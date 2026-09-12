@@ -178,8 +178,12 @@ add_library(ninfer_ops STATIC
   ops/common/memory_evict.cu
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
+  ops/linear/nvfp4/nvfp4_exact_geometry_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
+  ops/linear/nvfp4/nvfp4_exact_geometry_small_t.cu
+  ops/linear/nvfp4/nvfp4_exact_geometry_a16_gemm.cu
   ops/linear/nvfp4/nvfp4_w4a4.cu
+  ops/linear/nvfp4/nvfp4_exact_geometry_w4a4.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_mma.cu

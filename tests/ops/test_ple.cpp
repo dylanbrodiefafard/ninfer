@@ -1,5 +1,6 @@
 #include "ninfer/ops/ple.h"
 #include "ops/op_tester.h"
+#include "ops/native_projection_fixture.h"
 #include "ops/launcher/ple.h"
 
 #include <cuda_fp16.h>
@@ -259,7 +260,7 @@ int batched_staging_decode_case(int width) {
 }
 
 struct Weights {
-    Weights()
+    Weights(QType type = QType::GGML_Q8_0)
         : key_host(static_cast<std::size_t>(ops::kPleChannels) * kQ8RowBytes, 0),
           value_host(static_cast<std::size_t>(ops::kPleEmbeddingWidth) * kQ8RowBytes, 0),
           key_device(key_host.size()), value_device(value_host.size()) {
@@ -281,6 +282,24 @@ struct Weights {
         value_device.copy_from_host(value_host.data(), value_host.size());
         key = make_weight(key_device, ops::kPleChannels);
         value = make_weight(value_device, ops::kPleEmbeddingWidth);
+        key_unit = static_cast<double>(scale) * 127.0;
+        value_unit = static_cast<double>(scale) * 64.0;
+        if (native_projection_format(type)) {
+            auto native_key = native_sparse_fixture(type, ops::kPleChannels, ops::kPleEmbeddingWidth);
+            auto native_value = native_sparse_fixture(type, ops::kPleEmbeddingWidth, ops::kPleEmbeddingWidth);
+            for (int row = 0; row < ops::kPleChannels; ++row) {
+                native_sparse_set(native_key, row, 0, (row & 1) ? -1.0F : 1.0F);
+            }
+            for (int row = 0; row < ops::kPleEmbeddingWidth; ++row) {
+                native_sparse_set(native_value, row, 1, 0.5F);
+            }
+            key_device = to_device(native_key.payload);
+            value_device = to_device(native_value.payload);
+            key = native_key.device_weight(key_device.p);
+            value = native_value.device_weight(value_device.p);
+            key_unit = 1.0;
+            value_unit = 0.5;
+        }
     }
 
     static Weight make_weight(DeviceBuffer& storage, int rows) {
@@ -308,6 +327,7 @@ struct Weights {
     DeviceBuffer value_device;
     std::uint16_t scale_bits{};
     float scale{};
+    double key_unit{}, value_unit{};
     Weight key;
     Weight value;
 };
@@ -367,7 +387,7 @@ RunResult run_inject(std::span<const float> residual, std::span<const float> emb
     auto dold = to_device(std::vector<std::uint16_t>(old_state.begin(), old_state.end()));
     GuardedDeviceBuffer dnew(old_state.size_bytes());
     GuardedDeviceBuffer dout(residual.size_bytes());
-    DeviceArena workspace(ops::ple_workspace_capacity_bytes(width));
+    DeviceArena workspace(ops::ple_workspace_capacity_bytes(width, weights.key.qtype, weights.value.qtype));
     Tensor residual_t(dresidual.p, DType::BF16, {ops::kPleEmbeddingWidth, 4, width});
     Tensor embedding_t(dembedding.p, DType::BF16, {ops::kPleEmbeddingWidth, width});
     Tensor key_norm_t(dnorm_key.p, DType::FP32, {ops::kPleChannels});
@@ -403,8 +423,8 @@ OracleResult oracle(const Inputs& input, const Weights& weights,
                    [](std::uint16_t bits) { return static_cast<double>(bf16_to_f32(bits)); });
     std::vector<double> current(static_cast<std::size_t>(ops::kPleChannels) * input.width);
     std::vector<double> output(static_cast<std::size_t>(ops::kPleChannels) * input.width);
-    const double key_unit = static_cast<double>(weights.scale) * 127.0;
-    const double value_unit = weights.scale * 64.0;
+    const double key_unit = weights.key_unit;
+    const double value_unit = weights.value_unit;
     for (int token = 0; token < input.width; ++token) {
         const double e0 = input.embedding[ops::kPleEmbeddingWidth * token];
         const double e1 = input.embedding[ops::kPleEmbeddingWidth * token + 1];
@@ -472,10 +492,10 @@ OracleResult oracle(const Inputs& input, const Weights& weights,
     return {std::move(output), std::move(final_state)};
 }
 
-int injection_state_case() {
+int injection_state_case(QType type = QType::GGML_Q8_0) {
     constexpr int width = 4;
     Inputs input(width);
-    Weights weights;
+    Weights weights(type);
     std::vector<std::uint16_t> initial_state(static_cast<std::size_t>(ops::kPleChannels) * 9);
     for (int history = 0; history < 9; ++history) {
         for (int channel = 0; channel < ops::kPleChannels; ++channel) {
@@ -548,6 +568,8 @@ int main() {
         failures += batched_staging_decode_case(width);
     }
     failures += injection_state_case();
+    failures += injection_state_case(QType::NVFP4);
+    failures += injection_state_case(QType::FP8_E4M3FN_ROW_BF16S);
     if (failures != 0) {
         std::cerr << "PLE tests failed: " << failures << '\n';
         return 1;

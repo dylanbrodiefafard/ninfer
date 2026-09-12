@@ -21,9 +21,8 @@ __global__ __launch_bounds__(Threads,
                              2) void fp8_a8_quantize_kernel(const __nv_bfloat16* __restrict__ input,
                                                             std::uint8_t* __restrict__ codes,
                                                             float* __restrict__ scales) {
-    static_assert((ActivationGeometry::kInputRows % (Threads * 2)) == 0);
     constexpr int pairs_per_token  = ActivationGeometry::kInputRows / 2;
-    constexpr int pairs_per_thread = pairs_per_token / Threads;
+    constexpr int pairs_per_thread = (pairs_per_token + Threads - 1) / Threads;
     constexpr int warps            = Threads / 32;
     __shared__ float warp_maxima[warps];
     __shared__ float token_scale;
@@ -42,7 +41,8 @@ __global__ __launch_bounds__(Threads,
 #pragma unroll
     for (int item = 0; item < pairs_per_thread; ++item) {
         const int pair = tid + item * Threads;
-        values[item]   = bf16x2_bits_to_float2(input_pairs[pair]);
+        values[item]   = pair < pairs_per_token ? bf16x2_bits_to_float2(input_pairs[pair])
+                                                : make_float2(0.0F, 0.0F);
         maximum        = fmaxf(maximum, fabsf(values[item].x));
         maximum        = fmaxf(maximum, fabsf(values[item].y));
     }
@@ -62,7 +62,9 @@ __global__ __launch_bounds__(Threads,
     for (int item = 0; item < pairs_per_thread; ++item) {
         const int pair      = tid + item * Threads;
         const float2 scaled = make_float2(values[item].x * inverse, values[item].y * inverse);
-        output_pairs[pair]  = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+        if (pair < pairs_per_token) {
+            output_pairs[pair] = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+        }
     }
     if (tid == 0) { scales[token] = scale; }
 }
@@ -119,11 +121,23 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
         throw std::invalid_argument("fp8 A8 requires caller workspace");
     }
     switch (weight.k) {
+    case Fp8Activation2560Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation2560Geometry>(x, workspace, stream);
+        return;
     case Fp8Activation5120Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation5120Geometry>(x, workspace, stream);
         return;
     case Fp8Activation6144Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation6144Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation640Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation640Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation10240Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation10240Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation320Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation320Geometry>(x, workspace, stream);
         return;
     case Fp8Activation17408Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation17408Geometry>(x, workspace, stream);
@@ -155,6 +169,41 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
     case Fp8Problem::Residual17408:
         launch_problem<Fp8Residual17408Geometry>(weight, out, workspace, tokens, stream);
         return;
+    case Fp8Problem::Rows10240K2560:
+        launch_problem<Fp8Rows10240K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows6144K2560:
+        launch_problem<Fp8Rows6144K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows12288K2560:
+        launch_problem<Fp8Rows12288K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows512K2560:
+        launch_problem<Fp8Rows512K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows2560K6144:
+        launch_problem<Fp8Rows2560K6144Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows640K2560:
+        launch_problem<Fp8Rows640K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows1280K2560:
+        launch_problem<Fp8Rows1280K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows2560K640:
+        launch_problem<Fp8Rows2560K640Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows320K10240:
+        launch_problem<Fp8Rows320K10240Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows10240K320:
+        launch_problem<Fp8Rows10240K320Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Rows2560K2560:
+        launch_problem<Fp8Rows2560K2560Geometry>(weight, out, workspace, tokens, stream);
+        return;
+    case Fp8Problem::Vocabulary2560:
+        break;
     }
     throw std::logic_error("FP8 vocabulary has no A8 route");
 }

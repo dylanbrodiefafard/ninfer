@@ -49,6 +49,41 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     case Fp8Problem::Residual17408:
         launch_exact<Fp8Residual17408Geometry>(x, weight, out, stream);
         return;
+    case Fp8Problem::Rows10240K2560:
+        launch_exact<Fp8Rows10240K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows6144K2560:
+        launch_exact<Fp8Rows6144K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows12288K2560:
+        launch_exact<Fp8Rows12288K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows512K2560:
+        launch_exact<Fp8Rows512K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows2560K6144:
+        launch_exact<Fp8Rows2560K6144Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows640K2560:
+        launch_exact<Fp8Rows640K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows1280K2560:
+        launch_exact<Fp8Rows1280K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows2560K640:
+        launch_exact<Fp8Rows2560K640Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows320K10240:
+        launch_exact<Fp8Rows320K10240Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows10240K320:
+        launch_exact<Fp8Rows10240K320Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Rows2560K2560:
+        launch_exact<Fp8Rows2560K2560Geometry>(x, weight, out, stream);
+        return;
+    case Fp8Problem::Vocabulary2560:
+        break;
     }
     throw std::logic_error("FP8 vocabulary decode uses its A16 MMA route");
 }

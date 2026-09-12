@@ -8,6 +8,15 @@ namespace ninfer::ops::detail {
 
 void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+void launch_nvfp4_exact_geometry_decode(const Tensor& x, const Weight& weight, Tensor& out,
+                                        cudaStream_t stream);
+void launch_nvfp4_exact_geometry_small_t(const Tensor& x, const Weight& weight, Tensor& out,
+                                         cudaStream_t stream);
+void launch_nvfp4_exact_geometry_a16_gemm(const Tensor& x, const Weight& weight, Tensor& out,
+                                          cudaStream_t stream);
+void launch_nvfp4_exact_geometry_w4a4(const Weight& weight, Tensor& out,
+                                      struct Nvfp4W4a4Workspace workspace,
+                                      cudaStream_t stream);
 void launch_nvfp4_decode_splitk(const Tensor& embedding, const Tensor& hidden, const Weight& weight,
                                 Tensor& out, cudaStream_t stream);
 void launch_nvfp4_small_t_splitk(const Tensor& embedding, const Tensor& hidden,

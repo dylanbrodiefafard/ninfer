@@ -3,7 +3,10 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
+#include "ninfer/ops/linear.h"
 #include "ops/launcher/qwen4_sparse_moe.h"
+#include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cuda_runtime.h>
 
@@ -16,6 +19,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -149,6 +153,93 @@ void require_mapped_bank(const Qwen4MappedRoutedGateUp& bank) {
     }
 }
 
+bool native_weight(QType qtype) {
+    return qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16S;
+}
+
+void require_native_weight(const Weight& weight, std::int32_t matrices,
+                           std::int32_t rows, std::int32_t columns, const char* name) {
+    const bool rank_three = matrices != 1;
+    if (weight.n != rows || weight.k != columns ||
+        weight.ndim != (rank_three ? 3U : 2U) ||
+        weight.shape[0] != (rank_three ? matrices : rows) ||
+        weight.shape[1] != (rank_three ? rows : columns) ||
+        weight.shape[2] != (rank_three ? columns : 1) || weight.shape[3] != 1 ||
+        !std::equal(std::begin(weight.shape), std::end(weight.shape),
+                    std::begin(weight.padded_shape))) {
+        throw std::invalid_argument(std::string("qwen4_sparse_moe: invalid ") + name);
+    }
+    Weight flattened = weight;
+    flattened.ndim = 2;
+    flattened.n = matrices * rows;
+    flattened.shape[0] = flattened.padded_shape[0] = flattened.n;
+    flattened.shape[1] = flattened.padded_shape[1] = columns;
+    flattened.shape[2] = flattened.padded_shape[2] = 1;
+    if (weight.qtype == QType::NVFP4) {
+        (void)detail::validate_nvfp4_weight(flattened, "qwen4_sparse_moe_resident");
+    } else if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        (void)detail::validate_fp8_weight(flattened, "qwen4_sparse_moe_resident");
+    } else {
+        throw std::invalid_argument(std::string("qwen4_sparse_moe: invalid format for ") + name);
+    }
+}
+
+void require_resident_projection(const Weight& weight, QType ggml_qtype,
+                                  std::int32_t rows, std::int32_t columns,
+                                  const char* name) {
+    if (native_weight(weight.qtype)) {
+        require_native_weight(weight, 1, rows, columns, name);
+    } else {
+        require_ggml_weight(weight, ggml_qtype, 1, rows, columns, name);
+    }
+}
+
+void resident_projection(const Tensor& x, const Weight& weight, Tensor& out,
+                          WorkspaceArena& workspace, cudaStream_t stream) {
+    if (native_weight(weight.qtype)) {
+        linear(x, weight, out, LinearPolicy::A16Only, workspace, stream);
+    } else {
+        ggml_block_linear(x, weight, out, stream);
+    }
+}
+
+void validate_resident_profile(const Qwen4ResidentSparseMoeWeights& weights) {
+    const auto check = [](const Weight& weight, int rows, int columns, bool gate_up,
+                           bool routed) {
+        const bool ggml = gate_up
+            ? (routed ? weight.qtype == QType::GGML_IQ1_S || weight.qtype == QType::GGML_IQ2_XXS
+                      : weight.qtype == QType::GGML_Q5_K || weight.qtype == QType::GGML_Q6_K)
+            : weight.qtype == (routed ? QType::GGML_IQ4_NL : QType::GGML_Q8_0);
+        if ((!ggml && !native_weight(weight.qtype)) || weight.n != rows || weight.k != columns) {
+            throw std::invalid_argument("qwen4_sparse_moe_resident: invalid weight profile");
+        }
+        const QuantLayout layout = weight.qtype == QType::NVFP4
+            ? QuantLayout::BlockScaleK16M128x4
+            : weight.qtype == QType::FP8_E4M3FN_ROW_BF16S
+                ? QuantLayout::RowScale : QuantLayout::GgmlBlockRow;
+        if (weight.layout != layout) {
+            throw std::invalid_argument("qwen4_sparse_moe_resident: invalid weight layout");
+        }
+    };
+    check(weights.routed_gate, kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, true, true);
+    check(weights.routed_up, kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, true, true);
+    check(weights.routed_down, kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate, false, true);
+    check(weights.shared_gate_proj, kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, true, false);
+    check(weights.shared_up, kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, true, false);
+    check(weights.shared_down, kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate, false, false);
+    for (const auto pair : {std::pair{&weights.routed_gate, &weights.routed_up},
+                            std::pair{&weights.shared_gate_proj, &weights.shared_up}}) {
+        if (!native_weight(pair.first->qtype) && !native_weight(pair.second->qtype) &&
+            pair.first->qtype != pair.second->qtype) {
+            throw std::invalid_argument("qwen4_sparse_moe_resident: GGML gate/up formats differ");
+        }
+    }
+    if (weights.router.qtype != QType::FP32_CTRL || weights.router.n != kQwen4SparseMoeExperts ||
+        weights.router.k != kQwen4SparseMoeHidden) {
+        throw std::invalid_argument("qwen4_sparse_moe_resident: invalid router profile");
+    }
+}
+
 struct Scratch {
     Tensor logits;
     Tensor gate;
@@ -196,6 +287,37 @@ struct ResidentWideScratch {
     Tensor expert_cursors;
     Tensor occurrence_slots;
 };
+
+bool resident_native_profile(const Qwen4ResidentSparseMoeWeights& weights) {
+    return native_weight(weights.routed_gate.qtype) || native_weight(weights.routed_up.qtype) ||
+           native_weight(weights.routed_down.qtype) ||
+           native_weight(weights.shared_gate_proj.qtype) || native_weight(weights.shared_up.qtype) ||
+           native_weight(weights.shared_down.qtype);
+}
+
+std::size_t shared_projection_workspace(const Qwen4ResidentSparseMoeWeights& weights,
+                                        std::int32_t width) {
+    std::size_t capacity = 0;
+    for (const Weight* weight : {&weights.shared_gate_proj, &weights.shared_up,
+                                 &weights.shared_down}) {
+        if (native_weight(weight->qtype)) {
+            capacity = std::max(capacity, linear_workspace_capacity_bytes(
+                weight->qtype, weight->n, weight->k, LinearPolicy::A16Only, width, width));
+        }
+    }
+    return capacity;
+}
+
+std::int32_t resident_gather_rows(const Qwen4ResidentSparseMoeWeights& weights) {
+    std::int32_t rows = 0;
+    for (const Weight* bank : {&weights.routed_gate, &weights.routed_up,
+                               &weights.routed_down}) {
+        if (bank->qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            rows = std::max(rows, bank->k);
+        }
+    }
+    return rows;
+}
 
 struct PrefillScratch {
     Tensor logits;
@@ -277,9 +399,19 @@ std::size_t required_prefill_workspace(std::int32_t width) {
 }
 
 
-std::size_t required_resident_workspace(std::int32_t width) {
+std::size_t required_resident_workspace(const Qwen4ResidentSparseMoeWeights& weights,
+                                       std::int32_t width) {
+    validate_resident_profile(weights);
     WorkspaceLayoutBuilder layout;
-    if (width == 1) {
+    if (resident_native_profile(weights)) {
+        (void)allocate_resident_wide_scratch(layout, width);
+        // Native expert routes gather sorted occurrences without moving IDs to the host.
+        // The scratch is reused by gate, up, and down in stream order.
+        const std::size_t gathered = static_cast<std::size_t>(resident_gather_rows(weights)) *
+                                     kQwen4SparseMoeTopK * width * sizeof(std::uint16_t);
+        const std::size_t child = std::max(gathered, shared_projection_workspace(weights, width));
+        if (child != 0) { (void)layout.alloc_bytes(child); }
+    } else if (width == 1) {
         (void)allocate_resident_scratch(layout);
     } else if (width < kResidentGroupedMinWidth) {
         // The scalar implementation reuses one token's scratch serially.
@@ -363,12 +495,13 @@ std::size_t qwen4_sparse_moe_prefill_workspace_capacity_bytes(std::int32_t width
     return required_prefill_workspace(width);
 }
 
-std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(std::int32_t width) {
+std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
+    const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width) {
     if (width <= 0 || width > kQwen4SparseMoePrefillMaxWidth) {
         throw std::invalid_argument(
             "qwen4_sparse_moe_resident_workspace_capacity_bytes: width must be in [1,4096]");
     }
-    return required_resident_workspace(width);
+    return required_resident_workspace(weights, width);
 }
 
 void qwen4_sparse_moe_gate_up_swiglu(const Tensor& x, const Weight& gate,
@@ -892,31 +1025,44 @@ void qwen4_sparse_moe_resident(const Tensor& x,
                           "destination", "qwen4_sparse_moe_resident");
     require_dense_router(weights.router);
     const QType routed_qtype = weights.routed_gate.qtype;
-    if ((routed_qtype != QType::GGML_IQ1_S && routed_qtype != QType::GGML_IQ2_XXS) ||
-        weights.routed_up.qtype != routed_qtype) {
+    if (!native_weight(routed_qtype) && routed_qtype != QType::GGML_IQ1_S &&
+        routed_qtype != QType::GGML_IQ2_XXS) {
         throw std::invalid_argument(
             "qwen4_sparse_moe_resident: routed gate/up formats differ or are invalid");
     }
-    require_ggml_weight(weights.routed_gate, routed_qtype, kQwen4SparseMoeExperts,
-                        kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "routed_gate");
-    require_ggml_weight(weights.routed_up, routed_qtype, kQwen4SparseMoeExperts,
-                        kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "routed_up");
-    require_ggml_weight(weights.routed_down, QType::GGML_IQ4_NL, kQwen4SparseMoeExperts,
-                        kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate, "routed_down");
-    if ((weights.shared_gate_proj.qtype != QType::GGML_Q5_K &&
-         weights.shared_gate_proj.qtype != QType::GGML_Q6_K) ||
-        weights.shared_up.qtype != weights.shared_gate_proj.qtype) {
+    for (const Weight* bank : {&weights.routed_gate, &weights.routed_up}) {
+        if (native_weight(bank->qtype)) {
+            require_native_weight(*bank, kQwen4SparseMoeExperts,
+                                   kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden,
+                                   "routed gate/up");
+        } else {
+            require_ggml_weight(*bank, bank->qtype, kQwen4SparseMoeExperts,
+                                kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden,
+                                "routed gate/up");
+        }
+    }
+    if (native_weight(weights.routed_down.qtype)) {
+        require_native_weight(weights.routed_down, kQwen4SparseMoeExperts,
+                               kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate,
+                               "routed_down");
+    } else {
+        require_ggml_weight(weights.routed_down, QType::GGML_IQ4_NL, kQwen4SparseMoeExperts,
+                            kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate, "routed_down");
+    }
+    if (!native_weight(weights.shared_gate_proj.qtype) &&
+        weights.shared_gate_proj.qtype != QType::GGML_Q5_K &&
+        weights.shared_gate_proj.qtype != QType::GGML_Q6_K) {
         throw std::invalid_argument(
             "qwen4_sparse_moe_resident: shared gate/up formats differ or are invalid");
     }
-    require_ggml_weight(weights.shared_gate_proj, weights.shared_gate_proj.qtype, 1,
+    require_resident_projection(weights.shared_gate_proj, weights.shared_gate_proj.qtype,
                         kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden,
                         "shared_gate_proj");
-    require_ggml_weight(weights.shared_up, weights.shared_gate_proj.qtype, 1,
+    require_resident_projection(weights.shared_up, weights.shared_up.qtype,
                         kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "shared_up");
-    require_ggml_weight(weights.shared_down, QType::GGML_Q8_0, 1, kQwen4SparseMoeHidden,
+    require_resident_projection(weights.shared_down, QType::GGML_Q8_0, kQwen4SparseMoeHidden,
                         kQwen4SparseMoeIntermediate, "shared_down");
-    const std::size_t required = required_resident_workspace(width);
+    const std::size_t required = required_resident_workspace(weights, width);
     if (!has_workspace_capacity(workspace, required)) {
         throw std::invalid_argument("qwen4_sparse_moe_resident: insufficient workspace");
     }
@@ -943,7 +1089,7 @@ void qwen4_sparse_moe_resident(const Tensor& x,
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
-    if (width < kResidentGroupedMinWidth) {
+    if (width < kResidentGroupedMinWidth && !resident_native_profile(weights)) {
         ResidentScratch scratch = allocate_resident_scratch(workspace);
         for (std::int32_t token = 0; token < width; ++token) {
             auto* x_data = static_cast<std::byte*>(x.data) +
@@ -985,28 +1131,43 @@ void qwen4_sparse_moe_resident(const Tensor& x,
     detail::qwen4_sparse_moe_resident_wide_route_launch(
         x, weights.router, weights.shared_gate, scratch.logits, selected_ids,
         selected_weights, scratch.shared_gate_value, stream);
-    ggml_block_linear(x, weights.shared_gate_proj, scratch.shared_gate_projection, stream);
-    ggml_block_linear(x, weights.shared_up, scratch.shared_up, stream);
+    resident_projection(x, weights.shared_gate_proj, scratch.shared_gate_projection,
+                         workspace, stream);
+    resident_projection(x, weights.shared_up, scratch.shared_up, workspace, stream);
     detail::qwen4_sparse_moe_swiglu_launch(
         scratch.shared_gate_projection, scratch.shared_up,
         scratch.shared_gate_projection, stream);
-    ggml_block_linear(scratch.shared_gate_projection, weights.shared_down, scratch.shared,
-                      stream);
+    resident_projection(scratch.shared_gate_projection, weights.shared_down, scratch.shared,
+                         workspace, stream);
 
     detail::qwen4_sparse_moe_resident_group_launch(
         selected_ids, scratch.expert_counts, scratch.expert_offsets,
         scratch.expert_cursors, scratch.occurrence_slots, stream);
-    detail::qwen4_sparse_moe_resident_grouped_gate_up_launch(
-        x, weights.routed_gate, scratch.expert_counts, scratch.expert_offsets,
-        scratch.occurrence_slots, scratch.routed_gate, stream);
-    detail::qwen4_sparse_moe_resident_grouped_gate_up_launch(
-        x, weights.routed_up, scratch.expert_counts, scratch.expert_offsets,
-        scratch.occurrence_slots, scratch.routed_up, stream);
+    Tensor gathered;
+    if (const int rows = resident_gather_rows(weights); rows != 0) {
+        gathered = workspace.alloc(DType::BF16, {rows, kQwen4SparseMoeTopK * width});
+    }
+    const auto routed_projection = [&](const Tensor& input, const Weight& bank,
+                                        Tensor& output, bool input_is_ranked) {
+        if (native_weight(bank.qtype)) {
+            detail::qwen4_sparse_moe_resident_native_linear_launch(
+                input, bank, scratch.expert_counts, scratch.expert_offsets,
+                scratch.occurrence_slots, gathered, output, input_is_ranked, stream);
+        } else if (input_is_ranked) {
+            detail::qwen4_sparse_moe_resident_grouped_down_launch(
+                input, bank, scratch.expert_counts, scratch.expert_offsets,
+                scratch.occurrence_slots, output, stream);
+        } else {
+            detail::qwen4_sparse_moe_resident_grouped_gate_up_launch(
+                input, bank, scratch.expert_counts, scratch.expert_offsets,
+                scratch.occurrence_slots, output, stream);
+        }
+    };
+    routed_projection(x, weights.routed_gate, scratch.routed_gate, false);
+    routed_projection(x, weights.routed_up, scratch.routed_up, false);
     detail::qwen4_sparse_moe_swiglu_launch(
         scratch.routed_gate, scratch.routed_up, scratch.routed_gate, stream);
-    detail::qwen4_sparse_moe_resident_grouped_down_launch(
-        scratch.routed_gate, weights.routed_down, scratch.expert_counts,
-        scratch.expert_offsets, scratch.occurrence_slots, scratch.rank_results, stream);
+    routed_projection(scratch.routed_gate, weights.routed_down, scratch.rank_results, true);
     detail::qwen4_sparse_moe_prefill_finish_launch(
         scratch.rank_results, selected_weights, scratch.shared,
         scratch.shared_gate_value, destination, stream);

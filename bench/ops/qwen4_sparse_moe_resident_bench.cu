@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
@@ -28,6 +29,38 @@ constexpr std::int32_t kExperts = ops::kQwen4SparseMoeExperts;
 constexpr std::int32_t kTopK = ops::kQwen4SparseMoeTopK;
 constexpr std::int32_t kIntermediate = ops::kQwen4SparseMoeIntermediate;
 constexpr std::int32_t kRouteWindows = 52;
+
+bool native_format(QType type) {
+    return type == QType::NVFP4 || type == QType::FP8_E4M3FN_ROW_BF16S;
+}
+
+const char* format_name(QType type) {
+    switch (type) {
+    case QType::NVFP4: return "nvfp4";
+    case QType::FP8_E4M3FN_ROW_BF16S: return "fp8";
+    case QType::GGML_IQ1_S: return "iq1_s";
+    case QType::GGML_IQ2_XXS: return "iq2_xxs";
+    case QType::GGML_Q5_K: return "q5_k";
+    case QType::GGML_Q6_K: return "q6_k";
+    default: throw std::invalid_argument("unsupported benchmark format");
+    }
+}
+
+Weight native_bank(QType type, int experts, int rows, int columns, DeviceBuffer& storage) {
+    auto packed = type == QType::NVFP4
+        ? bench::make_nvfp4_weight(experts * rows, columns)
+        : bench::make_fp8_weight(experts * rows, columns);
+    storage = std::move(packed.storage);
+    Weight weight = packed.weight;
+    if (experts != 1) {
+        weight.ndim = 3;
+        weight.n = rows;
+        weight.shape[0] = weight.padded_shape[0] = experts;
+        weight.shape[1] = weight.padded_shape[1] = rows;
+        weight.shape[2] = weight.padded_shape[2] = columns;
+    }
+    return weight;
+}
 
 struct FormatSpec {
     std::size_t values;
@@ -142,15 +175,19 @@ class Fixture {
 public:
     Fixture(QType routed_qtype, QType shared_qtype, std::int32_t width)
         : routed_qtype_(routed_qtype), width_(width), shared_qtype_(shared_qtype),
-          one_routed_(matrix_bytes(routed_qtype_, kIntermediate, kHidden)),
+          one_routed_(native_format(routed_qtype_)
+                          ? 0 : matrix_bytes(routed_qtype_, kIntermediate, kHidden)),
           routed_bank_bytes_(static_cast<std::size_t>(kExperts) * one_routed_),
-          down_bank_bytes_(static_cast<std::size_t>(kExperts) *
+          down_bank_bytes_(native_format(routed_qtype_) ? 0 : static_cast<std::size_t>(kExperts) *
                            matrix_bytes(QType::GGML_IQ4_NL, kHidden, kIntermediate)),
           host_gate_(routed_bank_bytes_), host_up_(routed_bank_bytes_),
           host_down_(down_bank_bytes_),
-          host_shared_gate_proj_(matrix_bytes(shared_qtype_, kIntermediate, kHidden)),
-          host_shared_up_(matrix_bytes(shared_qtype_, kIntermediate, kHidden)),
-          host_shared_down_(matrix_bytes(QType::GGML_Q8_0, kHidden, kIntermediate)),
+          host_shared_gate_proj_(native_format(shared_qtype_)
+                                    ? 0 : matrix_bytes(shared_qtype_, kIntermediate, kHidden)),
+          host_shared_up_(native_format(shared_qtype_)
+                             ? 0 : matrix_bytes(shared_qtype_, kIntermediate, kHidden)),
+          host_shared_down_(native_format(shared_qtype_)
+                               ? 0 : matrix_bytes(QType::GGML_Q8_0, kHidden, kIntermediate)),
           device_inputs_(static_cast<std::size_t>(width_) * kHidden * sizeof(std::uint16_t)),
           device_router_(static_cast<std::size_t>(kExperts) * kHidden * sizeof(float)),
           device_gate_(routed_bank_bytes_), device_up_(routed_bank_bytes_),
@@ -159,14 +196,15 @@ public:
           device_shared_up_(host_shared_up_.size()), device_shared_down_(host_shared_down_.size()),
           selected_ids_(static_cast<std::size_t>(width_) * kTopK * sizeof(std::int32_t)),
           selected_weights_(static_cast<std::size_t>(width_) * kTopK * sizeof(float)),
-          destination_(static_cast<std::size_t>(width_) * kHidden * sizeof(std::uint16_t)),
-          workspace_(ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(width_)) {
-        fill_valid_blocks(host_gate_, routed_qtype_, 0x12345678U);
-        fill_valid_blocks(host_up_, routed_qtype_, 0x87654321U);
-        fill_valid_blocks(host_down_, QType::GGML_IQ4_NL, 0x31415926U);
-        fill_valid_blocks(host_shared_gate_proj_, shared_qtype_, 0x27182818U);
-        fill_valid_blocks(host_shared_up_, shared_qtype_, 0x16180339U);
-        fill_valid_blocks(host_shared_down_, QType::GGML_Q8_0, 0x42424242U);
+          destination_(static_cast<std::size_t>(width_) * kHidden * sizeof(std::uint16_t)) {
+        if (!native_format(routed_qtype_)) {
+            fill_valid_blocks(host_gate_, routed_qtype_, 0x12345678U);
+            fill_valid_blocks(host_up_, routed_qtype_, 0x87654321U);
+            fill_valid_blocks(host_down_, QType::GGML_IQ4_NL, 0x31415926U);
+            fill_valid_blocks(host_shared_gate_proj_, shared_qtype_, 0x27182818U);
+            fill_valid_blocks(host_shared_up_, shared_qtype_, 0x16180339U);
+            fill_valid_blocks(host_shared_down_, QType::GGML_Q8_0, 0x42424242U);
+        }
 
         std::vector<float> router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
         for (std::int32_t window = 0; window < kRouteWindows; ++window) {
@@ -177,37 +215,53 @@ public:
             }
         }
         device_router_.copy_from_host(router.data(), device_router_.bytes);
-        device_gate_.copy_from_host(host_gate_.data(), host_gate_.size());
-        device_up_.copy_from_host(host_up_.data(), host_up_.size());
-        device_down_.copy_from_host(host_down_.data(), host_down_.size());
+        if (!native_format(routed_qtype_)) {
+            device_gate_.copy_from_host(host_gate_.data(), host_gate_.size());
+            device_up_.copy_from_host(host_up_.data(), host_up_.size());
+            device_down_.copy_from_host(host_down_.data(), host_down_.size());
+            device_shared_gate_proj_.copy_from_host(host_shared_gate_proj_.data(),
+                                                    host_shared_gate_proj_.size());
+            device_shared_up_.copy_from_host(host_shared_up_.data(), host_shared_up_.size());
+            device_shared_down_.copy_from_host(host_shared_down_.data(), host_shared_down_.size());
+        }
         device_shared_gate_.fill(0);
-        device_shared_gate_proj_.copy_from_host(host_shared_gate_proj_.data(),
-                                                host_shared_gate_proj_.size());
-        device_shared_up_.copy_from_host(host_shared_up_.data(), host_shared_up_.size());
-        device_shared_down_.copy_from_host(host_shared_down_.data(), host_shared_down_.size());
 
         shared_gate_ = Tensor(device_shared_gate_.p, DType::FP32, {kHidden});
         selected_ids_view_ = Tensor(selected_ids_.p, DType::I32, {kTopK, width_});
         selected_weights_view_ = Tensor(selected_weights_.p, DType::FP32, {kTopK, width_});
         destination_view_ = Tensor(destination_.p, DType::BF16, {kHidden, width_});
-        resident_weights_ = {
-            .router = make_router(device_router_.p),
-            .routed_gate = make_ggml_weight(device_gate_.p, device_gate_.bytes, routed_qtype_,
-                                            kExperts, kIntermediate, kHidden),
-            .routed_up = make_ggml_weight(device_up_.p, device_up_.bytes, routed_qtype_,
-                                          kExperts, kIntermediate, kHidden),
-            .routed_down = make_ggml_weight(device_down_.p, device_down_.bytes,
-                                            QType::GGML_IQ4_NL, kExperts, kHidden,
-                                            kIntermediate),
-            .shared_gate = shared_gate_,
-            .shared_gate_proj = make_ggml_weight(
-                device_shared_gate_proj_.p, device_shared_gate_proj_.bytes, shared_qtype_, 1,
-                kIntermediate, kHidden),
-            .shared_up = make_ggml_weight(device_shared_up_.p, device_shared_up_.bytes,
-                                          shared_qtype_, 1, kIntermediate, kHidden),
-            .shared_down = make_ggml_weight(device_shared_down_.p, device_shared_down_.bytes,
-                                            QType::GGML_Q8_0, 1, kHidden, kIntermediate),
-        };
+        if (native_format(routed_qtype_)) {
+            resident_weights_ = {
+                make_router(device_router_.p),
+                native_bank(routed_qtype_, kExperts, kIntermediate, kHidden, device_gate_),
+                native_bank(routed_qtype_, kExperts, kIntermediate, kHidden, device_up_),
+                native_bank(routed_qtype_, kExperts, kHidden, kIntermediate, device_down_),
+                shared_gate_,
+                native_bank(shared_qtype_, 1, kIntermediate, kHidden, device_shared_gate_proj_),
+                native_bank(shared_qtype_, 1, kIntermediate, kHidden, device_shared_up_),
+                native_bank(shared_qtype_, 1, kHidden, kIntermediate, device_shared_down_)};
+        } else {
+            resident_weights_ = {
+                .router = make_router(device_router_.p),
+                .routed_gate = make_ggml_weight(device_gate_.p, device_gate_.bytes, routed_qtype_,
+                                                kExperts, kIntermediate, kHidden),
+                .routed_up = make_ggml_weight(device_up_.p, device_up_.bytes, routed_qtype_,
+                                              kExperts, kIntermediate, kHidden),
+                .routed_down = make_ggml_weight(device_down_.p, device_down_.bytes,
+                                                QType::GGML_IQ4_NL, kExperts, kHidden,
+                                                kIntermediate),
+                .shared_gate = shared_gate_,
+                .shared_gate_proj = make_ggml_weight(
+                    device_shared_gate_proj_.p, device_shared_gate_proj_.bytes, shared_qtype_, 1,
+                    kIntermediate, kHidden),
+                .shared_up = make_ggml_weight(device_shared_up_.p, device_shared_up_.bytes,
+                                              shared_qtype_, 1, kIntermediate, kHidden),
+                .shared_down = make_ggml_weight(device_shared_down_.p, device_shared_down_.bytes,
+                                                QType::GGML_Q8_0, 1, kHidden, kIntermediate),
+            };
+        }
+        workspace_ = DeviceBuffer(
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_weights_, width_));
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     }
 
@@ -217,6 +271,8 @@ public:
             (void)cudaStreamDestroy(stream_);
         }
     }
+
+    std::size_t workspace_bytes() const { return workspace_.bytes; }
 
     Measurement measure(bool batched, bool rotating, std::int32_t iterations,
                         bool profile = false) {
@@ -334,6 +390,7 @@ struct Options {
     std::int32_t width = 1;
     bool profile = false;
     bool iterations_explicit = false;
+    std::string_view format;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -344,9 +401,17 @@ Options parse_options(int argc, char** argv) {
             options.profile = true;
             continue;
         }
+        if (option == "--format" && index + 1 < argc) {
+            options.format = argv[++index];
+            if (options.format != "nvfp4" && options.format != "fp8" &&
+                options.format != "iq1_s" && options.format != "iq2_xxs") {
+                throw std::invalid_argument("format must be nvfp4, fp8, iq1_s, or iq2_xxs");
+            }
+            continue;
+        }
         if ((option != "--iterations" && option != "--width") || index + 1 >= argc) {
             throw std::invalid_argument(
-                "usage: qwen4 resident bench [--iterations N] [--width T] [--profile]");
+                "usage: qwen4 resident bench [--iterations N] [--width T] [--format nvfp4|fp8|iq1_s|iq2_xxs] [--profile]");
         }
         const long parsed = std::strtol(argv[++index], nullptr, 10);
         if (option == "--iterations" && (parsed <= 0 || parsed > 100000)) {
@@ -374,8 +439,8 @@ void report(QType qtype, QType shared_qtype, const char* workload, const char* p
             const Measurement& measurement, std::int32_t iterations,
             std::int32_t width, std::size_t resident_bytes,
             std::size_t workspace_bytes) {
-    const char* format = qtype == QType::GGML_IQ1_S ? "iq1_s" : "iq2_xxs";
-    const char* shared_format = shared_qtype == QType::GGML_Q5_K ? "q5_k" : "q6_k";
+    const char* format = format_name(qtype);
+    const char* shared_format = format_name(shared_qtype);
     std::cout << std::fixed << std::setprecision(3) << "format=" << format
               << " shared_format=" << shared_format
               << " workload=" << workload << " placement=" << placement
@@ -392,13 +457,16 @@ void report(QType qtype, QType shared_qtype, const char* workload, const char* p
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
-        constexpr std::array<std::pair<QType, QType>, 3> profiles{{
+        constexpr std::array<std::pair<QType, QType>, 5> profiles{{
             {QType::GGML_IQ1_S, QType::GGML_Q5_K},
             {QType::GGML_IQ2_XXS, QType::GGML_Q5_K},
             {QType::GGML_IQ2_XXS, QType::GGML_Q6_K},
+            {QType::NVFP4, QType::NVFP4},
+            {QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S},
         }};
         for (const auto [qtype, shared_qtype] : profiles) {
-            if (options.profile && qtype != QType::GGML_IQ1_S) { continue; }
+            if (!options.format.empty() && options.format != format_name(qtype)) { continue; }
+            if (options.profile && options.format.empty() && qtype != QType::GGML_IQ1_S) { continue; }
             Fixture fixture(qtype, shared_qtype, options.width);
             for (bool rotating : {false, true}) {
                 if (options.profile && !rotating) { continue; }
@@ -409,8 +477,7 @@ int main(int argc, char** argv) {
                 }
                 const Measurement resident = fixture.measure(
                     true, rotating, options.iterations, options.profile);
-                const std::size_t workspace_bytes =
-                    ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(options.width);
+                const std::size_t workspace_bytes = fixture.workspace_bytes();
                 if (!options.profile) {
                     report(qtype, shared_qtype, workload, "scalar_repeat",
                            scalar, options.iterations, options.width,

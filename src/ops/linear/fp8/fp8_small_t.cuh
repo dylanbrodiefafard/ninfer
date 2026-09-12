@@ -61,9 +61,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     static_assert(Schedule::kTokenTile <= ActiveTokens);
     static_assert(!PairRows || (Schedule::kRowsPerWarp % 2) == 0);
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
-    static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
-    constexpr int kPhases = Geometry::kInputRows / kValuesPerPhase;
+    constexpr int kPhases =
+        (Geometry::kInputRows + kValuesPerPhase - 1) / kValuesPerPhase;
     constexpr int kStoredRowsPerWarp =
         PairRows ? Schedule::kRowsPerWarp / 2 : Schedule::kRowsPerWarp;
     constexpr int kStoredRowsPerCta = Schedule::kWarpsPerCta * kStoredRowsPerWarp;
@@ -100,22 +100,28 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 const int local_token = task / kPacksPerToken;
                 const int local_pack  = task - local_token * kPacksPerToken;
                 const int token       = token0 + local_token;
-                if (token < ActiveTokens) {
+                const int column      = phase * kValuesPerPhase + local_pack * 8;
+                if (token < ActiveTokens && column < Geometry::kInputRows) {
                     destination[task] = load_vec<uint4>(
                         x + static_cast<std::int64_t>(token) * Geometry::kInputRows +
-                        phase * kValuesPerPhase + local_pack * 8);
+                        column);
+                } else {
+                    destination[task] = make_uint4(0, 0, 0, 0);
                 }
             }
         }
 
         const int value_begin = phase * kValuesPerPhase + lane * Schedule::kValuesPerLane;
-        Fp8CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
+        Fp8CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp] = {};
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-            const int weight_row = row_policy.weight_row(row_begin, local_row);
-            row_codes[local_row] = load_fp8_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
-                weight_codes + static_cast<std::int64_t>(weight_row) * Geometry::kInputRows +
-                value_begin);
+            if (value_begin < Geometry::kInputRows) {
+                const int weight_row = row_policy.weight_row(row_begin, local_row);
+                row_codes[local_row] =
+                    load_fp8_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
+                        weight_codes + static_cast<std::int64_t>(weight_row) * Geometry::kInputRows +
+                        value_begin);
+            }
         }
 
         Fp8ActivationPack<Schedule::kValuesPerLane> activation[Schedule::kTokenTile];
@@ -133,9 +139,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #pragma unroll
             for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
                 const int token = token0 + local_token;
-                if (token < ActiveTokens) {
+                if (token < ActiveTokens && value_begin < Geometry::kInputRows) {
                     activation[local_token] = load_fp8_activation_pack<Schedule::kValuesPerLane>(
                         x + static_cast<std::int64_t>(token) * Geometry::kInputRows + value_begin);
+                } else {
+                    activation[local_token] = {};
                 }
             }
         }

@@ -10,9 +10,12 @@
 
 namespace ninfer::ops {
 
-/** Caller-owned transient capacity for the Qwen4-preview C=1, T<=max_tokens GR profile. */
+/** Caller-owned transient capacity for C=1, T<=max_tokens and the explicit projection formats.
+ * Defaults describe the GGUF verifier. Native formats use Linear A16Only. */
 [[nodiscard]] std::size_t
-gated_residual_workspace_capacity_bytes(std::int32_t max_tokens = 1);
+gated_residual_workspace_capacity_bytes(std::int32_t max_tokens = 1,
+                                        QType down = QType::GGML_Q8_0,
+                                        QType up = QType::GGML_Q8_0);
 
 /**
  * Op: gated_residual_read
@@ -25,7 +28,8 @@ gated_residual_workspace_capacity_bytes(std::int32_t max_tokens = 1);
  *   G = reshape(sigmoid(W_up u), [4,2560])
  *   x = (1/4) * sum_i G_i * Rhat_i.
  *
- * down_weight is GGML Q8_0 [320,10240], up_weight is GGML Q8_0 [10240,320], and x is the
+ * down_weight is Q8_0 or row-scaled FP8 [320,10240]; up_weight is Q8_0, row-scaled FP8 or
+ * NVFP4 [10240,320]. N=320 makes down_weight ineligible for the NVFP4 physical layout. x is the
  * represented BF16 [2560,T] output. This entry admits C=1 and T in [1,4096]. Each token column is
  * independent; T=1 retains the verifier decode route. The ideal oracle
  * exact-decodes both matrices and evaluates the complete formula naively in FP64 from represented

@@ -24,6 +24,52 @@ Qwen4 target must receive a separate artifact reference that fixes its complete 
 order, names, formats, layouts, placement, aliases, and transforms; this document deliberately
 does not invent those decisions for an unrunnable BF16 preview.
 
+## Bounded native-format qualification
+
+Native NVFP4 and `FP8_E4M3FN_ROW_BF16S` projection qualification does not require a complete
+GPU-resident preview checkpoint. `tools.parity.qwen4.mixed_projection_fixture` reads selected
+matrices from the existing verification artifact, checks its external vectorized GGML decoder
+against independent scalar codec witnesses, rounds the decoded values explicitly to BF16, and
+encodes the registered native formats offline. It never rewrites the verification model or its
+placement. Its `qwen4/layer-qualification` identity is a test fixture, not a registered target.
+
+The bounded selection covers GDN layers 0 and 2, QSA layer 3, both GR directions, and routed
+expert gate/down matrices at expert ids 0 and 511. GR down `[320,10240]` uses FP8 only because
+its row count violates the NVFP4 layout's N%128 requirement. The generated fixture is about
+191 MiB and has 23 matrices. No PLE table, ordinary-weight streaming, or CPU floating-point
+inference is involved in executing those projections.
+
+With Python 3.11, Torch, NumPy, and the local llama.cpp `gguf-py` package on `PYTHONPATH`:
+
+```sh
+python3.11 -m tools.parity.qwen4.mixed_projection_fixture \
+  --source /models/qwen4_ud_iq1_s_verify.ninfer \
+  --out out/qwen4-mixed-projections.ninfer
+```
+
+Run `build/tests/ninfer_qwen4_mixed_projection_real_test out/qwen4-mixed-projections.ninfer`
+inside the GPU builder. Alternatively set `NINFER_QWEN4_MIXED_PROJECTIONS` for its opt-in CTest.
+It checks full Linear outputs at T=1/17/33 with A16 compute, including graph replay, and sampled
+outputs at T=129/512/4096 with both A16 compute and the format's permissive A4/A8 policy. Every
+output is scanned for non-finite/unwritten values. The oracle independently decodes the stored codes and scales
+and computes FP64 dot products from represented public inputs; it does not use the converter's
+reconstruction or another GPU route as its reference.
+
+This is evidence of kernel correctness on real weight distributions, combined with complete-Op
+qualification at the same model geometry. It is **not** evidence of original-BF16-to-NVFP4/FP8
+model quality, full-checkpoint equivalence, or whole-model PPL: the input GGUF is already lossy,
+and the new offline encoding adds another quantization boundary. Those claims require the
+matching source weights/reference outputs and a complete admitted artifact profile.
+
+The completed qualification on RTX 5090, CUDA 13.1, `sm_120a` passed the 23-matrix real fixture,
+the existing GGUF Program reset/prefill/continuation regression, complete native GDN/GR/PLE/QSA
+and resident-MoE tests, and the independent Linear route-boundary oracles. The full
+`scripts/run-unit-tests.sh` gate passed 112 tests; two unrelated load-plan tests skipped because
+their Qwen3.6 artifacts were not configured. The focused Python artifact/encoder suite passed
+35 tests. The finished implementation received an independent Sol review, including re-review
+of its GDN partition-oracle repair. Native-kernel timing and the explicit near-zero MoE accuracy
+limitation are recorded in `qwen4-op-contracts.md`.
+
 ## 1. Exact source identity
 
 | Field | Value |

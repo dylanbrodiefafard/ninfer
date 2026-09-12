@@ -251,8 +251,11 @@ def analyze_from_args(args) -> dict:
         label = ""
     if args.t is None:
         raise ValueError("--t is required")
-    atom = fp8_compute_atom(n,k,args.t,args.policy) if qtype == 'fp8' else 'nvfp4'
-    mma_rate = args.mma_per_s if args.mma_per_s is not None else _load_mma_rate(args.mma_json, atom)
+    atom = (fp8_compute_atom(n,k,args.t,args.policy) if qtype == 'fp8'
+            else nvfp4_compute_atom(n,k,args.t,args.policy) if qtype == 'nvfp4'
+            else 'nvfp4')
+    mma_rate = (args.mma_per_s if args.mma_per_s is not None
+                else _load_mma_rate(args.mma_json, atom) if atom is not None else None)
     card = analyze(
         n, k, args.t, qtype,
         policy=args.policy, phase=args.phase, idea=args.idea,
@@ -291,19 +294,62 @@ def weight_bytes(n: int, k: int, qtype: str) -> int:
     return groups * spec["bytes_per_group"]
 
 
-def fp8_compute_atom(n: int, k: int, t: int, policy: str) -> str:
+FP8_EXACT_A8_FIRST_T = {
+    (10240,2560):8, (6144,2560):13, (12288,2560):5, (512,2560):17,
+    (2560,6144):17, (640,2560):17, (1280,2560):17, (2560,640):9,
+    (320,10240):13, (10240,320):192, (2560,2560):13,
+}
+
+FP8_EXACT_A16_FIRST_T = {
+    (10240,2560):17, (6144,2560):21, (12288,2560):21, (512,2560):29,
+    (2560,6144):37, (640,2560):29, (1280,2560):29, (2560,640):17,
+    (320,10240):45, (10240,320):9, (2560,2560):29,
+}
+
+NVFP4_EXACT_A16_FIRST_T = {
+    (512,2560):256, (640,2560):256, (2560,6144):256,
+    (6144,2560):128, (1280,2560):128, (2560,2560):128,
+    (10240,2560):64, (12288,2560):64, (2560,640):64,
+    (10240,320):64, (248320,2560):64,
+}
+
+
+def fp8_compute_atom(n: int, k: int, t: int, policy: str) -> str | None:
     """Public pure-Linear route; fused Ops have their own measured crossover."""
     if policy not in ('a16','a8'):
         raise ValueError('FP8 bound supports a16 or a8')
-    if policy == 'a16' or n == 248320:
+    if n == 248320:
+        return 'bf16'
+    first_a16 = FP8_EXACT_A16_FIRST_T.get((n,k))
+    if first_a16 is not None:
+        if policy == 'a16':
+            return 'bf16' if t >= first_a16 else None
+        if t >= FP8_EXACT_A8_FIRST_T[(n,k)]:
+            return 'fp8'
+        return 'bf16' if t >= first_a16 else None
+    if policy == 'a16':
         return 'bf16'
     if (n,k)==(34816,5120):
         return 'fp8' if t==1 or t>=5 else 'bf16'
-    threshold={(14336,5120):12,(16384,5120):11,
-               (5120,6144):25,(5120,17408):25}.get((n,k))
+    threshold=FP8_EXACT_A8_FIRST_T.get((n,k), {
+        (14336,5120):12, (16384,5120):11,
+        (5120,6144):25, (5120,17408):25,
+    }.get((n,k)))
     if threshold is None:
         raise ValueError('unregistered FP8 Linear geometry')
     return 'fp8' if t>=threshold else 'bf16'
+
+
+def nvfp4_compute_atom(n: int, k: int, t: int, policy: str) -> str | None:
+    """Arithmetic atom for the newly qualified exact-geometry public route."""
+    first_a16 = NVFP4_EXACT_A16_FIRST_T.get((n,k))
+    if first_a16 is None:
+        return 'nvfp4'
+    if policy == 'a16' or n == 248320:
+        return 'bf16' if t >= first_a16 else None
+    if policy != 'a4':
+        raise ValueError('NVFP4 exact geometry supports a16 or a4')
+    return 'nvfp4' if t >= 33 else None
 
 
 def activation_bytes(n: int, k: int, t: int) -> int:
@@ -508,10 +554,13 @@ def analyze(
     flops = useful_flops(n, k, t)
     ai = flops / bytes_
     t_mem_us = (bytes_ / (SUSTAINED_READ_GB_S * 1e9)) * 1e6
-    if is_ggml:
-        # Exact public-representation bytes give a one-read lower bound. The live scalar codec
-        # family has format-specific decode instructions and may replay weights across T tiles;
-        # neither dense-FP4 peak nor the registered Linear MMA issue rate models that work.
+    atom_name = (fp8_compute_atom(n,k,t,policy) if qtype == 'fp8'
+                 else nvfp4_compute_atom(n,k,t,policy) if qtype == 'nvfp4'
+                 else 'nvfp4')
+    if is_ggml or atom_name is None:
+        # Exact public-representation bytes give a one-read lower bound. GGML codecs and the
+        # newly admitted scalar A16 routes have format-specific CUDA-core work that no registered
+        # Linear MMA issue rate models.
         t_comp_us = None
         atom = None
         count = None
@@ -519,15 +568,19 @@ def analyze(
         floor_us = t_mem_us
         bound = "profile-required"
     else:
-        # FP8 qualification requires its measured instruction roof; never borrow
-        # the calibrated NVFP4 rate for an instruction with a different K extent.
-        if qtype == 'fp8' and (policy not in ('a8','a16') or not mma_per_s or mma_per_s <= 0):
-            raise ValueError('FP8 requires a16/a8 and matching kdev mma calibration (or --mma-per-s)')
+        # FP8 and the exact-geometry NVFP4 A16 route require their measured instruction roof;
+        # never borrow the calibrated dense-FP4 rate for a different MMA atom.
+        measured_atom = qtype == 'fp8' or (qtype == 'nvfp4' and atom_name == 'bf16')
+        if measured_atom and (not mma_per_s or mma_per_s <= 0):
+            raise ValueError(
+                f'{qtype} {policy} requires matching kdev mma calibration (or --mma-per-s)')
         atom = NVFP4_MMA if qtype == "nvfp4" else (BF16_MMA if qtype == "bf16" else S8_MMA)
-        if qtype == 'fp8':
-            atom = (16,8,32) if fp8_compute_atom(n,k,t,policy)=='fp8' else BF16_MMA
+        if atom_name == 'fp8':
+            atom = (16,8,32)
+        elif atom_name == 'bf16':
+            atom = BF16_MMA
         compute_tflops = (mma_per_s * 2 * atom[0]*atom[1]*atom[2] / 1e12
-                          if qtype == 'fp8' else DENSE_FP4_TFLOP_S)
+                          if measured_atom else DENSE_FP4_TFLOP_S)
         t_comp_us = flops / (compute_tflops * 1e6)
         count = mma_count(n, k, t, atom)
         t_issue_us = None
@@ -566,6 +619,9 @@ def analyze(
         next_step = (
             "Profile the exact public GGML Op before choosing a compute-side idea; only "
             "weight-pass reduction is admitted without a codec compute roof."
+            if is_ggml else
+            "Profile the exact public scalar Linear route before choosing a compute-side idea; "
+            "no MMA compute roof applies to this implementation profile."
         )
     elif bound == "DRAM":
         next_step = "Do not write CUDA. Attack bytes or raise T per weight pass (aggregate_T / weight_replay)."
@@ -581,7 +637,7 @@ def analyze(
         measured_pct = 100.0 * floor_us / measured_us
 
     ridge_t = None
-    if not is_ggml:
+    if not is_ggml and atom_name is not None:
         denom = (2 * n * k / (compute_tflops * 1e12)) - (2 * (n + k) / (SUSTAINED_READ_GB_S * 1e9))
         ridge_t = (w_bytes / (SUSTAINED_READ_GB_S * 1e9) / denom) if denom > 0 else None
 
@@ -594,7 +650,8 @@ def analyze(
         "model_bytes": bytes_,
         "useful_flops": flops,
         "ai_flop_per_byte": ai,
-        "ridge_flop_per_byte": None if is_ggml else compute_tflops * 1000 / SUSTAINED_READ_GB_S,
+        "ridge_flop_per_byte": (None if is_ggml or atom_name is None
+                                 else compute_tflops * 1000 / SUSTAINED_READ_GB_S),
         "ridge_t": ridge_t,
         "t_mem_us": t_mem_us,
         "t_comp_us": t_comp_us,
@@ -691,6 +748,20 @@ def _self_test() -> int:
     fp8=analyze(14336,5120,1024,'fp8',policy='a8',mma_per_s=1e10)
     check('fp8-atom',fp8['mma_atom']==dict(m=16,n=8,k=32))
     check('fp8-roof',abs(fp8['t_comp_us']-useful_flops(14336,5120,1024)/81.92e6)<1e-8)
+    fp8_exact=analyze(10240,2560,8,'fp8',policy='a8',mma_per_s=1e10)
+    check('fp8-exact-crossover',fp8_exact['mma_atom']==dict(m=16,n=8,k=32))
+    fp8_scalar=analyze(10240,2560,16,'fp8',policy='a16')
+    check('fp8-a16-scalar-profile',fp8_scalar['bound']=='profile-required')
+    fp8_a16=analyze(10240,2560,17,'fp8',policy='a16',mma_per_s=1e10)
+    check('fp8-a16-crossover',fp8_a16['mma_atom']==dict(m=16,n=8,k=16))
+    nvfp4_a16=analyze(10240,2560,64,'nvfp4',policy='a16',mma_per_s=1e10)
+    check('nvfp4-a16-atom',nvfp4_a16['mma_atom']==dict(m=16,n=8,k=16))
+    check('nvfp4-a16-roof',
+          abs(nvfp4_a16['t_comp_us']-useful_flops(10240,2560,64)/40.96e6)<1e-8)
+    nvfp4_scalar=analyze(512,2560,64,'nvfp4',policy='a16')
+    check('nvfp4-a16-scalar-profile',nvfp4_scalar['bound']=='profile-required')
+    nvfp4_a4=analyze(512,2560,33,'nvfp4',policy='a4')
+    check('nvfp4-a4-atom',nvfp4_a4['mma_atom']==dict(m=16,n=8,k=64))
     d1 = analyze(14336, 5120, 1, "nvfp4")
     check("t1-dram", d1["bound"] == "DRAM", d1["bound"])
     d1024 = analyze(14336, 5120, 1024, "nvfp4")

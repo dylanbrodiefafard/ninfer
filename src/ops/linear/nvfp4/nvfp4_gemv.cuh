@@ -232,31 +232,41 @@ compute_nvfp4_rows(Activation activation, const std::uint8_t* __restrict__ codes
                    int flat_row0, int lane, int token,
                    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
-    constexpr int kPhases         = Geometry::kInputRows / kValuesPerPhase;
+    constexpr int kPhases = (Geometry::kInputRows + kValuesPerPhase - 1) / kValuesPerPhase;
+    constexpr bool kHasTail = (Geometry::kInputRows % kValuesPerPhase) != 0;
     constexpr int kGroupsPerLane =
         Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16;
-    static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
-
 #pragma unroll
     for (int phase = 0; phase < kPhases; ++phase) {
+        const int value_begin = phase * kValuesPerPhase + lane * Schedule::kValuesPerLane;
+        const bool lane_active = !kHasTail || value_begin < Geometry::kInputRows;
         float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
-        Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
+        Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp] = {};
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            // StagedRaw coefficient broadcast uses a full-warp sync mask. Tail-inactive lanes
+            // therefore participate with a harmless in-range scale address, then skip all math.
+            const int coefficient_phase = lane_active ? phase : 0;
+            const int coefficient_lane  = lane_active ? lane : 0;
             load_nvfp4_coefficients<Geometry, Schedule>(
-                scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
-                inverse_weight_divisor, coefficients[local_row]);
-            const std::int64_t code_offset =
-                static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
-                phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
-            row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
-                codes + code_offset);
+                scales, shared, parent_rows[local_row], flat_row0 + local_row,
+                coefficient_phase, coefficient_lane, inverse_weight_divisor,
+                coefficients[local_row]);
+            if (lane_active) {
+                const std::int64_t code_offset =
+                    static_cast<std::int64_t>(parent_rows[local_row]) *
+                        Geometry::kCodeBytesPerRow +
+                    value_begin / 2;
+                row_codes[local_row] =
+                    load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
+                        codes + code_offset);
+            }
         }
 
+        if (!lane_active) { continue; }
 #pragma unroll
         for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
-            const int activation_index =
-                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
+            const int activation_index = value_begin / 2 + pair;
             const float2 activation_value = activation.load_pair(token, activation_index);
             const int group               = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
 #pragma unroll
