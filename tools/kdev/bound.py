@@ -594,7 +594,7 @@ def analyze(
         "model_bytes": bytes_,
         "useful_flops": flops,
         "ai_flop_per_byte": ai,
-        "ridge_flop_per_byte": compute_tflops * 1000 / SUSTAINED_READ_GB_S,
+        "ridge_flop_per_byte": None if is_ggml else compute_tflops * 1000 / SUSTAINED_READ_GB_S,
         "ridge_t": ridge_t,
         "t_mem_us": t_mem_us,
         "t_comp_us": t_comp_us,
