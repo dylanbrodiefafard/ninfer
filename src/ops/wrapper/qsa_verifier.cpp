@@ -5,7 +5,9 @@
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/qsa_verifier.h"
 #include "ops/wrapper/qsa_validation.h"
+#include "ops/common/quantized_projection.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -73,6 +75,10 @@ void require_bf16_weight(const Weight& weight, int rows, const char* name) {
 }
 
 void require_q5_weight(const Weight& weight, int rows, int columns, const char* name) {
+    if (detail::is_native_quantized_projection(weight.qtype)) {
+        detail::validate_native_projection(weight, rows, columns, name);
+        return;
+    }
     const std::uint64_t row_bytes = static_cast<std::uint64_t>(columns / 256) * 176U;
     if (columns % 256 != 0 || weight.qtype != QType::GGML_Q5_K ||
         weight.layout != QuantLayout::GgmlBlockRow || weight.ndim != 2 || weight.n != rows ||
@@ -100,12 +106,24 @@ void validate_weights(const QsaVerifierWeights& weights) {
 
 } // namespace
 
-std::size_t qsa_verifier_workspace_bytes(std::int32_t width) {
+std::size_t qsa_verifier_workspace_bytes(std::int32_t width, QType query_gate,
+                                         QType key, QType value, QType output) {
     if (width <= 0 || width > kQsaMaximumTokens) {
         throw std::invalid_argument("qsa_verifier_workspace_bytes: width must be in [1,4096]");
     }
     WorkspaceLayoutBuilder layout;
     (void)allocate_scratch(layout, width);
+    for (QType type : {query_gate, key, value, output}) {
+        if (type != QType::GGML_Q5_K && !detail::is_native_quantized_projection(type)) {
+            throw std::invalid_argument("qsa_verifier: unsupported projection format");
+        }
+    }
+    const auto bytes = std::max({
+        detail::projection_workspace_bytes(query_gate, 12288, 2560, width),
+        detail::projection_workspace_bytes(key, 512, 2560, width),
+        detail::projection_workspace_bytes(value, 512, 2560, width),
+        detail::projection_workspace_bytes(output, 2560, 6144, width)});
+    if (bytes) { (void)layout.alloc_bytes(bytes); }
     return layout.peak_bytes();
 }
 
@@ -132,7 +150,9 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
     if (visible_ids.ne[0] <= 0 || visible_ids.ne[0] > max_visible) {
         throw std::invalid_argument("qsa_verifier: visible extent must be in [1,4096*width]");
     }
-    if (workspace.bytes() < qsa_verifier_workspace_bytes(width)) {
+    if (workspace.bytes() < qsa_verifier_workspace_bytes(
+            width, weights.core_query_gate.qtype, weights.core_key.qtype,
+            weights.core_value.qtype, weights.output.qtype)) {
         throw std::invalid_argument("qsa_verifier: workspace is too small");
     }
     validate_weights(weights);
@@ -175,9 +195,9 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
     Scratch scratch = allocate_scratch(arena, width);
     detail::qsa_bf16_project_launch(x, weights.index_query, scratch.index_query, stream);
     detail::qsa_bf16_project_launch(x, weights.index_key, scratch.index_key, stream);
-    ggml_block_linear(x, weights.core_query_gate, scratch.raw_query_gate, stream);
-    ggml_block_linear(x, weights.core_key, scratch.raw_key, stream);
-    ggml_block_linear(x, weights.core_value, scratch.raw_value, stream);
+    detail::quantized_projection(x, weights.core_query_gate, scratch.raw_query_gate, arena, stream);
+    detail::quantized_projection(x, weights.core_key, scratch.raw_key, arena, stream);
+    detail::quantized_projection(x, weights.core_value, scratch.raw_value, arena, stream);
     detail::qsa_core_norm_rope_launch(scratch.raw_query_gate, scratch.raw_key, position,
                                       weights.core_query_norm, weights.core_key_norm,
                                       scratch.query, scratch.key, stream);
@@ -194,7 +214,7 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
                            scratch.attention, scratch.attention_workspace, stream);
     detail::qsa_output_gate_launch(scratch.attention, scratch.raw_query_gate, scratch.gated,
                                    stream);
-    ggml_block_linear(scratch.gated, weights.output, out, stream);
+    detail::quantized_projection(scratch.gated, weights.output, out, arena, stream);
 }
 
 } // namespace ninfer::ops

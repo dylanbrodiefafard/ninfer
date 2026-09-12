@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/kernel/ggml_block_linear.cuh"
+#include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/fp8/fp8_a16_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -16,6 +18,136 @@ namespace {
 constexpr int kBlock = 256;
 constexpr int kAggregateTokens = 16;
 constexpr int kGroupedRowBlocks = 32;
+
+template <int InputTokenDivisor>
+__global__ void resident_native_gather_kernel(
+    const __nv_bfloat16* input, const std::int32_t* occurrences,
+    __nv_bfloat16* gathered, int rows, int count) {
+    const int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (pack >= rows / 8 * count) { return; }
+    const int token = pack / (rows / 8);
+    const int column = pack % (rows / 8) * 8;
+    const int input_token = occurrences[token] / InputTokenDivisor;
+    store_vec(gathered + static_cast<std::int64_t>(token) * rows + column,
+              load_vec<uint4>(input + static_cast<std::int64_t>(input_token) * rows + column));
+}
+
+struct ResidentFp8Output {
+    __nv_bfloat16* data;
+    const std::int32_t* occurrences;
+    int rows;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        data[static_cast<std::int64_t>(occurrences[token]) * rows + row] = __float2bfloat16_rn(value);
+    }
+};
+
+template <class Geometry>
+using ResidentFp8Schedule = Fp8A16SmallTMmaSchedule<Geometry::kInputRows == 640 ? 2 : 8, 16, 2>;
+
+template <class Geometry, class Schedule = ResidentFp8Schedule<Geometry>>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
+void resident_fp8_grouped_kernel(
+    const __nv_bfloat16* gathered, const std::uint8_t* codes, const __nv_bfloat16* scales,
+    const std::int32_t* counts, const std::int32_t* offsets,
+    const std::int32_t* occurrences, __nv_bfloat16* output) {
+    const int expert = static_cast<int>(blockIdx.y);
+    const int count = counts[expert];
+    if (count == 0) { return; }
+    const int offset = offsets[expert];
+    codes += static_cast<std::int64_t>(expert) * Geometry::kOutputRows * Geometry::kInputRows;
+    scales += expert * Geometry::kOutputRows;
+    gathered += static_cast<std::int64_t>(offset) * Geometry::kInputRows;
+    occurrences += offset;
+    __shared__ __align__(16) Fp8A16SmallTMmaSharedStorage<Schedule> shared;
+    for (int begin = 0; begin < count; begin += 16) {
+        const int live = min(16, count - begin);
+        fp8_a16_small_t_mma_device<Geometry, 16, Schedule, ResidentFp8Output, true>(
+            gathered + static_cast<std::int64_t>(begin) * Geometry::kInputRows,
+            codes, scales, {output, occurrences + begin, Geometry::kOutputRows},
+            static_cast<int>(blockIdx.x) * Schedule::kRowsPerCta, shared, live);
+        __syncthreads();
+    }
+}
+
+// The logical occurrence mapping is private to sparse MoE; packed arithmetic, scale indexing,
+// short-K handling and the production A16 schedule remain owned by the Linear family.
+template <class Geometry, int InputTokenDivisor>
+struct ResidentNvfp4Activation {
+    const __nv_bfloat16* input;
+    const std::int32_t* occurrences;
+    int live_tokens;
+
+    __device__ __forceinline__ const __nv_bfloat16* values(int token, int column) const {
+        const int slot = occurrences[token < live_tokens ? token : 0];
+        return input + static_cast<std::int64_t>(slot / InputTokenDivisor) *
+                           Geometry::kInputRows + column;
+    }
+
+    __device__ __forceinline__ float2 load_pair(int token, int pair) const {
+        return bf16x2_bits_to_float2(*reinterpret_cast<const std::uint32_t*>(values(token, pair * 2)));
+    }
+};
+
+template <class Geometry, int TileTokens, int InputTokenDivisor,
+          class Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, TileTokens>::Type>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
+void resident_nvfp4_grouped_kernel(
+    const __nv_bfloat16* input, const std::uint8_t* codes, const std::uint8_t* scales,
+    float inverse_divisor, const std::int32_t* counts, const std::int32_t* offsets,
+    const std::int32_t* occurrences, __nv_bfloat16* output) {
+    static_assert(Schedule::kWarpsPerRow == 1);
+    static_assert(Schedule::kTokenTile == TileTokens);
+    const int expert = static_cast<int>(blockIdx.y);
+    const int count = counts[expert];
+    if (count == 0) { return; }
+    codes += static_cast<std::int64_t>(expert) * Geometry::kOutputRows *
+             Geometry::kCodeBytesPerRow;
+    scales += static_cast<std::int64_t>(expert) * Geometry::kOutputRows *
+              Geometry::kGroupsPerRow;
+    occurrences += offsets[expert];
+    __shared__ Nvfp4SmallTSharedStorage<Geometry, TileTokens, Schedule> shared;
+    constexpr int ctas_per_tile = 128 / Schedule::kRowsPerCta;
+    const int row_block = static_cast<int>(blockIdx.x);
+    const int row_tile = row_block / ctas_per_tile;
+    const int row_mod = (row_block % ctas_per_tile) * (Schedule::kRowsPerCta / 4);
+    stage_nvfp4_scales<Geometry, Schedule>(scales, shared.gemv, row_tile, row_mod);
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int flat_row0 = warp * Schedule::kRowsPerWarp;
+    int rows[Schedule::kRowsPerWarp];
+#pragma unroll
+    for (int local = 0; local < Schedule::kRowsPerWarp; ++local) {
+        const int flat = flat_row0 + local;
+        rows[local] = row_tile * 128 + row_mod + flat / 4 + (flat & 3) * 32;
+    }
+    for (int begin = 0; begin < count; begin += TileTokens) {
+        const int live = min(TileTokens, count - begin);
+        ResidentNvfp4Activation<Geometry, InputTokenDivisor> activation{
+            input, occurrences + begin, live};
+        float accumulators[Schedule::kRowsPerWarp][TileTokens][Schedule::kAccumulatorChains]{};
+        compute_nvfp4_small_t_rows<Geometry, TileTokens, Schedule>(
+            activation, codes, scales, shared, inverse_divisor, rows, flat_row0, 0, 0,
+            lane, accumulators);
+#pragma unroll
+        for (int row = 0; row < Schedule::kRowsPerWarp; ++row) {
+#pragma unroll
+            for (int token = 0; token < TileTokens; ++token) {
+                float value = 0.0F;
+#pragma unroll
+                for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+                    value += accumulators[row][token][chain];
+                }
+                value = warp_reduce_sum(value);
+                if (lane == 0 && token < live) {
+                    output[static_cast<std::int64_t>(occurrences[begin + token]) *
+                               Geometry::kOutputRows + rows[row]] = __float2bfloat16_rn(value);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
 
 __global__ void resident_wide_router_logits_kernel(
     const __nv_bfloat16* x, const float* router, const float* shared_gate,
@@ -956,6 +1088,89 @@ void qwen4_sparse_moe_resident_grouped_down_launch(
     launch_resident_grouped_linear<QType::GGML_IQ4_NL, 1>(
         activated, bank, expert_counts, expert_offsets, occurrence_slots, rank_results,
         stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry, int TileTokens, int InputTokenDivisor>
+void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
+                           const Tensor& offsets, const Tensor& occurrences,
+                           Tensor& output, cudaStream_t stream) {
+    using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, TileTokens>::Type;
+    resident_nvfp4_grouped_kernel<Geometry, TileTokens, InputTokenDivisor>
+        <<<dim3(Geometry::kOutputRows / Schedule::kRowsPerCta, kQwen4SparseMoeExperts),
+           Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(input.data),
+            static_cast<const std::uint8_t*>(bank.qdata),
+            static_cast<const std::uint8_t*>(bank.scales), 1.0F / bank.weight_scale_divisor,
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const std::int32_t*>(offsets.data),
+            static_cast<const std::int32_t*>(occurrences.data),
+            static_cast<__nv_bfloat16*>(output.data));
+}
+
+template <class Geometry, int InputTokenDivisor>
+void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
+                           const Tensor& offsets, const Tensor& occurrences,
+                           Tensor& output, cudaStream_t stream) {
+    if (occurrences.ne[0] <= 2 * kQwen4SparseMoeTopK) {
+        launch_resident_nvfp4<Geometry, 2, InputTokenDivisor>(input, bank, counts, offsets,
+                                                            occurrences, output, stream);
+    } else {
+        launch_resident_nvfp4<Geometry, 16, InputTokenDivisor>(input, bank, counts, offsets,
+                                                             occurrences, output, stream);
+    }
+}
+
+template <class Geometry>
+void launch_resident_fp8(const Tensor& gathered, const Weight& bank, const Tensor& counts,
+                         const Tensor& offsets, const Tensor& occurrences, Tensor& output,
+                         cudaStream_t stream) {
+    using Schedule = ResidentFp8Schedule<Geometry>;
+    resident_fp8_grouped_kernel<Geometry>
+        <<<dim3(Geometry::kOutputRows / Schedule::kRowsPerCta, kQwen4SparseMoeExperts),
+           Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(gathered.data),
+            static_cast<const std::uint8_t*>(bank.qdata),
+            static_cast<const __nv_bfloat16*>(bank.scales),
+            static_cast<const std::int32_t*>(counts.data),
+            static_cast<const std::int32_t*>(offsets.data),
+            static_cast<const std::int32_t*>(occurrences.data),
+            static_cast<__nv_bfloat16*>(output.data));
+}
+
+void qwen4_sparse_moe_resident_native_linear_launch(
+    const Tensor& input, const Weight& bank, const Tensor& counts,
+    const Tensor& offsets, const Tensor& occurrences, Tensor& gathered,
+    Tensor& output, bool input_is_ranked, cudaStream_t stream) {
+    if (bank.qtype == QType::NVFP4) {
+        if (input_is_ranked) {
+            launch_resident_nvfp4<Nvfp4N2560K640Geometry, 1>(
+                input, bank, counts, offsets, occurrences, output, stream);
+        } else {
+            launch_resident_nvfp4<Nvfp4N640K2560Geometry, kQwen4SparseMoeTopK>(
+                input, bank, counts, offsets, occurrences, output, stream);
+        }
+    } else if (bank.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        const int packs = bank.k / 8 * occurrences.ne[0];
+        const int blocks = (packs + kBlock - 1) / kBlock;
+        if (input_is_ranked) {
+            resident_native_gather_kernel<1><<<blocks, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input.data),
+                static_cast<const std::int32_t*>(occurrences.data),
+                static_cast<__nv_bfloat16*>(gathered.data), bank.k, occurrences.ne[0]);
+            launch_resident_fp8<Fp8Rows2560K640Geometry>(
+                gathered, bank, counts, offsets, occurrences, output, stream);
+        } else {
+            resident_native_gather_kernel<kQwen4SparseMoeTopK><<<blocks, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input.data),
+                static_cast<const std::int32_t*>(occurrences.data),
+                static_cast<__nv_bfloat16*>(gathered.data), bank.k, occurrences.ne[0]);
+            launch_resident_fp8<Fp8Rows640K2560Geometry>(
+                gathered, bank, counts, offsets, occurrences, output, stream);
+        }
+    } else {
+        throw std::invalid_argument("Qwen4 native grouped linear received unsupported format");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

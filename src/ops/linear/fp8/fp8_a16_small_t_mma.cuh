@@ -18,36 +18,40 @@
 
 namespace ninfer::ops::detail {
 
+template <class Schedule>
+union Fp8A16SmallTMmaSharedStorage {
+    static constexpr int kRowsPerCta = Schedule::kRowsPerCta;
+    static constexpr int kGroupK     = Schedule::kGroupK;
+    static constexpr int kWarps      = Schedule::kKWarps;
+    static constexpr int kTokenMmas  = Schedule::kTileTokens / 8;
+
+    struct {
+        std::uint8_t codes[kRowsPerCta][kGroupK];
+        __nv_bfloat16 activations[kWarps][Schedule::kTileTokens * Schedule::kTileKPerWarp];
+    } staging;
+
+    float partial[kWarps * kTokenMmas * 32 * 4];
+};
+
 template <class Geometry, int ActiveTokens, class Schedule, class Output = Fp8ContiguousOutput,
           bool MaskedColumns = false>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_small_t_mma_kernel(
+__device__ __forceinline__ void fp8_a16_small_t_mma_device(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
-    const __nv_bfloat16* __restrict__ row_scales, Output output, int columns = ActiveTokens) {
+    const __nv_bfloat16* __restrict__ row_scales, Output output, int row0,
+    Fp8A16SmallTMmaSharedStorage<Schedule>& shared, int columns = ActiveTokens) {
     constexpr int kHidden     = Geometry::kInputRows;
     constexpr int kTileK      = Schedule::kTileKPerWarp;
     constexpr int kWarps      = Schedule::kKWarps;
     constexpr int kRowsPerCta = Schedule::kRowsPerCta;
     constexpr int kGroupK     = Schedule::kGroupK;
-    constexpr int kGroups     = kHidden / kGroupK;
+    constexpr int kGroups     = (kHidden + kGroupK - 1) / kGroupK;
     constexpr int kTileTokens = Schedule::kTileTokens;
     constexpr int kTokenMmas  = kTileTokens / 8;
-    static_assert((kHidden % kGroupK) == 0);
     static_assert((Geometry::kOutputRows % kRowsPerCta) == 0);
     static_assert(ActiveTokens >= 1 && ActiveTokens <= kTileTokens);
     static_assert((kWarps & 1) == 0);
     constexpr unsigned kMask = 0xffffffffU;
 
-    union SharedStorage {
-        struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
-        } staging;
-
-        float partial[kWarps * kTokenMmas * 32 * 4];
-    };
-
-    __shared__ __align__(16) SharedStorage shared;
     auto& code_shared = shared.staging.codes;
     auto& x_shared    = shared.staging.activations;
 
@@ -56,7 +60,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
     const int lane         = tid & 31;
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
-    const int row0         = static_cast<int>(blockIdx.x) * kRowsPerCta;
     const int live_columns = MaskedColumns ? columns : ActiveTokens;
 
     const auto stage_activation = [&](int group_k0) {
@@ -71,17 +74,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
             const int k8    = item - token * (kTileK / 8);
             auto* destination =
                 &x_shared[warp][token * kTileK + fp8_a16_shared_col_64(token, k8 * 8)];
-            if constexpr (!MaskedColumns && (!kPadded || ActiveTokens == kTileTokens)) {
+            const int column = group_k0 + warp * kTileK + k8 * 8;
+            if constexpr (!MaskedColumns && (!kPadded || ActiveTokens == kTileTokens) &&
+                          (kHidden % kGroupK) == 0) {
                 cp_async<16, kActivationCache>(destination,
                                                x + static_cast<std::int64_t>(token) * kHidden +
                                                    group_k0 + warp * kTileK + k8 * 8);
             } else {
-                const int source_token = token < live_columns ? token : 0;
+                const bool valid       = token < live_columns && column < kHidden;
+                const int source_token = valid ? token : 0;
+                const int source_col   = valid ? column : 0;
                 cp_async_zfill<16, kActivationCache>(
-                    destination,
-                    x + static_cast<std::int64_t>(source_token) * kHidden + group_k0 +
-                        warp * kTileK + k8 * 8,
-                    token < live_columns ? 16 : 0);
+                    destination, x + static_cast<std::int64_t>(source_token) * kHidden + source_col,
+                    valid ? 16 : 0);
             }
         }
     };
@@ -94,10 +99,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
             const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
             for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
-                cp_async<16, kWeightCache>(&code_shared[row][swizzled_chunk * 16],
-                                           weight_codes +
-                                               static_cast<std::int64_t>(row0 + row) * kHidden +
-                                               group_k0 + chunk * 16);
+                const int column         = group_k0 + chunk * 16;
+                if constexpr ((kHidden % kGroupK) == 0) {
+                    cp_async<16, kWeightCache>(
+                        &code_shared[row][swizzled_chunk * 16],
+                        weight_codes + static_cast<std::int64_t>(row0 + row) * kHidden + column);
+                } else {
+                    const bool valid = column < kHidden;
+                    cp_async_zfill<16, kWeightCache>(
+                        &code_shared[row][swizzled_chunk * 16],
+                        weight_codes + static_cast<std::int64_t>(row0 + row) * kHidden +
+                            (valid ? column : 0),
+                        valid ? 16 : 0);
+                }
             }
         }
     };
@@ -221,6 +235,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sm
             }
         }
     }
+}
+
+template <class Geometry, int ActiveTokens, class Schedule, class Output = Fp8ContiguousOutput,
+          bool MaskedColumns = false>
+__global__
+__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_small_t_mma_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
+    const __nv_bfloat16* __restrict__ row_scales, Output output, int columns = ActiveTokens) {
+    __shared__ __align__(16) Fp8A16SmallTMmaSharedStorage<Schedule> shared;
+    fp8_a16_small_t_mma_device<Geometry, ActiveTokens, Schedule, Output, MaskedColumns>(
+        x, weight_codes, row_scales, output,
+        static_cast<int>(blockIdx.x) * Schedule::kRowsPerCta, shared, columns);
 }
 
 } // namespace ninfer::ops::detail

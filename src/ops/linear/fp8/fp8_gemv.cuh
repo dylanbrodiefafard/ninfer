@@ -99,11 +99,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const __nv_bfloat16* __restrict__ row_scales, Output output, RowPolicy row_policy = {},
     Epilogue epilogue = {}) {
     constexpr int kValuesPerPhase = kWarpSize * Schedule::kValuesPerLane;
-    static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
     static_assert(!PairRows || (Schedule::kRowsPerWarp % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kRowsPerCta / 2)) == 0);
-    constexpr int kPhases = Geometry::kInputRows / kValuesPerPhase;
+    constexpr int kPhases =
+        (Geometry::kInputRows + kValuesPerPhase - 1) / kValuesPerPhase;
     constexpr int kStoredRowsPerWarp =
         PairRows ? Schedule::kRowsPerWarp / 2 : Schedule::kRowsPerWarp;
     constexpr int kStoredRowsPerCta = Schedule::kWarpsPerCta * kStoredRowsPerWarp;
@@ -118,7 +118,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 #pragma unroll Schedule::kPhaseUnroll
     for (int phase = 0; phase < kPhases; ++phase) {
         const int value_begin = phase * kValuesPerPhase + lane * Schedule::kValuesPerLane;
-        Fp8CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
+        Fp8CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp] = {};
+        if (value_begin >= Geometry::kInputRows) { continue; }
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
             const int weight_row = row_policy.weight_row(row_begin, local_row);

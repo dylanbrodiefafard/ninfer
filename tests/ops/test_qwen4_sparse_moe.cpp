@@ -2,6 +2,7 @@
 
 #include "ops/ggml_iq_oracle.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
 
@@ -1419,7 +1420,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
             small_resident_width * kHidden * sizeof(std::uint16_t));
         DeviceArena small_resident_workspace(
             ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(
-                small_resident_width));
+                resident_weights, small_resident_width));
         Tensor small_resident_x_tensor(small_resident_x.p, DType::BF16,
                                        {kHidden, small_resident_width});
         Tensor small_resident_ids_tensor(small_resident_ids.data(), DType::I32,
@@ -1553,7 +1554,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
         GuardedDeviceBuffer resident_panel_second_output(
             static_cast<std::size_t>(resident_width) * kHidden * sizeof(std::uint16_t));
         DeviceArena resident_panel_workspace(
-            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_width));
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_weights, resident_width));
         Tensor resident_panel_x(resident_panel_device.p, DType::BF16,
                                 {kHidden, resident_width});
         Tensor resident_panel_ids_tensor(resident_panel_ids.data(), DType::I32,
@@ -1619,7 +1620,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
             "Qwen4 resident grouped back-to-back output");
 
         DeviceArena short_resident_panel_workspace(
-            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_width) - 1);
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_weights, resident_width) - 1);
         failures += expect_invalid(
             [&] {
                 ops::qwen4_sparse_moe_resident(
@@ -1652,7 +1653,7 @@ int run_case(QType routed_qtype, QType shared_qtype, RouteFixture route_fixture,
             GuardedDeviceBuffer maximum_output(
                 static_cast<std::size_t>(maximum_width) * kHidden * sizeof(std::uint16_t));
             DeviceArena maximum_workspace(
-                ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(maximum_width));
+                ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_weights, maximum_width));
             Tensor maximum_x_tensor(maximum_x.p, DType::BF16,
                                     {kHidden, maximum_width});
             Tensor maximum_ids_tensor(maximum_ids.data(), DType::I32,
@@ -2328,6 +2329,248 @@ int prefill_partition_and_slot_reuse_case() {
     return failures;
 }
 
+quantized_weight::PackedWeight native_matrix(QType qtype, int rows, int columns,
+                                             std::uint32_t seed, bool decorrelated = false) {
+    quantized_weight::PatternedWeightOptions options;
+    if (qtype == QType::NVFP4) {
+        options.weight_scale_divisor = 64.0F;
+        options.input_scale_divisor = 3.5F;
+    }
+    auto result = quantized_weight::make_patterned_weight(qtype, rows, columns, seed, options);
+    if (decorrelated) {
+        // Keep the stored scales, but break the periodic factory's correlated cancellation.
+        for (std::size_t i = 0; i < result.code_plane_bytes; ++i) {
+            auto code = static_cast<std::uint8_t>(quantized_weight::detail::mix64(
+                (static_cast<std::uint64_t>(seed) << 32) ^ i) >> 56);
+            if (qtype == QType::FP8_E4M3FN_ROW_BF16S && (code & 0x7fU) == 0x7fU) {
+                code = static_cast<std::uint8_t>((code & 0x80U) | 0x7eU);
+            }
+            result.payload[i] = code;
+        }
+    }
+    return result;
+}
+
+struct NativeBankFixture {
+    std::vector<quantized_weight::PackedWeight> matrices;
+    DeviceBuffer device;
+    Weight weight;
+
+    NativeBankFixture(QType qtype, int rows, int columns, std::span<const int> experts,
+                       std::uint32_t seed, bool decorrelated) {
+        for (int expert : experts) {
+            matrices.push_back(native_matrix(qtype, rows, columns, seed + expert * 13U,
+                                             decorrelated));
+        }
+        const auto& first = matrices.front();
+        const std::size_t codes = first.code_plane_bytes * kExperts;
+        const std::size_t scales = first.scale_plane_bytes * kExperts;
+        device = DeviceBuffer(codes + scales + (qtype == QType::NVFP4 ? sizeof(float) : 0));
+        cuda_check(cudaMemset(device.p, 0, device.bytes), "native expert bank clear");
+        for (std::size_t index = 0; index < experts.size(); ++index) {
+            const auto& matrix = matrices[index];
+            const int expert = experts[index];
+            device.copy_from_host(matrix.payload.data(), matrix.code_plane_bytes,
+                                   expert * matrix.code_plane_bytes);
+            device.copy_from_host(matrix.payload.data() + matrix.scale_plane_offset,
+                                   matrix.scale_plane_bytes,
+                                   codes + expert * matrix.scale_plane_bytes);
+        }
+        weight = first.device_weight(device.p);
+        weight.payload_bytes = device.bytes;
+        weight.scales = static_cast<std::byte*>(device.p) + codes;
+        weight.ndim = 3;
+        weight.shape[0] = weight.padded_shape[0] = kExperts;
+        weight.shape[1] = weight.padded_shape[1] = rows;
+        weight.shape[2] = weight.padded_shape[2] = columns;
+        if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+            weight.scale_ne[0] = kExperts * rows;
+            weight.scale_nb[1] = weight.scale_nb[2] = weight.scale_nb[3] =
+                static_cast<std::int64_t>(kExperts) * rows * sizeof(std::uint16_t);
+        } else {
+            device.copy_from_host(&weight.weight_scale_divisor, sizeof(float), codes + scales);
+        }
+    }
+};
+
+std::vector<double> native_projection_oracle(const quantized_weight::PackedWeight& weight,
+                                             std::span<const double> input) {
+    std::vector<double> out(weight.weight.n);
+    for (int row = 0; row < weight.weight.n; ++row) {
+        double value = 0;
+        for (int column = 0; column < weight.weight.k; ++column) {
+            value += quantized_weight::logical_weight_fp64(weight, row, column) * input[column];
+        }
+        out[row] = value;
+    }
+    return out;
+}
+
+std::vector<double> native_expert_oracle(const quantized_weight::PackedWeight& gate,
+                                         const quantized_weight::PackedWeight& up,
+                                         const quantized_weight::PackedWeight& down,
+                                         std::span<const double> input) {
+    auto activation = native_projection_oracle(gate, input);
+    const auto projected_up = native_projection_oracle(up, input);
+    for (int row = 0; row < kIntermediate; ++row) {
+        activation[row] = silu(activation[row]) * projected_up[row];
+    }
+    return native_projection_oracle(down, activation);
+}
+
+int native_resident_case(QType gate_format, QType up_format, QType down_format,
+                          cudaStream_t stream, bool decorrelated = false) {
+    // Selected experts span both bank edges and distinct scale tiles. Unselected banks are zero,
+    // so a wrong device-selected offset cannot accidentally reproduce the represented oracle.
+    constexpr std::array<int, kTopK> experts{0, 1, 31, 63, 127, 255, 319, 383, 510, 511};
+    NativeBankFixture gate(gate_format, kIntermediate, kHidden, experts, 73U, decorrelated);
+    NativeBankFixture up(up_format, kIntermediate, kHidden, experts, 151U, decorrelated);
+    NativeBankFixture down(down_format, kHidden, kIntermediate, experts, 219U, decorrelated);
+    auto shared_gate = native_matrix(up_format, kIntermediate, kHidden, 397U, decorrelated);
+    auto shared_up = native_matrix(gate_format, kIntermediate, kHidden, 401U, decorrelated);
+    auto shared_down = native_matrix(down_format, kHidden, kIntermediate, 419U, decorrelated);
+    DeviceBuffer shared_gate_device = to_device(shared_gate.payload);
+    DeviceBuffer shared_up_device = to_device(shared_up.payload);
+    DeviceBuffer shared_down_device = to_device(shared_down.payload);
+    std::vector<float> router(static_cast<std::size_t>(kExperts) * kHidden, 0.0F);
+    for (int rank = 0; rank < kTopK; ++rank) {
+        router[static_cast<std::size_t>(experts[rank]) * kHidden] = 4.0F + rank * 0.125F;
+        router[static_cast<std::size_t>(experts[rank]) * kHidden + 1] =
+            (rank & 1) == 0 ? 0.25F : -0.25F;
+    }
+    DeviceBuffer router_device = to_device(router);
+    std::vector<float> shared_selector(kHidden, 0.0F);
+    shared_selector[0] = -0.75F;
+    shared_selector[1] = 0.125F;
+    DeviceBuffer selector_device = to_device(shared_selector);
+    ops::Qwen4ResidentSparseMoeWeights weights{
+        make_router(router_device.p), gate.weight, up.weight, down.weight,
+        Tensor(selector_device.p, DType::FP32, {kHidden}),
+        shared_gate.device_weight(shared_gate_device.p), shared_up.device_weight(shared_up_device.p),
+        shared_down.device_weight(shared_down_device.p)};
+
+    constexpr int patterns = 2;
+    std::array<std::vector<float>, patterns> inputs;
+    std::array<OracleRoute, patterns> routes;
+    std::array<std::vector<double>, patterns> reference;
+    for (int pattern = 0; pattern < patterns; ++pattern) {
+        inputs[pattern].resize(kHidden);
+        for (int column = 0; column < kHidden; ++column) {
+            inputs[pattern][column] = ((column * 17 + pattern * 23) % 47 - 23) / 2048.0F;
+        }
+        inputs[pattern][0] = 1.0F;
+        inputs[pattern][1] = pattern == 0 ? -0.5F : 0.75F;
+        if (decorrelated) {
+            inputs[pattern][2] = 0.5F;
+            inputs[pattern][257] = -0.25F;
+        }
+        round_to_bf16(inputs[pattern]);
+        const std::vector<double> represented(inputs[pattern].begin(), inputs[pattern].end());
+        routes[pattern] = route_oracle(router, represented);
+        reference[pattern].assign(kHidden, 0.0);
+        for (int rank = 0; rank < kTopK; ++rank) {
+            const auto found = std::find(experts.begin(), experts.end(), routes[pattern].ids[rank]);
+            if (found == experts.end()) { throw std::logic_error("native fixture route"); }
+            const auto index = static_cast<std::size_t>(found - experts.begin());
+            const auto expert = native_expert_oracle(gate.matrices[index], up.matrices[index],
+                                                      down.matrices[index], represented);
+            for (int row = 0; row < kHidden; ++row) {
+                reference[pattern][row] += routes[pattern].weights[rank] * expert[row];
+            }
+        }
+        const auto shared = native_expert_oracle(shared_gate, shared_up, shared_down, represented);
+        const double selector = sigmoid(-0.75 * represented[0] + 0.125 * represented[1]);
+        for (int row = 0; row < kHidden; ++row) {
+            reference[pattern][row] += selector * shared[row];
+        }
+    }
+
+    int failures = 0;
+    for (int width : {1, 2, 3, 16, 17, 512, 4096}) {
+        std::vector<float> panel(static_cast<std::size_t>(width) * kHidden);
+        for (int token = 0; token < width; ++token) {
+            std::copy(inputs[token % patterns].begin(), inputs[token % patterns].end(),
+                       panel.begin() + static_cast<std::size_t>(token) * kHidden);
+        }
+        DeviceBuffer input_device = to_device_bf16(panel);
+        GuardedDeviceBuffer ids_device(static_cast<std::size_t>(width) * kTopK * sizeof(int));
+        GuardedDeviceBuffer probabilities_device(static_cast<std::size_t>(width) * kTopK * sizeof(float));
+        GuardedDeviceBuffer output_device(static_cast<std::size_t>(width) * kHidden * sizeof(std::uint16_t));
+        DeviceArena workspace(ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights, width));
+        Tensor x(input_device.p, DType::BF16, {kHidden, width});
+        Tensor ids(ids_device.data(), DType::I32, {kTopK, width});
+        Tensor probabilities(probabilities_device.data(), DType::FP32, {kTopK, width});
+        Tensor output(output_device.data(), DType::BF16, {kHidden, width});
+        ops::qwen4_sparse_moe_resident(x, weights, ids, probabilities, output, workspace, stream);
+        cuda_synchronize(stream);
+        const auto actual_ids = from_device<int>(ids.data, static_cast<std::size_t>(width) * kTopK);
+        const auto actual_weights = from_device<float>(probabilities.data, static_cast<std::size_t>(width) * kTopK);
+        const auto actual = from_device_bf16(output.data, static_cast<std::size_t>(width) * kHidden);
+        for (int token = 0; token < width; ++token) {
+            const int pattern = token % patterns;
+            const auto format_name = [](QType type) {
+                return type == QType::NVFP4 ? "nvfp4" : "fp8";
+            };
+            const std::string label = std::string("Qwen4 native resident ") +
+                format_name(gate_format) + "/" + format_name(up_format) + "/" +
+                format_name(down_format) + (decorrelated ? " decorrelated" : " periodic") +
+                " T=" + std::to_string(width);
+            const auto ids_begin = actual_ids.begin() + static_cast<std::size_t>(token) * kTopK;
+            failures += verify_exact((label + " ids").c_str(),
+                std::vector<int>(ids_begin, ids_begin + kTopK),
+                std::vector<int>(routes[pattern].ids.begin(), routes[pattern].ids.end()));
+            std::vector<double> actual_route(kTopK);
+            for (int rank = 0; rank < kTopK; ++rank) {
+                actual_route[rank] = actual_weights[static_cast<std::size_t>(token) * kTopK + rank];
+            }
+            failures += verify_pointwise(label + " probabilities", actual_route,
+                                          routes[pattern].weights, kRouteWeightCriterion);
+            const auto actual_token = std::span<const double>(actual).subspan(
+                static_cast<std::size_t>(token) * kHidden, kHidden);
+            if (!decorrelated && gate_format == QType::NVFP4 &&
+                up_format == QType::NVFP4 && down_format == QType::NVFP4) {
+                // Retain the original ill-conditioned witness (ideal RMS < 1e-8).
+                // BF16 activation rounding dominates its near-zero output; this case
+                // claims only finite absolute accuracy at the existing gross-error floor.
+                for (int row = 0; row < kHidden; ++row) {
+                    if (!std::isfinite(actual_token[row]) ||
+                        std::abs(actual_token[row] - reference[pattern][row]) >
+                            kOutputCriterion.gross_absolute) {
+                        std::cerr << label << " near-zero absolute witness failed\n";
+                        ++failures;
+                        break;
+                    }
+                }
+            } else {
+                failures += verify_reduction(label + " complete represented FP64 formula",
+                    actual_token, reference[pattern], kOutputCriterion);
+            }
+        }
+        failures += ids_device.verify_guards("native resident ids");
+        failures += probabilities_device.verify_guards("native resident probabilities");
+        failures += output_device.verify_guards("native resident output");
+        if (width == 17) {
+            DeviceArena short_workspace(
+                ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights, width) - 1);
+            failures += expect_invalid([&] {
+                ops::qwen4_sparse_moe_resident(x, weights, ids, probabilities, output,
+                                               short_workspace, stream);
+            }, "native resident insufficient caller workspace");
+        }
+    }
+    auto invalid_profile = weights;
+    --invalid_profile.routed_down.k;
+    failures += expect_invalid([&] {
+        (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(invalid_profile, 17);
+    }, "native resident query rejects invalid shape profile");
+    invalid_profile = weights;
+    invalid_profile.routed_up.qtype = QType::FP32_CTRL;
+    failures += expect_invalid([&] {
+        (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(invalid_profile, 17);
+    }, "native resident query rejects invalid format profile");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2351,10 +2594,10 @@ int main() {
             [] { (void)ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4097); },
             "excessive prefill width");
         failures += expect_invalid(
-            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(0); },
+            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes({}, 0); },
             "zero resident width");
         failures += expect_invalid(
-            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(4097); },
+            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes({}, 4097); },
             "excessive resident width");
         if (ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4096) == 0) {
             throw std::runtime_error("Qwen4 sparse MoE maximum prefill workspace is empty");
@@ -2373,6 +2616,18 @@ int main() {
         failures += run_case(QType::GGML_IQ1_S, QType::GGML_Q5_K,
                              RouteFixture::Underflow, 0.0F, pipeline_events, stream);
         failures += prefill_partition_and_slot_reuse_case();
+        failures += native_resident_case(QType::NVFP4, QType::NVFP4, QType::NVFP4, stream);
+        failures += native_resident_case(QType::FP8_E4M3FN_ROW_BF16S,
+                                         QType::FP8_E4M3FN_ROW_BF16S,
+                                         QType::FP8_E4M3FN_ROW_BF16S, stream);
+        failures += native_resident_case(QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S,
+                                         QType::NVFP4, stream);
+        failures += native_resident_case(QType::NVFP4, QType::NVFP4, QType::NVFP4, stream, true);
+        failures += native_resident_case(QType::FP8_E4M3FN_ROW_BF16S,
+                                         QType::FP8_E4M3FN_ROW_BF16S,
+                                         QType::FP8_E4M3FN_ROW_BF16S, stream, true);
+        failures += native_resident_case(QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S,
+                                         QType::NVFP4, stream, true);
         cuda_check(cudaStreamSynchronize(pipeline_events.transfer_stream),
                    "cudaStreamSynchronize transfer");
         cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");

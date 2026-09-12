@@ -64,7 +64,13 @@ enum class LinearPolicy : std::uint8_t {
  * internally; a valid encoding and alignment do not imply arbitrary N/K support. The current
  * NVFP4 problems `[N,K]` in `{[14336,5120], [16384,5120], [34816,5120],
  * [5120,6144], [5120,17408], [5120,25600], [6144,5120], [5120,4096],
- * [1280,5120], [256,5120], [5120,10240]}` accept every positive T. The five
+ * [1280,5120], [256,5120], [5120,10240]}` accept every positive T.
+ * Both NVFP4 and FP8 additionally admit the Qwen4 projection geometries
+ * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144],
+ * [640,2560], [1280,2560], [2560,640], [10240,320], [2560,2560], [248320,2560]}`.
+ * FP8 additionally admits `[320,10240]`; that shape is not a legal NVFP4 block-scale layout.
+ * These are exact geometry qualifications, not a promise of arbitrary future checkpoint support.
+ * The five
  * DFlash2-only geometries are A16-only; AllowA4 still resolves them to A16.
  * MTP `fc` `[5120,10240]` admits W4A4 at T≥8 (residual-class N; T=4/6 stay A16). Text and MTP packed-weight problems accept
  * every positive column extent T. Registered W8 problems `[5120,25600]`, `[5120,4096]`,

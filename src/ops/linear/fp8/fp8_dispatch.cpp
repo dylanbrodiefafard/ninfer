@@ -26,7 +26,7 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     if (policy == LinearPolicy::A16Only) { return Fp8LinearRoute::A16; }
     // A permissive policy does not require a lower-precision route. Vocabulary logits retain
     // BF16 activation compute for every policy, matching the existing Q6/W8 output heads.
-    if (problem == Fp8Problem::Vocabulary &&
+    if (is_fp8_vocabulary_problem(problem) &&
         (policy == LinearPolicy::AllowA8 || policy == LinearPolicy::AllowA4)) {
         return Fp8LinearRoute::A16;
     }
@@ -46,18 +46,39 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
         return tokens >= 25 ? Fp8LinearRoute::A8 : Fp8LinearRoute::A16;
+    case Fp8Problem::Rows10240K2560:
+    case Fp8Problem::Rows6144K2560:
+    case Fp8Problem::Rows12288K2560:
+    case Fp8Problem::Rows512K2560:
+    case Fp8Problem::Rows2560K6144:
+    case Fp8Problem::Rows640K2560:
+    case Fp8Problem::Rows1280K2560:
+    case Fp8Problem::Rows2560K640:
+    case Fp8Problem::Rows320K10240:
+    case Fp8Problem::Rows10240K320:
+    case Fp8Problem::Rows2560K2560:
+        return tokens >= fp8_exact_a8_first_t(problem) ? Fp8LinearRoute::A8
+                                                        : Fp8LinearRoute::A16;
+    case Fp8Problem::Vocabulary2560:
+        return Fp8LinearRoute::A16;
     }
     throw std::logic_error("unreachable FP8 linear problem");
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
-    if (problem == Fp8Problem::Vocabulary && x.ne[1] >= kFp8VocabularyFirstA16GemmT) {
+    if (is_fp8_vocabulary_problem(problem) && x.ne[1] >= kFp8VocabularyFirstA16GemmT) {
         launch_fp8_vocabulary_a16_gemm(x, weight, out, stream);
         return;
     }
-    const std::int32_t chunk = problem == Fp8Problem::Vocabulary ? kFp8VocabularyLastA16SmallTMmaT
-                                                                 : fp8_linear_small_t_max(problem);
+    if (is_fp8_exact_geometry_problem(problem) &&
+        x.ne[1] >= fp8_exact_a16_gemm_first_t(problem)) {
+        launch_fp8_exact_geometry_a16_gemm(x, weight, out, stream);
+        return;
+    }
+    const std::int32_t chunk = is_fp8_vocabulary_problem(problem)
+                                   ? kFp8VocabularyLastA16SmallTMmaT
+                                   : fp8_linear_small_t_max(problem);
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += chunk) {
         const std::int32_t active = std::min(chunk, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
@@ -66,7 +87,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
-        if (problem == Fp8Problem::Vocabulary) {
+        if (is_fp8_vocabulary_problem(problem)) {
             launch_fp8_vocabulary_a16_small_t(input_chunk, weight, output_chunk, stream);
         } else if (active == 1) {
             launch_fp8_decode(input_chunk, weight, output_chunk, stream);
@@ -91,6 +112,20 @@ bool interval_uses_a8(Fp8Problem problem, LinearPolicy policy, std::int32_t min_
     case Fp8Problem::Residual6144:
     case Fp8Problem::Residual17408:
         return max_tokens >= 25;
+    case Fp8Problem::Rows10240K2560:
+    case Fp8Problem::Rows6144K2560:
+    case Fp8Problem::Rows12288K2560:
+    case Fp8Problem::Rows512K2560:
+    case Fp8Problem::Rows2560K6144:
+    case Fp8Problem::Rows640K2560:
+    case Fp8Problem::Rows1280K2560:
+    case Fp8Problem::Rows2560K640:
+    case Fp8Problem::Rows320K10240:
+    case Fp8Problem::Rows10240K320:
+    case Fp8Problem::Rows2560K2560:
+        return max_tokens >= fp8_exact_a8_first_t(problem);
+    case Fp8Problem::Vocabulary2560:
+        return false;
     }
     throw std::logic_error("unreachable FP8 linear problem");
 }

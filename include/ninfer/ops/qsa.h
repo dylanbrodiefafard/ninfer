@@ -92,18 +92,23 @@ void qsa_selected_attention(const Tensor& q, const Tensor& selected_ids,
 struct QsaVerifierWeights {
     Weight index_query; // contiguous BF16_CTRL [512,2560]
     Weight index_key;   // contiguous BF16_CTRL [128,2560]
-    Weight core_query_gate; // GGML Q5_K [12288,2560], per-head query then gate
-    Weight core_key;        // GGML Q5_K [512,2560]
-    Weight core_value;      // GGML Q5_K [512,2560]
-    Weight output;          // GGML Q5_K [2560,6144]
+    Weight core_query_gate; // Q5_K/NVFP4/row-scaled FP8 [12288,2560], per-head query then gate
+    Weight core_key;        // Q5_K/NVFP4/row-scaled FP8 [512,2560]
+    Weight core_value;      // Q5_K/NVFP4/row-scaled FP8 [512,2560]
+    Weight output;          // Q5_K/NVFP4/row-scaled FP8 [2560,6144]
     Tensor index_query_norm; // converted GGUF FP32 gamma [128]
     Tensor index_key_norm;   // converted GGUF FP32 gamma [128]
     Tensor core_query_norm;  // converted GGUF FP32 gamma [256]
     Tensor core_key_norm;    // converted GGUF FP32 gamma [256]
 };
 
-/** Fixed transient device capacity for qsa_verifier at width W in [1,4096]. */
-[[nodiscard]] std::size_t qsa_verifier_workspace_bytes(std::int32_t width);
+/** Transient capacity at width W in [1,4096] and explicit core projection formats.
+ * Defaults describe the GGUF verifier; each core projection also admits NVFP4 or row-scaled FP8,
+ * using Linear A16Only. Index projections remain BF16 and state remains NVFP4-G16. */
+[[nodiscard]] std::size_t qsa_verifier_workspace_bytes(
+    std::int32_t width, QType query_gate = QType::GGML_Q5_K,
+    QType key = QType::GGML_Q5_K, QType value = QType::GGML_Q5_K,
+    QType output = QType::GGML_Q5_K);
 
 /**
  * Actual-artifact C=1 QSA verifier composite for W in [1,4096]. x/out are BF16 [2560,W],
@@ -117,7 +122,7 @@ struct QsaVerifierWeights {
  * normalized/rotated K, projected V, raw index key, and position at token_id, selects visible-rank
  * blocks, and evaluates selected attention through the NVFP4-G16 state. Each 256-wide attention
  * head is multiplied by sigmoid of its represented raw gate, concatenated, and projected by the
- * Q5_K output weight. Newly appended values are always consumed through the cache codec.
+ * output weight. Newly appended values are always consumed through the cache codec.
  *
  * This verifier entry owns no frontier, visibility construction, commit, or rollback. All storage
  * is caller-owned, non-overlapping except for no permitted aliases, and remains alive through the

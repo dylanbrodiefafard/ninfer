@@ -105,9 +105,12 @@ cmake --build build --parallel --target ninfer_qwen4_prefill_gate_up_swiglu_benc
 `ninfer_qwen4_sparse_moe_resident_bench` is the exact H2560/E512/top10/I640 public-Op
 placement and width A/B. It uses complete IQ1_S or IQ2_XXS gate/up banks, the complete IQ4_NL down
 bank, and all three real shared-format combinations: IQ1_S/Q5_K, IQ2_XXS/Q5_K, and the layer-2
-IQ2_XXS/Q6_K pair. `scalar_repeat` invokes the accepted T=1 public Op T times. `resident` invokes
+IQ2_XXS/Q6_K pair, plus complete synthetic NVFP4 and row-scaled FP8 bank profiles. Use
+`--format nvfp4|fp8|iq1_s|iq2_xxs` to select a format. Native profiles preserve A16 activation
+arithmetic and do not stand in for checkpoint quality evidence. `scalar_repeat` invokes the
+accepted T=1 public Op T times. `resident` invokes
 one `[2560,T]` public Op, dynamically indexes complete device banks from GPU route ids, and performs
-no copy or host synchronization inside the Op. `fixed_hot` selects the same ten experts across the
+no host transfer or synchronization inside the Op. `fixed_hot` selects the same ten experts across the
 panel; at T>=52, `rotating` cycles 52 windows covering all 512 experts. At those widths it is the
 full-bank-reuse profile rather than an L2-only hot-set result.
 
@@ -116,6 +119,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
 cmake --build build --parallel --target ninfer_qwen4_sparse_moe_resident_bench
 ./build/bench/ninfer_qwen4_sparse_moe_resident_bench --width 512 --iterations 5
 ./build/bench/ninfer_qwen4_sparse_moe_resident_bench --width 4096 --iterations 3
+./build/bench/ninfer_qwen4_sparse_moe_resident_bench --format nvfp4 --width 512 --iterations 5
 ```
 
 The benchmark reports synchronous host wall time, compute-stream critical path, input tokens per

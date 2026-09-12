@@ -1,5 +1,6 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
+#include "ops/native_projection_fixture.h"
 
 #include <cuda_fp8.h>
 
@@ -110,20 +111,27 @@ struct Bf16MatrixFixture {
 };
 
 struct Q5MatrixFixture {
+    QType type;
+    quantized_weight::PackedWeight native;
     static constexpr int kBlockValues = 256;
     static constexpr int kBlockBytes  = 176;
 
-    Q5MatrixFixture(int rows, int columns)
-        : rows(rows), columns(columns), row_bytes((columns / kBlockValues) * kBlockBytes),
+    Q5MatrixFixture(int rows, int columns, QType format = QType::GGML_Q5_K)
+        : type(format), rows(rows), columns(columns), row_bytes((columns / kBlockValues) * kBlockBytes),
           bytes(static_cast<std::size_t>(rows) * row_bytes, 0), device(bytes.size()) {
         if (columns % kBlockValues != 0) {
             throw std::invalid_argument("Q5 test matrix columns must be block aligned");
+        }
+        if (native_projection_format(type)) {
+            native = native_sparse_fixture(type, rows, columns);
+            device = DeviceBuffer(native.payload.size());
         }
     }
 
     // Direct Q5_K hand encoding for a represented value of +1: d=1, dmin=0, the selected
     // 32-value group has scale=1, low code=1, and all high code bits are zero.
     void set_unit(int row, int column) {
+        if (native_projection_format(type)) { native_sparse_set(native, row, column, 1.0F); return; }
         auto* block = bytes.data() + static_cast<std::size_t>(row) * row_bytes +
                       static_cast<std::size_t>(column / kBlockValues) * kBlockBytes;
         block[0] = 0x00U;
@@ -141,6 +149,10 @@ struct Q5MatrixFixture {
     }
 
     Weight finish() {
+        if (native_projection_format(type)) {
+            device.copy_from_host(native.payload.data(), native.payload.size());
+            return native.device_weight(device.p);
+        }
         device.copy_from_host(bytes.data(), device.bytes);
         Weight weight{};
         weight.payload         = device.p;
@@ -961,7 +973,7 @@ std::array<double, 256> oracle_core_norm_rope(const std::array<double, 256>& raw
     return output;
 }
 
-int verifier_composite_real_shape_case() {
+int verifier_composite_real_shape_case(QType type = QType::GGML_Q5_K) {
     constexpr int capacity = 16;
     constexpr int width = 2;
     StateFixture state(capacity);
@@ -1007,10 +1019,10 @@ int verifier_composite_real_shape_case() {
     for (int head = 0; head < 4; ++head) { index_query.set(128 * head, 0, 1.0F); }
     index_key.set(0, 0, 1.0F);
 
-    Q5MatrixFixture core_query_gate(12288, 2560);
-    Q5MatrixFixture core_key(512, 2560);
-    Q5MatrixFixture core_value(512, 2560);
-    Q5MatrixFixture output(2560, 6144);
+    Q5MatrixFixture core_query_gate(12288, 2560, type);
+    Q5MatrixFixture core_key(512, 2560, type);
+    Q5MatrixFixture core_value(512, 2560, type);
+    Q5MatrixFixture output(2560, 6144, type);
     for (int head = 0; head < 24; ++head) {
         for (int d = 0; d < 256; ++d) {
             core_query_gate.set_unit(head * 512 + d, (d & 1) == 0 ? 0 : 2);
@@ -1055,7 +1067,7 @@ int verifier_composite_real_shape_case() {
                                   sizeof(std::int32_t));
     GuardedDeviceBuffer dcount(width * sizeof(std::int32_t));
     GuardedDeviceBuffer dout(static_cast<std::size_t>(2560) * width * sizeof(std::uint16_t));
-    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(width));
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(width, type, type, type, type));
     dout.fill(0xcd);
     workspace.fill(0xcd);
 
@@ -1356,6 +1368,8 @@ int main() {
     failures += selector_score_order_case();
     failures += selected_attention_capacity_case();
     failures += verifier_composite_real_shape_case();
+    failures += verifier_composite_real_shape_case(QType::NVFP4);
+    failures += verifier_composite_real_shape_case(QType::FP8_E4M3FN_ROW_BF16S);
     if (failures != 0) {
         std::cerr << "qsa tests failed: " << failures << "\n";
         return 1;

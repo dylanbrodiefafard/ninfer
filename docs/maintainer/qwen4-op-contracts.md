@@ -19,6 +19,72 @@ The research profile is the official `Qwen/Qwen3.8-Flash-Next` checkpoint at rev
 `c119ec3cc37ab69642f39cca2de4187714002b08`. A future runnable Qwen4 target must freeze its own
 geometry and formats instead of inheriting preview constants implicitly.
 
+### Native weight-format qualification
+
+The existing GDN, QSA core, GR and PLE composite Ops also accept native NVFP4 and row-scaled
+`FP8_E4M3FN_ROW_BF16S` projections at their exact preview geometries. Their complete-layer
+arithmetic retains BF16 activations (`LinearPolicy::A16Only`), FP32 controls/recurrent state, and
+the existing output criteria. QSA index projections remain BF16; QSA K/V remain NVFP4-G16; the
+mapped PLE table remains a separate embedding format. GR down `[320,10240]` admits FP8 but not
+NVFP4 because its N=320 violates the registered block-scale layout. Explicit format arguments to
+each composite's workspace query describe the actual profile; the defaults still describe the
+unchanged GGUF verifier.
+
+The public Linear Op additionally qualifies optimized A4/A8 activation-compute routes for these
+weight formats. Permission for those routes at a standalone Linear boundary is not automatically
+permission to use them repeatedly inside a nonlinear/recurrent layer. Native resident MoE uses
+device-selected complete banks and independently qualifies the complete ideal FP64 formula; its
+private projection and activation storage is not reproduced in that oracle.
+
+These are usable, independently callable GPU layer components, not a registered Qwen4 Engine
+target or a promise about unannounced smaller-checkpoint dimensions. The host-staged full-preview
+verifier continues to bind only its exact existing GGUF-derived artifact. Bounded real-weight
+qualification and its source-quality limitations are documented in `qwen4-artifact.md`.
+
+The native NVFP4 A16 prefill route decodes each packed tile into CTA-private BF16 operands and
+uses BF16 Tensor Core MMA with FP32 accumulation. E2M1 codes times their E4M3 block scale are
+exactly representable in BF16; the artifact's global divisor is applied in the FP32 epilogue.
+There is no persistent decoded-weight copy or runtime repack. Shape-specific measured crossovers
+retain the decode/small-T routes below T64, T128, or T256. The separately permitted A4 route uses
+native FP4 MMA and remains distinct from this activation-preserving route.
+
+On RTX 5090, CUDA 13.1, `sm_120a`, cold-cache public Linear measurements for `[10240,2560]`
+(A16 policy, three warmups, eleven timed repetitions, median) changed from 221.184 to 77.184 us
+at T129, 835.584 to 154.880 us at T512, and 6844.416 to 1091.584 us at T4096. These are
+operator-level results with device-resident weights, not full-preview throughput or measurements
+including host expert transfers. Independent FP64 Linear qualification covers all eleven native
+NVFP4 geometries and the T63/64/65, T127/128/129, and T255/256/257 crossover boundaries.
+
+The row-scaled FP8 A16 prefill route likewise reuses persistent weight tiles with BF16 MMA,
+applying each stored BF16 row scale after FP32 accumulation. On the same hardware/toolchain,
+cold-cache public Linear medians (three warmups, twenty timed repetitions) for `[10240,2560]`
+changed from 359.392 to 79.360 us at T129, 1366.016 to 153.280 us at T512, and 10914.816 to
+1095.680 us at T4096. Its separate A8 policy permits
+activation quantization only at independently qualified dispatch widths; A16 remains the
+complete-layer policy.
+
+Native resident MoE qualification uses the complete ideal FP64 formula, not a reference that
+copies its private BF16 projection/SwiGLU stores. Ordinary inputs and decorrelated packed-weight
+witnesses retain the existing `2.5/255` relative-L2 and gross-error criteria. One retained
+periodic all-NVFP4 input nearly
+cancels: its two reference RMS values are `9.0021e-9` and `4.6865e-10`. An offline attribution
+experiment reproducing the private BF16 seams explains relative errors of 18.9% and 29.1%, but
+maximum absolute errors are only `2.7660e-9` and `2.9991e-10`. This explicitly labeled near-zero
+witness checks finite outputs and the existing absolute/gross bound, without claiming a relative
+accuracy guarantee for that ill-conditioned case. It does not replace the strict relative tests;
+the private-seam attribution model is not retained as a correctness oracle. The full FP8 and
+mixed-format witnesses keep the ordinary relative criterion.
+
+The complete resident MoE benchmark, on the same 5090/toolchain, measures GPU-stream elapsed
+time for one layer with all banks resident. At T1, means over ten iterations were 161.635 us
+(NVFP4) and 159.824 us (FP8). At T512, means over three iterations for fixed-hot/rotating expert
+selection were 3.794/4.790 ms for NVFP4 and 1.449/2.186 ms for FP8. Repeating the scalar public
+Op for the same token panel took 82.852/86.980 ms and 81.484/88.961 ms respectively. Rotating
+selection spans all 512 experts; resident weights occupy approximately 1.424 GB (NVFP4) or
+2.531 GB (FP8). These are one-layer schedule measurements, not cold-cache medians or full-model
+decode/prefill speeds. NVFP4 grouped execution reuses the Linear A16 SmallT arithmetic; FP8
+grouped execution reuses its BF16 MMA body. Routing and all floating-point execution stay on GPU.
+
 ## 1. Boundary rules and notation
 
 The contracts follow `docs/maintainer/op-development.md`:
@@ -702,7 +768,7 @@ or floating-point CPU work.
 The host scratch is four-byte aligned and mutually disjoint from both mapped banks and the pinned
 stage; the same fixed-compute-stream rule protects cross-call slot reuse.
 
-The same semantic Op also has a device-resident T=1..4096 verifier profile. Its routed gate and up
+The same semantic Op also has a device-resident GGML T=1..4096 verifier profile. Its routed gate and up
 operands are complete rank-three IQ1_S or IQ2_XXS banks `[512,640,2560]`, and routed down is the
 complete IQ4_NL bank `[512,2560,640]`. T below 256 repeats the exact scalar fused route because the
 measured fixed grouping and launch overhead outweighs its reuse benefit at short widths. At T>=256,
