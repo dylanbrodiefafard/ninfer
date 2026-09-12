@@ -164,17 +164,166 @@ lane, exclusive
 FIFO occupancy (RAM hit drops the restored chat from `used`/`entries`; later spill recaptures it),
 one-entry spill drop of a dirty-lane occupant, Engine teardown after a RAM restore,
 and the C=3 shared-pool analog (three 3-page chats, two 4-page continuations plus RAM suffix restore of the third, 2-page fits-now backfill, blocked 4-page tail, exact vs suffix reuse). `ninfer_qwen3_6_27b_disk_real_test` covers the SSD third tier on a real Engine: disk-without-RAM construction, restart `HostDisk`, inclusive disk after RAM consume, equal-length VRAM then RAM then disk, longer disk over shorter VRAM, suffix prefill after disk restore, C=1 dirty-lane and RAM-full disk hits, C=2 empty-lane and dirty-only disk hits, C=3 overlapping empty lanes, empty-lane disk vs two VRAM continues, triple overlapping `HostDisk` covering three dirty lanes, disk restore plus two MRU VRAM continues, duplicate disk submit, queued disk matcher behind a full batch, cancel-during-disk-restore, suffix disk with occupants, two HostDisk plus one MRU VRAM continue, disk admit after two in-flight VRAM continues, greedy vs DFlash directory fingerprint, and DFlash2 disk restore. `ninfer_admission_policy_test` locks the same 10-page leftover-2 / leftover-0 / no-lane arithmetic.
+
+`ninfer_qwen3_6_27b_cache_admission_real_test` checks that a 1 MiB RAM budget cannot block
+admission at C=1–4. It forces selected-lane and shared-pool victim capture drops, then verifies
+overlapping dirty-lane replacements complete at C>1. It uses NVFP4 KV and
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`.
+The disk Engine suite also checks tiny-RAM capture drops during `HostDisk` admission at
+C=1–4, retained sibling continuations, greedy replay parity, and request-local copy timing.
+
+Cache interleaving coverage follows the supported ownership model: one executor mutates
+admission/claim state, while CUDA copies and disk workers complete asynchronously. The bounded
+explorations execute the real cache implementations:
+
+| Test | Enumerated scope | Observable checks |
+| --- | --- | --- |
+| `ninfer_kv_ram_cache_test` | 175 states / 1,101 transitions: capacities of one, two, and three equal-size slots, two keys (including duplicates), one claim, and queued/harvested copy ownership | FIFO matching and eviction, claim release/consume, exact counters, copy retirement, exact restored KV |
+| `ninfer_kv_disk_cache_test` | 320 schedules over two four-page entries: reader counts 1–16; prefetch dequeued, slot assigned, reading, or filled; promotion, cancellation, reclaim, or switch; injected in-flight read failures | Exact restored KV, obsolete work cannot affect a replacement restore, failure accounting, drained I/O pins |
+| `ninfer_qwen3_6_27b_cache_interleavings_real_test` | Every cancellation subset at C=1–4, RAM-only and RAM+disk, for ordinary, MTP, and DFlash execution (60 subsets per backend); ordinary cancellation after the first publication, speculative cancellation after the second with a per-request backend-round witness | Actual RAM reuse, concurrent decode, canceled/completed terminal states, next-token continuation against fresh computation of the same represented history |
+
+The Engine matrix uses NVFP4 KV and `--backend ordinary|mtp|dflash`. Ordinary/MTP use
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`; DFlash uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`. Speculative cases require actual backend execution.
+MTP also retains eight C=2 first-publication cancellation cases that reproduce invalid-tail
+images shadowing a later usable cache entry. The opt-in real CTests register all three backends.
+Its cancellation
+trigger is after host-claim consumption; it does not prove cancellation during Engine copy-hold.
+Set `TMPDIR` to a writable NVMe scratch directory for the real cache tests: their temporary
+stores intentionally exercise spill pressure, and container overlay storage can dominate runtime.
+Completed peers must survive a RAM round trip. An ordinary in-flight cancellation discards its
+overwritten recurrent state; a later request may miss or use an earlier valid checkpoint, but
+must not restore that state under its former frontier. Multi-token greedy trajectories across
+different batch/prefill arithmetic routes are not the cache oracle.
+The lower-level suites control incomplete DMA and disk read/cancellation boundaries directly.
+Two additional RAM schedules force a disk-style worker's pending-event snapshot before or after
+an unrelated executor capture, then verify concurrent copy waits, drained pins, and exact KV bytes.
+Sixteen disk schedules hold page or immediate-state DMA incomplete at reader counts 1, 2, 8,
+and 16, then cancel or shut down before restoring another entry into the same destinations.
+They check that CopyHold includes the independent state DMA, retirement drains both CUDA owners,
+and replacement KV/hidden bytes and event-ticket cleanup are exact.
+Four promotion schedules queue prefetch behind idle spill work, then demand or cancel its
+restore with one or sixteen readers. They verify restore progress, resumed idle commits,
+exact KV, and transfer of the queued-prefetch pin to ordinary restore ownership.
+Sixteen pre-admission pressure schedules hold prefetch at dequeue, slot assignment, page read,
+or completion with one, two, eight, or sixteen readers. A single executor then spills and evicts
+a RAM victim, recaptures a retained image, and restores the claimed disk source with exact KV.
+Disk corruption tests classify expected read failures separately from unexpected worker errors,
+quarantine the failed source even when tombstone persistence fails, and verify that a shared-page
+sibling restores exactly after durable invalidation and reopening the store.
+Four prefetch allocation schedules fail the first or second queued page with one or sixteen
+readers, then check exact demanded restore and zero leaked pins. Two additional setup failures
+check that an unreturned restore ticket is drained and reclaimed before retry.
+Six cancellation schedules pause dequeued prefetch before slot assignment with one, two, or
+sixteen readers, including an injected worker exception. Cancellation must retire every reader
+pin before strict source invalidation, then allow another exact restore.
+An idle-candidate snapshot allocation failure must leave no pin or durable image and allow
+the same worker to complete a later spill.
+Six spill-queue allocation schedules fail after zero, one, or two successful enqueues, for idle and
+emergency spills. An independent RAM I/O pin must survive cleanup, continue to prevent eviction,
+and retire normally before a successful spill retry.
+Two branch-spill schedules fail the actual next C++ allocation on the preparing thread,
+preserve the parent's shared-object reference count,
+retry successfully, and require all references to retire when both owning entries are evicted.
+A two-gate RAM eviction schedule lets a disk-worker-style snapshot borrow the victim's CUDA
+event during eviction's unlocked wait. Completing the victim's DMA must not release its entry
+until the snapshot's second DMA finishes; the surviving image then restores exact KV.
+Two RAM teardown schedules deny C++ allocations on the destroying executor while D2H or H2D
+is incomplete, requiring DMA retirement and exact restored bytes. Three RAM event-exhaustion
+cases cover capture timing before DMA, capture completion after gated D2H, and restore timing
+before H2D; they require clean ownership and exact retry. A synthetic CUDA launch failure must
+retain its execution-error classification. The checkpoint pool retirement test also fails initial
+head-fence allocation, then retries before gated D2H and checks completed bytes at release. Six spill-batch schedules fail
+page-record allocation after acquiring two, four, or eight jobs, for idle and emergency spills;
+all payload claims must retire and a later eight-page spill must restore exactly. Idle-to-emergency
+promotion also runs with caller allocation denied. Eight publication schedules fail metadata
+preparation for create, refresh, extend, and branch, each with idle and emergency spill. They
+require drained pins, an unchanged previous generation, successful retry, and exact restore after
+reopening the store. Each retry denies real C++ allocations throughout committed-entry
+installation and checks that even caught allocation attempts remain zero. Two failed-unlink
+schedules deny allocation during locked/unlocked cleanup, require tombstoned entries to remain
+unavailable, and verify retry/reopen.
+Nine startup allocation schedules cover index/FIFO/node publication, skipped-entry ownership,
+a spawned page-validation worker, manifest rebuild after partially loading normal or skipped
+entries, and allocation-free validation-cache cleanup. They require exact reference ownership,
+healthy sibling reuse, FIFO eviction, and later reopening of an entry skipped by transient
+allocation pressure.
+Backend-readiness regressions exercise seven RAM cases, nine disk ranking/reopen cases, and
+four resident-planner cases: invalid current tails or unsupported longer frontiers must not hide
+a usable alternative. Two same-prefix disk refresh schedules replace the selected generation before claim or while
+claim waits for idle publication; both reject the stale plan and permit a fresh claim.
+These bounds do not exhaust arbitrary OS/CUDA instruction schedules, unbounded request histories,
+all prompt geometries, or every speculative backend combination. Passing them is evidence for
+the stated transitions, not a proof that all possible interleavings are correct.
+
+`ninfer_qwen3_6_27b_dflash_cache_cancel_real_test` checks exact-prefix continuation after
+published DFlash cancellation through VRAM, RAM, and disk reopen. It uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`; next-token output is compared with fresh computation
+of the identical input. Planner unit cases separately check invalid-hidden rejection,
+checkpoint fallback, valid-hidden append, and continued reuse when a suffix regenerates hidden.
+Its C=2 RAM+disk case submits repeated exact prefixes, suffixes, changed prompts, and a
+cancelled speculative continuation from an idle Engine under retained-lane capture pressure.
+It requires actual HostRam and reopened HostDisk restores, DFlash execution, and matching
+fresh next-token results. A 180-second watchdog for each admission lifecycle reports the
+current phase and waiting/running/prefill/decode counters before exiting directly; shutdown
+remains bounded by the CTest timeout. Use the NVMe `TMPDIR` described above for disk work.
+A further three C=2 DFlash admissions use a 256 MiB RAM budget checked to fit only one image,
+two occupied retained lanes, and a target already evicted to disk. Each HostDisk admission must
+both capture a retained victim and evict a RAM image before its continuation is compared with
+fresh computation. This exercises disk prefetch followed by synchronous RAM-pressure handling
+while the request is still counted as waiting; it does not force the OS worker schedule.
+Use `--case c2` to run just these C=2 lifecycle and RAM-pressure cases.
+The disk Engine suite's `--case corrupt` selection truncates a cached page pack after startup
+and requires transparent cold continuation with the same next token as fresh computation at
+C=1–4, with C−1 healthy peers each decoding 128 tokens. The DFlash artifact environment runs
+the same four cases with DFlash and checkpoint capture enabled. The failed entry is invalidated;
+a later request must also succeed.
+Its `--case metadata` selection checks 32 allocation-failure recoveries: C=1–4 at host
+descriptor creation, partially published restore setup, post-copy checkpoint installation,
+and lazy CUDA completion-event creation after restore DMA. The eight event cases also run via
+`--case event`.
+Descriptor/setup/event cases use ordinary and DFlash execution; checkpoint cases use MTP and DFlash
+and require an actual captured checkpoint. Peers must finish and cold output must match fresh
+computation after the injected failure.
+The RAM Engine suite's `--case fallback` selection injects a one-shot restore metadata
+allocation failure after H2D submission for a 128-token NVFP4 KV image. Sixteen cases combine
+C=1–4, RAM-only or RAM+disk, and ordinary or DFlash execution. Each requires consumption of the
+fault, discarded RAM ownership, cold continuation matching fresh computation, completion of
+healthy decoding peers, and a successful later request. DFlash cases retain checkpoint capture
+through recovery. These test transient cache allocation failure, not sustained process-wide OOM.
+The RAM Engine suite's `--case planning` selection checks another 16 C=1–4 cases with
+RAM-only/RAM+disk and ordinary/DFlash execution. A one-shot optional cache-lookup allocation
+failure must preserve cold admission, healthy peers, and fresh next-token behavior. Candidate
+version memoization prevents retrying the same failed lookup in a scheduler spin.
+The existing RAM Engine suite accepts `--case mtp` to run only its MTP suffix-cache case;
+that case checks the configured draft window and actual speculative execution without fixing
+the adaptive policy to a particular first-round draft length.
+
 `ninfer_kv_ram_cache_perf_test` checks host pack/unpack bandwidth against pinned memcpy.
 `ninfer_kv_disk_cache_perf_test` spills and restores a ~90 MiB 64-plane INT8 page image on the
 repository `out/` NVMe (override with `NINFER_KV_DISK_PERF_DIR`), against a 40 MB/s floor and
 buffered plus `O_DIRECT` sequential POSIX write/read baselines.
 `ninfer_kv_ram_cache_opt_test` checks event
 overlapped restore, fragmented vs contiguous PageMajor runs, and GDN/hidden RAM round-trips.
-`ninfer_kv_ram_cache_test` includes `test_copy_compute_stream_overlap`: a 32 MiB hidden D2H/H2D
-on `copy_stream` must still be in flight after a compute-only `cudaEventSynchronize` on
-`device.stream`. It also checks that `unpack_device` without an intervening harvest still reports
+`ninfer_kv_ram_cache_test` includes `test_copy_compute_stream_overlap`: callback-gated D2H/H2D
+on `copy_stream` remain incomplete while a compute-only event on `device.stream` completes.
+The same gates verify that eviction/consume fence unfinished copies before retiring and reusing
+their pinned storage. It also checks that `unpack_device` without an intervening harvest still reports
 both save and load elapsed, and that `consume` without harvest clears pending copy ids and folds
-D2H elapsed into save. `ninfer_device_test` checks `order_copy_after_compute`.
+D2H elapsed into save. Post-DMA capture and restore metadata allocation faults use the same
+gates to verify incomplete-copy ownership, safe cleanup, exact subsequent restores, and reclaimed
+capacity. The arena suite checks fragmented retirement and full coalescing while preserving live
+bytes. `ninfer_device_test` checks `order_copy_after_compute`.
+The real checkpoint suite's `--case event-allocation` checks MTP or DFlash Program capture with
+head-event allocation failure at a prefill checkpoint. The request must complete without a
+capture and consume the injected failure; later capture and actual checkpoint restore must
+succeed, with next-token output matching fresh computation. The default real checkpoint run
+also includes this case.
+The runtime-mechanism suite fills the checkpoint recycling pool, then verifies that dropping
+an excess image waits for its gated D2H and releases the completed bytes without growing the pool.
+Twelve copy-snapshot allocation schedules cover both snapshot buffers, D2H/H2D, and CPU wait,
+compute-stream wait, or timing harvest. They require safe completion without leaked I/O pins,
+exact destination bytes, and successful consumption and capacity reclamation.
 `ninfer_kv_ram_cache_large_test` moves a 27B-shaped GDN slot (~147 MiB) and a
 64-plane ~100 MiB INT8 KV image both ways, including a two-slot GDN plus KV restore, and repeats
 that copy/compute overlap proof:

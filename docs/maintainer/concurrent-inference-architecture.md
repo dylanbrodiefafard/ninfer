@@ -851,9 +851,12 @@ in-flight unit stay off `copy_stream`. `--no-prefix-reuse` disables ladder captu
 pin, and restore.
 
 The host tier is an exclusive FIFO of chats that are not on a VRAM lane. A new capture appends at
-the tail. Capacity pressure evicts the oldest unpinned host entry until the new image fits; if it
-still cannot, `drops` increments and the incoming request proceeds while the VRAM bundle is
-released. Host RAM is not a precondition for admission.
+the tail. Capture first rejects images that cannot fit around a claimed restore source; feasible
+capacity pressure evicts the oldest unpinned host entry until the new image fits. If capture
+cannot complete, `drops` increments and the incoming request proceeds while the VRAM bundle is
+released. Host RAM is not a precondition for admission. A failed optional capture must not
+remove that lane from the reclaimable victim set or return `Overloaded`: this applies both
+to the selected dirty lane and to other free retained lanes needed for shared-pool capacity.
 
 Capture and retained-lane eviction run only after `find_admission_lane` has already selected a
 free lane for that request. A queued prompt that still cannot fit — because in-flight lanes occupy
@@ -870,16 +873,16 @@ The executor captures at each admission site that is about to destroy a retained
 3. a RAM restore that is about to cover a still-dirty target lane.
 
 Capture queues D2H on `copy_stream` and **holds the source pages mapped** until `copies_ready`.
-Admit is two-phase: bind records the request in its lane and any captured-but-not-evicted victims
-as copy-hold; other decode-ready lanes may run a DecodeRound while that D2H (and later restore
-H2D) is in flight. Admit-complete waits with `cudaEventQuery` (and `EventSynchronize` on copy
+Admit is two-phase: bind records the request in its lane and the retained victims awaiting release
+as copy-hold (including victims whose optional capture was dropped); other decode-ready lanes may
+run a DecodeRound while that D2H (and later restore H2D) is in flight. Admit-complete waits with `cudaEventQuery` (and `EventSynchronize` on copy
 only when membership is empty), then `evict_retained_lane` / `kv.reset()`, optional restore H2D,
 `wait_kv_ram_copies_on_compute` immediately before this lane's `start_prefill_lane`, and harvest.
 Harvest of D2H/H2D elapsed happens after that wait, not on an overlapping DecodeRound launch.
 If the held request is cancelled or fails before admit-complete, drain waits for those copies,
-harvests, releases an unused RAM claim, and `evict_retained_lane` on every captured victim so the
-D2H image is the only remaining copy. A later RAM hit exclusive-claims the matching host entry (pinned entries are invisible to later
-`plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
+harvests, releases an unused RAM claim, and calls `evict_retained_lane` on every selected victim.
+If capture succeeded, the completed D2H image is the only remaining copy. A later RAM hit
+exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
 after them so other-lane decode can overlap the DMA. Consume then erases that entry wherever it
 sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
 before consume releases the claim and leaves the host row in place. After consume the bundle lives
@@ -1022,8 +1025,10 @@ Cancellation 不打断 in-flight GPU unit。Boundary 在 launch 前观察一次 
 heads）按与 `OutputLimit` 相同的边界 retain，供后续 prefix reuse。未完成的 suffix prefill 回滚到 occupy
 base：该处若有 turn-rollback 或 ladder head 则 restore 该 head；否则若仍持有 rewrite checkpoint 则回滚到
 它。回滚后丢掉其后的 staged heads，并释放该 lane 的 staging occupancy，然后 retain。occupy base 为 0 且
-没有 rewrite 时释放整条 `SequenceState`（含 staged heads）。Speculative in-flight 行以
-`commit_columns=0` fold 后 retain 在 unit 前的 committed frontier。error/shutdown
+没有 rewrite 时释放整条 `SequenceState`（含 staged heads）。Ordinary in-flight decode 已原地覆盖
+GDN current 和 continuation hidden，不能只回退 ledger/KV frontier 后 retain；该取消行释放整条
+`SequenceState`，与 §8.4 一致。在两个 unit 之间观察到取消时，尚未被覆盖的 committed state 仍可 retain。
+Speculative in-flight 行以 `commit_columns=0` fold 后 retain 在 unit 前的 committed frontier。error/shutdown
 仍释放整条 `SequenceState`。Provisional writes 不影响同一 round 的其他 rows。
 
 因此 cancellation 最多等待一个 membership 已固定的 GPU unit，再加一次 boundary processing。

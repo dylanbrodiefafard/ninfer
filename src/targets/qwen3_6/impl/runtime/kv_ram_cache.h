@@ -151,6 +151,13 @@ struct RamMatch {
     std::uint32_t reuse_base   = 0;
 };
 
+enum class RamCaptureStatus { Captured, NeedsEviction, Dropped };
+
+struct RamCaptureResult {
+    RamCaptureStatus status;
+    std::uint64_t entry_id = 0;
+};
+
 class KVRamCache {
 public:
     explicit KVRamCache(std::size_t capacity_bytes);
@@ -163,14 +170,15 @@ public:
     KVRamCache& operator=(KVRamCache&&)      = delete;
 
     [[nodiscard]] std::optional<RamMatch> plan_match(const PreparedPromptData& prompt,
-                                                     std::span<const PrefixHash128> hash_chain);
+                                                     std::span<const PrefixHash128> hash_chain,
+                                                     const ReuseBackendPolicy& policy = {});
 
     void claim(std::uint64_t entry_id);
     void release(std::uint64_t entry_id);
     void consume(std::uint64_t entry_id);
     [[nodiscard]] bool is_claimed(std::uint64_t entry_id) const;
 
-    std::optional<std::uint64_t> capture(const RamCaptureSource& source);
+    [[nodiscard]] RamCaptureResult capture(const RamCaptureSource& source);
     [[nodiscard]] std::optional<std::uint64_t> peek_oldest_unpinned() const;
     [[nodiscard]] std::vector<std::uint64_t> fifo_ids() const;
     void pin_for_io(std::uint64_t entry_id);
@@ -224,8 +232,31 @@ public:
     [[nodiscard]] std::size_t test_pending_copy_count() const noexcept;
     void test_fail_next_ticket_write() noexcept { fail_next_ticket_write_ = true; }
     void test_fail_next_capture() noexcept { fail_next_capture_ = true; }
+    void test_fail_next_capture_metadata_allocation() noexcept {
+        fail_next_capture_metadata_allocation_ = true;
+    }
+    static void test_fail_next_plan_metadata_allocation() noexcept {
+        fail_next_plan_metadata_allocation_.store(true, std::memory_order_release);
+    }
+    [[nodiscard]] static bool test_plan_metadata_allocation_pending() noexcept {
+        return fail_next_plan_metadata_allocation_.load(std::memory_order_acquire);
+    }
+    static void test_fail_next_restore_metadata_allocation() noexcept {
+        fail_next_restore_metadata_allocation_.store(true, std::memory_order_release);
+    }
+    [[nodiscard]] static bool test_restore_metadata_failure_pending() noexcept {
+        return fail_next_restore_metadata_allocation_.load(std::memory_order_acquire);
+    }
+    void test_fail_next_copy_snapshot_allocation(int stage = 0) noexcept {
+        fail_copy_snapshot_allocation_stage_ = stage;
+    }
+    void test_fail_copy_event_allocation_after(int successful_events) noexcept {
+        fail_copy_event_allocation_after_ = successful_events;
+    }
+    [[nodiscard]] bool test_retirement_waiting_for_io() const noexcept {
+        return retirement_waiting_for_io_.load(std::memory_order_acquire);
+    }
     void test_fail_next_copy_sync() noexcept { fail_next_copy_sync_ = true; }
-    void test_fail_next_retire() noexcept { fail_next_retire_ = true; }
     [[nodiscard]] std::uint32_t test_io_pins(std::uint64_t entry_id) const;
     void test_set_copy_sync_stall_ms(int ms);
     [[nodiscard]] bool test_copy_sync_entered() const;
@@ -278,6 +309,7 @@ private:
     [[nodiscard]] const Record& require(std::uint64_t entry_id) const;
     void destroy_record(std::uint64_t entry_id, bool count_eviction,
                         std::unique_lock<std::mutex>& lock);
+    void create_copy_event(cudaEvent_t* event, unsigned int flags);
     void begin_copies(Record& record, cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     [[nodiscard]] bool copies_ready_locked(std::uint64_t entry_id) const;
@@ -288,23 +320,15 @@ private:
     void maybe_copy_sync_stall() const;
     double harvest_record(Record& record);
     [[nodiscard]] double copy_elapsed_seconds(const Record& record) const;
-    void retire_record(Record& record);
-    void reap_retired(bool block);
     void pin_pending_copy_events(std::vector<cudaEvent_t>& events, std::vector<std::uint64_t>& ids);
     void unpin_copy_events(const std::vector<std::uint64_t>& ids) noexcept;
     void drop_pending_save(std::uint64_t entry_id) noexcept;
     void drop_pending_id(std::uint64_t entry_id) noexcept;
     void bump_version() noexcept { ++index_version_; }
 
-    struct RetiredCopy {
-        void* block           = nullptr;
-        cudaEvent_t copies_done = nullptr;
-    };
-
     HostPinnedArena arena_;
     std::deque<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, Record> records_;
-    std::vector<RetiredCopy> retired_;
     std::vector<std::uint64_t> pending_save_ids_;
     std::optional<std::uint64_t> pending_load_id_;
     std::uint64_t next_id_           = 1;
@@ -322,8 +346,13 @@ private:
     std::condition_variable io_cv_;
     bool fail_next_ticket_write_ = false;
     bool fail_next_capture_      = false;
+    bool fail_next_capture_metadata_allocation_ = false;
+    std::atomic<bool> retirement_waiting_for_io_{false};
+    int fail_copy_event_allocation_after_ = -1;
+    inline static std::atomic<bool> fail_next_restore_metadata_allocation_{false};
+    inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
+    int fail_copy_snapshot_allocation_stage_ = -1;
     bool fail_next_copy_sync_   = false;
-    bool fail_next_retire_      = false;
     std::atomic<int> copy_sync_stall_ms_{0};
     mutable std::atomic<bool> copy_sync_entered_{false};
 };

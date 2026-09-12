@@ -130,7 +130,13 @@ int expect_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocat
 std::optional<std::uint64_t> capture_or_evict(q36::detail::KVRamCache& cache,
                                               const q36::detail::RamCaptureSource& source) {
     for (;;) {
-        if (auto id = cache.capture(source)) { return id; }
+        const auto result = cache.capture(source);
+        if (result.status == ninfer::targets::qwen3_6::detail::RamCaptureStatus::Captured) {
+            return result.entry_id;
+        }
+        if (result.status == ninfer::targets::qwen3_6::detail::RamCaptureStatus::Dropped) {
+            return std::nullopt;
+        }
         const auto victim = cache.peek_oldest_unpinned();
         if (!victim) { return std::nullopt; }
         cache.evict_one_unpinned(*victim);
@@ -524,6 +530,9 @@ int main() {
         }
     }
     identity.assign(retained);
+    // This transfer-only image has no saved tail hidden state. A suffix query
+    // can reuse its KV and recompute the hidden state at the next token.
+    prompt = retained;
     q36::detail::RamCaptureSource capture;
     capture.execution_frontier = static_cast<std::uint32_t>(tokens.size());
     capture.ledger_frontier    = static_cast<std::uint32_t>(retained.token_ids.size());
@@ -818,6 +827,7 @@ int main() {
         }
         q36::detail::ResidentPrefixIdentity state_identity;
         state_identity.assign(state_retained);
+        state_prompt = state_retained;
         auto state_capture = capture;
         state_capture.execution_frontier = 4;
         state_capture.ledger_frontier = 5;

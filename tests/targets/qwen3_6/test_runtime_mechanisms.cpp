@@ -7,6 +7,11 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
+#include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
+#include "cuda_stream_gate.h"
+#include <atomic>
+#include <chrono>
+#include <future>
 #define NINFER_QWEN36_RUNTIME_NS mechanism_slots
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #undef NINFER_QWEN36_RUNTIME_NS
@@ -927,6 +932,34 @@ q36::detail::PrefillReuseSelection decide(const q36::detail::ResidentReuseState&
                                                dflash_full_layers);
 }
 
+// Speculative cancellation folds GDN back to E but cannot restore current tail
+// hidden. DFlash context remains at E; an exact-prefix continuation must restore a
+// checkpoint or recompute, while a nonempty suffix can establish new tail hidden.
+void test_cancelled_dflash_exact_prefix_reuse() {
+    using Path = ninfer::PrefixReusePath;
+    using Backend = ninfer::SpeculativeBackend;
+    ResidentReuseFixture fixture;
+    auto state = fixture.state;
+    state.dflash_context_frontier = state.execution_frontier;
+    state.tail_hidden_valid = false;
+    const auto exact = text_prompt(state.execution_frontier);
+    auto selected = decide(state, exact, Backend::DFlash, false, true);
+    expect(selected.path == Path::FullReset && selected.frontier == 0,
+           "cancelled DFlash exact prefix without hidden must recompute");
+    selected = decide(state, fixture.prompt, Backend::DFlash, false, true);
+    expect(selected.path == Path::AppendAtFrontier && selected.frontier == 4,
+           "cancelled DFlash nonempty suffix can establish new hidden");
+    state.rewrite_valid = true;
+    state.rewrite_frontier = 2;
+    selected = decide(state, exact, Backend::DFlash, false, true);
+    expect(selected.path == Path::RestoreTurnCheckpoint && selected.frontier == 2,
+           "cancelled DFlash exact prefix restores an available earlier checkpoint");
+    state.tail_hidden_valid = true;
+    selected = decide(state, exact, Backend::DFlash, false, true);
+    expect(selected.path == Path::AppendAtFrontier && selected.frontier == 4,
+           "valid DFlash exact prefix still appends ahead of its checkpoint");
+}
+
 void test_resident_reuse_decision() {
     using Path    = ninfer::PrefixReusePath;
     using Kind    = q36::RewriteCheckpointKind;
@@ -996,6 +1029,39 @@ void test_resident_reuse_decision() {
         const auto sel = decide(state, prompt, Backend::Mtp);
         expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 4,
                "matching staged head beats a shorter rewrite checkpoint");
+    }
+
+    // Readiness is filtered per candidate, before longest-frontier ranking.
+    state.mtp_kv_valid = 1;
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == 2,
+               "unready longer MTP staged head does not shadow ready rewrite");
+    }
+    state.rewrite_frontier = 4;
+    state.context_checkpoints = {
+        {2, q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 2),
+         q36::detail::ContextCheckpointKind::Ladder}};
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 2,
+               "unready longer MTP rewrite does not shadow ready staged head");
+    }
+    state.context_checkpoints.push_back(
+        {4, q36::detail::prefix_hash_at(fixture.ledger, fixture.identity, 4),
+         q36::detail::ContextCheckpointKind::TurnRollback});
+    {
+        const auto sel = decide(state, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 2,
+               "multiple unready MTP frontiers do not hide an earlier usable head");
+    }
+    state.context_checkpoints.resize(1);
+    state.dflash_context_frontier = 3;
+    state.backend_image_present = true;
+    {
+        const auto sel = decide(state, prompt, Backend::DFlash, true, true, true);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 2,
+               "unready longer DFlash rewrite does not shadow ready staged head");
     }
 
     // The checkpoint kind determines the restore path.
@@ -1097,6 +1163,60 @@ void test_adaptive_capture_and_topology() {
            "k_index folds before B");
 }
 
+void test_full_checkpoint_pool_drains_copy() {
+    using Head = q36::detail::ContextCheckpointHead;
+    std::vector<Head> pool;
+    pool.reserve(1);
+    pool.emplace_back();
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    std::uint32_t* device_value = nullptr;
+    CUDA_CHECK(cudaMalloc(&device_value, sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaMemsetAsync(device_value, 0x5a, sizeof(std::uint32_t), stream));
+    ninfer::test::StreamCopyGate gate;
+    std::atomic<std::uint32_t> value_at_release{0};
+    Head head;
+    head.hidden = std::shared_ptr<ninfer::PinnedHostBuffer>(
+        new ninfer::PinnedHostBuffer(sizeof(std::uint32_t)), [&](auto* buffer) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, buffer->data(), sizeof(value));
+            value_at_release.store(value, std::memory_order_release);
+            delete buffer;
+    });
+    std::memset(head.hidden->data(), 0, sizeof(std::uint32_t));
+    Head::test_fail_next_copy_event_allocation();
+    bool allocation_failed = false;
+    try { head.prepare_copy_event(); }
+    catch (const std::bad_alloc&) { allocation_failed = true; }
+    expect(allocation_failed && head.copies_done == nullptr && head.hidden &&
+               !Head::test_copy_event_allocation_pending(),
+           "checkpoint event exhaustion was not recoverable before DMA");
+    head.prepare_copy_event();
+    gate.launch(stream);
+    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), device_value, sizeof(std::uint32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaEventRecord(head.copies_done, stream));
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    auto retire = std::async(std::launch::async, [&] {
+        entered.set_value();
+        q36::detail::recycle_checkpoint_image(pool, std::move(head));
+    });
+    entered_future.wait();
+    expect(retire.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
+           "full checkpoint pool did not wait for the excess image's DMA");
+    gate.release();
+    retire.get();
+    expect(value_at_release.load(std::memory_order_acquire) == 0x5a5a5a5aU,
+           "full checkpoint pool did not release the completed image");
+    expect(pool.size() == 1 && head.copies_done == nullptr,
+           "full checkpoint pool grew or retained the retired event");
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    pool.clear();
+    CUDA_CHECK(cudaFree(device_value));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
 void test_context_checkpoint_image_pool_policy() {
     using q36::detail::ContextCheckpointImageLayout;
     constexpr ContextCheckpointImageLayout mtp{.conv_bytes      = 64,
@@ -1136,9 +1256,11 @@ int main() {
     test_prefix_hash_and_dflash_gate();
     test_prefill_context_marks();
     test_resident_reuse_decision();
+    test_cancelled_dflash_exact_prefix_reuse();
     test_dflash_chain_verify_kv_headroom();
     test_adaptive_capture_and_topology();
     test_context_checkpoint_image_pool_policy();
+    test_full_checkpoint_pool_drains_copy();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

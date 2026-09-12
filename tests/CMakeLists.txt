@@ -164,15 +164,46 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
   SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_6_27b_ram_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_27b_ram_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_cache_admission_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_cache_admission_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_cache_admission_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 300)
+ninfer_add_test(ninfer_qwen3_6_27b_cache_interleavings_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_cache_interleavings_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_cache_interleavings_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
+foreach(backend mtp dflash)
+  add_test(NAME ninfer_qwen3_6_27b_${backend}_cache_interleavings_real_test
+    COMMAND ninfer_qwen3_6_27b_cache_interleavings_real_test --backend ${backend})
+  set_tests_properties(ninfer_qwen3_6_27b_${backend}_cache_interleavings_real_test PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 900)
+endforeach()
+ninfer_add_test(ninfer_qwen3_6_27b_dflash_cache_cancel_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_dflash_cache_cancel_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_dflash_cache_cancel_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 300)
 ninfer_add_test(ninfer_qwen3_6_27b_disk_real_test
   SOURCES targets/qwen3_6_27b/test_engine_disk_real.cpp
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_6_27b_disk_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_27b_disk_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_6_27b_disk_metadata_real_test
+  COMMAND ninfer_qwen3_6_27b_disk_real_test --case metadata)
+set_tests_properties(ninfer_qwen3_6_27b_disk_metadata_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_qwen3_6_27b_context_checkpoint_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_checkpoint_real.cpp
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_6_27b_context_checkpoint_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_27b_context_checkpoint_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash_real.cpp

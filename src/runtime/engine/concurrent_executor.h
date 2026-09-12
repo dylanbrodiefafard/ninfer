@@ -178,6 +178,7 @@ public:
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
             }
+            request->queue_order = next_queue_order_++;
             pending_.push_back(request);
             published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
                                               std::memory_order_relaxed);
@@ -396,6 +397,7 @@ private:
         }
 
         const std::uint64_t id;
+        std::uint64_t queue_order = 0;
         HostInputLease host_input;
         targets::qwen3_6::PreparedPrompt prompt;
         targets::qwen3_6::OutputSession output;
@@ -404,6 +406,7 @@ private:
         ResolvedRequestOptions options;
         OutputDelivery delivery = OutputDelivery::TerminalOnly;
         Clock::time_point deadline;
+        bool cache_fallback = false;
         Clock::time_point submitted;
         std::optional<Clock::time_point> first_token;
         std::optional<GenerationBudget> budget;
@@ -508,7 +511,8 @@ private:
         bool disk_claimed            = false;
         bool disk_consumed           = false;
         std::uint64_t disk_restore_epoch = 0;
-        std::vector<std::uint32_t> victim_lanes;
+        std::array<std::uint32_t, kMaximumConcurrency> victim_lanes{};
+        std::size_t victim_count = 0;
         bool victims_evicted         = false;
         bool restored                = false;
         bool needs_prefill           = false;
@@ -1002,7 +1006,7 @@ private:
                 if ((*it)->cancelled.load(std::memory_order_acquire)) {
                     cancelled.push_back(*it);
                     it = pending_.erase(it);
-                } else if (now >= (*it)->deadline) {
+                } else if (!(*it)->cache_fallback && now >= (*it)->deadline) {
                     expired.push_back(*it);
                     it = pending_.erase(it);
                 } else {
@@ -1179,12 +1183,17 @@ private:
         const std::uint64_t version = instance_.program->kv_ram_index_version();
         if (request->ram_index_version == version) { return; }
         request->ram_plan.reset();
-        Plan plan =
-            instance_.program->plan_ram_reuse(request->prompt, *request->base_plan);
-        if (plan.summary().reusable_prompt_tokens > 0 &&
-            plan.summary().ram_entry_id != 0 &&
-            plan.summary().reuse_source == PrefixReuseSource::HostRam) {
-            request->ram_plan.emplace(std::move(plan));
+        try {
+            Plan plan =
+                instance_.program->plan_ram_reuse(request->prompt, *request->base_plan);
+            if (plan.summary().reusable_prompt_tokens > 0 &&
+                plan.summary().ram_entry_id != 0 &&
+                plan.summary().reuse_source == PrefixReuseSource::HostRam) {
+                request->ram_plan.emplace(std::move(plan));
+            }
+        } catch (const std::bad_alloc&) {
+            // Cache lookup is optional. Keep normal lane/cold admission available
+            // and remember this index version so allocation pressure cannot spin.
         }
         request->ram_index_version = version;
     }
@@ -1197,12 +1206,17 @@ private:
         const std::uint64_t version = instance_.program->kv_disk_index_version();
         if (request->disk_index_version == version) { return; }
         request->disk_plan.reset();
-        Plan plan =
-            instance_.program->plan_disk_reuse(request->prompt, *request->base_plan);
-        if (plan.summary().reusable_prompt_tokens > 0 &&
-            plan.summary().disk_entry_id != 0 &&
-            plan.summary().reuse_source == PrefixReuseSource::HostDisk) {
-            request->disk_plan.emplace(std::move(plan));
+        try {
+            Plan plan =
+                instance_.program->plan_disk_reuse(request->prompt, *request->base_plan);
+            if (plan.summary().reusable_prompt_tokens > 0 &&
+                plan.summary().disk_entry_id != 0 &&
+                plan.summary().reuse_source == PrefixReuseSource::HostDisk) {
+                request->disk_plan.emplace(std::move(plan));
+            }
+        } catch (const std::bad_alloc&) {
+            // Cache lookup is optional. Keep normal lane/cold admission available
+            // and remember this index version so allocation pressure cannot spin.
         }
         request->disk_index_version = version;
     }
@@ -1366,7 +1380,7 @@ private:
         }
         if (!copy_hold_->victims_evicted) {
             try {
-                for (const std::uint32_t victim : copy_hold_->victim_lanes) {
+                for (const std::uint32_t victim : std::span(copy_hold_->victim_lanes).first(copy_hold_->victim_count)) {
                     instance_.program->evict_retained_lane(victim);
                     invalidate_lane_plans(victim);
                 }
@@ -1402,7 +1416,7 @@ private:
                     if (!membership_empty) { return AdmissionProgress::CopyHold; }
                     instance_.program->wait_kv_ram_copies();
                 }
-                for (const std::uint32_t victim : hold.victim_lanes) {
+                for (const std::uint32_t victim : std::span(hold.victim_lanes).first(hold.victim_count)) {
                     instance_.program->evict_retained_lane(victim);
                     invalidate_lane_plans(victim);
                 }
@@ -1468,6 +1482,52 @@ private:
             (void)resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
             return AdmissionProgress::RanGpuUnit;
+        } catch (const CacheRestoreFailure&) {
+            // Host cache bytes are optional. Before prefill consumes the prompt,
+            // drain partial DMA and relinquish the failed reservation, then let
+            // normal FIFO admission recheck the cold reservation against peers.
+            if (!copy_hold_ || (!copy_hold_->disk_hit && !copy_hold_->ram_hit) ||
+                request->cache_fallback ||
+                prefill_lane_ || request->begin || !request->generated.empty()) {
+                throw;
+            }
+            instance_.program->cancel_disk_restore();
+            instance_.program->synchronize_all();
+            harvest_kv_copy_seconds(request);
+            if (copy_hold_->ram_claimed && !copy_hold_->ram_consumed) {
+                instance_.program->release_ram_entry(ram_entry_id);
+                copy_hold_->ram_claimed = false;
+                instance_.program->discard_ram_capture(ram_entry_id);
+            }
+            if (copy_hold_->disk_claimed && !copy_hold_->disk_consumed) {
+                instance_.program->release_disk_entry(disk_entry_id);
+                copy_hold_->disk_claimed = false;
+            }
+            if (copy_hold_->disk_hit) { instance_.program->invalidate_disk_entry(disk_entry_id); }
+            instance_.program->abort_lane(lane);
+            copy_hold_.reset();
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+            release_planning_state(request);
+            request->lane.reset();
+            request->budget.reset();
+            request->admission_resources = {};
+            request->remaining_service_work = 0;
+            request->backfill_epoch = 0;
+            request->backfill_class = BackfillClass::None;
+            request->cache_fallback = true;
+            request->options.execution.force_cold_prefill = true;
+            {
+                std::lock_guard lock(queue_mutex_);
+                const auto position = std::lower_bound(
+                    pending_.begin(), pending_.end(), request->queue_order,
+                    [](const auto& queued, std::uint64_t order) { return queued->queue_order < order; });
+                pending_.insert(position, request);
+                published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
+                                                  std::memory_order_relaxed);
+            }
+            publish_runtime_stats();
+            return AdmissionProgress::ControlProgress;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             if (copy_hold_) {
@@ -1504,7 +1564,7 @@ private:
                                                           LaneChoice choice,
                                                           BackfillClass backfill_class,
                                                           std::uint64_t backfill_epoch) {
-        if (Clock::now() >= request->deadline) {
+        if (!request->cache_fallback && Clock::now() >= request->deadline) {
             return remove_pending_error(
                 request, std::make_exception_ptr(RequestError(
                              RequestErrorKind::QueueTimeout,
@@ -1542,7 +1602,8 @@ private:
 
         bool ram_claimed  = false;
         bool disk_claimed = false;
-        std::vector<std::uint64_t> captured_ram_ids;
+        std::array<std::uint64_t, kMaximumConcurrency> captured_ram_ids{};
+        std::size_t captured_ram_count = 0;
         auto release_host_if_needed = [&]() {
             if (ram_claimed) {
                 try {
@@ -1558,12 +1619,12 @@ private:
             }
         };
         auto rollback_ram_captures = [&]() {
-            for (const std::uint64_t id : captured_ram_ids) {
+            for (const std::uint64_t id : std::span(captured_ram_ids).first(captured_ram_count)) {
                 try {
                     instance_.program->discard_ram_capture(id);
                 } catch (...) {}
             }
-            captured_ram_ids.clear();
+            captured_ram_count = 0;
         };
 
         try {
@@ -1574,7 +1635,8 @@ private:
                                                          disk_summary.disk_hash_f_lo,
                                                          disk_summary.disk_hash_f_hi,
                                                          disk_summary.reusable_prompt_tokens,
-                                                         disk_summary.disk_reuse_path)) {
+                                                         disk_summary.disk_reuse_path,
+                                                         disk_summary.disk_committed_generation)) {
                     request->disk_plan.reset();
                     release_host_if_needed();
                     return AdmissionProgress::None;
@@ -1586,21 +1648,11 @@ private:
                 instance_.program->claim_ram_entry(choice.ram_entry_id);
                 ram_claimed = true;
             }
-            std::vector<std::uint32_t> victims;
-            std::vector<std::uint32_t> capture_failed;
-            auto capture_fail_admit = [&]() {
-                harvest_kv_copy_seconds(request);
-                rollback_ram_captures();
-                release_host_if_needed();
-                harvest_kv_copy_seconds(request);
-                return remove_pending_error(
-                    request, std::make_exception_ptr(RequestError(
-                                 RequestErrorKind::Overloaded,
-                                 "KV RAM cannot capture a retained lane")));
-            };
+            std::array<std::uint32_t, kMaximumConcurrency> victims{};
+            std::size_t victim_count = 0;
             if (choice.evict_retained) {
                 while (!instance_.program->can_admit_lane_after_releasing(lane, winning_plan,
-                                                                          victims)) {
+                                                                          std::span(victims).first(victim_count))) {
                     std::optional<std::uint32_t> victim;
                     std::uint64_t victim_tick = 0;
                     for (std::uint32_t retained_lane = 0; retained_lane < max_concurrency_;
@@ -1609,12 +1661,8 @@ private:
                             !instance_.program->has_retained_lane(retained_lane)) {
                             continue;
                         }
-                        if (std::find(victims.begin(), victims.end(), retained_lane) !=
-                            victims.end()) {
-                            continue;
-                        }
-                        if (std::find(capture_failed.begin(), capture_failed.end(),
-                                      retained_lane) != capture_failed.end()) {
+                        if (std::find(victims.begin(), victims.begin() + victim_count, retained_lane) !=
+                            victims.begin() + victim_count) {
                             continue;
                         }
                         const std::uint64_t tick =
@@ -1624,26 +1672,26 @@ private:
                             victim_tick = tick;
                         }
                     }
-                    if (!victim) { return capture_fail_admit(); }
-                    std::uint64_t ram_id = 0;
-                    if (!instance_.program->capture_retained_lane(*victim, &ram_id)) {
-                        capture_failed.push_back(*victim);
-                        continue;
+                    if (!victim) {
+                        throw std::logic_error("selected admission cannot reclaim enough retained KV");
                     }
-                    if (ram_id != 0) { captured_ram_ids.push_back(ram_id); }
-                    victims.push_back(*victim);
+                    std::uint64_t ram_id = 0;
+                    // Saving a completed prefix is optional. Even if its host
+                    // image is dropped, this free lane can release its GPU pages.
+                    (void)instance_.program->capture_retained_lane(*victim, &ram_id);
+                    if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
+                    victims[victim_count++] = *victim;
                 }
             }
 
             if (instance_.program->has_retained_lane(lane) &&
                 (ram_hit || disk_hit || winning_plan.summary().reusable_prompt_tokens == 0)) {
                 std::uint64_t ram_id = 0;
-                if (!instance_.program->capture_retained_lane(lane, &ram_id)) {
-                    return capture_fail_admit();
-                }
-                if (ram_id != 0) { captured_ram_ids.push_back(ram_id); }
-                if (std::find(victims.begin(), victims.end(), lane) == victims.end()) {
-                    victims.push_back(lane);
+                (void)instance_.program->capture_retained_lane(lane, &ram_id);
+                if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
+                if (std::find(victims.begin(), victims.begin() + victim_count, lane) ==
+                    victims.begin() + victim_count) {
+                    victims[victim_count++] = lane;
                 }
             }
 
@@ -1701,7 +1749,8 @@ private:
                 .disk_hit        = disk_hit,
                 .disk_entry_id   = choice.disk_entry_id,
                 .disk_claimed    = disk_claimed,
-                .victim_lanes    = std::move(victims),
+                .victim_lanes    = victims,
+                .victim_count    = victim_count,
                 .needs_prefill   = needs_prefill,
             });
             ram_claimed  = false;
@@ -1767,7 +1816,7 @@ private:
                 }
                 continue;
             }
-            if (Clock::now() >= head->deadline) {
+            if (!head->cache_fallback && Clock::now() >= head->deadline) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
                               RequestErrorKind::QueueTimeout,
@@ -1834,7 +1883,7 @@ private:
                     }
                     continue;
                 }
-                if (Clock::now() >= candidate->deadline) {
+                if (!candidate->cache_fallback && Clock::now() >= candidate->deadline) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
                                        RequestErrorKind::QueueTimeout,
@@ -2207,6 +2256,7 @@ private:
     std::deque<std::shared_ptr<Request>> recovery_queue_;
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
+    std::uint64_t next_queue_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::optional<CopyHold> copy_hold_;

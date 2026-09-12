@@ -12,6 +12,7 @@
 
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
+#include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
@@ -78,6 +79,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    bool force_cold_prefill = false;
     bool capture_context_checkpoint = false;
 };
 
@@ -101,6 +103,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint64_t disk_entry_id               = 0;
     PrefixHash128 disk_hash_f{};
     std::uint32_t disk_execution_frontier     = 0;
+    std::uint64_t disk_committed_generation   = 0;
     bool capture_context_checkpoints          = false;
     bool capture_context_checkpoint           = false;
 };
@@ -146,54 +149,7 @@ struct RewriteCheckpoint {
     std::uint32_t frontier     = 0;
 };
 
-struct ContextCheckpointHead {
-    std::uint32_t frontier = 0;
-    qwen3_6::detail::PrefixHash128 hash{};
-    qwen3_6::detail::ContextCheckpointKind kind = qwen3_6::detail::ContextCheckpointKind::Ladder;
-    std::shared_ptr<PinnedHostBuffer> conv;
-    std::shared_ptr<PinnedHostBuffer> recurrent;
-    std::shared_ptr<PinnedHostBuffer> hidden;
-    std::shared_ptr<PinnedHostBuffer> dflash;
-    cudaEvent_t copies_done = nullptr;
-
-    ContextCheckpointHead() = default;
-    ContextCheckpointHead(const ContextCheckpointHead&)            = delete;
-    ContextCheckpointHead& operator=(const ContextCheckpointHead&) = delete;
-    ContextCheckpointHead(ContextCheckpointHead&& other) noexcept { *this = std::move(other); }
-    ContextCheckpointHead& operator=(ContextCheckpointHead&& other) noexcept {
-        if (this == &other) { return *this; }
-        release();
-        frontier     = other.frontier;
-        hash         = other.hash;
-        kind         = other.kind;
-        conv         = std::move(other.conv);
-        recurrent    = std::move(other.recurrent);
-        hidden       = std::move(other.hidden);
-        dflash       = std::move(other.dflash);
-        copies_done  = other.copies_done;
-        other.copies_done = nullptr;
-        other.frontier    = 0;
-        other.kind        = qwen3_6::detail::ContextCheckpointKind::Ladder;
-        return *this;
-    }
-    ~ContextCheckpointHead() { release(); }
-
-    void wait_copies() const {
-        if (copies_done != nullptr) { CUDA_CHECK(cudaEventSynchronize(copies_done)); }
-    }
-
-    void release() noexcept {
-        if (copies_done != nullptr) {
-            (void)cudaEventSynchronize(copies_done);
-            (void)cudaEventDestroy(copies_done);
-            copies_done = nullptr;
-        }
-        conv.reset();
-        recurrent.reset();
-        hidden.reset();
-        dflash.reset();
-    }
-};
+using ContextCheckpointHead = qwen3_6::detail::ContextCheckpointHead;
 
 struct ContextCheckpointIndex {
     std::uint32_t frontier = 0;
@@ -366,9 +322,11 @@ public:
     void consume_ram_entry(std::uint64_t entry_id);
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
-                                        std::uint32_t expected_reuse_base = 0,
-                                        PrefixReusePath expected_reuse = PrefixReusePath::FullReset);
+                                        std::uint32_t expected_reuse_base,
+                                        PrefixReusePath expected_reuse,
+                                        std::uint64_t expected_committed_generation);
     void release_disk_entry(std::uint64_t entry_id);
+    void invalidate_disk_entry(std::uint64_t entry_id);
     void consume_disk_entry(std::uint64_t entry_id);
     void prefetch_disk_window(std::uint64_t entry_id, std::uint32_t text_pages,
                               std::uint32_t backend_pages);
@@ -565,7 +523,7 @@ private:
         std::size_t conv_bytes, std::size_t recurrent_bytes, std::size_t hidden_bytes,
         std::size_t dflash_bytes);
     void record_context_checkpoint_head_use(ContextCheckpointHead& head, cudaStream_t stream);
-    void recycle_context_checkpoint_head(ContextCheckpointHead&& head);
+    void recycle_context_checkpoint_head(ContextCheckpointHead&& head) noexcept;
     void drop_context_checkpoints_after(SequenceState& sequence, std::uint32_t frontier) noexcept;
     void clear_context_checkpoints(SequenceState& sequence) noexcept;
     void install_ram_context_checkpoints(SequenceState& sequence,

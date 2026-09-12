@@ -200,9 +200,11 @@ public:
     void consume_ram_entry(std::uint64_t entry_id);
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
-                                        std::uint32_t expected_reuse_base = 0,
-                                        PrefixReusePath expected_reuse = PrefixReusePath::FullReset);
+                                        std::uint32_t expected_reuse_base,
+                                        PrefixReusePath expected_reuse,
+                                        std::uint64_t expected_committed_generation);
     void release_disk_entry(std::uint64_t entry_id);
+    void invalidate_disk_entry(std::uint64_t entry_id);
     void consume_disk_entry(std::uint64_t entry_id);
     void prefetch_disk_window(std::uint64_t entry_id, std::uint32_t text_pages,
                               std::uint32_t backend_pages);

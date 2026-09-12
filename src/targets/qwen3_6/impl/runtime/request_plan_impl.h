@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -119,6 +118,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling                       = translate_sampling(options.sampling);
     install_suppressed_tokens(base->sampling, options);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->force_cold_prefill             = options.force_cold_prefill;
     base->capture_context_checkpoint     = options.capture_context_checkpoint;
     if (options.capture_context_checkpoint &&
         !ninfer::context_checkpoint_capture_available(options.allow_prefix_reuse,
@@ -211,8 +211,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
 void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const ResidentStateView& view,
                                            const PreparedPromptData& prompt,
                                            const RequestBasePlanImpl& base) {
-    if (!base.allow_prefix_reuse || !prompt.identity.reusable || view.ledger == nullptr ||
-        view.identity == nullptr) {
+    if (!base.allow_prefix_reuse || base.force_cold_prefill || !prompt.identity.reusable ||
+        view.ledger == nullptr || view.identity == nullptr) {
         return;
     }
     std::vector<qwen3_6::detail::ContextCheckpointRef> heads;
@@ -241,24 +241,10 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
     plan.reuse      = selected.path;
     plan.reuse_base = selected.frontier;
 
-    // Unexpected-state diagnostic: the resident execution frontier matches the prompt, so a
-    // healthy MTP lane should append; the MTP continuation state instead says it cannot. This
-    // is the checkpoint/FullReset-fallback case the append gate was added for, so surface it
-    // rather than let the fallback happen silently.
-    if (speculative_backend == ninfer::SpeculativeBackend::Mtp && state.execution_frontier != 0 &&
-        qwen3_6::detail::prefix_matches(prompt, *state.ledger, *state.identity,
-                                       state.execution_frontier) &&
-        !qwen3_6::detail::mtp_prefix_reuse_ready(ninfer::PrefixReusePath::AppendAtFrontier,
-                                                  state.execution_frontier, state.mtp_kv_valid,
-                                                  state.tail_hidden_valid, mtp_cache_present)) {
-        std::fprintf(stderr,
-                     "[ninfer ERROR] qwen3_6 MTP prefix-reuse: execution frontier %u matches "
-                     "the prompt but MTP append is not ready (tail_hidden_valid=%d "
-                     "mtp_kv_valid=%u mtp_cache=%d); using %s@%u instead of append_frontier\n",
-                     state.execution_frontier, state.tail_hidden_valid ? 1 : 0, state.mtp_kv_valid,
-                     mtp_cache_present ? 1 : 0,
-                     qwen3_6::detail::reuse_path_name(selected.path), selected.frontier);
-    }
+    // Cancellation can retain the committed prefix while invalidating the
+    // provisional tail hidden. The reuse policy intentionally chooses a saved
+    // checkpoint or a cold prefill for that ordinary lifecycle state.
+
 }
 
 void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
@@ -292,6 +278,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         plan.disk_entry_id            = 0;
         plan.disk_hash_f              = {};
         plan.disk_execution_frontier  = 0;
+        plan.disk_committed_generation = 0;
         plan.reuse_base               = 0;
     } else if (plan.reuse_source == PrefixReuseSource::None) {
         plan.reuse_source = PrefixReuseSource::VramResident;
@@ -303,6 +290,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
     plan.summary.disk_hash_f_lo          = plan.disk_hash_f.lo;
     plan.summary.disk_hash_f_hi          = plan.disk_hash_f.hi;
     plan.summary.disk_execution_frontier = plan.disk_execution_frontier;
+    plan.summary.disk_committed_generation = plan.disk_committed_generation;
     plan.summary.disk_reuse_path         = plan.reuse;
     plan.summary.reuse_source            = plan.reuse_source;
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -421,14 +409,18 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    if (!kv_ram_cache_ || !base.allow_prefix_reuse || !prompt.identity.reusable) {
+    if (!kv_ram_cache_ || !base.allow_prefix_reuse || base.force_cold_prefill ||
+        !prompt.identity.reusable) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
     }
 
     const std::vector<qwen3_6::detail::PrefixHash128> chain =
         qwen3_6::detail::prefix_hash_chain(prompt);
-    const std::optional<qwen3_6::detail::RamMatch> match = kv_ram_cache_->plan_match(prompt, chain);
+    const std::optional<qwen3_6::detail::RamMatch> match = kv_ram_cache_->plan_match(
+        prompt, chain, qwen3_6::detail::ReuseBackendPolicy{
+            speculative_backend, decoder->mtp_cache() != nullptr,
+            dflash.has_value(), DFlashConfig::full_layers > 0});
     if (!match || match->reuse_base == 0) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
@@ -476,7 +468,8 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
 
-    if (!kv_disk_cache_ || !base.allow_prefix_reuse || !prompt.identity.reusable) {
+    if (!kv_disk_cache_ || !base.allow_prefix_reuse || base.force_cold_prefill ||
+        !prompt.identity.reusable) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
     }
@@ -484,7 +477,10 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
     const std::vector<qwen3_6::detail::PrefixHash128> chain =
         qwen3_6::detail::prefix_hash_chain(prompt);
     const std::optional<qwen3_6::detail::DiskMatch> match =
-        kv_disk_cache_->plan_match(prompt, chain);
+        kv_disk_cache_->plan_match(prompt, chain,
+            qwen3_6::detail::ReuseBackendPolicy{speculative_backend,
+                decoder->mtp_cache() != nullptr, dflash.has_value(),
+                DFlashConfig::full_layers > 0});
     if (!match || match->reuse_base == 0) {
         finish_request_plan(*plan, nullptr, prompt, base);
         return RequestPlan(std::move(plan));
@@ -525,6 +521,7 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
     plan->disk_entry_id             = match->entry_id;
     plan->disk_hash_f               = match->hash_f;
     plan->disk_execution_frontier   = match->execution_frontier;
+    plan->disk_committed_generation = match->committed_generation;
     finish_request_plan(*plan, &view, prompt, base);
     return RequestPlan(std::move(plan));
 }

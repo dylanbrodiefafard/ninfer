@@ -1,3 +1,5 @@
+#include "cuda_stream_gate.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/linear_attention_state.h"
@@ -14,6 +16,8 @@
 #include <vector>
 
 namespace {
+
+using ninfer::test::StreamCopyGate;
 
 constexpr int kWarmup = 1;
 constexpr int kIters  = 3;
@@ -206,7 +210,9 @@ int capture_bundle(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::
     source.tail_hidden          = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.stream               = stream;
-    return cache.capture(source) ? 0 : 1;
+    return cache.capture(source).status ==
+                   ninfer::targets::qwen3_6::detail::RamCaptureStatus::Captured
+               ? 0 : 1;
 }
 
 } // namespace
@@ -465,7 +471,12 @@ int main() {
     ninfer::DeviceBuffer rewrite_buf(10240);
     rewrite_buf.fill(0xa2);
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {10240});
+    ninfer::DeviceBuffer scratch(256);
+    cudaEvent_t compute_done{};
+    CUDA_CHECK(cudaEventCreate(&compute_done));
     ninfer::targets::qwen3_6::detail::KVRamCache cache(1024ULL * 1024ULL * 1024ULL);
+    StreamCopyGate capture_gate;
+    capture_gate.launch(ctx.copy_stream);
     if (capture_bundle(cache, kv_pool, contiguous, gdn, hidden, rewrite, ctx.copy_stream) != 0) {
         return fail("large SequenceState capture failed");
     }
@@ -474,9 +485,6 @@ int main() {
         cache.plan_match(prompt, ninfer::targets::qwen3_6::detail::prefix_hash_chain(prompt));
     if (!match) { return fail("large capture did not match"); }
 
-    ninfer::DeviceBuffer scratch(256);
-    cudaEvent_t compute_done{};
-    CUDA_CHECK(cudaEventCreate(&compute_done));
     CUDA_CHECK(cudaMemsetAsync(scratch.p, 0, 1, ctx.stream));
     CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
     CUDA_CHECK(cudaEventSynchronize(compute_done));
@@ -500,6 +508,7 @@ int main() {
         }
     }
     extra.release();
+    capture_gate.release();
     ctx.synchronize_all();
     if (!cache.copies_ready(match->entry_id)) {
         return fail("capture copies_ready stayed false after synchronize_all");
@@ -527,6 +536,9 @@ int main() {
     target.stream                    = ctx.copy_stream;
     cache.claim(match->entry_id);
     ctx.synchronize();
+    StreamCopyGate restore_gate;
+    restore_gate.launch(ctx.copy_stream);
+    // Timing starts after the gate, excluding the intentional completion delay.
     CUDA_CHECK(cudaEventRecord(start, ctx.copy_stream));
     (void)cache.unpack_device(match->entry_id, target);
     CUDA_CHECK(cudaEventRecord(stop, ctx.copy_stream));
@@ -536,6 +548,7 @@ int main() {
     if (cache.copies_ready(match->entry_id)) {
         return fail("restore H2D was drained by a compute-only wait; copies are on device.stream");
     }
+    restore_gate.release();
     CUDA_CHECK(cudaEventSynchronize(stop));
     ctx.synchronize_all();
     cache.consume(match->entry_id);

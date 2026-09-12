@@ -286,6 +286,39 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
     return true;
 }
 
+std::size_t longest_matching_prefix(
+    std::span<const TokenId> left_tokens, const ResidentPrefixIdentity& left,
+    std::span<const TokenId> right_tokens, const ResidentPrefixIdentity& right,
+    std::size_t limit) {
+    std::size_t count = std::min({limit, left_tokens.size(), right_tokens.size(),
+                                  left.size(), right.size()});
+    std::size_t matched = 0;
+    while (matched < count && left_tokens[matched] == right_tokens[matched] &&
+           left.token_types()[matched] == right.token_types()[matched] &&
+           left.positions(0)[matched] == right.positions(0)[matched] &&
+           left.positions(1)[matched] == right.positions(1)[matched] &&
+           left.positions(2)[matched] == right.positions(2)[matched]) {
+        ++matched;
+    }
+    count = matched;
+    const auto left_items = left.vision_items();
+    const auto right_items = right.vision_items();
+    for (std::size_t i = 0; i < std::max(left_items.size(), right_items.size()); ++i) {
+        const VisionItem* a = i < left_items.size() ? &left_items[i] : nullptr;
+        const VisionItem* b = i < right_items.size() ? &right_items[i] : nullptr;
+        const std::size_t a_begin = a ? a->token_spans.front().begin : count;
+        const std::size_t b_begin = b ? b->token_spans.front().begin : count;
+        const std::size_t begin = std::min(a_begin, b_begin);
+        if (begin >= count) { break; }
+        if (a == nullptr || b == nullptr || !same_item(*a, *b) ||
+            item_end(*a) > count || item_end(*b) > count) {
+            count = begin;
+            break;
+        }
+    }
+    return count;
+}
+
 bool prefix_items_complete_at(const std::vector<VisionItem>& items, std::size_t tokens) {
     std::size_t count = 0;
     return prefix_item_count(items, tokens, &count);

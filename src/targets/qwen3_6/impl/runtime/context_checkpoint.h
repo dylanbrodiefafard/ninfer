@@ -298,23 +298,39 @@ struct ResidentReuseState {
                : ninfer::PrefixReusePath::RestoreResponseCheckpoint;
 }
 
-// Human-readable reuse-path name for diagnostics (snake_case, matches the serve log naming).
-[[nodiscard]] constexpr const char* reuse_path_name(ninfer::PrefixReusePath path) noexcept {
-    switch (path) {
-        case ninfer::PrefixReusePath::FullReset:
-            return "full_reset";
-        case ninfer::PrefixReusePath::AppendAtFrontier:
-            return "append_frontier";
-        case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
-            return "restore_turn_checkpoint";
-        case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
-            return "restore_response_checkpoint";
-        case ninfer::PrefixReusePath::RestoreContextCheckpoint:
-            return "restore_context_checkpoint";
-        case ninfer::PrefixReusePath::RestoreTurnRollback:
-            return "restore_turn_rollback";
+struct ReuseBackendPolicy {
+    ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::None;
+    bool mtp_cache_present = false;
+    bool dflash_present = false;
+    bool dflash_full_layers = false;
+};
+
+// Filter every candidate before ranking, including candidates in different RAM
+// or disk entries. An unusable longer frontier cannot hide an earlier usable head.
+[[nodiscard]] inline bool reuse_candidate_ready(
+    const ResidentReuseState& state, ninfer::PrefixReusePath path,
+    std::uint32_t frontier, std::size_t prompt_tokens,
+    const ReuseBackendPolicy& policy) noexcept {
+    if (path == ninfer::PrefixReusePath::AppendAtFrontier) {
+        if (prompt_tokens == frontier && !state.tail_hidden_valid) { return false; }
+        if (policy.backend == ninfer::SpeculativeBackend::DFlash &&
+            state.dflash_context_frontier != frontier) { return false; }
     }
-    return "unknown";
+    if (policy.backend == ninfer::SpeculativeBackend::Mtp &&
+        !mtp_prefix_reuse_ready(path, frontier, state.mtp_kv_valid,
+                                state.tail_hidden_valid, policy.mtp_cache_present)) {
+        return false;
+    }
+    if (is_rewrite_checkpoint_restore(path) &&
+        policy.backend == ninfer::SpeculativeBackend::DFlash) {
+        if (!policy.dflash_present || state.dflash_context_frontier < frontier) { return false; }
+        if (policy.dflash_full_layers &&
+            !dflash_rewrite_checkpoint_ready(state.backend_image_present,
+                                              state.dflash_context_frontier, frontier)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // The resident prefix-reuse decision for one request. A matching execution frontier wins as
@@ -322,22 +338,18 @@ struct ResidentReuseState {
 // the checkpoint branch runs: DFlash needs its context at the frontier, MTP needs tail
 // hidden + MTP KV there. An unready append falls through to a usable rewrite or staged
 // checkpoint instead of forcing a FullReset later. Among the non-append candidates the
-// longest matching head wins; the per-backend tail checks can still FullReset a selected
-// restore the backend cannot legally continue.
+// longest matching head that the backend can legally continue wins.
 [[nodiscard]] inline PrefillReuseSelection decide_resident_reuse(
     const ResidentReuseState& state, const PreparedPromptData& prompt,
     ninfer::SpeculativeBackend backend, bool mtp_cache_present, bool dflash_present,
     bool dflash_full_layers) {
-    const bool dflash_append_ready =
-        backend != ninfer::SpeculativeBackend::DFlash ||
-        state.dflash_context_frontier == state.execution_frontier;
-    const bool mtp_append_ready =
-        backend != ninfer::SpeculativeBackend::Mtp ||
-        mtp_prefix_reuse_ready(ninfer::PrefixReusePath::AppendAtFrontier,
-                               state.execution_frontier, state.mtp_kv_valid,
-                               state.tail_hidden_valid, mtp_cache_present);
+    const ReuseBackendPolicy policy{backend, mtp_cache_present, dflash_present, dflash_full_layers};
+    const auto ready = [&](ninfer::PrefixReusePath path, std::uint32_t frontier) {
+        return reuse_candidate_ready(state, path, frontier, prompt.token_ids.size(), policy);
+    };
     const bool current_matches =
-        state.execution_frontier != 0 && dflash_append_ready && mtp_append_ready &&
+        state.execution_frontier != 0 &&
+        ready(ninfer::PrefixReusePath::AppendAtFrontier, state.execution_frontier) &&
         prefix_matches(prompt, *state.ledger, *state.identity, state.execution_frontier);
     bool rewrite_matches                     = false;
     ninfer::PrefixReusePath rewrite_path     = ninfer::PrefixReusePath::FullReset;
@@ -355,7 +367,8 @@ struct ResidentReuseState {
             state.rewrite_frontier <= state.identity->size()) {
             const PrefixHash128 hash =
                 prefix_hash_at(*state.ledger, *state.identity, state.rewrite_frontier);
-            if (hash_ok(state.rewrite_frontier, hash)) {
+            if (hash_ok(state.rewrite_frontier, hash) &&
+                ready(rewrite_restore_path(state.rewrite_kind), state.rewrite_frontier)) {
                 rewrite_matches  = true;
                 rewrite_frontier = state.rewrite_frontier;
                 rewrite_path     = rewrite_restore_path(state.rewrite_kind);
@@ -363,7 +376,8 @@ struct ResidentReuseState {
         }
         matching_heads.reserve(state.context_checkpoints.size());
         for (const ContextCheckpointRef& head : state.context_checkpoints) {
-            if (hash_ok(head.frontier, head.hash)) {
+            if (hash_ok(head.frontier, head.hash) &&
+                ready(reuse_path_for_context_checkpoint_kind(head.kind), head.frontier)) {
                 matching_heads.push_back(PrefillReuseHead{head.frontier, head.kind});
             }
         }
@@ -372,21 +386,6 @@ struct ResidentReuseState {
         select_resident_prefill_reuse(current_matches, state.execution_frontier,
                                       rewrite_matches, rewrite_frontier, rewrite_path,
                                       matching_heads);
-    if (backend == ninfer::SpeculativeBackend::Mtp &&
-        !mtp_prefix_reuse_ready(selected.path, selected.frontier, state.mtp_kv_valid,
-                                state.tail_hidden_valid, mtp_cache_present)) {
-        selected = {};
-    }
-    if (is_rewrite_checkpoint_restore(selected.path) &&
-        backend == ninfer::SpeculativeBackend::DFlash) {
-        bool ready = dflash_present && state.dflash_context_frontier >= selected.frontier;
-        if (dflash_full_layers) {
-            ready = ready && dflash_rewrite_checkpoint_ready(state.backend_image_present,
-                                                             state.dflash_context_frontier,
-                                                             selected.frontier);
-        }
-        if (!ready) { selected = {}; }
-    }
     return selected;
 }
 

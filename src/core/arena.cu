@@ -329,6 +329,13 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes + alignment - 1);
     if (err != cudaSuccess) {
+        if (err == cudaErrorMemoryAllocation) {
+            const cudaError_t pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
+                throw std::runtime_error(cuda_error_message("cudaMallocHost pending error", pending));
+            }
+            throw std::bad_alloc();
+        }
         throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }
 
@@ -369,9 +376,9 @@ HostPinnedArena::HostPinnedArena(std::size_t capacity_bytes) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("HostPinnedArena capacity must be nonzero");
     }
+    free_.push_back(FreeSpan{0, capacity_bytes});
     base_ = allocate_registered_host(capacity_bytes, mapping_bytes_);
     cap_  = capacity_bytes;
-    free_.push_back(FreeSpan{0, capacity_bytes});
 }
 
 HostPinnedArena::~HostPinnedArena() { free_registered_host(base_, mapping_bytes_); }
@@ -422,13 +429,21 @@ void* HostPinnedArena::try_alloc(std::size_t bytes, std::size_t align) {
 
         const std::size_t alloc_offset = span.offset + lead;
         const std::size_t tail         = span.size - lead - bytes;
+        // N live blocks can separate at most N+1 free spans. Reserve for the
+        // new block before publishing it so every later free is allocation-free,
+        // including a fragmented release order under host-memory pressure.
+        const std::size_t spans = live_.size() + 2;
+        if (free_.capacity() < spans) {
+            free_.reserve(std::max(spans, free_.capacity() * 2));
+        }
+        void* ptr = static_cast<unsigned char*>(base_) + alloc_offset;
+        const bool inserted = live_.emplace(ptr, LiveBlock{alloc_offset, bytes}).second;
+        if (!inserted) { throw std::logic_error("HostPinnedArena allocation overlaps a live block"); }
+        // All potentially allocating work precedes mutation of the free list.
         free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(index));
         if (tail != 0) { insert_free(alloc_offset + bytes, tail); }
         if (lead != 0) { insert_free(span.offset, lead); }
-
-        void* ptr         = static_cast<unsigned char*>(base_) + alloc_offset;
-        live_[ptr]        = LiveBlock{alloc_offset, bytes};
-        used_            += bytes;
+        used_ += bytes;
         return ptr;
     }
     return nullptr;

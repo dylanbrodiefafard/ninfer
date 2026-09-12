@@ -64,6 +64,12 @@ private:
                                   const ResidentPrefixIdentity& resident_identity,
                                   std::size_t count);
 
+// Longest identical represented input prefix, ending outside any Vision item.
+[[nodiscard]] std::size_t longest_matching_prefix(
+    std::span<const TokenId> left_tokens, const ResidentPrefixIdentity& left,
+    std::span<const TokenId> right_tokens, const ResidentPrefixIdentity& right,
+    std::size_t limit);
+
 [[nodiscard]] std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt);
 
 [[nodiscard]] PrefixHash128 prefix_hash_at(std::span<const TokenId> tokens,

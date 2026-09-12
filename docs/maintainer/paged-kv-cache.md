@@ -846,7 +846,10 @@ pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuati
 The optional pinned-host tier is an exclusive FIFO of completed retained SequenceState bundles
 that are not on a VRAM lane. Capture happens at the executor admission site that is about to
 destroy that bundle and appends a fresh D2H image at the FIFO tail. A capture that does not fit
-the host budget increments `drops` and the incoming request still proceeds. D2H/H2D run on
+the host budget increments `drops` once and the incoming request still proceeds. Capture reports
+`Captured`, `NeedsEviction`, or `Dropped`; only `NeedsEviction` permits the caller to spill/evict
+residents and retry. An image larger than the entire arena is `Dropped` without evicting any
+resident. D2H/H2D run on
 `DeviceContext::copy_stream`. Source GPU pages stay mapped until that entry's `copies_done` is
 ready; unpack is not ordered behind block-table publish on the compute stream. Restore writes the
 host image onto a new page mapping of the chosen free lane (an empty lane
@@ -857,8 +860,14 @@ Capture and restore both require a selected
 free lane; a queued request that cannot admit does not dump in-flight or other retained GPU
 state. Consume erases the host entry wherever it sits
 in the FIFO and retires the block; capacity eviction destroys the oldest unpinned resident and
-waits for its copy event before freeing. Both then follow the same checkpoint decision as VRAM
+waits for its copy event and all host-side event borrowers before freeing. A disk worker waiting
+on another pending image can borrow this event while the eviction's CUDA wait releases the RAM
+mutex; transfer completion alone does not retire that borrow. Both then follow the same checkpoint decision as VRAM
 prefix reuse.
+Before requesting capacity eviction, capture checks whether the image can fit a contiguous
+arena interval after removing unclaimed residents. A claimed restore source divides the arena
+into fixed gaps; if none can fit the image, capture drops once and preserves the other residents.
+Retired copies drain before this decision; temporary idle-spill I/O pins can drain before eviction.
 Logged `used`/`entries` (human `kv-ram=` / `n=`) are live host residents only. Serve and CLI also
 print CUDA D2H `save=` and H2D `load=` elapsed harvested after the first non-throwing
 `start_prefill_lane`. The host image packs logical page `i`
@@ -902,6 +911,22 @@ skipped, or held page/state objects. It memory-maps object maps, validates sorte
 and checks each live page CRC once across the bounded reader pool. Torn map tails are truncated;
 conflicting IDs, overlapping extents, corrupt live records, and unsupported fingerprints
 invalidate the affected store or entry according to their ownership boundary.
+Startup prepares index/FIFO or skipped-entry storage before acquiring object references.
+Validation workers contain their own exceptions, so transient allocation failure rejects an
+optional entry without terminating the process or deleting its durable image. If manifest
+enumeration must restart after partial publication, the rebuild resets the index, FIFO, skipped
+entries, and their reference counts together. Validation-cache cleanup releases its storage
+without allocating.
+
+Before the entry metadata rename, the spill worker prepares the replacement index node,
+FIFO capacity, predecessor object lists, and uncertainty-hold capacity. Publication then updates
+ownership without allocating; failed preparation drops the optional spill while preserving the
+previous generation and releasing its pins. Spill page batches have a fixed maximum of eight
+jobs, and idle-to-emergency promotion transfers its queue without allocation.
+Spill preparation transfers the caller's RAM pin only after all jobs are queued, so a failed
+queue allocation leaves exactly one caller-owned pin to release. Branch sharing reserves all
+rollback bookkeeping before acquiring references; allocation failure cannot leave an untracked
+shared reference.
 
 The fingerprint describes each packed logical-page plane by dtype, plane order, logical
 leading/head extents, and packed bytes per page. It deliberately excludes the resident GPU page
@@ -923,11 +948,30 @@ conservatively require a fresh cache directory. No model-size hashing pass is in
 startup. The trusted local owner must not mutate an artifact while an Engine is using it.
 Pre-v6 stores lack this boundary and are rejected, not silently adopted or automatically deleted.
 
+Exact-frontier reuse also requires a valid target tail-hidden image. In particular, speculative
+DFlash cancellation can retain the committed KV/GDN/context frontier while invalidating that
+image. An exact-prefix request must then use a valid checkpoint or recompute; a longer suffix
+may still reuse the frontier because suffix prefill produces fresh hidden state. This eligibility
+rule applies equally to VRAM, RAM, and disk candidates.
+
+Spill refresh, extension, and branching compare the exact represented input before sharing
+parent KV pages: token IDs, token types, all three MRoPE position axes, and complete media
+identity and geometry must match. The shared prefix ends before any changed or incomplete
+Vision item. A parent ticket or equal token IDs alone does not permit page reuse.
+For MTP, the last backend slot also depends on the sampled ledger token at the execution
+frontier. A same-frontier refresh preserves the full backend only when that token's identity
+and the valid extent are unchanged; otherwise it rewrites the affected tail, including any
+new page required when an exact-hit bridge extends validity after cancelled prefill.
+
 Compaction copies live extents into a new generation, publishes its complete base map, and then
 atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
 durable and all reader leases have drained. Admission requires the copy-on-write reserve before
 the first compaction or spill byte is written. Eviction uses durable tombstones so an uncertain
-metadata publication cannot make a referenced object reusable.
+metadata publication cannot make a referenced object reusable. Before capacity eviction, admission
+checks that the incoming incremental bytes plus unique extents protected by claims or I/O pins
+(including a spill's parent) fit the budget. Known capacity shortfalls are rejected without
+evicting unrelated residents. Shared protected extents are counted once, and refresh/extend
+replacement credit remains included in the incremental-byte calculation.
 
 Restore owns `2 * restore_io_threads` pinned page slots and equally sized device staging slots.
 Readers issue aligned direct reads into the pinned slots, validate each packed record, enqueue one
@@ -940,6 +984,36 @@ serial.
 The page window, state owners, destination page mappings, and generation lease remain alive until
 the copy-stream completion event has been consumed. The spill side uses separate pinned scratch,
 so an idle spill may overlap restore reads; emergency spill remains exclusive with restore I/O.
+Restore readiness requires the completed join of page scatter and independent state H2D, not
+only finished reads or empty page slots. Until that join completes, admission remains in
+copy-hold so other active requests can continue decoding.
+When admission uses prefetched pages, their queued reads become restore work and take priority
+over idle spill. Leaving required reads behind idle spill would deadlock, because the active
+restore itself prevents idle spill from advancing.
+Cancellation before source invalidation drains dequeued reader claims as well as active page
+and state transfers. A prefetched page retains its I/O pin from queue publication through reader
+retirement, including the interval before a transfer slot is assigned and exception cleanup.
+Prefix matching filters append and checkpoint candidates using the same backend-readiness
+rules as resident reuse before ranking them. An unusable canceled tail cannot shadow a usable
+checkpoint or another cache entry. Disk plans carry the selected committed generation; claim
+checks it before and after waiting for an idle rewrite, so a same-prefix refresh requires replanning.
+MTP disk validation requires pages for the declared valid backend extent; readiness checks exclude
+frontiers beyond that extent while preserving eligible earlier checkpoints.
+Cache-owned CUDA event creation treats only `cudaErrorMemoryAllocation` as recoverable
+allocation pressure; other CUDA statuses retain their execution-error classification. Checkpoint
+head and staging events exist before DMA can borrow their buffers. RAM teardown and the bounded
+admission/capture bookkeeping do not allocate.
+Optional RAM/disk candidate-planning allocation failure skips that candidate at its current index
+version and leaves ordinary lane/cold admission available.
+An expected disk read/decode failure or RAM/disk restore metadata allocation failure before prefill
+is a cache miss for the request. Drain its worker and CUDA owners, release the claim, and
+quarantine the failed disk entry or discard the RAM image before recomputing
+without reuse. Re-admission preserves request identity and FIFO ordering, rechecks the cold GPU
+reservation, and does not apply the initial queue deadline to an already-admitted recovery.
+The fallback is bounded to one cold-prefill retry, preserving the request's checkpoint-capture
+settings. Invariant and execution failures are not
+cache-miss signals. Quarantine uses normal tombstone/refcount eviction; if tombstone persistence
+fails, the entry stays unavailable in memory without dropping shared-object references.
 
 ---
 
@@ -1066,7 +1140,7 @@ fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降�
 | 只有更短 token prefix match，但该位置没有 checkpoint | cache miss |
 | retained occupancy 阻塞 admission | Prefix Cache eviction 完整 entry 后重试 atomic admission |
 | retained eviction 后，request set 满足 main contract 但 backend reservation 失败 | startup sizing 或 accounting invariant violation；不是正常等待条件 |
-| request cancellation | 未完成 prefill 回滚到 occupy base 上的 turn-rollback/ladder head，否则 rewrite checkpoint，丢掉其后的 staged heads 并 retain；occupy base 为 0 且没有 rewrite 时释放 bundle（含 staged heads）；speculative in-flight decode 丢掉本 unit 的 provisional result 并以 `commit_columns=0` fold 后 retain 已 commit 的 frontier；已 commit 的 decode/prefill frontier 与 OutputLimit 一样 retain，并保留该 frontier 及之前的 context-checkpoint heads |
+| request cancellation | 未完成 prefill 回滚到 occupy base 上的 turn-rollback/ladder head，否则 rewrite checkpoint，丢掉其后的 staged heads 并 retain；occupy base 为 0 且没有 rewrite 时释放 bundle（含 staged heads）；ordinary in-flight decode 已覆盖 GDN/hidden，释放 bundle，不能只回退 ledger 后缓存；speculative in-flight decode 丢掉本 unit 的 provisional result 并以 `commit_columns=0` fold 后 retain 已 commit 的 frontier；unit 之间已 commit 的 decode/prefill frontier 与 OutputLimit 一样 retain，并保留该 frontier 及之前的 context-checkpoint heads |
 | admitted request materialize 时无 free page | reservation-accounting violation，作为 Engine failure |
 | 一个 request 使用 main pool 大部分容量 | 合法，只要其他 per-pool entitlements 仍满足 invariants |
 
