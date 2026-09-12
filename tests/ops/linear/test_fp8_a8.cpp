@@ -56,6 +56,38 @@ int run_fp8_a8() {
         run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
                   {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
 
+    struct AddedProblem {
+        std::int32_t n;
+        std::int32_t k;
+        std::int32_t a8_first_t;
+    };
+    constexpr std::array added_shapes{
+        AddedProblem{10240, 2560, 8},   AddedProblem{6144, 2560, 13},
+        AddedProblem{12288, 2560, 5},   AddedProblem{512, 2560, 17},
+        AddedProblem{2560, 6144, 17},   AddedProblem{640, 2560, 17},
+        AddedProblem{1280, 2560, 17},   AddedProblem{2560, 640, 9},
+        AddedProblem{320, 10240, 13},   AddedProblem{10240, 320, 192},
+        AddedProblem{2560, 2560, 13},
+    };
+    std::uint32_t added_seed = 911U;
+    for (const auto& shape : added_shapes) {
+        const std::array invocations{
+            Invocation{shape.a8_first_t - 1, CallForm::Policy, ops::LinearPolicy::AllowA8},
+            Invocation{shape.a8_first_t, CallForm::Policy, ops::LinearPolicy::AllowA8},
+            Invocation{512, CallForm::Policy, ops::LinearPolicy::AllowA8},
+        };
+        failures += run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                              {shape.n, shape.k, added_seed, Comparison::Sampled, true,
+                               invocations});
+        added_seed += 2U;
+    }
+
+    constexpr std::array added_full_invocations{
+        Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
+    };
+    failures += run_shape("FP8_A8_ADDED_FULL", ActivationCompute::A8, make_fp8_weight,
+                          {512, 2560, 941U, Comparison::Full, true, added_full_invocations});
+
     struct Problem {
         std::int32_t rows;
         std::int32_t input_rows;
@@ -100,6 +132,23 @@ int run_fp8_a8() {
             a16 != 0) {
             std::cerr << "FP8 A8 workspace interval contract mismatch for N=" << problem.rows
                       << " K=" << problem.input_rows << '\n';
+            ++failures;
+        }
+    }
+    for (const auto& shape : added_shapes) {
+        const std::size_t below = ops::linear_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, shape.n, shape.k, ops::LinearPolicy::AllowA8,
+            shape.a8_first_t - 1, shape.a8_first_t - 1);
+        const std::size_t at = ops::linear_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, shape.n, shape.k, ops::LinearPolicy::AllowA8,
+            shape.a8_first_t, shape.a8_first_t);
+        const std::size_t span = ops::linear_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, shape.n, shape.k, ops::LinearPolicy::AllowA8, 1, 512);
+        const std::size_t a16 = ops::linear_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, shape.n, shape.k, ops::LinearPolicy::A16Only, 1, 4096);
+        if (below != 0 || at == 0 || span < at || a16 != 0) {
+            std::cerr << "FP8 added A8 workspace interval contract mismatch for N=" << shape.n
+                      << " K=" << shape.k << '\n';
             ++failures;
         }
     }

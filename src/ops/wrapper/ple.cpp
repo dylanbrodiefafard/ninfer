@@ -4,9 +4,11 @@
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/ple.h"
+#include "ops/common/quantized_projection.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +36,10 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
 
 void require_q8_weight(const Weight& weight, std::int32_t rows, const char* name) {
     constexpr std::int32_t columns = kPleEmbeddingWidth;
+    if (detail::is_native_quantized_projection(weight.qtype)) {
+        detail::validate_native_projection(weight, rows, columns, name);
+        return;
+    }
     constexpr std::uint64_t row_bytes = (columns / 32) * 34;
     const std::uint64_t expected = static_cast<std::uint64_t>(rows) * row_bytes;
     if (weight.qtype != QType::GGML_Q8_0 || weight.layout != QuantLayout::GgmlBlockRow ||
@@ -65,9 +71,18 @@ Scratch allocate_scratch(Allocator& allocator, std::int32_t width) {
     };
 }
 
-std::size_t required_workspace(std::int32_t width) {
+std::size_t required_workspace(std::int32_t width, QType key, QType value) {
+    for (QType type : {key, value}) {
+        if (type != QType::GGML_Q8_0 && !detail::is_native_quantized_projection(type)) {
+            throw std::invalid_argument("ple_inject: unsupported projection format");
+        }
+    }
     WorkspaceLayoutBuilder layout;
     (void)allocate_scratch(layout, width);
+    const auto bytes = std::max(
+        detail::projection_workspace_bytes(key, kPleChannels, kPleEmbeddingWidth, width),
+        detail::projection_workspace_bytes(value, kPleEmbeddingWidth, kPleEmbeddingWidth, width));
+    if (bytes) { (void)layout.alloc_bytes(bytes); }
     return layout.peak_bytes();
 }
 
@@ -168,11 +183,11 @@ void ple_iq4_nl_decode_rows(const Tensor& device_rows, Tensor& embedding, cudaSt
     detail::ple_iq4_nl_decode_rows_launch(device_rows, embedding, stream);
 }
 
-std::size_t ple_workspace_capacity_bytes(std::int32_t width) {
+std::size_t ple_workspace_capacity_bytes(std::int32_t width, QType key, QType value) {
     if (width <= 0 || width > 4096) {
         throw std::invalid_argument("ple_workspace_capacity_bytes: width must be in [1,4096]");
     }
-    return required_workspace(width);
+    return required_workspace(width, key, value);
 }
 
 void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
@@ -201,7 +216,7 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
                    "residual_out");
     require_q8_weight(key_weight, kPleChannels, "key_weight");
     require_q8_weight(value_weight, kPleEmbeddingWidth, "value_weight");
-    const std::size_t required = required_workspace(width);
+    const std::size_t required = required_workspace(width, key_weight.qtype, value_weight.qtype);
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("ple_inject: insufficient workspace capacity");
@@ -239,8 +254,8 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
 
     auto scope     = workspace.scope();
     Scratch scratch = allocate_scratch(workspace, width);
-    ggml_block_linear(embedding, key_weight, scratch.key, stream);
-    ggml_block_linear(embedding, value_weight, scratch.value, stream);
+    detail::quantized_projection(embedding, key_weight, scratch.key, workspace, stream);
+    detail::quantized_projection(embedding, value_weight, scratch.value, workspace, stream);
     detail::ple_gate_launch(residual, scratch.key, scratch.value, key_norm_weight,
                             query_norm_weight, scratch.gated, stream);
     detail::ple_conv_input_launch(scratch.gated, conv_norm_weight, scratch.current_state, stream);

@@ -1,6 +1,7 @@
 #include "ninfer/ops/gated_residual.h"
 
 #include "ops/op_tester.h"
+#include "ops/native_projection_fixture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -122,6 +123,8 @@ std::vector<double> q8_project(const std::vector<std::uint8_t>& weight, std::int
 }
 
 struct Fixture {
+    QType down_type, up_type;
+    quantized_weight::PackedWeight native_down, native_up;
     std::vector<float> norm;
     std::vector<std::uint8_t> down;
     std::vector<std::uint8_t> up;
@@ -131,9 +134,17 @@ struct Fixture {
     DeviceBuffer d_up;
     DeviceBuffer d_write;
 
-    Fixture()
-        : norm(kFlat), down(make_q8(kRank, kFlat, 7102U)),
+    Fixture(QType down_format = QType::GGML_Q8_0, QType up_format = QType::GGML_Q8_0)
+        : down_type(down_format), up_type(up_format), norm(kFlat), down(make_q8(kRank, kFlat, 7102U)),
           up(make_q8(kFlat, kRank, 7103U)), write(static_cast<std::size_t>(kBranches) * kFlat) {
+        if (native_projection_format(down_type)) {
+            native_down = native_projection_fixture(down_type, kRank, kFlat, 7102U);
+            down = native_down.payload;
+        }
+        if (native_projection_format(up_type)) {
+            native_up = native_projection_fixture(up_type, kFlat, kRank, 7103U);
+            up = native_up.payload;
+        }
         fill_uniform(norm, 7101U, 0.80F, 1.20F);
         fill_uniform(write, 7104U, -0.003F, 0.003F);
         d_norm = to_device_f32(norm);
@@ -169,9 +180,13 @@ OracleResult oracle(const Fixture& fixture, const std::vector<float>& residual,
             }
         }
 
-        std::vector<double> low_rank = q8_project(fixture.down, kRank, kFlat, normalized);
+        std::vector<double> low_rank = native_projection_format(fixture.down_type)
+            ? native_projection_oracle(fixture.native_down, normalized)
+            : q8_project(fixture.down, kRank, kFlat, normalized);
         for (double& value : low_rank) { value = silu(value / 4.0); }
-        const std::vector<double> up = q8_project(fixture.up, kFlat, kRank, low_rank);
+        const std::vector<double> up = native_projection_format(fixture.up_type)
+            ? native_projection_oracle(fixture.native_up, low_rank)
+            : q8_project(fixture.up, kFlat, kRank, low_rank);
         for (std::int32_t d = 0; d < kHidden; ++d) {
             double mixed = 0.0;
             for (std::int32_t branch = 0; branch < kBranches; ++branch) {
@@ -223,9 +238,14 @@ int run_case(const Fixture& fixture, std::int32_t tokens, const char* label) {
     Tensor mixed_tensor(d_mixed.data(), DType::BF16, {kHidden, tokens});
     Tensor read_only_tensor(d_read_only.data(), DType::BF16, {kHidden, tokens});
     Tensor scale_tensor(d_scale.data(), DType::BF16, {kBranches, tokens});
-    const Weight down_weight = q8_weight(fixture.d_down.p, fixture.d_down.bytes, kRank, kFlat);
-    const Weight up_weight = q8_weight(fixture.d_up.p, fixture.d_up.bytes, kFlat, kRank);
-    const std::size_t workspace_bytes = ops::gated_residual_workspace_capacity_bytes(tokens);
+    const Weight down_weight = native_projection_format(fixture.down_type)
+        ? fixture.native_down.device_weight(fixture.d_down.p)
+        : q8_weight(fixture.d_down.p, fixture.d_down.bytes, kRank, kFlat);
+    const Weight up_weight = native_projection_format(fixture.up_type)
+        ? fixture.native_up.device_weight(fixture.d_up.p)
+        : q8_weight(fixture.d_up.p, fixture.d_up.bytes, kFlat, kRank);
+    const std::size_t workspace_bytes = ops::gated_residual_workspace_capacity_bytes(
+        tokens, down_weight.qtype, up_weight.qtype);
     WorkspaceArena workspace(workspace_bytes);
 
     ops::gated_residual_read_write(residual_tensor, norm_tensor, down_weight, up_weight,
@@ -298,6 +318,10 @@ int main() {
     failures += run_case(fixture, 3, "gated residual uneven T=3");
     failures += run_case(fixture, 64, "gated residual T=64");
     failures += run_case(fixture, 65, "gated residual T=65");
+    Fixture fp8(QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S);
+    failures += run_case(fp8, 3, "gated residual FP8");
+    Fixture mixed(QType::FP8_E4M3FN_ROW_BF16S, QType::NVFP4);
+    failures += run_case(mixed, 33, "gated residual FP8/NVFP4");
     try {
         const std::size_t broad = ops::gated_residual_workspace_capacity_bytes(4096);
         if (broad <= ops::gated_residual_workspace_capacity_bytes(65)) {

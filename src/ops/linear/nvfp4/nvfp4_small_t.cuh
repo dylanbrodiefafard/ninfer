@@ -61,11 +61,10 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                          [Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerWarpPhase = 32 * Schedule::kValuesPerLane;
     constexpr int kValuesPerPhase     = Schedule::kWarpsPerRow * kValuesPerWarpPhase;
-    constexpr int kPhases             = Geometry::kInputRows / kValuesPerPhase;
+    constexpr int kPhases = (Geometry::kInputRows + kValuesPerPhase - 1) / kValuesPerPhase;
+    constexpr bool kHasTail = (Geometry::kInputRows % kValuesPerPhase) != 0;
     constexpr int kGroupsPerLane =
         Schedule::kValuesPerLane < 16 ? 1 : Schedule::kValuesPerLane / 16;
-    static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
-
 #pragma unroll Schedule::kPhaseUnroll
     for (int phase = 0; phase < kPhases; ++phase) {
         if constexpr (Schedule::kActivationAccess == Nvfp4SmallTActivationAccess::SharedPhase) {
@@ -78,42 +77,51 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                 const int local_token = task / kPacksPerToken;
                 const int local_pack  = task - local_token * kPacksPerToken;
                 const int token       = token0 + local_token;
+                const int value_begin = phase * kValuesPerPhase + local_pack * 8;
                 if (token < ActiveTokens) {
-                    const __nv_bfloat16* source = activation.values(
-                        token, phase * kValuesPerPhase + local_pack * 8);
-                    destination[task] = load_vec<uint4>(source);
+                    if (!kHasTail || value_begin < Geometry::kInputRows) {
+                        const __nv_bfloat16* source = activation.values(token, value_begin);
+                        destination[task]           = load_vec<uint4>(source);
+                    } else {
+                        destination[task] = {};
+                    }
                 }
             }
             __syncthreads();
         }
 
         const int warp_phase = phase * Schedule::kWarpsPerRow + warp_in_row;
+        const int lane_value_begin = phase * kValuesPerPhase +
+                                     warp_in_row * kValuesPerWarpPhase +
+                                     lane * Schedule::kValuesPerLane;
+        const bool lane_active = !kHasTail || lane_value_begin < Geometry::kInputRows;
         float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
-        Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
+        Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp] = {};
 #pragma unroll
         for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
-            load_nvfp4_coefficients<Geometry, Schedule>(
-                scales, shared.gemv, parent_rows[local_row], flat_row0 + local_row, warp_phase,
-                lane, inverse_weight_divisor, coefficients[local_row]);
-            const std::int64_t code_offset =
-                static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
-                phase * (kValuesPerPhase / 2) + warp_in_row * (kValuesPerWarpPhase / 2) +
-                lane * Schedule::kPairsPerLane;
-            row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
-                codes + code_offset);
+            if (lane_active) {
+                load_nvfp4_coefficients<Geometry, Schedule>(
+                    scales, shared.gemv, parent_rows[local_row], flat_row0 + local_row,
+                    warp_phase, lane, inverse_weight_divisor, coefficients[local_row]);
+                const std::int64_t code_offset =
+                    static_cast<std::int64_t>(parent_rows[local_row]) *
+                        Geometry::kCodeBytesPerRow +
+                    lane_value_begin / 2;
+                row_codes[local_row] =
+                    load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
+                        codes + code_offset);
+            }
         }
 
+        if (lane_active) {
         if constexpr (Schedule::kActivationAccess == Nvfp4SmallTActivationAccess::TokenPacked) {
             Nvfp4ActivationPack<Schedule::kValuesPerLane> staged[Schedule::kTokenTile];
 #pragma unroll
             for (int local_token = 0; local_token < Schedule::kTokenTile; ++local_token) {
                 const int token = token0 + local_token;
                 if (token < ActiveTokens) {
-                    const int value_begin = phase * kValuesPerPhase +
-                                            warp_in_row * kValuesPerWarpPhase +
-                                            lane * Schedule::kValuesPerLane;
                     staged[local_token] = load_nvfp4_activation_pack<Schedule::kValuesPerLane>(
-                        activation.values(token, value_begin));
+                        activation.values(token, lane_value_begin));
                 }
             }
 
@@ -194,6 +202,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                     }
                 }
             }
+        }
         }
 
         // Trailing barrier after the last phase is dead: nothing else reads shared.activation.

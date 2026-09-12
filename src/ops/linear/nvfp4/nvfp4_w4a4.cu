@@ -1,6 +1,7 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include "core/device.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
@@ -125,6 +126,15 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
     case Nvfp4Activation10240Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation10240Geometry>(x, weight, workspace, stream);
         return;
+    case Nvfp4Activation2560Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation2560Geometry>(x, weight, workspace, stream);
+        return;
+    case Nvfp4Activation640Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation640Geometry>(x, weight, workspace, stream);
+        return;
+    case Nvfp4Activation320Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation320Geometry>(x, weight, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
     }
@@ -153,11 +163,24 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::MtpFc:
         launch_problem<Nvfp4MtpFcGeometry>(weight, out, workspace, tokens, stream);
         return;
+    case Nvfp4Problem::N10240K2560:
+    case Nvfp4Problem::N6144K2560:
+    case Nvfp4Problem::N12288K2560:
+    case Nvfp4Problem::N512K2560:
+    case Nvfp4Problem::N2560K6144:
+    case Nvfp4Problem::N640K2560:
+    case Nvfp4Problem::N1280K2560:
+    case Nvfp4Problem::N2560K640:
+    case Nvfp4Problem::N10240K320:
+    case Nvfp4Problem::N2560K2560:
+        launch_nvfp4_exact_geometry_w4a4(weight, out, workspace, stream);
+        return;
     case Nvfp4Problem::DflashFeature:
     case Nvfp4Problem::DflashQkv:
     case Nvfp4Problem::DflashAttnOut:
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
+    case Nvfp4Problem::N248320K2560:
         break;
     }
     throw std::invalid_argument("nvfp4 W4A4 linear: DFlash2 problems are A16-only");

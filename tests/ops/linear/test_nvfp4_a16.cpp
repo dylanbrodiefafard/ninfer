@@ -3,6 +3,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <utility>
 
 namespace {
 
@@ -32,6 +33,23 @@ int run_nvfp4_a16() {
         Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
+    constexpr std::array exact_geometry_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{2, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{5, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{16, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{32, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{63, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{64, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{65, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{127, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{128, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{255, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{256, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{257, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
     int failures = 0;
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {14336, 5120, 701U, Comparison::Sampled, true, attn_invocations});
@@ -55,6 +73,18 @@ int run_nvfp4_a16() {
                           {256, 5120, 721U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
+    std::uint32_t exact_seed = 740U;
+    for (const auto [n, k] : {
+             std::pair{10240, 2560}, std::pair{6144, 2560},  std::pair{12288, 2560},
+             std::pair{512, 2560},   std::pair{2560, 6144}, std::pair{640, 2560},
+             std::pair{1280, 2560},  std::pair{2560, 640},  std::pair{10240, 320},
+             std::pair{2560, 2560},  std::pair{248320, 2560},
+         }) {
+        failures += run_shape("NVFP4_A16 exact geometry", ActivationCompute::A16,
+                              make_nvfp4_weight,
+                              {n, k, exact_seed++, Comparison::Sampled, true,
+                               exact_geometry_invocations});
+    }
     constexpr std::array<std::int32_t, 3> dflash_batches{2, 3, 4};
     failures += run_packed_sequences_matches_panels(
         "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, 5,

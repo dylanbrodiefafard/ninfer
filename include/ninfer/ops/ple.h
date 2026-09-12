@@ -67,14 +67,17 @@ void ple_iq4_nl_stage_rows_batch(const PleMappedIq4NlTable& table,
  */
 void ple_iq4_nl_decode_rows(const Tensor& device_rows, Tensor& embedding, cudaStream_t stream);
 
-/** Fixed transient device capacity for ple_inject at exact C=1 width W. */
-[[nodiscard]] std::size_t ple_workspace_capacity_bytes(std::int32_t width);
+/** Transient capacity for C=1 width W and explicit projection formats (GGUF defaults).
+ * Native formats use Linear A16Only. The mapped table format is unchanged. */
+[[nodiscard]] std::size_t ple_workspace_capacity_bytes(
+    std::int32_t width, QType key = QType::GGML_Q8_0, QType value = QType::GGML_Q8_0);
 
 /**
  * Complete preview PLE injection and convolution-state transition for C=1.
  *
  * residual/residual_out are contiguous BF16 [2560,4,W], embedding is BF16 [2560,W]. key_weight is
- * GGML Q8_0 [10240,2560], value_weight is GGML Q8_0 [2560,2560]. key_norm_weight,
+ * Q8_0, NVFP4 or row-scaled FP8 [10240,2560]; value_weight independently uses those formats
+ * at [2560,2560]. key_norm_weight,
  * query_norm_weight, and conv_norm_weight are FP32 [10240]; conv_weight has mathematical shape
  * [10240,4] and contiguous physical Tensor shape [4,10240] (four taps fastest per channel).
  * old_conv_state/new_conv_state are BF16 [10240,9]. The two state tensors may be disjoint or alias

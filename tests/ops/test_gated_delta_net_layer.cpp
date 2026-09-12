@@ -1,6 +1,7 @@
 #include "ninfer/ops/gated_delta_net_layer.h"
 
 #include "ops/op_tester.h"
+#include "ops/native_projection_fixture.h"
 #include "ops/launcher/gated_delta_net_layer.h"
 
 #include <algorithm>
@@ -237,6 +238,7 @@ Weight ggml_weight(void* data, std::uint64_t bytes, QType qtype, std::int32_t ro
 
 struct Fixture {
     QType input_qtype;
+    quantized_weight::PackedWeight native_qkv, native_z, native_output;
     std::vector<std::uint8_t> qkv;
     std::vector<std::uint8_t> z;
     std::vector<float> a;
@@ -265,6 +267,14 @@ struct Fixture {
           conv(static_cast<std::size_t>(kQkvRows) * 4), ssm_a(kValueHeads),
           dt_bias(kValueHeads), norm(kHeadDim),
           output(make_quant(QType::GGML_Q6_K, kHidden, kValueRows, 8109U)) {
+        if (native_projection_format(input_format)) {
+            native_qkv = native_projection_fixture(input_format, kQkvRows, kHidden, 8101U);
+            native_z = native_projection_fixture(input_format, kValueRows, kHidden, 8102U);
+            native_output = native_projection_fixture(input_format, kHidden, kValueRows, 8109U);
+            qkv = native_qkv.payload;
+            z = native_z.payload;
+            output = native_output.payload;
+        }
         fill_uniform(a, 8103U, -0.008F, 0.008F);
         fill_uniform(b, 8104U, -0.008F, 0.008F);
         fill_uniform(conv, 8105U, -0.20F, 0.20F);
@@ -286,15 +296,18 @@ struct Fixture {
 
     ops::GatedDeltaNetLayerWeights views() {
         return {
-            ggml_weight(d_qkv.p, d_qkv.bytes, input_qtype, kQkvRows, kHidden),
-            ggml_weight(d_z.p, d_z.bytes, input_qtype, kValueRows, kHidden),
+            native_projection_format(input_qtype) ? native_qkv.device_weight(d_qkv.p)
+                : ggml_weight(d_qkv.p, d_qkv.bytes, input_qtype, kQkvRows, kHidden),
+            native_projection_format(input_qtype) ? native_z.device_weight(d_z.p)
+                : ggml_weight(d_z.p, d_z.bytes, input_qtype, kValueRows, kHidden),
             Tensor(d_a.p, DType::FP32, {kHidden, kValueHeads}),
             Tensor(d_b.p, DType::FP32, {kHidden, kValueHeads}),
             Tensor(d_conv.p, DType::FP32, {4, kQkvRows}),
             Tensor(d_ssm_a.p, DType::FP32, {kValueHeads}),
             Tensor(d_dt_bias.p, DType::FP32, {kValueHeads}),
             Tensor(d_norm.p, DType::FP32, {kHeadDim}),
-            ggml_weight(d_output.p, d_output.bytes, QType::GGML_Q6_K, kHidden, kValueRows),
+            native_projection_format(input_qtype) ? native_output.device_weight(d_output.p)
+                : ggml_weight(d_output.p, d_output.bytes, QType::GGML_Q6_K, kHidden, kValueRows),
         };
     }
 };
@@ -352,10 +365,12 @@ OracleResult oracle(const Fixture& fixture, const std::vector<float>& input,
         for (std::int32_t d = 0; d < kHidden; ++d) {
             token_input[d] = input[static_cast<std::size_t>(token) * kHidden + d];
         }
-        const auto raw_token =
-            project_quant(fixture.qkv, fixture.input_qtype, kQkvRows, kHidden, token_input);
-        const auto z_token =
-            project_quant(fixture.z, fixture.input_qtype, kValueRows, kHidden, token_input);
+        const auto raw_token = native_projection_format(fixture.input_qtype)
+            ? native_projection_oracle(fixture.native_qkv, token_input)
+            : project_quant(fixture.qkv, fixture.input_qtype, kQkvRows, kHidden, token_input);
+        const auto z_token = native_projection_format(fixture.input_qtype)
+            ? native_projection_oracle(fixture.native_z, token_input)
+            : project_quant(fixture.z, fixture.input_qtype, kValueRows, kHidden, token_input);
         for (std::int32_t row = 0; row < kQkvRows; ++row) {
             raw[static_cast<std::size_t>(token) * kQkvRows + row] =
                 represented_bf16(raw_token[row]);
@@ -487,8 +502,9 @@ OracleResult oracle(const Fixture& fixture, const std::vector<float>& input,
         for (std::int32_t d = 0; d < kValueRows; ++d) {
             token_input[d] = normalized_gated[static_cast<std::size_t>(token) * kValueRows + d];
         }
-        const auto token_output =
-            project_quant(fixture.output, QType::GGML_Q6_K, kHidden, kValueRows, token_input);
+        const auto token_output = native_projection_format(fixture.input_qtype)
+            ? native_projection_oracle(fixture.native_output, token_input)
+            : project_quant(fixture.output, QType::GGML_Q6_K, kHidden, kValueRows, token_input);
         for (std::int32_t row = 0; row < kHidden; ++row) {
             output[static_cast<std::size_t>(token) * kHidden + row] = token_output[row];
         }
@@ -522,7 +538,8 @@ int run_complete_case(Fixture& fixture, std::int32_t tokens, const char* label) 
     Tensor ssm_out(d_ssm_out.data(), DType::FP32, {kHeadDim, kHeadDim, kValueHeads});
     Tensor output(d_output.data(), DType::BF16, {kHidden, tokens});
     auto weights = fixture.views();
-    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(tokens);
+    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(
+        tokens, weights.qkv.qtype, weights.z.qtype, weights.output.qtype);
     WorkspaceArena full_workspace(full_bytes);
     ops::gated_delta_net_layer(x, weights, conv_in, conv_out, ssm_in, ssm_out, output,
                                full_workspace, nullptr);
@@ -632,13 +649,15 @@ int run_partition_case(Fixture& fixture, std::int32_t tokens,
     Tensor partition_output_t(partition_output.data(), DType::BF16, {kHidden, tokens});
     auto weights = fixture.views();
 
-    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(tokens);
+    const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(
+        tokens, weights.qkv.qtype, weights.z.qtype, weights.output.qtype);
     WorkspaceArena full_workspace(full_bytes);
     ops::gated_delta_net_layer(x, weights, full_conv_t, full_conv_t, full_ssm_t, full_ssm_t,
                                full_output_t, full_workspace, nullptr);
 
     const std::size_t partition_bytes =
-        ops::gated_delta_net_layer_workspace_capacity_bytes(maximum_chunk);
+        ops::gated_delta_net_layer_workspace_capacity_bytes(
+            maximum_chunk, weights.qkv.qtype, weights.z.qtype, weights.output.qtype);
     WorkspaceArena partition_workspace(partition_bytes);
     std::int32_t offset = 0;
     for (const std::int32_t chunk : chunks) {
@@ -657,9 +676,34 @@ int run_partition_case(Fixture& fixture, std::int32_t tokens,
     std::vector<double> full_reference(full_output_values.begin(), full_output_values.end());
     int failures = verify_reduction(prefix + " partition output", partition_output_values,
                                     full_reference, kOutputCriterion);
-    failures += verify_exact((prefix + " partition conv state").c_str(),
-                             from_device<std::uint16_t>(partition_conv, initial_conv.size()),
-                             from_device<std::uint16_t>(full_conv, initial_conv.size()));
+    if (native_projection_format(fixture.input_qtype)) {
+        // Persistent convolution history is the last three represented QKV projections.
+        // Qualify both reduction routes against that oracle, not against each other's bits.
+        std::vector<double> expected_conv(initial_conv.begin(), initial_conv.end());
+        for (int history = 0; history < 3; ++history) {
+            const int token = tokens - 3 + history;
+            if (token < 0) {
+                std::copy_n(initial_conv.begin() + (tokens + history) * kQkvRows, kQkvRows,
+                            expected_conv.begin() + history * kQkvRows);
+                continue;
+            }
+            const auto begin = input.begin() + static_cast<std::size_t>(token) * kHidden;
+            const std::vector<double> token_input(begin, begin + kHidden);
+            const auto projected = native_projection_oracle(fixture.native_qkv, token_input);
+            for (int row = 0; row < kQkvRows; ++row) {
+                expected_conv[static_cast<std::size_t>(history) * kQkvRows + row] =
+                    represented_bf16(projected[row]);
+            }
+        }
+        failures += verify_reduction(prefix + " full conv state",
+            from_device_bf16(full_conv, initial_conv.size()), expected_conv, kConvStateCriterion);
+        failures += verify_reduction(prefix + " partition conv state",
+            from_device_bf16(partition_conv, initial_conv.size()), expected_conv, kConvStateCriterion);
+    } else {
+        failures += verify_exact((prefix + " partition conv state").c_str(),
+                                 from_device<std::uint16_t>(partition_conv, initial_conv.size()),
+                                 from_device<std::uint16_t>(full_conv, initial_conv.size()));
+    }
     const auto full_ssm_values = from_device<float>(full_ssm, initial_ssm.size());
     const auto partition_ssm_values = from_device<float>(partition_ssm, initial_ssm.size());
     failures += verify_reduction(prefix + " partition SSM state",
@@ -689,6 +733,18 @@ int main() {
     failures += run_partition_case(q5_fixture, 65, {64, 1}, "GDN chunk tail");
     Fixture q6_fixture(QType::GGML_Q6_K);
     failures += run_complete_case(q6_fixture, 1, "GDN layer-2 Q6_K/Q6_K");
+    for (QType type : {QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S}) {
+        Fixture native(type);
+        failures += run_complete_case(native, 3, type == QType::NVFP4 ? "GDN NVFP4" : "GDN FP8");
+        failures += run_partition_case(native, 65, {32, 33}, "GDN native partition");
+        failures += run_partition_case(native, 257, {128, 129}, "GDN native wide partition");
+        if (type == QType::NVFP4) {
+            native.native_z = native_projection_fixture(QType::FP8_E4M3FN_ROW_BF16S,
+                                                          kValueRows, kHidden, 8102U);
+            native.d_z = to_device(native.native_z.payload);
+            failures += run_complete_case(native, 3, "GDN mixed NVFP4/FP8");
+        }
+    }
     try {
         const std::size_t broad = ops::gated_delta_net_layer_workspace_capacity_bytes(4096);
         if (broad <= ops::gated_delta_net_layer_workspace_capacity_bytes(65)) {

@@ -3,7 +3,9 @@
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/gated_residual.h"
+#include "ops/common/quantized_projection.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +50,10 @@ void require_tensor(const Tensor& tensor, DType dtype, std::array<std::int32_t, 
 
 void require_q8_weight(const Weight& weight, std::int32_t rows, std::int32_t columns,
                        const char* op, const char* name) {
+    if (detail::is_native_quantized_projection(weight.qtype)) {
+        detail::validate_native_projection(weight, rows, columns, op);
+        return;
+    }
     const std::uint64_t bytes = static_cast<std::uint64_t>(rows) * (columns / 32) * 34;
     if (weight.qtype != QType::GGML_Q8_0 || weight.layout != QuantLayout::GgmlBlockRow ||
         weight.payload == nullptr || weight.qdata != weight.payload || weight.payload_bytes != bytes ||
@@ -95,9 +101,18 @@ void require_disjoint(std::span<const AddressRange> ranges) {
     }
 }
 
-std::size_t required_workspace(std::int32_t tokens) {
+std::size_t required_workspace(std::int32_t tokens, QType down, QType up) {
+    for (QType type : {down, up}) {
+        if (type != QType::GGML_Q8_0 && !detail::is_native_quantized_projection(type)) {
+            throw std::invalid_argument("gated_residual: unsupported projection format");
+        }
+    }
     WorkspaceLayoutBuilder layout;
     (void)allocate_scratch(layout, tokens);
+    const auto bytes = std::max(
+        detail::projection_workspace_bytes(down, kRank, kFlat, tokens),
+        detail::projection_workspace_bytes(up, kFlat, kRank, tokens));
+    if (bytes) { (void)layout.alloc_bytes(bytes); }
     return layout.peak_bytes();
 }
 
@@ -122,7 +137,7 @@ void run_read(const Tensor& residual, const Tensor& norm_weight, const Weight& d
         require_tensor(*write_scale, DType::BF16, {kBranches, tokens, 1, 1}, op, "write_scale");
     }
 
-    const std::size_t required = required_workspace(tokens);
+    const std::size_t required = required_workspace(tokens, down_weight.qtype, up_weight.qtype);
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("gated_residual_read: insufficient workspace capacity");
@@ -149,9 +164,9 @@ void run_read(const Tensor& residual, const Tensor& norm_weight, const Weight& d
     auto scope = workspace.scope();
     Scratch scratch = allocate_scratch(workspace, tokens);
     detail::gated_residual_normalize_launch(residual, norm_weight, scratch.normalized, stream);
-    ggml_block_linear(scratch.normalized, down_weight, scratch.low_rank, stream);
+    detail::quantized_projection(scratch.normalized, down_weight, scratch.low_rank, workspace, stream);
     detail::gated_residual_activate_launch(scratch.low_rank, stream);
-    ggml_block_linear(scratch.low_rank, up_weight, scratch.up_logits, stream);
+    detail::quantized_projection(scratch.low_rank, up_weight, scratch.up_logits, workspace, stream);
     detail::gated_residual_mix_launch(scratch.normalized, scratch.up_logits, x, stream);
     if (write_weight != nullptr) {
         detail::gated_residual_write_launch(scratch.normalized, *write_weight, *write_scale, stream);
@@ -160,12 +175,12 @@ void run_read(const Tensor& residual, const Tensor& norm_weight, const Weight& d
 
 } // namespace
 
-std::size_t gated_residual_workspace_capacity_bytes(std::int32_t max_tokens) {
+std::size_t gated_residual_workspace_capacity_bytes(std::int32_t max_tokens, QType down, QType up) {
     if (max_tokens <= 0 || max_tokens > 4096) {
         throw std::invalid_argument(
             "gated_residual_workspace_capacity_bytes: max_tokens must be in [1,4096]");
     }
-    return required_workspace(max_tokens);
+    return required_workspace(max_tokens, down, up);
 }
 
 void gated_residual_read(const Tensor& residual, const Tensor& norm_weight,

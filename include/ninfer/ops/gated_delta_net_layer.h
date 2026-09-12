@@ -12,23 +12,27 @@ namespace ninfer::ops {
 
 /** Persistent and learned views for the fixed Qwen4-preview Gated DeltaNet layer. */
 struct GatedDeltaNetLayerWeights {
-    Weight qkv;       // GGML Q5_K or Q6_K [10240,2560], q[2048] | k[2048] | v[6144]
-    Weight z;         // same GGML input format as qkv, [6144,2560]
+    Weight qkv;       // Q5_K/Q6_K, NVFP4 or row-scaled FP8 [10240,2560]; q|k|v
+    Weight z;         // Q5_K/Q6_K, NVFP4 or row-scaled FP8 [6144,2560]
     Tensor a;         // FP32 physical [2560,48], mathematical [48,2560]
     Tensor b;         // FP32 physical [2560,48], mathematical [48,2560]
     Tensor conv;      // FP32 physical [4,10240], mathematical [10240,4], oldest..current taps
     Tensor ssm_a;     // FP32 [48], converted -exp(A_log) decay multiplier
     Tensor dt_bias;   // FP32 [48]
     Tensor norm;      // FP32 [128], ordinary learned scale (no unit offset)
-    Weight output;    // GGML Q6_K [2560,6144]
+    Weight output;    // Q6_K, NVFP4 or row-scaled FP8 [2560,6144]
 };
 
 /**
  * Returns caller-owned transient capacity for the registered H=2560, Hq=16, Hv=48, Dh=128,
- * C=1/T<=max_tokens profile.
+ * C=1/T<=max_tokens and explicit projection-format profile. Defaults describe the GGUF verifier.
+ * Native formats use Linear A16Only; each projection may independently select its
+ * format. The two legacy GGML input projections retain their matching-format constraint.
  */
 [[nodiscard]] std::size_t
-gated_delta_net_layer_workspace_capacity_bytes(std::int32_t max_tokens = 1);
+gated_delta_net_layer_workspace_capacity_bytes(
+    std::int32_t max_tokens = 1, QType qkv = QType::GGML_Q5_K,
+    QType z = QType::GGML_Q5_K, QType output = QType::GGML_Q6_K);
 
 /**
  * Op: gated_delta_net_layer

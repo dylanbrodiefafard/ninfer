@@ -101,7 +101,7 @@ template <int KWarps, int TileTokens, int MinBlocksPerSm,
           Fp8A16SmallTMmaActivationStage ActivationStage =
               Fp8A16SmallTMmaActivationStage::ActiveOnly>
 struct Fp8A16SmallTMmaSchedule {
-    static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
+    static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
                   TileTokens == 40 || TileTokens == 48);
     static_assert(MinBlocksPerSm > 0);
@@ -125,15 +125,31 @@ using Fp8MlpGateUpGeometry       = Fp8Geometry<34816, 5120>;
 using Fp8VocabularyGeometry      = Fp8Geometry<248320, 5120>;
 using Fp8Residual6144Geometry    = Fp8Geometry<5120, 6144>;
 using Fp8Residual17408Geometry   = Fp8Geometry<5120, 17408>;
+using Fp8Rows10240K2560Geometry  = Fp8Geometry<10240, 2560>;
+using Fp8Rows6144K2560Geometry   = Fp8Geometry<6144, 2560>;
+using Fp8Rows12288K2560Geometry  = Fp8Geometry<12288, 2560>;
+using Fp8Rows512K2560Geometry    = Fp8Geometry<512, 2560>;
+using Fp8Rows2560K6144Geometry   = Fp8Geometry<2560, 6144>;
+using Fp8Rows640K2560Geometry    = Fp8Geometry<640, 2560>;
+using Fp8Rows1280K2560Geometry   = Fp8Geometry<1280, 2560>;
+using Fp8Rows2560K640Geometry    = Fp8Geometry<2560, 640>;
+using Fp8Rows320K10240Geometry   = Fp8Geometry<320, 10240>;
+using Fp8Rows10240K320Geometry   = Fp8Geometry<10240, 320>;
+using Fp8Rows2560K2560Geometry   = Fp8Geometry<2560, 2560>;
+using Fp8Vocabulary2560Geometry = Fp8Geometry<248320, 2560>;
+using Fp8Activation2560Geometry = Fp8ActivationGeometry<2560>;
 using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
 using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
+using Fp8Activation640Geometry   = Fp8ActivationGeometry<640>;
+using Fp8Activation10240Geometry = Fp8ActivationGeometry<10240>;
+using Fp8Activation320Geometry   = Fp8ActivationGeometry<320>;
 using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
 
 inline constexpr std::int32_t kFp8VocabularyFirstA16SmallTMmaT = 1;
 inline constexpr std::int32_t kFp8VocabularyLastA16SmallTMmaT  = 48;
 inline constexpr std::int32_t kFp8VocabularyFirstA16GemmT      = 42;
 
-template <int ActiveTokens>
+template <class Geometry, int ActiveTokens>
 struct Fp8VocabularyA16SmallTMmaProductionSchedule {
     static_assert(ActiveTokens >= kFp8VocabularyFirstA16SmallTMmaT);
     static_assert(ActiveTokens <= kFp8VocabularyLastA16SmallTMmaT);
@@ -144,7 +160,10 @@ struct Fp8VocabularyA16SmallTMmaProductionSchedule {
                                            : ActiveTokens <= 32 ? 32
                                            : ActiveTokens <= 40 ? 40
                                                                 : 48;
-    static constexpr int kKWarps         = ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4);
+    static constexpr int kKWarps         = Geometry::kInputRows == 2560
+                                               ? (ActiveTokens <= 24 ? 8 : 4)
+                                               : (ActiveTokens <= 8 ? 16
+                                                                    : (ActiveTokens <= 24 ? 8 : 4));
     static constexpr int kMinBlocksPerSm = kKWarps == 16 ? 1 : 2;
     using Type = Fp8A16SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocksPerSm>;
 };
@@ -156,7 +175,117 @@ enum class Fp8Problem : std::uint8_t {
     Vocabulary,
     Residual6144,
     Residual17408,
+    Rows10240K2560,
+    Rows6144K2560,
+    Rows12288K2560,
+    Rows512K2560,
+    Rows2560K6144,
+    Rows640K2560,
+    Rows1280K2560,
+    Rows2560K640,
+    Rows320K10240,
+    Rows10240K320,
+    Rows2560K2560,
+    Vocabulary2560,
 };
+
+inline constexpr bool is_fp8_vocabulary_problem(Fp8Problem problem) {
+    return problem == Fp8Problem::Vocabulary || problem == Fp8Problem::Vocabulary2560;
+}
+
+inline constexpr bool is_fp8_exact_geometry_problem(Fp8Problem problem) {
+    switch (problem) {
+    case Fp8Problem::Rows10240K2560:
+    case Fp8Problem::Rows6144K2560:
+    case Fp8Problem::Rows12288K2560:
+    case Fp8Problem::Rows512K2560:
+    case Fp8Problem::Rows2560K6144:
+    case Fp8Problem::Rows640K2560:
+    case Fp8Problem::Rows1280K2560:
+    case Fp8Problem::Rows2560K640:
+    case Fp8Problem::Rows320K10240:
+    case Fp8Problem::Rows10240K320:
+    case Fp8Problem::Rows2560K2560:
+        return true;
+    case Fp8Problem::AttnInput:
+    case Fp8Problem::GdnInput:
+    case Fp8Problem::MlpGateUp:
+    case Fp8Problem::Vocabulary:
+    case Fp8Problem::Residual6144:
+    case Fp8Problem::Residual17408:
+    case Fp8Problem::Vocabulary2560:
+        return false;
+    }
+    return false;
+}
+
+// RTX 5090 cold-cache crossovers from the scalar A16 route to the exact-geometry BF16 MMA
+// mainloop. Each retained boundary has a matched public-Op measurement on both sides.
+inline constexpr std::int32_t fp8_exact_a16_gemm_first_t(Fp8Problem problem) {
+    switch (problem) {
+    case Fp8Problem::Rows10240K2560:
+        return 17;
+    case Fp8Problem::Rows6144K2560:
+    case Fp8Problem::Rows12288K2560:
+        return 21;
+    case Fp8Problem::Rows512K2560:
+    case Fp8Problem::Rows640K2560:
+    case Fp8Problem::Rows1280K2560:
+    case Fp8Problem::Rows2560K2560:
+        return 29;
+    case Fp8Problem::Rows2560K6144:
+        return 37;
+    case Fp8Problem::Rows2560K640:
+        return 17;
+    case Fp8Problem::Rows320K10240:
+        return 45;
+    case Fp8Problem::Rows10240K320:
+        return 9;
+    case Fp8Problem::AttnInput:
+    case Fp8Problem::GdnInput:
+    case Fp8Problem::MlpGateUp:
+    case Fp8Problem::Vocabulary:
+    case Fp8Problem::Residual6144:
+    case Fp8Problem::Residual17408:
+    case Fp8Problem::Vocabulary2560:
+        return 0x7fffffff;
+    }
+    return 0x7fffffff;
+}
+
+// AllowA8 uses the independently qualified quantize-then-FP8-MMA route only after it wins the
+// represented-BF16 A16 route at the same public problem. Vocabulary logits remain A16-only.
+inline constexpr std::int32_t fp8_exact_a8_first_t(Fp8Problem problem) {
+    switch (problem) {
+    case Fp8Problem::Rows10240K2560:
+        return 8;
+    case Fp8Problem::Rows6144K2560:
+        return 13;
+    case Fp8Problem::Rows12288K2560:
+        return 5;
+    case Fp8Problem::Rows512K2560:
+    case Fp8Problem::Rows2560K6144:
+    case Fp8Problem::Rows640K2560:
+    case Fp8Problem::Rows1280K2560:
+        return 17;
+    case Fp8Problem::Rows2560K640:
+        return 9;
+    case Fp8Problem::Rows320K10240:
+    case Fp8Problem::Rows2560K2560:
+        return 13;
+    case Fp8Problem::Rows10240K320:
+        return 192;
+    case Fp8Problem::AttnInput:
+    case Fp8Problem::GdnInput:
+    case Fp8Problem::MlpGateUp:
+    case Fp8Problem::Vocabulary:
+    case Fp8Problem::Residual6144:
+    case Fp8Problem::Residual17408:
+    case Fp8Problem::Vocabulary2560:
+        return 0x7fffffff;
+    }
+    return 0x7fffffff;
+}
 
 inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
     return (output_rows == Fp8AttnInputGeometry::kOutputRows &&
@@ -170,7 +299,31 @@ inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32
            (output_rows == Fp8Residual6144Geometry::kOutputRows &&
             input_rows == Fp8Residual6144Geometry::kInputRows) ||
            (output_rows == Fp8Residual17408Geometry::kOutputRows &&
-            input_rows == Fp8Residual17408Geometry::kInputRows);
+            input_rows == Fp8Residual17408Geometry::kInputRows) ||
+           (output_rows == Fp8Rows10240K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows10240K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Rows6144K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows6144K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Rows12288K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows12288K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Rows512K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows512K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Rows2560K6144Geometry::kOutputRows &&
+            input_rows == Fp8Rows2560K6144Geometry::kInputRows) ||
+           (output_rows == Fp8Rows640K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows640K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Rows1280K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows1280K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Rows2560K640Geometry::kOutputRows &&
+            input_rows == Fp8Rows2560K640Geometry::kInputRows) ||
+           (output_rows == Fp8Rows320K10240Geometry::kOutputRows &&
+            input_rows == Fp8Rows320K10240Geometry::kInputRows) ||
+           (output_rows == Fp8Rows10240K320Geometry::kOutputRows &&
+            input_rows == Fp8Rows10240K320Geometry::kInputRows) ||
+           (output_rows == Fp8Rows2560K2560Geometry::kOutputRows &&
+            input_rows == Fp8Rows2560K2560Geometry::kInputRows) ||
+           (output_rows == Fp8Vocabulary2560Geometry::kOutputRows &&
+            input_rows == Fp8Vocabulary2560Geometry::kInputRows);
 }
 
 inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -198,14 +351,62 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
         input_rows == Fp8Residual17408Geometry::kInputRows) {
         return Fp8Problem::Residual17408;
     }
+    if (output_rows == Fp8Rows10240K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows10240K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows10240K2560;
+    }
+    if (output_rows == Fp8Rows6144K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows6144K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows6144K2560;
+    }
+    if (output_rows == Fp8Rows12288K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows12288K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows12288K2560;
+    }
+    if (output_rows == Fp8Rows512K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows512K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows512K2560;
+    }
+    if (output_rows == Fp8Rows2560K6144Geometry::kOutputRows &&
+        input_rows == Fp8Rows2560K6144Geometry::kInputRows) {
+        return Fp8Problem::Rows2560K6144;
+    }
+    if (output_rows == Fp8Rows640K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows640K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows640K2560;
+    }
+    if (output_rows == Fp8Rows1280K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows1280K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows1280K2560;
+    }
+    if (output_rows == Fp8Rows2560K640Geometry::kOutputRows &&
+        input_rows == Fp8Rows2560K640Geometry::kInputRows) {
+        return Fp8Problem::Rows2560K640;
+    }
+    if (output_rows == Fp8Rows320K10240Geometry::kOutputRows &&
+        input_rows == Fp8Rows320K10240Geometry::kInputRows) {
+        return Fp8Problem::Rows320K10240;
+    }
+    if (output_rows == Fp8Rows10240K320Geometry::kOutputRows &&
+        input_rows == Fp8Rows10240K320Geometry::kInputRows) {
+        return Fp8Problem::Rows10240K320;
+    }
+    if (output_rows == Fp8Rows2560K2560Geometry::kOutputRows &&
+        input_rows == Fp8Rows2560K2560Geometry::kInputRows) {
+        return Fp8Problem::Rows2560K2560;
+    }
+    if (output_rows == Fp8Vocabulary2560Geometry::kOutputRows &&
+        input_rows == Fp8Vocabulary2560Geometry::kInputRows) {
+        return Fp8Problem::Vocabulary2560;
+    }
     throw std::invalid_argument("unsupported FP8 problem");
 }
 
 template <class Geometry>
 struct Fp8LinearDecodeProductionSchedule;
 
-// RTX 5090 cold-cache winner for this exact problem. Each newly registered geometry supplies its
-// own specialization so admission never silently inherits another problem's measured schedule.
+// Every admitted geometry supplies an explicit schedule so one problem cannot silently inherit
+// another problem's route.
 template <>
 struct Fp8LinearDecodeProductionSchedule<Fp8AttnInputGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
@@ -231,6 +432,26 @@ struct Fp8LinearDecodeProductionSchedule<Fp8Residual17408Geometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+#define NINFER_FP8_DECODE_SCHEDULE(Geometry)                                                        \
+    template <>                                                                                     \
+    struct Fp8LinearDecodeProductionSchedule<Geometry> {                                            \
+        using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;                      \
+    }
+
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows10240K2560Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows6144K2560Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows12288K2560Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows512K2560Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows2560K6144Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows640K2560Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows1280K2560Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows2560K640Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows320K10240Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows10240K320Geometry);
+NINFER_FP8_DECODE_SCHEDULE(Fp8Rows2560K2560Geometry);
+
+#undef NINFER_FP8_DECODE_SCHEDULE
+
 inline constexpr std::int32_t kFp8FirstSmallT = 2;
 inline constexpr std::int32_t kFp8LastSmallT  = 24;
 
@@ -252,6 +473,24 @@ inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual6144Geometry> = kFp
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8Residual17408Geometry> = kFp8LastSmallT;
 
+#define NINFER_FP8_SMALL_T_MAX(Geometry)                                                           \
+    template <>                                                                                    \
+    inline constexpr std::int32_t kFp8LinearSmallTMax<Geometry> = 4
+
+NINFER_FP8_SMALL_T_MAX(Fp8Rows10240K2560Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows6144K2560Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows12288K2560Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows512K2560Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows2560K6144Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows640K2560Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows1280K2560Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows2560K640Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows320K10240Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows10240K320Geometry);
+NINFER_FP8_SMALL_T_MAX(Fp8Rows2560K2560Geometry);
+
+#undef NINFER_FP8_SMALL_T_MAX
+
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     switch (problem) {
     case Fp8Problem::AttnInput:
@@ -266,6 +505,20 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
         return kFp8LinearSmallTMax<Fp8Residual6144Geometry>;
     case Fp8Problem::Residual17408:
         return kFp8LinearSmallTMax<Fp8Residual17408Geometry>;
+    case Fp8Problem::Rows10240K2560:
+    case Fp8Problem::Rows6144K2560:
+    case Fp8Problem::Rows12288K2560:
+    case Fp8Problem::Rows512K2560:
+    case Fp8Problem::Rows2560K6144:
+    case Fp8Problem::Rows640K2560:
+    case Fp8Problem::Rows1280K2560:
+    case Fp8Problem::Rows2560K640:
+    case Fp8Problem::Rows320K10240:
+    case Fp8Problem::Rows10240K320:
+    case Fp8Problem::Rows2560K2560:
+        return 4;
+    case Fp8Problem::Vocabulary2560:
+        break;
     }
     throw std::logic_error("FP8 vocabulary uses its A16 MMA route");
 }

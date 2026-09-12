@@ -59,13 +59,13 @@ struct Qwen4SparseMoeWeights {
 /** Device-resident expert banks for the exact Qwen4-preview sparse-MoE geometry. */
 struct Qwen4ResidentSparseMoeWeights {
     Weight router;           // contiguous FP32 [512,2560]
-    Weight routed_gate;      // device IQ1_S or IQ2_XXS [512,640,2560]
-    Weight routed_up;        // same format and shape as routed_gate
-    Weight routed_down;      // device IQ4_NL [512,2560,640]
+    Weight routed_gate;      // device IQ1_S/IQ2_XXS or NVFP4/FP8 [512,640,2560]
+    Weight routed_up;        // same geometry; mixed resident formats may differ
+    Weight routed_down;      // device IQ4_NL or NVFP4/FP8 [512,2560,640]
     Tensor shared_gate;      // device FP32 [2560]
-    Weight shared_gate_proj; // device Q5_K or Q6_K [640,2560]
-    Weight shared_up;        // same format and shape as shared_gate_proj
-    Weight shared_down;      // device Q8_0 [2560,640]
+    Weight shared_gate_proj; // device Q5_K/Q6_K or NVFP4/FP8 [640,2560]
+    Weight shared_up;        // same geometry; native formats may differ
+    Weight shared_down;      // device Q8_0 or NVFP4/FP8 [2560,640]
 };
 
 /** Exact encoded bytes copied for one gate/up expert pair of the selected routed format. */
@@ -132,7 +132,7 @@ struct Qwen4SparseMoePrefillPipeline {
 
 /** Caller-owned transient device capacity for qwen4_sparse_moe_resident at exact width T. */
 [[nodiscard]] std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
-    std::int32_t width);
+    const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width);
 
 /**
  * Op: qwen4_sparse_moe_gate_up_swiglu
@@ -228,26 +228,42 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
  * Op: qwen4_sparse_moe_resident
  *
  * Computes the same complete formula, observable route outputs, represented-format decoding,
- * BF16 projection/SwiGLU seams, rank-ordered FP32 routed accumulation, shared branch, and BF16
- * Store result as qwen4_sparse_moe independently for every token. x/destination are contiguous
+ * rank-ordered routed accumulation, shared branch, and BF16 result storage as qwen4_sparse_moe
+ * independently for every token. x/destination are contiguous
  * BF16 [2560,T], selected_ids are I32 [10,T], and selected_weights are FP32 [10,T], with
  * rank-fastest route storage and T in [1,4096]. The routed gate/up banks are complete
  * device-resident rank-three IQ1_S or IQ2_XXS weights [512,640,2560]; routed down is a complete
  * device-resident IQ4_NL weight [512,2560,640]. Same-expert selections across tokens remain
  * independent occurrences. GPU-produced selected_ids dynamically index all three banks. No
- * selected id or weight byte crosses to the host, and the Op performs no copy, host
+ * selected id or weight byte crosses to the host, and the Op performs no host transfer, host
  * synchronization, event operation, allocation, or runtime repack.
  *
  * All inputs and weights are read-only. selected_ids, selected_weights, destination, and workspace
  * are pairwise disjoint from every input and weight. The width-specific workspace query is the
- * exact caller-owned capacity contract. T=1 retains the scalar fused implementation. Private
- * small-T dispatch repeats that implementation, while sufficiently wide calls use device-only
+ * exact caller-owned capacity contract. The GGML profile at T=1 retains the scalar fused
+ * implementation. Its private small-T dispatch repeats that implementation, while sufficiently
+ * wide calls use device-only
  * route grouping and exact-format expert aggregation; grouping order is private because every
  * occurrence writes its unique rank/token slot before the observable rank-order merge. The same
- * independent complete FP64 oracle and per-token output criteria used by
- * qwen4_sparse_moe qualify this implementation. Work is enqueued on stream; the caller owns every
+ * independent complete FP64 oracle and per-token output criteria used by qwen4_sparse_moe
+ * qualify this implementation. Intermediate BF16 projection/activation storage belongs to the
+ * private implementation profile, not the ideal oracle formula. Work is enqueued on stream;
+ * the caller owns every
  * device allocation and must retain it through stream completion. This eager verifier
  * implementation is not CUDA-Graph qualified.
+ *
+ * Alternatively, each routed bank independently admits NVFP4 or FP8_E4M3FN_ROW_BF16S in addition
+ * to its GGML role format; when both members of a gate/up pair are GGML their formats match.
+ * The logical
+ * rank-three shape remains [512,N,K], with n=N and k=K, but the physical payload and scale metadata
+ * are those of the registered rank-two encoding [512*N,K]. Thus each expert owns consecutive
+ * code rows and scale tiles/rows, and NVFP4 has one represented weight divisor for the entire
+ * bank. This is an execution-view contract, not a new rank-three artifact format. Shared
+ * projections independently admit their existing GGML format, NVFP4, or row-scaled FP8.
+ * Native projection arithmetic retains A16 activations: admitting a quantized weight does not
+ * implicitly permit activation quantization at the complete nonlinear Op boundary. Native banks
+ * use device-only expert grouping at every T; NVFP4 reads occurrence-mapped activation tiles
+ * directly, while FP8 uses bounded caller-owned gathered activations for its A16 MMA mainloop.
  */
 void qwen4_sparse_moe_resident(const Tensor& x,
                                const Qwen4ResidentSparseMoeWeights& weights,

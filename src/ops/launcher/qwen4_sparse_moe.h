@@ -36,6 +36,11 @@ void qwen4_sparse_moe_resident_grouped_down_launch(
     const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& rank_results,
     cudaStream_t stream);
 
+void qwen4_sparse_moe_resident_native_linear_launch(
+    const Tensor& input, const Weight& bank, const Tensor& expert_counts,
+    const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& gathered,
+    Tensor& output, bool input_is_ranked, cudaStream_t stream);
+
 void qwen4_sparse_moe_shared_gate_up_swiglu_launch(
     const Tensor& x, const Weight& gate, const Weight& up, Tensor& activated,
     cudaStream_t stream);

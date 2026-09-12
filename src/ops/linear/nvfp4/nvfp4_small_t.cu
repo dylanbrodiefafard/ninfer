@@ -82,6 +82,19 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::MtpFc:
         launchers<Nvfp4MtpFcGeometry>()[index](x, weight, out, stream);
         return;
+    case Nvfp4Problem::N10240K2560:
+    case Nvfp4Problem::N6144K2560:
+    case Nvfp4Problem::N12288K2560:
+    case Nvfp4Problem::N512K2560:
+    case Nvfp4Problem::N2560K6144:
+    case Nvfp4Problem::N640K2560:
+    case Nvfp4Problem::N1280K2560:
+    case Nvfp4Problem::N2560K640:
+    case Nvfp4Problem::N10240K320:
+    case Nvfp4Problem::N2560K2560:
+    case Nvfp4Problem::N248320K2560:
+        launch_nvfp4_exact_geometry_small_t(x, weight, out, stream);
+        return;
     }
 }
 

@@ -48,11 +48,30 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
         return Nvfp4LinearRoute::A16;
     case Nvfp4Problem::MtpFc:
         return tokens >= kNvfp4FirstW4a4MtpFc ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::N248320K2560:
+        return Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::N10240K2560:
+    case Nvfp4Problem::N6144K2560:
+    case Nvfp4Problem::N12288K2560:
+    case Nvfp4Problem::N512K2560:
+    case Nvfp4Problem::N2560K6144:
+    case Nvfp4Problem::N640K2560:
+    case Nvfp4Problem::N1280K2560:
+    case Nvfp4Problem::N2560K640:
+    case Nvfp4Problem::N10240K320:
+    case Nvfp4Problem::N2560K2560:
+        return tokens >= kNvfp4FirstW4a4ExactGeometry ? Nvfp4LinearRoute::W4A4
+                                                       : Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
+    if (x.ne[1] >= nvfp4_exact_a16_gemm_first_t(problem)) {
+        launch_nvfp4_exact_geometry_a16_gemm(x, weight, out, stream);
+        return;
+    }
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);

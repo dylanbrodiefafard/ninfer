@@ -118,10 +118,27 @@ using Nvfp4DflashConvProjGeometry = Nvfp4GemvGeometry<1280, 5120>;
 using Nvfp4DflashSelectorGeometry = Nvfp4GemvGeometry<256, 5120>;
 using Nvfp4MtpFcGeometry         = Nvfp4GemvGeometry<5120, 10240>;
 
+// Exact H=2560 projection geometries. These remain Linear facts: target/model roles are resolved
+// before constructing the Weight view, and dispatch depends only on the represented matrix shape.
+using Nvfp4N10240K2560Geometry  = Nvfp4GemvGeometry<10240, 2560>;
+using Nvfp4N6144K2560Geometry   = Nvfp4GemvGeometry<6144, 2560>;
+using Nvfp4N12288K2560Geometry  = Nvfp4GemvGeometry<12288, 2560>;
+using Nvfp4N512K2560Geometry    = Nvfp4GemvGeometry<512, 2560>;
+using Nvfp4N2560K6144Geometry   = Nvfp4GemvGeometry<2560, 6144>;
+using Nvfp4N640K2560Geometry    = Nvfp4GemvGeometry<640, 2560>;
+using Nvfp4N1280K2560Geometry   = Nvfp4GemvGeometry<1280, 2560>;
+using Nvfp4N2560K640Geometry    = Nvfp4GemvGeometry<2560, 640>;
+using Nvfp4N10240K320Geometry   = Nvfp4GemvGeometry<10240, 320>;
+using Nvfp4N2560K2560Geometry   = Nvfp4GemvGeometry<2560, 2560>;
+using Nvfp4N248320K2560Geometry = Nvfp4GemvGeometry<248320, 2560>;
+
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation10240Geometry = Nvfp4ActivationGeometry<10240>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+using Nvfp4Activation2560Geometry  = Nvfp4ActivationGeometry<2560>;
+using Nvfp4Activation640Geometry   = Nvfp4ActivationGeometry<640>;
+using Nvfp4Activation320Geometry   = Nvfp4ActivationGeometry<320>;
 
 enum class Nvfp4Problem : std::uint8_t {
     AttnInput,
@@ -135,12 +152,23 @@ enum class Nvfp4Problem : std::uint8_t {
     DflashConvProj,
     DflashSelector,
     MtpFc,
+    N10240K2560,
+    N6144K2560,
+    N12288K2560,
+    N512K2560,
+    N2560K6144,
+    N640K2560,
+    N1280K2560,
+    N2560K640,
+    N10240K320,
+    N2560K2560,
+    N248320K2560,
 };
 
 inline constexpr bool is_nvfp4_a16_only_problem(Nvfp4Problem problem) {
     return problem == Nvfp4Problem::DflashFeature || problem == Nvfp4Problem::DflashQkv ||
            problem == Nvfp4Problem::DflashAttnOut || problem == Nvfp4Problem::DflashConvProj ||
-           problem == Nvfp4Problem::DflashSelector;
+           problem == Nvfp4Problem::DflashSelector || problem == Nvfp4Problem::N248320K2560;
 }
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -165,7 +193,29 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4DflashSelectorGeometry::kOutputRows &&
             input_rows == Nvfp4DflashSelectorGeometry::kInputRows) ||
            (output_rows == Nvfp4MtpFcGeometry::kOutputRows &&
-            input_rows == Nvfp4MtpFcGeometry::kInputRows);
+            input_rows == Nvfp4MtpFcGeometry::kInputRows) ||
+           (output_rows == Nvfp4N10240K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N10240K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N6144K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N6144K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N12288K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N12288K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N512K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N512K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N2560K6144Geometry::kOutputRows &&
+            input_rows == Nvfp4N2560K6144Geometry::kInputRows) ||
+           (output_rows == Nvfp4N640K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N640K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N1280K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N1280K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N2560K640Geometry::kOutputRows &&
+            input_rows == Nvfp4N2560K640Geometry::kInputRows) ||
+           (output_rows == Nvfp4N10240K320Geometry::kOutputRows &&
+            input_rows == Nvfp4N10240K320Geometry::kInputRows) ||
+           (output_rows == Nvfp4N2560K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N2560K2560Geometry::kInputRows) ||
+           (output_rows == Nvfp4N248320K2560Geometry::kOutputRows &&
+            input_rows == Nvfp4N248320K2560Geometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -213,6 +263,50 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
         input_rows == Nvfp4MtpFcGeometry::kInputRows) {
         return Nvfp4Problem::MtpFc;
     }
+    if (output_rows == Nvfp4N10240K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N10240K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N10240K2560;
+    }
+    if (output_rows == Nvfp4N6144K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N6144K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N6144K2560;
+    }
+    if (output_rows == Nvfp4N12288K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N12288K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N12288K2560;
+    }
+    if (output_rows == Nvfp4N512K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N512K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N512K2560;
+    }
+    if (output_rows == Nvfp4N2560K6144Geometry::kOutputRows &&
+        input_rows == Nvfp4N2560K6144Geometry::kInputRows) {
+        return Nvfp4Problem::N2560K6144;
+    }
+    if (output_rows == Nvfp4N640K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N640K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N640K2560;
+    }
+    if (output_rows == Nvfp4N1280K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N1280K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N1280K2560;
+    }
+    if (output_rows == Nvfp4N2560K640Geometry::kOutputRows &&
+        input_rows == Nvfp4N2560K640Geometry::kInputRows) {
+        return Nvfp4Problem::N2560K640;
+    }
+    if (output_rows == Nvfp4N10240K320Geometry::kOutputRows &&
+        input_rows == Nvfp4N10240K320Geometry::kInputRows) {
+        return Nvfp4Problem::N10240K320;
+    }
+    if (output_rows == Nvfp4N2560K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N2560K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N2560K2560;
+    }
+    if (output_rows == Nvfp4N248320K2560Geometry::kOutputRows &&
+        input_rows == Nvfp4N248320K2560Geometry::kInputRows) {
+        return Nvfp4Problem::N248320K2560;
+    }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
 
@@ -241,6 +335,32 @@ inline constexpr std::int32_t kNvfp4FirstW4a4MlpGateUp     = 2;
 inline constexpr std::int32_t kNvfp4FirstW4a4Residual6144  = 5;
 inline constexpr std::int32_t kNvfp4FirstW4a4Residual17408 = 3;
 inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
+// Conservative existing-family baseline for newly admitted exact shapes. Per-geometry earlier
+// cutovers require matched public-Op evidence; the vocabulary projection remains A16-only.
+inline constexpr std::int32_t kNvfp4FirstW4a4ExactGeometry = 33;
+// The scalar A16 route owns decode and short panels. Wider panels decode each packed weight tile
+// once into a CTA-private BF16 MMA operand instead of replaying the full bank every 32 columns.
+// Low-output or long-K projections need more columns to expose enough independent MMA CTAs.
+inline constexpr std::int32_t nvfp4_exact_a16_gemm_first_t(Nvfp4Problem problem) {
+    switch (problem) {
+    case Nvfp4Problem::N512K2560:
+    case Nvfp4Problem::N640K2560:
+    case Nvfp4Problem::N2560K6144:
+        return 256;
+    case Nvfp4Problem::N6144K2560:
+    case Nvfp4Problem::N1280K2560:
+    case Nvfp4Problem::N2560K2560:
+        return 128;
+    case Nvfp4Problem::N10240K2560:
+    case Nvfp4Problem::N12288K2560:
+    case Nvfp4Problem::N2560K640:
+    case Nvfp4Problem::N10240K320:
+    case Nvfp4Problem::N248320K2560:
+        return 64;
+    default:
+        return 0x7fffffff;
+    }
+}
 // Tree/chain verify is W<=16. Packed GDN conv-record uses fused SmallT for B=1 W=4,
 // grouped SmallT replay for B=1 W=5/6 and B=2..4 W=2/5, fused T=1-reduction
 // GEMV+FP32 conv for other B=1 widths, and one same-reduction request-indexed SmallT
