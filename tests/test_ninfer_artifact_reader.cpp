@@ -187,7 +187,7 @@ void test_fp8_row_layout() {
     auto directory = normative_directory();
     directory["objects"].push_back({{"name", "fp8"}, {"kind", "tensor"}, {"shape", {2, 4}},
         {"format", "FP8_E4M3FN_ROW_BF16S"}, {"layout", "row-scale-v1"},
-        {"offset", 3584}, {"bytes", 260}});
+        {"offset", 5376}, {"bytes", 260}});
     auto fixture = write_fixture(directory, "fp8-row-scale");
     Reader reader(fixture.path);
     const auto* tensor = std::get_if<TensorDescriptor>(reader.find("fp8"));
