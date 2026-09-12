@@ -48,7 +48,7 @@ def _parse_probe_json(text: str) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="kdev mma", description=__doc__)
-    parser.add_argument("--atom", default="all", choices=["nvfp4", "bf16", "s8", "all"])
+    parser.add_argument("--atom", default="all", choices=["nvfp4", "bf16", "fp8", "s8", "all"])
     parser.add_argument("--iters", type=int, default=8192)
     parser.add_argument("--warps", type=int, default=8)
     parser.add_argument("--blocks-per-sm", type=int, default=2)

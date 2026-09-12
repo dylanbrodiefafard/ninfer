@@ -136,6 +136,7 @@ struct EngineOptions {
     // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.
     std::string model_id;
     std::string weights_id;
+    std::string artifact_file_identity;
     // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
     std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
     KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;

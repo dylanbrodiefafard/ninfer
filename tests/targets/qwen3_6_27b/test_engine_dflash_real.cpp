@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -360,15 +361,63 @@ int check_tokens(const char* label, const ninfer::GenerationResult& result,
     }
     const bool diagnostic = kind == OracleKind::TargetOnly;
     if (matched != want.size() && !diagnostic) { return 1; }
-    constexpr std::size_t kQualifiedTargetPrefix = 21;
-    if (diagnostic && matched < want.size() && matched < kQualifiedTargetPrefix) {
-        std::cerr << label << " diverged before the qualified packed/T=1 boundary at token "
-                  << kQualifiedTargetPrefix << '\n';
-        return 1;
-    }
     if (matched < want.size()) {
         std::cerr << label << " greedy match " << matched << '/' << want.size()
                   << " vs " << want_name << " (cross-schedule diagnostic)\n";
+    }
+    return 0;
+}
+
+// A fixed greedy-prefix length is artifact-specific, not a floating-point contract.
+// Qualify the first changed choice at its shared prefix using ordinary T=1 scoring,
+// with the original prompt's prefill boundary. The 0.25-nat bound permits at most
+// exp(0.25) = 1.284 probability ratio versus the ordinary greedy choice. This is a
+// behavioral cross-schedule guard, supplementary to the independent Op oracles;
+// it does not qualify arbitrary later trajectory divergence. The p-less trajectory
+// likelihood tests below and exact C=1/C>1 checks protect those distinct contracts.
+int check_target_margins(const char* artifact,
+                         const std::array<std::vector<ninfer::TokenId>, 4>& prompts,
+                         const std::array<std::vector<ninfer::TokenId>, 4>& generated,
+                         const std::array<std::vector<ninfer::TokenId>, 4>& ordinary,
+                         const char* label) {
+    bool needs_score = false;
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        needs_score |= generated[i] != ordinary[i];
+    }
+    if (!needs_score) { return 0; }
+    ninfer::Engine baseline(base_engine_options(artifact));
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        if (generated[i] == ordinary[i]) { continue; }
+        const std::size_t matched = match_prefix_length(generated[i], ordinary[i]);
+        if (matched == 0 || matched >= generated[i].size() || matched >= ordinary[i].size()) {
+            return 1;
+        }
+        auto score_choice = [&](ninfer::TokenId choice) {
+            auto ids = prompts[i];
+            ids.insert(ids.end(), ordinary[i].begin(), ordinary[i].begin() + matched);
+            ids.push_back(choice);
+            ninfer::ScoreOptions options;
+            options.schedule = ninfer::ScoreSchedule::Decode;
+            options.skip_tokens = static_cast<std::uint32_t>(prompts[i].size());
+            return baseline.score(baseline.prepare_tokens(std::move(ids), false), options);
+        };
+        const auto target = score_choice(ordinary[i][matched]);
+        const auto proposal = score_choice(generated[i][matched]);
+        if (target.non_finite != 0 || proposal.non_finite != 0 ||
+            target.tokens_scored != matched || proposal.tokens_scored != matched ||
+            target.token_nlls.size() != matched || proposal.token_nlls.size() != matched) {
+            std::cerr << label << " invalid first-divergence score\n";
+            return 1;
+        }
+        const double gap = proposal.token_nlls.back() - target.token_nlls.back();
+        std::cout << label << " prompt " << i << " first_divergence=" << matched
+                  << " target_nll=" << target.token_nlls.back()
+                  << " dflash_choice_nll=" << proposal.token_nlls.back()
+                  << " nll_gap=" << gap << '\n';
+        if (!std::isfinite(gap) || gap < -1.0e-5 || gap > 0.25) {
+            std::cerr << label << " first changed choice failed the 0.25-nat margin bound\n";
+            return 1;
+        }
     }
     return 0;
 }
@@ -1908,6 +1957,7 @@ int main() {
 
     auto run_k = [&](std::uint32_t draft_tokens, const char* label) -> int {
         std::array<std::vector<ninfer::TokenId>, 4> target_oracles;
+        std::array<std::vector<ninfer::TokenId>, 4> dflash_oracles;
         const char* only_prompt = std::getenv("NINFER_DFLASH_TEST_ONLY_PROMPT");
         {
             // A DFlash self-comparison can miss a verifier that consistently commits the
@@ -1945,7 +1995,6 @@ int main() {
         try {
             ninfer::Engine engine(dflash_options);
             if (const int result = check_dflash_load(engine); result != 0) { return result; }
-            std::array<std::vector<ninfer::TokenId>, 4> dflash_oracles;
             int failed = 0;
             for (std::size_t i = 0; i < prompts.size(); ++i) {
                 if (only_prompt != nullptr &&
@@ -1958,7 +2007,7 @@ int main() {
                     result != 0) {
                     return result;
                 }
-                // Packed/T=1 identity. Do not return here: C>1 isolation still uses
+                // Packed/T=1 diagnostic. Do not return here: C>1 isolation still uses
                 // the saved C=1 DFlash tokens even when a later greedy token flips.
                 const std::string vs_target =
                     std::string(label) + " prompt " + std::to_string(i) + " vs target-only";
@@ -1997,6 +2046,11 @@ int main() {
             std::cerr << label << " engine std::bad_alloc (k=" << draft_tokens
                       << " max_conc=" << dflash_options.max_concurrency
                       << " graph=" << dflash_options.use_cuda_graph << ")\n";
+            return 1;
+        }
+        // The DFlash engine must be destroyed before loading the ordinary scorer:
+        // the supported workload has only one resident model instance.
+        if (check_target_margins(artifact, prompts, dflash_oracles, target_oracles, label) != 0) {
             return 1;
         }
         std::cout << "ok " << label << '\n' << std::flush;

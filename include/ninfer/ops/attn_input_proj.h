@@ -10,6 +10,12 @@
 
 namespace ninfer::ops {
 
+// The single-parent target domain also admits FP8_E4M3FN_ROW_BF16S RowScale
+// [14336,5120], ordered [Q(6144),K(1024),gate(6144),V(1024)]. A16Only and AllowA8
+// admit every positive T. The mathematical oracle is the complete projection
+// from signed E4M3FN codes times exact BF16 row multipliers, without private
+// activation quantization in the oracle. A8 workspace is caller-owned.
+
 /**
  * Computes four independent linear projections for each token:
  *

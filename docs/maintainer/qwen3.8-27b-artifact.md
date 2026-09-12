@@ -96,6 +96,74 @@ Fused QKV row ranges are query `[0,4096)`, key `[4096,5120)`, value `[5120,6144)
 
 ## 3. Conversion
 
+### Selective FP8 conversion (328 MiB recipe)
+
+Generate directly from the original BF16 checkpoint and an original NVFP4 `.ninfer`
+shell; this CPU-only conversion does not need an intermediate FP8 model or bank:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_selective_fp8 \
+  --base-artifact /models/base_nvfp4_dflash.ninfer \
+  --model /models/qwen3.8-27b-bf16 \
+  --out /models/qwen3_8_27b_nvfp4_fp8_328mib_dflash.ninfer
+```
+
+Use the Python 3.11 conversion environment with PyTorch and safetensors. Paths above
+are explicit input/output examples, not downloaded prerequisites. The output must
+not already exist. A `.conversion.json` sidecar records the recipe and verifies all
+written payloads. The original shell's draft (if any) is copied unchanged.
+
+The fixed recipe promotes eight matrices, using zero-based layer indices:
+attention output 11; fused attention Q/K/gate/V inputs 27, 31 and 51; MLP gate/up
+and down at 62 and 63. FP8 codes use per-row BF16 multipliers with round-to-nearest-even;
+the scale is represented before code rounding. All original BF16 protections,
+W8 endpoints, norms, GDN controls and remaining NVFP4 matrices are preserved exactly.
+The 328 MiB label describes added payload relative to the base, not total model size.
+It is an empirically selected coding-quality/memory tradeoff, not a claim of global
+perplexity optimality or elimination of reasoning loops.
+
+### Mixed FP8/NVFP4 storage profile
+
+Different files under the same artifact identity must not exchange retained numerical state.
+KV disk format v6 binds the opened artifact's local file generation; use a fresh cache directory
+when switching to a composed mixed or selective variant. Old cache directories are not deleted.
+
+The characterized neroued/Unsloth base uses the same `qwen3.8-27b/nvfp4`
+identity with a distinct, validated Text inventory. Its vocabulary endpoints,
+attention and GDN projections, and MLPs in layers 56–63 use
+`FP8_E4M3FN_ROW_BF16S` / `row-scale-v1` (146 tensors). Layers 0–55 retain
+NVFP4 MLP matrices and their input divisors. Each GDN A/B control is one BF16
+`[96,5120]` parent bound as two contiguous `[48,5120]` views. Norms, Vision,
+MTP and frontend resources retain the stored base values. Qualification used the
+current 66-object `dflash/` companion with unchanged non-draft payloads. An old
+`dflash2/` companion is not executed by a second runtime. The selective converter
+above preserves the supported draft already present in its input shell.
+
+FP8 prefill permits the qualified A8 implementation profile; decode and verify
+use A16. Short GDN convolution snapshot/record (W≤16) stays A16 even when A8 is
+allowed: the short A8 record profile failed its independent output criterion.
+FP8 storage is not an FP8 KV-cache format, and does not alter p-less sampling,
+DFlash acceptance, grammar or recovery semantics.
+
+The selective FP8 profile retains the base W8 vocabulary endpoints, separate BF16
+GDN A/B controls, and all nine protected BF16 projection objects. Any of the base's
+247 NVFP4 Text matrices may instead use `FP8_E4M3FN_ROW_BF16S` / `row-scale-v1`;
+its paired NVFP4 input-divisor object must then be absent. The remaining objects
+retain the base inventory. W8 endpoints plus at least one FP8 Text projection
+select `SelectiveFp8Nvfp4`; full inventory validation still rejects incompatible
+formats, missing objects, and unconsumed divisors. Startup reserves the maximum of
+the existing NVFP4 and FP8 leaf workspaces; execution selects the qualified policy
+from each bound weight. This permits isolated weight-quality experiments without
+changing endpoints, norms, BF16 protections, draft matrices, or sampling semantics.
+Artifact validity does not establish a selective recipe's quality benefit.
+FP8 packed verification retains C=1-shaped residual and GDN projection/convolution
+panels. Flattening GDN W×B would change the SmallT reduction and, at some widths,
+introduce a BF16 projected materialization absent from C=1. Exact batched/serial
+output and valid-record checks protect this arithmetic isolation in addition to
+the independent mathematical output criterion.
+
+### Source conversion
+
 The converter consumes the Qwen3.8-27B BF16 checkpoint and writes one complete artifact:
 
 ```bash
@@ -183,15 +251,19 @@ ArtifactIdentity(qwen3.8-27b, groupwise-int)
     -> target qwen3_8_27b
 
 ArtifactIdentity(qwen3.8-27b, nvfp4)
-    -> WeightsProfile::Nvfp4
+    -> WeightsProfile::Nvfp4 (W8 token embedding)
+       or WeightsProfile::SelectiveFp8Nvfp4 (W8 endpoints, selected FP8 Text matrices)
+       or WeightsProfile::MixedFp8Nvfp4 (row-scaled FP8 token embedding)
     -> target qwen3_8_27b
 ```
 
 The groupwise profile binds the embedding and output head as W8 and the Text body through the
 groupwise binding. Workspace selection follows the groupwise execution routes. The NVFP4 identity
-reuses the Qwen3.6-27B NVFP4 profile unchanged: that profile already stores the vocabulary
+with W8 endpoints reuses the Qwen3.6-27B NVFP4 profile: that profile stores the vocabulary
 endpoints as W8, which is the only groupwise difference between the two models, so the object
-layouts are identical. MTP matrices on that identity bind as W8 or NVFP4. The registry constructs the 27B `LoadedModel`, `SequencePlan`, and
+layouts are identical. The mixed profile validates the complete inventory described
+above after selecting from the embedding descriptor; filenames and tensor counts
+are not dispatch inputs. MTP matrices on that identity bind as W8 or NVFP4. The registry constructs the 27B `LoadedModel`, `SequencePlan`, and
 `Program`, and reports `qwen3_8_27b/qwen3.8-27b/groupwise-int` or
 `qwen3_8_27b/qwen3.8-27b/nvfp4` in the load summary.
 

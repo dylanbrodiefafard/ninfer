@@ -515,6 +515,7 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     w.u32(kDiskFormatVersion);
     w.str(fp.model_id);
     w.str(fp.weights_id);
+    w.str(fp.artifact_file_identity);
     w.u8(static_cast<std::uint8_t>(fp.kv_cache));
     w.u8(static_cast<std::uint8_t>(fp.speculative));
     w.u32(fp.page_size);
@@ -550,6 +551,7 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     DiskFingerprint fp;
     fp.model_id             = r.str();
     fp.weights_id           = r.str();
+    fp.artifact_file_identity = r.str();
     fp.kv_cache             = static_cast<KvCacheStorage>(r.u8());
     fp.speculative          = static_cast<SpeculativeBackend>(r.u8());
     fp.page_size            = r.u32();
@@ -811,6 +813,8 @@ void compare_fingerprint_field(bool ok, const char* field) {
 void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want) {
     compare_fingerprint_field(have.model_id == want.model_id, "model_id");
     compare_fingerprint_field(have.weights_id == want.weights_id, "weights_id");
+    compare_fingerprint_field(have.artifact_file_identity == want.artifact_file_identity,
+                              "artifact_file_identity");
     compare_fingerprint_field(have.kv_cache == want.kv_cache, "kv_cache");
     compare_fingerprint_field(have.speculative == want.speculative, "speculative");
     compare_fingerprint_field(have.page_size == want.page_size, "page_size");
@@ -979,6 +983,7 @@ try_decode_tombstone(const std::vector<std::uint8_t>& bytes) {
 } // namespace
 
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
+                                      std::string artifact_file_identity,
                                       KvCacheStorage kv_cache, SpeculativeBackend speculative,
                                       const PagedKVPool& text, const PagedKVPool* backend,
                                       const LinearAttentionStatePool* gdn,
@@ -986,6 +991,7 @@ DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_
     DiskFingerprint fp;
     fp.model_id            = std::move(model_id);
     fp.weights_id          = std::move(weights_id);
+    fp.artifact_file_identity = std::move(artifact_file_identity);
     fp.kv_cache            = kv_cache;
     fp.speculative         = speculative;
     fp.page_size           = static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -1024,6 +1030,9 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
     }
     if (config_.location.empty()) {
         throw std::invalid_argument("KV disk cache requires a location");
+    }
+    if (config_.fingerprint.artifact_file_identity.empty()) {
+        throw std::invalid_argument("KV disk cache requires an artifact_file_identity");
     }
     const std::size_t page_bytes =
         std::max<std::size_t>(config_.logical_page_bytes, 256);

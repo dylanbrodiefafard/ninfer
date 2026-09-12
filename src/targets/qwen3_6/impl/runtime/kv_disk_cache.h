@@ -956,6 +956,7 @@ private:
 };
 
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
+                                      std::string artifact_file_identity,
                                       KvCacheStorage kv_cache, SpeculativeBackend speculative,
                                       const PagedKVPool& text, const PagedKVPool* backend,
                                       const LinearAttentionStatePool* gdn,

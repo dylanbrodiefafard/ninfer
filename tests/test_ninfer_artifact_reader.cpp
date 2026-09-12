@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <chrono>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -116,6 +117,31 @@ void test_registered_sizes() {
     }
 }
 
+void test_fp8_row_layout() {
+    const std::array<std::uint64_t, 2> shape{2, 4};
+    const auto geometry = ninfer::artifact::row_scale_geometry(
+        NumericFormat::FP8_E4M3FN_ROW_BF16S, shape);
+    if (geometry.code_plane_bytes != 8 || geometry.scale_plane_offset != 256 ||
+        geometry.scale_plane_bytes != 4 || geometry.encoded_bytes != 260) {
+        throw std::runtime_error("FP8 row-scale geometry differs from exact byte layout");
+    }
+    auto directory = normative_directory();
+    directory["objects"].push_back({{"name", "fp8"}, {"kind", "tensor"}, {"shape", {2, 4}},
+        {"format", "FP8_E4M3FN_ROW_BF16S"}, {"layout", "row-scale-v1"},
+        {"offset", 3584}, {"bytes", 260}});
+    auto fixture = write_fixture(directory, "fp8-row-scale");
+    Reader reader(fixture.path);
+    const auto* tensor = std::get_if<TensorDescriptor>(reader.find("fp8"));
+    if (tensor == nullptr || tensor->format != NumericFormat::FP8_E4M3FN_ROW_BF16S ||
+        tensor->layout != StorageLayout::RowScaleV1 || reader.payload(*tensor).data.size() != 260) {
+        throw std::runtime_error("FP8 row-scale directory/payload did not round trip");
+    }
+    expect_artifact_error([&] {
+        (void)ninfer::artifact::tensor_encoded_size(StorageLayout::RowSplitK128V1,
+            NumericFormat::FP8_E4M3FN_ROW_BF16S, shape);
+    }, "FP8 cannot use grouped integer layout");
+}
+
 void test_normative_fixture() {
     auto fixture = write_fixture(normative_directory(), "valid");
     Reader reader(fixture.path);
@@ -185,13 +211,44 @@ void test_common_validation() {
     }
 }
 
+void test_file_generation_identity() {
+    auto original = write_fixture(normative_directory(), "file-identity-original");
+    auto replacement = write_fixture(normative_directory(), "file-identity-replacement");
+    const auto initial = Reader(original.path).file_identity();
+    if (initial.empty() || Reader(original.path).file_identity() != initial) {
+        throw std::runtime_error("unchanged artifact file identity is not stable");
+    }
+    if (Reader(replacement.path).file_identity() == initial) {
+        throw std::runtime_error("distinct files with the same artifact identity alias");
+    }
+    // Same pathname, same byte length, same public identity; a new inode must
+    // invalidate persistent state rather than reusing the replaced model's KV.
+    std::filesystem::rename(replacement.path, original.path);
+    const auto replaced = Reader(original.path).file_identity();
+    if (replaced == initial) { throw std::runtime_error("artifact replacement was not detected"); }
+    const auto before = std::filesystem::last_write_time(original.path);
+    {
+        const auto payload_offset = Reader(original.path).payload_offset();
+        std::fstream file(original.path, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(static_cast<std::streamoff>(payload_offset));
+        file.put('Z');
+        if (!file) { throw std::runtime_error("failed to modify artifact fixture payload"); }
+    }
+    std::filesystem::last_write_time(original.path, before - std::chrono::seconds(2));
+    if (Reader(original.path).file_identity() == replaced) {
+        throw std::runtime_error("artifact modification was not detected");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_registered_sizes();
+        test_fp8_row_layout();
         test_normative_fixture();
         test_common_validation();
+        test_file_generation_identity();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -15,9 +15,10 @@ The initial storage registry contains exactly these identities:
 | `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
+| `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | positive rank 2 `[N,K]` | 256 bytes |
 
 These are closed identities, not templates. A format/layout combination not present in the table is
-unsupported. In particular, a direct format cannot use either quantized layout, grouped
+unsupported. In particular, a direct format cannot use a quantized layout, grouped
 signed-integer formats cannot use `contiguous-le-v1`, and `NVFP4` cannot use
 `row-split-k128-v1`.
 
@@ -295,7 +296,16 @@ The scale word's byte offset within the scale plane is:
 Layout decoding must recover the original packed E2M1 words, natural `[N,K/16]` E4M3FN scale-word
 matrix, and exact divisor word. It never decodes and re-encodes either floating-point format.
 
-## 5. `raw-bytes-v1`
+## 5. `row-scale-v1`
+
+For logical `[N,K]`, the first `N*K` bytes are finite signed E4M3FN codes in
+row-major order. BF16 row multipliers begin at `align_up(N*K,256)`; each row has
+one little-endian two-byte word. Encoded size is exactly `align_up(N*K,256)+2*N`.
+Only the code/scale gap is padded (zero bytes); no per-row or trailing padding is
+present. Codes and scales are preserved bit-exactly, including signed-zero codes.
+This layout accepts only `FP8_E4M3FN_ROW_BF16S`; it does not transpose or repack at load.
+
+## 6. `raw-bytes-v1`
 
 `raw-bytes-v1` is a required-resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -310,7 +320,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 6. Decode boundary
+## 7. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -320,6 +330,7 @@ Layout decoding yields only persistent logical words:
 - `blockscale-k16-m128x4-v1` yields the packed E2M1 words, natural E4M3FN group-scale words, and
   matrix-level FP32 weight divisor;
 - `raw-bytes-v1` yields the enclosing resource bytes.
+- `row-scale-v1` yields signed E4M3FN code words and exact BF16 row multipliers.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,

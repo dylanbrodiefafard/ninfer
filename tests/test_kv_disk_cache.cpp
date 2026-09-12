@@ -442,7 +442,7 @@ disk_config(const fs::path& location, q36::detail::KVRamCache& ram, ninfer::Page
     cfg.max_context    = max_context;
     cfg.ram            = &ram;
     cfg.fingerprint    = q36::detail::make_disk_fingerprint(
-        "qwen3.6-27b", "groupwise-int", ninfer::KvCacheStorage::Int8Group64, speculative, text,
+        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64, speculative, text,
         backend, gdn, cyclic);
     cfg.text_pool          = &text;
     cfg.backend_pool       = backend;
@@ -675,6 +675,17 @@ int test_lock_and_fingerprint(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
         threw = std::string(e.what()).find("model_id") != std::string::npos;
     }
     if (!threw) { return fail("fingerprint mismatch did not name model_id"); }
+    cfg.fingerprint.model_id = "qwen3.6-27b";
+    cfg.fingerprint.artifact_file_identity = "different-file-same-model-and-weights";
+    threw = false;
+    try {
+        q36::detail::KVDiskCache mismatch(cfg);
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()).find("artifact_file_identity") != std::string::npos;
+    }
+    if (!threw) { return fail("same-profile different artifact reused the disk cache"); }
+    cfg.fingerprint.artifact_file_identity = "disk-test-artifact";
+    { q36::detail::KVDiskCache unchanged(cfg); }
     (void)ctx;
     return 0;
 }
@@ -1232,7 +1243,7 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::DFlash,
                            32ULL << 20, 4096);
     cfg.fingerprint =
-        q36::detail::make_disk_fingerprint("qwen3.6-27b", "groupwise-int",
+        q36::detail::make_disk_fingerprint("qwen3.6-27b", "groupwise-int", "disk-test-artifact",
                                            ninfer::KvCacheStorage::Int8Group64,
                                            ninfer::SpeculativeBackend::DFlash, pool, nullptr,
                                            nullptr, &cyclic);
@@ -11305,7 +11316,7 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
     std::vector<std::uint8_t> meta((std::istreambuf_iterator<char>(in)),
                                    std::istreambuf_iterator<char>());
     in.close();
-    // encode_meta: magic 8, version 5, then packed scalars through identity_id at
+    // encode_meta: magic 8, version 6, then packed scalars through identity_id at
     // byte 100, current_gdn_id at 108, current_hidden_id at 116.
     constexpr std::size_t kCurrentHiddenIdOff = 116;
     if (meta.size() < kCurrentHiddenIdOff + 8) {

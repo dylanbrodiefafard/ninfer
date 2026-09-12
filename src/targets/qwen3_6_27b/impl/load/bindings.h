@@ -67,6 +67,7 @@ struct GdnPlan {
     artifact::ObjectHandle convolution;
     artifact::ObjectHandle a_projection;
     artifact::ObjectHandle b_projection;
+    std::optional<artifact::ObjectHandle> a_b_projection;
     std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
     artifact::ObjectHandle norm;
     WeightPlan output;

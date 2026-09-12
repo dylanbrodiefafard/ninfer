@@ -10,6 +10,7 @@ namespace ninfer::test::linear_swiglu {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
+    A8,
     A4,
 };
 
@@ -23,7 +24,8 @@ struct Profile {
 };
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases);
+                std::span<const std::int32_t> token_cases,
+                std::span<const std::int32_t> graph_cases = {});
 
 // Packed width column 0 vs T=1 A16 decode on the same weights and token-0 activation.
 int run_column0_matches_decode(std::string_view label, const Profile& profile,

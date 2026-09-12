@@ -88,14 +88,15 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
     const auto& identity                          = reader.identity();
-    const auto weights_profile                    = Target::resolve_weights(identity);
+    artifact::Binder binder(reader);
+    const auto weights_profile                    = Target::resolve_weights(identity, binder);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
     EngineOptions planned = options;
     planned.model_id      = identity.model_id;
     planned.weights_id    = identity.weights_id;
+    planned.artifact_file_identity = reader.file_identity();
 
-    artifact::Binder binder(reader);
     auto load_plan        = Target::plan_load(binder, planned, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, planned, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();

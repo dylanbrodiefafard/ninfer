@@ -346,6 +346,8 @@ ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
@@ -383,6 +385,13 @@ ninfer_add_fused_linear_test(
 ninfer_add_op_test(ninfer_linear_add_nvfp4_test
   SOURCES ops/linear_add/test_nvfp4.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_add_fp8_test
+  SOURCES ops/linear_add/test_fp8.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_fp8_test
+  ops/linear_swiglu/test_fp8.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
 ninfer_add_fused_linear_test(
   ninfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp

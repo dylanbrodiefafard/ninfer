@@ -83,7 +83,8 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
                              std::string(target_key) + "'");
 }
 
-Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
+Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity,
+                                                          const artifact::Binder& binder) {
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
@@ -93,11 +94,30 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Nvfp4;
     }
-    // Qwen3.8 reuses the Qwen3.6 NVFP4 profile unchanged: that profile already
-    // holds the vocabulary endpoints in W8, which is the only place the two
-    // groupwise artifacts differ, so the object layouts are identical.
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Nvfp4;
+        const auto* object = binder.find("text/token_embedding");
+        const auto* tensor = object == nullptr ? nullptr :
+            std::get_if<artifact::TensorDescriptor>(object);
+        if (tensor != nullptr && tensor->format == artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+            return WeightsProfile::MixedFp8Nvfp4;
+        }
+        if (tensor != nullptr && tensor->format == artifact::NumericFormat::W8G32_F16S) {
+            for (std::size_t layer = 0; layer < 64; ++layer) {
+                const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+                for (const char* role : {"attention/query_key_gate_value", "attention/output",
+                                         "gdn/query_key_value_z", "gdn/output",
+                                         "mlp/gate_up", "mlp/down"}) {
+                    const auto* entry = binder.find(prefix + role);
+                    const auto* weight = entry == nullptr ? nullptr :
+                        std::get_if<artifact::TensorDescriptor>(entry);
+                    if (weight != nullptr && weight->format == artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S) {
+                        return WeightsProfile::SelectiveFp8Nvfp4;
+                    }
+                }
+            }
+            return WeightsProfile::Nvfp4;
+        }
+        throw artifact::ArtifactError("qwen3.8-27b/nvfp4: unsupported vocabulary storage profile");
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");

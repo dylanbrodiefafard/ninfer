@@ -96,6 +96,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
+    if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -103,6 +104,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
+    if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -210,6 +212,7 @@ public:
         fd_   = fd;
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
+        status_ = status;
     }
 
     ~MappedFile() {
@@ -223,6 +226,15 @@ public:
     const std::byte* data() const noexcept { return data_; }
 
     std::size_t size() const noexcept { return size_; }
+
+    std::string file_identity() const {
+        return "linux-file-v1:" + std::to_string(status_.st_dev) + ":" +
+               std::to_string(status_.st_ino) + ":" + std::to_string(status_.st_size) + ":" +
+               std::to_string(status_.st_mtim.tv_sec) + ":" +
+               std::to_string(status_.st_mtim.tv_nsec) + ":" +
+               std::to_string(status_.st_ctim.tv_sec) + ":" +
+               std::to_string(status_.st_ctim.tv_nsec);
+    }
 
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
         constexpr std::size_t alignment = Reader::direct_io_alignment;
@@ -250,6 +262,7 @@ private:
     int fd_                = -1;
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
+    struct stat status_ {};
 };
 
 } // namespace
@@ -362,6 +375,8 @@ Reader::Reader(Reader&&) noexcept            = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
 const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
+
+std::string Reader::file_identity() const { return impl_->file.file_identity(); }
 
 const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
 

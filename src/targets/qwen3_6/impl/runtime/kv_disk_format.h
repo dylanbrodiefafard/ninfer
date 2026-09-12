@@ -22,7 +22,7 @@ inline constexpr char kDiskTombstoneMagic[8]    = {'N', 'I', 'D', 'K', 'T', 'B',
 inline constexpr char kDiskPackSetMagic[8]      = {'N', 'I', 'D', 'K', 'P', 'S', '0', '1'};
 inline constexpr char kDiskObjectMapMagic[8]    = {'N', 'I', 'D', 'K', 'O', 'M', '0', '1'};
 
-inline constexpr std::uint32_t kDiskFormatVersion     = 5;
+inline constexpr std::uint32_t kDiskFormatVersion     = 6;
 inline constexpr std::uint32_t kDiskPageHeaderBytes   = 16;
 inline constexpr std::uint32_t kDiskPageIoAlignment   = 4096;
 inline constexpr std::uint32_t kDiskCodecHeaderBytes  = 24;
@@ -88,6 +88,7 @@ struct DiskPlaneSchema {
 };
 
 struct DiskFingerprint {
+    std::string artifact_file_identity;
     std::string model_id;
     std::string weights_id;
     KvCacheStorage kv_cache          = KvCacheStorage::Nvfp4;

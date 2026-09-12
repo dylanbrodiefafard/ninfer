@@ -49,6 +49,10 @@ constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::AllowA4;
 ops::LinearPolicy text_policy(const Weight& weight,
                               qwen3_6::TextPhase phase = qwen3_6::TextPhase::Prefill,
                               std::int32_t aggregate_tokens = 0) {
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        return phase == qwen3_6::TextPhase::Prefill && aggregate_tokens > 1
+                   ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
+    }
     // P-less is sensitive to small target-logit perturbations at its collision-probability
     // boundary. Keep target verification on the same A16 matrix route as ordinary decode.
     // Numerically sensitive fused projections remain per-request panels unless they have an
@@ -149,6 +153,14 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
                             width, width));
     }
+    const Weight& parent =
+        std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
+    if (parent.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                parent.qtype, 16384, TextConfig::hidden, ops::LinearPolicy::AllowA8,
+                batch, width, width));
+    }
     return nvfp4_gdn_record_leaf_bytes(batch, width, width);
 }
 
@@ -162,10 +174,13 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
                             width, width));
     }
-    return std::max(
-        kMinimumLeafWorkspaceBytes,
+    const Weight& parent =
+        std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
+    const auto policy = parent.qtype == QType::FP8_E4M3FN_ROW_BF16S
+                            ? ops::LinearPolicy::AllowA8 : kNvfp4TextPolicy;
+    return std::max(kMinimumLeafWorkspaceBytes,
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch, width, width));
+            parent.qtype, 16384, TextConfig::hidden, policy, batch, width, width));
 }
 
 void mtp_split_packed_attention(const Tensor& hidden, const Weight& packed, Tensor& query,
@@ -298,7 +313,8 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           WorkspaceArena& workspace, cudaStream_t stream,
                                           std::int32_t route_tokens) {
     if (split_verify_panels(phase, route_tokens, attention.ne[1]) &&
-        !aggregate_verify_residuals(phase, route_tokens, attention.ne[1])) {
+        (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+         !aggregate_verify_residuals(phase, route_tokens, attention.ne[1]))) {
         for (std::int32_t offset = 0; offset < attention.ne[1]; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
             ops::linear_add(attention.slice(1, offset, route_tokens), weight, residual_panel,
@@ -462,7 +478,8 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                     cudaStream_t stream, std::int32_t route_tokens) {
     if (split_verify_panels(phase, route_tokens, hidden.ne[1]) &&
-        !aggregate_verify_residuals(phase, route_tokens, hidden.ne[1])) {
+        (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+         !aggregate_verify_residuals(phase, route_tokens, hidden.ne[1]))) {
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
             ops::linear_add(hidden.slice(1, offset, route_tokens), weight, residual_panel,
@@ -499,16 +516,30 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
-        const bool aggregate_down =
-            aggregate_verify_extent(phase, route_tokens, hidden.ne[1]);
+        // The aggregate residual schedules were qualified for the existing
+        // formats, not FP8. Keep FP8 at the C=1 panel width to preserve its
+        // reduction profile when another request joins the verify batch.
+        const bool aggregate_down = weights.down.qtype != QType::FP8_E4M3FN_ROW_BF16S &&
+                                    aggregate_verify_extent(phase, route_tokens, hidden.ne[1]);
         const bool aggregate_swiglu = weights.gate_up.qtype == QType::NVFP4 &&
                                       aggregate_verify_swiglu(phase, route_tokens, hidden.ne[1]);
         if (aggregate_swiglu) {
             ops::linear_swiglu(hidden, weights.gate_up, activation,
                                text_policy(weights.gate_up, phase, route_tokens), workspace,
                                stream);
-            ops::linear_add(activation, weights.down, residual,
-                            text_policy(weights.down, phase, route_tokens), workspace, stream);
+            if (aggregate_down) {
+                ops::linear_add(activation, weights.down, residual,
+                                text_policy(weights.down, phase, route_tokens), workspace, stream);
+            } else {
+                // Selective storage can pair an aggregate NVFP4 gate/up with an
+                // FP8 down projection. The latter still requires C=1 panels.
+                for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
+                    Tensor residual_panel = residual.slice(1, offset, route_tokens);
+                    ops::linear_add(activation.slice(1, offset, route_tokens), weights.down,
+                                    residual_panel, text_policy(weights.down, phase, route_tokens),
+                                    workspace, stream);
+                }
+            }
             return;
         }
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
@@ -619,9 +650,18 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::SelectiveFp8Nvfp4:
+        return std::max(attention_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last),
+                        attention_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return 0;
+    case WeightsProfile::MixedFp8Nvfp4:
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden,
+            ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -633,11 +673,20 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::SelectiveFp8Nvfp4:
+        return std::max(attention_output_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last),
+                        attention_output_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
                                                         ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::MixedFp8Nvfp4:
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, TextConfig::hidden, TextConfig::query_size,
+            ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
@@ -652,9 +701,18 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::SelectiveFp8Nvfp4:
+        return std::max(gdn_input_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last),
+                        gdn_input_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return 0;
+    case WeightsProfile::MixedFp8Nvfp4:
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden,
+            ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -667,12 +725,22 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::SelectiveFp8Nvfp4:
+        return std::max(gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile::Nvfp4,
+                           qwen3_6::TextPhase::Prefill, batch_size, first, last),
+                        gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                           qwen3_6::TextPhase::Prefill, batch_size, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
+    case WeightsProfile::MixedFp8Nvfp4:
+        return std::max(kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden,
+                ops::LinearPolicy::AllowA8, batch_size, first, last));
     case WeightsProfile::Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -687,12 +755,22 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::SelectiveFp8Nvfp4:
+        return std::max(gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile::Nvfp4,
+                           qwen3_6::TextPhase::Prefill, batch_size, first, last),
+                        gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                           qwen3_6::TextPhase::Prefill, batch_size, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
+    case WeightsProfile::MixedFp8Nvfp4:
+        return std::max(kMinimumLeafWorkspaceBytes,
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden,
+                ops::LinearPolicy::AllowA8, batch_size, first, last));
     case WeightsProfile::Nvfp4:
         return nvfp4_gdn_record_leaf_bytes(batch_size, first, last);
     }
@@ -705,11 +783,20 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::SelectiveFp8Nvfp4:
+        return std::max(gdn_output_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last),
+                        gdn_output_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                           qwen3_6::TextPhase::Prefill, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
                                                         TextConfig::value_dim,
                                                         ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::MixedFp8Nvfp4:
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, TextConfig::hidden, TextConfig::value_dim,
+            ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
@@ -737,6 +824,21 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
         down_qtype    = QType::Q5G64_F16S;
         policy        = ops::LinearPolicy::A16Only;
         break;
+    case WeightsProfile::SelectiveFp8Nvfp4:
+    case WeightsProfile::MixedFp8Nvfp4: {
+        WorkspaceLayoutBuilder fp8;
+        (void)fp8.alloc(DType::BF16, {TextConfig::intermediate, last});
+        const std::size_t scratch = std::max(
+            ops::linear_swiglu_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
+                2 * TextConfig::intermediate, TextConfig::hidden,
+                ops::LinearPolicy::AllowA8, first, last),
+            ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
+                TextConfig::hidden, TextConfig::intermediate,
+                ops::LinearPolicy::AllowA8, first, last));
+        (void)fp8.alloc_bytes(scratch);
+        return std::max(fp8.peak_bytes(1), post_mixer_workspace_capacity_bytes(
+            WeightsProfile::Nvfp4, qwen3_6::TextPhase::Prefill, first, last));
+    }
     case WeightsProfile::Nvfp4:
         gate_up_qtype = QType::NVFP4;
         down_qtype    = QType::NVFP4;

@@ -292,11 +292,15 @@ decimal integer; `0` is rejected. Construction fails if the host pin cannot be a
 `--kv-disk-compress zstd` compresses new GDN/hidden/cyclic blobs only; KV pages are never
 application-compressed. Disk is inclusive: a VRAM or RAM hit does not delete the committed SSD
 generation. Equal reuse prefers VRAM, then RAM, then disk.
-Disk format v5 fingerprints canonical logical KV pages rather than the current GPU pool capacity,
+Disk format v6 fingerprints canonical logical KV pages rather than the current GPU pool capacity,
 so one location can reopen across `--vision` on/off and automatic resident-capacity changes. Media
-content remains part of each entry identity. Pre-v5 locations fail the version check and must be
-cleared once; model, weights, KV dtype, speculative backend, and persistent-state incompatibilities
-still fail startup.
+content remains part of each entry identity. The fingerprint also binds the opened artifact's
+local file generation (device, inode, byte length, nanosecond modification/change times), not just
+its shared model/weights names. Replaced or modified artifacts require a fresh cache directory;
+even a byte-identical copy is conservatively a different file. Artifacts must remain immutable
+while an Engine is using them. Pre-v6 locations fail startup: select a new directory and retain
+the old one until its contents are no longer needed. KV dtype, speculative backend, and
+persistent-state incompatibilities also fail startup.
 Orderly Engine shutdown copies active chats into the host cache, saves cache entries that are not
 yet on SSD, and finishes outstanding disk writes. When disk is enabled, the same stderr progress
 renderer prints `kv-disk` `copy active chats` / `save cache entries` / `finish disk writes`

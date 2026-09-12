@@ -64,6 +64,13 @@ This writes `profiles/kdev/mma_issue.json`. Re-run bound or recipe; they pick up
 `mma_per_s`. The register-only issue roof is the compute floor that matters. 1676 TFLOP/s
 is the datasheet fallback used when the probe file is absent.
 
+For row-scaled FP8 use `--qtype fp8 --policy a8` (or `a16`). The public Linear
+benchmark supports both. FP8 bound cards require a matching measured `fp8` or
+`bf16` MMA rate from `kdev mma`; they never reuse the NVFP4 instruction rate or
+FP4 datasheet roof. Their weight floor is `N*K + 2*N` bytes. The instruction
+probe excludes operand conversion, activation quantization, loads and epilogues;
+public-Op timings must include those costs.
+
 ## Layer 2 — parameter sweep on the GPU
 
 Search parameters inside one family (tile M/N, K stages, warps, pipeline). Do not fork a new

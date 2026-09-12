@@ -39,7 +39,7 @@ constexpr int kWarmup   = 5;
 constexpr int kTrials   = 7;
 constexpr double kDenseFp4TflopS = 1676.0;
 
-enum class Atom : int { Nvfp4, Bf16, S8 };
+enum class Atom : int { Nvfp4, Bf16, Fp8, S8 };
 
 struct Options {
     Atom atom      = Atom::Nvfp4;
@@ -85,6 +85,16 @@ __device__ __forceinline__ void issue_s8(int iters, float& c0, float& c1, float&
     c3 = static_cast<float>(ic3);
 }
 
+__device__ __forceinline__ void issue_fp8(int iters, float& c0, float& c1, float& c2, float& c3) {
+    const unsigned a = 0x38383838u;
+    for (int i = 0; i < iters; ++i) {
+#pragma unroll
+        for (int u = 0; u < kInner; ++u) {
+            ninfer::ops::mma_fp8_e4m3(c0, c1, c2, c3, a, a, a, a, a, a);
+        }
+    }
+}
+
 template <Atom kAtom>
 __global__ void mma_issue_kernel(float* sink, int iters) {
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
@@ -92,6 +102,8 @@ __global__ void mma_issue_kernel(float* sink, int iters) {
         issue_nvfp4(iters, c0, c1, c2, c3);
     } else if constexpr (kAtom == Atom::Bf16) {
         issue_bf16(iters, c0, c1, c2, c3);
+    } else if constexpr (kAtom == Atom::Fp8) {
+        issue_fp8(iters, c0, c1, c2, c3);
     } else {
         issue_s8(iters, c0, c1, c2, c3);
     }
@@ -162,7 +174,7 @@ Result run_atom(const char* name, int m, int n, int k, const Options& opt, int s
 
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s [--atom nvfp4|bf16|s8|all] [--iters N] [--warps W] "
+                 "usage: %s [--atom nvfp4|bf16|fp8|s8|all] [--iters N] [--warps W] "
                  "[--blocks-per-sm B] [--json]\n",
                  argv0);
 }
@@ -187,6 +199,8 @@ Options parse(int argc, char** argv) {
                 opt.atom = Atom::Bf16;
             } else if (value == "s8") {
                 opt.atom = Atom::S8;
+            } else if (value == "fp8") {
+                opt.atom = Atom::Fp8;
             } else if (value == "all") {
                 opt.all = true;
             } else {
@@ -234,6 +248,7 @@ int main(int argc, char** argv) {
         results.push_back(run_atom<Atom::Bf16>("bf16", 16, 8, 16, opt, sm_count));
     }
     if (want(Atom::S8)) { results.push_back(run_atom<Atom::S8>("s8", 16, 8, 32, opt, sm_count)); }
+    if (want(Atom::Fp8)) { results.push_back(run_atom<Atom::Fp8>("fp8", 16, 8, 32, opt, sm_count)); }
 
     if (opt.json) {
         std::printf("{\n");

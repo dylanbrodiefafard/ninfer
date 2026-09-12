@@ -885,7 +885,7 @@ lease but does not delete the durable entry; a later VRAM or RAM hit likewise le
 available. C=1 does not submit restore reads until the selected retained victim has been captured
 and its GPU pages released.
 
-Disk format v5 stores objects in 1 GiB, per-kind pack segments under an atomically selected
+Disk format v6 stores objects in 1 GiB, per-kind pack segments under an atomically selected
 generation. `PACKSET` names the generation and reserves monotonically increasing object-ID ranges.
 The immutable base map and append-only, CRC-framed log resolve stable object IDs to aligned
 extents. Page and state records carry header/payload CRC32C; ledger and identity records retain
@@ -912,6 +912,16 @@ packed bytes through the current pool geometry. A cache directory can therefore 
 size, logical plane schema, speculative backend, and persistent GDN/DFlash state geometry remain
 strict compatibility boundaries. Vision media identity remains in each entry's exact identity
 record, so changed image or video content cannot reuse a stored prefix.
+
+The v6 fingerprint additionally requires the opened artifact's local file-generation identity:
+device, inode, byte length, and nanosecond modification/change timestamps, captured from the
+Reader's open descriptor. Distinct quantization variants may share `model_id`/`weights_id` but
+must never share retained numerical state. This is an immutable-local-file identity, not a
+content hash or an integrity check against concurrent/adversarial file mutation. Unchanged
+reopens are stable; replacement, metadata modification, or copying to a different inode may
+conservatively require a fresh cache directory. No model-size hashing pass is introduced at
+startup. The trusted local owner must not mutate an artifact while an Engine is using it.
+Pre-v6 stores lack this boundary and are rejected, not silently adopted or automatically deleted.
 
 Compaction copies live extents into a new generation, publishes its complete base map, and then
 atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
