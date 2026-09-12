@@ -6,8 +6,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
+
+// A failed optional cache read can be retried by recomputing the prompt.
+// CUDA failures and execution errors must retain their original exception.
+class CacheRestoreFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;
@@ -26,6 +34,8 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Internal cache recovery bypasses existing images without disabling capture.
+    bool force_cold_prefill               = false;
     bool capture_context_checkpoint       = false;
     std::array<TokenId, kMaximumSuppressedTokens> suppressed_token_ids{};
     std::uint32_t suppressed_token_count = 0;
@@ -70,6 +80,7 @@ struct RequestPlanSummary {
     std::uint64_t disk_hash_f_lo           = 0;
     std::uint64_t disk_hash_f_hi           = 0;
     std::uint32_t disk_execution_frontier  = 0;
+    std::uint64_t disk_committed_generation = 0;
     PrefixReusePath disk_reuse_path       = PrefixReusePath::FullReset;
     PrefixReuseSource reuse_source         = PrefixReuseSource::None;
 };

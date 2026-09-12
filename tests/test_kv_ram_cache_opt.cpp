@@ -123,7 +123,9 @@ int capture_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::P
     source.gdn_current_slot = gdn != nullptr ? 0 : -1;
     source.tail_hidden      = hidden;
     source.stream           = stream;
-    return cache.capture(source) ? 0 : 1;
+    return cache.capture(source).status ==
+                   ninfer::targets::qwen3_6::detail::RamCaptureStatus::Captured
+               ? 0 : 1;
 }
 
 double gbs(std::size_t bytes, double ms, int copies) {
@@ -263,8 +265,10 @@ int main() {
     }
     auto dest = pool.reserve(kPages);
     dest.materialize_pages(kPages, ctx.stream);
+    // KV-only fixture has no sampled tail hidden; a suffix regenerates it.
+    const auto continuation = text_prompt({1, 2, 3, 4, 5});
     const auto match =
-        cache.plan_match(prompt, ninfer::targets::qwen3_6::detail::prefix_hash_chain(prompt));
+        cache.plan_match(continuation, ninfer::targets::qwen3_6::detail::prefix_hash_chain(continuation));
     if (!match) { return fail("opt capture did not index before copy completion"); }
     ninfer::targets::qwen3_6::detail::RamRestoreTarget target;
     target.text           = &dest;

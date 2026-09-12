@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -1876,7 +1877,65 @@ int exercise_turn_rollback(const char* artifact,
     return 0;
 }
 
+// Exercise the Program acquisition boundary, not just the head's event helper:
+// an allocation failure must occur before DMA can borrow this head's buffers.
+int exercise_event_allocation(const char* artifact, ninfer::SpeculativeBackend spec) {
+    using Head = ninfer::targets::qwen3_6::detail::ContextCheckpointHead;
+    constexpr std::uint32_t mark = 128;
+    auto options = [&] {
+        auto value = engine_options(artifact, 1, 2048, false, 2048, spec);
+        value.prefill_chunk = mark;
+        value.context_checkpoint_marks = std::vector<std::uint32_t>{mark};
+        value.kv_cache = ninfer::KvCacheStorage::Nvfp4;
+        return value;
+    };
+    const auto failed_prompt = padded(kPadCtl, mark);
+    const auto retry_prompt = padded(kPadCtlHit, mark);
+    std::vector<ninfer::TokenId> failed_tokens;
+    std::vector<ninfer::TokenId> restored_tokens;
+    {
+        ninfer::Engine engine(options());
+        if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
+        Head::test_fail_next_copy_event_allocation();
+        // One prefill chunk gives exactly one capture opportunity. A retry at a
+        // later chunk would hide failure to preserve the optional-capture boundary.
+        const auto failed = engine.generate(engine.prepare_tokens(failed_prompt), greedy(1, true));
+        if (Head::test_copy_event_allocation_pending() ||
+            failed.generated_token_ids.size() != 1 ||
+            failed.captured_context_checkpoint_tokens != 0) {
+            return fail("checkpoint event OOM did not drop only the optional Program capture");
+        }
+        failed_tokens = failed.generated_token_ids;
+        const auto captured = engine.generate(engine.prepare_tokens(retry_prompt), greedy(2, true));
+        if (captured.generated_token_ids.size() != 2 ||
+            captured.captured_context_checkpoint_tokens != mark) {
+            return fail("checkpoint capture did not recover after event allocation failure");
+        }
+        const auto restored = engine.generate(engine.prepare_tokens(retry_prompt), greedy(1, true));
+        if (restored.prefix_reuse_path != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
+            restored.restored_context_checkpoint_tokens != mark ||
+            restored.generated_token_ids.size() != 1) {
+            return fail("checkpoint event OOM retry did not produce a reusable head");
+        }
+        restored_tokens = restored.generated_token_ids;
+    }
+    // A new Engine and cold execution make the next-token oracle independent of
+    // both the failed acquisition and the surviving/restored checkpoint state.
+    {
+        ninfer::Engine oracle(options());
+        const auto failed_cold = oracle.generate(oracle.prepare_tokens(failed_prompt), greedy(1, false));
+        const auto retry_cold = oracle.generate(oracle.prepare_tokens(retry_prompt), greedy(1, false));
+        if (failed_tokens != failed_cold.generated_token_ids ||
+            restored_tokens != retry_cold.generated_token_ids) {
+            return fail("checkpoint event allocation recovery differs from fresh cold next token");
+        }
+    }
+    std::cout << "checkpoint Program event allocation recovery passed\n";
+    return 0;
+}
+
 int exercise_artifact(const char* artifact, ninfer::SpeculativeBackend spec) {
+    if (const int rc = exercise_event_allocation(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_single_lane(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_catch_up(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_cancel(artifact, spec); rc != 0) { return rc; }
@@ -1901,7 +1960,18 @@ int exercise_artifact(const char* artifact, ninfer::SpeculativeBackend spec) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool single_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                             std::string(argv[2]) == "single";
+    const bool event_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                            std::string(argv[2]) == "event-allocation";
+    if (argc != 1 && !single_only && !event_only) {
+        return fail("usage: checkpoint_real [--case single|event-allocation]");
+    }
+    const auto run = [single_only, event_only](const char* artifact, ninfer::SpeculativeBackend spec) {
+        if (event_only) { return exercise_event_allocation(artifact, spec); }
+        return single_only ? exercise_single_lane(artifact, spec) : exercise_artifact(artifact, spec);
+    };
     try {
         const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
         const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
@@ -1915,20 +1985,20 @@ int main() {
         }
         if (groupwise != nullptr && *groupwise != '\0') {
             if (const int result =
-                    exercise_artifact(groupwise, ninfer::SpeculativeBackend::Mtp);
+                    run(groupwise, ninfer::SpeculativeBackend::Mtp);
                 result != 0) {
                 return result;
             }
         }
         if (nvfp4 != nullptr && *nvfp4 != '\0') {
-            if (const int result = exercise_artifact(nvfp4, ninfer::SpeculativeBackend::Mtp);
+            if (const int result = run(nvfp4, ninfer::SpeculativeBackend::Mtp);
                 result != 0) {
                 return result;
             }
         }
         if (dflash != nullptr && *dflash != '\0') {
             if (const int result =
-                    exercise_artifact(dflash, ninfer::SpeculativeBackend::DFlash);
+                    run(dflash, ninfer::SpeculativeBackend::DFlash);
                 result != 0) {
                 return result;
             }

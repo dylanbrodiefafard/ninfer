@@ -288,14 +288,20 @@ template <>
 bool Program<Variant>::claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
                                         std::uint32_t expected_reuse_base,
-                                        PrefixReusePath expected_reuse) {
+                                        PrefixReusePath expected_reuse,
+                                         std::uint64_t expected_committed_generation) {
     return impl_->claim_disk_entry(entry_id, expected_frontier, hash_lo, hash_hi,
-                                   expected_reuse_base, expected_reuse);
+                                   expected_reuse_base, expected_reuse, expected_committed_generation);
 }
 
 template <>
 void Program<Variant>::release_disk_entry(std::uint64_t entry_id) {
     impl_->release_disk_entry(entry_id);
+}
+
+template <>
+void Program<Variant>::invalidate_disk_entry(std::uint64_t entry_id) {
+    impl_->invalidate_disk_entry(entry_id);
 }
 
 template <>

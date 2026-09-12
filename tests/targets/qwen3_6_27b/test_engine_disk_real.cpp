@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1427,87 +1428,177 @@ int exercise_destroy_during_disk_restore(const char* artifact) {
     return 0;
 }
 
-int exercise_capture_fail_does_not_leak_load(const char* artifact) {
-    const auto disk_dir = make_disk_dir("capture-fail");
+int exercise_capture_drop_during_disk_restore(const char* artifact) {
+    const auto disk_dir = make_disk_dir("capture-drop");
     std::vector<SeededChat> seeded;
     if (const int rc = seed_disk_chats(artifact, disk_dir, {tokens_a()}, &seeded); rc != 0) {
         return rc;
     }
     constexpr std::size_t kTinyRam = 1ULL << 20;
-    ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kTinyRam));
-    const auto occupant =
-        engine.generate(engine.prepare_tokens(tokens_b()), greedy(8, false));
-    if (occupant.generated_token_ids.size() != 8) {
-        return fail("capture-fail occupant did not generate");
-    }
-    wait_idle(engine);
-    bool overloaded = false;
-    try {
-        (void)engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, true));
-    } catch (const ninfer::RequestError& error) {
-        if (error.kind() != ninfer::RequestErrorKind::Overloaded) {
-            std::cerr << "capture-fail threw " << error.what() << '\n';
-            return 1;
+    const std::vector<std::vector<ninfer::TokenId>> keeps{
+        tokens_b(), tokens_c(), tokens_d(), tokens_e()};
+    for (std::uint32_t concurrency = 1; concurrency <= 4; ++concurrency) {
+        std::cerr << "disk_real: capture-drop C=" << concurrency << '\n';
+        ninfer::Engine engine(disk_options(artifact, disk_dir, concurrency, kTinyRam));
+        std::vector<ninfer::GenerationResult> occupants;
+        if (const int rc = fill_lanes(
+                engine, {keeps.begin(), keeps.begin() + concurrency}, &occupants,
+                "capture-drop occupants"); rc != 0) {
+            return rc;
         }
-        overloaded = true;
-    }
-    if (!overloaded) {
-        return fail("tiny-RAM disk hit did not overload on capture");
-    }
-    const auto hist_b = resume_prefix(tokens_b(), occupant.generated_token_ids);
-    const auto next = engine.generate(engine.prepare_tokens(hist_b), greedy(4, true));
-    if (next.generated_token_ids.size() != 4) {
-        return fail("capture-fail leaked into a later occupant continue");
-    }
-    if (next.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident &&
-        next.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
-        std::cerr << "capture-fail occupant continue source="
-                  << source_name(next.prefix_reuse_source) << '\n';
-        return 1;
-    }
-    if (next.kv_disk_load_seconds > 0.0) {
-        std::cerr << "capture-fail billed prefetch load onto the next request, load="
-                  << next.kv_disk_load_seconds << "s\n";
-        return 1;
+        const auto before = engine.runtime_stats();
+        const auto hit =
+            engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, true));
+        if (const int rc = expect_hit(
+                hit, ninfer::PrefixReuseSource::HostDisk,
+                static_cast<std::uint32_t>(seeded[0].history.size()), "capture-drop restore");
+            rc != 0) {
+            return rc;
+        }
+        const auto after = engine.runtime_stats();
+        if (hit.generated_token_ids.size() != 4 ||
+            after.kv_ram_drops != before.kv_ram_drops + 1 ||
+            after.kv_ram_captures != before.kv_ram_captures ||
+            after.kv_ram_evictions != before.kv_ram_evictions) {
+            return fail("disk restore did not drop exactly its uncapturable dirty victim");
+        }
+        for (std::uint32_t lane = 1; lane < concurrency; ++lane) {
+            const auto history = resume_prefix(keeps[lane], occupants[lane].generated_token_ids);
+            const auto sibling = engine.generate(engine.prepare_tokens(history), greedy(4, true));
+            if (sibling.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
+                sibling.reused_prompt_tokens != history.size() ||
+                sibling.generated_token_ids.size() != 4 || sibling.kv_disk_load_seconds > 0.0) {
+                return fail("capture-drop restore damaged a retained sibling or leaked copy timing");
+            }
+        }
+        // The covered oldest occupant has no RAM snapshot. Its fresh replay
+        // must still work and must not inherit the preceding restore's timing.
+        const auto next = engine.generate(engine.prepare_tokens(keeps[0]), greedy(8, false));
+        if (next.generated_token_ids != occupants[0].generated_token_ids ||
+            next.kv_disk_load_seconds > 0.0 || next.kv_disk_h2d_seconds > 0.0) {
+            return fail("capture-drop restore poisoned the next request or leaked copy timing");
+        }
+        const auto baseline =
+            engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, false));
+        if (const int rc = expect_greedy_match(hit, baseline, "capture-drop restore"); rc != 0) {
+            return rc;
+        }
     }
     return 0;
 }
 
-int exercise_corrupt_restore_does_not_kill_engine(const char* artifact) {
-    const auto disk_dir = make_disk_dir("corrupt-restore");
-    std::vector<SeededChat> seeded;
-    if (const int rc = seed_disk_chats(artifact, disk_dir, {tokens_a()}, &seeded); rc != 0) {
-        return rc;
-    }
-    ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kRamBytes));
-    std::vector<ninfer::GenerationResult> occupants;
-    if (const int rc = fill_lanes(engine, {tokens_b()}, &occupants, "corrupt-restore occupant");
-        rc != 0) {
-        return rc;
-    }
-    wait_idle(engine);
-    if (!truncate_first_main_object(disk_dir)) {
-        return fail("corrupt-restore found no main object to truncate");
-    }
-    bool restore_failed = false;
-    try {
-        (void)engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, true));
-    } catch (const ninfer::RequestError& error) {
-        if (error.kind() != ninfer::RequestErrorKind::Unavailable) {
-            std::cerr << "corrupt restore threw " << error.what() << '\n';
-            return 1;
+enum class RestoreFault { CorruptPage, HostMetadata, SetupMetadata, CheckpointMetadata, CopyEvent };
+
+int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = false,
+                                      RestoreFault fault = RestoreFault::CorruptPage) {
+    using Disk = ninfer::targets::qwen3_6::detail::KVDiskCache;
+    for (std::uint32_t concurrency : {1U, 2U, 3U, 4U}) {
+        const auto disk_dir = make_disk_dir("corrupt-restore");
+        auto options = [&](std::uint32_t lanes) {
+            auto result = dflash ? dflash_disk_options(artifact, disk_dir, lanes, kRamBytes)
+                                 : disk_options(artifact, disk_dir, lanes, kRamBytes);
+            if (fault == RestoreFault::CheckpointMetadata) {
+                result.context_checkpoint_marks = std::vector<std::uint32_t>{64};
+                if (!dflash) {
+                    result.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+                    result.speculative.draft_tokens = 4;
+                }
+            }
+            return result;
+        };
+        std::vector<ninfer::TokenId> generated;
+        auto source = tokens_a();
+        if (fault != RestoreFault::CorruptPage) { source.resize(192, 198); }
+        {
+            // DFlash cyclic capacity is part of the startup fingerprint. Seed
+            // with the same C as the restored Engine, then cover every lane.
+            ninfer::Engine seed(options(concurrency));
+            const auto first = seed.generate(seed.prepare_tokens(source),
+                                             greedy(8, fault == RestoreFault::CheckpointMetadata));
+            generated = first.generated_token_ids;
+            if (fault == RestoreFault::CheckpointMetadata && first.captured_context_checkpoint_tokens == 0) {
+                return fail("metadata fixture did not capture a real checkpoint image");
+            }
+            if ((dflash || fault == RestoreFault::CheckpointMetadata) && first.speculative.rounds == 0) {
+                return fail("cache fallback seed did not execute its speculative backend");
+            }
+            for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+                auto occupant = tokens_b();
+                occupant.push_back(static_cast<ninfer::TokenId>(728 + lane));
+                (void)seed.generate(seed.prepare_tokens(occupant), greedy(4, false));
+            }
+            if (seed.runtime_stats().kv_ram_captures == 0) {
+                return fail("corrupt fallback seed was not captured");
+            }
         }
-        restore_failed = true;
-    } catch (const std::exception& error) {
-        std::cerr << "corrupt restore killed the Engine: " << error.what() << '\n';
-        return 1;
+        const auto history = resume_prefix(source, generated);
+        ninfer::Engine engine(options(concurrency));
+        if (fault == RestoreFault::CorruptPage && !truncate_first_main_object(disk_dir)) {
+            return fail("corrupt fallback found no main object to truncate");
+        }
+        std::vector<ninfer::GenerationHandle> peers;
+        if (concurrency > 1) {
+            for (std::uint32_t lane = 1; lane < concurrency; ++lane) {
+                auto peer_prompt = tokens_g();
+                peer_prompt.push_back(static_cast<ninfer::TokenId>(728 + lane));
+                peers.push_back(engine.submit(engine.prepare_tokens(peer_prompt), greedy(128, false)));
+            }
+            std::uint32_t prefilling = 0;
+            if (!wait_scheduler(engine, &prefilling, [&](const auto& stats) {
+                    return stats.decode_ready_requests == concurrency - 1;
+                }, "corrupt fallback peer decode")) { return 1; }
+        }
+        const auto before = engine.runtime_stats();
+        if (fault == RestoreFault::CopyEvent) { Disk::test_fail_next_restore_event_allocation(); }
+        if (fault == RestoreFault::HostMetadata) { Disk::test_fail_next_load_host_allocation(); }
+        if (fault == RestoreFault::SetupMetadata) { Disk::test_fail_next_restore_setup_allocation(); }
+        if (fault == RestoreFault::CheckpointMetadata) { Disk::test_fail_next_checkpoint_metadata_allocation(); }
+        auto recovery_options = greedy(1, true);
+        recovery_options.execution.capture_context_checkpoint = dflash;
+        const auto restored = engine.generate(engine.prepare_tokens(history), recovery_options);
+        const auto after = engine.runtime_stats();
+        if (restored.prefix_reuse_source != ninfer::PrefixReuseSource::None ||
+            restored.generated_token_ids.size() != 1 ||
+            (fault == RestoreFault::CheckpointMetadata && restored.captured_context_checkpoint_tokens == 0) ||
+            (fault == RestoreFault::CorruptPage && after.kv_disk_drops <= before.kv_disk_drops) ||
+            (fault == RestoreFault::CopyEvent && Disk::test_restore_event_allocation_pending()) ||
+            (fault == RestoreFault::HostMetadata && Disk::test_load_host_allocation_failure_pending()) ||
+            (fault == RestoreFault::SetupMetadata && Disk::test_restore_setup_allocation_failure_pending()) ||
+            (fault == RestoreFault::CheckpointMetadata && Disk::test_checkpoint_metadata_allocation_failure_pending())) {
+            return fail("corrupt disk restore did not transparently fall back to cold prefill");
+        }
+        for (auto& peer : peers) {
+            if (peer.wait().generated_token_ids.size() != 128) {
+                return fail("corrupt cache fallback interrupted its healthy peer");
+            }
+        }
+        const auto oracle = engine.generate(engine.prepare_tokens(history), greedy(1, false));
+        if (restored.generated_token_ids != oracle.generated_token_ids) {
+            return fail("corrupt cache fallback changed the fresh next token");
+        }
+        const auto next = engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+        if (next.generated_token_ids.size() != 4) {
+            return fail("Engine did not accept a later request after cache fallback");
+        }
+        std::cout << "corrupt disk fallback C=" << concurrency << " dflash=" << dflash << " fault=" << static_cast<int>(fault) << " passed\n";
     }
-    if (!restore_failed) {
-        return fail("truncated main object still restored");
-    }
-    const auto next = engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
-    if (next.generated_token_ids.size() != 4) {
-        return fail("Engine did not accept a later request after a failed disk restore");
+    return 0;
+}
+
+int exercise_disk_metadata_fallback(const char* artifact, bool dflash = false) {
+    for (RestoreFault fault : {RestoreFault::HostMetadata, RestoreFault::SetupMetadata,
+                              RestoreFault::CheckpointMetadata, RestoreFault::CopyEvent}) {
+        try {
+            if (const int result = exercise_corrupt_restore_falls_back(artifact, dflash, fault);
+                result != 0) { return result; }
+        } catch (const std::exception& error) {
+            if (!dflash && fault == RestoreFault::CheckpointMetadata &&
+                std::string(error.what()).find("mtp/") != std::string::npos) {
+                std::cerr << "skip: checkpoint metadata recovery needs MTP objects\n";
+                continue;
+            }
+            throw;
+        }
     }
     return 0;
 }
@@ -1761,13 +1852,13 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("capture-fail does not leak load",
-                           [&] { return exercise_capture_fail_does_not_leak_load(artifact); });
+    if (const int rc = run("capture-drop during disk restore",
+                           [&] { return exercise_capture_drop_during_disk_restore(artifact); });
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("corrupt restore does not kill Engine",
-                           [&] { return exercise_corrupt_restore_does_not_kill_engine(artifact); });
+    if (const int rc = run("corrupt restore falls back to cold prefill",
+                           [&] { return exercise_corrupt_restore_falls_back(artifact); });
         rc != 0) {
         return rc;
     }
@@ -1806,7 +1897,16 @@ int exercise_artifact(const char* artifact) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool corrupt_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                              std::string(argv[2]) == "corrupt";
+    const bool metadata_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                               std::string(argv[2]) == "metadata";
+    const bool event_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                            std::string(argv[2]) == "event";
+    if (argc != 1 && !corrupt_only && !metadata_only && !event_only) {
+        return fail("usage: disk_real [--case corrupt|metadata|event]");
+    }
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
@@ -1818,14 +1918,17 @@ int main() {
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
+        if (const int result = (event_only ? exercise_corrupt_restore_falls_back(groupwise, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(groupwise) : corrupt_only ? exercise_corrupt_restore_falls_back(groupwise) : exercise_artifact(groupwise)); result != 0) { return result; }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
+        if (const int result = (event_only ? exercise_corrupt_restore_falls_back(nvfp4, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(nvfp4) : corrupt_only ? exercise_corrupt_restore_falls_back(nvfp4) : exercise_artifact(nvfp4)); result != 0) { return result; }
     }
     if (dflash != nullptr && *dflash != '\0' &&
         (nvfp4 == nullptr || *nvfp4 == '\0' || std::string(dflash) != nvfp4)) {
-        if (const int result = exercise_artifact(dflash); result != 0) { return result; }
+        if (const int result = (event_only ? exercise_corrupt_restore_falls_back(dflash, true, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(dflash, true) : corrupt_only ? exercise_corrupt_restore_falls_back(dflash, true) : exercise_artifact(dflash)); result != 0) { return result; }
+    }
+    if (!corrupt_only && !metadata_only && !event_only && dflash != nullptr && *dflash != '\0') {
+        if (const int result = exercise_corrupt_restore_falls_back(dflash, true); result != 0) { return result; }
     }
     std::cout << "ok\n";
     return 0;

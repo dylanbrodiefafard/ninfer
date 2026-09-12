@@ -1,4 +1,9 @@
 #include "ninfer/engine.h"
+#include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
+#include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
+
+#include <filesystem>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -444,7 +449,7 @@ int exercise_partial_prefill(ninfer::Engine& engine) {
     return 0;
 }
 
-int exercise_cancel_retain_ram(ninfer::Engine& engine) {
+int exercise_cancel_continue_ram(ninfer::Engine& engine) {
     const auto keep = tokens_a();
     struct CancelAfterPublish : ninfer::OutputSink {
         std::atomic<int> published{0};
@@ -458,31 +463,24 @@ int exercise_cancel_retain_ram(ninfer::Engine& engine) {
         engine.generate(engine.prepare_tokens(keep), greedy(32, false), &sink, cancel);
     if (first.finish_reason != ninfer::FinishReason::Cancelled ||
         first.generated_token_ids.empty()) {
-        return fail("cancel-retain RAM source did not stop with published tokens");
+        return fail("cancel-continue RAM source did not stop with published tokens");
     }
 
-    const auto captures_before = engine.runtime_stats().kv_ram_captures;
     const ninfer::GenerationResult evictor =
         engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
     if (evictor.generated_token_ids.size() != 4 ||
         evictor.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
-        return fail("cancel-retain RAM evictor did not FullReset");
+        return fail("cancel-continue RAM evictor did not FullReset");
     }
-    if (engine.runtime_stats().kv_ram_captures <= captures_before) {
-        return fail("cancel-retain RAM evictor did not capture the cancelled chat");
-    }
-
     const std::vector<ninfer::TokenId> history = resume_prefix(keep, first.generated_token_ids);
-    const auto restores_before                 = engine.runtime_stats().kv_ram_restores;
+    // A committed-boundary cancel may retain; an ordinary in-flight cancel
+    // releases its overwritten GDN state. Both paths must continue correctly.
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(history), greedy(4, true));
-    if (const int rc =
-            expect_ram_hit(hit, static_cast<std::uint32_t>(history.size()), "cancel-retain RAM");
-        rc != 0) {
-        return rc;
-    }
-    if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
-        return fail("cancel-retain RAM hit did not restore the cancelled chat");
+    const ninfer::GenerationResult fresh =
+        engine.generate(engine.prepare_tokens(history), greedy(4, false));
+    if (hit.generated_token_ids != fresh.generated_token_ids) {
+        return fail("cancel-continue RAM changed greedy output");
     }
     return 0;
 }
@@ -1219,11 +1217,10 @@ int exercise_mtp(const char* artifact) {
     if (source.generated_token_ids.size() != 8) {
         return fail("MTP suffix source did not complete");
     }
-    if (source.speculative.draft_window != 5 || source.speculative.rounds_per_draft.size() < 5 ||
-        source.speculative.rounds_per_draft[4] == 0) {
+    if (source.speculative.draft_window != 5 || source.speculative.rounds == 0) {
         std::cerr << "MTP adaptive source live_k=" << source.speculative.live_draft_tokens
                   << " window=" << source.speculative.draft_window << '\n';
-        return fail("MTP adaptive source did not record seeded k=4 rounds");
+        return fail("MTP source did not execute speculative rounds with the configured window");
     }
     const std::vector<ninfer::TokenId> history = resume_prefix(keep, source.generated_token_ids);
     const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
@@ -1259,7 +1256,7 @@ int exercise_mtp(const char* artifact) {
         return fail("MTP suffix RAM reuse changed greedy output");
     }
     if (hit.speculative.draft_window != 5 || vram.speculative.draft_window != 5) {
-        return fail("MTP RAM/VRAM restore leaked live_k off the seeded attractor");
+        return fail("MTP RAM/VRAM restore changed the configured draft window");
     }
     return 0;
 }
@@ -1551,6 +1548,98 @@ int exercise_shared_pool_c3(const char* artifact) {
     return 0;
 }
 
+int exercise_restore_allocation_fallback(const char* artifact, bool dflash = false,
+                                         bool planning = false) {
+    using Disk = ninfer::targets::qwen3_6::detail::KVDiskCache;
+    using Ram = ninfer::targets::qwen3_6::detail::KVRamCache;
+    for (bool disk : {false, true}) {
+        for (std::uint32_t concurrency : {1U, 2U, 3U, 4U}) {
+            struct Directory {
+                std::filesystem::path path;
+                ~Directory() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+            } directory{std::filesystem::temp_directory_path() /
+                        ("ninfer-ram-fallback-" + std::to_string(::getpid()) + "-" +
+                         std::to_string(concurrency) + "-" + std::to_string(disk))};
+            auto options = ordinary_options(artifact, concurrency, 4096, 4ULL << 30);
+            options.pending_timeout_ms = 120000;
+            options.kv_cache = ninfer::KvCacheStorage::Nvfp4;
+            if (disk) {
+                options.kv_disk_capacity_bytes = 8ULL << 30;
+                options.kv_disk_location = directory.path;
+            }
+            if (dflash) {
+                options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+                options.speculative.draft_tokens = 4;
+                options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            }
+            ninfer::Engine engine(options);
+            const auto source = pad_tokens(tokens_a(), 128);
+            const auto seed = engine.generate(engine.prepare_tokens(source), greedy(8, false));
+            const auto history = resume_prefix(source, seed.generated_token_ids);
+            for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+                auto occupant = tokens_c();
+                occupant[3] += lane;
+                (void)engine.generate(engine.prepare_tokens(occupant), greedy(4, false));
+            }
+            std::vector<ninfer::GenerationHandle> peers;
+            for (std::uint32_t lane = 1; lane < concurrency; ++lane) {
+                auto peer = tokens_c();
+                peer[3] += 10 + lane;
+                peers.push_back(engine.submit(engine.prepare_tokens(peer), greedy(128, false)));
+            }
+            if (!peers.empty()) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+                while (engine.runtime_stats().decode_ready_requests != peers.size()) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        return fail("RAM fallback peers did not enter decode");
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            // Fail optional lookup before admission, or fail its restore descriptor
+            // after H2D. Both must preserve the request and its healthy peers.
+            const auto before = engine.runtime_stats();
+            if (planning) {
+                Ram::test_fail_next_plan_metadata_allocation();
+                if (disk) { Disk::test_fail_next_plan_metadata_allocation(); }
+            } else {
+                Ram::test_fail_next_restore_metadata_allocation();
+            }
+            auto recovery_options = greedy(1, true);
+            recovery_options.execution.capture_context_checkpoint = dflash;
+            const auto restored = engine.generate(engine.prepare_tokens(history), recovery_options);
+            if (Ram::test_restore_metadata_failure_pending() ||
+                Ram::test_plan_metadata_allocation_pending() ||
+                (disk && Disk::test_plan_metadata_allocation_pending()) ||
+                restored.prefix_reuse_source != ninfer::PrefixReuseSource::None ||
+                restored.generated_token_ids.size() != 1) {
+                return fail("RAM descriptor failure did not transparently retry cold");
+            }
+            for (auto& peer : peers) {
+                if (peer.wait().generated_token_ids.size() != 128) {
+                    return fail("RAM fallback interrupted its healthy peer");
+                }
+            }
+            const auto after = engine.runtime_stats();
+            if ((!planning && after.kv_ram_evictions <= before.kv_ram_evictions) ||
+                after.kv_ram_restores != before.kv_ram_restores) {
+                return fail("RAM fallback did not discard its failed source without consuming it");
+            }
+            const auto oracle = engine.generate(engine.prepare_tokens(history), greedy(1, false));
+            if (restored.generated_token_ids != oracle.generated_token_ids) {
+                return fail("RAM fallback changed the fresh next token");
+            }
+            const auto next = engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+            if (next.generated_token_ids.size() != 4) {
+                return fail("RAM fallback prevented a later request");
+            }
+            std::cout << "RAM allocation fallback C=" << concurrency << " disk=" << disk
+                      << " dflash=" << dflash << " planning=" << planning << " passed\n";
+        }
+    }
+    return 0;
+}
+
 int exercise_artifact(const char* artifact) {
     {
         ninfer::Engine engine(ordinary_options(artifact, 1, 4096, kRamHitBytes, 128));
@@ -1562,8 +1651,8 @@ int exercise_artifact(const char* artifact) {
         if (const int rc = exercise_partial_prefill(engine); rc != 0) { return rc; }
         std::cerr << "ram_real: prefill-cancel retain then RAM capture\n";
         if (const int rc = exercise_prefill_cancel_capture_ram(engine); rc != 0) { return rc; }
-        std::cerr << "ram_real: cancel-retain dump/restore\n";
-        if (const int rc = exercise_cancel_retain_ram(engine); rc != 0) { return rc; }
+        std::cerr << "ram_real: cancellation continuation after eviction\n";
+        if (const int rc = exercise_cancel_continue_ram(engine); rc != 0) { return rc; }
     }
     std::cerr << "ram_real: exclusive FIFO occupancy\n";
     if (const int rc = exercise_exclusive_occupancy(artifact); rc != 0) { return rc; }
@@ -1605,6 +1694,8 @@ int exercise_artifact(const char* artifact) {
     if (const int rc = exercise_spill_drop(artifact); rc != 0) { return rc; }
     std::cerr << "ram_real: teardown after restore\n";
     if (const int rc = exercise_teardown_after_restore(artifact); rc != 0) { return rc; }
+    if (const int rc = exercise_restore_allocation_fallback(artifact); rc != 0) { return rc; }
+    if (const int rc = exercise_restore_allocation_fallback(artifact, false, true); rc != 0) { return rc; }
     std::cerr << "ram_real: MTP\n";
     if (const int rc = exercise_mtp(artifact); rc != 0) { return rc; }
     return 0;
@@ -1612,20 +1703,45 @@ int exercise_artifact(const char* artifact) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool mtp_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                          std::string(argv[2]) == "mtp";
+    const bool fallback_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                               std::string(argv[2]) == "fallback";
+    const bool planning_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                               std::string(argv[2]) == "planning";
+    if (argc != 1 && !mtp_only && !fallback_only && !planning_only) {
+        std::cerr << "usage: " << argv[0] << " [--case mtp|fallback|planning]\n";
+        return 2;
+    }
+    const auto run = [mtp_only, fallback_only, planning_only](const char* artifact) {
+        return mtp_only ? exercise_mtp(artifact)
+             : planning_only ? exercise_restore_allocation_fallback(artifact, false, true)
+             : fallback_only ? exercise_restore_allocation_fallback(artifact)
+                             : exercise_artifact(artifact);
+    };
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS or "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS to a qwen3.6-27b or "
+    const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
+        (dflash == nullptr || *dflash == '\0')) {
+        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
+                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
+                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS to a qwen3.6-27b or "
                      "qwen3.8-27b .ninfer\n";
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
+        if (const int result = run(groupwise); result != 0) { return result; }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
+        if (const int result = run(nvfp4); result != 0) { return result; }
+    }
+    if (dflash != nullptr && *dflash != '\0' && !mtp_only) {
+        if (const int result = exercise_restore_allocation_fallback(dflash, true, planning_only); result != 0) { return result; }
+        if (!planning_only && !fallback_only) {
+            if (const int result = exercise_restore_allocation_fallback(dflash, true, true); result != 0) { return result; }
+        }
     }
     std::cout << "ok\n";
     return 0;

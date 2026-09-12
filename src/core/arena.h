@@ -111,7 +111,8 @@ private:
 
 // One contiguous, fully resident CUDA-registered region with a first-fit block allocator.
 // try_alloc never throws for capacity; construction throws if the host reservation or CUDA
-// registration fails.
+// registration fails. Valid frees allocate no metadata; a metadata allocation failure in
+// try_alloc leaves the arena unchanged.
 class HostPinnedArena {
 public:
     explicit HostPinnedArena(std::size_t capacity_bytes);

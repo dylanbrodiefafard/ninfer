@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -77,6 +78,7 @@ private:
 };
 
 struct DiskMatch {
+    std::uint64_t committed_generation = 0;
     std::uint64_t entry_id              = 0;
     PrefixReusePath reuse               = PrefixReusePath::FullReset;
     std::uint32_t reuse_base            = 0;
@@ -200,7 +202,8 @@ public:
     KVDiskCache& operator=(KVDiskCache&&)      = delete;
 
     [[nodiscard]] std::optional<DiskMatch> plan_match(const PreparedPromptData& prompt,
-                                                      std::span<const PrefixHash128> hash_chain);
+                                                      std::span<const PrefixHash128> hash_chain,
+                                                     const ReuseBackendPolicy& policy = {});
     [[nodiscard]] std::optional<DiskRestoredHost> load_host(std::uint64_t entry_id) const;
     [[nodiscard]] bool populate_checkpoint_images(DiskRestoredHost& host);
     [[nodiscard]] DiskRestoredHost take_restore_checkpoints();
@@ -208,9 +211,12 @@ public:
     bool claim(std::uint64_t entry_id);
     bool claim(std::uint64_t entry_id, PrefixHash128 expected_hash_f,
                std::uint32_t expected_frontier, std::uint32_t expected_reuse_base = 0,
-               PrefixReusePath expected_reuse = PrefixReusePath::FullReset);
+               PrefixReusePath expected_reuse = PrefixReusePath::FullReset,
+               std::uint64_t expected_committed_generation = 0);
     void release(std::uint64_t entry_id);
     void consume(std::uint64_t entry_id);
+    // Caller has drained restore owners and released the entry claim.
+    void invalidate_entry(std::uint64_t entry_id);
 
     void note_ram_resident(std::uint64_t ram_id, std::uint64_t disk_ticket);
     void forget_ram_resident(std::uint64_t ram_id) noexcept;
@@ -250,6 +256,7 @@ public:
     [[nodiscard]] static std::uint32_t test_crc32c(std::span<const std::uint8_t> bytes) noexcept;
     void test_break_object(std::uint64_t object_id, DiskObjectKind kind);
     [[nodiscard]] std::uint64_t test_object_refcount(std::uint64_t object_id) const;
+    [[nodiscard]] std::uint64_t test_object_skip_refcount(std::uint64_t object_id) const;
     [[nodiscard]] bool test_entry_in_index(std::uint64_t entry_id) const;
     [[nodiscard]] std::vector<std::uint64_t> test_main_page_ids(std::uint64_t entry_id) const;
     [[nodiscard]] std::vector<std::uint64_t> test_backend_page_ids(std::uint64_t entry_id) const;
@@ -265,8 +272,26 @@ public:
     void test_arm_fail_object_unlink();
     void test_arm_fail_entry_unlink();
     void test_arm_fail_prepare_spill();
+    void test_before_branch_refs(void (*hook)()) {
+        std::lock_guard lock(mutex_);
+        before_branch_refs_ = hook;
+    }
+    void test_fail_spill_enqueue_after(int successful_jobs) {
+        std::lock_guard lock(mutex_);
+        fail_spill_enqueue_after_ = successful_jobs;
+    }
+    bool test_spill_enqueue_fault_pending() const {
+        std::lock_guard lock(mutex_);
+        return fail_spill_enqueue_after_ >= 0;
+    }
+    void test_arm_fail_ram_note_allocation();
+    void test_arm_fail_idle_snapshot_allocation();
     bool test_fifo_evict_one_unpersisted();
+    bool test_flush_pending_unlinks(bool unlock);
     [[nodiscard]] bool test_meta_renamed() const;
+    bool test_claim_waited_for_idle() const {
+        return claim_waited_for_idle_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] bool test_objects_fsynced_before_meta() const;
     [[nodiscard]] std::uint32_t test_disk_io_pins(std::uint64_t entry_id) const;
     void test_force_zstd_fail();
@@ -287,6 +312,12 @@ public:
     bool test_fifo_evict_one();
     void test_arm_restore_job_barrier();
     [[nodiscard]] bool test_restore_job_dequeued() const;
+    [[nodiscard]] std::uint64_t test_restore_epoch() const;
+    [[nodiscard]] bool test_waiting_h2d_drain() const;
+    [[nodiscard]] bool test_waiting_reader_drain() const {
+        return waiting_reader_drain_.load(std::memory_order_acquire);
+    }
+    void test_gate_state_h2d(cudaEvent_t gate);
     void test_release_restore_job_barrier();
     void test_arm_restore_state_barrier();
     [[nodiscard]] bool test_restore_state_entered() const;
@@ -297,7 +328,56 @@ public:
     void test_release_copy_lease_barrier();
     [[nodiscard]] cudaEvent_t test_copies_done() const;
     void test_arm_fail_page_read();
+    void test_arm_fail_restore_job();
+    void test_fail_prefetch_enqueue_after(int successful_jobs);
+    static void test_fail_next_restore_setup_allocation() noexcept {
+        fail_next_restore_setup_allocation_.store(true, std::memory_order_release);
+    }
+    static bool test_restore_setup_allocation_failure_pending() noexcept {
+        return fail_next_restore_setup_allocation_.load(std::memory_order_acquire);
+    }
+
+    static void test_fail_next_restore_event_allocation() noexcept {
+        fail_next_restore_event_allocation_.store(true, std::memory_order_release);
+    }
+    static bool test_restore_event_allocation_pending() noexcept {
+        return fail_next_restore_event_allocation_.load(std::memory_order_acquire);
+    }
+    static void test_fail_next_plan_metadata_allocation() noexcept {
+        fail_next_plan_metadata_allocation_.store(true, std::memory_order_release);
+    }
+    static bool test_plan_metadata_allocation_pending() noexcept {
+        return fail_next_plan_metadata_allocation_.load(std::memory_order_acquire);
+    }
+    static void test_fail_next_load_host_allocation() noexcept {
+        fail_next_load_host_allocation_.store(true, std::memory_order_release);
+    }
+    static bool test_load_host_allocation_failure_pending() noexcept {
+        return fail_next_load_host_allocation_.load(std::memory_order_acquire);
+    }
+
+    static void test_fail_next_checkpoint_metadata_allocation() noexcept {
+        fail_next_checkpoint_metadata_allocation_.store(true, std::memory_order_release);
+    }
+    static bool test_checkpoint_metadata_allocation_failure_pending() noexcept {
+        return fail_next_checkpoint_metadata_allocation_.load(std::memory_order_acquire);
+    }
+
+    static void test_startup_allocation_hook(void (*hook)(int)) noexcept {
+        startup_allocation_hook_.store(hook, std::memory_order_release);
+    }
+    void test_fail_publication_allocation() noexcept {
+        fail_publication_allocation_.store(true, std::memory_order_release);
+    }
+    void test_publication_install_hook(void (*hook)(bool) noexcept) {
+        std::lock_guard lock(mutex_);
+        publication_install_hook_ = hook;
+    }
+    [[nodiscard]] bool test_publication_allocation_pending() const noexcept {
+        return fail_publication_allocation_.load(std::memory_order_acquire);
+    }
     void test_arm_fail_restore_state_setup();
+    void test_arm_fail_restore_state_invariant();
     void test_arm_fail_after_checkpoint_prepare_start();
     void test_arm_fail_after_state_h2d_enqueue();
     void test_arm_direct_state_read_barrier();
@@ -335,6 +415,12 @@ public:
     [[nodiscard]] bool test_reader_claim(std::uint32_t pool, std::uint32_t logical) const;
     [[nodiscard]] bool test_window_assigned(std::uint32_t pool, std::uint32_t logical) const;
     void test_arm_fail_after_payload_take();
+    std::size_t test_failed_page_batch_size() const {
+        return failed_page_batch_size_.load(std::memory_order_acquire);
+    }
+    void test_arm_fail_page_batch_allocation() {
+        fail_page_batch_allocation_.store(true, std::memory_order_release);
+    }
     [[nodiscard]] std::uint32_t test_payload_io_inflight() const;
     [[nodiscard]] std::uint64_t test_prefetch_preempted_idle() const;
     [[nodiscard]] bool test_emergency_queued() const;
@@ -377,9 +463,19 @@ private:
         ResidentPrefixIdentity identity;
         std::vector<std::uint64_t> uncertainty_ids;
         bool pinned       = false;
+        bool unavailable  = false;
         std::uint32_t io_pins = 0;
         std::uint64_t claim_generation = 0;
         std::uint64_t committed_generation = 0;
+    };
+
+    using EntryIndex = std::unordered_map<std::uint64_t, IndexEntry>;
+    struct PreparedPublication {
+        EntryIndex::node_type node;
+        DiskMeta replaced;
+        std::vector<std::uint64_t> previous_uncertainty;
+        std::vector<std::uint64_t> removed_ids;
+        bool had_entry = false;
     };
 
     struct RamNote {
@@ -423,6 +519,7 @@ private:
     };
 
     struct SpillSession {
+        bool ram_pin_owned = false;
         std::uint64_t ram_id         = 0;
         std::uint64_t ticket         = 0;
         std::uint64_t parent_id      = 0;
@@ -633,6 +730,7 @@ private:
     void unlink_unreferenced(std::uint64_t id);
     bool make_capacity(std::uint64_t needed, std::unique_lock<std::mutex>& lock);
     void fifo_evict_one();
+    bool evict_entry(std::uint64_t entry_id);
     bool gc_skipped_one();
 
     void pin_disk(std::uint64_t entry_id);
@@ -651,7 +749,9 @@ private:
     void spill_page_batch(SpillSession& session, std::span<const Job> jobs,
                           std::unique_lock<std::mutex>& lock);
     void commit_spill(SpillSession& session, std::unique_lock<std::mutex>& lock);
-    void install_committed_entry(SpillSession& session, std::unique_lock<std::mutex>& lock,
+    PreparedPublication prepare_publication(const SpillSession& session);
+    void install_committed_entry(SpillSession& session, PreparedPublication& publication,
+                                 std::unique_lock<std::mutex>& lock,
                                  bool mark_durable = true, bool retain_replaced = false);
     void release_spill_pins(SpillSession& session, bool mark_failed);
     void drop_spill(SpillSession& session, std::unique_lock<std::mutex>& lock);
@@ -793,11 +893,14 @@ private:
     std::vector<std::uint8_t> spill_zstd_;
     std::vector<std::uint8_t> decode_zstd_;
 
-    std::unordered_map<std::uint64_t, IndexEntry> entries_;
-    std::deque<std::uint64_t> fifo_;
+    std::atomic<bool> fail_publication_allocation_{false};
+    void (*publication_install_hook_)(bool) noexcept = nullptr;
+    EntryIndex entries_;
+    std::vector<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, ObjectRef> objects_;
     std::unordered_map<std::uint64_t, StartupObjectValidation> startup_validated_objects_;
     bool startup_loading_index_ = false;
+    inline static std::atomic<void (*)(int)> startup_allocation_hook_{nullptr};
     std::vector<SkippedTree> skipped_;
     std::unordered_map<std::uint64_t, RamNote> ram_notes_;
     std::uint64_t unique_bytes_     = 0;
@@ -843,7 +946,8 @@ private:
     };
     std::vector<ReaderClaim> reader_claims_{};
 
-    std::unordered_set<std::uint64_t> idle_cancel_rams_;
+    // One executor performs a single RAM claim/eviction/emergency scope at a time.
+    std::uint64_t idle_cancel_ram_ = 0;
     bool idle_pinning_              = false;
     std::uint64_t idle_pinning_ram_ = 0;
     bool idle_cancel_all_           = false;
@@ -852,6 +956,7 @@ private:
     std::optional<DiskRestoreTarget> restore_target_;
     std::uint64_t restore_entry_id_ = 0;
     bool restore_failed_            = false;
+    std::exception_ptr restore_worker_error_;
     bool restore_kv_done_           = false;
     bool restore_state_done_        = false;
     std::uint32_t restore_next_main_ = 0;
@@ -892,6 +997,17 @@ private:
     std::atomic<int> fsync_stall_ms_{0};
     mutable std::atomic<bool> fsync_entered_{false};
     std::atomic<bool> restore_job_barrier_armed_{false};
+    std::atomic<bool> fail_restore_job_{false};
+    std::atomic<bool> fail_restore_state_invariant_{false};
+    bool fail_ram_note_allocation_ = false;
+    bool fail_idle_snapshot_allocation_ = false;
+    int fail_prefetch_enqueue_after_ = -1;
+    inline static std::atomic<bool> fail_next_restore_setup_allocation_{false};
+    inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
+    inline static std::atomic<bool> fail_next_restore_event_allocation_{false};
+    inline static std::atomic<bool> fail_next_load_host_allocation_{false};
+    inline static std::atomic<bool> fail_next_checkpoint_metadata_allocation_{false};
+
     std::atomic<bool> restore_job_dequeued_{false};
     std::atomic<bool> restore_job_continue_{true};
     std::atomic<bool> restore_state_barrier_armed_{false};
@@ -916,9 +1032,13 @@ private:
     std::atomic<bool> slot_assign_continue_{true};
     std::atomic<bool> scatter_record_barrier_armed_{false};
     std::atomic<bool> scatter_record_entered_{false};
+    std::atomic<bool> waiting_reader_drain_{false};
+    std::atomic<bool> waiting_h2d_drain_{false};
     std::atomic<bool> scatter_record_continue_{true};
     std::atomic<std::uint32_t> scatter_record_logical_{0};
     std::atomic<bool> fail_after_payload_take_{false};
+    std::atomic<bool> fail_page_batch_allocation_{false};
+    std::atomic<std::size_t> failed_page_batch_size_{0};
     std::atomic<std::uint64_t> prefetch_preempted_idle_{0};
     cudaEvent_t last_wait_copy_event_ = nullptr;
     std::uint32_t timing_harvests_     = 0;
@@ -942,6 +1062,7 @@ private:
     bool idle_requested_      = false;
     bool crash_before_meta_   = false;
     bool stall_after_meta_rename_ = false;
+    std::atomic<bool> claim_waited_for_idle_{false};
     bool fail_after_meta_rename_  = false;
     bool fail_rollback_meta_      = false;
     bool fail_after_rollback_rename_ = false;
@@ -950,6 +1071,8 @@ private:
     bool fail_object_unlink_                = false;
     bool fail_entry_unlink_                 = false;
     bool fail_prepare_spill_               = false;
+    int fail_spill_enqueue_after_ = -1;
+    void (*before_branch_refs_)() = nullptr;
     bool force_zstd_fail_     = false;
     std::filesystem::path canonical_location_;
     std::vector<std::uint64_t> branch_shared_ids_;

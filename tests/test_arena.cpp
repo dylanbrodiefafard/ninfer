@@ -258,6 +258,41 @@ int main() {
     }
 
     {
+        // Dense allocation followed by isolated frees is the peak free-span case
+        // for cache retirement. Every surviving block must keep its contents and
+        // releasing all blocks must recover the complete pinned region.
+        constexpr std::size_t count = 64;
+        constexpr std::size_t bytes = 256;
+        ninfer::HostPinnedArena host(count * bytes);
+        std::array<void*, count> blocks{};
+        for (std::size_t i = 0; i < count; ++i) {
+            blocks[i] = host.try_alloc(bytes, bytes);
+            if (blocks[i] == nullptr) { return fail("dense host arena allocation failed"); }
+            std::memset(blocks[i], static_cast<int>(i), bytes);
+        }
+        for (std::size_t i = 1; i < count; i += 2) { host.free(blocks[i]); }
+        failures += expect_size(host.used(), count / 2 * bytes, "fragmented host arena used");
+        for (std::size_t i = 1; i < count; i += 2) {
+            void* replacement = host.try_alloc(bytes, bytes);
+            failures += expect_ptr(replacement, blocks[i], "fragmented host first-fit reuse");
+        }
+        for (std::size_t i = 0; i < count; i += 2) {
+            const auto* data = static_cast<const unsigned char*>(blocks[i]);
+            for (std::size_t j = 0; j < bytes; ++j) {
+                if (data[j] != static_cast<unsigned char>(i)) {
+                    return fail("fragmented host retirement modified a live block");
+                }
+            }
+            host.free(blocks[i]);
+        }
+        for (std::size_t i = count; i > 0; i -= 2) { host.free(blocks[i - 1]); }
+        failures += expect_size(host.used(), 0, "fully reclaimed host arena used");
+        void* whole = host.try_alloc(count * bytes, bytes);
+        if (whole != host.base()) { return fail("fragmented host arena did not fully coalesce"); }
+        host.free(whole);
+    }
+
+    {
         auto future = std::async(std::launch::async, [] {
             CUDA_CHECK(cudaSetDevice(0));
             return std::make_unique<ninfer::HostPinnedArena>(1024);

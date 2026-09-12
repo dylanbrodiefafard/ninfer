@@ -800,6 +800,13 @@ the live pinned log, but other-lane restore after eviction needs the FIFO.
 `--kv-ram-capacity > 0` and `--kv-disk-location`. Disk is inclusive of VRAM/RAM hits; equal reuse
 length prefers VRAM, then RAM, then disk. `--kv-disk-compress` is not part of the directory
 fingerprint and affects new GDN/hidden/cyclic writes only.
+Runtime cache capacity or optional capture-allocation failures skip the capture and do not reject
+generation. Optional cache-lookup allocation failure leaves normal cold admission available.
+If a disk cache read or optional RAM/disk restore metadata or CUDA-event allocation fails before
+prefill, the Engine drains the partial restore,
+excludes that entry from reuse, and recomputes the prompt without prefix reuse. The same request
+returns through normal capacity admission; its original queue deadline does not expire this
+already-admitted recovery. This cache fallback does not produce `service_unavailable`.
 Disk format v6 fingerprints canonical logical KV pages rather than the current GPU pool capacity,
 so one location can reopen across `--vision` on/off and automatic resident-capacity changes. Media
 content remains part of each entry identity. The fingerprint also binds the opened artifact's

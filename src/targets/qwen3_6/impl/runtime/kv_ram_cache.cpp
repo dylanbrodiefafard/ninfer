@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 
 #include "core/device.h"
+#include "targets/qwen3_6/impl/runtime/cache_cuda_event.h"
 
 #include <algorithm>
 #include <chrono>
@@ -367,19 +368,18 @@ KVRamCache::KVRamCache(std::size_t capacity_bytes) : arena_(capacity_bytes) {}
 KVRamCache::KVRamCache(HostPinnedArena&& arena) : arena_(std::move(arena)) {}
 
 KVRamCache::~KVRamCache() {
-    reap_retired(true);
-    std::vector<std::uint64_t> ids(fifo_.begin(), fifo_.end());
-    for (std::uint64_t id : ids) {
-        auto it = records_.find(id);
-        if (it == records_.end()) { continue; }
-        if (it->second.copies_start != nullptr) {
-            (void)cudaEventDestroy(it->second.copies_start);
-            it->second.copies_start = nullptr;
+    // Teardown must remain allocation-free, including after host-memory pressure.
+    // The disk owner has already joined its workers; no snapshot is needed.
+    for (auto& [id, record] : records_) {
+        if (record.copies_start != nullptr) {
+            (void)cudaEventDestroy(record.copies_start);
+            record.copies_start = nullptr;
         }
-        if (it->second.copies_done != nullptr) {
-            (void)cudaEventSynchronize(it->second.copies_done);
-            (void)cudaEventDestroy(it->second.copies_done);
-            it->second.copies_done = nullptr;
+        if (record.copies_done != nullptr) {
+            maybe_copy_sync_stall();
+            (void)cudaEventSynchronize(record.copies_done);
+            (void)cudaEventDestroy(record.copies_done);
+            record.copies_done = nullptr;
         }
     }
     records_.clear();
@@ -427,19 +427,26 @@ void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction,
     bump_version();
 }
 
+void KVRamCache::create_copy_event(cudaEvent_t* event, unsigned int flags) {
+    if (fail_copy_event_allocation_after_ >= 0 && fail_copy_event_allocation_after_-- == 0) {
+        check_cache_cuda_event_allocation(cudaErrorMemoryAllocation);
+    }
+    create_cache_cuda_event(event, flags);
+}
+
 void KVRamCache::begin_copies(Record& record, cudaStream_t stream) {
     if (record.copies_start != nullptr) {
         CUDA_CHECK(cudaEventDestroy(record.copies_start));
         record.copies_start = nullptr;
     }
-    CUDA_CHECK(cudaEventCreate(&record.copies_start));
+    create_copy_event(&record.copies_start, cudaEventDefault);
     CUDA_CHECK(cudaEventRecord(record.copies_start, stream));
     record.copies_timed = false;
 }
 
 void KVRamCache::record_copies(Record& record, cudaStream_t stream) {
     if (record.copies_done == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&record.copies_done, cudaEventBlockingSync));
+        create_copy_event(&record.copies_done, cudaEventBlockingSync);
     }
     CUDA_CHECK(cudaEventRecord(record.copies_done, stream));
     record.copies_timed = record.copies_start != nullptr;
@@ -617,10 +624,47 @@ void KVRamCache::wait_event_unlocked(std::unique_lock<std::mutex>& lock, cudaEve
     auto pinned = records_.find(entry_id);
     if (pinned != records_.end() && pinned->second.io_pins > 0) { --pinned->second.io_pins; }
     io_cv_.notify_all();
+    // The unlocked CUDA wait permits unrelated disk-worker snapshots to borrow
+    // this event. Its transfer finishing does not retire those host-side leases.
+    io_cv_.wait(lock, [&] {
+        const auto live = records_.find(entry_id);
+        const bool ready = live == records_.end() || live->second.io_pins == 0;
+        retirement_waiting_for_io_.store(!ready, std::memory_order_release);
+        return ready;
+    });
 }
 
 void KVRamCache::pin_pending_copy_events(std::vector<cudaEvent_t>& events,
                                         std::vector<std::uint64_t>& ids) {
+    // Publish pins only after both snapshot buffers can hold every event.
+    // A failed optional snapshot must not strand pins or fail the request.
+    try {
+        if (fail_copy_snapshot_allocation_stage_ == 0) {
+            fail_copy_snapshot_allocation_stage_ = -1;
+            throw std::bad_alloc();
+        }
+        const std::size_t count = pending_save_ids_.size() + (pending_load_id_ ? 1 : 0);
+        ids.reserve(count);
+        if (fail_copy_snapshot_allocation_stage_ == 1) {
+            fail_copy_snapshot_allocation_stage_ = -1;
+            throw std::bad_alloc();
+        }
+        events.reserve(count);
+    } catch (const std::bad_alloc&) {
+        // Every event is already recorded by the single executor. Holding the
+        // mutex retains its owner while synchronously completing that snapshot;
+        // CUDA completion does not require another cache operation or worker.
+        maybe_copy_sync_stall();
+        const auto wait = [&](std::uint64_t id) {
+            const auto it = records_.find(id);
+            if (it != records_.end() && it->second.copies_done != nullptr) {
+                CUDA_CHECK(cudaEventSynchronize(it->second.copies_done));
+            }
+        };
+        for (const auto id : pending_save_ids_) { wait(id); }
+        if (pending_load_id_) { wait(*pending_load_id_); }
+        return;
+    }
     auto pin = [&](std::uint64_t id) {
         const auto it = records_.find(id);
         if (it == records_.end() || it->second.copies_done == nullptr) { return; }
@@ -640,44 +684,6 @@ void KVRamCache::unpin_copy_events(const std::vector<std::uint64_t>& ids) noexce
         --it->second.io_pins;
     }
     io_cv_.notify_all();
-}
-
-void KVRamCache::retire_record(Record& record) {
-    if (fail_next_retire_) {
-        fail_next_retire_ = false;
-        throw std::bad_alloc();
-    }
-    RetiredCopy item;
-    item.block       = record.block;
-    item.copies_done = record.copies_done;
-    retired_.push_back(item);
-    record.block       = nullptr;
-    record.copies_done = nullptr;
-}
-
-void KVRamCache::reap_retired(bool block) {
-    std::size_t keep = 0;
-    for (RetiredCopy& item : retired_) {
-        if (item.copies_done != nullptr) {
-            if (!block) {
-                const cudaError_t ready = cudaEventQuery(item.copies_done);
-                if (ready == cudaErrorNotReady) {
-                    retired_[keep++] = item;
-                    continue;
-                }
-                CUDA_CHECK(ready);
-            } else {
-                CUDA_CHECK(cudaEventSynchronize(item.copies_done));
-            }
-            CUDA_CHECK(cudaEventDestroy(item.copies_done));
-            item.copies_done = nullptr;
-        }
-        if (item.block != nullptr) {
-            arena_.free(item.block);
-            item.block = nullptr;
-        }
-    }
-    retired_.resize(keep);
 }
 
 void KVRamCache::drop_pending_save(std::uint64_t entry_id) noexcept {
@@ -723,7 +729,14 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     Record& live = require(entry_id);
     const double leftover    = copy_elapsed_seconds(live);
     const bool load_pending  = pending_load_id_ && *pending_load_id_ == entry_id;
-    retire_record(live);
+    // The source event has completed above, so no deferred owner is needed.
+    // Arena free uses metadata reserved at allocation time and cannot allocate.
+    if (live.copies_done != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(live.copies_done));
+        live.copies_done = nullptr;
+    }
+    arena_.free(live.block);
+    live.block = nullptr;
     if (live.copies_start != nullptr) {
         (void)cudaEventDestroy(live.copies_start);
         live.copies_start = nullptr;
@@ -739,9 +752,6 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
     ++restores_;
     bump_version();
-    try {
-        reap_retired(false);
-    } catch (...) {}
 }
 
 std::optional<std::uint64_t> KVRamCache::peek_oldest_unpinned() const {
@@ -845,8 +855,12 @@ KVRamCache::HostKvView KVRamCache::host_kv(std::uint64_t entry_id) const {
 }
 
 std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
-                                               std::span<const PrefixHash128> hash_chain) {
+                                               std::span<const PrefixHash128> hash_chain,
+                                               const ReuseBackendPolicy& policy) {
     std::lock_guard lock(io_mutex_);
+    if (fail_next_plan_metadata_allocation_.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc();
+    }
     std::optional<RamMatch> best;
     for (std::uint64_t id : fifo_) {
         const Record& record = require(id);
@@ -868,10 +882,17 @@ std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
 
         const HeaderView header    = read_header(record.block, record.bytes);
         const RamRestoredHost host = host_from_header(record.block, header);
+        const ResidentReuseState state{
+            .mtp_kv_valid = host.mtp_kv_valid,
+            .dflash_context_frontier = host.dflash_context_frontier,
+            .tail_hidden_valid = host.tail_hidden_valid,
+            .backend_image_present = host.backend_image_present,
+        };
         RamMatch candidate;
         candidate.entry_id = id;
         const auto consider = [&](PrefixReusePath path, std::uint32_t base) {
-            if (base == 0) { return; }
+            if (base == 0 || !reuse_candidate_ready(state, path, base,
+                                                     prompt.token_ids.size(), policy)) { return; }
             ++exact_comparisons_;
             if (!prefix_matches(prompt, host.ledger, host.identity, base)) { return; }
             if (base > candidate.reuse_base) {
@@ -921,7 +942,7 @@ void KVRamCache::record_drop() {
     bump_version();
 }
 
-std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source) {
+RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
     if (source.identity == nullptr || source.text == nullptr || source.text_pool == nullptr) {
         throw std::invalid_argument("RAM capture source is incomplete");
     }
@@ -933,7 +954,7 @@ std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source)
         fail_next_capture_ = false;
         ++drops_;
         bump_version();
-        return std::nullopt;
+        return {RamCaptureStatus::Dropped};
     }
 
     HeaderView header;
@@ -1039,17 +1060,37 @@ std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source)
     if (header.entry_bytes > arena_.capacity()) {
         ++drops_;
         bump_version();
-        return std::nullopt;
+        return {RamCaptureStatus::Dropped};
     }
 
-    reap_retired(false);
     void* block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
     if (block == nullptr) {
-        reap_retired(true);
-        block = arena_.try_alloc(header.entry_bytes, kDeviceAlign);
-    }
-    if (block == nullptr) {
-        return std::nullopt;
+        // A claimed restore source cannot be evicted to capture its GPU victim.
+        // Check the largest interval that eviction could actually create before
+        // asking the caller to discard any other reusable entries. I/O pins are
+        // temporary: the caller cancels/drains idle spill before eviction.
+        std::lock_guard lock(io_mutex_);
+        std::vector<std::pair<std::size_t, std::size_t>> claimed;
+        const auto* base = static_cast<const std::uint8_t*>(arena_.base());
+        for (const auto& [id, record] : records_) {
+            if (!record.pinned) { continue; }
+            const auto offset = static_cast<const std::uint8_t*>(record.block) - base;
+            claimed.emplace_back(static_cast<std::size_t>(offset), record.bytes);
+        }
+        std::sort(claimed.begin(), claimed.end());
+        std::size_t begin = 0;
+        std::size_t largest = 0;
+        for (const auto& [offset, bytes] : claimed) {
+            largest = std::max(largest, offset - begin);
+            begin = offset + bytes;
+        }
+        largest = std::max(largest, arena_.capacity() - begin);
+        if (header.entry_bytes > largest) {
+            ++drops_;
+            bump_version();
+            return {RamCaptureStatus::Dropped};
+        }
+        return {RamCaptureStatus::NeedsEviction};
     }
 
     bool copies_launched = false;
@@ -1092,7 +1133,7 @@ std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source)
         if (lengths[1] != 0) { source.identity->pack(raw + header.offset[1]); }
         const auto start_device_copies = [&] {
             if (copies_start != nullptr) { return; }
-            CUDA_CHECK(cudaEventCreate(&copies_start));
+            create_copy_event(&copies_start, cudaEventDefault);
             CUDA_CHECK(cudaEventRecord(copies_start, source.stream));
         };
         if (lengths[2] != 0) {
@@ -1190,6 +1231,10 @@ std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source)
         record.checkpoint_path     = source.rewrite_kind == RewriteCheckpointKind::TurnClosure
                                          ? PrefixReusePath::RestoreTurnCheckpoint
                                          : PrefixReusePath::RestoreResponseCheckpoint;
+        if (fail_next_capture_metadata_allocation_) {
+            fail_next_capture_metadata_allocation_ = false;
+            throw std::bad_alloc();
+        }
         record.ladders.reserve(source.ladder_heads.size());
         for (const RamLadderHead& head : source.ladder_heads) {
             record.ladders.push_back(RamLadderIndex{
@@ -1209,9 +1254,10 @@ std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source)
         pending_save_ids_.push_back(record.id);
         ++captures_;
         bump_version();
-        return record.id;
+        return {RamCaptureStatus::Captured, record.id};
     } catch (...) {
         if (copies_launched) {
+            maybe_copy_sync_stall();
             if (source.stream != nullptr) {
                 (void)cudaStreamSynchronize(source.stream);
             } else {
@@ -1227,6 +1273,11 @@ std::optional<std::uint64_t> KVRamCache::capture(const RamCaptureSource& source)
         }
         throw;
     }
+} catch (const std::bad_alloc&) {
+    // Capturing an optional cache image must not fail an admitted request.
+    // The inner transaction has already fenced DMA and reclaimed any partial image.
+    record_drop();
+    return {RamCaptureStatus::Dropped};
 }
 
 RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamRestoreTarget& target) {
@@ -1392,6 +1443,9 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         Record& record = require(entry_id);
         record_copies(record, target.stream);
         pending_load_id_ = entry_id;
+    }
+    if (fail_next_restore_metadata_allocation_.exchange(false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc();
     }
     return host_from_header(raw, header);
 }
