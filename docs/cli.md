@@ -218,9 +218,10 @@ Hamming distance at most 2p/512 (so p<256 is exact identity). The continuation i
 from the already-computed typical set V (renormalized V without that atom, or the in-domain
 runner-up when V is that singleton). This is not a `suppressed_tokens` member and does not
 rebuild L. It does not detect duplicate tool calls across requests and does not alter tool-call
-content. There is no CLI flag. P-less membership is `p_v ≥ L·exp(-2ε/T)` with
-`ε = 1/16` (first-order softmax perturbation of the logits); L is the unperturbed collision
-probability. Under MTP or DFlash2,
+content. There is no CLI flag. P-less membership is `p_v ≥ max(L·exp(-2ε/T), 1/M)` with
+`ε = 1/16` (first-order softmax perturbation of the logits) and `M = 1024`; L is the
+unperturbed collision probability, and an empty set falls back to the eligible mode.
+Under MTP or DFlash2,
 p-less applies at every hop (chain Leviathan with one-hot draft `q`) and to the bonus after a full
 accept. The cycle exclusion applies only to the first hop's next-token decision; later hops use
 their unmodified p-less candidate sets. Temperature zero remains greedy at every hop.

@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -119,19 +120,32 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
             const double p = weights[static_cast<std::size_t>(token)] / total;
             collision += p * p;
         }
-        const double scale = ops::p_less_admission_scale(config.temperature);
+        const double cut = ops::p_less_membership_cut(collision, config.temperature);
         Distribution out;
         double kept = 0.0;
         for (int token = 0; token < token_domain; ++token) {
             if (suppressed(token)) { continue; }
             const double p = weights[static_cast<std::size_t>(token)] / total;
-            if (p * scale >= collision) {
+            if (p >= cut) {
                 out.tokens.push_back(token);
                 out.probabilities.push_back(p);
                 kept += p;
             }
         }
-        for (double& probability : out.probabilities) { probability /= kept; }
+        if (out.tokens.empty()) {
+            int argmax = -1;
+            for (int token = 0; token < token_domain; ++token) {
+                if (suppressed(token)) { continue; }
+                if (argmax < 0 || logits[static_cast<std::size_t>(token)] >
+                                      logits[static_cast<std::size_t>(argmax)]) {
+                    argmax = token;
+                }
+            }
+            out.tokens        = {argmax};
+            out.probabilities = {1.0};
+        } else {
+            for (double& probability : out.probabilities) { probability /= kept; }
+        }
         if (config.typical_exclude >= 0) {
             const auto found = std::find(out.tokens.begin(), out.tokens.end(),
                                          config.typical_exclude);
@@ -1222,6 +1236,188 @@ int p_less_first_order_slack_contract() {
     return failures;
 }
 
+double p_less_collision(const std::vector<float>& column, int token_domain, float temperature) {
+    double max_scaled = 0.0;
+    bool have_max     = false;
+    for (int token = 0; token < token_domain; ++token) {
+        const double scaled =
+            static_cast<double>(column[static_cast<std::size_t>(token)]) / temperature;
+        if (!have_max || scaled > max_scaled) {
+            max_scaled = scaled;
+            have_max   = true;
+        }
+    }
+    double total = 0.0;
+    std::vector<double> weights(static_cast<std::size_t>(token_domain));
+    for (int token = 0; token < token_domain; ++token) {
+        const double w = std::exp(
+            static_cast<double>(column[static_cast<std::size_t>(token)]) / temperature - max_scaled);
+        weights[static_cast<std::size_t>(token)] = w;
+        total += w;
+    }
+    double collision = 0.0;
+    for (int token = 0; token < token_domain; ++token) {
+        const double p = weights[static_cast<std::size_t>(token)] / total;
+        collision += p * p;
+    }
+    return collision;
+}
+
+int p_less_peaked_invariance_contract() {
+    struct Shape {
+        int physical_rows;
+        int token_domain;
+        int a;
+        int b;
+        const char* label;
+    };
+    const Shape shapes[] = {
+        {257, 257, 3, 11, "sample p-less peaked invariance N=257"},
+        {248320, 248077, 17, 7919, "sample p-less peaked invariance N=248077"},
+    };
+    const float temps[] = {0.6f, 1.5f, 2.0f};
+    int failures        = 0;
+    for (const Shape& shape : shapes) {
+        for (float temperature : temps) {
+            std::vector<float> column(static_cast<std::size_t>(shape.physical_rows), -20.0f);
+            column[static_cast<std::size_t>(shape.a)] = 8.0f;
+            column[static_cast<std::size_t>(shape.b)] = 7.0f;
+            if (shape.physical_rows > shape.token_domain) {
+                column[static_cast<std::size_t>(shape.token_domain)]           = 100.0f;
+                column[static_cast<std::size_t>(shape.physical_rows - 1)] = 200.0f;
+            }
+            round_to_bf16(column);
+            ops::SamplingConfig config;
+            config.temperature = temperature;
+            config.p_less      = 1;
+            config.seed        = 17;
+            const double collision = p_less_collision(column, shape.token_domain, temperature);
+            const double n_eff     = 1.0 / collision;
+            const double slack     = collision / ops::p_less_admission_scale(temperature);
+            const double cut = ops::p_less_membership_cut(collision, temperature);
+            if (!(n_eff < 0.5 * static_cast<double>(ops::kPLessMaxEffectiveSupport)) ||
+                cut != slack) {
+                std::cerr << shape.label << " T=" << temperature
+                          << ": n_eff=" << n_eff << " was not idle vs M\n";
+                return failures + 1;
+            }
+            const Distribution oracle =
+                distribution_oracle(column, shape.token_domain, config);
+            if (oracle.tokens.empty() ||
+                std::find(oracle.tokens.begin(), oracle.tokens.end(), shape.a) ==
+                    oracle.tokens.end()) {
+                std::cerr << shape.label << " T=" << temperature
+                          << ": peaked support lost the mode\n";
+                return failures + 1;
+            }
+            const int samples = shape.token_domain > 1000 ? 1024 : 4096;
+            const RunResult result =
+                run_repeated(column, shape.token_domain, samples, 8, config, 50,
+                             ops::kSamplePurposeDecode);
+            failures += result.integrity_failures;
+            failures += verify_distribution(
+                (std::string(shape.label) + " T=" + std::to_string(temperature)).c_str(),
+                result.tokens, oracle);
+        }
+    }
+    return failures;
+}
+
+int p_less_small_vocab_uniform_contract() {
+    constexpr int token_domain = 257;
+    std::vector<float> column(token_domain, 0.0f);
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature = 2.0f;
+    config.p_less      = 1;
+    config.seed        = 19;
+    const double collision = p_less_collision(column, token_domain, config.temperature);
+    const double cut       = ops::p_less_membership_cut(collision, config.temperature);
+    if (!(collision > 1.0 / static_cast<double>(ops::kPLessMaxEffectiveSupport)) ||
+        cut != collision / ops::p_less_admission_scale(config.temperature)) {
+        std::cerr << "small-vocab uniform floor was not idle\n";
+        return 1;
+    }
+    const Distribution oracle = distribution_oracle(column, token_domain, config);
+    if (oracle.tokens.size() != static_cast<std::size_t>(token_domain)) {
+        std::cerr << "small-vocab uniform support size " << oracle.tokens.size()
+                  << " expected " << token_domain << '\n';
+        return 1;
+    }
+    constexpr int samples  = 16384;
+    const RunResult result = run_repeated(column, token_domain, samples, 8, config, 50,
+                                          ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_distribution("sample p-less small-vocab uniform", result.tokens, oracle);
+}
+
+int p_less_soup_collapse_contract() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    int failures                = 0;
+    for (float temperature : {1.5f, 2.0f}) {
+        std::vector<float> column(physical_rows, 0.0f);
+        column[token_domain]      = 100.0f;
+        column[physical_rows - 1] = 200.0f;
+        round_to_bf16(column);
+        ops::SamplingConfig config;
+        config.temperature     = temperature;
+        config.p_less          = 1;
+        config.seed            = 23;
+        const double collision = p_less_collision(column, token_domain, temperature);
+        const double n_eff     = 1.0 / collision;
+        if (!(n_eff > static_cast<double>(ops::kPLessMaxEffectiveSupport))) {
+            std::cerr << "soup fixture T=" << temperature << " n_eff=" << n_eff
+                      << " did not exceed M\n";
+            return failures + 1;
+        }
+        const Distribution oracle = distribution_oracle(column, token_domain, config);
+        if (oracle.tokens != std::vector<int>{0} || oracle.probabilities != std::vector<double>{1.0}) {
+            std::cerr << "soup T=" << temperature << " oracle was not Dirac on min-argmax\n";
+            return failures + 1;
+        }
+        constexpr int samples  = 256;
+        const RunResult result = run_repeated(column, token_domain, samples, 8, config, 50,
+                                              ops::kSamplePurposeDecode);
+        failures += result.integrity_failures;
+        failures += verify_exact(
+            (std::string("sample p-less soup Dirac T=") + std::to_string(temperature)).c_str(),
+            result.tokens, std::vector<int>(samples, 0));
+    }
+    return failures;
+}
+
+int p_less_floor_binds_with_head_contract() {
+    constexpr int token_domain = 4096;
+    constexpr int mode         = 13;
+    std::vector<float> column(token_domain, 0.0f);
+    column[mode] = 3.0f;
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature     = 2.0f;
+    config.p_less          = 1;
+    config.seed            = 29;
+    const double collision = p_less_collision(column, token_domain, config.temperature);
+    const double n_eff     = 1.0 / collision;
+    if (!(n_eff > static_cast<double>(ops::kPLessMaxEffectiveSupport))) {
+        std::cerr << "K=4096 head fixture n_eff=" << n_eff << " did not exceed M\n";
+        return 1;
+    }
+    const Distribution oracle = distribution_oracle(column, token_domain, config);
+    if (oracle.tokens.size() != 1 || oracle.tokens.front() != mode) {
+        std::cerr << "K=4096 floor-bind support size " << oracle.tokens.size();
+        if (!oracle.tokens.empty()) { std::cerr << " head=" << oracle.tokens.front(); }
+        std::cerr << " expected Dirac on " << mode << '\n';
+        return 1;
+    }
+    constexpr int samples  = 1024;
+    const RunResult result = run_repeated(column, token_domain, samples, 8, config, 50,
+                                          ops::kSamplePurposeDecode);
+    return result.integrity_failures +
+           verify_exact("sample p-less K=4096 floor-bind Dirac", result.tokens,
+                        std::vector<int>(samples, mode));
+}
+
 int eligibility_masks(int domain, int physical) {
     const int words = (domain + 31) / 32;
     std::vector<std::uint32_t> masks(3 * words, 0);
@@ -1337,6 +1533,10 @@ int main() {
     failures += p_less_typical_exclude_real_shape_singleton_contract();
     failures += p_less_typical_exclude_real_shape_multi_contract();
     failures += p_less_first_order_slack_contract();
+    failures += p_less_peaked_invariance_contract();
+    failures += p_less_small_vocab_uniform_contract();
+    failures += p_less_soup_collapse_contract();
+    failures += p_less_floor_binds_with_head_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

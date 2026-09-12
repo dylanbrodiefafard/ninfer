@@ -698,7 +698,9 @@ top-k, min-p, and presence/frequency penalties from both process flags and reque
 logs a one-time warning. Ignored request fields must still satisfy their normal input ranges before
 sampler resolution.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
-p-less remains exact argmax. Under MTP or DFlash2, p-less applies at every hop (chain Leviathan with
+p-less remains exact argmax. P-less membership is `p_v ≥ max(L·exp(-2ε/T), 1/M)` with
+`ε = 1/16` and `M = 1024`; L is the unperturbed collision probability, and an empty set
+falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (chain Leviathan with
 one-hot draft `q`) and to the bonus. A thinking-cycle exclusion affects only the next token,
 not later hops in the same speculative round. There is
 no OpenAI or Anthropic schema field for this mode.
