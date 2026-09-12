@@ -1573,12 +1573,52 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
         const double p = weights[static_cast<std::size_t>(token)] / total;
         collision += p * p;
     }
-    const double scale = ops::p_less_admission_scale(config.temperature);
+    const double cut = ops::p_less_membership_cut(collision, config.temperature);
     std::vector<int> support;
     for (int token = 0; token < token_domain; ++token) {
         if (p_less_token_suppressed(config, token) || !(total > 0.0)) { continue; }
         const double p = weights[static_cast<std::size_t>(token)] / total;
-        if (p * scale >= collision) { support.push_back(token); }
+        if (p >= cut) { support.push_back(token); }
+    }
+    if (support.empty()) {
+        int argmax = -1;
+        double best = 0.0;
+        bool have   = false;
+        for (int token = 0; token < token_domain; ++token) {
+            if (p_less_token_suppressed(config, token)) { continue; }
+            const double x =
+                static_cast<double>(logits[base + static_cast<std::size_t>(token)]);
+            if (!have || x > best || (x == best && token < argmax)) {
+                best   = x;
+                argmax = token;
+                have   = true;
+            }
+        }
+        if (argmax >= 0) { support.push_back(argmax); }
+    }
+    if (config.typical_exclude >= 0) {
+        const auto found =
+            std::find(support.begin(), support.end(), config.typical_exclude);
+        if (found != support.end()) {
+            if (support.size() == 1) {
+                const int mode = support[0];
+                int runner     = -1;
+                float best     = 0.0f;
+                bool have      = false;
+                for (int token = 0; token < token_domain; ++token) {
+                    if (p_less_token_suppressed(config, token) || token == mode) { continue; }
+                    const float x = logits[base + static_cast<std::size_t>(token)];
+                    if (!have || x > best || (x == best && token < runner)) {
+                        best   = x;
+                        runner = token;
+                        have   = true;
+                    }
+                }
+                if (runner >= 0) { support = {runner}; }
+            } else {
+                support.erase(found);
+            }
+        }
     }
     return support;
 }
@@ -1690,7 +1730,10 @@ int check_p_less_chain_invariants(const char* label, const ChainAcceptObserved& 
         if (p_less_token_suppressed(config, token)) {
             fail("licensed suppressed token " + std::to_string(token));
         }
-        const auto support = p_less_support_oracle(logits, physical_rows, i, token_domain, config);
+        ops::SamplingConfig hop_cfg = config;
+        if (i > 0) { hop_cfg.typical_exclude = -1; }
+        const auto support =
+            p_less_support_oracle(logits, physical_rows, i, token_domain, hop_cfg);
         if (support.empty() || !p_less_support_contains(support, token)) {
             fail("licensed token " + std::to_string(token) + " is outside p-less support at hop " +
                  std::to_string(i));
@@ -1708,8 +1751,10 @@ int check_p_less_chain_invariants(const char* label, const ChainAcceptObserved& 
     }
     if (got.accepted < k) {
         const int rejected = drafts[static_cast<std::size_t>(got.accepted)];
+        ops::SamplingConfig hop_cfg = config;
+        if (got.accepted > 0) { hop_cfg.typical_exclude = -1; }
         const auto support =
-            p_less_support_oracle(logits, physical_rows, got.accepted, token_domain, config);
+            p_less_support_oracle(logits, physical_rows, got.accepted, token_domain, hop_cfg);
         if (support.size() > 1 &&
             got.licensed[static_cast<std::size_t>(got.accepted)] == rejected) {
             fail("rejected draft " + std::to_string(rejected) +
@@ -1820,6 +1865,44 @@ int p_less_chain_token_invariants_case(int physical_rows, int token_domain, int 
     if (rejected_hops == 0) {
         std::cerr << label << ": never rejected a draft; cannot check residual validity\n";
         ++failures;
+    }
+    return failures;
+}
+
+int p_less_flat_column_c1_accept_case() {
+    constexpr int physical_rows = 4096;
+    constexpr int token_domain  = 4096;
+    constexpr int k             = 1;
+    constexpr int draft         = 17;
+    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) * (k + 1), 0.0f);
+    round_to_bf16(logits_f);
+    std::vector<std::uint16_t> logits_bits(logits_f.size());
+    for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
+    const std::vector<std::int32_t> drafts{draft};
+    ops::SamplingConfig config{};
+    config.temperature                = 2.0f;
+    config.p_less                     = 1;
+    constexpr std::int32_t initial_length = 40;
+    const auto support =
+        p_less_support_oracle(logits_f, physical_rows, 0, token_domain, config);
+    if (support != std::vector<int>{0} || p_less_support_contains(support, draft)) {
+        std::cerr << "flat C=1 p-less support was not Dirac on min-argmax; |V*|="
+                  << support.size() << '\n';
+        return 1;
+    }
+    int failures = 0;
+    for (unsigned long long seed = 1; seed <= 8; ++seed) {
+        config.seed    = seed;
+        const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
+                                          token_domain, config, nullptr, nullptr);
+        failures += check_p_less_chain_invariants("speculative p-less flat C=1 accept", got,
+                                                  logits_f, physical_rows, drafts, token_domain,
+                                                  config, initial_length);
+        if (got.accepted != 0 || got.licensed[0] != 0) {
+            std::cerr << "flat C=1: draft outside V* was not rejected to min-argmax; accepted="
+                      << got.accepted << " correction=" << got.licensed[0] << '\n';
+            ++failures;
+        }
     }
     return failures;
 }
@@ -2153,8 +2236,10 @@ int check_p_less_tree_invariants(const char* label, const TreeAcceptObserved& go
         if (p_less_token_suppressed(config, token)) {
             fail("licensed suppressed token " + std::to_string(token));
         }
+        ops::SamplingConfig hop_cfg = config;
+        if (i > 0) { hop_cfg.typical_exclude = -1; }
         const auto support =
-            p_less_support_oracle(logits, physical_rows, node, token_domain, config);
+            p_less_support_oracle(logits, physical_rows, node, token_domain, hop_cfg);
         if (support.empty() || !p_less_support_contains(support, token)) {
             fail("licensed token " + std::to_string(token) +
                  " is outside p-less support at packed column " + std::to_string(node));
@@ -2904,6 +2989,7 @@ int main() {
     failures += suppressed_draft_rejection_case(64);
     failures += suppressed_draft_rejection_case(257);
     failures += p_less_deterministic_accept_case();
+    failures += p_less_flat_column_c1_accept_case();
     failures += p_less_suppressed_bonus_case();
     failures += p_less_suppressed_draft_rejection_case(64);
     failures += p_less_suppressed_draft_rejection_case(257);

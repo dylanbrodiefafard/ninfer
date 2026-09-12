@@ -264,9 +264,12 @@ struct SamplingPLessMoments {
     unsigned long long runner_key = 0ull;
 };
 
-// Membership is e*sum_exp >= sum_exp2_cut, with sum_exp2_cut = sum_exp2 * exp(-2ε/T)
-// (p_v >= L·exp(-2ε/T) without dividing into a threshold). logit_cut is a
-// conservative prefilter at the same slack: z < logit_cut cannot pass.
+// Membership is e*sum_exp >= sum_exp2_cut, with
+// sum_exp2_cut = max(sum_exp2 * exp(-2ε/T), sum_exp^2 / M)
+// (p_v >= max(L·exp(-2ε/T), 1/M) without dividing into a threshold). logit_cut
+// is a prefilter at that stored cut: e >= sum_exp2_cut/sum_exp implies
+// z >= m + T log(sum_exp2_cut/sum_exp). z < logit_cut cannot pass, including
+// when the floor excludes the mode. The 1/M floor is not relaxed by ε.
 struct SamplingPLessGate {
     float m         = 0.0f;
     float sum_exp   = 0.0f;
@@ -284,10 +287,10 @@ __device__ __forceinline__ SamplingPLessGate sampling_p_less_gate(const Sampling
     g.logit_cut = 1.0e30f;
     const float two_eps_over_t = 2.0f * kPLessLogitPerturbation * inv_temp;
     const float inv_scale      = __expf(-two_eps_over_t);
-    g.sum_exp2                 = st.sum_exp2 * inv_scale;
-    if (st.sum_exp > 0.0f && st.sum_exp2 > 0.0f) {
-        const float x_cut = logf(st.sum_exp2 / st.sum_exp) - two_eps_over_t;
-        g.logit_cut       = st.m + x_cut / inv_temp;
+    g.sum_exp2 = fmaxf(st.sum_exp2 * inv_scale,
+                       st.sum_exp * st.sum_exp / static_cast<float>(kPLessMaxEffectiveSupport));
+    if (st.sum_exp > 0.0f && g.sum_exp2 > 0.0f) {
+        g.logit_cut = st.m + logf(g.sum_exp2 / st.sum_exp) / inv_temp;
     }
     return g;
 }

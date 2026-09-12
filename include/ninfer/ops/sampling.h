@@ -13,14 +13,26 @@ namespace ninfer::ops {
 
 // L∞ logit perturbation used for the p-less membership cut. First-order softmax
 // maps ||Δz||_∞ ≤ ε to a relative p factor exp(2ε/T): admit v when
-// p_v ≥ L · exp(-2ε/T) ≡ L/(1+α). L itself is the unperturbed collision
-// probability and is not rebuilt. ε is one BF16 ulp at logit magnitude 8–16.
-inline constexpr float kPLessLogitPerturbation = 0.0625f;
+// p_v ≥ max(L · exp(-2ε/T), 1/M) ≡ max(L/(1+α), 1/M). L itself is the unperturbed
+// collision probability and is not rebuilt. ε slack applies only to L; the 1/M
+// floor is not relaxed. ε is one BF16 ulp at logit magnitude 8–16. M caps the
+// inverse-participation-ratio support so a flat next-token p cannot open the
+// whole vocabulary.
+inline constexpr float kPLessLogitPerturbation          = 0.0625f;
+inline constexpr std::int32_t kPLessMaxEffectiveSupport = 1024;
 
 #if !defined(__CUDA_ARCH__)
 [[nodiscard]] inline double p_less_admission_scale(double temperature) noexcept {
     if (!(temperature > 0.0)) { return 1.0; }
     return std::exp(2.0 * static_cast<double>(kPLessLogitPerturbation) / temperature);
+}
+
+// τ = max(L / s, 1/M) with s = exp(2ε/T). Same membership as p * s >= L when the
+// floor is idle, rewritten as p >= τ.
+[[nodiscard]] inline double p_less_membership_cut(double collision, double temperature) noexcept {
+    const double floor   = 1.0 / static_cast<double>(kPLessMaxEffectiveSupport);
+    const double relaxed = collision / p_less_admission_scale(temperature);
+    return relaxed > floor ? relaxed : floor;
 }
 #endif
 
@@ -90,13 +102,16 @@ struct SamplingConfig {
  * allowed by the optional eligibility bitset and not listed in the first
  * suppressed_token_count entries of suppressed_tokens
  * (penalties, top_k, top_p, and min_p are ignored). Let p=softmax(z/temperature) over that
- * eligible domain, L=sum_v p_v^2, and V={v: p_v >= L·exp(-2ε/T)} with
- * ε=kPLessLogitPerturbation (non-empty: the eligible mode is always admitted).
- * Equivalently, with e_v=exp((z_v-m)/temperature) and m the eligible max logit, V is
- * {v: e_v * sum_i e_i >= sum_i e_i^2 · exp(-2ε/T)} so the cut is not rounded through
- * L = (sum e^2)/(sum e)^2 and a first-order softmax perturbation of the logits cannot
- * drop a token that exact-math p_v>=L would have kept. L is the unperturbed collision
- * probability; the scale only relaxes membership.
+ * eligible domain, L=sum_v p_v^2, τ=max(L·exp(-2ε/T), 1/M) with ε=kPLessLogitPerturbation
+ * and M=kPLessMaxEffectiveSupport, and V={v: p_v >= τ}. If V is empty, emit the eligible
+ * mode (min argmax), or the in-domain runner-up when that mode is typical_exclude.
+ * Equivalently, with e_v=exp((z_v-m)/temperature) and m the eligible
+ * max logit, V is
+ * {v: e_v * sum_i e_i >= max(sum_i e_i^2 · exp(-2ε/T), (sum_i e_i)^2 / M)} so the cut
+ * is not rounded through L = (sum e^2)/(sum e)^2. ε slack applies only to unperturbed L;
+ * the 1/M floor is not relaxed. When the floor is idle, a first-order softmax perturbation
+ * of the logits cannot drop a token that exact-math p_v>=L would have kept. L is the
+ * unperturbed collision probability and is not rebuilt.
  * If typical_exclude is in V and the remaining admitted mass is strictly positive, sample from
  * the renormalized restriction of p to V without that atom. If V is exactly {typical_exclude},
  * emit the in-domain runner-up (second-max eligible logit, lower id breaking ties). That atom
