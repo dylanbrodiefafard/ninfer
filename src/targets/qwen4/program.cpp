@@ -59,10 +59,10 @@ constexpr std::size_t kPrefillControlBytes =
     kPrefillVisibleIdsOffset + kMaximumPrefillVisibleIds * sizeof(std::int32_t);
 
 std::size_t prefill_workspace_bytes() {
-    return std::max({ops::gated_residual_workspace_capacity_bytes(kMaximumPrefillChunk),
-                     ops::gated_delta_net_layer_workspace_capacity_bytes(kMaximumPrefillChunk),
-                     ops::qsa_verifier_workspace_bytes(kMaximumPrefillChunk),
-                     ops::ple_workspace_capacity_bytes(kMaximumPrefillChunk),
+    return std::max({ops::gated_residual_workspace_capacity_bytes(kMaximumPrefillChunk, QType::GGML_Q8_0, QType::GGML_Q8_0),
+                     ops::gated_delta_net_layer_workspace_capacity_bytes(kMaximumPrefillChunk, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q6_K),
+                     ops::qsa_verifier_workspace_bytes(kMaximumPrefillChunk, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K),
+                     ops::ple_workspace_capacity_bytes(kMaximumPrefillChunk, QType::GGML_Q8_0, QType::GGML_Q8_0),
                      ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(
                          kMaximumPrefillChunk)});
 }
@@ -363,7 +363,7 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
                             model_.view().ple.value, model_.view().ple.key_norm,
                             model_.view().ple.query_norm, model_.view().ple.conv_norm,
                             model_.view().ple.conv, conv_state, conv_state, residual, workspace,
-                            stream_);
+                            ops::PleNormFormat::EffectiveFp32, stream_);
         }
 
         const LayerWeights& weights = model_.view().layers[layer];
@@ -392,7 +392,8 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
             profile::ScopedRange qsa_range(profile::Phase::Qsa,
                                            static_cast<std::uint64_t>(layer));
             Tensor qsa_workspace(state_.workspace().base(), DType::U8,
-                                 {static_cast<std::int32_t>(ops::qsa_verifier_workspace_bytes(1))});
+                                 {static_cast<std::int32_t>(ops::qsa_verifier_workspace_bytes(1,
+                                     QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K))});
             ops::qsa_verifier(
                 mixed, append_id, position_ids, visible_ids, visible_offsets, *weights.qsa,
                 *state_.qsa()[layer], qsa_diagnostics_[qsa_index].selected_ids,
@@ -400,7 +401,7 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
             ++qsa_index;
         }
         if (layer == 0) {
-            // Layer-0 mixer work is already queued. Faulting/copying the mapped rows here lets the
+            // Layer-0 mixer work is already queued. Gathering the RAM-locked rows here lets the
             // host gather overlap that GPU work; the same-stream H2D remains ordered before the
             // layer-1 decode and injection.
             Tensor ple_device_rows = state_.ple_device_rows();
@@ -607,7 +608,7 @@ PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids
                             model_.view().ple.key, model_.view().ple.value,
                             model_.view().ple.key_norm, model_.view().ple.query_norm,
                             model_.view().ple.conv_norm, model_.view().ple.conv, conv_state,
-                            conv_state, residual, workspace, stream_);
+                            conv_state, residual, workspace, ops::PleNormFormat::EffectiveFp32, stream_);
         }
 
         const LayerWeights& weights = model_.view().layers[layer];
@@ -635,7 +636,8 @@ PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids
                                            static_cast<std::uint64_t>(layer));
             Tensor qsa_workspace(storage.workspace.p, DType::U8,
                                  {static_cast<std::int32_t>(
-                                     ops::qsa_verifier_workspace_bytes(width))});
+                                     ops::qsa_verifier_workspace_bytes(width, QType::GGML_Q5_K,
+                                         QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K))});
             ops::qsa_verifier(mixed, append_ids, positions, visible_ids, visible_offsets,
                               *weights.qsa, *state_.qsa()[layer], selected_ids,
                               selected_count, block, qsa_workspace, stream_);

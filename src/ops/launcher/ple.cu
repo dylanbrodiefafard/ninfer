@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cmath>
 #include <cstdint>
@@ -12,6 +13,35 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr float kEpsilon = 1.0e-6F;
+
+__global__ void ple_nvfp4_decode_kernel(const std::uint8_t* encoded,
+                                        __nv_bfloat16* output, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    const int feature = i % kPleRowWidth;
+    const auto* row = encoded + (i / kPleRowWidth) * kPleNvfp4StagedRowBytes;
+    const unsigned code = (row[feature / 2] >> ((feature & 1) * 4)) & 15;
+    constexpr float magnitudes[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    const float value = copysignf(magnitudes[code & 7], code & 8 ? -1.0F : 1.0F);
+    __nv_fp8_e4m3 scale;
+    scale.__x = row[80 + feature / 16];
+    // Row stride 94 does not guarantee F32 alignment. Decode exact LE bytes, never alias-cast.
+    const auto* bytes = row + kPleNvfp4RowBytes;
+    const std::uint32_t word = std::uint32_t(bytes[0]) | (std::uint32_t(bytes[1]) << 8) |
+        (std::uint32_t(bytes[2]) << 16) | (std::uint32_t(bytes[3]) << 24);
+    const float result = __fmul_rn(value * static_cast<float>(scale), __uint_as_float(word));
+    output[i] = __float2bfloat16_rn(result);
+}
+
+__global__ void ple_fp8_decode_kernel(const std::uint8_t* encoded, std::uint16_t scale_bits,
+                                      __nv_bfloat16* output, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    __nv_fp8_e4m3 value;
+    value.__x = encoded[i];
+    const float scale = __bfloat162float(__ushort_as_bfloat16(scale_bits));
+    output[i] = __float2bfloat16_rn(static_cast<float>(value) * scale);
+}
 
 __device__ __forceinline__ std::uint16_t load_u16_le(const std::uint8_t* bytes) {
     return static_cast<std::uint16_t>(bytes[0]) |
@@ -38,10 +68,16 @@ __global__ void ple_iq4_nl_decode_kernel(const std::uint8_t* encoded, __nv_bfloa
     output[index]        = __float2bfloat16_rn(iq4_nl_value(block, d % kPleIq4NlBlockValues));
 }
 
+__device__ __forceinline__ float ple_norm(float value) { return value; }
+__device__ __forceinline__ float ple_norm(__nv_bfloat16 value) { return 1.0F + __bfloat162float(value); }
+__device__ __forceinline__ float ple_coefficient(float value) { return value; }
+__device__ __forceinline__ float ple_coefficient(__nv_bfloat16 value) { return __bfloat162float(value); }
+
+template <typename Norm>
 __global__ void ple_gate_kernel(const __nv_bfloat16* residual,
                                 const __nv_bfloat16* projected_key,
-                                const __nv_bfloat16* projected_value, const float* key_weight,
-                                const float* query_weight, float* gated, int width) {
+                                const __nv_bfloat16* projected_value, const Norm* key_weight,
+                                const Norm* query_weight, float* gated, int width) {
     __shared__ float q_reduce[256];
     __shared__ float k_reduce[256];
     __shared__ float inv_q;
@@ -80,9 +116,9 @@ __global__ void ple_gate_kernel(const __nv_bfloat16* residual,
     for (int d = lane; d < kPleEmbeddingWidth; d += blockDim.x) {
         const int channel = channel_base + d;
         const float q = __bfloat162float(residual[channel + token_base]) * inv_q *
-                        query_weight[channel];
+                        ple_norm(query_weight[channel]);
         const float k = __bfloat162float(projected_key[channel + token_base]) * inv_k *
-                        key_weight[channel];
+                        ple_norm(key_weight[channel]);
         dot += q * k;
     }
     q_reduce[lane] = dot;
@@ -106,7 +142,8 @@ __global__ void ple_gate_kernel(const __nv_bfloat16* residual,
     }
 }
 
-__global__ void ple_conv_input_kernel(const float* gated, const float* norm_weight,
+template <typename Norm>
+__global__ void ple_conv_input_kernel(const float* gated, const Norm* norm_weight,
                                       __nv_bfloat16* current, int width) {
     __shared__ float reduce[256];
     __shared__ float inv_rms;
@@ -130,7 +167,7 @@ __global__ void ple_conv_input_kernel(const float* gated, const float* norm_weig
     __syncthreads();
     for (int d = lane; d < kPleEmbeddingWidth; d += blockDim.x) {
         const int channel = channel_base + d;
-        const float normalized = gated[channel + token_base] * inv_rms * norm_weight[channel];
+        const float normalized = gated[channel + token_base] * inv_rms * ple_norm(norm_weight[channel]);
         current[channel + token_base] = __float2bfloat16_rn(normalized);
     }
 }
@@ -145,8 +182,9 @@ __device__ __forceinline__ float state_value(const __nv_bfloat16* old_state,
                                                      logical_index]);
 }
 
+template <typename Coefficient>
 __global__ void ple_conv_inject_kernel(const __nv_bfloat16* residual, const float* gated,
-                                       const float* conv_weight,
+                                       const Coefficient* conv_weight,
                                        const __nv_bfloat16* old_state,
                                        const __nv_bfloat16* current, __nv_bfloat16* output,
                                        int width) {
@@ -156,7 +194,7 @@ __global__ void ple_conv_inject_kernel(const __nv_bfloat16* residual, const floa
         float conv = 0.0F;
 #pragma unroll
         for (int tap = 0; tap < 4; ++tap) {
-            conv += conv_weight[static_cast<std::int64_t>(channel) * 4 + tap] *
+            conv += ple_coefficient(conv_weight[static_cast<std::int64_t>(channel) * 4 + tap]) *
                     state_value(old_state, current, channel, token - 9 + 3 * tap);
         }
         const float activated = conv / (1.0F + expf(-conv));
@@ -188,6 +226,24 @@ __global__ void ple_state_update_kernel(const __nv_bfloat16* old_state,
 
 } // namespace
 
+void ple_nvfp4_decode_rows_launch(const Tensor& device_rows, Tensor& embedding,
+                                  cudaStream_t stream) {
+    const int count = kPleEmbeddingWidth * device_rows.ne[2];
+    ple_nvfp4_decode_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+        static_cast<const std::uint8_t*>(device_rows.data),
+        static_cast<__nv_bfloat16*>(embedding.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ple_fp8_decode_rows_launch(const Tensor& device_rows, std::uint16_t scale_bits,
+                                Tensor& embedding, cudaStream_t stream) {
+    const int count = kPleEmbeddingWidth * embedding.ne[2];
+    ple_fp8_decode_kernel<<<(count + 255) / 256, 256, 0, stream>>>(
+        static_cast<const std::uint8_t*>(device_rows.data), scale_bits,
+        static_cast<__nv_bfloat16*>(embedding.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ple_iq4_nl_decode_rows_launch(const Tensor& device_rows, Tensor& embedding,
                                    cudaStream_t stream) {
     constexpr int block = 256;
@@ -200,22 +256,38 @@ void ple_iq4_nl_decode_rows_launch(const Tensor& device_rows, Tensor& embedding,
 
 void ple_gate_launch(const Tensor& residual, const Tensor& projected_key,
                      const Tensor& projected_value, const Tensor& key_norm_weight,
-                     const Tensor& query_norm_weight, Tensor& gated, cudaStream_t stream) {
-    ple_gate_kernel<<<dim3(kPleBranches, residual.ne[2]), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(residual.data),
-        static_cast<const __nv_bfloat16*>(projected_key.data),
-        static_cast<const __nv_bfloat16*>(projected_value.data),
-        static_cast<const float*>(key_norm_weight.data),
-        static_cast<const float*>(query_norm_weight.data), static_cast<float*>(gated.data),
-        residual.ne[2]);
+                     const Tensor& query_norm_weight, Tensor& gated, PleNormFormat norm_format,
+                     cudaStream_t stream) {
+    if (norm_format == PleNormFormat::ZeroCenteredBf16) {
+        ple_gate_kernel<<<dim3(kPleBranches, residual.ne[2]), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(residual.data),
+            static_cast<const __nv_bfloat16*>(projected_key.data),
+            static_cast<const __nv_bfloat16*>(projected_value.data),
+            static_cast<const __nv_bfloat16*>(key_norm_weight.data),
+            static_cast<const __nv_bfloat16*>(query_norm_weight.data), static_cast<float*>(gated.data), residual.ne[2]);
+    } else {
+        ple_gate_kernel<<<dim3(kPleBranches, residual.ne[2]), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(residual.data),
+            static_cast<const __nv_bfloat16*>(projected_key.data),
+            static_cast<const __nv_bfloat16*>(projected_value.data),
+            static_cast<const float*>(key_norm_weight.data),
+            static_cast<const float*>(query_norm_weight.data), static_cast<float*>(gated.data),
+            residual.ne[2]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 void ple_conv_input_launch(const Tensor& gated, const Tensor& conv_norm_weight,
-                           Tensor& current_state, cudaStream_t stream) {
-    ple_conv_input_kernel<<<dim3(kPleBranches, gated.ne[1]), 256, 0, stream>>>(
-        static_cast<const float*>(gated.data), static_cast<const float*>(conv_norm_weight.data),
-        static_cast<__nv_bfloat16*>(current_state.data), gated.ne[1]);
+                           Tensor& current_state, PleNormFormat norm_format, cudaStream_t stream) {
+    if (norm_format == PleNormFormat::ZeroCenteredBf16) {
+        ple_conv_input_kernel<<<dim3(kPleBranches, gated.ne[1]), 256, 0, stream>>>(
+            static_cast<const float*>(gated.data), static_cast<const __nv_bfloat16*>(conv_norm_weight.data),
+            static_cast<__nv_bfloat16*>(current_state.data), gated.ne[1]);
+    } else {
+        ple_conv_input_kernel<<<dim3(kPleBranches, gated.ne[1]), 256, 0, stream>>>(
+            static_cast<const float*>(gated.data), static_cast<const float*>(conv_norm_weight.data),
+            static_cast<__nv_bfloat16*>(current_state.data), gated.ne[1]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -223,12 +295,21 @@ void ple_conv_inject_launch(const Tensor& residual, const Tensor& gated,
                             const Tensor& conv_weight, const Tensor& old_state,
                             const Tensor& current_state, Tensor& out, cudaStream_t stream) {
     constexpr int block = 256;
-    ple_conv_inject_kernel<<<(kPleChannels + block - 1) / block, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(gated.data),
-        static_cast<const float*>(conv_weight.data),
-        static_cast<const __nv_bfloat16*>(old_state.data),
-        static_cast<const __nv_bfloat16*>(current_state.data),
-        static_cast<__nv_bfloat16*>(out.data), residual.ne[2]);
+    if (conv_weight.dtype == DType::BF16) {
+        ple_conv_inject_kernel<<<(kPleChannels + block - 1) / block, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(gated.data),
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(old_state.data),
+            static_cast<const __nv_bfloat16*>(current_state.data),
+            static_cast<__nv_bfloat16*>(out.data), residual.ne[2]);
+    } else {
+        ple_conv_inject_kernel<<<(kPleChannels + block - 1) / block, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(gated.data),
+            static_cast<const float*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(old_state.data),
+            static_cast<const __nv_bfloat16*>(current_state.data),
+            static_cast<__nv_bfloat16*>(out.data), residual.ne[2]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

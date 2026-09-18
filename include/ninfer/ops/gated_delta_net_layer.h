@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -10,35 +11,46 @@
 
 namespace ninfer::ops {
 
+struct GatedDeltaNetProjectionPolicy {
+    LinearPolicy qkv = LinearPolicy::A16Only;
+    LinearPolicy z = LinearPolicy::A16Only;
+    LinearPolicy output = LinearPolicy::A16Only;
+};
+
 /** Persistent and learned views for the fixed Qwen4-preview Gated DeltaNet layer. */
 struct GatedDeltaNetLayerWeights {
-    Weight qkv;       // Q5_K/Q6_K, NVFP4 or row-scaled FP8 [10240,2560]; q|k|v
-    Weight z;         // Q5_K/Q6_K, NVFP4 or row-scaled FP8 [6144,2560]
+    Weight qkv;       // BF16, Q5_K/Q6_K, NVFP4, row or tensor-calibrated FP8 [10240,2560]; q|k|v
+    Weight z;         // BF16, Q5_K/Q6_K, NVFP4, row or tensor-calibrated FP8 [6144,2560]
     Tensor a;         // FP32 physical [2560,48], mathematical [48,2560]
     Tensor b;         // FP32 physical [2560,48], mathematical [48,2560]
     Tensor conv;      // FP32 physical [4,10240], mathematical [10240,4], oldest..current taps
     Tensor ssm_a;     // FP32 [48], converted -exp(A_log) decay multiplier
     Tensor dt_bias;   // FP32 [48]
     Tensor norm;      // FP32 [128], ordinary learned scale (no unit offset)
-    Weight output;    // Q6_K, NVFP4 or row-scaled FP8 [2560,6144]
+    Weight output;    // BF16, Q6_K, NVFP4, row or tensor-calibrated FP8 [2560,6144]
 };
 
 /**
  * Returns caller-owned transient capacity for the registered H=2560, Hq=16, Hv=48, Dh=128,
- * C=1/T<=max_tokens and explicit projection-format profile. Defaults describe the GGUF verifier.
- * Native formats use Linear A16Only; each projection may independently select its
- * format. The two legacy GGML input projections retain their matching-format constraint.
+ * C=1/T<=max_tokens and explicit projection-format profile.
+ * Each projection independently selects its format. A16Only is the default; native
+ * tensor-calibrated FP8 roles separately permit AllowA8 with the exact source input scale
+ * retained as Linear's per-token guarded activation-scale floor.
+ * The query includes caller-owned activation packing scratch for the selected policies.
+ * QKV and output may not both select AllowA8: that combined approximation failed
+ * the predeclared complete-component output gate. Z may combine with either one.
+ * The two legacy GGML input projections retain their matching-format constraint.
  */
 [[nodiscard]] std::size_t
 gated_delta_net_layer_workspace_capacity_bytes(
-    std::int32_t max_tokens = 1, QType qkv = QType::GGML_Q5_K,
-    QType z = QType::GGML_Q5_K, QType output = QType::GGML_Q6_K);
+    std::int32_t max_tokens, QType qkv, QType z, QType output,
+    GatedDeltaNetProjectionPolicy policy = {});
 
 /**
  * Op: gated_delta_net_layer
  *
- * Applies the complete Qwen4-preview GDN sublayer from represented BF16 input and converted
- * UD-IQ1_S artifact weights. It
+ * Applies the complete Qwen4-preview GDN sublayer from represented BF16 input and the
+ * explicitly admitted native or diagnostic projection weights. It
  * projects independent qkv/z/a/b branches; applies the width-four causal depthwise convolution
  * and SiLU only to qkv; L2-normalizes Q/K with epsilon 1e-6 and repeats each of 16 Q/K heads over
  * three tiled value-head groups; forms beta=sigmoid(b) and
@@ -57,16 +69,21 @@ gated_delta_net_layer_workspace_capacity_bytes(
  * The mathematical oracle exact-decodes represented inputs/weights and evaluates each closed
  * formula naively in FP64. It applies the declared consumer representations between formulas:
  * decoded qkv and z projection outputs are BF16, controls and each recurrent transition are FP32,
- * recurrent output is BF16 before gated norm, and gated-norm output is BF16 before the Q6_K output
- * projection. The GGUF converter stores V-side qkv/z/a/b/ssm_a/dt/conv/output in tiled order, so
+ * recurrent output is BF16 before gated norm, and gated-norm output is BF16 before the output
+ * projection. Offline conversion stores V-side qkv/z/a/b/ssm_a/dt/conv/output in tiled order, so
  * value head h consumes Q/K head h%16. BF16 convolution state,
  * FP32 recurrent state, and BF16 out are persistent/final observable boundaries. All non-state
  * operands, output, and live workspace are pairwise non-overlapping. Execution is asynchronous on
- * stream.
+ * stream. Optional per-role calibrated FP8 A8 uses Linear's guarded source-floor temporary
+ * E4M3 activation codec; it does not change these BF16/FP32 public and state boundaries.
+ * A8 approximation is checked against the same represented-input oracle under a separately
+ * declared implementation profile, not by feeding quantized private inputs into that oracle.
+ * Admission is bounded component qualification, not whole-model PPL or default-policy approval.
  */
 void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& weights,
                            const Tensor& conv_state_in, Tensor& conv_state_out,
                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                           WorkspaceArena& workspace, cudaStream_t stream);
+                           WorkspaceArena& workspace, cudaStream_t stream,
+                           GatedDeltaNetProjectionPolicy policy = {});
 
 } // namespace ninfer::ops

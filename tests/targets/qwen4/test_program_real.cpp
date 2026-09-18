@@ -163,8 +163,8 @@ std::vector<std::uint8_t> snapshot_continuation(const verifier::State& state, in
         }
         if (state.qsa()[layer]) {
             const auto& qsa = *state.qsa()[layer];
-            append_tensor_bytes(snapshot, qsa.k_codes);
-            append_tensor_bytes(snapshot, qsa.v_codes);
+            append_tensor_bytes(snapshot, qsa.k);
+            append_tensor_bytes(snapshot, qsa.v);
             append_tensor_bytes(snapshot, qsa.k_scales);
             append_tensor_bytes(snapshot, qsa.v_scales);
             append_checked<std::uint16_t>(snapshot, qsa.raw_index_keys,
@@ -233,10 +233,10 @@ int validate_current_qsa_cache(const verifier::State& state, std::int32_t token_
             const std::size_t scale_offset = 16ULL *
                 (static_cast<std::size_t>(token_index) + verifier::kQsaCapacity * head);
             CUDA_CHECK(cudaMemcpy(k_codes.data(),
-                                  static_cast<const std::byte*>(qsa.k_codes.data) + code_offset,
+                                  static_cast<const std::byte*>(qsa.k.data) + code_offset,
                                   k_codes.size(), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(v_codes.data(),
-                                  static_cast<const std::byte*>(qsa.v_codes.data) + code_offset,
+                                  static_cast<const std::byte*>(qsa.v.data) + code_offset,
                                   v_codes.size(), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(k_scales.data(),
                                   static_cast<const std::byte*>(qsa.k_scales.data) + scale_offset,
@@ -274,8 +274,8 @@ int validate_current_qsa_cache(const verifier::State& state, std::int32_t token_
                 }
             }
         }
-        if (!any_nonzero || qsa.k_codes.dtype != ninfer::DType::U8 ||
-            qsa.v_codes.dtype != ninfer::DType::U8 ||
+        if (!any_nonzero || qsa.k.dtype != ninfer::DType::U8 ||
+            qsa.v.dtype != ninfer::DType::U8 ||
             qsa.k_scales.dtype != ninfer::DType::FP8_E4M3FN ||
             qsa.v_scales.dtype != ninfer::DType::FP8_E4M3FN) {
             std::cerr << "QSA current NVFP4 row was not represented at layer " << layer << '\n';

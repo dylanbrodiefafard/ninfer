@@ -79,6 +79,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/ggml_block_linear.cu
   ops/launcher/gated_delta_net_layer.cu
   ops/launcher/gated_residual.cu
+  ops/launcher/gated_residual_stem.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
   ops/launcher/bidirectional_gqa_attention.cu
@@ -173,6 +174,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
   ops/linear/bf16/bf16_gemv.cu
   ops/linear/bf16/bf16_gemm_mma.cu
+  ops/linear/bf16/bf16_f32.cu
   ops/linear/bf16/bf16_small_t.cu
   ops/linear/bf16/bf16_dispatch.cpp
   ops/common/memory_evict.cu
@@ -256,6 +258,7 @@ add_library(ninfer_ops STATIC
   ops/linear/fp8/fp8_a16_small_t_mma.cu
   ops/linear/fp8/fp8_a16_gemm_mma.cu
   ops/linear/fp8/fp8_a8.cu
+  ops/linear/fp8/fp8_tensor.cu
   ops/linear/fp8/fp8_dispatch.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
@@ -267,6 +270,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/ggml_block_linear.cpp
   ops/wrapper/gated_delta_net_layer.cpp
   ops/wrapper/gated_residual.cpp
+  ops/wrapper/gated_residual_stem.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
@@ -278,6 +282,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
+  ops/wrapper/vision_patch_merger.cpp
   ops/wrapper/linear_add.cpp
   ops/wrapper/linear_pair.cpp
   ops/wrapper/linear_swiglu.cpp

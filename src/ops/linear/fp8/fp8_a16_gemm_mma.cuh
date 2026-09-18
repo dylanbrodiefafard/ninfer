@@ -55,11 +55,12 @@ struct Fp8A16GemmSchedule {
     static_assert(kSharedBytes <= 99 * 1024);
 };
 
-template <class Geometry, class Schedule, bool FullTokens, class Output = Fp8ContiguousOutput>
+template <class Geometry, class Schedule, bool FullTokens, class Output = Fp8ContiguousOutput,
+          class Scales = const __nv_bfloat16*>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ weight_codes,
-    const __nv_bfloat16* __restrict__ row_scales, Output output, std::int32_t tokens) {
+    Scales row_scales, Output output, std::int32_t tokens) {
     constexpr int M       = Geometry::kOutputRows;
     constexpr int K       = Geometry::kInputRows;
     constexpr int BM      = Schedule::kBlockRows;
@@ -226,8 +227,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     for (int mma_row = 0; mma_row < MT; ++mma_row) {
         const int row0     = row_begin + wm * WM + mma_row * 16 + gid;
         const int row1     = row0 + 8;
-        const float scale0 = __bfloat162float(row_scales[row0]);
-        const float scale1 = __bfloat162float(row_scales[row1]);
+        const float scale0 = fp8_weight_scale(row_scales, row0);
+        const float scale1 = fp8_weight_scale(row_scales, row1);
 #pragma unroll
         for (int mma_token = 0; mma_token < NT; ++mma_token) {
             const int token0    = token_begin + wn * WN + mma_token * 8 + 2 * lid;

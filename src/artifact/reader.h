@@ -29,7 +29,11 @@ enum class NumericFormat {
     Q6G64_F16S,
     W8G32_F16S,
     NVFP4,
+    NVFP4_EXPERT_F32M,
+    NVFP4_PARTITION_F32M,
     FP8_E4M3FN_ROW_BF16S,
+    FP8_E4M3FN_TENSOR_BF16S,
+    FP8_E4M3FN_TENSOR_F32M,
     Q8_0,
     Q4_K,
     Q5_K,
@@ -45,6 +49,10 @@ enum class StorageLayout {
     BlockScaleK16M128x4V1,
     RowScaleV1,
     GgmlBlockRowV1,
+    ExpertBlockScaleK16M128x4V1,
+    TensorScaleV1,
+    PartitionedRowBlockScaleK16V1,
+    TensorCalibratedV1,
 };
 
 enum class ResourceEncoding {
@@ -92,6 +100,15 @@ struct BlockScaleGeometry {
 
 BlockScaleGeometry block_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
+struct ExpertBlockScaleGeometry {
+    std::uint64_t experts = 0, rows = 0, columns = 0;
+    std::uint64_t code_plane_bytes = 0, scale_plane_offset = 0, scale_plane_bytes = 0;
+    std::uint64_t weight_multiplier_offset = 0, input_multiplier_offset = 0;
+    std::uint64_t encoded_bytes = 0;
+};
+ExpertBlockScaleGeometry expert_block_scale_geometry(
+    NumericFormat format, std::span<const std::uint64_t> shape);
+
 struct RowScaleGeometry {
     std::uint64_t rows               = 0;
     std::uint64_t columns            = 0;
@@ -100,6 +117,23 @@ struct RowScaleGeometry {
     std::uint64_t scale_plane_bytes  = 0;
     std::uint64_t encoded_bytes      = 0;
 };
+
+struct TensorScaleGeometry {
+    std::uint64_t rows = 0, columns = 0, code_plane_bytes = 0, scale_offset = 0, encoded_bytes = 0;
+};
+TensorScaleGeometry tensor_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+struct PartitionBlockScaleGeometry {
+    std::uint64_t partitions = 0, rows = 0, columns = 0, row_bytes = 0;
+    std::uint64_t multiplier_offset = 0, encoded_bytes = 0;
+};
+struct TensorCalibratedGeometry {
+    std::uint64_t rows = 0, columns = 0, multiplier_offset = 0, encoded_bytes = 0;
+};
+TensorCalibratedGeometry tensor_calibrated_geometry(
+    NumericFormat format, std::span<const std::uint64_t> shape);
+PartitionBlockScaleGeometry partition_block_scale_geometry(
+    NumericFormat format, std::span<const std::uint64_t> shape);
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 struct GgmlBlockGeometry {
@@ -144,6 +178,14 @@ struct PayloadSpan {
     std::span<const std::byte> data;
 };
 
+// Exact payload backed by an eagerly populated, non-pageable OS mapping.
+// Ownership is independent of Reader and of other resident mappings.
+struct ResidentPayload {
+    std::shared_ptr<const void> backing;
+    std::span<const std::byte> data;
+    std::uint64_t locked_bytes = 0;
+};
+
 struct ArtifactIdentity {
     std::string model_id;
     std::string weights_id;
@@ -174,6 +216,7 @@ public:
     std::uint64_t payload_offset() const noexcept;
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
+    ResidentPayload resident_payload(const ObjectDescriptor& object) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
 
 private:

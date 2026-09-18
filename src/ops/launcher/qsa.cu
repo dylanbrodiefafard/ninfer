@@ -38,13 +38,32 @@ __device__ __forceinline__ std::int64_t scale_index(int group, int token, int he
                (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(capacity) * head);
 }
 
+template <bool Bf16>
 __device__ __forceinline__ float decode_value(const std::uint8_t* codes,
                                                const std::uint8_t* scales, int d, int token,
                                                int head, int capacity) {
+    if constexpr (Bf16) {
+        const auto* values = reinterpret_cast<const __nv_bfloat16*>(codes);
+        return __bfloat162float(values[d + 256LL * (token + static_cast<std::int64_t>(capacity) * head)]);
+    }
     const std::uint8_t packed = codes[code_index(d >> 1, token, head, capacity)];
     const float2 pair         = decode_nvfp4_e2m1x2(packed);
     const float scale         = decode_nvfp4_e4m3(scales[scale_index(d >> 4, token, head, capacity)]);
     return ((d & 1) == 0 ? pair.x : pair.y) * scale;
+}
+
+__global__ void qsa_append_bf16_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
+                                      const std::int32_t* ids, __nv_bfloat16* out_k,
+                                      __nv_bfloat16* out_v, int capacity) {
+    const int token = blockIdx.x;
+    const int head = blockIdx.y;
+    const int d = threadIdx.x;
+    const int id = ids[token];
+    if (id < 0 || id >= capacity) { return; }
+    const auto source = d + 256LL * (head + 2LL * token);
+    const auto dest = d + 256LL * (id + static_cast<std::int64_t>(capacity) * head);
+    out_k[dest] = k[source];
+    out_v[dest] = v[source];
 }
 
 __global__ void qsa_append_nvfp4_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
@@ -376,6 +395,7 @@ __global__ void qsa_select_topk_kernel(const std::int32_t* visible_ids,
     }
 }
 
+template <bool Bf16>
 __global__ void qsa_attention_short_kernel(const __nv_bfloat16* q,
                                            const std::int32_t* selected,
                                            const std::int32_t* counts,
@@ -413,7 +433,7 @@ __global__ void qsa_attention_short_kernel(const __nv_bfloat16* q,
                     feature + static_cast<std::int64_t>(kQsaHeadDim) *
                                   (head + static_cast<std::int64_t>(kQsaQueryHeads) * token);
                 dot += __bfloat162float(q[query_index]) *
-                       decode_value(k_codes, k_scales, feature, id, kv_head, capacity);
+                       decode_value<Bf16>(k_codes, k_scales, feature, id, kv_head, capacity);
             }
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -450,12 +470,13 @@ __global__ void qsa_attention_short_kernel(const __nv_bfloat16* q,
     for (int j = 0; j < count; ++j) {
         const int id = token_selected[j];
         if (id >= 0 && id < capacity) {
-            value += scores[j] * inv * decode_value(v_codes, v_scales, d, id, kv_head, capacity);
+            value += scores[j] * inv * decode_value<Bf16>(v_codes, v_scales, d, id, kv_head, capacity);
         }
     }
     out[output_index] = __float2bfloat16_rn(value);
 }
 
+template <bool Bf16>
 __global__ void qsa_attention_score_tiled_kernel(
     const __nv_bfloat16* q, const std::int32_t* selected, const std::int32_t* counts,
     const std::uint8_t* k_codes, const std::uint8_t* k_scales, float* scores,
@@ -480,7 +501,7 @@ __global__ void qsa_attention_score_tiled_kernel(
             for (int d = static_cast<int>(threadIdx.x); d < kQsaHeadDim; d += blockDim.x) {
                 keys[rank_offset][d] =
                     id >= 0 && id < capacity
-                        ? decode_value(k_codes, k_scales, d, id, kv_head, capacity)
+                        ? decode_value<Bf16>(k_codes, k_scales, d, id, kv_head, capacity)
                         : 0.0F;
             }
         }
@@ -540,6 +561,7 @@ __global__ void qsa_attention_softmax_kernel(float* scores, const std::int32_t* 
     for (int rank = d; rank < count; rank += kQsaHeadDim) { head_scores[rank] *= inverse; }
 }
 
+template <bool Bf16>
 __global__ void qsa_attention_value_tiled_kernel(
     const std::int32_t* selected, const std::int32_t* counts, const std::uint8_t* v_codes,
     const std::uint8_t* v_scales, const float* probabilities, float* partials,
@@ -557,7 +579,7 @@ __global__ void qsa_attention_value_tiled_kernel(
         for (int rank = begin; rank < end; ++rank) {
             const int id = selected[rank];
             const float value = id >= 0 && id < capacity
-                                    ? decode_value(v_codes, v_scales, d, id, kv_head, capacity)
+                                    ? decode_value<Bf16>(v_codes, v_scales, d, id, kv_head, capacity)
                                     : 0.0F;
 #pragma unroll
             for (int local_head = 0; local_head < kAttentionHeadsPerGroup; ++local_head) {
@@ -603,13 +625,20 @@ void qsa_state_append_launch(const Tensor& k, const Tensor& v, const Tensor& raw
                              QsaStateView state, cudaStream_t stream) {
     const int width    = k.ne[2];
     const int capacity = state.raw_index_keys.ne[1];
-    qsa_append_nvfp4_kernel<<<dim3(kGroups, width, kQsaKvHeads), 1, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-        static_cast<const std::int32_t*>(append_ids.data),
-        static_cast<std::uint8_t*>(state.k_codes.data),
-        static_cast<std::uint8_t*>(state.v_codes.data),
-        static_cast<std::uint8_t*>(state.k_scales.data),
-        static_cast<std::uint8_t*>(state.v_scales.data), width, capacity);
+    if (state.format == QsaKvFormat::BF16) {
+        qsa_append_bf16_kernel<<<dim3(width, kQsaKvHeads), kQsaHeadDim, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(append_ids.data),
+            static_cast<__nv_bfloat16*>(state.k.data), static_cast<__nv_bfloat16*>(state.v.data), capacity);
+    } else {
+        qsa_append_nvfp4_kernel<<<dim3(kGroups, width, kQsaKvHeads), 1, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(append_ids.data),
+            static_cast<std::uint8_t*>(state.k.data),
+            static_cast<std::uint8_t*>(state.v.data),
+            static_cast<std::uint8_t*>(state.k_scales.data),
+            static_cast<std::uint8_t*>(state.v_scales.data), width, capacity);
+    }
     CUDA_CHECK(cudaGetLastError());
     qsa_append_index_kernel<<<width, 128, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(raw_index_keys.data),
@@ -675,18 +704,19 @@ void qsa_index_select_launch(const Tensor& raw_query, const QsaStateView& state,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
+template <bool Bf16>
+void selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
                                    const Tensor& selected_count, const QsaStateView& state,
                                    Tensor& out, Tensor& workspace, cudaStream_t stream) {
     const int selected_bound = selected_ids.ne[0];
     const int width = q.ne[2];
     if (width > 1 || selected_bound <= kAttentionValueTile) {
-        qsa_attention_short_kernel<<<dim3(kQsaQueryHeads, width), kQsaHeadDim, 0, stream>>>(
+        qsa_attention_short_kernel<Bf16><<<dim3(kQsaQueryHeads, width), kQsaHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(selected_ids.data),
             static_cast<const std::int32_t*>(selected_count.data),
-            static_cast<const std::uint8_t*>(state.k_codes.data),
-            static_cast<const std::uint8_t*>(state.v_codes.data),
+            static_cast<const std::uint8_t*>(state.k.data),
+            static_cast<const std::uint8_t*>(state.v.data),
             static_cast<const std::uint8_t*>(state.k_scales.data),
             static_cast<const std::uint8_t*>(state.v_scales.data),
             static_cast<__nv_bfloat16*>(out.data), selected_bound,
@@ -702,23 +732,23 @@ void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
         kAttentionScoreRanksPerBlock;
     const int value_tiles =
         (selected_bound + kAttentionValueTile - 1) / kAttentionValueTile;
-    qsa_attention_score_tiled_kernel<<<dim3(score_blocks, kAttentionHeadGroups), kQsaHeadDim,
+    qsa_attention_score_tiled_kernel<Bf16><<<dim3(score_blocks, kAttentionHeadGroups), kQsaHeadDim,
                                        0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const std::int32_t*>(selected_ids.data),
         static_cast<const std::int32_t*>(selected_count.data),
-        static_cast<const std::uint8_t*>(state.k_codes.data),
+        static_cast<const std::uint8_t*>(state.k.data),
         static_cast<const std::uint8_t*>(state.k_scales.data),
         scores, selected_bound, state.raw_index_keys.ne[1]);
     CUDA_CHECK(cudaGetLastError());
     qsa_attention_softmax_kernel<<<kQsaQueryHeads, kQsaHeadDim, 0, stream>>>(
         scores, static_cast<const std::int32_t*>(selected_count.data), selected_bound);
     CUDA_CHECK(cudaGetLastError());
-    qsa_attention_value_tiled_kernel<<<dim3(value_tiles, kAttentionHeadGroups), kQsaHeadDim,
+    qsa_attention_value_tiled_kernel<Bf16><<<dim3(value_tiles, kAttentionHeadGroups), kQsaHeadDim,
                                        0, stream>>>(
         static_cast<const std::int32_t*>(selected_ids.data),
         static_cast<const std::int32_t*>(selected_count.data),
-        static_cast<const std::uint8_t*>(state.v_codes.data),
+        static_cast<const std::uint8_t*>(state.v.data),
         static_cast<const std::uint8_t*>(state.v_scales.data), scores, partials,
         selected_bound, state.raw_index_keys.ne[1]);
     CUDA_CHECK(cudaGetLastError());
@@ -726,6 +756,16 @@ void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
         static_cast<const std::int32_t*>(selected_count.data), partials,
         static_cast<__nv_bfloat16*>(out.data), selected_bound, value_tiles);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void qsa_selected_attention_launch(const Tensor& q, const Tensor& selected_ids,
+                                   const Tensor& selected_count, const QsaStateView& state,
+                                   Tensor& out, Tensor& workspace, cudaStream_t stream) {
+    if (state.format == QsaKvFormat::BF16) {
+        selected_attention_launch<true>(q, selected_ids, selected_count, state, out, workspace, stream);
+    } else {
+        selected_attention_launch<false>(q, selected_ids, selected_count, state, out, workspace, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

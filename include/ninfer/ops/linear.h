@@ -42,7 +42,7 @@ enum class LinearPolicy : std::uint8_t {
  * @f[
  *   \mathrm{ideal}_{n,t} =
  *   \sum_{k=0}^{K-1}
- *     \mathrm{FP32Dequant}(w)_{n,k}\,\mathrm{FP32}(x_{k,t}).
+ *     \mathrm{Decode}(w)_{n,k}\,\mathrm{FP32}(x_{k,t}).
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
@@ -69,6 +69,24 @@ enum class LinearPolicy : std::uint8_t {
  * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144],
  * [640,2560], [1280,2560], [2560,640], [10240,320], [2560,2560], [248320,2560]}`.
  * FP8 additionally admits `[320,10240]`; that shape is not a legal NVFP4 block-scale layout.
+ * Tensor-calibrated FP8_E4M3FN_TENSOR_F32M separately admits exactly
+ * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144],
+ * [640,2560], [2560,640]}` with exact FP32 tensor weight/input multipliers.
+ * Its A16 route preserves BF16 activations; AllowA8 may pack temporary E4M3 operands using
+ * per-token FP32 scale max(stored input multiplier, RN(maxabs(x_token)/448)),
+ * FP32 round-to-nearest division and finite-saturating E4M3 RNE. The stored scalar is
+ * an unchanged calibration floor; the guarded private profile is not publisher bit parity.
+ * The weight multiplier and input multiplier are dequantization scales, never divisors
+ * stored under an existing row-scaled weight format. Guarding avoids large outlier clipping;
+ * activation rounding remains an approximation to qualify on caller distributions, not arbitrary-input
+ * losslessness. Both policies return BF16 outputs; no A4 policy or vocabulary shape is admitted.
+ * Contiguous BF16 additionally admits the native preview non-routed projections
+ * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [640,2560],
+ * [2560,2560], [2560,6144], [320,10240], [10240,320], [2560,640], [248320,2560],
+ * [4608,4608], [2560,4608]}`. The last two are the native BF16 Vision merger.
+ * Native BF16 Vision patch/encoder additionally admits `[1152,1536]`, `[3456,1152]`,
+ * `[1152,1152]`, `[4304,1152]` and `[1152,4304]` using the canonical MMA schedule,
+ * with zero-filled partial row/K tiles for the real 4304 dimension (no weight repacking).
  * These are exact geometry qualifications, not a promise of arbitrary future checkpoint support.
  * The five
  * DFlash2-only geometries are A16-only; AllowA4 still resolves them to A16.
@@ -80,8 +98,9 @@ enum class LinearPolicy : std::uint8_t {
  * column does not inherently represent a text token. FP32_CTRL is unsupported.
  *
  * @par Numerical contract
- * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
- * The one Linear oracle accepts that matrix and the FP32 values represented by the BF16 activation,
+ * Test fixture code exact-decodes each represented weight coefficient, honoring registered codec
+ * semantic casts without adding an unregistered FP32 rounding. The one Linear oracle accepts
+ * those coefficients and the FP32 values represented by the BF16 activation,
  * evaluates every complete dot product with naive FP64 accumulation, and retains the FP64 result.
  * The BF16 output is promoted and compared against that result. Output representation,
  * accumulator precision, activation quantization, staging, reduction order, and kernel schedule

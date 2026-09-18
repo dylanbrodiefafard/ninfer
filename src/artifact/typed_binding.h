@@ -33,6 +33,10 @@ class MaterializedArtifact;
     const MaterializedArtifact& materialized, ObjectHandle handle, NumericFormat format,
     std::initializer_list<std::int32_t> shape);
 
+[[nodiscard]] Weight materialized_nvfp4_expert_weight(
+    const MaterializedArtifact& materialized, ObjectHandle handle,
+    std::int32_t experts, std::int32_t rows, std::int32_t columns);
+
 /** Return one byte-identical rank-two matrix view of a rank-three GGML expert bank. */
 [[nodiscard]] Weight ggml_block_matrix_view(const Weight& bank, std::int32_t matrix_index);
 

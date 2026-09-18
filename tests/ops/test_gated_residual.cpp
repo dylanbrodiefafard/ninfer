@@ -2,6 +2,8 @@
 
 #include "ops/op_tester.h"
 #include "ops/native_projection_fixture.h"
+#include "targets/qwen4/native_bf16_fixture.h"
+#include "targets/qwen4/native_sequence_components.h"
 
 #include <algorithm>
 #include <cmath>
@@ -147,10 +149,43 @@ struct Fixture {
         }
         fill_uniform(norm, 7101U, 0.80F, 1.20F);
         fill_uniform(write, 7104U, -0.003F, 0.003F);
+        upload();
+    }
+
+    Fixture(const std::string& path, int layer, const std::string& kind)
+        : down_type(QType::BF16_CTRL), up_type(QType::BF16_CTRL) {
+        qwen4_native::Bf16Source source(path, layer);
+        const std::string prefix = kind + "_hyper_connection.";
+        norm = source.values(prefix + "hc_norm.weight", {kFlat});
+        for (auto& value : norm) { value += 1.0F; }
+        write = source.values(prefix + "block_inject_weight.weight", {kBranches, kFlat});
+        native_down = qwen4_native::bf16_matrix(source.bits(
+            prefix + "input_mix_weight_down.weight", {kRank, kFlat}), kRank, kFlat);
+        native_up = qwen4_native::bf16_matrix(source.bits(
+            prefix + "input_mix_weight_up.weight", {kFlat, kRank}), kFlat, kRank);
+        down = native_down.payload; up = native_up.payload;
+        upload();
+    }
+
+    void upload() {
         d_norm = to_device_f32(norm);
         d_down = to_device(down);
         d_up = to_device(up);
         d_write = to_device_f32(write);
+    }
+
+    explicit Fixture(const std::string& endpoint_path)
+        : down_type(QType::BF16_CTRL), up_type(QType::BF16_CTRL), write(kBranches*kFlat,0.F) {
+        qwen4_native::Bf16Source source(endpoint_path);
+        const std::string prefix="model.language_model.hyper_connection_mixer.";
+        norm=source.values(prefix+"hc_norm.weight",{kFlat});
+        for(auto& value:norm) { value+=1.F; }
+        native_down=qwen4_native::bf16_matrix(source.bits(prefix+"input_mix_weight_down.weight",
+            {kRank,kFlat}),kRank,kFlat);
+        native_up=qwen4_native::bf16_matrix(source.bits(prefix+"input_mix_weight_up.weight",
+            {kFlat,kRank}),kFlat,kRank);
+        down=native_down.payload; up=native_up.payload;
+        upload();
     }
 };
 
@@ -212,6 +247,19 @@ std::vector<std::uint16_t> bits(const void* device, std::size_t words) {
     return from_device<std::uint16_t>(device, words);
 }
 
+template<class Scale>
+std::vector<double> inject_oracle(const std::vector<float>& residual,
+                                  const std::vector<float>& block,
+                                  const std::vector<Scale>& scale) {
+    std::vector<double> result(residual.size());
+    const int tokens=block.size()/kHidden;
+    for(int t=0;t<tokens;++t) for(int branch=0;branch<kBranches;++branch) for(int d=0;d<kHidden;++d) {
+        const int i=t*kFlat+branch*kHidden+d;
+        result[i]=double(residual[i])+double(scale[t*kBranches+branch])*block[t*kHidden+d];
+    }
+    return result;
+}
+
 int run_case(const Fixture& fixture, std::int32_t tokens, const char* label) {
     std::vector<float> residual(static_cast<std::size_t>(kFlat) * tokens);
     std::vector<float> block_output(static_cast<std::size_t>(kHidden) * tokens);
@@ -256,7 +304,7 @@ int run_case(const Fixture& fixture, std::int32_t tokens, const char* label) {
 
     const auto actual_mixed = from_device_bf16(d_mixed.data(), expected.mixed.size());
     const auto actual_scale = from_device_bf16(d_scale.data(), expected.scale.size());
-    int failures = verify_reduction(std::string(label) + " Q8 read", actual_mixed, expected.mixed,
+    int failures = verify_reduction(std::string(label) + " read", actual_mixed, expected.mixed,
                                     kReadCriterion);
     failures += verify_reduction(std::string(label) + " FP32 write", actual_scale, expected.scale,
                                  kScaleCriterion);
@@ -273,19 +321,7 @@ int run_case(const Fixture& fixture, std::int32_t tokens, const char* label) {
     ops::gated_residual_inject(in_place_tensor, block_tensor, scale_tensor, in_place_tensor, nullptr);
     cuda_synchronize();
 
-    std::vector<double> inject_expected(residual.size());
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t branch = 0; branch < kBranches; ++branch) {
-            for (std::int32_t d = 0; d < kHidden; ++d) {
-                const std::size_t index = static_cast<std::size_t>(token) * kFlat +
-                                          static_cast<std::size_t>(branch) * kHidden + d;
-                inject_expected[index] =
-                    residual[index] +
-                    actual_scale[static_cast<std::size_t>(token) * kBranches + branch] *
-                        block_output[static_cast<std::size_t>(token) * kHidden + d];
-            }
-        }
-    }
+    const auto inject_expected=inject_oracle(residual,block_output,actual_scale);
     failures += verify_reduction(
         std::string(label) + " inject",
         from_device_bf16(d_injected.data(), inject_expected.size()), inject_expected,
@@ -309,22 +345,210 @@ int run_case(const Fixture& fixture, std::int32_t tokens, const char* label) {
     return failures;
 }
 
+std::vector<float> fp8_residual_roundtrip(const std::vector<float>& original) {
+    const int tokens = original.size() / kFlat;
+    auto decoded = original;
+    // Candidate storage only: one positive FP32 dequantization multiplier per token/branch,
+    // E4M3FN RNE codes, FP32 decode then explicit BF16 boundary. Gates/weights stay protected.
+    // This is an offline quality experiment, not an admitted persistent-state codec.
+    std::array<double, 127> positive_codes{};
+    for (int code = 0; code < 127; ++code) {
+        positive_codes[code] = quantized_weight::detail::decode_e4m3fn(code);
+    }
+    for (int row = 0; row < tokens * kBranches; ++row) {
+        float maximum = 0;
+        for (int d = 0; d < kHidden; ++d) { maximum = std::max(maximum, std::abs(original[row*kHidden+d])); }
+        const float scale = maximum == 0 ? 1.0F : maximum / 448.0F;
+        for (int d = 0; d < kHidden; ++d) {
+            const auto index = row*kHidden+d;
+            const double target = std::abs(static_cast<double>(original[index])) / scale;
+            int selected = 0;
+            double distance = INFINITY;
+            for (int code = 0; code < 127; ++code) {
+                const double error = std::abs(positive_codes[code] - target);
+                if (error < distance || (error == distance && (code & 1) == 0)) {
+                    distance = error; selected = code;
+                }
+            }
+            const float value = std::copysign(static_cast<float>(positive_codes[selected]), original[index]) * scale;
+            decoded[index] = bf16_to_f32(f32_to_bf16(value));
+        }
+    }
+    return decoded;
+}
+
+int fp8_residual_experiment(const Fixture& fixture, const std::string& label) {
+    constexpr int tokens = 33;
+    std::vector<float> original(tokens * kFlat);
+    fill_uniform(original, 7201U + tokens, -0.70F, 0.70F);
+    round_to_bf16(original);
+    const auto decoded = fp8_residual_roundtrip(original);
+    const auto baseline = oracle(fixture, original, tokens);
+    const auto candidate = oracle(fixture, decoded, tokens);
+    const auto read = compute_reduction_stats(candidate.mixed.data(), baseline.mixed.data(), baseline.mixed.size());
+    const auto write = compute_reduction_stats(candidate.scale.data(), baseline.scale.data(), baseline.scale.size());
+    const bool accepted = reduction_passes(read, baseline.mixed.size(), kReadCriterion) &&
+                          reduction_passes(write, baseline.scale.size(), kScaleCriterion);
+    std::cout << "FP8_RESIDUAL_STORAGE " << label << " T=" << tokens
+              << " read_rel_l2=" << read.relative_l2 << " read_max_abs=" << read.maximum_absolute_error
+              << " write_rel_l2=" << write.relative_l2 << " write_max_abs=" << write.maximum_absolute_error
+              << " storage_ratio=" << (1.0 + 4.0/kHidden)/2.0
+              << " decision=" << (accepted ? "local_pass" : "reject") << '\n';
+    // A measured precision-profile rejection is a successful experiment. Non-finite math is not.
+    return read.first_non_finite >= 0 || write.first_non_finite >= 0 ? 1 : 0;
+}
+
 } // namespace
 
-int main() {
+#ifdef NINFER_QWEN4_SEQUENCE_COMPONENTS
+namespace ninfer::test::qwen4_sequence {
+Result final_read(const std::string& path,const Result& residual,bool partitioned) {
+    Fixture fixture(path);
+    const int tokens=residual.actual.size()/kFlat;
+    const auto local=oracle(fixture,residual.actual,tokens);
+    const auto propagated=oracle(fixture,residual.reference,tokens);
+    auto dr=to_device_bf16(residual.actual);
+    GuardedDeviceBuffer dm(tokens*kHidden*2);
+    Tensor r(dr.p,DType::BF16,{kHidden,kBranches,tokens});
+    Tensor norm(fixture.d_norm.p,DType::FP32,{kFlat});
+    Tensor mixed(dm.data(),DType::BF16,{kHidden,tokens});
+    WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes(tokens,QType::BF16_CTRL,QType::BF16_CTRL));
+    for(int start=0;start<tokens;) {
+        const int chunk=partitioned && start==0 ? std::max(1,tokens-1) : tokens-start;
+        auto cr=r.slice(2,start,chunk),cm=mixed.slice(1,start,chunk);
+        ops::gated_residual_read(cr,norm,fixture.native_down.device_weight(fixture.d_down.p),
+            fixture.native_up.device_weight(fixture.d_up.p),cm,workspace,nullptr);
+        start+=chunk;
+    }
+    cuda_synchronize();
+    Result result;
+    const auto actual=from_device_bf16(dm.data(),tokens*kHidden);
+    result.actual.assign(actual.begin(),actual.end());
+    result.reference=represented(propagated.mixed);
+    result.failures=verify_reduction("native final GR local read",wide(result.actual),local.mixed,kReadCriterion)+
+        dm.verify_guards("native final GR output");
+    return result;
+}
+Result residual_fp8_store(const Result& input, const std::string& path, int layer,
+                          const std::string& kind) {
+    Result result;
+    result.actual=fp8_residual_roundtrip(input.actual);
+    result.reference=fp8_residual_roundtrip(input.reference);
+    if(kind.empty()) { return result; }
+    // The same independent codec transforms each chain independently. Following GPU GR
+    // calls are checked against their usual represented-input oracle and unchanged gates.
+    // This additional comparison measures storage loss, not production arithmetic error.
+    Fixture fixture(path,layer,kind);
+    const int tokens=input.actual.size()/kFlat;
+    const auto original=oracle(fixture,input.actual,tokens);
+    const auto decoded=oracle(fixture,result.actual,tokens);
+    const auto read_loss=compute_reduction_stats(decoded.mixed.data(),original.mixed.data(),original.mixed.size());
+    const auto gate_loss=compute_reduction_stats(decoded.scale.data(),original.scale.data(),original.scale.size());
+    const bool near_identity=reduction_passes(read_loss,original.mixed.size(),kReadCriterion) &&
+        reduction_passes(gate_loss,original.scale.size(),kScaleCriterion);
+    std::cout<<"FP8_RESIDUAL_NATIVE_STORAGE probe_layer="<<layer<<" probe_role="<<kind<<" T="<<tokens
+        <<" read_rel_l2="<<read_loss.relative_l2<<" gate_rel_l2="<<gate_loss.relative_l2
+        <<" old_near_identity_screen="<<(near_identity?"pass":"reject")
+        <<" storage_ratio="<<(1.0+4.0/kHidden)/2.0<<'\n';
+    result.failures=(read_loss.first_non_finite>=0 || gate_loss.first_non_finite>=0)?1:0;
+    return result;
+}
+ReadResult read(const std::string& path, int layer, const Result& residual, const std::string& kind,
+                bool partitioned) {
+    Fixture fixture(path, layer, kind);
+    const int tokens = residual.actual.size() / kFlat;
+    const auto local = oracle(fixture, residual.actual, tokens);
+    const auto propagated = oracle(fixture, residual.reference, tokens);
+    auto dr = to_device_bf16(residual.actual);
+    GuardedDeviceBuffer dm(tokens*kHidden*2), ds(tokens*kBranches*2);
+    Tensor r(dr.p,DType::BF16,{kHidden,kBranches,tokens});
+    Tensor norm(fixture.d_norm.p,DType::FP32,{kFlat});
+    Tensor write(fixture.d_write.p,DType::FP32,{kFlat,kBranches});
+    Tensor mixed(dm.data(),DType::BF16,{kHidden,tokens});
+    Tensor scale(ds.data(),DType::BF16,{kBranches,tokens});
+    WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes(tokens,QType::BF16_CTRL,QType::BF16_CTRL));
+    for(int start=0;start<tokens;) {
+        const int chunk=partitioned && start==0 ? tokens-1 : tokens-start;
+        auto cr=r.slice(2,start,chunk),cm=mixed.slice(1,start,chunk),cs=scale.slice(1,start,chunk);
+        ops::gated_residual_read_write(cr,norm,fixture.native_down.device_weight(fixture.d_down.p),
+            fixture.native_up.device_weight(fixture.d_up.p),write,cm,cs,workspace,nullptr);
+        start+=chunk;
+    }
+    cuda_synchronize();
+    ReadResult result{{from_device_bf16(dm.data(),tokens*kHidden),represented(propagated.mixed)},
+                      {from_device_bf16(ds.data(),tokens*kBranches),represented(propagated.scale)}};
+    result.mixed.failures = verify_reduction("sequence GR local read",wide(result.mixed.actual),local.mixed,kReadCriterion);
+    result.scale.failures = verify_reduction("sequence GR local write",wide(result.scale.actual),local.scale,kScaleCriterion);
+    return result;
+}
+Result inject(const Result& residual, const Result& block, const Result& scale,bool partitioned) {
+    const int tokens = block.actual.size()/kHidden;
+    auto dr=to_device_bf16(residual.actual), db=to_device_bf16(block.actual), ds=to_device_bf16(scale.actual);
+    GuardedDeviceBuffer dy(residual.actual.size()*2);
+    Tensor r(dr.p,DType::BF16,{kHidden,kBranches,tokens}),b(db.p,DType::BF16,{kHidden,tokens}),
+        s(ds.p,DType::BF16,{kBranches,tokens}),y(dy.data(),DType::BF16,{kHidden,kBranches,tokens});
+    for(int start=0;start<tokens;) {
+        const int chunk=partitioned && start==0 ? tokens-1 : tokens-start;
+        auto cr=r.slice(2,start,chunk),cb=b.slice(1,start,chunk),cs=s.slice(1,start,chunk),cy=y.slice(2,start,chunk);
+        ops::gated_residual_inject(cr,cb,cs,cy,nullptr);
+        start+=chunk;
+    }
+    cuda_synchronize();
+    Result result{from_device_bf16(dy.data(),residual.actual.size()),{}};
+    const auto local=inject_oracle(residual.actual,block.actual,scale.actual);
+    const auto propagated=inject_oracle(residual.reference,block.reference,scale.reference);
+    result.reference=represented(propagated);
+    result.failures=verify_reduction("sequence GR local inject",wide(result.actual),local,kInjectCriterion);
+    return result;
+}
+}
+#else
+int main(int argc, char** argv) {
     if (const int unavailable = require_cuda()) { return unavailable; }
+    if (argc == 2 && std::string_view(argv[1]) == "--fp8-residual-experiment") {
+        const char* root = std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
+        if (!root) { return 77; }
+        int failures = 0;
+        for (int layer : {0, 3}) {
+            for (const std::string kind : {"attn", "mlp"}) {
+                Fixture fixture(std::string(root) + "/qwen4-layer-" + std::to_string(layer) + ".ninfer", layer, kind);
+                failures += fp8_residual_experiment(fixture, "layer=" + std::to_string(layer) + " " + kind);
+            }
+        }
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--native-real") {
+        const char* root = std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
+        if (!root) { return 77; }
+        int failures = 0;
+        for (int layer : {0, 3}) {
+            for (const std::string kind : {"attn", "mlp"}) {
+                Fixture fixture(std::string(root) + "/qwen4-layer-" + std::to_string(layer) + ".ninfer", layer, kind);
+                for (int tokens : {1, 3, 33}) {
+                    const auto label = "native source GR layer=" + std::to_string(layer) + " " + kind;
+                    failures += run_case(fixture, tokens, label.c_str());
+                }
+            }
+        }
+        std::cout << (failures ? "FAIL" : "PASS") << " native source GR\n";
+        return failures ? 1 : 0;
+    }
     Fixture fixture;
     int failures = run_case(fixture, 1, "gated residual T=1");
     failures += run_case(fixture, 3, "gated residual uneven T=3");
     failures += run_case(fixture, 64, "gated residual T=64");
     failures += run_case(fixture, 65, "gated residual T=65");
+    Fixture bf16(QType::BF16_CTRL, QType::BF16_CTRL);
+    for (int tokens : {1, 3, 33}) {
+        failures += run_case(bf16, tokens, "gated residual BF16");
+    }
     Fixture fp8(QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S);
     failures += run_case(fp8, 3, "gated residual FP8");
     Fixture mixed(QType::FP8_E4M3FN_ROW_BF16S, QType::NVFP4);
     failures += run_case(mixed, 33, "gated residual FP8/NVFP4");
     try {
-        const std::size_t broad = ops::gated_residual_workspace_capacity_bytes(4096);
-        if (broad <= ops::gated_residual_workspace_capacity_bytes(65)) {
+        const std::size_t broad = ops::gated_residual_workspace_capacity_bytes(4096, QType::GGML_Q8_0, QType::GGML_Q8_0);
+        if (broad <= ops::gated_residual_workspace_capacity_bytes(65, QType::GGML_Q8_0, QType::GGML_Q8_0)) {
             std::cerr << "FAIL gated residual broad workspace capacity\n";
             ++failures;
         }
@@ -333,10 +557,11 @@ int main() {
         ++failures;
     }
     try {
-        (void)ops::gated_residual_workspace_capacity_bytes(4097);
+        (void)ops::gated_residual_workspace_capacity_bytes(4097, QType::GGML_Q8_0, QType::GGML_Q8_0);
         std::cerr << "FAIL gated residual accepted T=4097 capacity\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
     std::cout << (failures ? "FAIL" : "OK") << " gated_residual\n";
     return failures == 0 ? 0 : 1;
 }
+#endif

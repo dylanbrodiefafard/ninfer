@@ -1,15 +1,30 @@
 #pragma once
 
 #include "ops/quantized_weight.h"
+#include "ops/direct_bf16_weight.h"
 
 namespace ninfer::test {
 
 inline bool native_projection_format(QType type) {
-    return type == QType::NVFP4 || type == QType::FP8_E4M3FN_ROW_BF16S;
+    return type == QType::BF16_CTRL || type == QType::NVFP4 || type == QType::FP8_E4M3FN_ROW_BF16S;
 }
 
 inline quantized_weight::PackedWeight native_projection_fixture(
     QType type, int rows, int columns, unsigned seed) {
+    if (type == QType::BF16_CTRL) {
+        const auto host = direct_bf16_weight::make_patterned(rows, columns, seed);
+        quantized_weight::PackedWeight result;
+        result.weight = host.device_weight(nullptr);
+        result.payload.resize(host.bits.size() * 2);
+        result.code_plane_bytes = result.payload.size();
+        for (std::size_t index = 0; index < host.bits.size(); ++index) {
+            // Keep nonlinear composite fixtures away from saturation while retaining
+            // independent signed hash-distributed, exactly represented BF16 values.
+            quantized_weight::detail::store_u16_le(result.payload, index * 2,
+                f32_to_bf16(bf16_to_f32(host.bits[index]) / 32.0F));
+        }
+        return result;
+    }
     quantized_weight::PatternedWeightOptions options;
     if (type == QType::NVFP4) {
         options.weight_scale_divisor = 64.0F;
@@ -43,6 +58,11 @@ inline std::vector<double> native_projection_oracle(
 
 // Exact sparse mathematical witnesses, with every stored scale equal to one.
 inline quantized_weight::PackedWeight native_sparse_fixture(QType type, int rows, int columns) {
+    if (type == QType::BF16_CTRL) {
+        auto weight = native_projection_fixture(type, rows, columns, 0);
+        std::fill(weight.payload.begin(), weight.payload.end(), 0);
+        return weight;
+    }
     quantized_weight::PatternedWeightOptions options;
     if (type == QType::NVFP4) {
         options.weight_scale_divisor = options.input_scale_divisor = 1.0F;
@@ -64,7 +84,11 @@ inline void native_sparse_set(quantized_weight::PackedWeight& weight, int row, i
     if (value != 1.0F && value != -1.0F && value != 0.5F) {
         throw std::invalid_argument("native sparse witness: unsupported exact coefficient");
     }
-    if (weight.weight.qtype == QType::NVFP4) {
+    if (weight.weight.qtype == QType::BF16_CTRL) {
+        quantized_weight::detail::store_u16_le(weight.payload,
+            (static_cast<std::size_t>(row) * weight.weight.k + column) * 2,
+            f32_to_bf16(value));
+    } else if (weight.weight.qtype == QType::NVFP4) {
         const unsigned code = value == 0.5F ? 1U : value == 1.0F ? 2U : 10U;
         auto& byte = weight.payload[static_cast<std::size_t>(row) * weight.weight.k / 2 + column / 2];
         const int shift = 4 * (column & 1);

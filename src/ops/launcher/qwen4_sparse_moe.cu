@@ -4,6 +4,7 @@
 #include "ops/common/math.cuh"
 #include "ops/kernel/ggml_block_linear.cuh"
 #include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -18,6 +19,94 @@ namespace {
 constexpr int kBlock = 256;
 constexpr int kAggregateTokens = 16;
 constexpr int kGroupedRowBlocks = 32;
+
+// Compact CTA work is bounded by ceil(total occurrences / 32) + 512. No CPU routing or
+// launch-size readback is needed, and inactive experts do not produce a T-by-E empty grid.
+__global__ void resident_a4_tiles_kernel(const int* counts, int* tiles) {
+    __shared__ int prefix[kQwen4SparseMoeExperts];
+    const int expert = threadIdx.x;
+    const int own = counts[expert] >= kQwen4ResidentA4MinOccurrences ? (counts[expert] + 31) / 32 : 0;
+    prefix[expert] = own;
+    __syncthreads();
+    for (int stride = 1; stride < kQwen4SparseMoeExperts; stride *= 2) {
+        const int add = expert >= stride ? prefix[expert - stride] : 0;
+        __syncthreads();
+        prefix[expert] += add;
+        __syncthreads();
+    }
+    const int begin = prefix[expert] - own;
+    for (int tile = 0; tile < own; ++tile) {
+        tiles[2 + 2 * (begin + tile)] = expert;
+        tiles[3 + 2 * (begin + tile)] = tile * 32;
+    }
+    if (expert == 0) { tiles[0] = prefix[kQwen4SparseMoeExperts - 1]; }
+}
+
+template <int K, int InputDivisor>
+__global__ void resident_a4_pack_kernel(
+    const __nv_bfloat16* input, const int* occurrences, const int* ids, const int* counts,
+    const float* multipliers, std::uint8_t* codes, std::uint8_t* scales, int slots) {
+    const int task = blockIdx.x * blockDim.x + threadIdx.x;
+    if (task >= slots * (K / 16)) { return; }
+    const int slot = task / (K / 16), group = task % (K / 16);
+    const int occurrence = occurrences[slot], expert = ids[occurrence];
+    if (counts[expert] < kQwen4ResidentA4MinOccurrences) { return; }
+    const auto* source = input + static_cast<std::int64_t>(occurrence / InputDivisor) * K + group * 16;
+    float2 values[8];
+    float maximum = 0.0F;
+    for (int i = 0; i < 8; ++i) {
+        values[i] = bf16x2_bits_to_float2(reinterpret_cast<const std::uint32_t*>(source)[i]);
+        maximum = fmaxf(maximum, fmaxf(fabsf(values[i].x), fabsf(values[i].y)));
+    }
+    const float multiplier = multipliers[expert];
+    // Source multiplier semantics, never a rounded reciprocal stored as a divisor.
+    // This qualified private profile clamps the block scale to finite E4M3's positive range.
+    const float scale = fminf(448.0F, fmaxf(0x1p-9F,
+        __fdiv_rn(maximum, 6.0F * multiplier)));
+    const auto encoded = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
+    const float denominator = decode_nvfp4_e4m3(encoded) * multiplier;
+    for (int i = 0; i < 8; ++i) {
+        values[i].x = __fdiv_rn(values[i].x, denominator);
+        values[i].y = __fdiv_rn(values[i].y, denominator);
+    }
+    std::uint32_t lo, hi;
+    pack_nvfp4_e2m1x16(values, lo, hi);
+    store_vec(codes + static_cast<std::int64_t>(slot) * (K / 2) + group * 8, make_uint2(lo, hi));
+    scales[static_cast<std::int64_t>(slot) * (K / 16) + group] = encoded;
+}
+
+struct ResidentA4Output {
+    __nv_bfloat16* data;
+    const int* occurrences;
+    int rows;
+    __device__ __forceinline__ void store_vector(int row, int token, uint4 value) const {
+        store_vec(data + static_cast<std::int64_t>(occurrences[token]) * rows + row, value);
+    }
+};
+
+template <class Geometry, class Schedule>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
+void resident_a4_mma_kernel(
+    const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
+    const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
+    const float* weight_multipliers, const float* input_multipliers, const int* counts,
+    const int* offsets, const int* occurrences, const int* tiles, __nv_bfloat16* output) {
+    const int tile = blockIdx.y;
+    if (tile >= tiles[0]) { return; }
+    const int expert = tiles[2 + 2 * tile], token_begin = tiles[3 + 2 * tile];
+    const int offset = offsets[expert];
+    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+    const Nvfp4W4a4MaterializedActivation activation{
+        activation_codes + static_cast<std::int64_t>(offset) * Geometry::kCodeBytesPerRow,
+        activation_scales + static_cast<std::int64_t>(offset) * Geometry::kGroupsPerRow};
+    const ResidentA4Output out{output, occurrences + offset, Geometry::kOutputRows};
+    nvfp4_w4a4_mma_tile<Geometry, Schedule>(activation,
+        weight_codes + static_cast<std::int64_t>(expert) * Geometry::kOutputRows * Geometry::kCodeBytesPerRow,
+        weight_scales + static_cast<std::int64_t>(expert) * Geometry::kOutputRows * Geometry::kGroupsPerRow,
+        counts[expert], weight_multipliers[expert] * input_multipliers[expert],
+        Nvfp4IdentityEpilogue{}, out, Nvfp4W4a4IdentityRows{}, shared, token_begin,
+        static_cast<int>(blockIdx.x) * Schedule::kBlockN);
+}
 
 template <int InputTokenDivisor>
 __global__ void resident_native_gather_kernel(
@@ -94,13 +183,15 @@ template <class Geometry, int TileTokens, int InputTokenDivisor,
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
 void resident_nvfp4_grouped_kernel(
     const __nv_bfloat16* input, const std::uint8_t* codes, const std::uint8_t* scales,
-    float inverse_divisor, const std::int32_t* counts, const std::int32_t* offsets,
-    const std::int32_t* occurrences, __nv_bfloat16* output) {
+    float inverse_divisor, const float* expert_multipliers,
+    const std::int32_t* counts, const std::int32_t* offsets,
+    const std::int32_t* occurrences, __nv_bfloat16* output, bool allow_a4) {
     static_assert(Schedule::kWarpsPerRow == 1);
     static_assert(Schedule::kTokenTile == TileTokens);
     const int expert = static_cast<int>(blockIdx.y);
     const int count = counts[expert];
-    if (count == 0) { return; }
+    if (count == 0 || (allow_a4 && count >= kQwen4ResidentA4MinOccurrences)) { return; }
+    if (expert_multipliers != nullptr) { inverse_divisor = expert_multipliers[expert]; }
     codes += static_cast<std::int64_t>(expert) * Geometry::kOutputRows *
              Geometry::kCodeBytesPerRow;
     scales += static_cast<std::int64_t>(expert) * Geometry::kOutputRows *
@@ -149,20 +240,21 @@ void resident_nvfp4_grouped_kernel(
     }
 }
 
+template <class Control>
 __global__ void resident_wide_router_logits_kernel(
-    const __nv_bfloat16* x, const float* router, const float* shared_gate,
+    const __nv_bfloat16* x, const Control* router, const Control* shared_gate,
     float* logits, float* shared_gate_value, std::int32_t width) {
     const int row = static_cast<int>(blockIdx.x);
     const int token_base = static_cast<int>(blockIdx.y) * kAggregateTokens;
     const int tile_tokens = min(kAggregateTokens, width - token_base);
-    const float* weights = row < kQwen4SparseMoeExperts
+    const Control* weights = row < kQwen4SparseMoeExperts
                                ? router + static_cast<std::int64_t>(row) *
                                               kQwen4SparseMoeHidden
                                : shared_gate;
     float partial[kAggregateTokens]{};
     for (int column = static_cast<int>(threadIdx.x);
          column < kQwen4SparseMoeHidden; column += blockDim.x) {
-        const float weight = weights[column];
+        const float weight = static_cast<float>(weights[column]);
 #pragma unroll
         for (int token = 0; token < kAggregateTokens; ++token) {
             if (token < tile_tokens) {
@@ -661,8 +753,9 @@ __global__ void router_logits_kernel(const __nv_bfloat16* x, const float* weight
     if (threadIdx.x == 0) { logits[expert] = partial[0]; }
 }
 
-__global__ void resident_router_logits_kernel(const __nv_bfloat16* x, const float* weight,
-                                              const float* shared_gate, float* logits,
+template <class Control>
+__global__ void resident_router_logits_kernel(const __nv_bfloat16* x, const Control* weight,
+                                              const Control* shared_gate, float* logits,
                                               float* shared_gate_value) {
     const int expert = static_cast<int>(blockIdx.x);
     float sum = 0.0F;
@@ -671,7 +764,7 @@ __global__ void resident_router_logits_kernel(const __nv_bfloat16* x, const floa
                           : shared_gate;
     for (int column = static_cast<int>(threadIdx.x); column < kQwen4SparseMoeHidden;
          column += blockDim.x) {
-        sum = fmaf(row[column], __bfloat162float(x[column]), sum);
+        sum = fmaf(static_cast<float>(row[column]), __bfloat162float(x[column]), sum);
     }
     __shared__ float partial[kBlock];
     partial[threadIdx.x] = sum;
@@ -856,6 +949,12 @@ __global__ void swiglu_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up
         silu(__bfloat162float(gate[index])) * __bfloat162float(up[index]));
 }
 
+__global__ void swiglu_f32_kernel(const float* gate, const float* up,
+                                  __nv_bfloat16* activated, std::int32_t count) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) { activated[index] = __float2bfloat16_rn(silu(gate[index]) * up[index]); }
+}
+
 __global__ void zero_routed_kernel(float* routed) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index < kQwen4SparseMoeHidden) { routed[index] = 0.0F; }
@@ -983,10 +1082,14 @@ void qwen4_sparse_moe_resident_route_launch(
     const Tensor& x, const Weight& router, const Tensor& shared_gate, Tensor& logits,
     Tensor& selected_ids, Tensor& selected_weights, Tensor& shared_gate_value,
     cudaStream_t stream) {
-    resident_router_logits_kernel<<<kQwen4SparseMoeExperts + 1, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(router.qdata),
-        static_cast<const float*>(shared_gate.data), static_cast<float*>(logits.data),
-        static_cast<float*>(shared_gate_value.data));
+    const auto project = [&]<class Control>() {
+        resident_router_logits_kernel<<<kQwen4SparseMoeExperts + 1, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const Control*>(router.qdata),
+            static_cast<const Control*>(shared_gate.data), static_cast<float*>(logits.data),
+            static_cast<float*>(shared_gate_value.data));
+    };
+    if (router.qtype == QType::BF16_CTRL) { project.template operator()<__nv_bfloat16>(); }
+    else { project.template operator()<float>(); }
     CUDA_CHECK(cudaGetLastError());
     resident_route_kernel<<<1, kQwen4SparseMoeExperts, 0, stream>>>(
         static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
@@ -1002,11 +1105,15 @@ void qwen4_sparse_moe_resident_wide_route_launch(
     const dim3 grid(
         kQwen4SparseMoeExperts + 1,
         static_cast<unsigned>((width + kAggregateTokens - 1) / kAggregateTokens));
-    resident_wide_router_logits_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const float*>(router.qdata),
-        static_cast<const float*>(shared_gate.data), static_cast<float*>(logits.data),
-        static_cast<float*>(shared_gate_value.data), width);
+    const auto project = [&]<class Control>() {
+        resident_wide_router_logits_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const Control*>(router.qdata),
+            static_cast<const Control*>(shared_gate.data), static_cast<float*>(logits.data),
+            static_cast<float*>(shared_gate_value.data), width);
+    };
+    if (router.qtype == QType::BF16_CTRL) { project.template operator()<__nv_bfloat16>(); }
+    else { project.template operator()<float>(); }
     CUDA_CHECK(cudaGetLastError());
     route_kernel<<<width, kBlock, 0, stream>>>(
         static_cast<float*>(logits.data),
@@ -1091,33 +1198,83 @@ void qwen4_sparse_moe_resident_grouped_down_launch(
     CUDA_CHECK(cudaGetLastError());
 }
 
+void qwen4_sparse_moe_a4_tiles_launch(const Tensor& counts, Tensor& tiles, cudaStream_t stream) {
+    resident_a4_tiles_kernel<<<1, kQwen4SparseMoeExperts, 0, stream>>>(
+        static_cast<const int*>(counts.data), static_cast<int*>(tiles.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry, class Schedule, int InputDivisor>
+void launch_resident_a4(const Tensor& input, const Weight& bank, const Tensor& counts,
+    const Tensor& offsets, const Tensor& occurrences, const Tensor& ids, const Tensor& tiles,
+    Tensor& codes, Tensor& scales, Tensor& output, cudaStream_t stream) {
+    const auto* weight_scales = static_cast<const std::uint8_t*>(bank.scales);
+    const auto* wm = reinterpret_cast<const float*>(weight_scales +
+        static_cast<std::uint64_t>(kQwen4SparseMoeExperts) * bank.n * bank.k / 16);
+    const auto* im = wm + kQwen4SparseMoeExperts;
+    const int tasks = occurrences.ne[0] * (Geometry::kInputRows / 16);
+    resident_a4_pack_kernel<Geometry::kInputRows, InputDivisor>
+        <<<(tasks + 255) / 256, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(input.data), static_cast<const int*>(occurrences.data),
+            static_cast<const int*>(ids.data), static_cast<const int*>(counts.data), im,
+            static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data), occurrences.ne[0]);
+    resident_a4_mma_kernel<Geometry, Schedule>
+        <<<dim3(Geometry::kOutputRows / Schedule::kBlockN, tiles.ne[1] - 1), Schedule::kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(codes.data), static_cast<const std::uint8_t*>(scales.data),
+            static_cast<const std::uint8_t*>(bank.qdata), weight_scales, wm, im,
+            static_cast<const int*>(counts.data), static_cast<const int*>(offsets.data),
+            static_cast<const int*>(occurrences.data), static_cast<const int*>(tiles.data),
+            static_cast<__nv_bfloat16*>(output.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_a4_linear_launch(
+    const Tensor& input, const Weight& bank, const Tensor& counts, const Tensor& offsets,
+    const Tensor& occurrences, const Tensor& ids, const Tensor& tiles,
+    Tensor& codes, Tensor& scales, Tensor& output, bool ranked, cudaStream_t stream) {
+    if (ranked) {
+        launch_resident_a4<Nvfp4N2560K640Geometry,
+            Nvfp4W4a4MmaSchedule<32,64,128,2,4,4,1>,1>(input,bank,counts,offsets,
+                occurrences,ids,tiles,codes,scales,output,stream);
+    } else {
+        launch_resident_a4<Nvfp4N640K2560Geometry,
+            Nvfp4W4a4MmaSchedule<32,64,256,2,4,4,1>,kQwen4SparseMoeTopK>(input,bank,counts,offsets,
+                occurrences,ids,tiles,codes,scales,output,stream);
+    }
+}
+
 template <class Geometry, int TileTokens, int InputTokenDivisor>
 void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
                            const Tensor& offsets, const Tensor& occurrences,
-                           Tensor& output, cudaStream_t stream) {
+                           Tensor& output, cudaStream_t stream, bool allow_a4) {
     using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, TileTokens>::Type;
     resident_nvfp4_grouped_kernel<Geometry, TileTokens, InputTokenDivisor>
         <<<dim3(Geometry::kOutputRows / Schedule::kRowsPerCta, kQwen4SparseMoeExperts),
            Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(input.data),
             static_cast<const std::uint8_t*>(bank.qdata),
-            static_cast<const std::uint8_t*>(bank.scales), 1.0F / bank.weight_scale_divisor,
+            static_cast<const std::uint8_t*>(bank.scales),
+            bank.qtype == QType::NVFP4_EXPERT_F32M ? 1.0F : 1.0F / bank.weight_scale_divisor,
+            bank.qtype == QType::NVFP4_EXPERT_F32M
+                ? reinterpret_cast<const float*>(static_cast<const std::uint8_t*>(bank.scales) +
+                    static_cast<std::uint64_t>(kQwen4SparseMoeExperts) * bank.n * bank.k / 16)
+                : nullptr,
             static_cast<const std::int32_t*>(counts.data),
             static_cast<const std::int32_t*>(offsets.data),
             static_cast<const std::int32_t*>(occurrences.data),
-            static_cast<__nv_bfloat16*>(output.data));
+            static_cast<__nv_bfloat16*>(output.data), allow_a4);
 }
 
 template <class Geometry, int InputTokenDivisor>
 void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
                            const Tensor& offsets, const Tensor& occurrences,
-                           Tensor& output, cudaStream_t stream) {
+                           Tensor& output, cudaStream_t stream, bool allow_a4) {
     if (occurrences.ne[0] <= 2 * kQwen4SparseMoeTopK) {
         launch_resident_nvfp4<Geometry, 2, InputTokenDivisor>(input, bank, counts, offsets,
-                                                            occurrences, output, stream);
+                                                            occurrences, output, stream, allow_a4);
     } else {
         launch_resident_nvfp4<Geometry, 16, InputTokenDivisor>(input, bank, counts, offsets,
-                                                             occurrences, output, stream);
+                                                             occurrences, output, stream, allow_a4);
     }
 }
 
@@ -1141,14 +1298,14 @@ void launch_resident_fp8(const Tensor& gathered, const Weight& bank, const Tenso
 void qwen4_sparse_moe_resident_native_linear_launch(
     const Tensor& input, const Weight& bank, const Tensor& counts,
     const Tensor& offsets, const Tensor& occurrences, Tensor& gathered,
-    Tensor& output, bool input_is_ranked, cudaStream_t stream) {
-    if (bank.qtype == QType::NVFP4) {
+    Tensor& output, bool input_is_ranked, cudaStream_t stream, bool allow_a4) {
+    if (bank.qtype == QType::NVFP4 || bank.qtype == QType::NVFP4_EXPERT_F32M) {
         if (input_is_ranked) {
             launch_resident_nvfp4<Nvfp4N2560K640Geometry, 1>(
-                input, bank, counts, offsets, occurrences, output, stream);
+                input, bank, counts, offsets, occurrences, output, stream, allow_a4);
         } else {
             launch_resident_nvfp4<Nvfp4N640K2560Geometry, kQwen4SparseMoeTopK>(
-                input, bank, counts, offsets, occurrences, output, stream);
+                input, bank, counts, offsets, occurrences, output, stream, allow_a4);
         }
     } else if (bank.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         const int packs = bank.k / 8 * occurrences.ne[0];
@@ -1220,6 +1377,15 @@ void qwen4_sparse_moe_indexed_down_finish_launch(
     launch_indexed_down_finish<QType::GGML_IQ4_NL>(
         activated, expert_bank, selected_ids, selected_weights, shared, shared_gate,
         destination, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void qwen4_sparse_moe_swiglu_f32_launch(const Tensor& gate, const Tensor& up, Tensor& activated,
+                                       cudaStream_t stream) {
+    const auto count = static_cast<std::int32_t>(activated.numel());
+    swiglu_f32_kernel<<<(count + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+        static_cast<const float*>(gate.data), static_cast<const float*>(up.data),
+        static_cast<__nv_bfloat16*>(activated.data), count);
     CUDA_CHECK(cudaGetLastError());
 }
 

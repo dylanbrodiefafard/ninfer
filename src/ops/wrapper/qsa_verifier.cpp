@@ -5,7 +5,9 @@
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/qsa_verifier.h"
 #include "ops/wrapper/qsa_validation.h"
-#include "ops/common/quantized_projection.h"
+#include "ops/common/projection.h"
+#include "ops/linear/bf16/bf16_launch.h"
+#include "ops/linear/fp8/fp8_tensor.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -31,12 +33,13 @@ struct Scratch {
 };
 
 template <class Allocator>
-Scratch allocate_scratch(Allocator& allocator, std::int32_t width) {
+Scratch allocate_scratch(Allocator& allocator, std::int32_t width,QType key_type) {
     return {
         allocator.alloc(DType::BF16, {128, 4, width}),
         allocator.alloc(DType::BF16, {128, width}),
         allocator.alloc(DType::BF16, {12288, width}),
-        allocator.alloc(DType::BF16, {512, width}),
+        allocator.alloc(key_type==QType::BF16_CTRL || key_type==QType::FP8_E4M3FN_TENSOR_F32M
+            ? DType::FP32 : DType::BF16, {512, width}),
         allocator.alloc(DType::BF16, {512, width}),
         allocator.alloc(DType::BF16, {256, 24, width}),
         allocator.alloc(DType::BF16, {256, 2, width}),
@@ -75,7 +78,11 @@ void require_bf16_weight(const Weight& weight, int rows, const char* name) {
 }
 
 void require_q5_weight(const Weight& weight, int rows, int columns, const char* name) {
-    if (detail::is_native_quantized_projection(weight.qtype)) {
+    if(weight.qtype==QType::FP8_E4M3FN_TENSOR_F32M) {
+        if(weight.n!=rows || weight.k!=columns) { throw std::invalid_argument("qsa FP8 projection shape"); }
+        detail::validate_fp8_tensor_weight(weight,name);return;
+    }
+    if (detail::is_native_projection(weight.qtype)) {
         detail::validate_native_projection(weight, rows, columns, name);
         return;
     }
@@ -104,6 +111,22 @@ void validate_weights(const QsaVerifierWeights& weights) {
     require_tensor(weights.core_key_norm, DType::FP32, 256, 1, 1, "core_key_norm");
 }
 
+std::size_t projection_capacity(QType type,int rows,int columns,int width) {
+    if(type==QType::FP8_E4M3FN_TENSOR_F32M) {
+        return linear_workspace_capacity_bytes(type,rows,columns,LinearPolicy::A16Only,1,width);
+    }
+    if(type!=QType::GGML_Q5_K && !detail::is_native_projection(type)) {
+        throw std::invalid_argument("qsa: unsupported projection format");
+    }
+    return detail::projection_workspace_bytes(type,rows,columns,width);
+}
+
+void project(const Tensor& x,const Weight& w,Tensor& y,
+    WorkspaceArena& arena,cudaStream_t stream) {
+    if(w.qtype==QType::FP8_E4M3FN_TENSOR_F32M) { linear(x,w,y,LinearPolicy::A16Only,arena,stream); }
+    else { detail::projection(x,w,y,arena,stream); }
+}
+
 } // namespace
 
 std::size_t qsa_verifier_workspace_bytes(std::int32_t width, QType query_gate,
@@ -112,17 +135,12 @@ std::size_t qsa_verifier_workspace_bytes(std::int32_t width, QType query_gate,
         throw std::invalid_argument("qsa_verifier_workspace_bytes: width must be in [1,4096]");
     }
     WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout, width);
-    for (QType type : {query_gate, key, value, output}) {
-        if (type != QType::GGML_Q5_K && !detail::is_native_quantized_projection(type)) {
-            throw std::invalid_argument("qsa_verifier: unsupported projection format");
-        }
-    }
+    (void)allocate_scratch(layout, width,key);
     const auto bytes = std::max({
-        detail::projection_workspace_bytes(query_gate, 12288, 2560, width),
-        detail::projection_workspace_bytes(key, 512, 2560, width),
-        detail::projection_workspace_bytes(value, 512, 2560, width),
-        detail::projection_workspace_bytes(output, 2560, 6144, width)});
+        projection_capacity(query_gate,12288,2560,width),
+        projection_capacity(key,512,2560,width),
+        projection_capacity(value,512,2560,width),
+        projection_capacity(output,2560,6144,width)});
     if (bytes) { (void)layout.alloc_bytes(bytes); }
     return layout.peak_bytes();
 }
@@ -178,10 +196,10 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
                                    "core_query_norm"),
          detail::qsa_address_range(weights.core_key_norm, "qsa_verifier",
                                    "core_key_norm"),
-         detail::qsa_address_range(state.k_codes, "qsa_verifier", "state.k_codes"),
-         detail::qsa_address_range(state.v_codes, "qsa_verifier", "state.v_codes"),
-         detail::qsa_address_range(state.k_scales, "qsa_verifier", "state.k_scales"),
-         detail::qsa_address_range(state.v_scales, "qsa_verifier", "state.v_scales"),
+         detail::qsa_address_range(state.k, "qsa_verifier", "state.k"),
+         detail::qsa_address_range(state.v, "qsa_verifier", "state.v"),
+         detail::qsa_scale_address_range(state.k_scales, state.format, "qsa_verifier", "state.k_scales"),
+         detail::qsa_scale_address_range(state.v_scales, state.format, "qsa_verifier", "state.v_scales"),
          detail::qsa_address_range(state.raw_index_keys, "qsa_verifier",
                                    "state.raw_index_keys"),
          detail::qsa_address_range(state.positions, "qsa_verifier", "state.positions"),
@@ -192,12 +210,18 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
         "qsa_verifier");
 
     DeviceArena arena(DeviceSpan{workspace.data, workspace.bytes()});
-    Scratch scratch = allocate_scratch(arena, width);
+    Scratch scratch = allocate_scratch(arena, width,weights.core_key.qtype);
     detail::qsa_bf16_project_launch(x, weights.index_query, scratch.index_query, stream);
     detail::qsa_bf16_project_launch(x, weights.index_key, scratch.index_key, stream);
-    detail::quantized_projection(x, weights.core_query_gate, scratch.raw_query_gate, arena, stream);
-    detail::quantized_projection(x, weights.core_key, scratch.raw_key, arena, stream);
-    detail::quantized_projection(x, weights.core_value, scratch.raw_value, arena, stream);
+    project(x,weights.core_query_gate,scratch.raw_query_gate,arena,stream);
+    if(weights.core_key.qtype==QType::BF16_CTRL) {
+        detail::launch_bf16_f32(x,weights.core_key,scratch.raw_key,stream);
+    } else if(weights.core_key.qtype==QType::FP8_E4M3FN_TENSOR_F32M) {
+        detail::fp8_tensor_key_f32(x,weights.core_key,scratch.raw_key,stream);
+    } else {
+        detail::projection(x, weights.core_key, scratch.raw_key, arena, stream);
+    }
+    project(x,weights.core_value,scratch.raw_value,arena,stream);
     detail::qsa_core_norm_rope_launch(scratch.raw_query_gate, scratch.raw_key, position,
                                       weights.core_query_norm, weights.core_key_norm,
                                       scratch.query, scratch.key, stream);
@@ -214,7 +238,7 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
                            scratch.attention, scratch.attention_workspace, stream);
     detail::qsa_output_gate_launch(scratch.attention, scratch.raw_query_gate, scratch.gated,
                                    stream);
-    detail::quantized_projection(scratch.gated, weights.output, out, arena, stream);
+    project(scratch.gated,weights.output,out,arena,stream);
 }
 
 } // namespace ninfer::ops

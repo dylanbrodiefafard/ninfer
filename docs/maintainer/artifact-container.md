@@ -197,10 +197,10 @@ The version-2 registry contains:
 
 | Namespace | Registered identities | Authority |
 |---|---|---|
-| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`, `IQ4_NL` | [`tensor-formats.md`](tensor-formats.md) |
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `NVFP4_EXPERT_F32M`, `NVFP4_PARTITION_F32M`, `FP8_E4M3FN_ROW_BF16S`, `FP8_E4M3FN_TENSOR_BF16S`, `FP8_E4M3FN_TENSOR_F32M`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`, `IQ4_NL` | [`tensor-formats.md`](tensor-formats.md) |
 | `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
 | `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
-| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1`, `ggml-block-row-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `expert-blockscale-k16-m128x4-v1`, `partitioned-row-blockscale-k16-v1`, `row-scale-v1`, `tensor-scale-v1`, `ggml-block-row-v1` | [`storage-layouts.md`](storage-layouts.md) |
 | resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
 
 There are no retired tombstones at this revision.
@@ -307,18 +307,28 @@ with model-private loops rather than duplicating a flat JSON table in C++.
 
 Completeness validation and device residency are separate. A registered target always consumes and
 validates its complete artifact inventory, then assigns every object exactly one placement. A tensor
-is copied to the compact device arena, exposed as a read-only mapped-host span, or validate-only; a
+is copied to the compact device arena, exposed as a read-only mapped-host or resident-host span,
+or validate-only; a
 resource is copied into owning host bytes or validate-only. Mapped tensors are distinct from copied
 resources: `MaterializedArtifact` retains the file mapping for the lifetime of every exposed span,
 but does not pin or copy the tensor payload. A validate-only object has no runtime address and cannot
-become resident later. These choices do not define a partial or alternate artifact.
+become resident later. Resident-host placement instead owns an independent, page-rounded mapping
+of the exact payload with an eager OS memory lock. All pages are populated and non-swappable
+before device arena allocation or successful materialization. The lock survives Reader destruction
+and MaterializedArtifact moves and is released with its mapping after the last owner. Separate
+resident mappings cannot unlock each other's virtual ranges. This is not CUDA host registration
+and creates no second full payload copy. Lock failure is a startup error with no pageable fallback.
+These choices do not define a partial or alternate artifact.
 
 Mapped-host placement is a raw storage/lifetime mechanism, not authority for generic CPU execution
 or arbitrary weight streaming. The exact target artifact contract must name any tensor assigned that
 placement and own how bounded consumers access it. Materialization statistics report device tensor
-count, mapped tensor count/bytes, copied resource count/bytes, actual file-read bytes, H2D bytes, and
+count, mapped tensor count/bytes (including resident mappings), the resident tensor byte subset,
+actual page-rounded resident locked bytes,
+copied resource count/bytes, actual explicit file-read bytes, H2D bytes, and
 pinned upload staging separately; merely establishing a mapping does not count the full mapped span
-as bytes read.
+as bytes read. OS population I/O is not an explicit-reader-byte counter. The exact Qwen4 PLE table
+requires resident-host placement; its diagnostic expert banks retain ordinary mapped-host placement.
 
 When one target accepts multiple `weights_id` values, the package resolver produces one typed
 profile and passes that same value to both the exact binder and the sequence/workspace planner. The
@@ -426,7 +436,7 @@ The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
 `tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this
 layer. The compact evidence retained for later changes is:
 
-- Python and C++ registry/layout checks for all sixteen numeric formats and a raw resource;
+- Python and C++ registry/layout checks for all twenty numeric formats and a raw resource;
 - representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
 - exact representative direct-word, Q4/Q5/Q6/W8 code/scale, NVFP4 block-scale, and source-preserved
   GGML block-row layout checks;

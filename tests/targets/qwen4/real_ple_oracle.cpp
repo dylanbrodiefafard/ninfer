@@ -368,10 +368,11 @@ int ninfer::test::qwen4::real_oracle::run_ple_cell(const verifier::LoadedModel& 
     Tensor old_state_tensor(device_old_state.p, DType::BF16, {kChannels, kHistory});
     Tensor new_state_tensor(device_new_state.data(), DType::BF16, {kChannels, kHistory});
     Tensor output_tensor(device_output.data(), DType::BF16, {kHidden, kBranches, 1});
-    DeviceArena workspace(ops::ple_workspace_capacity_bytes(1));
+    DeviceArena workspace(ops::ple_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
     ops::ple_inject(residual_tensor, embedding_tensor, weights.key, weights.value,
                     weights.key_norm, weights.query_norm, weights.conv_norm, weights.conv,
-                    old_state_tensor, new_state_tensor, output_tensor, workspace, device.stream);
+                    old_state_tensor, new_state_tensor, output_tensor, workspace,
+                    ops::PleNormFormat::EffectiveFp32, device.stream);
     device.synchronize();
 
     int failures = verify_exact(

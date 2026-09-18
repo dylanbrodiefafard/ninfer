@@ -117,8 +117,8 @@ int main() {
         if (state.qsa()[layer]) {
             ++qsa_count;
             const auto& qsa = *state.qsa()[layer];
-            if (qsa.k_codes.ne[1] != verifier::kQsaCapacity ||
-                !all_zero(qsa.k_codes.data, qsa.k_codes.bytes()) ||
+            if (qsa.k.ne[1] != verifier::kQsaCapacity ||
+                !all_zero(qsa.k.data, qsa.k.bytes()) ||
                 !all_zero(qsa.positions.data, qsa.positions.bytes())) {
                 std::cerr << "FAIL invalid reset QSA state\n";
                 ++failures;

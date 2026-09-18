@@ -14,7 +14,11 @@ The initial storage registry contains exactly these identities:
 | `contiguous-le-v1` | tensor layout | `BF16`, `FP32`, `I32` | rank `0..16` | 256 bytes |
 | `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
+| `expert-blockscale-k16-m128x4-v1` | tensor layout | `NVFP4_EXPERT_F32M` | positive rank 3 `[E,N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | positive rank 2 `[N,K]` | 256 bytes |
+| `tensor-scale-v1` | tensor layout | `FP8_E4M3FN_TENSOR_BF16S` | positive rank 2 `[N,K]` | 256 bytes |
+| `tensor-calibrated-v1` | tensor layout | `FP8_E4M3FN_TENSOR_F32M` | positive rank 2 `[N,K]` | 256 bytes |
+| `partitioned-row-blockscale-k16-v1` | tensor layout | `NVFP4_PARTITION_F32M` | positive rank 3 `[P,R,K]`, `K % 16 == 0` | 256 bytes |
 | `ggml-block-row-v1` | tensor layout | `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`, `IQ4_NL` | rank 2 `[N,K]` or rank 3 `[E,N,K]`, complete K blocks | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
@@ -26,6 +30,42 @@ signed-integer formats cannot use `contiguous-le-v1`, and `NVFP4` cannot use
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
 container and is not included in an object's `bytes`.
+
+### Source-preserving NVFP4 expert banks
+
+`expert-blockscale-k16-m128x4-v1` stores all experts' packed code matrices consecutively
+in expert-major row-major order (`E*N*K/2` bytes), then the scale plane at the next
+256-byte boundary (`E*N*K/16` bytes). Each expert's scales use the same M128x4 swizzle
+defined below for `blockscale-k16-m128x4-v1`; no expert padding is inserted. Since N is
+divisible by 128, flattening `[E,N]` gives the same swizzle. Immediately after scales
+are E little-endian FP32 weight multipliers, then E little-endian FP32 input multipliers.
+The payload ends after the input multipliers; there is no tensor-wide divisor. Packing
+preserves all source code, scale and multiplier bits, with no numerical conversion.
+
+### Tensor-calibrated FP8 matrices
+
+`tensor-calibrated-v1` stores `N*K` row-major E4M3FN code bytes, zero padding to
+the next four-byte boundary, then two little-endian FP32 words: the weight
+multiplier followed by the input multiplier. Total size is `align_up(N*K,4)+8`.
+There is no row-scale expansion, reciprocal folding, or conversion to BF16 scalar
+metadata. The source input multiplier is activation calibration and does not alter
+the logical matrix coefficients.
+
+### Tensor-scaled embeddings
+
+`partitioned-row-blockscale-k16-v1` stores P*R rows in partition-major order. Each row
+contains K/2 adjacent-pair E2M1 bytes followed immediately by K/16 E4M3FN scale bytes.
+After all rows are P little-endian FP32 multiplier words, with no padding between rows
+or before those words. Total bytes are `P*R*(K/2+K/16)+4*P`. The multiplier plane may be
+unaligned; readers use byte-safe loads. This row-local layout preserves the source words
+while allowing bounded selected-row transfer without streaming unrelated rows. Gathering
+a row with its exact partition multiplier is staging, not runtime requantization.
+
+`tensor-scale-v1` stores row-major E4M3FN code bytes (`N*K` bytes), immediately followed
+by the two little-endian bytes of the BF16 tensor multiplier. Total size is `N*K+2`,
+with no internal padding. If the code count is odd, readers copy the tail word without
+assuming aligned BF16 access. Whole resident tables and bounded row fixtures use this
+same storage format; artifact placement and complete host locking are separate contracts.
 
 The helper used below is:
 

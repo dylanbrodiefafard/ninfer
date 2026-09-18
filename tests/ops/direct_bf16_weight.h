@@ -60,8 +60,9 @@ inline HostWeight make_patterned(std::int32_t n, std::int32_t k, std::uint32_t s
     return result;
 }
 
-inline double dot_fp64(const HostWeight& weight, std::int32_t row,
-                       std::span<const float> activation) {
+template<class Scalar>
+inline double dot_fp64_values(const HostWeight& weight, std::int32_t row,
+                              std::span<const Scalar> activation) {
     if (row < 0 || row >= weight.n || activation.size() != static_cast<std::size_t>(weight.k)) {
         throw std::invalid_argument("invalid direct BF16 oracle argument");
     }
@@ -72,6 +73,11 @@ inline double dot_fp64(const HostWeight& weight, std::int32_t row,
                   static_cast<double>(activation[static_cast<std::size_t>(column)]);
     }
     return result;
+}
+
+inline double dot_fp64(const HostWeight& weight, std::int32_t row,
+                       std::span<const float> activation) {
+    return dot_fp64_values<float>(weight,row,activation);
 }
 
 class DeviceWeight {

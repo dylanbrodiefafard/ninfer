@@ -4,7 +4,7 @@
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/ple.h"
-#include "ops/common/quantized_projection.h"
+#include "ops/common/projection.h"
 
 #include <cuda_runtime.h>
 
@@ -36,7 +36,7 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
 
 void require_q8_weight(const Weight& weight, std::int32_t rows, const char* name) {
     constexpr std::int32_t columns = kPleEmbeddingWidth;
-    if (detail::is_native_quantized_projection(weight.qtype)) {
+    if (detail::is_native_projection(weight.qtype)) {
         detail::validate_native_projection(weight, rows, columns, name);
         return;
     }
@@ -73,7 +73,7 @@ Scratch allocate_scratch(Allocator& allocator, std::int32_t width) {
 
 std::size_t required_workspace(std::int32_t width, QType key, QType value) {
     for (QType type : {key, value}) {
-        if (type != QType::GGML_Q8_0 && !detail::is_native_quantized_projection(type)) {
+        if (type != QType::GGML_Q8_0 && !detail::is_native_projection(type)) {
             throw std::invalid_argument("ple_inject: unsupported projection format");
         }
     }
@@ -112,6 +112,126 @@ void require_disjoint(std::span<const Range> ranges, const char* op) {
 }
 
 } // namespace
+
+void ple_nvfp4_stage_rows_batch(const PleResidentNvfp4Table& table,
+                                std::span<const std::int32_t> row_ids, std::int32_t width,
+                                void* pinned_rows, std::size_t pinned_bytes,
+                                Tensor& device_rows, cudaStream_t stream) {
+    constexpr const char* op = "ple_nvfp4_stage_rows_batch";
+    if (width <= 0 || width > kPleMaxWidth ||
+        row_ids.size() != static_cast<std::size_t>(kPleHeads) * width) {
+        throw std::invalid_argument("ple_nvfp4_stage_rows_batch: invalid width or row-id extent");
+    }
+    require_tensor(device_rows, DType::U8, kPleNvfp4StagedRowBytes, kPleHeads, width, op, "device_rows");
+    if (!table.data || !table.partitions || !table.rows_per_partition ||
+        table.partitions > SIZE_MAX / 4 || table.rows_per_partition > SIZE_MAX / table.partitions) {
+        throw std::invalid_argument("ple_nvfp4_stage_rows_batch: invalid partition extent");
+    }
+    const auto rows = table.partitions * table.rows_per_partition;
+    if (rows > (SIZE_MAX - table.partitions * 4) / kPleNvfp4RowBytes ||
+        table.bytes != rows * kPleNvfp4RowBytes + table.partitions * 4) {
+        throw std::invalid_argument("ple_nvfp4_stage_rows_batch: invalid resident payload size");
+    }
+    const std::size_t bytes = row_ids.size() * kPleNvfp4StagedRowBytes;
+    if (!pinned_rows || pinned_bytes < bytes) {
+        throw std::invalid_argument("ple_nvfp4_stage_rows_batch: pinned slot is too small");
+    }
+    const std::array<Range, 3> ranges{range(table.data, table.bytes, op),
+        range(pinned_rows, bytes, op), range(device_rows.data, device_rows.bytes(), op)};
+    require_disjoint(ranges, op);
+    cudaPointerAttributes attributes{};
+    const auto status = cudaPointerGetAttributes(&attributes, pinned_rows);
+    if (status != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+        if (status != cudaSuccess) { (void)cudaGetLastError(); }
+        throw std::invalid_argument("ple_nvfp4_stage_rows_batch: source is not pinned host memory");
+    }
+    for (const auto row : row_ids) {
+        if (row < 0 || static_cast<std::uint64_t>(row) >= rows) {
+            throw std::invalid_argument("ple_nvfp4_stage_rows_batch: row outside resident table");
+        }
+    }
+    auto* destination = static_cast<std::uint8_t*>(pinned_rows);
+    const auto* multipliers = table.data + rows * kPleNvfp4RowBytes;
+    for (std::size_t i = 0; i < row_ids.size(); ++i) {
+        const auto row = static_cast<std::uint64_t>(row_ids[i]);
+        auto* record = destination + i * kPleNvfp4StagedRowBytes;
+        std::memcpy(record, table.data + row * kPleNvfp4RowBytes, kPleNvfp4RowBytes);
+        std::memcpy(record + kPleNvfp4RowBytes, multipliers + (row / table.rows_per_partition) * 4, 4);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(device_rows.data, pinned_rows, bytes, cudaMemcpyHostToDevice, stream));
+}
+
+void ple_nvfp4_decode_rows(const Tensor& device_rows, Tensor& embedding, cudaStream_t stream) {
+    constexpr const char* op = "ple_nvfp4_decode_rows";
+    const int width = device_rows.ne[2];
+    if (width <= 0 || width > kPleMaxWidth) {
+        throw std::invalid_argument("ple_nvfp4_decode_rows: invalid width");
+    }
+    require_tensor(device_rows, DType::U8, kPleNvfp4StagedRowBytes, kPleHeads, width, op, "device_rows");
+    require_tensor(embedding, DType::BF16, kPleRowWidth, kPleHeads, width, op, "embedding");
+    if (overlaps(range(device_rows.data, device_rows.bytes(), op),
+                 range(embedding.data, embedding.bytes(), op))) {
+        throw std::invalid_argument("ple_nvfp4_decode_rows: input and output overlap");
+    }
+    detail::ple_nvfp4_decode_rows_launch(device_rows, embedding, stream);
+}
+
+void ple_fp8_stage_rows_batch(const PleResidentFp8Table& table,
+                             std::span<const std::int32_t> row_ids, std::int32_t width,
+                             void* pinned_rows, std::size_t pinned_bytes,
+                             Tensor& device_rows, cudaStream_t stream) {
+    constexpr const char* op = "ple_fp8_stage_rows_batch";
+    if (width <= 0 || width > kPleMaxWidth ||
+        row_ids.size() != static_cast<std::size_t>(kPleHeads) * width) {
+        throw std::invalid_argument("ple_fp8_stage_rows_batch: invalid width or row-id extent");
+    }
+    require_tensor(device_rows, DType::U8, kPleRowWidth, kPleHeads, width, op, "device_rows");
+    if (!table.data || !table.rows || table.rows > SIZE_MAX / kPleRowWidth ||
+        table.bytes != table.rows * kPleRowWidth) {
+        throw std::invalid_argument("ple_fp8_stage_rows_batch: invalid resident table span");
+    }
+    const std::size_t bytes = static_cast<std::size_t>(kPleEmbeddingWidth) * width;
+    if (!pinned_rows || pinned_bytes < bytes) {
+        throw std::invalid_argument("ple_fp8_stage_rows_batch: pinned slot is too small");
+    }
+    const std::array<Range, 3> ranges{range(table.data, table.bytes, op),
+        range(pinned_rows, bytes, op), range(device_rows.data, device_rows.bytes(), op)};
+    require_disjoint(ranges, op);
+    cudaPointerAttributes attributes{};
+    const auto status = cudaPointerGetAttributes(&attributes, pinned_rows);
+    if (status != cudaSuccess || attributes.type != cudaMemoryTypeHost) {
+        if (status != cudaSuccess) { (void)cudaGetLastError(); }
+        throw std::invalid_argument("ple_fp8_stage_rows_batch: source is not pinned host memory");
+    }
+    for (const auto row : row_ids) {
+        if (row < 0 || static_cast<std::uint64_t>(row) >= table.rows) {
+            throw std::invalid_argument("ple_fp8_stage_rows_batch: row outside resident table");
+        }
+    }
+    auto* destination = static_cast<std::uint8_t*>(pinned_rows);
+    for (std::size_t i = 0; i < row_ids.size(); ++i) {
+        std::memcpy(destination + i * kPleRowWidth,
+                    table.data + static_cast<std::uint64_t>(row_ids[i]) * kPleRowWidth,
+                    kPleRowWidth);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(device_rows.data, pinned_rows, bytes, cudaMemcpyHostToDevice, stream));
+}
+
+void ple_fp8_decode_rows(const Tensor& device_rows, std::uint16_t scale_bits,
+                         Tensor& embedding, cudaStream_t stream) {
+    constexpr const char* op = "ple_fp8_decode_rows";
+    const int width = device_rows.ne[2];
+    if (width <= 0 || width > kPleMaxWidth || scale_bits == 0 || scale_bits >= 0x7f80) {
+        throw std::invalid_argument("ple_fp8_decode_rows: invalid width or positive finite scale");
+    }
+    require_tensor(device_rows, DType::U8, kPleRowWidth, kPleHeads, width, op, "device_rows");
+    require_tensor(embedding, DType::BF16, kPleRowWidth, kPleHeads, width, op, "embedding");
+    if (overlaps(range(device_rows.data, device_rows.bytes(), op),
+                 range(embedding.data, embedding.bytes(), op))) {
+        throw std::invalid_argument("ple_fp8_decode_rows: input and output overlap");
+    }
+    detail::ple_fp8_decode_rows_launch(device_rows, scale_bits, embedding, stream);
+}
 
 void ple_iq4_nl_stage_rows(const PleMappedIq4NlTable& table,
                            std::span<const std::int32_t, kPleHeads> row_ids, void* pinned_rows,
@@ -195,7 +315,7 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
                 const Tensor& query_norm_weight, const Tensor& conv_norm_weight,
                 const Tensor& conv_weight, const Tensor& old_conv_state,
                 Tensor& new_conv_state, Tensor& residual_out, WorkspaceArena& workspace,
-                cudaStream_t stream) {
+                PleNormFormat norm_format, cudaStream_t stream) {
     constexpr const char* op = "ple_inject";
     const int width = residual.ne[2];
     if (width <= 0 || width > 4096) {
@@ -203,11 +323,18 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
     }
     require_tensor(residual, DType::BF16, kPleEmbeddingWidth, kPleBranches, width, op, "residual");
     require_tensor(embedding, DType::BF16, kPleEmbeddingWidth, width, 1, op, "embedding");
-    require_tensor(key_norm_weight, DType::FP32, kPleChannels, 1, 1, op, "key_norm_weight");
-    require_tensor(query_norm_weight, DType::FP32, kPleChannels, 1, 1, op,
+    if (norm_format != PleNormFormat::EffectiveFp32 && norm_format != PleNormFormat::ZeroCenteredBf16) {
+        throw std::invalid_argument("ple_inject: unsupported norm format");
+    }
+    const DType norm_type = norm_format == PleNormFormat::ZeroCenteredBf16 ? DType::BF16 : DType::FP32;
+    require_tensor(key_norm_weight, norm_type, kPleChannels, 1, 1, op, "key_norm_weight");
+    require_tensor(query_norm_weight, norm_type, kPleChannels, 1, 1, op,
                    "query_norm_weight");
-    require_tensor(conv_norm_weight, DType::FP32, kPleChannels, 1, 1, op, "conv_norm_weight");
-    require_tensor(conv_weight, DType::FP32, 4, kPleChannels, 1, op, "conv_weight");
+    require_tensor(conv_norm_weight, norm_type, kPleChannels, 1, 1, op, "conv_norm_weight");
+    if (conv_weight.dtype != DType::BF16 && conv_weight.dtype != DType::FP32) {
+        throw std::invalid_argument("ple_inject: unsupported convolution weight dtype");
+    }
+    require_tensor(conv_weight, conv_weight.dtype, 4, kPleChannels, 1, op, "conv_weight");
     require_tensor(old_conv_state, DType::BF16, kPleChannels, kPleConvHistory, 1, op,
                    "old_conv_state");
     require_tensor(new_conv_state, DType::BF16, kPleChannels, kPleConvHistory, 1, op,
@@ -254,11 +381,11 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
 
     auto scope     = workspace.scope();
     Scratch scratch = allocate_scratch(workspace, width);
-    detail::quantized_projection(embedding, key_weight, scratch.key, workspace, stream);
-    detail::quantized_projection(embedding, value_weight, scratch.value, workspace, stream);
+    detail::projection(embedding, key_weight, scratch.key, workspace, stream);
+    detail::projection(embedding, value_weight, scratch.value, workspace, stream);
     detail::ple_gate_launch(residual, scratch.key, scratch.value, key_norm_weight,
-                            query_norm_weight, scratch.gated, stream);
-    detail::ple_conv_input_launch(scratch.gated, conv_norm_weight, scratch.current_state, stream);
+                            query_norm_weight, scratch.gated, norm_format, stream);
+    detail::ple_conv_input_launch(scratch.gated, conv_norm_weight, scratch.current_state, norm_format, stream);
     detail::ple_conv_inject_launch(residual, scratch.gated, conv_weight, old_conv_state,
                                    scratch.current_state, residual_out, stream);
     detail::ple_state_update_launch(old_conv_state, scratch.current_state, new_conv_state, stream);

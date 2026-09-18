@@ -126,13 +126,20 @@ ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|w8)_a16_test$' --output-on-f
 
 All Linear files use `ops/linear/linear_test_common.{h,cpp}` and the same
 `ops/quantized_weight.h` fixture as the fused projection tests. The fixture produces the complete
-packed GPU payload and exact-decodes the logical float rows used by the one
+packed GPU payload and decodes the logical weight rows to double without an incidental
+FP32 pre-rounding before the one
 `cpu_linear_gemm_fp64()` reference. The reference performs naive double accumulation and never
 reproduces a production route's activation quantization, staging, reduction tree, or BF16 output
 rounding. Each activation compute path selects one centrally defined comparison tolerance for its
 whole suite; private kernel, schedule, launcher, and T selection do not change it. Individual test
 files call public `linear()` and contain no private selector, launcher, schedule, or kernel
 assertions.
+
+The calibrated native FP8 suite additionally tests its explicit activation codec against
+an independent enumerated E4M3 oracle, including signed zero, midpoint rounding,
+subnormals, saturation, unchanged source-floor scales and expanded per-token
+guard scales at K=640/2560/6144. Those exact codec checks are separate from Linear's
+unchanged represented-input FP64 numerical oracle.
 
 Run the native Python suites with the project Python environment:
 

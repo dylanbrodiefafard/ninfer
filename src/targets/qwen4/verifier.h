@@ -28,6 +28,7 @@ inline constexpr std::size_t kObjectCount = 1224;
 inline constexpr std::size_t kMappedTensorCount = 97;
 inline constexpr std::size_t kDeviceTensorCount = 1127;
 inline constexpr std::uint64_t kMappedTensorBytes = 45'996'784'640ULL;
+inline constexpr std::uint64_t kResidentPleBytes = 28'800'138'240ULL;
 inline constexpr std::uint64_t kDevicePayloadBytes = 26'538'652'160ULL;
 inline constexpr std::size_t kPersistentStateBytes = 157'126'664ULL;
 inline constexpr std::size_t kExpertStageBytes = ops::kQwen4SparseMoePipelineStageBytes;

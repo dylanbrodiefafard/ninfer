@@ -4,13 +4,20 @@
 
 namespace ninfer::ops::detail {
 
+void ple_nvfp4_decode_rows_launch(const Tensor& device_rows, Tensor& embedding,
+                                  cudaStream_t stream);
+
+void ple_fp8_decode_rows_launch(const Tensor& device_rows, std::uint16_t scale_bits,
+                                Tensor& embedding, cudaStream_t stream);
+
 void ple_iq4_nl_decode_rows_launch(const Tensor& device_rows, Tensor& embedding,
                                    cudaStream_t stream);
 void ple_gate_launch(const Tensor& residual, const Tensor& projected_key,
                      const Tensor& projected_value, const Tensor& key_norm_weight,
-                     const Tensor& query_norm_weight, Tensor& gated, cudaStream_t stream);
+                     const Tensor& query_norm_weight, Tensor& gated, PleNormFormat norm_format,
+                     cudaStream_t stream);
 void ple_conv_input_launch(const Tensor& gated, const Tensor& conv_norm_weight,
-                           Tensor& current_state, cudaStream_t stream);
+                           Tensor& current_state, PleNormFormat norm_format, cudaStream_t stream);
 void ple_conv_inject_launch(const Tensor& residual, const Tensor& gated,
                             const Tensor& conv_weight, const Tensor& old_state,
                             const Tensor& current_state, Tensor& out, cudaStream_t stream);

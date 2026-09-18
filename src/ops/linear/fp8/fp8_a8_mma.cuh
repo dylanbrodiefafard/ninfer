@@ -9,6 +9,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/linear/fp8/fp8_output.cuh"
 
 #include <cuda_bf16.h>
 
@@ -104,10 +105,11 @@ fp8_mma_tile_coordinates(std::int32_t linear, std::int32_t row_tiles, std::int32
 }
 
 template <class Geometry, class Schedule, bool FullTokens, class Epilogue, class Output,
-          class RowPolicy = Fp8MmaIdentityRows, bool PairRows = false>
+          class RowPolicy = Fp8MmaIdentityRows, bool PairRows = false,
+          class Scales = const __nv_bfloat16*>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_mma_kernel(
     const std::uint8_t* __restrict__ activation_codes, const float* __restrict__ activation_scales,
-    const std::uint8_t* __restrict__ weight_codes, const __nv_bfloat16* __restrict__ weight_scales,
+    const std::uint8_t* __restrict__ weight_codes, Scales weight_scales,
     std::int32_t tokens, Epilogue epilogue, Output output, RowPolicy row_policy = {}) {
     constexpr int TILES_K = Geometry::kInputRows / Schedule::kBlockK;
     constexpr int BM      = Schedule::kBlockTokens;
@@ -303,8 +305,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;
             const int parent_row0 = row_policy.weight_row(row_begin, local_row0);
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1);
-            const std::uint32_t scale_bits = load_vec<std::uint32_t>(weight_scales + parent_row0);
-            const float2 weight_scale      = bf16x2_bits_to_float2(scale_bits);
+            const float2 weight_scale = fp8_weight_scale_pair(weight_scales, parent_row0);
             float value00 =
                 accumulators[mma_token][mma_row][0] * activation_scale0 * weight_scale.x;
             float value01 =

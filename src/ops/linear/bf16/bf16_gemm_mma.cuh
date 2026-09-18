@@ -147,8 +147,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     constexpr int S       = Schedule::kPipelineStages;
     constexpr int WARPS_N = Schedule::kWarpsN;
     constexpr int THREADS = Schedule::kThreads;
-    static_assert(M % BM == 0);
-    static_assert(K % BK == 0);
+    // Source BF16 Vision MLP is 4304-wide: complete 8-value transfers, but partial
+    // 64-wide row/K tiles. Divisible instantiations retain their original loads/stores.
+    static_assert(K % 8 == 0);
     static_assert(K / BK >= S);
 
     extern __shared__ __align__(16) unsigned char shared_raw[];
@@ -163,7 +164,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    constexpr int tiles_m = M / BM;
+    constexpr int tiles_m = (M + BM - 1) / BM;
     const int tiles_n     = tokens / BN + static_cast<int>(tokens % BN != 0);
     int tile_m            = 0;
     int tile_n            = 0;
@@ -192,9 +193,17 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
             const int row = item / (BK / 8);
             const int k8  = item - row * (BK / 8);
             const int kk  = k8 * 8;
-            cp_async<16, Schedule::kWeightCache>(
-                &a_stage[row * BK + bf16_mma_shared_col<Schedule>(row, kk)],
-                &weight[static_cast<std::int64_t>(m0 + row) * K + k0 + kk]);
+            if constexpr (M % BM == 0 && K % BK == 0) {
+                cp_async<16, Schedule::kWeightCache>(
+                    &a_stage[row * BK + bf16_mma_shared_col<Schedule>(row, kk)],
+                    &weight[static_cast<std::int64_t>(m0 + row) * K + k0 + kk]);
+            } else {
+                const bool valid = m0 + row < M && k0 + kk < K;
+                const auto offset = valid ? static_cast<std::int64_t>(m0 + row) * K + k0 + kk : 0;
+                cp_async_zfill<16, Schedule::kWeightCache>(
+                    &a_stage[row * BK + bf16_mma_shared_col<Schedule>(row, kk)],
+                    &weight[offset], valid ? 16 : 0);
+            }
         }
 
 #pragma unroll 1
@@ -204,19 +213,25 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
             const int kk    = k8 * 8;
             auto* dst       = &b_stage[col * BK + bf16_mma_shared_col<Schedule>(col, kk)];
             const int token = n0 + col;
-            if constexpr (FullTokens) {
+            if constexpr (FullTokens && K % BK == 0) {
                 cp_async<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(token) * K + k0 + kk]);
-            } else {
+            } else if constexpr (K % BK == 0) {
                 const bool valid = token < tokens;
                 cp_async_zfill<16, Schedule::kActivationCache>(
                     dst, &x[static_cast<std::int64_t>(valid ? token : 0) * K + k0 + kk],
+                    valid ? 16 : 0);
+            } else {
+                const bool valid = token < tokens && k0 + kk < K;
+                const auto offset = valid ? static_cast<std::int64_t>(token) * K + k0 + kk : 0;
+                cp_async_zfill<16, Schedule::kActivationCache>(
+                    dst, &x[offset],
                     valid ? 16 : 0);
             }
         }
     };
 
-    constexpr int kTiles = K / BK;
+    constexpr int kTiles = (K + BK - 1) / BK;
 #pragma unroll
     for (int stage = 0; stage < S; ++stage) {
         stage_inputs(stage, stage);
@@ -312,7 +327,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
             const int token0   = n0 + wn * WN + ni * 8 + 2 * lid;
             const int token1   = token0 + 1;
             const float* value = accum[mi][ni];
-            if constexpr (FullTokens) {
+            if constexpr (M % BM != 0) {
+                if (row0 < M) {
+                    if (FullTokens || token0 < tokens) output_tile.store(row0, token0, value[0]);
+                    if (FullTokens || token1 < tokens) output_tile.store(row0, token1, value[1]);
+                }
+                if (row1 < M) {
+                    if (FullTokens || token0 < tokens) output_tile.store(row1, token0, value[2]);
+                    if (FullTokens || token1 < tokens) output_tile.store(row1, token1, value[3]);
+                }
+            } else if constexpr (FullTokens) {
                 output_tile.store(row0, token0, value[0]);
                 output_tile.store(row0, token1, value[1]);
                 output_tile.store(row1, token0, value[2]);

@@ -30,6 +30,11 @@ The executable `--help` output is the exact source for command-line option spell
 - [Maintainer tools](../tools/README.md)
 - [Capability evaluation](../eval/README.md)
 
+## Research recommendations
+
+- [Qwen4 weight, activation and state precision recommendations](research/qwen4-quantization-recommendations.md)
+  — evidence and candidates for a future smaller checkpoint; not a qualified implementation contract.
+
 ## Maintainer references
 
 The active references under [`maintainer/`](maintainer/) record current architecture, model,

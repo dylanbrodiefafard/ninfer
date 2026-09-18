@@ -119,6 +119,7 @@ int main() {
             stats.h2d_bytes != verifier::kDevicePayloadBytes ||
             stats.mapped_tensor_count != verifier::kMappedTensorCount ||
             stats.mapped_tensor_bytes != verifier::kMappedTensorBytes ||
+            stats.resident_tensor_bytes != verifier::kResidentPleBytes ||
             model->view().ple.table.bytes != 28'800'138'240ULL ||
             model->view().ple.table.data == nullptr) {
             std::cerr << "verifier materialization totals or retained PLE mapping changed\n";

@@ -46,12 +46,76 @@ constexpr auto kOutputLaunchers = make_launchers<OutputGeometry>(
 
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kBf16SmallTMinTokens);
+    if (weight.n == 4608 && weight.k == 4608) {
+        static constexpr auto launchers=make_launchers<Bf16GemvGeometry<4608,4608>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens-kBf16SmallTMinTokens+1>{});
+        launchers[index](x,weight,out,stream);return;
+    }
+    if (weight.n == 2560 && weight.k == 4608) {
+        static constexpr auto launchers=make_launchers<Bf16GemvGeometry<2560,4608>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens-kBf16SmallTMinTokens+1>{});
+        launchers[index](x,weight,out,stream);return;
+    }
+    if (weight.n == 248320 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<248320, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
     if (weight.n == ControlGeometry::kOutputRows && weight.k == ControlGeometry::kInputRows) {
         kControlLaunchers[index](x, weight, out, stream);
         return;
     }
     if (weight.n == OutputGeometry::kOutputRows && weight.k == OutputGeometry::kInputRows) {
         kOutputLaunchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 10240 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<10240, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 6144 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<6144, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 12288 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<12288, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 512 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<512, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 640 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<640, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 2560 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<2560, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 2560 && weight.k == 6144) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<2560, 6144>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 320 && weight.k == 10240) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<320, 10240>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("bf16 linear small-T: unsupported exact problem");

@@ -228,20 +228,16 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy,
           class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false,
           Cache WeightCache = Cache::cg>
-__global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_mma_kernel(
+__device__ __forceinline__ void nvfp4_w4a4_mma_tile(
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales, std::int32_t tokens, float alpha,
-    Epilogue epilogue, OutputPolicy output, RowPolicy row_policy = {}) {
+    Epilogue epilogue, OutputPolicy output, RowPolicy row_policy,
+    Nvfp4W4a4SharedStorage<Schedule>& shared, int token_begin, int row_begin) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
 
-    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
-    const int token_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
-    const int row_begin         = static_cast<int>(blockIdx.x) * kRowsPerBlock;
     constexpr int kKTiles       = Geometry::kInputRows / Schedule::kBlockK;
     constexpr int kWaitGroups   = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
 
@@ -407,6 +403,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             }
         }
     }
+}
+
+template <class Geometry, class Schedule, class Epilogue, class OutputPolicy,
+          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false,
+          Cache WeightCache = Cache::cg>
+__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
+void nvfp4_w4a4_mma_kernel(
+    Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
+    const std::uint8_t* __restrict__ weight_scales, std::int32_t tokens, float alpha,
+    Epilogue epilogue, OutputPolicy output, RowPolicy row_policy = {}) {
+    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+    constexpr int rows = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
+    nvfp4_w4a4_mma_tile<Geometry, Schedule, Epilogue, OutputPolicy, RowPolicy, PairRows, WeightCache>(
+        activation, weight_codes, weight_scales, tokens, alpha, epilogue, output, row_policy,
+        shared, static_cast<int>(blockIdx.y) * Schedule::kBlockM,
+        static_cast<int>(blockIdx.x) * rows);
 }
 
 template <class Geometry, int Threads = 256>

@@ -246,7 +246,7 @@ quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, s
     return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
 }
 
-void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
+void cpu_linear_gemm_fp64(const double* weight, const float* activation, double* output,
                           std::int32_t n, std::int32_t k, std::int32_t t) {
     if (weight == nullptr || activation == nullptr || output == nullptr || n <= 0 || k <= 0 ||
         t <= 0) {
@@ -264,7 +264,7 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
             static_cast<std::int32_t>((static_cast<std::int64_t>(n) * (thread + 1)) / thread_count);
         workers.emplace_back([=] {
             for (std::int32_t row = row_begin; row < row_end; ++row) {
-                const float* weight_row = weight + static_cast<std::size_t>(row) * k;
+                const double* weight_row = weight + static_cast<std::size_t>(row) * k;
                 for (std::int32_t token_begin = 0; token_begin < t; token_begin += kOracleTBlock) {
                     const std::int32_t active = std::min(kOracleTBlock, t - token_begin);
                     std::array<double, kOracleTBlock> accumulators{};
@@ -306,8 +306,13 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     const std::vector<std::int32_t> oracle_rows =
         shape.comparison == Comparison::Full ? all_indices(shape.n) : sampled_indices(shape.n);
     quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
-    const std::vector<float> oracle_weight =
-        quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
+    std::vector<double> oracle_weight(static_cast<std::size_t>(oracle_rows.size()) * shape.k);
+    for (std::size_t row = 0; row < oracle_rows.size(); ++row) {
+        for (int column = 0; column < shape.k; ++column) {
+            oracle_weight[row * shape.k + column] =
+                quantized_weight::logical_weight_fp64(host_weight, oracle_rows[row], column);
+        }
+    }
     const std::vector<std::uint16_t> activation_bits =
         make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
 

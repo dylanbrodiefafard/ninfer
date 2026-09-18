@@ -31,12 +31,14 @@ constexpr std::int32_t kIntermediate = ops::kQwen4SparseMoeIntermediate;
 constexpr std::int32_t kRouteWindows = 52;
 
 bool native_format(QType type) {
-    return type == QType::NVFP4 || type == QType::FP8_E4M3FN_ROW_BF16S;
+    return type == QType::NVFP4 || type == QType::NVFP4_EXPERT_F32M ||
+           type == QType::FP8_E4M3FN_ROW_BF16S;
 }
 
 const char* format_name(QType type) {
     switch (type) {
     case QType::NVFP4: return "nvfp4";
+    case QType::NVFP4_EXPERT_F32M: return "nvfp4-expert-f32m";
     case QType::FP8_E4M3FN_ROW_BF16S: return "fp8";
     case QType::GGML_IQ1_S: return "iq1_s";
     case QType::GGML_IQ2_XXS: return "iq2_xxs";
@@ -47,6 +49,40 @@ const char* format_name(QType type) {
 }
 
 Weight native_bank(QType type, int experts, int rows, int columns, DeviceBuffer& storage) {
+    if (type == QType::NVFP4_EXPERT_F32M) {
+        const std::size_t elements = static_cast<std::size_t>(experts) * rows * columns;
+        const std::size_t code_bytes = elements / 2;
+        const std::size_t scale_bytes = elements / 16;
+        const std::size_t weight_offset = code_bytes + scale_bytes;
+        storage = DeviceBuffer(weight_offset + 2 * experts * sizeof(float));
+        auto* bytes = static_cast<std::uint8_t*>(storage.p);
+        CUDA_CHECK(cudaMemset(bytes, 0x22, code_bytes));
+        CUDA_CHECK(cudaMemset(bytes + code_bytes, 0x38, scale_bytes));
+        std::vector<float> multipliers(2 * experts);
+        for (int expert = 0; expert < experts; ++expert) {
+            multipliers[expert] = 0.00004F * (1.0F + static_cast<float>(expert % 17) / 32.0F);
+            multipliers[experts + expert] =
+                (columns == kIntermediate ? 0.0024F : 0.0014F) *
+                (1.0F + static_cast<float>(expert % 11) / 32.0F);
+        }
+        CUDA_CHECK(cudaMemcpy(bytes + weight_offset, multipliers.data(),
+                              multipliers.size() * sizeof(float), cudaMemcpyHostToDevice));
+        Weight weight{};
+        weight.payload = weight.qdata = storage.p;
+        weight.payload_bytes = storage.bytes;
+        weight.scales = bytes + code_bytes;
+        weight.qtype = type;
+        weight.layout = QuantLayout::ExpertBlockScaleK16M128x4;
+        weight.scale_dtype = DType::FP8_E4M3FN;
+        weight.group_size = weight.group = 16;
+        weight.ndim = 3;
+        weight.n = rows;
+        weight.k = columns;
+        weight.shape[0] = weight.padded_shape[0] = experts;
+        weight.shape[1] = weight.padded_shape[1] = rows;
+        weight.shape[2] = weight.padded_shape[2] = columns;
+        return weight;
+    }
     auto packed = type == QType::NVFP4
         ? bench::make_nvfp4_weight(experts * rows, columns)
         : bench::make_fp8_weight(experts * rows, columns);
@@ -173,8 +209,8 @@ struct Measurement {
 
 class Fixture {
 public:
-    Fixture(QType routed_qtype, QType shared_qtype, std::int32_t width)
-        : routed_qtype_(routed_qtype), width_(width), shared_qtype_(shared_qtype),
+    Fixture(QType routed_qtype, QType shared_qtype, std::int32_t width, ops::LinearPolicy policy)
+        : routed_qtype_(routed_qtype), width_(width), shared_qtype_(shared_qtype), policy_(policy),
           one_routed_(native_format(routed_qtype_)
                           ? 0 : matrix_bytes(routed_qtype_, kIntermediate, kHidden)),
           routed_bank_bytes_(static_cast<std::size_t>(kExperts) * one_routed_),
@@ -261,7 +297,7 @@ public:
             };
         }
         workspace_ = DeviceBuffer(
-            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_weights_, width_));
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(resident_weights_, width_, policy_));
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     }
 
@@ -332,7 +368,7 @@ private:
             Tensor x(device_inputs_.p, DType::BF16, {kHidden, width_});
             ops::qwen4_sparse_moe_resident(
                 x, resident_weights_, selected_ids_view_, selected_weights_view_,
-                destination_view_, workspace, stream_);
+                destination_view_, workspace, stream_, policy_);
             return;
         }
         for (std::int32_t token = 0; token < width_; ++token) {
@@ -348,13 +384,14 @@ private:
             Tensor weights_view(route_weights, DType::FP32, {kTopK});
             Tensor output_view(output, DType::BF16, {kHidden});
             ops::qwen4_sparse_moe_resident(
-                x, resident_weights_, ids_view, weights_view, output_view, workspace, stream_);
+                x, resident_weights_, ids_view, weights_view, output_view, workspace, stream_, policy_);
         }
     }
 
     QType routed_qtype_;
     std::int32_t width_;
     QType shared_qtype_;
+    ops::LinearPolicy policy_;
     std::size_t one_routed_;
     std::size_t routed_bank_bytes_;
     std::size_t down_bank_bytes_;
@@ -386,6 +423,7 @@ private:
 };
 
 struct Options {
+    ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::int32_t iterations = 10;
     std::int32_t width = 1;
     bool profile = false;
@@ -397,21 +435,27 @@ Options parse_options(int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
         const std::string_view option(argv[index]);
+        if (option == "--policy" && index + 1 < argc) {
+            const std::string_view value = argv[++index];
+            if (value != "a16" && value != "a4") { throw std::invalid_argument("policy must be a16 or a4"); }
+            options.policy = value == "a4" ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only;
+            continue;
+        }
         if (option == "--profile") {
             options.profile = true;
             continue;
         }
         if (option == "--format" && index + 1 < argc) {
             options.format = argv[++index];
-            if (options.format != "nvfp4" && options.format != "fp8" &&
+            if (options.format != "nvfp4" && options.format != "nvfp4-expert-f32m" && options.format != "fp8" &&
                 options.format != "iq1_s" && options.format != "iq2_xxs") {
-                throw std::invalid_argument("format must be nvfp4, fp8, iq1_s, or iq2_xxs");
+                throw std::invalid_argument("format must be nvfp4, nvfp4-expert-f32m, fp8, iq1_s, or iq2_xxs");
             }
             continue;
         }
         if ((option != "--iterations" && option != "--width") || index + 1 >= argc) {
             throw std::invalid_argument(
-                "usage: qwen4 resident bench [--iterations N] [--width T] [--format nvfp4|fp8|iq1_s|iq2_xxs] [--profile]");
+                "usage: qwen4 resident bench [--iterations N] [--width T] [--format nvfp4|nvfp4-expert-f32m|fp8|iq1_s|iq2_xxs] [--policy a16|a4] [--profile]");
         }
         const long parsed = std::strtol(argv[++index], nullptr, 10);
         if (option == "--iterations" && (parsed <= 0 || parsed > 100000)) {
@@ -457,17 +501,22 @@ void report(QType qtype, QType shared_qtype, const char* workload, const char* p
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
-        constexpr std::array<std::pair<QType, QType>, 5> profiles{{
+        if (options.policy == ops::LinearPolicy::AllowA4 && options.format != "nvfp4-expert-f32m") {
+            throw std::invalid_argument("A4 benchmark requires --format nvfp4-expert-f32m");
+        }
+        std::cout << "# expert_policy=" << (options.policy == ops::LinearPolicy::AllowA4 ? "a4" : "a16") << '\n';
+        constexpr std::array<std::pair<QType, QType>, 6> profiles{{
             {QType::GGML_IQ1_S, QType::GGML_Q5_K},
             {QType::GGML_IQ2_XXS, QType::GGML_Q5_K},
             {QType::GGML_IQ2_XXS, QType::GGML_Q6_K},
             {QType::NVFP4, QType::NVFP4},
+            {QType::NVFP4_EXPERT_F32M, QType::NVFP4},
             {QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S},
         }};
         for (const auto [qtype, shared_qtype] : profiles) {
             if (!options.format.empty() && options.format != format_name(qtype)) { continue; }
             if (options.profile && options.format.empty() && qtype != QType::GGML_IQ1_S) { continue; }
-            Fixture fixture(qtype, shared_qtype, options.width);
+            Fixture fixture(qtype, shared_qtype, options.width, options.policy);
             for (bool rotating : {false, true}) {
                 if (options.profile && !rotating) { continue; }
                 const char* workload = rotating ? "rotating" : "fixed_hot";

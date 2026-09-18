@@ -76,30 +76,48 @@ void qsa_require_disjoint(std::initializer_list<QsaAddressRange> ranges, const c
     }
 }
 
+QsaAddressRange qsa_scale_address_range(const Tensor& tensor, QsaKvFormat format,
+                                       const char* op, const char* name) {
+    if (format == QsaKvFormat::BF16) { return {0, 0, name}; }
+    return qsa_address_range(tensor, op, name);
+}
+
 int qsa_validate_state(const QsaStateView& state, const char* op) {
     // Codes are stored through 32-bit writes by qsa_state_append. The remaining alignments match
     // the scalar types used by append, selection, and attention.
-    require_tensor(state.k_codes, DType::U8, op, "state.k_codes", alignof(std::uint32_t));
-    require_tensor(state.v_codes, DType::U8, op, "state.v_codes", alignof(std::uint32_t));
-    require_tensor(state.k_scales, DType::FP8_E4M3FN, op, "state.k_scales");
-    require_tensor(state.v_scales, DType::FP8_E4M3FN, op, "state.v_scales");
+    const bool bf16 = state.format == QsaKvFormat::BF16;
+    if (!bf16 && state.format != QsaKvFormat::NVFP4G16) {
+        throw std::invalid_argument(std::string(op) + ": unsupported KV format");
+    }
+    require_tensor(state.k, bf16 ? DType::BF16 : DType::U8, op, "state.k", 4);
+    require_tensor(state.v, bf16 ? DType::BF16 : DType::U8, op, "state.v", 4);
+    if (bf16) {
+        if (state.k_scales.data != nullptr || state.v_scales.data != nullptr) {
+            throw std::invalid_argument(std::string(op) + ": BF16 state has no scale planes");
+        }
+    } else {
+        require_tensor(state.k_scales, DType::FP8_E4M3FN, op, "state.k_scales");
+        require_tensor(state.v_scales, DType::FP8_E4M3FN, op, "state.v_scales");
+    }
     require_tensor(state.raw_index_keys, DType::BF16, op, "state.raw_index_keys");
     require_tensor(state.positions, DType::I32, op, "state.positions");
     const int capacity = state.raw_index_keys.ne[1];
     if (capacity <= 0 || capacity > kQsaMaximumTokens) {
         throw std::invalid_argument(std::string(op) + ": state capacity must be in [1,4096]");
     }
-    require_shape(state.k_codes, 128, capacity, kQsaKvHeads, op, "state.k_codes");
-    require_shape(state.v_codes, 128, capacity, kQsaKvHeads, op, "state.v_codes");
-    require_shape(state.k_scales, 16, capacity, kQsaKvHeads, op, "state.k_scales");
-    require_shape(state.v_scales, 16, capacity, kQsaKvHeads, op, "state.v_scales");
+    require_shape(state.k, bf16 ? 256 : 128, capacity, kQsaKvHeads, op, "state.k");
+    require_shape(state.v, bf16 ? 256 : 128, capacity, kQsaKvHeads, op, "state.v");
+    if (!bf16) {
+        require_shape(state.k_scales, 16, capacity, kQsaKvHeads, op, "state.k_scales");
+        require_shape(state.v_scales, 16, capacity, kQsaKvHeads, op, "state.v_scales");
+    }
     require_shape(state.raw_index_keys, kQsaIndexHeadDim, capacity, 1, op,
                   "state.raw_index_keys");
     require_shape(state.positions, 3, capacity, 1, op, "state.positions");
-    qsa_require_disjoint({qsa_address_range(state.k_codes, op, "state.k_codes"),
-                          qsa_address_range(state.v_codes, op, "state.v_codes"),
-                          qsa_address_range(state.k_scales, op, "state.k_scales"),
-                          qsa_address_range(state.v_scales, op, "state.v_scales"),
+    qsa_require_disjoint({qsa_address_range(state.k, op, "state.k"),
+                          qsa_address_range(state.v, op, "state.v"),
+                          qsa_scale_address_range(state.k_scales, state.format, op, "state.k_scales"),
+                          qsa_scale_address_range(state.v_scales, state.format, op, "state.v_scales"),
                           qsa_address_range(state.raw_index_keys, op, "state.raw_index_keys"),
                           qsa_address_range(state.positions, op, "state.positions")},
                          op);
@@ -133,10 +151,10 @@ void qsa_state_append(const Tensor& k, const Tensor& v, const Tensor& raw_index_
          detail::qsa_address_range(raw_index_keys, op, "raw_index_keys"),
          detail::qsa_address_range(position_ids, op, "position_ids"),
          detail::qsa_address_range(append_ids, op, "append_ids"),
-         detail::qsa_address_range(state.k_codes, op, "state.k_codes"),
-         detail::qsa_address_range(state.v_codes, op, "state.v_codes"),
-         detail::qsa_address_range(state.k_scales, op, "state.k_scales"),
-         detail::qsa_address_range(state.v_scales, op, "state.v_scales"),
+         detail::qsa_address_range(state.k, op, "state.k"),
+         detail::qsa_address_range(state.v, op, "state.v"),
+         detail::qsa_scale_address_range(state.k_scales, state.format, op, "state.k_scales"),
+         detail::qsa_scale_address_range(state.v_scales, state.format, op, "state.v_scales"),
          detail::qsa_address_range(state.raw_index_keys, op, "state.raw_index_keys"),
          detail::qsa_address_range(state.positions, op, "state.positions")},
         op);
@@ -194,10 +212,10 @@ void qsa_index_select(const Tensor& raw_query, const QsaStateView& state,
          detail::qsa_address_range(visible_offsets, op, "visible_offsets"),
          detail::qsa_address_range(query_norm_weight, op, "query_norm_weight"),
          detail::qsa_address_range(key_norm_weight, op, "key_norm_weight"),
-         detail::qsa_address_range(state.k_codes, op, "state.k_codes"),
-         detail::qsa_address_range(state.v_codes, op, "state.v_codes"),
-         detail::qsa_address_range(state.k_scales, op, "state.k_scales"),
-         detail::qsa_address_range(state.v_scales, op, "state.v_scales"),
+         detail::qsa_address_range(state.k, op, "state.k"),
+         detail::qsa_address_range(state.v, op, "state.v"),
+         detail::qsa_scale_address_range(state.k_scales, state.format, op, "state.k_scales"),
+         detail::qsa_scale_address_range(state.v_scales, state.format, op, "state.v_scales"),
          detail::qsa_address_range(state.raw_index_keys, op, "state.raw_index_keys"),
          detail::qsa_address_range(state.positions, op, "state.positions"),
          detail::qsa_address_range(selected_ids, op, "selected_ids"),
@@ -239,10 +257,10 @@ void qsa_selected_attention(const Tensor& q, const Tensor& selected_ids,
         {detail::qsa_address_range(q, op, "q"),
          detail::qsa_address_range(selected_ids, op, "selected_ids"),
          detail::qsa_address_range(selected_count, op, "selected_count"),
-         detail::qsa_address_range(state.k_codes, op, "state.k_codes"),
-         detail::qsa_address_range(state.v_codes, op, "state.v_codes"),
-         detail::qsa_address_range(state.k_scales, op, "state.k_scales"),
-         detail::qsa_address_range(state.v_scales, op, "state.v_scales"),
+         detail::qsa_address_range(state.k, op, "state.k"),
+         detail::qsa_address_range(state.v, op, "state.v"),
+         detail::qsa_scale_address_range(state.k_scales, state.format, op, "state.k_scales"),
+         detail::qsa_scale_address_range(state.v_scales, state.format, op, "state.v_scales"),
          detail::qsa_address_range(state.raw_index_keys, op, "state.raw_index_keys"),
          detail::qsa_address_range(state.positions, op, "state.positions"),
          detail::qsa_address_range(out, op, "out"),

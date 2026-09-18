@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
 
@@ -58,14 +59,20 @@ struct Qwen4SparseMoeWeights {
 
 /** Device-resident expert banks for the exact Qwen4-preview sparse-MoE geometry. */
 struct Qwen4ResidentSparseMoeWeights {
-    Weight router;           // contiguous FP32 [512,2560]
-    Weight routed_gate;      // device IQ1_S/IQ2_XXS or NVFP4/FP8 [512,640,2560]
+    Weight router;           // contiguous native BF16 or diagnostic FP32 [512,2560]
+    Weight routed_gate;      // device IQ1_S/IQ2_XXS or NVFP4/NVFP4_EXPERT_F32M/FP8 [512,640,2560]
     Weight routed_up;        // same geometry; mixed resident formats may differ
-    Weight routed_down;      // device IQ4_NL or NVFP4/FP8 [512,2560,640]
-    Tensor shared_gate;      // device FP32 [2560]
-    Weight shared_gate_proj; // device Q5_K/Q6_K or NVFP4/FP8 [640,2560]
+    Weight routed_down;      // device IQ4_NL or NVFP4/NVFP4_EXPERT_F32M/FP8 [512,2560,640]
+    Tensor shared_gate;      // device [2560], same BF16/FP32 storage as router
+    Weight shared_gate_proj; // device BF16, Q5_K/Q6_K or NVFP4/FP8 [640,2560]
     Weight shared_up;        // same geometry; native formats may differ
-    Weight shared_down;      // device Q8_0 or NVFP4/FP8 [2560,640]
+    Weight shared_down;      // device BF16, Q8_0 or NVFP4/FP8 [2560,640]
+};
+
+struct Qwen4SharedExpertPolicy {
+    LinearPolicy gate = LinearPolicy::A16Only;
+    LinearPolicy up = LinearPolicy::A16Only;
+    LinearPolicy down = LinearPolicy::A16Only;
 };
 
 /** Exact encoded bytes copied for one gate/up expert pair of the selected routed format. */
@@ -132,7 +139,9 @@ struct Qwen4SparseMoePrefillPipeline {
 
 /** Caller-owned transient device capacity for qwen4_sparse_moe_resident at exact width T. */
 [[nodiscard]] std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
-    const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width);
+    const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width,
+    LinearPolicy expert_policy = LinearPolicy::A16Only,
+    Qwen4SharedExpertPolicy shared_policy = {});
 
 /**
  * Op: qwen4_sparse_moe_gate_up_swiglu
@@ -259,16 +268,51 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
  * are those of the registered rank-two encoding [512*N,K]. Thus each expert owns consecutive
  * code rows and scale tiles/rows, and NVFP4 has one represented weight divisor for the entire
  * bank. This is an execution-view contract, not a new rank-three artifact format. Shared
- * projections independently admit their existing GGML format, NVFP4, or row-scaled FP8.
- * Native projection arithmetic retains A16 activations: admitting a quantized weight does not
+ * projections independently admit BF16, their existing GGML format, NVFP4, row-scaled FP8,
+ * or source-calibrated FP8_E4M3FN_TENSOR_F32M. The calibrated shared roles preserve
+ * separate exact FP32 weight/input multipliers; each role may explicitly select AllowA8
+ * through shared_policy. Packing is caller-workspace-owned and uses that role's stored
+ * input multiplier, including the post-SwiGLU down input. All defaults remain A16.
+ * Default native projection arithmetic retains A16 activations: admitting a quantized weight does not
  * implicitly permit activation quantization at the complete nonlinear Op boundary. Native banks
  * use device-only expert grouping at every T; NVFP4 reads occurrence-mapped activation tiles
  * directly, while FP8 uses bounded caller-owned gathered activations for its A16 MMA mainloop.
+ * A pair of BF16 shared gate/up weights retains FP32 projection values through SiLU-times-up,
+ * then writes a dedicated BF16 activation for shared down. These private intermediates avoid
+ * premature projection rounding; mixed/quantized shared pairs retain their qualified profiles.
+ * Native protected router/shared scalar gate weights remain source BF16 in device storage;
+ * the diagnostic pair may remain FP32. The pair uses the same storage dtype, widened exactly
+ * inside the existing FP32 dot products. This does not quantize routing, change the ideal
+ * top-k contract or introduce a BF16 logits/selected-probabilities Store. The source framework's
+ * unfused BF16 logits and scores are a distinct arithmetic profile, not promised bit parity.
+ *
+ * Native source banks additionally admit NVFP4_EXPERT_F32M with the registered
+ * expert-blockscale-k16-m128x4-v1 rank-three layout. Each expert's represented coefficient is
+ * signed E2M1 code times nonnegative finite E4M3FN block scale times that expert's exact positive
+ * FP32 weight multiplier. The payload retains independent positive FP32 input multipliers too;
+ * this A16 route does not use them or claim to reproduce the source W4A4 activation profile.
+ * No reciprocal conversion or lossy block-scale folding is performed. These banks are admitted
+ * only as routed weights, not as rank-two shared projections. Stored scalar/code validity is a
+ * loading precondition; the Op validates physical views without host-reading device payloads.
+ *
+ * Explicit AllowA4 requires all three routed banks to use NVFP4_EXPERT_F32M. GPU grouping
+ * selects W4A4 only for experts with at least 32 occurrences; smaller groups retain A16.
+ * Each projection uses its own stored input multiplier, including the post-SwiGLU down input.
+ * Private activation packing uses K=16 blocks, an E4M3FN scale rounded from
+ * clamp(maxabs/(6*input_multiplier), 2^-9, 448), and saturated nearest-even E2M1 codes.
+ * FP32 MMA accumulation is scaled by the exact stored weight and input multipliers, with
+ * BF16 projection outputs. Routing remains protected; shared activation policy is independent.
+ * Caller workspace owns
+ * compact GPU tile metadata and reusable packed activation buffers; no host route readback or
+ * allocation is introduced. This is a qualified implementation profile, not a claim of
+ * bit-identical publisher inference or full-model quality. A16Only remains the default.
  */
 void qwen4_sparse_moe_resident(const Tensor& x,
                                const Qwen4ResidentSparseMoeWeights& weights,
                                Tensor& selected_ids, Tensor& selected_weights,
                                Tensor& destination, WorkspaceArena& workspace,
-                               cudaStream_t stream);
+                               cudaStream_t stream,
+                               LinearPolicy expert_policy = LinearPolicy::A16Only,
+                               Qwen4SharedExpertPolicy shared_policy = {});
 
 } // namespace ninfer::ops

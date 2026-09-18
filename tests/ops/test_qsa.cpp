@@ -1,8 +1,8 @@
 #include "ninfer/ops/qsa.h"
 #include "ops/op_tester.h"
 #include "ops/native_projection_fixture.h"
-
-#include <cuda_fp8.h>
+#include "targets/qwen4/native_bf16_fixture.h"
+#include "targets/qwen4/native_sequence_components.h"
 
 #include <algorithm>
 #include <array>
@@ -42,9 +42,9 @@ int verify_filled(const char* label, const void* device, std::size_t bytes,
 }
 
 struct StateFixture {
-    explicit StateFixture(int capacity)
-        : capacity(capacity), k_codes(static_cast<std::size_t>(128) * capacity * 2),
-          v_codes(static_cast<std::size_t>(128) * capacity * 2),
+    explicit StateFixture(int capacity, ops::QsaKvFormat format = ops::QsaKvFormat::NVFP4G16)
+        : capacity(capacity), format(format), k_codes(static_cast<std::size_t>(format == ops::QsaKvFormat::BF16 ? 512 : 128) * capacity * 2),
+          v_codes(k_codes.bytes()),
           k_scales(static_cast<std::size_t>(16) * capacity * 2),
           v_scales(static_cast<std::size_t>(16) * capacity * 2),
           raw_keys(static_cast<std::size_t>(128) * capacity * sizeof(std::uint16_t)),
@@ -58,17 +58,20 @@ struct StateFixture {
     }
 
     ops::QsaStateView view() {
+        const bool bf16 = format == ops::QsaKvFormat::BF16;
         return {
-            Tensor(k_codes.data(), DType::U8, {128, capacity, 2}),
-            Tensor(v_codes.data(), DType::U8, {128, capacity, 2}),
-            Tensor(k_scales.data(), DType::FP8_E4M3FN, {16, capacity, 2}),
-            Tensor(v_scales.data(), DType::FP8_E4M3FN, {16, capacity, 2}),
+            format,
+            Tensor(k_codes.data(), bf16 ? DType::BF16 : DType::U8, {bf16 ? 256 : 128, capacity, 2}),
+            Tensor(v_codes.data(), bf16 ? DType::BF16 : DType::U8, {bf16 ? 256 : 128, capacity, 2}),
+            bf16 ? Tensor{} : Tensor(k_scales.data(), DType::FP8_E4M3FN, {16, capacity, 2}),
+            bf16 ? Tensor{} : Tensor(v_scales.data(), DType::FP8_E4M3FN, {16, capacity, 2}),
             Tensor(raw_keys.data(), DType::BF16, {128, capacity}),
             Tensor(positions.data(), DType::I32, {3, capacity}),
         };
     }
 
     int capacity;
+    ops::QsaKvFormat format;
     GuardedDeviceBuffer k_codes;
     GuardedDeviceBuffer v_codes;
     GuardedDeviceBuffer k_scales;
@@ -195,19 +198,29 @@ double decode_e2m1(std::uint8_t nibble) {
 }
 
 double decode_e4m3(std::uint8_t bits) {
-    __nv_fp8_e4m3 value;
-    value.__x = bits;
-    return static_cast<double>(static_cast<float>(value));
+    const int exponent=(bits>>3)&15, mantissa=bits&7;
+    if(exponent==15 && mantissa==7) { return NAN; }
+    const double magnitude=exponent==0 ? std::ldexp(double(mantissa),-9)
+        : std::ldexp(1.0+double(mantissa)/8.0,exponent-7);
+    return std::copysign(magnitude,bits&128 ? -1.0 : 1.0);
 }
 
 double decode_cache(const std::vector<std::uint8_t>& codes,
                     const std::vector<std::uint8_t>& scales, int d, int token, int head,
                     int capacity) {
+    if (scales.empty()) {
+        const auto offset = 2ULL * (d + 256ULL * (token + static_cast<std::size_t>(capacity) * head));
+        const auto bits = static_cast<std::uint16_t>(codes[offset] | (codes[offset + 1] << 8));
+        return bf16_to_f32(bits);
+    }
     const std::uint8_t packed = codes[code_index(d / 2, token, head, capacity)];
     const std::uint8_t nibble = (d & 1) == 0 ? packed & 0x0fU : packed >> 4U;
     return decode_e2m1(nibble) *
            decode_e4m3(scales[scale_index(d / 16, token, head, capacity)]);
 }
+
+void oracle_encode_cache(std::span<const double> values,int token,int head,int capacity,
+    std::vector<std::uint8_t>& codes,std::vector<std::uint8_t>& scales);
 
 int append_codec_and_attention_case() {
     constexpr int capacity = 8;
@@ -253,6 +266,23 @@ int append_codec_and_attention_case() {
     const auto v_scales =
         from_device<std::uint8_t>(state.v_scales.data(), state.v_scales.bytes());
     int failures = 0;
+    std::vector<std::uint8_t> expected_k_codes(k_codes.size()),expected_v_codes(v_codes.size()),
+        expected_k_scales(k_scales.size()),expected_v_scales(v_scales.size());
+    for(int token=0;token<width;++token) for(int head=0;head<2;++head) {
+        const int base=256*(head+2*token);
+        oracle_encode_cache(std::vector<double>(k.begin()+base,k.begin()+base+256),ids[token],head,
+            capacity,expected_k_codes,expected_k_scales);
+        oracle_encode_cache(std::vector<double>(v.begin()+base,v.begin()+base+256),ids[token],head,
+            capacity,expected_v_codes,expected_v_scales);
+        for(int byte=0;byte<128;++byte) {
+            const auto i=code_index(byte,ids[token],head,capacity);
+            if(k_codes[i]!=expected_k_codes[i] || v_codes[i]!=expected_v_codes[i]) { ++failures; }
+        }
+        for(int group=0;group<16;++group) {
+            const auto i=scale_index(group,ids[token],head,capacity);
+            if(k_scales[i]!=expected_k_scales[i] || v_scales[i]!=expected_v_scales[i]) { ++failures; }
+        }
+    }
     // Direct hand formula: absmax 6 -> scale 1 (E4M3 0x38); [+6,-6] -> E2M1 [7,15].
     for (int token : ids) {
         for (int head = 0; head < 2; ++head) {
@@ -438,13 +468,13 @@ int append_alignment_and_state_validation_case() {
     bad_position_state.fill(sentinel);
 
     auto bad_state = state.view();
-    bad_state.k_codes = Tensor(static_cast<std::byte*>(bad_k_codes.p) + 1, DType::U8,
+    bad_state.k = Tensor(static_cast<std::byte*>(bad_k_codes.p) + 1, DType::U8,
                                {128, capacity, 2});
     failures += expect_invalid_argument("qsa append misaligned state K codes", [&] {
         ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
     });
     bad_state = state.view();
-    bad_state.v_codes = Tensor(static_cast<std::byte*>(bad_v_codes.p) + 1, DType::U8,
+    bad_state.v = Tensor(static_cast<std::byte*>(bad_v_codes.p) + 1, DType::U8,
                                {128, capacity, 2});
     failures += expect_invalid_argument("qsa append misaligned state V codes", [&] {
         ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
@@ -462,12 +492,12 @@ int append_alignment_and_state_validation_case() {
         ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
     });
     bad_state = state.view();
-    bad_state.v_codes = bad_state.k_codes;
+    bad_state.v = bad_state.k;
     failures += expect_invalid_argument("qsa append overlapping state planes", [&] {
         ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
     });
     bad_state = state.view();
-    bad_state.k_codes = Tensor(dk.p, DType::U8, {128, capacity, 2});
+    bad_state.k = Tensor(dk.p, DType::U8, {128, capacity, 2});
     failures += expect_invalid_argument("qsa append overlapping input/state", [&] {
         ops::qsa_state_append(k_t, v_t, raw_t, position_t, id_t, bad_state, nullptr);
     });
@@ -527,10 +557,10 @@ int append_alignment_and_state_validation_case() {
     return failures;
 }
 
-int selector_ceiling_and_permutation_case() {
+int selector_ceiling_and_permutation_case(ops::QsaKvFormat format = ops::QsaKvFormat::NVFP4G16) {
     constexpr int capacity = ops::kQsaMaximumTokens;
     constexpr int width    = 2;
-    StateFixture state(capacity);
+    StateFixture state(capacity, format);
     std::vector<float> keys(static_cast<std::size_t>(128) * capacity, 0.0F);
     for (int id = 0; id < 4; ++id) { keys[128 * id] = -1.0F; }
     for (int id = 4; id < 8; ++id) { keys[128 * id] = 1.0F; }
@@ -601,10 +631,10 @@ int selector_ceiling_and_permutation_case() {
     return failures;
 }
 
-int selector_boundary_ties_case() {
+int selector_boundary_ties_case(ops::QsaKvFormat format = ops::QsaKvFormat::NVFP4G16) {
     constexpr std::array<int, 7> lengths{2047, 2048, 2049, 2050, 2051, 2052, 2053};
     constexpr int width = static_cast<int>(lengths.size());
-    StateFixture state(ops::kQsaMaximumTokens);
+    StateFixture state(ops::kQsaMaximumTokens, format);
     state.raw_keys.fill(0);
     state.positions.fill(0);
 
@@ -666,10 +696,10 @@ int selector_boundary_ties_case() {
     return failures;
 }
 
-int selector_route_switch_and_malformed_case() {
+int selector_route_switch_and_malformed_case(ops::QsaKvFormat format = ops::QsaKvFormat::NVFP4G16) {
     constexpr int short_length = ops::kQsaSelectedCapacity;
     constexpr int long_length = short_length + 1;
-    StateFixture state(ops::kQsaMaximumTokens);
+    StateFixture state(ops::kQsaMaximumTokens, format);
     state.raw_keys.fill(0);
     state.positions.fill(0);
 
@@ -773,9 +803,9 @@ int selector_route_switch_and_malformed_case() {
     return failures;
 }
 
-int selector_score_order_case() {
+int selector_score_order_case(ops::QsaKvFormat format = ops::QsaKvFormat::NVFP4G16) {
     constexpr int capacity = 8;
-    StateFixture state(capacity);
+    StateFixture state(capacity, format);
     std::vector<float> keys(static_cast<std::size_t>(128) * capacity);
     for (int id = 0; id < capacity; ++id) {
         const float value = id < 4 ? -1.0F : 1.0F;
@@ -971,6 +1001,128 @@ std::array<double, 256> oracle_core_norm_rope(const std::array<double, 256>& raw
         output[pair + 32] = normalized[pair + 32] * cosine + normalized[pair] * sine;
     }
     return output;
+}
+
+std::array<double, 256> oracle_attention_head(
+    const std::array<double, 256>& query, std::span<const int> ids, int head, int capacity,
+    const std::vector<std::uint8_t>& k_codes, const std::vector<std::uint8_t>& k_scales,
+    const std::vector<std::uint8_t>& v_codes, const std::vector<std::uint8_t>& v_scales) {
+    std::vector<double> logits(ids.size());
+    double maximum = -INFINITY;
+    for (std::size_t item = 0; item < ids.size(); ++item) {
+        for (int d = 0; d < 256; ++d) {
+            logits[item] += query[d] * decode_cache(k_codes, k_scales, d, ids[item], head, capacity);
+        }
+        logits[item] /= 16.0;
+        maximum = std::max(maximum, logits[item]);
+    }
+    double denominator = 0;
+    for (auto& value : logits) { value = std::exp(value - maximum); denominator += value; }
+    std::array<double, 256> result{};
+    for (int d = 0; d < 256; ++d) {
+        for (std::size_t item = 0; item < ids.size(); ++item) {
+            result[d] += logits[item] / denominator * decode_cache(v_codes, v_scales, d, ids[item], head, capacity);
+        }
+    }
+    return result;
+}
+
+int bf16_cache_case() {
+    constexpr int capacity = 2053;
+    constexpr int width = 2052; // One invalid suffix, two untouched physical rows.
+    StateFixture state(capacity, ops::QsaKvFormat::BF16);
+    auto state_view = state.view();
+    std::vector<std::uint16_t> keys(width * 512), values(keys.size()), raw(width * 128);
+    std::vector<int> ids(width), positions(width * 3);
+    for (int t = 0; t < width; ++t) {
+        ids[t] = t == width - 1 ? -1 : (37 * t + 11) % 2051;
+        for (int d = 0; d < 512; ++d) {
+            keys[t * 512 + d] = f32_to_bf16(float((t * 13 + d * 7) % 127 - 63) / 256);
+            values[t * 512 + d] = f32_to_bf16(float((t * 19 + d * 3) % 113 - 56) / 64);
+        }
+        // Storage must preserve signed zero and subnormal bits exactly, not re-quantize them.
+        keys[t * 512] = (t & 1) ? 0x8000 : 1;
+        values[t * 512 + 511] = (t & 1) ? 0x8001 : 0;
+        for (int d = 0; d < 128; ++d) { raw[t * 128 + d] = f32_to_bf16(float(t + d) / 512); }
+        for (int a = 0; a < 3; ++a) { positions[t * 3 + a] = t + a; }
+    }
+    auto dk=to_device(keys),dv=to_device(values),dr=to_device(raw),di=to_device(ids),dp=to_device(positions);
+    Tensor kt(dk.p,DType::BF16,{256,2,width}), vt(dv.p,DType::BF16,{256,2,width});
+    Tensor rt(dr.p,DType::BF16,{128,width}),it(di.p,DType::I32,{width}),pt(dp.p,DType::I32,{3,width});
+    std::vector<std::uint16_t> expected_k(capacity*512,0xcdcd),expected_v(expected_k),
+        expected_raw(capacity*128,0xcdcd);
+    std::vector<int> expected_positions(capacity*3,static_cast<int>(0xcdcdcdcd));
+    for(int t=0;t<width-1;++t) {
+        for(int h=0;h<2;++h) for(int d=0;d<256;++d) {
+            const int dest=d+256*(ids[t]+capacity*h),source=d+256*(h+2*t);
+            expected_k[dest]=keys[source]; expected_v[dest]=values[source];
+        }
+        std::copy_n(raw.begin()+128*t,128,expected_raw.begin()+128*ids[t]);
+        std::copy_n(positions.begin()+3*t,3,expected_positions.begin()+3*ids[t]);
+    }
+    int failures=0;
+    for(bool chunked:{false,true}) {
+        state.k_codes.fill(0xcd); state.v_codes.fill(0xcd);
+        state.raw_keys.fill(0xcd); state.positions.fill(0xcd);
+        for(int begin=0;begin<width;) {
+            const int count=chunked ? std::min(17,width-begin) : width;
+            const auto kpart=kt.slice(2,begin,count),vpart=vt.slice(2,begin,count),
+                rpart=rt.slice(1,begin,count),ipart=it.slice(0,begin,count),ppart=pt.slice(1,begin,count);
+            ops::qsa_state_append(kpart,vpart,rpart,ppart,ipart,state_view,nullptr);
+            begin+=count;
+        }
+        cuda_synchronize();
+        failures+=verify_exact("BF16 QSA complete K plane",from_device<std::uint16_t>(state.k_codes.data(),expected_k.size()),expected_k);
+        failures+=verify_exact("BF16 QSA complete V plane",from_device<std::uint16_t>(state.v_codes.data(),expected_v.size()),expected_v);
+        failures+=verify_exact("BF16 QSA complete index plane",from_device<std::uint16_t>(state.raw_keys.data(),expected_raw.size()),expected_raw);
+        failures+=verify_exact("BF16 QSA complete positions",from_device<int>(state.positions.data(),expected_positions.size()),expected_positions);
+    }
+    const auto kc=from_device<std::uint8_t>(state.k_codes.data(),state.k_codes.bytes()),
+        vc=from_device<std::uint8_t>(state.v_codes.data(),state.v_codes.bytes());
+    const std::vector<std::uint8_t> no_scales;
+    std::vector<float> query(256*24*2);
+    fill_uniform(query,90271,-0.25F,0.25F); round_to_bf16(query);
+    auto dq=to_device_bf16(query);
+    GuardedDeviceBuffer output(query.size()*2),workspace(ops::qsa_selected_attention_workspace_bytes());
+    Tensor wt(workspace.data(),DType::U8,{static_cast<int>(workspace.bytes())});
+    for(int count:{0,1,63,64,65,127,128,129,2047,2048,2051}) for(int tokens:{1,2}) {
+        const int bound=std::max(1,count);
+        std::vector<int> selected(bound*tokens,-1),counts(tokens,count);
+        for(int t=0;t<tokens;++t) for(int r=0;r<count;++r) { selected[t*bound+r]=(r*37+11)%2051; }
+        auto ds=to_device(selected),dc=to_device(counts);
+        Tensor qt(dq.p,DType::BF16,{256,24,tokens}),st(ds.p,DType::I32,{bound,tokens}),
+            ct(dc.p,DType::I32,{tokens}),ot(output.data(),DType::BF16,{256,24,tokens});
+        ops::qsa_selected_attention(qt,st,ct,state_view,ot,wt,nullptr);
+        cuda_synchronize();
+        std::vector<double> expected(256*24*tokens);
+        for(int t=0;t<tokens;++t) for(int h=0;h<24;++h) {
+            std::array<double,256> q{};
+            std::copy_n(query.begin()+256*(h+24*t),256,q.begin());
+            const auto result=oracle_attention_head(q,std::span(selected).subspan(t*bound,count),h/12,
+                                                   capacity,kc,no_scales,vc,no_scales);
+            std::copy(result.begin(),result.end(),expected.begin()+256*(h+24*t));
+        }
+        failures+=verify_reduction("BF16 QSA attention FP64 oracle",from_device_bf16(output.data(),expected.size()),
+                                    expected,ReductionCriterion{1.0/256,1e-6,1.0/128});
+        if(count==0) {
+            failures+=verify_exact("BF16 QSA empty attention is exact zero",
+                from_device<std::uint16_t>(output.data(),expected.size()),
+                std::vector<std::uint16_t>(expected.size(),0));
+        }
+    }
+    auto malformed=state_view;
+    malformed.k_scales=Tensor(state.k_scales.data(),DType::FP8_E4M3FN,{16,capacity,2});
+    failures+=expect_invalid_argument("BF16 state with scales",[&]{ops::qsa_state_append(kt,vt,rt,pt,it,malformed,nullptr);});
+    malformed=state_view; malformed.v=malformed.k;
+    failures+=expect_invalid_argument("BF16 state alias",[&]{ops::qsa_state_append(kt,vt,rt,pt,it,malformed,nullptr);});
+    failures+=verify_exact("BF16 QSA attention preserves K",from_device<std::uint16_t>(state.k_codes.data(),expected_k.size()),expected_k);
+    failures+=verify_exact("BF16 QSA attention preserves V",from_device<std::uint16_t>(state.v_codes.data(),expected_v.size()),expected_v);
+    failures+=verify_exact("BF16 QSA attention preserves index",from_device<std::uint16_t>(state.raw_keys.data(),expected_raw.size()),expected_raw);
+    failures+=verify_exact("BF16 QSA attention preserves positions",from_device<int>(state.positions.data(),expected_positions.size()),expected_positions);
+    failures+=state.k_codes.verify_guards("BF16 QSA K"); failures+=state.v_codes.verify_guards("BF16 QSA V");
+    failures+=state.raw_keys.verify_guards("BF16 QSA index"); failures+=state.positions.verify_guards("BF16 QSA positions");
+    failures+=output.verify_guards("BF16 QSA attention"); failures+=workspace.verify_guards("BF16 QSA workspace");
+    return failures;
 }
 
 int verifier_composite_real_shape_case(QType type = QType::GGML_Q5_K) {
@@ -1232,33 +1384,12 @@ int verifier_composite_real_shape_case(QType type = QType::GGML_Q5_K) {
         const auto& token_ids = expected_ids[token];
         for (int head = 0; head < 10; ++head) {
             const int kv_head = head / 12;
-            std::array<double, 10> logits{};
-            double maximum = -INFINITY;
-            for (int item = 0; item < static_cast<int>(token_ids.size()); ++item) {
-                const int id = token_ids[static_cast<std::size_t>(item)];
-                for (int d = 0; d < 256; ++d) {
-                    logits[item] += query[d] *
-                                    decode_cache(k_codes, k_scales, d, id, kv_head, capacity);
-                }
-                logits[item] /= 16.0;
-                maximum = std::max(maximum, logits[item]);
-            }
-            std::array<double, 10> probability{};
-            double denominator = 0.0;
-            for (int item = 0; item < static_cast<int>(token_ids.size()); ++item) {
-                probability[item] = std::exp(logits[item] - maximum);
-                denominator += probability[item];
-            }
+            const auto attention = oracle_attention_head(query, token_ids, kv_head, capacity,
+                                                         k_codes, k_scales, v_codes, v_scales);
             const double raw_gate = (head & 1) == 0 ? 1.0 : -1.0;
             const double gate = 1.0 / (1.0 + std::exp(-raw_gate));
             for (int d = 0; d < 256; ++d) {
-                double attention = 0.0;
-                for (int item = 0; item < static_cast<int>(token_ids.size()); ++item) {
-                    const int id = token_ids[static_cast<std::size_t>(item)];
-                    attention += probability[item] / denominator *
-                                 decode_cache(v_codes, v_scales, d, id, kv_head, capacity);
-                }
-                expected[d + 256 * (head + 10 * token)] = gate * attention;
+                expected[d + 256 * (head + 10 * token)] = gate * attention[d];
             }
         }
     }
@@ -1355,10 +1486,546 @@ int verifier_composite_real_shape_case(QType type = QType::GGML_Q5_K) {
     return failures;
 }
 
+std::vector<double> native_qsa_output_oracle(const quantized_weight::PackedWeight& output,
+    const std::vector<double>& raw_q, const std::array<float,256>& gamma,
+    const std::array<int,3>& position, std::span<const int> causal, int capacity,
+    const std::vector<std::uint8_t>& kc,const std::vector<std::uint8_t>& ks,
+    const std::vector<std::uint8_t>& vc,const std::vector<std::uint8_t>& vs) {
+    std::vector<double> gated(6144);
+    for(int head=0;head<24;++head) {
+        std::array<double,256> query{};
+        std::copy_n(raw_q.begin()+head*512,256,query.begin());
+        query=oracle_core_norm_rope(query,gamma,position);
+        const auto attention=oracle_attention_head(query,causal,head/12,capacity,kc,ks,vc,vs);
+        for(int d=0;d<256;++d) {
+            gated[head*256+d]=attention[d]/(1+std::exp(-raw_q[head*512+256+d]));
+        }
+    }
+    return native_projection_oracle(output,gated);
+}
+
+// Independent exact nearest-code enumeration for the registered NVFP4-G16 state codec.
+// BF16 append input is public; FP32 division and E4M3/E2M1 RNE are codec boundaries.
+void oracle_encode_cache(std::span<const double> values,int token,int head,int capacity,
+    std::vector<std::uint8_t>& codes,std::vector<std::uint8_t>& scales) {
+    if (scales.empty()) {
+        for (int d = 0; d < 256; ++d) {
+            const auto bits = f32_to_bf16(qwen4_sequence::represented(values[d]));
+            const auto offset = 2ULL * (d + 256ULL * (token + static_cast<std::size_t>(capacity) * head));
+            codes[offset] = bits & 255;
+            codes[offset + 1] = bits >> 8;
+        }
+        return;
+    }
+    const auto nearest=[](double magnitude,int count,auto decode) {
+        int best=0;
+        double error=std::numeric_limits<double>::infinity();
+        for(int code=0;code<count;++code) {
+            const double candidate=std::abs(magnitude-decode(code));
+            if(candidate<error || (candidate==error && (code&1)==0)) { best=code;error=candidate; }
+        }
+        return best;
+    };
+    for(int group=0;group<16;++group) {
+        std::array<float,16> represented{};
+        float maximum=0;
+        for(int d=0;d<16;++d) {
+            represented[d]=qwen4_sequence::represented(values[group*16+d]);
+            maximum=std::max(maximum,std::abs(represented[d]));
+        }
+        const auto scale=nearest(static_cast<float>(maximum/6.F),127,decode_e4m3);
+        scales[scale_index(group,token,head,capacity)]=scale;
+        const float divisor=decode_e4m3(scale);
+        for(int pair=0;pair<8;++pair) {
+            unsigned packed=0;
+            for(int item=0;item<2;++item) {
+                const float value=represented[pair*2+item];
+                const float normalized=divisor==0 ? 0 : value/divisor;
+                const auto magnitude=nearest(std::abs(normalized),8,decode_e2m1);
+                packed|=(magnitude|(std::signbit(normalized)?8:0))<<(item*4);
+            }
+            codes[code_index(group*8+pair,token,head,capacity)]=packed;
+        }
+    }
+}
+
+int native_qsa_case(const std::string& path, int width, bool partitioned = false,
+    const qwen4_sequence::Result* sequence_input=nullptr,qwen4_sequence::Result* sequence_output=nullptr,
+    ops::QsaKvFormat cache_format=ops::QsaKvFormat::BF16,const std::string& fp8_path={},
+    std::vector<int>* selection_trace=nullptr) {
+    qwen4_native::Bf16Source source(path, 3);
+    const std::string p = "self_attn.";
+    const auto index_bits = source.bits(p + "indexer.index_qk_proj.weight", {640,2560});
+    const auto iq = qwen4_native::bf16_matrix(std::span(index_bits).first(512*2560), 512, 2560);
+    const auto ik = qwen4_native::bf16_matrix(std::span(index_bits).subspan(512*2560), 128, 2560);
+    auto q = qwen4_native::bf16_matrix(source.bits(p + "q_proj.weight", {12288,2560}), 12288,2560);
+    auto k = qwen4_native::bf16_matrix(source.bits(p + "k_proj.weight", {512,2560}), 512,2560);
+    auto v = qwen4_native::bf16_matrix(source.bits(p + "v_proj.weight", {512,2560}), 512,2560);
+    auto o = qwen4_native::bf16_matrix(source.bits(p + "o_proj.weight", {2560,6144}), 2560,6144);
+    if(!fp8_path.empty()) {
+        artifact::Reader reader(fp8_path);
+        if(reader.identity()!=artifact::ArtifactIdentity{
+            "qwen4/native-fp8-projection-qualification","senfu-fp8-source"}) {
+            throw std::invalid_argument("wrong QSA calibrated source");
+        }
+        const auto replace=[&](quantized_weight::PackedWeight& weight,const char* role) {
+            const auto* object=reader.find(std::string("model.language_model.layers.3.self_attn.")+role+".weight");
+            const auto* descriptor=object?std::get_if<artifact::TensorDescriptor>(object):nullptr;
+            if(!descriptor || descriptor->format!=artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M ||
+                descriptor->layout!=artifact::StorageLayout::TensorCalibratedV1 ||
+                descriptor->shape!=std::vector<std::uint64_t>{static_cast<unsigned>(weight.weight.n),static_cast<unsigned>(weight.weight.k)}) {
+                throw std::invalid_argument("invalid calibrated QSA source role");
+            }
+            const auto raw=reader.payload(*descriptor).data;
+            weight.payload.resize(raw.size());std::memcpy(weight.payload.data(),raw.data(),raw.size());
+            weight.code_plane_bytes=std::uint64_t(weight.weight.n)*weight.weight.k;
+            weight.scale_plane_offset=weight.code_plane_bytes;weight.scale_plane_bytes=8;
+            weight.weight.qtype=QType::FP8_E4M3FN_TENSOR_F32M;
+            weight.weight.layout=QuantLayout::TensorCalibrated;weight.weight.scale_dtype=DType::FP32;
+            weight.weight.payload_bytes=raw.size();weight.weight.scale_ne[0]=2;weight.weight.scale_nb[0]=4;
+            for(int axis=1;axis<4;++axis) { weight.weight.scale_nb[axis]=8; }
+        };
+        replace(q,"q_proj");replace(k,"k_proj");replace(v,"v_proj");replace(o,"o_proj");
+    }
+    auto diq=to_device(iq.payload), dik=to_device(ik.payload), dq=to_device(q.payload),
+         dk=to_device(k.payload), dv=to_device(v.payload), doutw=to_device(o.payload);
+    auto iqn=source.values(p + "indexer.q_layernorm.weight", {128});
+    auto ikn=source.values(p + "indexer.k_layernorm.weight", {128});
+    auto qn=source.values(p + "q_norm.weight", {256});
+    auto kn=source.values(p + "k_norm.weight", {256});
+    for (auto* norm : {&iqn,&ikn,&qn,&kn}) { for (auto& value : *norm) { value += 1.0F; } }
+    auto diqn=to_device_f32(iqn), dikn=to_device_f32(ikn), dqn=to_device_f32(qn), dkn=to_device_f32(kn);
+    ops::QsaVerifierWeights weights{iq.device_weight(diq.p),ik.device_weight(dik.p),q.device_weight(dq.p),
+        k.device_weight(dk.p),v.device_weight(dv.p),o.device_weight(doutw.p),
+        Tensor(diqn.p,DType::FP32,{128}),Tensor(dikn.p,DType::FP32,{128}),
+        Tensor(dqn.p,DType::FP32,{256}),Tensor(dkn.p,DType::FP32,{256})};
+    const int capacity=std::max(16,((width+3)/4)*4);
+    StateFixture state(capacity, cache_format);
+    auto state_view=state.view();
+    std::vector<float> x(width*2560);
+    fill_uniform(x, 30303U, -0.2F, 0.2F); round_to_bf16(x);
+    if(sequence_input) { x=sequence_input->actual; }
+    std::vector<int> ids(width),positions(width*3),visible,offsets{0};
+    for(int t=0;t<width;++t) {
+        ids[t]=t;
+        for(int axis=0;axis<3;++axis) { positions[t*3+axis]=t+axis; }
+        for(int id=0;id<=t;++id) { visible.push_back(id); }
+        offsets.push_back(visible.size());
+    }
+    auto dx=to_device_bf16(x), dids=to_device(ids), dpos=to_device(positions),
+         dvisible=to_device(visible), doffsets=to_device(offsets);
+    GuardedDeviceBuffer out(width*2560*2), selected(width*ops::kQsaSelectedCapacity*4), counts(width*4);
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(width,q.weight.qtype,
+        k.weight.qtype,v.weight.qtype,o.weight.qtype));
+    Tensor xt(dx.p,DType::BF16,{2560,width}), it(dids.p,DType::I32,{width}),pt(dpos.p,DType::I32,{3,width});
+    Tensor vt(dvisible.p,DType::I32,{static_cast<int>(visible.size())}),ot(doffsets.p,DType::I32,{width+1});
+    Tensor st(selected.data(),DType::I32,{ops::kQsaSelectedCapacity,width}),ct(counts.data(),DType::I32,{width});
+    Tensor yt(out.data(),DType::BF16,{2560,width}),wt(workspace.data(),DType::U8,{static_cast<int>(workspace.bytes())});
+    if (!partitioned) {
+        ops::qsa_verifier(xt,it,pt,vt,ot,weights,state_view,st,ct,yt,wt,nullptr);
+    } else {
+        for (int start = 0; start < width;) {
+            const int chunk = start == 0 ? (sequence_input || !fp8_path.empty() ? width-1 : 2) : width - start;
+            const int begin = offsets[start], end = offsets[start + chunk];
+            std::vector<int> local_offsets(offsets.begin()+start,offsets.begin()+start+chunk+1);
+            for (auto& offset : local_offsets) { offset -= begin; }
+            auto local_device = to_device(local_offsets);
+            Tensor chunk_offsets(local_device.p,DType::I32,{chunk+1});
+            auto chunk_x=xt.slice(1,start,chunk), chunk_ids=it.slice(0,start,chunk),
+                 chunk_positions=pt.slice(1,start,chunk), chunk_visible=vt.slice(0,begin,end-begin),
+                 chunk_selected=st.slice(1,start,chunk), chunk_counts=ct.slice(0,start,chunk),
+                 chunk_out=yt.slice(1,start,chunk);
+            ops::qsa_verifier(chunk_x,chunk_ids,chunk_positions,chunk_visible,chunk_offsets,
+                weights,state_view,chunk_selected,chunk_counts,chunk_out,wt,nullptr);
+            cuda_synchronize(); // local CSR storage remains owned through completion.
+            start += chunk;
+        }
+    }
+    cuda_synchronize();
+    auto kc=from_device<std::uint8_t>(state.k_codes.data(),state.k_codes.bytes());
+    auto ks=from_device<std::uint8_t>(state.k_scales.data(),state.k_scales.bytes());
+    auto vc=from_device<std::uint8_t>(state.v_codes.data(),state.v_codes.bytes());
+    auto vs=from_device<std::uint8_t>(state.v_scales.data(),state.v_scales.bytes());
+    if (cache_format == ops::QsaKvFormat::BF16) { ks.clear(); vs.clear(); }
+    auto raw_keys=from_device_bf16(state.raw_keys.data(),capacity*128);
+    auto actual=from_device_bf16(out.data(),width*2560);
+    auto actual_ids=from_device<int>(selected.data(),width*ops::kQsaSelectedCapacity);
+    if(selection_trace) { *selection_trace=actual_ids; }
+    auto actual_counts=from_device<int>(counts.data(),width);
+    int failures=verify_exact("native QSA positions",from_device<int>(state.positions.data(),width*3),positions);
+    std::array<float,256> qgamma{},kgamma{};
+    std::copy(qn.begin(),qn.end(),qgamma.begin()); std::copy(kn.begin(),kn.end(),kgamma.begin());
+    const bool diagnose=sequence_output && cache_format==ops::QsaKvFormat::NVFP4G16;
+    std::vector<std::uint8_t> same_kc(kc.size()),same_ks(ks.size()),same_vc(vc.size()),same_vs(vs.size());
+    std::vector<double> kernel_formula,same_formula;
+    double key_error2=0,key_norm2=0,value_error2=0,value_norm2=0;
+    for(int t=0;t<width;++t) {
+        // All visible IDs fit below the budget; complete blocks may be ranked in another
+        // order at T17. Check exact membership and the complete untouched padding suffix.
+        if(actual_counts[t]!=t+1) { ++failures; }
+        const auto begin=actual_ids.begin()+t*ops::kQsaSelectedCapacity;
+        std::vector<int> membership(begin,begin+t+1);
+        std::sort(membership.begin(),membership.end());
+        for(int item=0;item<=t;++item) { if(membership[item]!=item) { ++failures; } }
+        for(int item=t+1;item<ops::kQsaSelectedCapacity;++item) {
+            if(actual_ids[t*ops::kQsaSelectedCapacity+item]!=-1) { ++failures; }
+        }
+        std::vector<double> input(x.begin()+t*2560,x.begin()+(t+1)*2560);
+        const auto raw_q=native_projection_oracle(q,input),raw_k=native_projection_oracle(k,input),
+                   raw_v=native_projection_oracle(v,input),raw_ik=native_projection_oracle(ik,input);
+        failures+=verify_reduction("native QSA index projection",std::span(raw_keys).subspan(t*128,128),
+                                    raw_ik,ReductionCriterion{1.0/256.0,1e-6,1.0/128.0});
+        const std::array<int,3> position{positions[t*3],positions[t*3+1],positions[t*3+2]};
+        for(int head=0;head<2;++head) {
+            std::array<double,256> key{};
+            std::copy_n(raw_k.begin()+head*256,256,key.begin());
+            key=oracle_core_norm_rope(key,kgamma,position);
+            if(diagnose) {
+                oracle_encode_cache(key,t,head,capacity,same_kc,same_ks);
+                oracle_encode_cache(std::span(raw_v).subspan(head*256,256),t,head,capacity,same_vc,same_vs);
+            }
+            for(int group=0;group<16;++group) {
+                double km=0,vm=0;
+                for(int d=group*16;d<(group+1)*16;++d) {
+                    km=std::max(km,std::abs(key[d])); vm=std::max(vm,std::abs(raw_v[head*256+d]));
+                }
+                for(int d=group*16;d<(group+1)*16;++d) {
+                    const double codec_error=cache_format==ops::QsaKvFormat::BF16 ? 0 : 17.0/96;
+                    const double kb=km/256+1e-4+codec_error*(km+km/256+1e-4);
+                    const double vb=vm/256+1e-4+codec_error*(vm+vm/256+1e-4);
+                    if(std::abs(decode_cache(kc,ks,d,t,head,capacity)-key[d])>kb ||
+                       std::abs(decode_cache(vc,vs,d,t,head,capacity)-raw_v[head*256+d])>vb) { ++failures; }
+                    const double ke=decode_cache(kc,ks,d,t,head,capacity)-key[d],
+                        ve=decode_cache(vc,vs,d,t,head,capacity)-raw_v[head*256+d];
+                    key_error2+=ke*ke;key_norm2+=key[d]*key[d];
+                    value_error2+=ve*ve;value_norm2+=raw_v[head*256+d]*raw_v[head*256+d];
+                }
+            }
+        }
+        std::vector<int> causal(ids.begin(),ids.begin()+t+1);
+        const auto expected=native_qsa_output_oracle(o,raw_q,qgamma,position,causal,capacity,kc,ks,vc,vs);
+        failures+=verify_reduction("native source QSA complete FP64 formula",std::span(actual).subspan(t*2560,2560),
+                                    expected,ReductionCriterion{0.02,2.5e-4,0.02});
+        if(diagnose || !fp8_path.empty()) {
+            kernel_formula.insert(kernel_formula.end(),expected.begin(),expected.end());
+        }
+        if(diagnose) {
+            const auto pure=native_qsa_output_oracle(o,raw_q,qgamma,position,causal,capacity,
+                same_kc,same_ks,same_vc,same_vs);
+            same_formula.insert(same_formula.end(),pure.begin(),pure.end());
+        }
+    }
+    if(!fp8_path.empty()) {
+        double error2=0,norm2=0,maximum=0;
+        for(std::size_t i=0;i<actual.size();++i) {
+            const double error=actual[i]-kernel_formula[i];error2+=error*error;
+            norm2+=kernel_formula[i]*kernel_formula[i];maximum=std::max(maximum,std::abs(error));
+        }
+        std::cout<<"QSA_CALIBRATED_ERRORS local_output_relative_l2="<<std::sqrt(error2/norm2)
+            <<" max_abs="<<maximum<<" K_state_relative_l2="<<std::sqrt(key_error2/key_norm2)
+            <<" V_state_relative_l2="<<std::sqrt(value_error2/value_norm2)<<'\n';
+    }
+    if(sequence_output) {
+        std::vector<std::uint8_t> ideal_kc(kc.size()),ideal_ks(ks.size()),ideal_vc(vc.size()),ideal_vs(vs.size());
+        sequence_output->actual.assign(actual.begin(),actual.end());
+        sequence_output->discrete_ids.assign(actual_ids.begin(),actual_ids.end());
+        std::vector<float> computed_reference(actual.size());
+        const auto& reference_input=sequence_input->reference;
+        for(int t=0;t<width;++t) {
+            std::vector<double> input(reference_input.begin()+t*2560,
+                reference_input.begin()+(t+1)*2560);
+            const auto raw_q=native_projection_oracle(q,input),raw_k=native_projection_oracle(k,input),
+                raw_v=native_projection_oracle(v,input);
+            const std::array<int,3> position{positions[t*3],positions[t*3+1],positions[t*3+2]};
+            for(int head=0;head<2;++head) {
+                std::array<double,256> key{};
+                std::copy_n(raw_k.begin()+head*256,256,key.begin());
+                key=oracle_core_norm_rope(key,kgamma,position);
+                oracle_encode_cache(key,t,head,capacity,ideal_kc,ideal_ks);
+                oracle_encode_cache(std::span(raw_v).subspan(head*256,256),t,head,capacity,ideal_vc,ideal_vs);
+            }
+            const std::vector<int> causal(ids.begin(),ids.begin()+t+1);
+            const auto expected=native_qsa_output_oracle(o,raw_q,qgamma,position,causal,capacity,
+                ideal_kc,ideal_ks,ideal_vc,ideal_vs);
+            const auto represented=qwen4_sequence::represented(expected);
+            std::copy(represented.begin(),represented.end(),computed_reference.begin()+t*2560);
+        }
+        sequence_output->reference=std::move(computed_reference);
+        if(diagnose) {
+            // Public BF16-state cross-check isolates codec input rounding. This is a
+            // diagnostic implementation comparison, not the independent formula above.
+            StateFixture public_bf16(capacity,ops::QsaKvFormat::BF16);
+            auto public_view=public_bf16.view();
+            for(int start=0;start<width;) {
+                const int chunk=partitioned ? (start==0 ? width-1:1):width;
+                const int begin=offsets[start],end=offsets[start+chunk];
+                std::vector<int> local(offsets.begin()+start,offsets.begin()+start+chunk+1);
+                for(auto& offset:local) { offset-=begin; }
+                auto local_device=to_device(local);
+                auto xx=xt.slice(1,start,chunk),ii=it.slice(0,start,chunk),pp=pt.slice(1,start,chunk),
+                    vv=vt.slice(0,begin,end-begin),ss=st.slice(1,start,chunk),cc=ct.slice(0,start,chunk),
+                    yy=yt.slice(1,start,chunk);
+                Tensor oo(local_device.p,DType::I32,{chunk+1});
+                ops::qsa_verifier(xx,ii,pp,vv,oo,weights,public_view,ss,cc,yy,wt,nullptr);
+                cuda_synchronize();start+=chunk;
+            }
+            const auto bk=from_device<std::uint8_t>(public_bf16.k_codes.data(),public_bf16.k_codes.bytes()),
+                bv=from_device<std::uint8_t>(public_bf16.v_codes.data(),public_bf16.v_codes.bytes());
+            std::vector<std::uint8_t> encoded_k(kc.size()),encoded_ks(ks.size()),
+                encoded_v(vc.size()),encoded_vs(vs.size()),empty;
+            for(int t=0;t<width;++t) for(int h=0;h<2;++h) {
+                std::array<double,256> key{},value{};
+                for(int d=0;d<256;++d) {
+                    key[d]=decode_cache(bk,empty,d,t,h,capacity);
+                    value[d]=decode_cache(bv,empty,d,t,h,capacity);
+                }
+                oracle_encode_cache(key,t,h,capacity,encoded_k,encoded_ks);
+                oracle_encode_cache(value,t,h,capacity,encoded_v,encoded_vs);
+            }
+            const auto compare_cache=[&](const char* label,const auto& ac,const auto& as,
+                const auto& bc,const auto& bs) {
+                int codes=0,scales=0;double error2=0,norm2=0,maximum=0;
+                for(int h=0;h<2;++h) for(int t=0;t<width;++t) {
+                    for(int g=0;g<16;++g) { scales+=as[scale_index(g,t,h,capacity)]!=bs[scale_index(g,t,h,capacity)]; }
+                    for(int d=0;d<256;++d) {
+                        const auto offset=code_index(d/2,t,h,capacity);
+                        const int shift=4*(d&1);
+                        codes+=((ac[offset]>>shift)&15)!=((bc[offset]>>shift)&15);
+                        const double a=decode_cache(ac,as,d,t,h,capacity),b=decode_cache(bc,bs,d,t,h,capacity);
+                        error2+=(a-b)*(a-b);norm2+=b*b;maximum=std::max(maximum,std::abs(a-b));
+                    }
+                }
+                std::cout<<"NVFP4_STATE_DIAG T="<<width<<" chunk="<<partitioned<<" comparison="<<label
+                    <<" code_differences="<<codes<<"/"<<width*512<<" scale_differences="<<scales<<"/"<<width*32
+                    <<" decoded_relative_l2="<<std::sqrt(error2/norm2)<<" max_abs="<<maximum<<'\n';
+                return codes+scales;
+            };
+            failures+=compare_cache("gpu_vs_publicBF16_codec_K",kc,ks,encoded_k,encoded_ks)!=0;
+            failures+=compare_cache("gpu_vs_publicBF16_codec_V",vc,vs,encoded_v,encoded_vs)!=0;
+            compare_cache("gpu_vs_sameInput_formula_K",kc,ks,same_kc,same_ks);
+            compare_cache("gpu_vs_sameInput_formula_V",vc,vs,same_vc,same_vs);
+            compare_cache("sameInput_vs_propagated_formula_K",same_kc,same_ks,ideal_kc,ideal_ks);
+            compare_cache("sameInput_vs_propagated_formula_V",same_vc,same_vs,ideal_vc,ideal_vs);
+            const auto report=[&](const char* label,const auto& a,const auto& b) {
+                double e=0,n=0,m=0;
+                for(std::size_t i=0;i<a.size();++i) { const double d=double(a[i])-double(b[i]);e+=d*d;n+=double(b[i])*b[i];m=std::max(m,std::abs(d)); }
+                std::cout<<"NVFP4_OUTPUT_DIAG T="<<width<<" chunk="<<partitioned<<" comparison="<<label
+                    <<" relative_l2="<<std::sqrt(e/n)<<" max_abs="<<m<<'\n';
+            };
+            report("GPU_vs_actualCache_formula",actual,kernel_formula);
+            report("actualCache_vs_sameInput_formula",kernel_formula,same_formula);
+            report("sameInput_vs_propagated_formula",same_formula,sequence_output->reference);
+        }
+    }
+    failures+=out.verify_guards("native QSA output");
+    failures+=selected.verify_guards("native QSA selected IDs");
+    failures+=counts.verify_guards("native QSA selected counts");
+    failures+=workspace.verify_guards("native QSA workspace");
+    failures+=state.k_codes.verify_guards("native QSA K codes");
+    failures+=state.v_codes.verify_guards("native QSA V codes");
+    failures+=state.k_scales.verify_guards("native QSA K scales");
+    failures+=state.v_scales.verify_guards("native QSA V scales");
+    failures+=state.raw_keys.verify_guards("native QSA raw index keys");
+    failures+=state.positions.verify_guards("native QSA positions");
+    return failures;
+}
+
+// Assessment hypothesis, not a registered runtime codec: independent nearest-code
+// enumeration, per-token/head FP32 scale, explicit FP32 reconstruction then BF16.
+std::uint8_t assessment_e4m3(float value) {
+    int best=0; double error=INFINITY;
+    for(int code=0;code<=126;++code) {
+        const double distance=std::abs(double(std::abs(value))-decode_e4m3(code));
+        if(distance<error || (distance==error && !(code&1))) { best=code;error=distance; }
+    }
+    return best | (std::signbit(value)?128:0);
+}
+
+int native_fp8_kv_assessment(const std::string& path) {
+    constexpr int width=129,capacity=129;
+    int failures=0;
+    for(const auto [value,code]:std::array<std::pair<float,int>,9>{{
+        {0.F,0},{-0.F,128},{1.F,56},{1.0625F,56},{1.1875F,58},
+        {448.F,126},{1000.F,126},{-1000.F,254},{0.0009765625F,0}}}) {
+        if(assessment_e4m3(value)!=code) { ++failures; }
+    }
+    qwen4_native::Bf16Source source(path,3);
+    const auto q=qwen4_native::bf16_matrix(source.bits("self_attn.q_proj.weight",{12288,2560}),12288,2560);
+    const auto k=qwen4_native::bf16_matrix(source.bits("self_attn.k_proj.weight",{512,2560}),512,2560);
+    const auto v=qwen4_native::bf16_matrix(source.bits("self_attn.v_proj.weight",{512,2560}),512,2560);
+    const auto o=qwen4_native::bf16_matrix(source.bits("self_attn.o_proj.weight",{2560,6144}),2560,6144);
+    const auto qn=source.values("self_attn.q_norm.weight",{256}),kn=source.values("self_attn.k_norm.weight",{256});
+    std::array<float,256> qgamma{},kgamma{};
+    for(int d=0;d<256;++d) { qgamma[d]=1.F+qn[d];kgamma[d]=1.F+kn[d]; }
+    std::vector<float> x(width*2560),queries(width*6144);
+    fill_uniform(x,30303U,-.2F,.2F);round_to_bf16(x);
+    std::vector<std::vector<double>> raw_queries(width);
+    std::vector<std::uint8_t> original_k(width*512*2),original_v(original_k.size()),empty;
+    for(int t=0;t<width;++t) {
+        const std::vector<double> input(x.begin()+t*2560,x.begin()+(t+1)*2560);
+        raw_queries[t]=native_projection_oracle(q,input);
+        const auto raw_k=native_projection_oracle(k,input),raw_v=native_projection_oracle(v,input);
+        const std::array<int,3> position{t+37,t+38,t+39};
+        for(int h=0;h<24;++h) {
+            std::array<double,256> query{};
+            std::copy_n(raw_queries[t].begin()+h*512,256,query.begin());
+            query=oracle_core_norm_rope(query,qgamma,position);
+            for(int d=0;d<256;++d) { queries[t*6144+h*256+d]=qwen4_sequence::represented(query[d]); }
+        }
+        for(int h=0;h<2;++h) {
+            std::array<double,256> key{};
+            std::copy_n(raw_k.begin()+h*256,256,key.begin());
+            key=oracle_core_norm_rope(key,kgamma,position);
+            oracle_encode_cache(key,t,h,capacity,original_k,empty);
+            oracle_encode_cache(std::span(raw_v).subspan(h*256,256),t,h,capacity,original_v,empty);
+        }
+    }
+    const auto compress=[&](const std::vector<std::uint8_t>& input) {
+        auto result=input;
+        for(int h=0;h<2;++h) for(int t=0;t<width;++t) {
+            float maximum=0;
+            for(int d=0;d<256;++d) { maximum=std::max(maximum,float(std::abs(decode_cache(input,empty,d,t,h,capacity)))); }
+            const float scale=maximum==0 ? 1.F : maximum/448.F;
+            for(int d=0;d<256;++d) {
+                const float value=decode_cache(input,empty,d,t,h,capacity);
+                const auto code=assessment_e4m3(value/scale);
+                const float reconstructed=float(decode_e4m3(code))*scale;
+                const auto bits=f32_to_bf16(reconstructed);
+                const auto offset=2*(d+256*(t+capacity*h));
+                result[offset]=bits&255;result[offset+1]=bits>>8;
+            }
+        }
+        return result;
+    };
+    const auto compressed_k=compress(original_k),compressed_v=compress(original_v);
+    const std::vector<std::uint8_t> zero_cache(original_k.size(),0);
+    failures+=verify_exact("FP8 candidate zero-row reconstruction",compress(zero_cache),zero_cache);
+    std::vector<int> selected(width*width,-1),counts(width);
+    for(int t=0;t<width;++t) { counts[t]=t+1;for(int id=0;id<=t;++id) { selected[t*width+id]=id; } }
+    auto dq=to_device_bf16(queries),ds=to_device(selected),dc=to_device(counts);
+    GuardedDeviceBuffer out(width*6144*2),workspace(ops::qsa_selected_attention_workspace_bytes());
+    Tensor qt(dq.p,DType::BF16,{256,24,width}),st(ds.p,DType::I32,{width,width}),
+        ct(dc.p,DType::I32,{width}),ot(out.data(),DType::BF16,{256,24,width}),
+        wt(workspace.data(),DType::U8,{static_cast<int>(workspace.bytes())});
+    std::vector<double> baseline_attention,baseline_output;
+    for(int mode=0;mode<4;++mode) {
+        const auto& kc=(mode&1)?compressed_k:original_k;
+        const auto& vc=(mode&2)?compressed_v:original_v;
+        std::vector<double> expected(width*6144),projected;
+        for(int t=0;t<width;++t) {
+            std::vector<double> gated(6144);
+            for(int h=0;h<24;++h) {
+                std::array<double,256> query{};
+                std::copy_n(queries.begin()+t*6144+h*256,256,query.begin());
+                const auto attention=oracle_attention_head(query,std::span(selected).subspan(t*width,t+1),
+                    h/12,capacity,kc,empty,vc,empty);
+                for(int d=0;d<256;++d) {
+                    expected[t*6144+h*256+d]=attention[d];
+                    gated[h*256+d]=attention[d]/(1+std::exp(-raw_queries[t][h*512+256+d]));
+                }
+            }
+            const auto output=native_projection_oracle(o,gated);
+            projected.insert(projected.end(),output.begin(),output.end());
+        }
+        if(mode==0) { baseline_attention=expected;baseline_output=projected;continue; }
+        const auto report=[&](const char* label,const auto& reference,const auto& candidate) {
+            double error2=0,norm2=0,maximum=0;
+            for(std::size_t i=0;i<reference.size();++i) {
+                const double error=candidate[i]-reference[i];error2+=error*error;
+                norm2+=reference[i]*reference[i];maximum=std::max(maximum,std::abs(error));
+            }
+            std::cout<<"FP8_KV_ASSESS mode="<<mode<<" boundary="<<label<<" relative_l2="
+                <<std::sqrt(error2/norm2)<<" max_abs="<<maximum<<'\n';
+            if(!std::isfinite(error2) || !std::isfinite(norm2)) { ++failures; }
+        };
+        report("attention",baseline_attention,expected);report("output_projection",baseline_output,projected);
+        StateFixture state(capacity,ops::QsaKvFormat::BF16);auto view=state.view();
+        cudaMemcpy(state.k_codes.data(),kc.data(),kc.size(),cudaMemcpyHostToDevice);
+        cudaMemcpy(state.v_codes.data(),vc.data(),vc.size(),cudaMemcpyHostToDevice);
+        for(bool partitioned:{false,true}) {
+            for(int start=0;start<width;) {
+                const int chunk=partitioned ? (start==0?128:1) : width;
+                auto qpart=qt.slice(2,start,chunk),spart=st.slice(1,start,chunk),
+                    cpart=ct.slice(0,start,chunk),opart=ot.slice(2,start,chunk);
+                ops::qsa_selected_attention(qpart,spart,cpart,view,opart,wt,nullptr);
+                start+=chunk;
+            }
+            cuda_synchronize();
+            failures+=verify_reduction("candidate decoded BF16 attention same-input FP64 oracle",
+                from_device_bf16(out.data(),expected.size()),expected,ReductionCriterion{1.0/256,1e-6,1.0/128});
+        }
+        failures+=verify_exact("FP8 candidate frozen selection",from_device<int>(ds.p,selected.size()),selected);
+        failures+=verify_exact("FP8 candidate immutable K",from_device<std::uint8_t>(state.k_codes.data(),kc.size()),kc);
+        failures+=verify_exact("FP8 candidate immutable V",from_device<std::uint8_t>(state.v_codes.data(),vc.size()),vc);
+    }
+    failures+=out.verify_guards("FP8 assessment output");
+    failures+=workspace.verify_guards("FP8 assessment workspace");
+    std::cout<<"FP8_KV_ASSESS payload_fraction=0.5078125 selected_ids=frozen hypothesis_only\n";
+    return failures;
+}
+
 } // namespace
 
-int main() {
+#ifdef NINFER_QWEN4_SEQUENCE_COMPONENTS
+namespace ninfer::test::qwen4_sequence {
+Result qsa(const std::string& path,const Result& input,bool partitioned,bool diagnostic_nvfp4) {
+    Result output;
+    output.failures=native_qsa_case(path,input.actual.size()/2560,partitioned,&input,&output,
+        diagnostic_nvfp4 ? ops::QsaKvFormat::NVFP4G16 : ops::QsaKvFormat::BF16);
+    return output;
+}
+Result qsa_calibrated(const std::string& root,const std::string& path,const Result& input,
+                     bool partitioned) {
+    Result output;
+    output.failures=native_qsa_case(path,input.actual.size()/2560,partitioned,&input,&output,
+        ops::QsaKvFormat::BF16,root+"/qwen4-fp8-projections.ninfer");
+    return output;
+}
+}
+#else
+int main(int argc,char** argv) {
     if (require_cuda() != 0) { return 1; }
+    if(argc==2 && std::string_view(argv[1])=="--native-fp8-real") {
+        const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
+        if(!root) { return 77; }
+        const std::string source=std::string(root)+"/qwen4-layer-3.ninfer",
+            calibrated=std::string(root)+"/qwen4-fp8-projections.ninfer";
+        int failures=0;
+        for(int width:{1,24,129}) {
+            std::vector<int> baseline_selection;
+            for(bool partitioned:{false,true}) {
+                if(partitioned && width!=129) { continue; }
+                std::vector<int> selection;
+                const int result=native_qsa_case(source,width,partitioned,nullptr,nullptr,
+                    ops::QsaKvFormat::BF16,calibrated,&selection);
+                failures+=result;
+                if(!partitioned) { baseline_selection=selection; }
+                failures+=verify_exact("QSA calibrated protected selector",selection,baseline_selection);
+                std::cout<<"QSA_CALIBRATED profile=A16 T="<<width
+                    <<" chunk="<<partitioned<<" screen_failures="<<result<<std::endl;
+            }
+        }
+        return failures?1:0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--native-fp8-kv-assessment") {
+        const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
+        if(!root) { return 77; }
+        return native_fp8_kv_assessment(std::string(root)+"/qwen4-layer-3.ninfer")?1:0;
+    }
+    if(argc==2 && std::string_view(argv[1])=="--native-real") {
+        const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
+        if(!root) { return 77; }
+        int failures=0;
+        for(int width:{1,5,27,28,128,129}) {
+            failures+=native_qsa_case(std::string(root)+"/qwen4-layer-3.ninfer",width);
+        }
+        failures+=native_qsa_case(std::string(root)+"/qwen4-layer-3.ninfer",5,true);
+        failures+=native_qsa_case(std::string(root)+"/qwen4-layer-3.ninfer",5,false,nullptr,nullptr,
+                                 ops::QsaKvFormat::NVFP4G16);
+        std::cout<<(failures?"FAIL":"PASS")<<" native source QSA\n";
+        return failures?1:0;
+    }
+    if(argc!=1) { std::cerr<<"Unknown QSA test argument\n"; return 1; }
     int failures = 0;
     failures += append_codec_and_attention_case();
     failures += append_alignment_and_state_validation_case();
@@ -1367,7 +2034,13 @@ int main() {
     failures += selector_route_switch_and_malformed_case();
     failures += selector_score_order_case();
     failures += selected_attention_capacity_case();
+    failures += bf16_cache_case();
+    failures += selector_ceiling_and_permutation_case(ops::QsaKvFormat::BF16);
+    failures += selector_boundary_ties_case(ops::QsaKvFormat::BF16);
+    failures += selector_route_switch_and_malformed_case(ops::QsaKvFormat::BF16);
+    failures += selector_score_order_case(ops::QsaKvFormat::BF16);
     failures += verifier_composite_real_shape_case();
+    failures += verifier_composite_real_shape_case(QType::BF16_CTRL);
     failures += verifier_composite_real_shape_case(QType::NVFP4);
     failures += verifier_composite_real_shape_case(QType::FP8_E4M3FN_ROW_BF16S);
     if (failures != 0) {
@@ -1377,3 +2050,4 @@ int main() {
     std::cout << "qsa tests passed\n";
     return 0;
 }
+#endif

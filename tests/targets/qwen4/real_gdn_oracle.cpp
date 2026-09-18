@@ -473,7 +473,8 @@ int run_layer(const char* label, const ops::GatedDeltaNetLayerWeights& weights,
     Tensor recurrence_out_tensor(device_recurrence_out.data(), DType::FP32,
                                  {kHeadDim, kHeadDim, kValueHeads});
     Tensor output_tensor(device_output.data(), DType::BF16, {kHidden});
-    WorkspaceArena workspace(ops::gated_delta_net_layer_workspace_capacity_bytes());
+    WorkspaceArena workspace(ops::gated_delta_net_layer_workspace_capacity_bytes(
+        1, weights.qkv.qtype, weights.z.qtype, weights.output.qtype));
     ops::gated_delta_net_layer(x_tensor, weights, conv_in_tensor, conv_out_tensor,
                                recurrence_in_tensor, recurrence_out_tensor, output_tensor,
                                workspace, device.stream);
@@ -511,7 +512,7 @@ std::vector<std::uint16_t> layer_zero_program_x(const verifier::LoadedModel& mod
     GuardedDeviceBuffer device_x(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
     device_x.fill(0xcd);
     Tensor x_tensor(device_x.data(), DType::BF16, {kHidden});
-    WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes());
+    WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
     const verifier::GrWeights& gr = model.view().layers[0].attention_gr;
     ops::gated_residual_read(state.residual(), gr.norm, gr.down, gr.up, x_tensor, workspace,
                              device.stream);
@@ -546,7 +547,7 @@ std::vector<std::uint16_t> layer_two_program_x(const verifier::LoadedModel& mode
                                    device.stream));
         Tensor residual_tensor(layer_one_residual.p, DType::BF16, {kHidden, kBranches});
         Tensor x_tensor(device_x.data(), DType::BF16, {kHidden});
-        WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes());
+        WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
         const verifier::GrWeights& gr = model.view().layers[2].attention_gr;
         ops::gated_residual_read(residual_tensor, gr.norm, gr.down, gr.up, x_tensor, workspace,
                                  device.stream);
@@ -640,7 +641,7 @@ AccumulatedFixture accumulated_layer_32_position_60(const verifier::LoadedModel&
 
         Tensor x_tensor(device_x.data(), DType::BF16, {kHidden});
         Tensor scale_tensor(device_scale.data(), DType::BF16, {kBranches});
-        WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes());
+        WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
         const verifier::GrWeights& gr = model.view().layers[kAccumulatedLayer].attention_gr;
         ops::gated_residual_read_write(result.gr[31].ffn_residual, gr.norm, gr.down, gr.up,
                                        gr.inject, x_tensor, scale_tensor, workspace,

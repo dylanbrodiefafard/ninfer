@@ -89,6 +89,7 @@ ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_ben
 ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES ops/sparse_moe_bench.cu)
 ninfer_add_op_bench(ninfer_qsa_bench SOURCES ops/qsa_bench.cu)
 ninfer_add_op_bench(ninfer_gated_residual_bench SOURCES ops/gated_residual_bench.cu)
+ninfer_add_op_bench(ninfer_ple_transfer_bench SOURCES ops/ple_transfer_bench.cpp)
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES ops/linear_pair_bench.cu)
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES ops/mtp_pack_bench.cu)
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES ops/proposal_remap_bench.cu)

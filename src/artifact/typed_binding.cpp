@@ -24,8 +24,16 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::RowSplitK128V1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
+    case NumericFormat::NVFP4_EXPERT_F32M:
+        return StorageLayout::ExpertBlockScaleK16M128x4V1;
+    case NumericFormat::NVFP4_PARTITION_F32M:
+        return StorageLayout::PartitionedRowBlockScaleK16V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::FP8_E4M3FN_TENSOR_BF16S:
+        return StorageLayout::TensorScaleV1;
+    case NumericFormat::FP8_E4M3FN_TENSOR_F32M:
+        return StorageLayout::TensorCalibratedV1;
     case NumericFormat::Q8_0:
     case NumericFormat::Q4_K:
     case NumericFormat::Q5_K:
@@ -56,8 +64,15 @@ QType qtype_for(NumericFormat format) {
         return QType::W8G32_F16S;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
+    case NumericFormat::NVFP4_EXPERT_F32M:
+        return QType::NVFP4_EXPERT_F32M;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::FP8_E4M3FN_TENSOR_F32M:
+        return QType::FP8_E4M3FN_TENSOR_F32M;
+    case NumericFormat::FP8_E4M3FN_TENSOR_BF16S:
+    case NumericFormat::NVFP4_PARTITION_F32M:
+        throw std::invalid_argument("embedding table is not a Linear Weight");
     case NumericFormat::Q8_0:
         return QType::GGML_Q8_0;
     case NumericFormat::Q4_K:
@@ -248,6 +263,9 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
     case TensorPlacement::MappedHost:
         binder.map_tensor_on_host(handle);
         break;
+    case TensorPlacement::ResidentHost:
+        binder.map_tensor_on_host(handle, true);
+        break;
     case TensorPlacement::ValidateOnly:
         binder.validate_only(handle);
         break;
@@ -276,6 +294,29 @@ Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandl
 
 Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
                            NumericFormat format, std::int32_t rows, std::int32_t columns) {
+    if (format == NumericFormat::FP8_E4M3FN_TENSOR_F32M) {
+        if (rows <= 0 || columns <= 0) { throw std::invalid_argument("FP8 matrix dimensions must be positive"); }
+        const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(rows), static_cast<std::uint64_t>(columns)};
+        const auto geometry = tensor_calibrated_geometry(format, shape);
+        Weight out{};
+        out.payload = materialized.device_data(handle); out.qdata = out.payload;
+        out.payload_bytes = geometry.encoded_bytes;
+        out.scales = static_cast<const std::byte*>(out.payload) + geometry.multiplier_offset;
+        out.qtype = QType::FP8_E4M3FN_TENSOR_F32M; out.layout = QuantLayout::TensorCalibrated;
+        out.scale_dtype = DType::FP32; out.ndim = 2; out.n = rows; out.k = columns;
+        out.shape[0] = out.padded_shape[0] = rows;
+        out.shape[1] = out.padded_shape[1] = columns;
+        out.scale_ne[0] = 2; out.scale_nb[0] = 4;
+        for (int i = 1; i < 4; ++i) { out.scale_nb[i] = 8; }
+        return out;
+    }
+    if (format == NumericFormat::FP8_E4M3FN_TENSOR_BF16S ||
+        format == NumericFormat::NVFP4_PARTITION_F32M) {
+        throw std::invalid_argument("embedding table is not a Linear Weight");
+    }
+    if (format == NumericFormat::NVFP4_EXPERT_F32M) {
+        throw std::invalid_argument("materialized_weight: use rank-three expert bank binding");
+    }
     if (format == NumericFormat::NVFP4) {
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
@@ -298,6 +339,32 @@ Weight materialized_ggml_block_weight(const MaterializedArtifact& materialized,
                                       std::initializer_list<std::int32_t> shape) {
     return ggml_block_weight(materialized, handle, format,
                              std::span<const std::int32_t>(shape.begin(), shape.size()));
+}
+
+Weight materialized_nvfp4_expert_weight(const MaterializedArtifact& materialized,
+                                        ObjectHandle handle, std::int32_t experts,
+                                        std::int32_t rows, std::int32_t columns) {
+    if (experts <= 0 || rows <= 0 || columns <= 0) {
+        throw std::invalid_argument("NVFP4 expert dimensions must be positive");
+    }
+    const std::array<std::uint64_t, 3> shape = {
+        static_cast<std::uint64_t>(experts), static_cast<std::uint64_t>(rows),
+        static_cast<std::uint64_t>(columns)};
+    const auto geometry = expert_block_scale_geometry(NumericFormat::NVFP4_EXPERT_F32M, shape);
+    Weight out{};
+    out.payload = materialized.device_data(handle);
+    out.qdata = out.payload;
+    out.scales = static_cast<const std::byte*>(out.payload) + geometry.scale_plane_offset;
+    out.payload_bytes = geometry.encoded_bytes;
+    out.qtype = QType::NVFP4_EXPERT_F32M;
+    out.scale_dtype = DType::FP8_E4M3FN;
+    out.layout = QuantLayout::ExpertBlockScaleK16M128x4;
+    out.ndim = 3;
+    out.n = rows; out.k = columns; out.group = 16; out.group_size = 16;
+    out.shape[0] = out.padded_shape[0] = experts;
+    out.shape[1] = out.padded_shape[1] = rows;
+    out.shape[2] = out.padded_shape[2] = columns;
+    return out;
 }
 
 Weight ggml_block_matrix_view(const Weight& bank, std::int32_t matrix_index) {
