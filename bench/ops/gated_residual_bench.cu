@@ -158,7 +158,7 @@ struct Fixture {
           write_weight(make_f32(static_cast<std::size_t>(kBranches) * kFlat, 0x7104U, 0.003F)),
           x(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t)),
           write_scale(static_cast<std::size_t>(kBranches) * sizeof(std::uint16_t)),
-          workspace(ninfer::ops::gated_residual_workspace_capacity_bytes()),
+          workspace(ninfer::ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0)),
           residual_tensor(residual.p, ninfer::DType::BF16, {kHidden, kBranches}),
           norm_tensor(norm_weight.p, ninfer::DType::FP32, {kFlat}),
           down(q8_weight(down_data.p, down_data.bytes, kRank, kFlat)),

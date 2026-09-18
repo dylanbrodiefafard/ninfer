@@ -11,29 +11,31 @@
 namespace ninfer::ops {
 
 /** Caller-owned transient capacity for C=1, T<=max_tokens and the explicit projection formats.
- * Defaults describe the GGUF verifier. Native formats use Linear A16Only. */
+ * Native formats use Linear A16Only; no diagnostic quantization is selected implicitly. */
 [[nodiscard]] std::size_t
-gated_residual_workspace_capacity_bytes(std::int32_t max_tokens = 1,
-                                        QType down = QType::GGML_Q8_0,
-                                        QType up = QType::GGML_Q8_0);
+gated_residual_workspace_capacity_bytes(std::int32_t max_tokens, QType down, QType up);
 
 /**
  * Op: gated_residual_read
  *
  * For contiguous BF16 residual branches R [2560,4,T], independently applies RMSNorm with epsilon
- * 1e-6 and the converted GGUF FP32 gamma [10240]. GGUF has already folded the source checkpoint's
- * zero-centered unit offset into gamma. For their branch-major concatenation Rhat:
+ * 1e-6 and effective FP32 gamma [10240]. Native BF16 source norm words are losslessly widened
+ * and receive their zero-centered unit offset in FP32 before binding this view; diagnostic
+ * GGUF conversion has already folded that offset into gamma. For branch-major concatenation Rhat:
  *
  *   u = SiLU(W_down Rhat / 4)
  *   G = reshape(sigmoid(W_up u), [4,2560])
  *   x = (1/4) * sum_i G_i * Rhat_i.
  *
- * down_weight is Q8_0 or row-scaled FP8 [320,10240]; up_weight is Q8_0, row-scaled FP8 or
+ * down_weight is BF16, Q8_0 or row-scaled FP8 [320,10240]; up_weight is BF16, Q8_0, row-scaled FP8 or
  * NVFP4 [10240,320]. N=320 makes down_weight ineligible for the NVFP4 physical layout. x is the
  * represented BF16 [2560,T] output. This entry admits C=1 and T in [1,4096]. Each token column is
  * independent; T=1 retains the verifier decode route. The ideal oracle
  * exact-decodes both matrices and evaluates the complete formula naively in FP64 from represented
  * inputs; internal BF16 staging is an implementation profile, not an additional semantic output.
+ * The native BF16/BF16 profile keeps normalization, read projections and activation in FP32
+ * internally to protect sensitive real-checkpoint gates. The public input/output and write-scale
+ * representations remain BF16; quantized/mixed weight profiles retain their qualified routes.
  * Inputs, weights, output, and live workspace are pairwise non-overlapping. Execution is
  * asynchronous on stream.
  */

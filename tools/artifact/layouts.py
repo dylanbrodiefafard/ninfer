@@ -21,8 +21,12 @@ import torch
 from .numeric import (
     DirectFormat,
     Fp8RowFormat,
+    Fp8TensorFormat,
+    Fp8CalibratedFormat,
     GgmlBlockFormat,
     Nvfp4Format,
+    Nvfp4ExpertFormat,
+    Nvfp4PartitionFormat,
     NumericFormat,
     QuantFormat,
     get_format,
@@ -86,6 +90,46 @@ class RowScaleGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpertBlockScaleGeometry:
+    experts: int
+    n: int
+    k: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    weight_multiplier_offset: int
+    input_multiplier_offset: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TensorScaleGeometry:
+    n: int
+    k: int
+    code_plane_bytes: int
+    scale_offset: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionBlockScaleGeometry:
+    partitions: int
+    rows: int
+    columns: int
+    row_bytes: int
+    multiplier_offset: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TensorCalibratedGeometry:
+    rows: int
+    columns: int
+    multiplier_offset: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class GgmlBlockGeometry:
     shape: tuple[int, ...]
     matrices: int
@@ -131,6 +175,14 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
+EXPERT_BLOCKSCALE_K16_M128X4_V1 = Layout(
+    "expert-blockscale-k16-m128x4-v1", 256, frozenset(("NVFP4_EXPERT_F32M",))
+)
+TENSOR_SCALE_V1 = Layout("tensor-scale-v1", 256, frozenset(("FP8_E4M3FN_TENSOR_BF16S",)))
+TENSOR_CALIBRATED_V1 = Layout("tensor-calibrated-v1", 256, frozenset(("FP8_E4M3FN_TENSOR_F32M",)))
+PARTITIONED_ROW_BLOCKSCALE_K16_V1 = Layout(
+    "partitioned-row-blockscale-k16-v1", 256, frozenset(("NVFP4_PARTITION_F32M",))
+)
 
 GGML_BLOCK_ROW_V1 = Layout(
     "ggml-block-row-v1",
@@ -145,6 +197,10 @@ LAYOUTS = MappingProxyType(
             CONTIGUOUS_LE_V1,
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
+            EXPERT_BLOCKSCALE_K16_M128X4_V1,
+            TENSOR_SCALE_V1,
+            TENSOR_CALIBRATED_V1,
+            PARTITIONED_ROW_BLOCKSCALE_K16_V1,
             ROW_SCALE_V1,
             GGML_BLOCK_ROW_V1,
         )
@@ -271,6 +327,52 @@ def block_scale_geometry(
     )
 
 
+def expert_block_scale_geometry(
+    format: str | Nvfp4ExpertFormat, shape: Sequence[int]
+) -> ExpertBlockScaleGeometry:
+    if not isinstance(_format(format), Nvfp4ExpertFormat):
+        raise ValueError("expert blockscale layout requires NVFP4_EXPERT_F32M")
+    e, n, k = _shape(shape, rank=3)
+    matrix = block_scale_geometry("NVFP4", (n, k))
+    codes = e * matrix.code_plane_bytes
+    scales_offset = align_up(codes, PLANE_ALIGNMENT)
+    scales = e * matrix.scale_plane_bytes
+    weight_offset = scales_offset + scales
+    input_offset = weight_offset + 4 * e
+    return ExpertBlockScaleGeometry(e, n, k, codes, scales_offset, scales,
+                                    weight_offset, input_offset, input_offset + 4 * e)
+
+
+def tensor_calibrated_geometry(
+    format: str | Fp8CalibratedFormat, shape: Sequence[int],
+) -> TensorCalibratedGeometry:
+    if not isinstance(_format(format), Fp8CalibratedFormat):
+        raise ValueError("tensor-calibrated-v1 requires FP8_E4M3FN_TENSOR_F32M")
+    n, k = _shape(shape, rank=2)
+    offset = align_up(n * k, 4)
+    return TensorCalibratedGeometry(n, k, offset, offset + 8)
+
+
+def partition_block_scale_geometry(
+    format: str | Nvfp4PartitionFormat, shape: Sequence[int],
+) -> PartitionBlockScaleGeometry:
+    if not isinstance(_format(format), Nvfp4PartitionFormat):
+        raise ValueError("partitioned row blockscale requires NVFP4_PARTITION_F32M")
+    p, r, k = _shape(shape, rank=3)
+    if k % 16:
+        raise ValueError("partitioned row blockscale requires K divisible by 16")
+    row_bytes = k // 2 + k // 16
+    offset = p * r * row_bytes
+    return PartitionBlockScaleGeometry(p, r, k, row_bytes, offset, offset + 4 * p)
+
+
+def tensor_scale_geometry(format: str | Fp8TensorFormat, shape: Sequence[int]) -> TensorScaleGeometry:
+    if not isinstance(_format(format), Fp8TensorFormat):
+        raise ValueError("tensor-scale-v1 requires FP8_E4M3FN_TENSOR_BF16S")
+    n, k = _shape(shape, rank=2)
+    return TensorScaleGeometry(n, k, n * k, n * k, n * k + 2)
+
+
 def row_scale_geometry(
     format: str | Fp8RowFormat, shape: Sequence[int]
 ) -> RowScaleGeometry:
@@ -356,6 +458,14 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is EXPERT_BLOCKSCALE_K16_M128X4_V1:
+        return expert_block_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is TENSOR_SCALE_V1:
+        return tensor_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is TENSOR_CALIBRATED_V1:
+        return tensor_calibrated_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is PARTITIONED_ROW_BLOCKSCALE_K16_V1:
+        return partition_block_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_BLOCK_ROW_V1:
         if not isinstance(numeric_spec, GgmlBlockFormat):
             raise ValueError("ggml-block-row-v1 requires a registered GGML block format")
@@ -524,6 +634,101 @@ def dequantize_fp8_row_scaled(
     )
 
 
+def encode_fp8_calibrated(codes: torch.Tensor, weight_multiplier: torch.Tensor,
+                          input_multiplier: torch.Tensor) -> bytes:
+    g = tensor_calibrated_geometry("FP8_E4M3FN_TENSOR_F32M", codes.shape)
+    codes = _exact_uint8_matrix(codes, (g.rows, g.columns), "calibrated FP8 codes")
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("calibrated FP8 codes must be finite")
+    for scale in (weight_multiplier, input_multiplier):
+        if scale.dtype != torch.float32 or scale.numel() != 1:
+            raise TypeError("calibrated FP8 multipliers require exact FP32 scalar words")
+        if not bool((torch.isfinite(scale) & (scale > 0)).all()):
+            raise ValueError("calibrated FP8 multipliers must be finite and positive")
+    return (codes.numpy().tobytes() + bytes(g.multiplier_offset - g.rows * g.columns) +
+            encode_direct(weight_multiplier.reshape(()), "FP32") +
+            encode_direct(input_multiplier.reshape(()), "FP32"))
+
+
+def decode_fp8_calibrated_words(payload: Payload, shape: Sequence[int]
+                                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    g = tensor_calibrated_geometry("FP8_E4M3FN_TENSOR_F32M", shape)
+    if _payload_length(payload) != g.payload_bytes:
+        raise ValueError("incorrect calibrated FP8 payload size")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[:g.rows * g.columns].clone().reshape(g.rows, g.columns)
+    scales = decode_direct(raw[g.multiplier_offset:].clone(), "FP32", (2,))
+    if bool(((codes & 0x7F) == 0x7F).any()) or not bool((torch.isfinite(scales) & (scales > 0)).all()):
+        raise ValueError("invalid calibrated FP8 numeric words")
+    if bool(raw[g.rows * g.columns:g.multiplier_offset].any()):
+        raise ValueError("calibrated FP8 alignment padding must be zero")
+    return codes, scales[0], scales[1]
+
+
+def pack_nvfp4_partitions(codes: torch.Tensor, scales: torch.Tensor,
+                          multipliers: torch.Tensor) -> bytes:
+    """Offline byte rearrangement only; preserve all source numeric words exactly."""
+    if codes.ndim != 3:
+        raise ValueError("partition codes require [P,R,K/2]")
+    p, r, half_k = codes.shape
+    g = partition_block_scale_geometry("NVFP4_PARTITION_F32M", (p, r, half_k * 2))
+    if tuple(scales.shape) != (p, r, g.columns // 16):
+        raise ValueError("partition scales require [P,R,K/16]")
+    c = _exact_uint8_matrix(codes.reshape(p * r, half_k), (p * r, half_k), "partition codes")
+    s = _exact_uint8_matrix(scales.reshape(p * r, g.columns // 16),
+                            (p * r, g.columns // 16), "partition scales")
+    if bool(((s >= 0x7F)).any()):
+        raise ValueError("partition scales must be nonnegative finite E4M3FN")
+    if multipliers.dtype != torch.float32 or tuple(multipliers.shape) != (p,):
+        raise TypeError("partition multipliers require exact FP32 [P]")
+    if not bool((torch.isfinite(multipliers) & (multipliers > 0)).all()):
+        raise ValueError("partition multipliers must be finite and positive")
+    return torch.cat((c, s), dim=1).numpy().tobytes() + encode_direct(multipliers, "FP32")
+
+
+def unpack_nvfp4_partitions(payload: Payload, shape: Sequence[int]
+                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    g = partition_block_scale_geometry("NVFP4_PARTITION_F32M", shape)
+    if _payload_length(payload) != g.payload_bytes:
+        raise ValueError("incorrect partitioned NVFP4 payload size")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    rows = raw[:g.multiplier_offset].reshape(g.partitions, g.rows, g.row_bytes)
+    codes = rows[:, :, :g.columns // 2].clone()
+    scales = rows[:, :, g.columns // 2:].clone()
+    multipliers = decode_direct(raw[g.multiplier_offset:].clone(), "FP32", (g.partitions,))
+    if bool((scales >= 0x7F).any()):
+        raise ValueError("partition scales must be nonnegative finite E4M3FN")
+    if not bool((torch.isfinite(multipliers) & (multipliers > 0)).all()):
+        raise ValueError("partition multipliers must be finite and positive")
+    return codes, scales, multipliers
+
+
+def encode_fp8_tensor_scaled(codes: torch.Tensor, multiplier: torch.Tensor) -> bytes:
+    g = tensor_scale_geometry("FP8_E4M3FN_TENSOR_BF16S", codes.shape)
+    codes = _exact_uint8_matrix(codes, (g.n, g.k), "tensor-scaled FP8 codes")
+    if multiplier.dtype != torch.bfloat16 or multiplier.numel() != 1:
+        raise TypeError("tensor multiplier requires one exact BF16 word")
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("tensor-scaled FP8 codes must be finite E4M3FN")
+    if not bool((torch.isfinite(multiplier) & (multiplier > 0)).all()):
+        raise ValueError("tensor multiplier must be finite and positive")
+    return codes.numpy().tobytes() + encode_direct(multiplier.reshape(()), "BF16")
+
+
+def decode_fp8_tensor_scaled_words(payload: Payload, shape: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    g = tensor_scale_geometry("FP8_E4M3FN_TENSOR_BF16S", shape)
+    if _payload_length(payload) != g.payload_bytes:
+        raise ValueError("incorrect tensor-scaled FP8 payload size")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[:g.code_plane_bytes].clone().reshape(g.n, g.k)
+    multiplier = decode_direct(raw[g.scale_offset:].clone(), "BF16", ())
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("tensor-scaled FP8 codes must be finite E4M3FN")
+    if not bool(torch.isfinite(multiplier) & (multiplier > 0)):
+        raise ValueError("tensor multiplier must be finite and positive")
+    return codes, multiplier
+
+
 def swizzle_nvfp4_scales(
     natural_scales: torch.Tensor, shape: Sequence[int]
 ) -> torch.Tensor:
@@ -646,6 +851,60 @@ def decode_nvfp4_words(
         raise ValueError("NVFP4 weight divisor must be finite and positive")
     divisor = torch.frombuffer(bytearray(divisor_bytes), dtype=torch.float32).reshape(())
     return codes, scales, divisor
+
+
+def _expert_multipliers(values: torch.Tensor, experts: int) -> bytes:
+    if values.dtype != torch.float32 or tuple(values.shape) != (experts,):
+        raise TypeError("expert multipliers require exact FP32 [E] words")
+    if not bool((torch.isfinite(values) & (values > 0)).all()):
+        raise ValueError("expert multipliers must be finite and positive")
+    return encode_direct(values, "FP32")
+
+
+def encode_nvfp4_experts(
+    packed_codes: torch.Tensor, natural_scales: torch.Tensor,
+    weight_multipliers: torch.Tensor, input_multipliers: torch.Tensor,
+    shape: Sequence[int],
+) -> bytes:
+    """Preserve source words; never reciprocate or fold expert multipliers."""
+    g = expert_block_scale_geometry("NVFP4_EXPERT_F32M", shape)
+    if tuple(packed_codes.shape) != (g.experts, g.n, g.k // 2):
+        raise ValueError("expert packed codes require [E,N,K/2]")
+    if tuple(natural_scales.shape) != (g.experts, g.n, g.k // 16):
+        raise ValueError("expert block scales require [E,N,K/16]")
+    codes = _exact_uint8_matrix(packed_codes.reshape(g.experts * g.n, g.k // 2),
+                                 (g.experts * g.n, g.k // 2), "expert codes")
+    scales = _exact_uint8_matrix(natural_scales.reshape(g.experts * g.n, g.k // 16),
+                                  (g.experts * g.n, g.k // 16), "expert scales")
+    if bool((((scales & 0x80) != 0) | (scales == 0x7F)).any()):
+        raise ValueError("expert block scales must be nonnegative finite E4M3FN")
+    payload = bytearray(g.payload_bytes)
+    payload[:g.code_plane_bytes] = codes.numpy().tobytes()
+    payload[g.scale_plane_offset:g.weight_multiplier_offset] = swizzle_nvfp4_scales(
+        scales, (g.experts * g.n, g.k)).numpy().tobytes()
+    payload[g.weight_multiplier_offset:g.input_multiplier_offset] = _expert_multipliers(
+        weight_multipliers, g.experts)
+    payload[g.input_multiplier_offset:] = _expert_multipliers(input_multipliers, g.experts)
+    return bytes(payload)
+
+
+def decode_nvfp4_expert_words(
+    payload: Payload, shape: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    g = expert_block_scale_geometry("NVFP4_EXPERT_F32M", shape)
+    if _payload_length(payload) != g.payload_bytes:
+        raise ValueError("incorrect NVFP4 expert payload size")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[:g.code_plane_bytes].clone().reshape(g.experts, g.n, g.k // 2)
+    scales = unswizzle_nvfp4_scales(raw[g.scale_plane_offset:g.weight_multiplier_offset],
+                                   (g.experts * g.n, g.k)).reshape(g.experts, g.n, g.k // 16)
+    if bool((((scales & 0x80) != 0) | (scales == 0x7F)).any()):
+        raise ValueError("expert block scales must be nonnegative finite E4M3FN")
+    weights = raw[g.weight_multiplier_offset:g.input_multiplier_offset].clone().view(torch.float32)
+    inputs = raw[g.input_multiplier_offset:].clone().view(torch.float32)
+    _expert_multipliers(weights, g.experts)
+    _expert_multipliers(inputs, g.experts)
+    return codes, scales, weights, inputs
 
 
 def _pack_low_nibbles(codes: torch.Tensor) -> torch.Tensor:
@@ -1155,8 +1414,28 @@ def dequantize_row_split(
 
 
 __all__ = [
+    "TENSOR_CALIBRATED_V1",
+    "TensorCalibratedGeometry",
+    "tensor_calibrated_geometry",
+    "encode_fp8_calibrated",
+    "decode_fp8_calibrated_words",
+    "PARTITIONED_ROW_BLOCKSCALE_K16_V1",
+    "PartitionBlockScaleGeometry",
+    "partition_block_scale_geometry",
+    "pack_nvfp4_partitions",
+    "unpack_nvfp4_partitions",
     "BLOCKSCALE_K16_M128X4_V1",
     "BlockScaleGeometry",
+    "EXPERT_BLOCKSCALE_K16_M128X4_V1",
+    "ExpertBlockScaleGeometry",
+    "TENSOR_SCALE_V1",
+    "TensorScaleGeometry",
+    "tensor_scale_geometry",
+    "encode_fp8_tensor_scaled",
+    "decode_fp8_tensor_scaled_words",
+    "expert_block_scale_geometry",
+    "encode_nvfp4_experts",
+    "decode_nvfp4_expert_words",
     "CONTIGUOUS_LE_V1",
     "GGML_BLOCK_ROW_V1",
     "GgmlBlockGeometry",

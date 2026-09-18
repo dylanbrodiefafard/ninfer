@@ -38,8 +38,9 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
-void vision_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
-                             const std::vector<float>& v, const std::vector<int>& cu_seqlens,
+template<class Scalar>
+void vision_attention_oracle(const std::vector<Scalar>& q, const std::vector<Scalar>& k,
+                             const std::vector<Scalar>& v, const std::vector<int>& cu_seqlens,
                              std::vector<double>& out) {
     constexpr double scale = 1.0 / std::sqrt(72.0);
     out.assign(q.size(), 0.0);
@@ -241,6 +242,14 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
 
 } // namespace
 
+#ifdef NINFER_VISION_ORACLE_ADAPTERS
+namespace ninfer::test::vision_source {
+std::vector<double> attention(const std::vector<double>& q,const std::vector<double>& k,
+                              const std::vector<double>& v,const std::vector<int>& segments) {
+    std::vector<double> out; vision_attention_oracle(q,k,v,segments,out); return out;
+}
+}
+#else
 int main() {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
@@ -276,3 +285,4 @@ int main() {
     std::cout << "vision_attention: PASS\n";
     return 0;
 }
+#endif

@@ -22,7 +22,8 @@ constexpr ReductionCriterion layer_norm_bf16_criterion() {
             /*gross_relative_to_max_reference*/ 2.7e-3};
 }
 
-std::vector<double> layer_norm_oracle(const std::vector<float>& x, const std::vector<float>& weight,
+template<class Scalar>
+std::vector<double> layer_norm_oracle(const std::vector<Scalar>& x, const std::vector<float>& weight,
                                       const std::vector<float>& bias, std::int32_t rows) {
     std::vector<double> output(x.size());
     for (std::int32_t row = 0; row < rows; ++row) {
@@ -96,6 +97,14 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
 
 } // namespace
 
+#ifdef NINFER_VISION_ORACLE_ADAPTERS
+namespace ninfer::test::vision_source {
+std::vector<double> norm(const std::vector<double>& x,const std::vector<float>& w,
+                         const std::vector<float>& b,int rows) {
+    return layer_norm_oracle(x,w,b,rows);
+}
+}
+#else
 int main() {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
@@ -115,3 +124,4 @@ int main() {
     std::cout << (failures ? "FAIL" : "OK") << " layer_norm correctness\n";
     return failures ? 1 : 0;
 }
+#endif

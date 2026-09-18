@@ -6,6 +6,9 @@
 
 namespace ninfer::ops::detail {
 
+void gated_residual_bf16_project_f32_launch(const Tensor& x, const Weight& weight,
+                                          Tensor& out, cudaStream_t stream);
+
 void gated_residual_normalize_launch(const Tensor& residual, const Tensor& norm_weight,
                                      Tensor& normalized, cudaStream_t stream);
 void gated_residual_activate_launch(Tensor& low_rank, cudaStream_t stream);

@@ -234,9 +234,10 @@ ModelView load_view(const BindingPlan& bindings,
 }
 
 std::size_t verifier_workspace_bytes() {
-    return std::max({ops::gated_residual_workspace_capacity_bytes(),
-                     ops::gated_delta_net_layer_workspace_capacity_bytes(),
-                     ops::qsa_verifier_workspace_bytes(1), ops::ple_workspace_capacity_bytes(1),
+    return std::max({ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0),
+                     ops::gated_delta_net_layer_workspace_capacity_bytes(1, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q6_K),
+                     ops::qsa_verifier_workspace_bytes(1, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K),
+                     ops::ple_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0),
                      ops::qwen4_sparse_moe_workspace_capacity_bytes()});
 }
 
@@ -254,7 +255,7 @@ ArtifactLoadPlan bind_artifact(const artifact::Reader& reader) {
     out.final_gr.down = bind(binder, "output_hc_down.weight", NumericFormat::Q8_0, {320, 10240});
     out.final_gr.up = bind(binder, "output_hc_up.weight", NumericFormat::Q8_0, {10240, 320});
     out.ple.table = bind(binder, "per_layer_token_embd.weight", NumericFormat::IQ4_NL,
-                         {320001536, 160}, TensorPlacement::MappedHost);
+                         {320001536, 160}, TensorPlacement::ResidentHost);
     out.token_embedding = bind(binder, "token_embd.weight", NumericFormat::Q4_K,
                                {248320, 2560});
 
@@ -286,12 +287,17 @@ ArtifactLoadPlan bind_artifact(const artifact::Reader& reader) {
     }
     artifact::MaterializationPlan materialization = binder.finish();
     std::uint64_t mapped_bytes = 0;
-    for (const auto& object : materialization.mapped_tensor_objects) { mapped_bytes += object.bytes; }
+    std::uint64_t resident_bytes = 0;
+    for (const auto& object : materialization.mapped_tensor_objects) {
+        mapped_bytes += object.bytes;
+        if (object.resident) { resident_bytes += object.bytes; }
+    }
     std::uint64_t device_bytes = 0;
     for (const auto& object : materialization.device_objects) { device_bytes += object.bytes; }
     if (materialization.mapped_tensor_objects.size() != kMappedTensorCount ||
         materialization.device_objects.size() != kDeviceTensorCount ||
         mapped_bytes != kMappedTensorBytes || device_bytes != kDevicePayloadBytes ||
+        resident_bytes != kResidentPleBytes ||
         materialization.device_capacity_bytes < kDevicePayloadBytes ||
         materialization.device_capacity_bytes >= kDevicePayloadBytes + kDeviceTensorCount * 256ULL) {
         throw artifact::ArtifactError("Qwen4 verifier placement totals changed");
@@ -337,9 +343,10 @@ State::State()
     for (std::size_t layer = 0; layer < kLayerCount; ++layer) {
         if (!is_qsa_layer(layer)) { continue; }
         ops::QsaStateView state{
-            .k_codes = Tensor(take(128 * kQsaCapacity * 2), DType::U8,
+            .format = ops::QsaKvFormat::NVFP4G16,
+            .k = Tensor(take(128 * kQsaCapacity * 2), DType::U8,
                               {128, kQsaCapacity, 2}),
-            .v_codes = Tensor(take(128 * kQsaCapacity * 2), DType::U8,
+            .v = Tensor(take(128 * kQsaCapacity * 2), DType::U8,
                               {128, kQsaCapacity, 2}),
             .k_scales = Tensor(take(16 * kQsaCapacity * 2), DType::FP8_E4M3FN,
                                {16, kQsaCapacity, 2}),

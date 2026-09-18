@@ -458,7 +458,7 @@ int ninfer::test::qwen4::real_oracle::run_gr_cell(const verifier::LoadedModel& m
     Tensor residual_tensor(device_residual.p, DType::BF16, {kHidden, kBranches});
     Tensor mixed_tensor(device_mixed.data(), DType::BF16, {kHidden});
     Tensor scale_tensor(device_scale.data(), DType::BF16, {kBranches});
-    WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes());
+    WorkspaceArena workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
     ops::gated_residual_read_write(residual_tensor, weights.norm, weights.down, weights.up,
                                    weights.inject, mixed_tensor, scale_tensor, workspace,
                                    device.stream);

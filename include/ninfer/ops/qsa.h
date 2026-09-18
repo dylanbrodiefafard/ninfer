@@ -19,16 +19,21 @@ inline constexpr std::int32_t kQsaSelectedCapacity = 2051;
 
 /**
  * Qwen4 C=1 QSA persistent planes. All tensors are contiguous and capacity is
- * startup-fixed in [1,4096]. K/V use NVFP4-G16: codes are U8 [128,capacity,2], with the low
+ * startup-fixed in [1,4096]. The explicit BF16 baseline uses K/V BF16 [256,capacity,2]
+ * and null scale tensors. The diagnostic NVFP4-G16 profile uses U8 [128,capacity,2], with the low
  * nibble representing the even feature and the high nibble the odd feature; scales are
  * FP8_E4M3FN [16,capacity,2]. Raw index keys are BF16 [128,capacity], and positions are I32
  * [3,capacity] in temporal/height/width order. Code planes are four-byte aligned for their packed
- * stores, raw index keys are two-byte aligned, and positions are four-byte aligned; all six planes
- * are pairwise disjoint.
+ * stores; BF16 K/V also require four-byte alignment. Raw index keys are two-byte aligned and
+ * positions are four-byte aligned; all present planes are pairwise disjoint. Format selection is
+ * explicit and never inferred from a checkpoint or from nullable scales.
  */
+enum class QsaKvFormat { BF16, NVFP4G16 };
+
 struct QsaStateView {
-    Tensor k_codes;
-    Tensor v_codes;
+    QsaKvFormat format = QsaKvFormat::BF16;
+    Tensor k;
+    Tensor v;
     Tensor k_scales;
     Tensor v_scales;
     Tensor raw_index_keys;
@@ -36,7 +41,8 @@ struct QsaStateView {
 };
 
 /**
- * Encode normalized/rotated K and projected V from BF16 [256,2,W] into exact NVFP4-G16 and
+ * Append normalized/rotated K and projected V from BF16 [256,2,W], copying every bit unchanged
+ * for BF16 state or encoding the exact registered NVFP4-G16 codec for diagnostic state, and
  * append BF16 raw index keys [128,W] plus I32 MRoPE positions [3,W] at I32 append_ids [W].
  * An id of -1 is an invalid suffix and writes nothing. Every other id is promised by the caller
  * to be unique and in the state's capacity. K and V are 16-byte aligned for their vectorized K16
@@ -54,8 +60,8 @@ void qsa_state_append(const Tensor& k, const Tensor& v, const Tensor& raw_index_
  * Select visible-rank blocks from BF16 raw_query [128,4,W]. query_ids is I32 [W]. Visibility is
  * CSR: offsets I32 [W+1] and flat strictly-increasing visible_ids. Each valid query id is in its
  * own slice. Complete rank blocks of four are scored after the semantic FP32 mean -> BF16 cast,
- * RMSNorm with converted GGUF gamma, and 64-wide interleaved MRoPE. GGUF has already folded the
- * source zero-centered unit offset. Scores sum four ReLU dots / sqrt(128).
+ * RMSNorm with effective gamma, and 64-wide interleaved MRoPE. Effective gamma represents
+ * the source zero-centered unit offset already added. Scores sum four ReLU dots / sqrt(128).
  * The highest 512 blocks win; ties choose the lower logical block rank. Their ids, in ranked
  * block order, are followed by the incomplete tail. selected_ids I32 [2051,W] is padded with -1;
  * selected_count I32 [W] gives the valid prefix. query_id -1 produces an empty column.
@@ -76,7 +82,8 @@ void qsa_index_select(const Tensor& raw_query, const QsaStateView& state,
 /**
  * Compute selected grouped-query attention from normalized/rotated BF16 q [256,24,W] and the
  * exact per-column selected prefixes. Query head h consumes KV head floor(h/12). Every K/V value
- * is decoded from the NVFP4-G16 state, including values appended earlier on the same stream.
+ * is read exactly from BF16 state or decoded from diagnostic NVFP4-G16 state, including values
+ * appended earlier on the same stream.
  * Softmax uses FP32 max/subtract/exp/sum and the fixed 1/sqrt(256) scale. out is BF16 [256,24,W].
  * Empty/invalid queries are exact zero. selected_ids is I32 [S,W] for a caller-known bound S in
  * [1,2051]; the caller promises each valid selected prefix is unique, visible, and in range and
@@ -92,23 +99,22 @@ void qsa_selected_attention(const Tensor& q, const Tensor& selected_ids,
 struct QsaVerifierWeights {
     Weight index_query; // contiguous BF16_CTRL [512,2560]
     Weight index_key;   // contiguous BF16_CTRL [128,2560]
-    Weight core_query_gate; // Q5_K/NVFP4/row-scaled FP8 [12288,2560], per-head query then gate
-    Weight core_key;        // Q5_K/NVFP4/row-scaled FP8 [512,2560]
-    Weight core_value;      // Q5_K/NVFP4/row-scaled FP8 [512,2560]
-    Weight output;          // Q5_K/NVFP4/row-scaled FP8 [2560,6144]
-    Tensor index_query_norm; // converted GGUF FP32 gamma [128]
-    Tensor index_key_norm;   // converted GGUF FP32 gamma [128]
-    Tensor core_query_norm;  // converted GGUF FP32 gamma [256]
-    Tensor core_key_norm;    // converted GGUF FP32 gamma [256]
+    Weight core_query_gate; // BF16/Q5_K/NVFP4/row- or tensor-scaled FP8 [12288,2560], query then gate
+    Weight core_key;        // BF16/Q5_K/NVFP4/row- or tensor-scaled FP8 [512,2560]
+    Weight core_value;      // BF16/Q5_K/NVFP4/row- or tensor-scaled FP8 [512,2560]
+    Weight output;          // BF16/Q5_K/NVFP4/row- or tensor-scaled FP8 [2560,6144]
+    Tensor index_query_norm; // effective FP32 gamma [128]
+    Tensor index_key_norm;   // effective FP32 gamma [128]
+    Tensor core_query_norm;  // effective FP32 gamma [256]
+    Tensor core_key_norm;    // effective FP32 gamma [256]
 };
 
 /** Transient capacity at width W in [1,4096] and explicit core projection formats.
- * Defaults describe the GGUF verifier; each core projection also admits NVFP4 or row-scaled FP8,
- * using Linear A16Only. Index projections remain BF16 and state remains NVFP4-G16. */
+ * Each core projection admits BF16, diagnostic Q5_K, NVFP4 or row-scaled FP8 A16,
+ * plus tensor-calibrated FP8 A16. QSA A8 projection profiles are not admitted.
+ * Index projections remain BF16; state format is explicitly selected. */
 [[nodiscard]] std::size_t qsa_verifier_workspace_bytes(
-    std::int32_t width, QType query_gate = QType::GGML_Q5_K,
-    QType key = QType::GGML_Q5_K, QType value = QType::GGML_Q5_K,
-    QType output = QType::GGML_Q5_K);
+    std::int32_t width, QType query_gate, QType key, QType value, QType output);
 
 /**
  * Actual-artifact C=1 QSA verifier composite for W in [1,4096]. x/out are BF16 [2560,W],
@@ -117,17 +123,21 @@ struct QsaVerifierWeights {
  * selected_ids/count expose the exact selector result as I32 [2051,W] and [W].
  *
  * The Op projects BF16 index queries/key, projects the per-head core query/gate parent plus K/V,
- * applies Q/K norms with converted GGUF gamma and 64-wide interleaved T/H/W MRoPE with theta 1e7,
+ * applies Q/K norms with effective gamma and 64-wide interleaved T/H/W MRoPE with theta 1e7,
  * appends
  * normalized/rotated K, projected V, raw index key, and position at token_id, selects visible-rank
- * blocks, and evaluates selected attention through the NVFP4-G16 state. Each 256-wide attention
+ * blocks, and evaluates selected attention through the explicit BF16 or NVFP4-G16 state. Each 256-wide attention
  * head is multiplied by sigmoid of its represented raw gate, concatenated, and projected by the
- * output weight. Newly appended values are always consumed through the cache codec.
+ * output weight. Newly appended values are always consumed through their represented cache format.
+ * Native BF16 and tensor-calibrated FP8 core K retain FP32 private output through norm/RoPE to avoid a
+ * premature BF16 projection cast before normalization. The BF16 append boundary remains explicit;
+ * other projection formats retain their qualified profile.
  *
  * This verifier entry owns no frontier, visibility construction, commit, or rollback. All storage
  * is caller-owned, non-overlapping except for no permitted aliases, and remains alive through the
  * stream. Workspace is contiguous U8, 256-byte aligned, and at least
- * qsa_verifier_workspace_bytes(W).
+ * qsa_verifier_workspace_bytes(W, query_type, key_type, value_type, output_type) for the
+ * supplied core projection formats (including the native-BF16 key precision scratch).
  */
 void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& position,
                   const Tensor& visible_ids, const Tensor& visible_offsets,

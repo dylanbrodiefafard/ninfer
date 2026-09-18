@@ -17,6 +17,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -96,7 +97,11 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
+    if (name == "NVFP4_EXPERT_F32M") { return NumericFormat::NVFP4_EXPERT_F32M; }
+    if (name == "NVFP4_PARTITION_F32M") { return NumericFormat::NVFP4_PARTITION_F32M; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "FP8_E4M3FN_TENSOR_BF16S") { return NumericFormat::FP8_E4M3FN_TENSOR_BF16S; }
+    if (name == "FP8_E4M3FN_TENSOR_F32M") { return NumericFormat::FP8_E4M3FN_TENSOR_F32M; }
     if (name == "Q8_0") { return NumericFormat::Q8_0; }
     if (name == "Q4_K") { return NumericFormat::Q4_K; }
     if (name == "Q5_K") { return NumericFormat::Q5_K; }
@@ -112,7 +117,15 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
+    if (name == "tensor-scale-v1") { return StorageLayout::TensorScaleV1; }
+    if (name == "tensor-calibrated-v1") { return StorageLayout::TensorCalibratedV1; }
+    if (name == "partitioned-row-blockscale-k16-v1") {
+        return StorageLayout::PartitionedRowBlockScaleK16V1;
+    }
     if (name == "ggml-block-row-v1") { return StorageLayout::GgmlBlockRowV1; }
+    if (name == "expert-blockscale-k16-m128x4-v1") {
+        return StorageLayout::ExpertBlockScaleK16M128x4V1;
+    }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -186,6 +199,50 @@ struct TransparentStringHash {
     }
 };
 
+class ResidentMapping {
+public:
+    ResidentMapping(int fd, std::uint64_t offset, std::size_t bytes, std::string_view name) {
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) { throw ArtifactError("cannot determine host page size"); }
+        const auto page = static_cast<std::uint64_t>(page_size);
+        const auto begin = offset / page * page;
+        const auto extent = checked_add(offset - begin, bytes, "resident mapping extent");
+        const auto rounded = checked_add(extent, page - 1, "resident mapping size") / page * page;
+        if (rounded > SIZE_MAX) { throw ArtifactError("resident mapping exceeds address space"); }
+        bytes_ = static_cast<std::size_t>(rounded);
+        base_ = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd, static_cast<off_t>(begin));
+        if (base_ == MAP_FAILED) {
+            throw std::system_error(errno, std::generic_category(), "map resident tensor " + std::string(name));
+        }
+        // Eager mlock, not MLOCK_ONFAULT: return only when every page is resident
+        // and cannot be reclaimed or swapped for the entire owner lifetime.
+        if (::mlock(base_, bytes_) != 0) {
+            const int error = errno;
+            (void)::munmap(base_, bytes_);
+            struct rlimit limit {};
+            const bool have_limit = ::getrlimit(RLIMIT_MEMLOCK, &limit) == 0;
+            throw ArtifactError("cannot secure resident host tensor " + std::string(name) +
+                ": eager mlock requires " + std::to_string(bytes_) + " bytes; " +
+                std::error_code(error, std::generic_category()).message() +
+                (have_limit ? "; RLIMIT_MEMLOCK=" + std::to_string(limit.rlim_cur) : "") +
+                ". Provide sufficient RAM and memory-lock allowance; disk-backed fallback is disabled");
+        }
+        data_ = static_cast<const std::byte*>(base_) + (offset - begin);
+    }
+    ~ResidentMapping() {
+        (void)::munlock(base_, bytes_);
+        (void)::munmap(base_, bytes_);
+    }
+    const std::byte* data() const noexcept { return data_; }
+    std::size_t locked_bytes() const noexcept { return bytes_; }
+    ResidentMapping(const ResidentMapping&) = delete;
+    ResidentMapping& operator=(const ResidentMapping&) = delete;
+private:
+    void* base_ = nullptr;
+    std::size_t bytes_ = 0;
+    const std::byte* data_ = nullptr;
+};
+
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
@@ -234,6 +291,7 @@ public:
     const std::byte* data() const noexcept { return data_; }
 
     std::size_t size() const noexcept { return size_; }
+    int fd() const noexcept { return fd_; }
 
     std::string file_identity() const {
         return "linux-file-v1:" + std::to_string(status_.st_dev) + ":" +
@@ -413,6 +471,18 @@ PayloadSpan Reader::payload(std::string_view name) const {
     const auto* object = find(name);
     if (object == nullptr) { throw ArtifactError("unknown artifact object: " + std::string(name)); }
     return payload(*object);
+}
+
+ResidentPayload Reader::resident_payload(const ObjectDescriptor& object) const {
+    if (!std::holds_alternative<TensorDescriptor>(object)) {
+        throw ArtifactError("resident host placement requires a tensor");
+    }
+    const auto source = payload(object);
+    auto mapping = std::make_shared<ResidentMapping>(impl_->file.fd(), source.absolute_offset,
+                                                    source.data.size(), object_name(object));
+    const auto data = std::span<const std::byte>(mapping->data(), source.data.size());
+    const auto locked_bytes = mapping->locked_bytes();
+    return {std::move(mapping), data, locked_bytes};
 }
 
 std::size_t Reader::read_direct(std::uint64_t absolute_offset,

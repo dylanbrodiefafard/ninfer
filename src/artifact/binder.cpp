@@ -105,7 +105,7 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     planned_[handle.index]                 = true;
 }
 
-void Binder::map_tensor_on_host(ObjectHandle handle) {
+void Binder::map_tensor_on_host(ObjectHandle handle, bool resident) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {
         throw ArtifactError("resource cannot be mapped as a host tensor");
@@ -115,7 +115,7 @@ void Binder::map_tensor_on_host(ObjectHandle handle) {
                             std::string(tensor->name));
     }
     materialization_.mapped_tensor_objects.push_back(
-        MappedTensorMaterialization{handle, tensor->bytes});
+        MappedTensorMaterialization{handle, tensor->bytes, resident});
     planned_[handle.index] = true;
 }
 

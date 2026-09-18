@@ -24,6 +24,8 @@ struct MaterializationStats {
     std::uint64_t device_capacity_bytes   = 0;
     std::uint64_t retained_resource_bytes = 0;
     std::uint64_t mapped_tensor_bytes     = 0;
+    std::uint64_t resident_tensor_bytes   = 0;
+    std::uint64_t resident_locked_bytes   = 0;
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
     std::size_t mapped_tensor_count       = 0;
@@ -64,6 +66,7 @@ private:
     std::unique_ptr<DeviceArena> device_arena_;
     std::vector<ObjectStorage> objects_;
     std::shared_ptr<const void> mapped_backing_;
+    std::vector<std::shared_ptr<const void>> resident_backings_;
     MaterializationStats stats_;
 };
 

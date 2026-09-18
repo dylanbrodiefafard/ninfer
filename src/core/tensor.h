@@ -44,6 +44,8 @@ enum class QType : std::uint16_t {
     GGML_IQ1_S   = 13,
     GGML_IQ2_XXS = 14,
     GGML_IQ4_NL  = 15,
+    NVFP4_EXPERT_F32M = 16,
+    FP8_E4M3FN_TENSOR_F32M = 17,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -52,6 +54,8 @@ enum class QuantLayout : std::uint16_t {
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
     GgmlBlockRow        = 4,
+    ExpertBlockScaleK16M128x4 = 5,
+    TensorCalibrated = 6,
 };
 
 struct Weight {

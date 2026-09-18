@@ -44,6 +44,34 @@ class Fp8RowFormat:
 
 
 @dataclass(frozen=True, slots=True)
+class Nvfp4ExpertFormat:
+    """E2M1/E4M3FN banks with exact per-expert FP32 weight/input multipliers."""
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class Nvfp4PartitionFormat:
+    """Row-local E2M1/E4M3 groups with one exact FP32 multiplier per partition."""
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8TensorFormat:
+    """Finite E4M3FN words with one positive BF16 tensor multiplier."""
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8CalibratedFormat:
+    """E4M3FN matrix with exact FP32 weight and input dequantization multipliers."""
+
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
 class GgmlBlockFormat:
     """One exact upstream GGML block representation."""
 
@@ -52,7 +80,7 @@ class GgmlBlockFormat:
     block_bytes: int
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | GgmlBlockFormat
+NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Nvfp4ExpertFormat | Nvfp4PartitionFormat | Fp8RowFormat | Fp8TensorFormat | Fp8CalibratedFormat | GgmlBlockFormat
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -64,7 +92,11 @@ Q5G64_F16S = QuantFormat("Q5G64_F16S", 5, 64, -16, 15)
 Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
+NVFP4_EXPERT_F32M = Nvfp4ExpertFormat("NVFP4_EXPERT_F32M")
+NVFP4_PARTITION_F32M = Nvfp4PartitionFormat("NVFP4_PARTITION_F32M")
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
+FP8_E4M3FN_TENSOR_BF16S = Fp8TensorFormat("FP8_E4M3FN_TENSOR_BF16S")
+FP8_E4M3FN_TENSOR_F32M = Fp8CalibratedFormat("FP8_E4M3FN_TENSOR_F32M")
 
 Q8_0 = GgmlBlockFormat("Q8_0", 32, 34)
 Q4_K = GgmlBlockFormat("Q4_K", 256, 144)
@@ -95,7 +127,11 @@ GGML_BLOCK_FORMATS = MappingProxyType(
     }
 )
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS}
+    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS,
+     NVFP4_EXPERT_F32M.name: NVFP4_EXPERT_F32M,
+     NVFP4_PARTITION_F32M.name: NVFP4_PARTITION_F32M,
+     FP8_E4M3FN_TENSOR_F32M.name: FP8_E4M3FN_TENSOR_F32M,
+     FP8_E4M3FN_TENSOR_BF16S.name: FP8_E4M3FN_TENSOR_BF16S}
 )
 
 
@@ -180,6 +216,10 @@ __all__ = [
     "FP8_ROW_FORMATS",
     "FP32",
     "Fp8RowFormat",
+    "Fp8TensorFormat",
+    "Fp8CalibratedFormat",
+    "FP8_E4M3FN_TENSOR_F32M",
+    "FP8_E4M3FN_TENSOR_BF16S",
     "GGML_BLOCK_FORMATS",
     "GgmlBlockFormat",
     "I32",
@@ -188,6 +228,10 @@ __all__ = [
     "IQ4_NL",
     "NUMERIC_FORMATS",
     "NVFP4",
+    "NVFP4_EXPERT_F32M",
+    "Nvfp4ExpertFormat",
+    "NVFP4_PARTITION_F32M",
+    "Nvfp4PartitionFormat",
     "NVFP4_FORMATS",
     "Nvfp4Format",
     "NumericFormat",

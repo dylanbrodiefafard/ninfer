@@ -17,8 +17,9 @@ The first architecture implementation therefore has two levels:
 checkpoint. For an exact Qwen4 target that contains the preview-style PLE table, the table is
 explicitly an artifact-backed, host-resident random-access
 tensor; “one resident model” means one model instance whose compute core is resident on the GPU,
-not that the PLE table is copied to VRAM. The table is read through an owned mapping, bounded pinned
-staging, and asynchronous H2D gathers as specified in section 3. This does not assume every future
+not that the PLE table is copied to VRAM. The complete table is populated and OS-locked in RAM
+before load succeeds, then read through an owned mapping, bounded CUDA-pinned staging, and
+asynchronous H2D gathers as specified in section 3. This does not assume every future
 Qwen4 checkpoint contains PLE. No currently audited preview profile qualifies for registration as a
 runnable RTX 5090 product: its official BF16 payload is 359,999,963,128 bytes, and the audited
 Unsloth UD-IQ1_S GGUF still has
@@ -45,6 +46,592 @@ the index establishes tensor names, shard assignment, and total bytes. Exact sha
 requires reading every safetensors header, which can be done with bounded HTTP range reads without
 downloading payloads. A full checkpoint becomes a deliberate conversion and qualification
 prerequisite only after the runnable target identity is selected.
+
+## 0. Native-checkpoint preparation and active native precision implementation
+
+### Active goal: native NVFP4 mixed precision (2026-09-18)
+
+The new goal supersedes the earlier tranche's completion claim as a statement of overall
+native readiness. That tranche's checks remain valid bounded evidence; its rejected A8 and
+FP8-residual profiles do not close the broader candidates. The design authority is
+`docs/research/qwen4-quantization-recommendations.md`, supplemented by the native precision
+source audit. Weight storage, temporary activation operands, accumulation and persistent
+state are separate decisions. GGUF/IQ/K-quants remain historical diagnostic formats only,
+never defaults for the future native model.
+
+- [x] Separate native-facing precision/state contracts from historical verifier defaults;
+  audit native protected-weight storage and actual source cast/control boundaries. Projection
+  workspace profiles are explicit; native router/scalar controls remain BF16 and small
+  effective-FP32 control views are documented source-faithful transformations, not GGUF defaults.
+- [x] Implement and independently qualify BF16 QSA KV as the native reference. Actual-source
+  widths 1/5/27/28/128/129 and both-cache selected-layer T5/T17 whole/chunk chains pass;
+  exact append and independent attention oracles cover short/tiled/selection boundaries.
+  Astra finished-code review found no material issue.
+- [x] Assess FP8 KV separately, retaining NVFP4-G16 only as an explicitly selected
+  experimental/diagnostic compression profile until quality qualification. Source-weight
+  T129/128+1 decoded-consumer checks pass unchanged gates; K-only/V-only/both storage loss
+  is measured independently. BF16 remains the reference; no runtime FP8 codec is admitted.
+  Astra finished-work review found no material issue.
+- [x] Pin/audit native NVFP4 PLE codes, block scales and per-shard multipliers; implement
+  source-faithful artifact storage, RAM-resident packed-row staging and GPU BF16 decode
+  alongside FP8 PLE. Preserve complete eager OS locking and bounded transfer lifetimes.
+  Exact synthetic/authentic codec and complete native injection checks pass; Astra review
+  found no material issue. Full-table capacity on unavailable native payloads remains deferred.
+- [x] Independently evaluate FP8-weight/A16 and calibrated FP8-weight/A8 for shared experts,
+  QSA and large GDN projections using authentic publisher calibration and bounded native-input
+  qualification panels. Preserve
+  NVFP4 expert scales and separate post-SwiGLU calibration; measure relevant dispatch widths.
+  Authentic publisher scales are preserved, not independently reproduced calibration: six
+  GDN policies and all eight shared policies pass bounded component gates; QSA is A16-only
+  after rejecting all A8 candidates under unchanged screens. Astra finished-code review is clear.
+- [x] Re-evaluate a research-grounded FP8 residual-storage profile separately from gate math;
+  distinguish codec/Op correctness, quantization error and model-quality uncertainty. Repeated
+  four-layer storage is rejected; no GPU FP8 residual codec/default is admitted. Other calibrated
+  storage recipes and full-model quality are not inferred from this bounded assessment.
+- [x] Qualify accepted native component compositions, state/selection and prefill/decode
+  continuation; measure changed PLE consumer latency and relevant 5090 performance. The
+  contiguous native first block (layers 0..3) passes synthetic and native-text whole/chunk
+  checks with BF16 cache; source-calibrated FP8/A16 and selective guarded A8 also pass.
+  PLE transfer/consumer timings are measured for both native table formats, and guarded
+  A8 dispatch timings and boundary qualification are complete. Real-EOS expert-A4 tests
+  pass unchanged whole/chunk gates; independent calibration attribution does not justify
+  replacing the source scale with a guard (17/20 dots improve, three and worst-case worsen).
+  Native token/hash-selected row panels are a distribution check, not full-model calibration.
+- [x] Record concrete policies and deferred gates for protected roles, endpoints, vision,
+  MTP and the actual future checkpoint, without inventing topology or copying dense-model
+  sensitivity lists. The native-preparation matrix in `docs/maintainer/qwen4-artifact.md`
+  separates source storage, admitted operands/state, rejected candidates and future gates.
+- [x] Following the request for the most complete feasible architecture preparation, close
+  bounded native endpoint gaps: audit/acquire the actual BF16 head and final GR, admit the
+  exact BF16 Linear geometry, and qualify final read/head composition independently.
+  All-vocabulary source checks and final-read composition pass unchanged gates; Astra is clear.
+- [x] Close the source-defined Vision merger component gap with an independent oracle and
+  a bounded native fixture; retain BF16/A16. Synthetic/native whole/chunk checks and Astra
+  review pass. This does not admit a multimodal product target.
+- [x] Close the remaining native BF16 Vision projection domains (patch, QKV, attention
+  output, MLP up/down), including the real 4304 row/reduction tails. Qualify a bounded
+  source patch/position/encoder-block fixture with existing surrounding Vision Ops and
+  independent mathematical oracles; no runtime weight repacking or new generic Vision graph.
+  Source P4/12/132 passes unchanged 2% gates (relative error 0.50–0.57%); exact synthetic
+  tail and segment-isolation witnesses pass. Astra finished-code review is clear.
+- [x] Qualify the source-defined two-projection/four-stream MTP stem as a bounded component,
+  if its pinned formulas and source inventory suffice. Do not claim full speculative MTP
+  admission without independent executable cache/selection/accept-fold traces. Native source
+  and unequal-branch synthetic checks pass the complete FP64 oracle; Astra is clear.
+- [x] Run focused and full C++ checks and resolve an independent finished-work **Astra**
+  review-and-fix loop (user selection replaces Sol for this goal). On 2026-09-18,
+  `./scripts/run-unit-tests.sh` in `ninfer-builder-qwen4-mixed` completed all 118
+  standard CTests: 116 passed, two missing-artifact load-plan skips, zero failures
+  (497.05 seconds). The 23 focused native Python tests, acquisition-tool compilation,
+  native-source component/composition checks and final whitespace review pass.
+  Astra's finished-code reviews, including guarded A8, Vision tails and the EOS-A4
+  attribution, have no material open finding. No commit or push was made.
+
+Numerical admission is mandatory for every changed route: one independent mathematical
+FP32/FP64 oracle per floating Op, exact independent codec/layout oracles, explicitly audited
+public casts/state boundaries, and criteria declared before measuring candidates. Exercise
+real shapes and native weights, cancellation/outliers, codec rounding/saturation boundaries,
+exact routing/selection where applicable, dispatch tails, and state/alias/lifetime transitions
+that the change affects. Pairwise kernel parity and plausible text do not replace the oracle.
+Diagnose failures; never silently widen a failed gate. Distinguish source weight loss,
+activation approximation and cache compression from implementation error. These checks cannot
+prove absence of every bug or substitute for future paired full-model quality measurements.
+
+Full-model PPL/task/long-context quality, unavailable full-table payload capacity admission,
+future target registration and final Pareto/default selection remain explicit deferred gates.
+No commit or push is authorized by this goal.
+
+This bounded native-preparation goal is complete. Its completed ledger does not claim
+full-model execution, a full multimodal frontend, or speculative MTP state/acceptance
+admission; the exact future target and those model-level gates remain separate work.
+
+Current native PLE checkpoint: `NVFP4_PARTITION_F32M` preserves per-shard scale domains;
+synthetic GPU gather/codec tests at T1/17/128/4096 and twelve authentic rows at T1/3/17
+pass exact independent byte/codec checks. Artifact reader tests and eight focused Python
+partition/source tests pass. Native PLE injection additionally passes actual-source full injection at T1/9/10/17/27/28/29
+for both packed-table formats, with nonzero history, reset, chunked continuation and in-place
+aliases against the independent complete formula. Selected-layer composition and finished
+Astra review pass; contiguous four-layer BF16-cache composition also passes as described below.
+Native resident MoE now
+retains BF16 router/shared-gate weights without FP32 device expansion; focused synthetic and
+actual-source A16/A4 regressions pass unchanged gates, with no material Astra finding.
+
+Expanded-chain checkpoint: the contiguous native 0..3 BF16-cache T5/T17 cells pass, but
+the experimental NVFP4-cache cells exceed the unchanged accumulated 2% gate at layer 3,
+including T17 whole/chunk comparison. Local component gates pass. The state-codec/upstream
+rounding decomposition is complete: same-input codes/scales are exact; upstream rounding
+crosses codec decision boundaries. Do not describe that wider compressed chain as qualified
+or relax its criterion. Native FP8 Linear's thirteen authentic projection fixtures, exact
+activation packing, old FP8 regressions and source-calibrated dispatch tests pass, with
+Astra review clear; closed GDN per-role A8 integration is also implemented and qualified below.
+
+Further checkpoint: calibrated GDN has six independently passing per-role policies at
+T65/64+1; simultaneous QKV/output A8 exceeds the predeclared gate and is not admitted.
+Calibrated QSA A16 and shared-expert per-role integration are qualified. The repeated FP8 residual-store
+experiment across native 0..3 reports 8.34% GPU drift and 8.37% independent formula storage
+loss versus BF16, failing the unchanged accumulated screen; no runtime FP8 residual dtype
+is enabled. A bounded native text panel now contains 33 tokenizer-selected BF16 token
+embedding rows and 528 exact hash-selected FP8 PLE rows from the pinned NVIDIA source.
+Its complete first-block and exact hash-continuation checks pass both whole33 and32+1,
+for source BF16 and separately calibrated FP8/A16 projections under unchanged gates. It
+is an input-distribution witness, not a full-model calibration or PPL corpus. A selective
+GDN-Z/shared-expert guarded A8 composition passes the same whole/chunk criteria;
+QSA calibrated projections are A16-only
+after all four A8 role candidates failed the predeclared closed-component screens.
+
+The first real-text selective-A8 attempt exposed a source-calibration mismatch for this panel: one GDN
+input at token 15 is 49.75 while the static source scale only covers 16.875. Independent
+clamp/rounding/projection attribution establishes clipping, not an implementation or scale-
+direction defect. Its failed local/accumulated checks remain recorded. A guarded per-token
+activation scale, floored by the unchanged source calibration, now passes exact packing,
+component and real33 whole/32+1 tests against the same criteria. The isolated Z projection
+error falls from 21.2924% to 0.667229%; it is a new private arithmetic profile, not a claim of
+publisher bitwise equivalence or future-model PPL.
+Packing-inclusive timing retains useful guarded A8 wins; K/V and shared gate/up keep
+A16 through T24 and first permit A8 at T25. Focused boundary regressions and Astra
+finished-code review pass; no source scale words or numerical gates were changed.
+
+The additional architecture audit found no missing main Text mixer topology. It did find
+that generic BF16 embedding gather already covers width 2560, but BF16 Linear did not admit
+the preview head's `[248320,2560]` geometry; final GR already has an independent oracle.
+The exact Vision merger had a Python oracle but no central closed Op; its new central Op
+and native fixture now pass. Existing `mtp_fc` and `mtp_pack` do not implement the preview's
+separately normalized token and four-stream stem; the new `gated_residual_stem` closes that
+bounded component with an independent complete oracle.
+The bounded tasks above supersede the earlier endpoint/merger/stem expansion deferral only;
+future exact identity, full-model quality, multimodal product integration and speculative
+transaction admission remain separate gates. No architecture is inferred for an unreleased model.
+
+### Previous bounded tranche (2026-09-12 through 2026-09-18)
+
+This tranche prepares Qwen4 NVFP4 execution before a smaller, fully resident checkpoint is
+available. It does not register the oversized preview, replace the supported Qwen3.8-27B product,
+or promise that future checkpoints inherit this preview's dimensions or precision recipe.
+The active implementation goal now includes the native-format stages below, informed by
+`docs/research/qwen4-quantization-recommendations.md` (2026-09-18). Their gates are not claims
+that those stages are already implemented. Publisher quality results are research evidence,
+not reproduced qualification results or authority to change protected state boundaries.
+
+### 0.0 Active implementation ledger and precision decisions
+
+- [x] Incorporate the research recommendations into the implementation order and gates.
+- [x] Close the pending PLE residency implementation unit verification: 2026-09-18 baseline
+  full suite passed 112 tests, with two missing-artifact skips. Full IQ4_NL table admission also
+  passed in a temporary builder with unlimited memlock: 28,800,139,264 bytes OS-locked and
+  26,538,652,160 device payload bytes loaded. Native changes require a new suite run; the larger
+  authentic FP8 table's capacity gate remains distinct.
+- [x] Establish exact native NVFP4 code/scale semantics and per-expert ownership, and acquire
+  bounded real layers/rows with all required controls.
+- [x] Implement missing BF16 component roles and native FP8 PLE decode/gather; retain packed
+  FP8 in locked host RAM and transfer selected packed rows for GPU decoding to BF16.
+- [x] Qualify native represented-weight A16 closed layers and continuation/state boundaries.
+- [x] Qualify expert W4A4 independently, with separate post-SwiGLU down calibration; retain
+  A16 dispatch when it is faster at small expert occurrence counts.
+- [x] Evaluate selective W8A8 QSA/GDN/shared projection candidates after baseline fidelity,
+  retaining only routes passing closed-layer and short-sequence gates.
+- [x] Evaluate FP8 gated-residual storage separately from gate arithmetic, subject to concrete
+  codec/state criteria and measured benefit; a rejected candidate also closes this experiment.
+- [x] Complete focused and full-suite verification and independent finished-work Sol review.
+
+Expert W4A4 is the first aggressive compute candidate. W8A8 has stronger direct preview
+activation evidence than W4A4 for shared experts and large QSA/GDN projections, so evaluate it
+next; W4A4 remains a later candidate, not a blanket default. Weight-only ablations do not qualify
+A8 or A4 activation operands. Ordinary observable activations remain BF16; local GEMM operand
+packing does not change persistent storage. Keep router/indexer decisions, GDN FP32 recurrence
+and controls, PLE content gates, and hyperconnection gates protected. Hyperconnection read
+projections remain BF16/A16 initially; eight-bit weights are a separate candidate, not permission
+for A8. Vocabulary endpoints, vision and MTP expansion are deferred until an exact target
+requires them, not additional tasks in this tranche.
+
+The source-BF16 QSA cache is the quality reference. The authorized verifier's NVFP4-G16 cache
+remains unchanged; kernel/state correctness there does not establish maximum-quality cache
+compression. Projection W8A8 evidence does not qualify FP8 attention operands or KV storage.
+FP8 residual storage must not lower gate computation or GDN recurrent precision. Compare
+candidate compute against represented-input mathematical oracles, and keep source weight loss,
+activation loss, and persistent-state compression loss distinct. Full-model paired PPL and
+future-checkpoint default selection remain deferred until a suitable complete model is available.
+
+The first FP8 residual-storage experiment is rejected, not enabled: actual layer-0/3 attention
+and MLP GR weights at T=33, per-token/per-branch FP32 scale `maxabs/448`, E4M3FN nearest-even
+storage, and BF16 decoded public values. Storage would be 50.0781% of BF16, but unchanged read
+relative-L2 gate `0.006` sees `0.02887..0.03175`; unchanged write gate `0.0035` sees
+`0.00408..0.00746`. These compare the same independent GR formula with original versus
+decoded residual inputs while preserving gate arithmetic. This rejects that bounded storage
+profile under existing criteria, not all possible FP8 residual strategies or the paper's
+recipe. No production residual dtype or default changes, and no speed qualification follows.
+
+### 0.1 Baseline and exact native source
+
+Commit `42f0024b` provides independently qualified NVFP4 and row-scaled FP8 Linear/component
+routes, complete synthetic GDN/GR/QSA/PLE/MoE fixtures, and a 23-matrix real-weight fixture.
+That fixture was requantized from the lossy GGUF. It proves represented-kernel arithmetic on
+those distributions, not compatibility with NVIDIA's packed checkpoint or source-BF16 quality.
+The current full verifier still binds the exact GGUF-derived artifact, not a native NVIDIA model.
+
+Use `nvidia/Qwen3.8-Flash-Next-NVFP4` revision
+`fc694b54fb0174e0913e6adf86691ef85a4ead47` as the concrete native source. Its published recipe is:
+
+| Component | Published storage/compute profile | Required decision |
+|---|---|---|
+| Main routed experts | NVFP4 W4A4, MSE-calibrated weights | Audit stored codes, block scales, global weight/input scales per projection/expert; do not assume one scalar per bank |
+| Attention/GDN, shared experts and remaining main-model projections | BF16 | Add the exact missing BF16 component domains; preserve source protection before evaluating alternatives |
+| PLE table | Per-tensor FP8 | Audit E4M3 variant, scale dtype/direction and exact table/shard layout; distinct from row-scaled Linear FP8 |
+| MTP routed experts | 128-by-128 block-scaled FP8 | Not supported by row-scaled FP8 automatically; defer execution until MTP is separately admitted |
+
+Bounded header/scalar reads confirmed that complete main layers 0 and 3 contain 6,166 tensors
+each and respectively 1,570,383,296 and 1,557,359,104 bytes (~2.913 GiB together, excluding
+workspace). Actual BF16 domains include GDN QKV/z/output, QSA Q/K/V/output and fused index-QK
+`[640,2560]`, GR `[320,10240]`/`[10240,320]`, and shared MoE gate/up/down. Native composition now
+admits these BF16 roles alongside NVFP4/row-FP8, with independent real-weight component tests.
+This is implemented arithmetic support, not merely an artifact-name translation.
+
+In layer 0, gate/up `weight_scale_2` has 218 distinct FP32 values across experts, and down has
+281; layer 3 has 239 and 209. For example, layer-0 gate expert 0/511 multipliers are
+`6.612142169615254e-05`/`3.106253643636592e-05`. Preserve the stored multiplication semantics:
+conversion to a rounded reciprocal in the current divisor field is not exact represented-weight
+equivalence. A native multiplier profile must have explicit codec/Op semantics and per-expert
+ownership. Site-wide input-scale sharing is allowed only after validating equality; it held in
+these sampled layers but is not an architectural invariant.
+
+PLE headers contain 128 F8_E4M3 arrays `[2500012,160]`, totaling 51,200,245,760 bytes
+(~47.684 GiB), plus one BF16 scalar `weight_scale=0.00019931793212890625`. A matching source
+decode implementation audit now resolves scale direction, nibble ordering for experts, PLE
+global-row/shard addressing and output casts. The exact producer is ModelOpt
+`73d778422388f0e849ecb180375d34ac445711ca`, identified by the checkpoint's producer version.
+`nvfp4_tensor.py` defines even-K low nibble and odd-K high nibble, with represented values
+`E2M1(code) * E4M3FN(block_scale) * FP32(weight_scale_2)`. Exported `input_scale` is an activation
+dequantization multiplier `amax/(6*448)`, not its reciprocal. Inference activation rounding and
+underflow policy still require their own qualified compute profile.
+
+For PLE, exporter `fp8_tensor.py` and the pinned SGLang consumer corroborate conversion to BF16
+followed by BF16 scale multiplication and BF16 output. The 128 shards partition contiguous
+global rows: `shard = global_row / 2500012`, `local_row = global_row % 2500012`. They are not
+head partitions. Detailed pinned source references are in `docs/maintainer/qwen4-op-contracts.md`
+section 7.1. Header facts alone were not used as proof of these formulas.
+
+The recipe is a reference baseline, not a rule that sparse attention requires BF16 or that
+every future PLE uses FP8. Main-model metadata/header inspection is the first binding gate.
+The source index places main GDN layer 0 in `model-00001-of-00010.safetensors` and main QSA
+layer 3 in `model-00002-of-00010.safetensors`; PLE is in `model-fp8-mtp-ple.safetensors`.
+Filter exact main-model prefixes so MTP layer 0 is not mistaken for main layer 0.
+
+### 0.2 Mandatory PLE residency prerequisite
+
+Replace lazy page-cache dependence for PLE with an artifact-owned, eagerly populated, OS-locked
+host tensor. A file-backed mapping is acceptable only while every PLE page is locked resident;
+the source file is startup storage, never an inference-time row-fetch mechanism. Do not duplicate
+the full table into a second allocation or CUDA-register the entire table. Keep bounded
+CUDA-pinned staging for H2D rows and GPU-side decode/math.
+
+Ownership and sequence: exact binder selects resident-host placement; artifact materialization
+retains the mapping, locks the complete page-aligned payload before device upload/readiness,
+and owns the lock through all consumers. Artifact owns the file-backed mapping/lock lifetime;
+core retains raw CUDA staging/transfer ownership. Failure unwinds locks
+and mappings and reports requested bytes plus the OS failure; there is no configurable lazy
+fallback. Only PLE gains this requirement: the diagnostic routed-weight streaming exception
+does not become a requirement to lock all 46 GB of mapped verifier payloads.
+
+Readiness means synchronous lock/population succeeded, not an asynchronous warmup was queued.
+`mlock2(MLOCK_ONFAULT)`, a successful `madvise`, or an observed warm page cache is insufficient.
+Prove small-fixture resident/locked pages, byte identity, ownership after Reader destruction,
+move/teardown cleanup, and fail-fast behavior with an insufficient per-process lock limit.
+Run the full existing IQ4_NL PLE/Program route when resources permit; later repeat with the
+complete authentic FP8 table. Never simulate full-table admission with only selected rows.
+
+Resource admission is host as well as GPU: the existing table is 28,800,138,240 encoded bytes;
+the preview FP8 table alone has 51,200,245,760 values before scale/alignment metadata. Check
+RAM headroom, process/container memory limits, OS memory-lock limits, and staging/state budgets
+before a large test. Do not kill services, disable swap globally, or force allocation under
+unsafe pressure. If resources cannot support residency, the loader must fail and the real
+capacity gate remains explicitly blocked pending maintainer action.
+
+### 0.3 Native acquisition and representation gate
+
+1. Read pinned config, quantization metadata, tensor index and bounded safetensors headers.
+   Resolve source formula/scale semantics against the pinned ModelOpt export/decode implementation.
+2. Extract selected main layers and all required scale/control tensors with verified HTTP byte
+   ranges. Reject a server ignoring Range rather than accidentally downloading a whole shard.
+   If full shards are necessary, estimate bytes and disk capacity first. Store prerequisites
+   under `local_llm/models/qwen4-...`, never commit weights or cached activation panels.
+3. Extend `tools/convert/qwen4`, `tools/reference/qwen4`, and `tools/parity/qwen4` for the exact
+   native sample. Keep `.ninfer` as the C++ artifact; do not add a direct safetensors runtime.
+   Preserve represented codes/scales exactly through offline layout transforms. No GGUF
+   round-trip, lossy scale folding, or runtime repacking is allowed in this fidelity gate.
+4. Audit whether the current complete-bank single-divisor layout can represent the actual
+   per-expert values. If not, give the exact native bank a coherent stored scale representation
+   and update converter, format/layout authority, binding, Op views, kernels and exact oracle
+   together. Preserve source FP32 multipliers rather than rounding their reciprocals into the
+   existing divisor representation. Do not silently normalize unequal global scales into
+   quantized block scales.
+5. Add BF16 projections and FP8 PLE only for the inspected roles/geometries. Per-tensor PLE,
+   per-row Linear, and block-scaled MTP FP8 remain distinct registered meanings. Do not create
+   speculative generic model graphs, arbitrary geometry registries or an unused MTP backend.
+
+Gate: exact independent decode/layout checks over acquired objects, complete role inventory,
+correct scale ownership and no unresolved representation loss. All bytes contributing to the
+selected closed layer must be present, including router/shared/control weights.
+
+Native expert A4 candidate gate, declared before its measurements: the A16 complete-MoE
+criterion remains unchanged. The separately permitted A4 implementation uses the existing
+Linear A4 profile's `0.16` relative-L2 and `0.16 * maximum_reference_magnitude` gross allowance,
+with the MoE absolute floor `1/32768`, against the same complete ideal FP64 formula. This is an
+engineering conformance envelope for four-bit activation arithmetic, not an acceptable PPL-loss
+budget or a default-quality qualification. Three nonlinear projections may fail it; do not
+increase it after seeing results. Report measured error, not just pass/fail, and retain source
+calibration separately for gate, up and post-SwiGLU down. Exact routing remains protected.
+The initial candidate reuses existing SM120 MMA tiles with GPU-only grouped occurrence packing
+and scattering; small expert occurrence counts retain A16. No checkpoint/default activation
+policy changes follow from this component experiment.
+
+The initial opt-in source-bank profile grouped occurrences entirely on the GPU and used
+W4A4 at 128 or more occurrences per expert, retaining A16 below that count. It reuses the
+qualified SM120 MMA tiles and separately repacks gate, up and post-SwiGLU down inputs with their
+stored per-expert multipliers. Synthetic complete-MoE tests through T=4096 and actual layer-0/3
+expert-bank tests pass the declared oracle gates; standalone Linear A4 regression also passes.
+On two deterministic BF16 input patterns, actual layer-0/3 A16 worst-token relative L2 is
+`0.00316111` / `0.00364733`. At T=257 the active A4 groups reach `0.114184` / `0.0942673`.
+With that initial 128-occurrence cutover, T=1/17/128/129 in these particular alternating-pattern
+panels retained A16-sized expert groups; synthetic fixed-hot fixtures separately exercised the
+127/128/129 cutover. The substantial A4
+component error is explicitly not described as negligible accuracy loss.
+These are component results, not full-model quality. Independent Sol source review of this
+subset on 2026-09-18 found no substantive issues; final integration review remains open.
+
+Initial complete resident-MoE CUDA-event measurements on RTX 5090 / CUDA 13.1.2, five timed
+iterations after three warmups, source-format synthetic banks and NVFP4 shared projections:
+T=128 fixed-hot routing took 390.982 us with opt-in A4 versus 1132.243 us A16. Rotating routes
+(52 expert windows, small per-expert counts) took 4292.627 versus 4243.955 us: no A4 arithmetic
+is selected there and dispatch adds overhead. T=512 fixed-hot A4 took 621.638 us versus
+3798.893 us A16; rotating A4 took 4817.901 us versus 4765.933 us A16. These are public-Op
+measurements including routing, packing and scatter,
+not end-to-end decode/prefill speeds or an activation-policy default recommendation.
+The benchmark is `ninfer_qwen4_sparse_moe_resident_bench --format nvfp4-expert-f32m
+--policy a16|a4 --width T --iterations 5` in `ninfer-builder-qwen4-mixed`.
+
+The final qualified private cutover is **32 occurrences per expert**, with A16Only still the
+default. A bounded comparison of the existing MMA family's 32/64/128 cutovers chose 32;
+there is one internal constant and no runtime tuning knob or alternate kernel family. Layer-0
+`tools.kdev bound` admitted aggregation/weight-replay changes for these shapes; the calibrated
+NVFP4 issue rate was `1.229813e11` MMA/s on 170 SMs. Five-iteration complete-Op measurements
+with the same fixture, hardware and three warmups were:
+
+| Workload | Cutover 128 (us) | Cutover 64 (us) | Final cutover 32 (us) |
+|---|---:|---:|---:|
+| T=32 fixed-hot | 376.038 | 376.960 | 231.571 |
+| T=64 fixed-hot | 634.080 | 297.581 | 297.421 |
+| T=128 fixed-hot | 390.982 | 391.194 | 390.688 |
+| T=4096 rotating | 23862.317 | 5147.763 | 5146.675 |
+
+Thus the balanced rotating prefill fixture improves about 4.64x without waiting for 128-token
+expert groups. Small rotating T=32/64 remains A16 arithmetic and incurs about 46/54 us extra
+dispatch/packing-launch overhead versus the initial 128 cutover (roughly 1.8%/1.3%); no claim
+is made that every route distribution improves. Resident weights remain 1,423,607,820 bytes;
+final workspace is 3,241,728/6,472,704/12,935,168/413,602,048 bytes at T=32/64/128/4096.
+The synthetic complete oracle passes through T=4096 with new 31/32/33 witnesses. Actual
+layer-0/3 tests pass unchanged criteria at T=63/64/65, explicitly counting groups of 31/32/33
+occurrences and testing mixed A16/A4 execution. Their active A4 worst-token relative L2 remains
+`0.114184`/`0.0942673`; unlike the initial profile, T=128/129 now activates A4 too. These
+non-negligible implementation errors are not a checkpoint-quality endorsement or a default
+activation-policy change.
+
+### 0.4 Complete-layer A16 reference baseline and native W4A4 qualification
+
+Build a bounded, unregistered layer harness at the actual preview shapes, resident on the GPU.
+Start with one GDN+GR+MoE layer and one QSA+GR+MoE layer; include the PLE injection boundary
+using authentic rows and then the fully resident table when capacity is available. Existing
+Ops and tests own mathematics; the harness only owns exact binding, state and orchestration.
+
+For the same stored NVFP4 weights, first qualify W4A16 as an activation-preserving diagnostic
+profile. It is not the source checkpoint's advertised W4A4 arithmetic, nor a BF16-weight oracle.
+Then implement/qualify the source W4A4 input scaling and compute profile. Evaluate both directly
+against the same independent ideal FP64 formula from represented public inputs; their A/B is
+additional evidence isolating activation quantization. Keep exact codec/transform checks exact.
+Private production staging/reduction/casts never become the mathematical oracle.
+
+Use deterministic ordinary/cancellation witnesses and bounded real activation panels. Panels
+captured from the running GGUF verifier are useful public inputs, not native reference outputs.
+Acquire matching BF16 source layers only if assessing weight-quantization loss; keep that result
+separate from kernel error and A4-versus-A16 loss.
+
+Predeclare per-Op output/state criteria and an accuracy manifest before A4 comparisons. Retain
+existing criteria for existing represented-input profiles. If a candidate fails, preserve the
+witness and diagnose routing/scale/rounding rather than widen tolerances to admit it. Explicit
+near-zero absolute witnesses must remain separately labeled alongside strict normwise tests.
+Record exact routing/selection structural invariants, top-k identities where the reference
+margin determines them, and tie policy; quantify any A4-induced selection change rather than
+mislabeling all valid top-k changes as a codec error.
+
+Cover scalar decode, non-aligned prefill, one-shot versus chunked continuation, and the QSA
+2048-token selection boundary within the existing 4096 verifier ceiling. Check output errors,
+FP32 recurrence, BF16 convolution history, QSA KV/index contents/frontiers, PLE hashes/EOS
+history, and residual branches at their specified semantic boundaries. The same-token sequence
+must use the same external inputs and resets; compare each route to its oracle, not only to
+another implementation.
+
+### 0.5 Resident performance and selective precision expansion
+
+Profile the complete layer first, without streamed expert weights masking device time. Use the
+required `tools.kdev` admission/SM120 procedure before CUDA speed changes. Prioritize measured
+NVFP4 MoE projection/occurrence-grouping bottlenecks; test realistic expert distributions as
+well as fixed-hot cases. Distinguish total prompt width from per-expert token count.
+
+Candidates include packed-weight replay reduction, gate/up fusion, bounded activation reuse,
+and measured small-batch dispatch improvements. Retain only public-Op/layer gains that pass the
+same mathematical gates and do not regress relevant decode/tail widths. Report arithmetic atom,
+cache/routing conditions, transfer-inclusive versus resident scope, and timing statistic.
+
+For PLE, measure startup loading separately from inference. Measure host gather, H2D completion,
+and exposed layer-1 consumer wait—not only enqueue time. Exercise token/head order, repeated
+rows, EOS and chunk boundaries with the table locked; cold storage is a startup test. Do not
+evict locked pages to manufacture an inference benchmark. Add deduplication, transfer-stream
+overlap or extra staging slots only when measured exposed latency justifies them and ownership
+remains explicit. Keep model teardown ordered after all host fills/transfers/device consumers.
+
+Only after source-profile fidelity, investigate additional FP8/NVFP4 attention/GDN/shared/GR/PLE
+projections. Hold router/index selection and sensitive controls/state at their baseline precision
+initially. Each accepted change needs the complete-layer gate and a short mixed-format sequence
+gate; passing standalone Linear or copying Qwen3.8-27B cutovers is insufficient.
+
+QSA/GDN selective A8 screening (2026-09-18, RTX 5090/CUDA 13.1): native layer-3 QSA matrices
+were converted offline to nearest-even E4M3FN with BF16 row scales. The matrix weight-loss
+relative L2 values were query/gate `0.0262857`, key `0.0263045`, value `0.025956`, output
+`0.0263777`; these are weight errors, not activation/kernel errors. At T=17 with BF16 inputs
+from seed 30303 uniform `[-0.2,0.2]`, the represented-FP8 A16 baseline passed the existing
+complete-output and cache-state gates. Enabling A8 separately for query/gate or output failed
+the unchanged complete-output criterion (`0.02` relative L2, `2.5e-4 + 0.02*max_reference`
+gross bound); query/gate failed nine token checks, output all seventeen. Key-only and
+value-only A8 failed the independently derived KV codec/state bounds. Indexer projections
+stayed BF16. This experiment used exact decoded observed cache as the attention consumer input
+plus independent cache-state bounds, not an entirely oracle-propagated sequence. All four
+QSA A8 candidates and their public policy/temporary test switches were removed; QSA remains A16.
+
+The native layer-0 GDN all-FP8 A16 baseline failed the existing near-exact packed-profile
+convolution-history criterion: one witness was actual `0.1640625`, reference `0.1650390625`.
+That is a private arithmetic/represented-history qualification limitation on real weights,
+not proof of a wrong codec or source weight-loss result. No criterion was widened or baseline
+retroactively labeled passing. Keeping QKV BF16 isolates Z/output experiments under the
+already established BF16 history criterion. Output-only row-FP8 A16 passed with relative L2
+`0.00165305`; output A8 failed at `0.0263308` against `0.009`, with maximum absolute error
+`0.00639752` against `0.00155780`. Output A8 permission was removed.
+
+**Rejected: GDN Z-only A8.** The GR-fed actual-source T=17 sequence fails the unchanged
+local GDN gross-error criterion: maximum absolute error `0.00309234` exceeds `0.00289572`,
+although relative L2 `0.005618` is below `0.009`. The candidate production permission, isolated
+test switches and A8-only workspace change were removed. No criterion was widened. GDN remains
+A16; the following isolated results are positive experimental evidence, not an admitted route.
+Native layer-0 Z weights converted to row-FP8 have weight relative L2 `0.0263107`.
+The complete represented-weight FP64 GDN oracle passed at T=1/12/13/17/65 with distinct state
+and repeated-scalar continuation, unchanged output/history/recurrent criteria, exact rollback,
+guards, and exact workspace high-water. At T=17 output relative L2 is `0.00166549` for A16 and
+`0.00292297` for A8; at T=65 it is `0.00211623` and `0.00318382`, below the `0.009` gate.
+T=65 recurrent error is unchanged at `0.000672458`, below `0.0065`.
+
+Public complete-GDN timings on RTX 5090/CUDA 13.1, resident actual weights, three warmups,
+twenty-call CUDA-event mean, including A8 packing, were:
+
+| T | A16 Z microseconds | AllowA8 Z microseconds |
+|---:|---:|---:|
+| 1 | 66.3552 | 66.0480 |
+| 12 | 102.144 | 102.451 |
+| 13 | 112.128 | 101.890 |
+| 17 | 130.355 | 113.051 |
+| 65 | 259.635 | 241.766 |
+
+T=1/12 uses the identical A16 dispatch; the small timing differences are run variation.
+T>=13 used the existing qualified Linear A8 route in the now-removed candidate. These are
+historical closed-GDN and time-continuation results; they do not establish multi-layer A8
+sequence quality, full-model PPL, or a future checkpoint's qualified recipe.
+
+Shared-expert W8A8 candidate outcome (2026-09-18): **rejected; shared projections remain
+A16 and no shared-A8 public policy is retained**. On RTX 5090/CUDA 13.1, the acquired
+native layer-0/3 BF16 shared gate/up/down matrices were independently converted offline to
+row-scaled FP8 (BF16 row scale, nearest-even finite E4M3FN code). Gate-only, up-only,
+down-only and all-three substitutions were evaluated at T=17/129 with the existing two
+represented BF16 input patterns, protected router/scalar gate, and A16 routed experts.
+The complete independent FP64 oracle decoded the candidate's actual FP8 weights; it did
+not use source BF16 weights or A16 kernel outputs as the candidate arithmetic reference.
+The unchanged complete-MoE criterion was relative L2 `2.5/255`, absolute floor `1/32768`,
+and gross-error coefficient `2/255`.
+
+| Shared FP8 A8 roles | Layer 0 worst token relative L2 | Layer 3 worst token relative L2 | Admission |
+|---|---:|---:|---|
+| gate only | 0.009465 | 0.018093 | rejected (including gross-error failures) |
+| up only | 0.010868 | 0.016322 | rejected |
+| down only | 0.012247 | 0.018611 | rejected |
+| gate/up/down | 0.017227 | 0.030641 | rejected |
+
+Weight quantization alone produced matrix relative L2 `0.025717..0.026149` and ideal
+complete-MoE perturbations `0.009041..0.031953`; these are separate from the arithmetic
+errors above and are not PPL estimates. The same candidate weights under A16 satisfied
+the unchanged complete criterion except layer-0 gate-only: relative L2 `0.005393` passed
+the aggregate threshold but a gross per-element error failed. That specific baseline
+failure is an A16 private-arithmetic limitation for the new represented inputs, not
+evidence of an A8-only failure or an artifact decoding error. Original native BF16-shared
+baselines remained passing. No threshold was relaxed and the losing policy, experimental
+routes and temporary candidate tests were removed; no speed admission or sequence-quality
+claim is made for shared A8.
+
+### 0.6 Integration gates, review, and smaller-model handoff
+
+This bounded implementation tranche is complete (2026-09-18). Final verification on
+RTX 5090 / CUDA 13.1.2 used `NINFER_DEV_CONTAINER=ninfer-builder-qwen4-mixed
+NINFER_BUILD_VOLUME=ninfer-build-cache-qwen4-mixed NINFER_DEV_JOBS=8
+./scripts/run-unit-tests.sh`: 112 passed, two missing-artifact load-plan skips,
+zero failures, 452.74 seconds of test time. Separately configured real-source
+component/sequence tests passed, including the original MoE regression inputs,
+native FP8 PLE rows and active A4 residual composition below. The 11 focused Python
+format/source tests, Python compilation and `git diff --check` passed. Independent
+Sol review of the finished production changes, repairs and final sequence tests
+returned clear; this was not merely a plan review. Full-model PPL, complete native
+FP8-table capacity admission and future target registration remain deferred gates,
+not claims established by the bounded tests. No commit or push was made.
+
+The native T=17 layer-0→layer-3 A16 sequence exposed a shared-MoE precision bug:
+layer-3 token 10/index 154 gave `0.0351562` against ideal `0.0348243` (whole),
+and `0.0339355` against `0.0342919` (partitioned). An independent staging
+counterfactual isolated the shared gate/up BF16 stores, not routed quantization.
+The BF16 shared pair now uses the existing GEMV/small-T/MMA families with private
+FP32 outputs through SwiGLU, then a distinct BF16 activation buffer; mixed-format
+pairs and routed A16/A4 contracts remain unchanged. Synthetic witnesses cover the
+27/28 projection-family boundary and 128/129 full/tail tiles. The two original
+represented input panels (not golden outputs) are retained locally under
+`models/qwen4-native-layers/qwen4-moe-layer3-original-{whole,partition}-input.bf16`
+with source/seed/profile metadata; the opt-in native harness recomputes the full
+FP64 oracle when present and explicitly reports missing regression fixtures.
+
+The corrected native source-A16 selected-layer chain passes at T=5/17 in whole
+and prefill(T−1)+decode1 schedules. A separate active-W4A4 MLP residual witness
+uses native layer-0/3 GR read → MoE → GR injection, with one represented residual
+token repeated to T=65. Actual routing counts 65 (whole) and 64/1 (partitioned)
+prove the grouped A4 route is active before the A16 decode tail. The unchanged
+accumulated criterion `{relative_l2=.02, gross_absolute=.005, gross_relative_to_max_reference=.02}`
+passes: worst relative L2 `0.00327633`, maximum absolute error `0.005859375`.
+This qualifies that short MLP residual composition, not A4 stateful attention/GDN,
+general prompt quality or full-model PPL; residual addition can attenuate the
+substantial standalone A4 MoE errors recorded in §0.3.
+
+Final corrected native MoE verification passes both original T=17 regression
+panels and all source-width witnesses. Layer-0/3 standalone A16 worst-token
+relative L2 is now `0.00298893` / `0.00324256`; active A4 at T=257 remains
+`0.114199` / `0.0942307`. These supersede the pre-private-precision-fix accuracy
+snapshot above, without changing its recorded performance measurement scope.
+
+Reuse a short resident block sequence for the A16 baseline, source W4A4 profile and combined
+candidate placements. Check accumulated output/state error, routing/selection drift, lifetime,
+and prefill-to-decode transitions. This is not full-model PPL, nor evidence that the oversized
+preview is a registered Engine target. Engine graph/concurrency/MTP/frontend work remains behind
+the exact fitting-target admission gate in the later phases of this plan.
+
+At each implementation checkpoint run focused exact/numerical/real-layer tests, affected Python
+tests, `git diff --check`, and the full `scripts/run-unit-tests.sh` gate after substantial work.
+Require independent Sol review of finished implementation and repairs, not just this plan.
+Commit and push only on the user's explicit request.
+
+When a smaller checkpoint arrives: freeze its actual topology/precision/scales, admit host PLE
+and GPU core/state budgets, adapt only concrete shapes/formats, bind its complete artifact,
+enforce PLE residency before public Engine readiness, and run paired per-token NLL/PPL plus
+task/long-context/state qualification. Re-evaluate combined A4 placements on that checkpoint;
+do not inherit this preview's calibration or claim that a small layer harness proves model PPL.
 
 ## 1. Fixed authorities and evidence
 
@@ -308,35 +895,34 @@ Central ownership follows semantic effects:
 | exact constants, tensor binding, storage profile, load diagnostics | exact target leaf |
 | public generated-token publication and Engine PIMPL | `src/runtime` |
 
-The current artifact layer can place tensors only on device or validate them; its retained-host
-path accepts resources, not tensors. Qwen4 therefore extends the generic artifact contract with an
-owned mapped-tensor placement. `LoadedModel` owns that mapping and the bounded host-gather executor
-until every host gather and CUDA transfer has drained; their lifetime is not tied to Reader
-construction. This placement is limited to the exact PLE table declared by the target artifact
-authority; it is not a general CPU-weight or fallback execution lane. The target owns deterministic
-PLE row requests and prefetch timing; artifact/core own bounded raw gather and transfer mechanisms.
-The concrete execution profile is:
+Artifact materialization distinguishes ordinary mapped tensors from resident-host tensors.
+PLE uses resident-host placement: an owned exact-span mapping is fully populated and eagerly
+OS-locked before model load returns. `LoadedModel` retains its backing and lock until all
+consumers drain. Reader destruction must not release resident pages, and distinct live owners
+must not accidentally unlock each other's mappings. This does not turn mapped expert streaming
+into a product execution lane. The target owns PLE row requests and prefetch timing; artifact/core
+own memory lifetime, locking and raw transfer mechanisms.
 
-- derive and deduplicate the 16 row ids per token while retaining output order;
-- gather rows from the artifact-owned mapping/file into a fixed, preallocated pinned staging ring,
-  with explicit cold-page advice/read-ahead rather than pinning the full table;
-- batch row requests across the compact C=1..8 execution unit and scatter gathered values back to
-  token/head order;
-- overlap prompt PLE fetch with layer-0 compute and schedule next-token fetch at the preceding
-  round boundary with three distinct completions: `host_fill_done` follows the CPU gather and page
-  faults and must precede `cudaMemcpyAsync`; `copy_done` follows H2D and permits reuse of the pinned
-  host slot; `consumer_done` follows the last graph/kernel read and alone permits reuse of the
-  graph-stable device staging slot (or of a coupled host/device ring slot);
-- make cancellation and model teardown drain every launched host fill, transfer, and consumer before
-  releasing their respective slots, without mutating committed PLE token/conv state; and
-- report cold and warm page-fault/read bytes, gather latency, H2D bytes, and overlap effectiveness.
+The execution requirements are:
 
-Do not copy the PLE into pinned RAM, encode it as an opaque resource, or use an external sidecar.
-Exact FP8 PLE storage also requires a registered E4M3FN-plus-scale format/layout and an exact
-decode oracle; it cannot be inferred from a framework bug or silently cast. Phase 0 requires the
-artifact storage, host mapping/page-cache budget, bounded pinned staging, and measured cold/warm
-decode/TTFT to be compatible with the product. Failure of that gate stops activation; it does not
-move PLE to VRAM or enable general CPU execution.
+- reject insufficient lock permission or RAM at startup; never return a lazy/page-cache fallback;
+- derive 16 row ids per token and gather from resident RAM into bounded preallocated CUDA-pinned
+  staging, preserving token/head order; deduplication is a measured optimization, not a prerequisite;
+- batch prompt rows and overlap host gathers with layer-0 compute; the existing prefill path also
+  overlaps H2D on its transfer stream and waits before layer-1 consumption;
+- distinguish `host_fill_done`, `copy_done` and `consumer_done` so neither the host source nor
+  device destination is reused before its last consumer; do not prefetch an unknown decode token;
+- drain all host fills, CUDA transfers and consumers before teardown, without mutating committed
+  token/conv state; and
+- report startup population/locked capacity separately from inference gather latency, H2D
+  completion, bytes and exposed consumer stalls. Inference-time storage reads are not admitted.
+
+Do not CUDA-pin or duplicate the entire PLE table, encode it as an opaque resource, or use an
+external sidecar. OS locking the complete table is mandatory and is distinct from CUDA-pinning
+the small staging buffers. Exact FP8 PLE requires an independently decoded, registered format;
+the native checkpoint audit in section 0 determines its scale/layout, not the row-scaled Linear
+profile. Phase 0 requires the complete resident host budget plus GPU core/state/staging budget.
+Failure stops activation rather than moving PLE to VRAM, disk paging, or CPU floating-point work.
 
 ### 3.1 UD-IQ1_S host-staged verification profile
 
@@ -345,7 +931,7 @@ inventory splits as follows:
 
 | Placement | Tensor set | Encoded bytes |
 |---|---|---:|
-| host mapped | PLE | 28,800,138,240 |
+| fully resident, OS-locked host mapping | PLE | 28,800,138,240 |
 | host mapped | 48 routed gate/up expert banks | 17,196,646,400 |
 | device resident | 48 routed-down expert banks | 22,649,241,600 |
 | device resident | every non-routed Text tensor | 3,889,410,560 |
@@ -592,12 +1178,12 @@ declared sole product identity. Confirm all of its device-resident weights plus 
 shared growing-pool minimum that gives every lane one page and one sequence `max_context` capacity,
 QSA index pools, any MTP provisional lead, workspace, graph allowance, and 1 GiB headroom fit the
 5090. When the exact target contains preview-style PLE, its mapped PLE is excluded from those device
-weights; independently confirm its artifact-owned host mapping, page-cache envelope, and bounded
-pinned staging fit host capacity and meet the cold/warm latency gate.
+weights; independently confirm its artifact-owned, fully populated OS-locked host mapping and
+bounded CUDA-pinned staging fit host capacity and meet the startup/inference latency gate.
 For each homogeneous pool, require the target-derived candidate `B(M)` to include all coupled
 pools/fixed allocations and satisfy the current `M_min <= M <= M_max` shared-capacity admission
 rules; do not budget or advertise `C * max_context`. If PLE is host-resident, also require artifact
-storage, host mapping/page-cache budget, bounded pinned staging, and measured cold/warm latency from
+storage, full resident/locked host budget, bounded pinned staging, and measured startup/inference latency from
 §3. The currently audited BF16 and UD-IQ1_S profiles cannot be registered. A complete custom profile
 is conditionally eligible only after it passes this Phase 0 gate; until then, continue reference/Op
 development without registration. Artifact-backed experts or multi-GPU execution remain a separate
@@ -640,12 +1226,12 @@ GDN/PLE state, typed model views, eager prefill, eager T=1 decode, scoring, and 
 the Engine internals that currently hard-code `targets::qwen3_6::PreparedPrompt` to use closed
 per-package type erasure or a variant keyed by `ActiveTarget`; do not expose target types publicly.
 Gate: artifact-native reference parity for layer taps, selected indices, logits/NLL, chunked
-prefill, T=1 continuation, request reset, and C=1..8 isolation.
+prefill, T=1 continuation, request reset, and C=1..4 isolation under the current product contract.
 
 The unregistered verifier portion of this phase is implemented for C=1: startup-fixed T=1..4096
 storage, T-wide embedding/GR/GDN/PLE/QSA/MoE execution, per-query causal QSA visibility, final-column
 head projection, and reset/partition/EOS continuation tests are live. Product registration,
-frontend ownership, multi-request C=1..8 scheduling, transactional MTP, and CUDA Graphs remain the
+frontend ownership, multi-request C=1..4 scheduling, transactional MTP, and CUDA Graphs remain the
 later gates described below and are not implied by the verifier.
 
 ### Phase 5 — Vision and frontend
@@ -662,7 +1248,7 @@ rollout, target verification, state-record/fold primitives, and family transacti
 prefix/checkpoint/state transaction to QSA and PLE, with runtime retaining generated-token
 publication policy. Gate: independent Op oracles plus integration coverage for rejection,
 partial/full acceptance, selected-index reuse parity, target logits, and published-token behavior
-at C=1..8.
+at C=1..4.
 
 ### Phase 7 — CUDA Graphs, concurrency, and retention
 
@@ -731,7 +1317,7 @@ Stop target activation, while retaining already valid architecture/Op work, unde
 conditions:
 
 - no exact checkpoint/profile has device-resident weights that fit the 32 GB 5090, or a target with
-  preview-style PLE cannot also satisfy its mapped-host capacity and latency contract;
+  preview-style PLE cannot also satisfy its resident/locked host capacity and latency contract;
 - Qwen4 final architecture differs materially from the preview and its new semantics are not yet
   authoritative;
 - MTP formula or transaction behavior cannot be resolved from two agreeing executable references
@@ -753,7 +1339,7 @@ The architecture is implemented only when the selected exact target has:
 - active model and artifact authorities with no preview-derived assumptions left implicit;
 - complete `.ninfer` conversion/binding and exact frontend resources;
 - independent oracles for every new or extended floating-point and exact transform;
-- correct eager and graph prefill/decode for C=1..8;
+- correct eager and graph prefill/decode for C=1..4;
 - transactional QSA/GDN/MTP state and, when present, PLE state, prefix retention, and restore;
 - Text, Vision, score, generate, CLI, OpenAI, and Anthropic behavior through the public Engine;
 - passing real-artifact parity, paired per-token PPL, long-context retrieval, and all applicable
@@ -763,6 +1349,9 @@ The architecture is implemented only when the selected exact target has:
 
 ## 12. Primary source addresses
 
+- https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/tree/fc694b54fb0174e0913e6adf86691ef85a4ead47
+- https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/raw/fc694b54fb0174e0913e6adf86691ef85a4ead47/hf_quant_config.json
+- https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/raw/fc694b54fb0174e0913e6adf86691ef85a4ead47/model.safetensors.index.json
 - https://arxiv.org/html/2608.30320v1
 - https://github.com/QwenLM/Qwen3.8-Flash-Next/tree/69885871a64393807d988b27b1b5e380e8f28526
 - https://huggingface.co/Qwen/Qwen3.8-Flash-Next/tree/de4b8e4d43b917e7706784d8bb445c9af86a3540

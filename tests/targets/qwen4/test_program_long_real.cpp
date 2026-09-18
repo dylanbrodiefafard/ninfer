@@ -337,10 +337,10 @@ std::vector<std::uint8_t> inspect_qsa_row(const ops::QsaStateView& state, std::i
         const std::size_t scale_offset = 16ULL *
             (static_cast<std::size_t>(token) + verifier::kQsaCapacity * head);
         CUDA_CHECK(cudaMemcpy(k_codes.data(),
-                              static_cast<const std::byte*>(state.k_codes.data) + code_offset,
+                              static_cast<const std::byte*>(state.k.data) + code_offset,
                               k_codes.size(), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(v_codes.data(),
-                              static_cast<const std::byte*>(state.v_codes.data) + code_offset,
+                              static_cast<const std::byte*>(state.v.data) + code_offset,
                               v_codes.size(), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(k_scales.data(),
                               static_cast<const std::byte*>(state.k_scales.data) + scale_offset,
@@ -458,8 +458,8 @@ void validate_qsa_layout(const ops::QsaStateView& state, std::size_t layer, int&
                tensor.ne[0] == n0 && tensor.ne[1] == n1 && tensor.ne[2] == n2 &&
                tensor.ne[3] == 1;
     };
-    if (!matches(state.k_codes, ninfer::DType::U8, 128, verifier::kQsaCapacity, 2) ||
-        !matches(state.v_codes, ninfer::DType::U8, 128, verifier::kQsaCapacity, 2) ||
+    if (!matches(state.k, ninfer::DType::U8, 128, verifier::kQsaCapacity, 2) ||
+        !matches(state.v, ninfer::DType::U8, 128, verifier::kQsaCapacity, 2) ||
         !matches(state.k_scales, ninfer::DType::FP8_E4M3FN, 16, verifier::kQsaCapacity, 2) ||
         !matches(state.v_scales, ninfer::DType::FP8_E4M3FN, 16, verifier::kQsaCapacity, 2) ||
         !matches(state.raw_index_keys, ninfer::DType::BF16, 128, verifier::kQsaCapacity, 1) ||
@@ -541,9 +541,9 @@ Digest128 hash_continuation(const verifier::State& state,
             ++qsa_count;
             const ops::QsaStateView& qsa = *state.qsa()[layer];
             validate_qsa_layout(qsa, layer, failures);
-            hash_device_tensor(digest, qsa.k_codes, "qsa_k_codes", ValidationKind::None,
+            hash_device_tensor(digest, qsa.k, "qsa_k_codes", ValidationKind::None,
                                scratch, failures, &bytes_hashed);
-            hash_device_tensor(digest, qsa.v_codes, "qsa_v_codes", ValidationKind::None,
+            hash_device_tensor(digest, qsa.v, "qsa_v_codes", ValidationKind::None,
                                scratch, failures, &bytes_hashed);
             hash_device_tensor(digest, qsa.k_scales, "qsa_k_scales",
                                ValidationKind::Fp8E4m3, scratch, failures, &bytes_hashed);
@@ -598,8 +598,8 @@ void visit_continuation_tensors(const verifier::State& state, Visitor&& visitor)
         }
         if (state.qsa()[layer]) {
             const ops::QsaStateView& qsa = *state.qsa()[layer];
-            visitor("qsa_k_codes", qsa.k_codes);
-            visitor("qsa_v_codes", qsa.v_codes);
+            visitor("qsa_k_codes", qsa.k);
+            visitor("qsa_v_codes", qsa.v);
             visitor("qsa_k_scales", qsa.k_scales);
             visitor("qsa_v_scales", qsa.v_scales);
             visitor("qsa_raw_keys", qsa.raw_index_keys);

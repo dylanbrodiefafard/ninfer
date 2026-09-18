@@ -4,6 +4,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -162,6 +163,20 @@ int run_bf16_linear() {
     DeviceWeight output_weight(make_patterned(5120, 6144, 409U));
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 27, 28, 32, 33, 127, 128, 129, 1024, 1536}) {
         failures += run_bf16_linear_case(output_weight, tokens);
+    }
+    for (const auto [rows, columns] : std::vector<std::pair<int, int>>{
+            {10240,2560}, {6144,2560}, {12288,2560}, {512,2560}, {640,2560},
+            {2560,2560}, {2560,6144}, {320,10240}, {10240,320}, {2560,640}}) {
+        DeviceWeight preview_weight(make_patterned(rows, columns, 419U));
+        for (int tokens : {1, 2, 17, 27, 28, 32, 33, 127, 128, 129, 4096}) {
+            failures += run_bf16_linear_case(preview_weight, tokens);
+        }
+    }
+    for (const auto [rows, columns] : std::array<std::pair<int,int>,2>{{{4608,4608},{2560,4608}}}) {
+        DeviceWeight merger_weight(make_patterned(rows,columns,421U));
+        for (int tokens : {1,5,27,28,128,129}) {
+            failures += run_bf16_linear_case(merger_weight,tokens);
+        }
     }
     return failures;
 }

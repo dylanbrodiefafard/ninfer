@@ -535,8 +535,8 @@ struct HostQsaState {
 HostQsaState copy_qsa_state(const ops::QsaStateView& state) {
     const std::int32_t capacity = state.raw_index_keys.ne[1];
     HostQsaState result(capacity);
-    result.k_codes = from_device<std::uint8_t>(state.k_codes.data, state.k_codes.numel());
-    result.v_codes = from_device<std::uint8_t>(state.v_codes.data, state.v_codes.numel());
+    result.k_codes = from_device<std::uint8_t>(state.k.data, state.k.numel());
+    result.v_codes = from_device<std::uint8_t>(state.v.data, state.v.numel());
     result.k_scales = from_device<std::uint8_t>(state.k_scales.data, state.k_scales.numel());
     result.v_scales = from_device<std::uint8_t>(state.v_scales.data, state.v_scales.numel());
     result.raw_index_keys =
@@ -555,6 +555,7 @@ struct GuardedQsaState {
           raw_index_keys(source.raw_index_keys.size() * sizeof(std::uint16_t)),
           positions(source.positions.size() * sizeof(std::int32_t)),
           view{
+              ops::QsaKvFormat::NVFP4G16,
               Tensor(k_codes.data(), DType::U8, {128, source.capacity, kKvHeads}),
               Tensor(v_codes.data(), DType::U8, {128, source.capacity, kKvHeads}),
               Tensor(k_scales.data(), DType::FP8_E4M3FN, {16, source.capacity, kKvHeads}),
@@ -948,7 +949,7 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
 
         Tensor x_tensor(qsa_x.data(), DType::BF16, {kHidden});
         Tensor write_scale_tensor(qsa_write_scale.data(), DType::BF16, {kBranches});
-        WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes());
+        WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
         const verifier::GrWeights& attention_gr = model.view().layers[layer].attention_gr;
         ops::gated_residual_read_write(
             result.gr[layer - 1].ffn_residual, attention_gr.norm, attention_gr.down,
@@ -1095,7 +1096,8 @@ int run_accumulated_qsa_cell(const verifier::LoadedModel& model, DeviceContext& 
         static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
     GuardedDeviceBuffer device_count(sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
-    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(1));
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(1,
+        QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K));
     device_selected.fill(0xcd);
     device_count.fill(0xcd);
     device_output.fill(0xcd);
@@ -1264,7 +1266,7 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
                                    device.stream));
         Tensor layer2_ffn_residual_tensor(layer2_ffn_residual.p, DType::BF16, {kHidden, 4});
         Tensor qsa_x_tensor(qsa_x.data(), DType::BF16, {kHidden});
-        WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes());
+        WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
         const verifier::GrWeights& layer3_gr = model.view().layers[3].attention_gr;
         ops::gated_residual_read(layer2_ffn_residual_tensor, layer3_gr.norm, layer3_gr.down,
                                  layer3_gr.up, qsa_x_tensor, gr_workspace, device.stream);
@@ -1354,9 +1356,9 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
         expected_state.positions[static_cast<std::size_t>(3) * current_id + axis] = position[axis];
     }
 
-    CUDA_CHECK(cudaMemcpy(state.k_codes.data, initial_state.k_codes.data(),
+    CUDA_CHECK(cudaMemcpy(state.k.data, initial_state.k_codes.data(),
                           initial_state.k_codes.size(), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(state.v_codes.data, initial_state.v_codes.data(),
+    CUDA_CHECK(cudaMemcpy(state.v.data, initial_state.v_codes.data(),
                           initial_state.v_codes.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(state.k_scales.data, initial_state.k_scales.data(),
                           initial_state.k_scales.size(), cudaMemcpyHostToDevice));
@@ -1391,7 +1393,8 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
         static_cast<std::size_t>(ops::kQsaSelectedCapacity) * sizeof(std::int32_t));
     GuardedDeviceBuffer device_count(sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
-    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(1));
+    GuardedDeviceBuffer workspace(ops::qsa_verifier_workspace_bytes(1,
+        QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K, QType::GGML_Q5_K));
     device_selected.fill(0xcd);
     device_count.fill(0xcd);
     device_output.fill(0xcd);
@@ -1425,8 +1428,8 @@ int ninfer::test::qwen4::real_oracle::run_qsa_cell(const verifier::LoadedModel& 
         from_device<std::int32_t>(device_selected.data(), ops::kQsaSelectedCapacity),
         expected_selected);
 
-    auto actual_k_codes = from_device<std::uint8_t>(state.k_codes.data, state.k_codes.bytes());
-    auto actual_v_codes = from_device<std::uint8_t>(state.v_codes.data, state.v_codes.bytes());
+    auto actual_k_codes = from_device<std::uint8_t>(state.k.data, state.k.bytes());
+    auto actual_v_codes = from_device<std::uint8_t>(state.v.data, state.v.bytes());
     auto actual_k_scales =
         from_device<std::uint8_t>(state.k_scales.data, state.k_scales.bytes());
     auto actual_v_scales =

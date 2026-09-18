@@ -21,17 +21,108 @@ geometry and formats instead of inheriting preview constants implicitly.
 
 ### Native weight-format qualification
 
-The existing GDN, QSA core, GR and PLE composite Ops also accept native NVFP4 and row-scaled
+The existing GDN, QSA core, GR and PLE composite Ops also accept native BF16, NVFP4 and row-scaled
 `FP8_E4M3FN_ROW_BF16S` projections at their exact preview geometries. Their complete-layer
 arithmetic retains BF16 activations (`LinearPolicy::A16Only`), FP32 controls/recurrent state, and
-the existing output criteria. QSA index projections remain BF16; QSA K/V remain NVFP4-G16; the
-mapped PLE table remains a separate embedding format. GR down `[320,10240]` admits FP8 but not
+the existing output criteria. QSA index projections remain BF16; native QSA K/V use the explicit
+BF16 baseline, while the historical diagnostic profile explicitly retains NVFP4-G16; the
+mapped PLE table remains a separate embedding format. GR down `[320,10240]` admits BF16 and FP8 but not
 NVFP4 because its N=320 violates the registered block-scale layout. Explicit format arguments to
-each composite's workspace query describe the actual profile; the defaults still describe the
-unchanged GGUF verifier.
+each composite's workspace query describe the actual profile; callers supply their weight formats
+explicitly rather than inheriting a diagnostic GGUF profile.
 
-The public Linear Op additionally qualifies optimized A4/A8 activation-compute routes for these
-weight formats. Permission for those routes at a standalone Linear boundary is not automatically
+The earlier row-scaled activation-FP8 candidates are not admitted. GDN Z-only A8 passed isolated native
+layer-0 checks and improved complete-Op timings, but the GR-fed T=17 sequence failed the
+unchanged local GDN gross-error gate: maximum absolute error `0.00309234` exceeded `0.00289572`
+despite relative L2 `0.005618` passing `0.009`. Its candidate API was removed; QSA and GDN-output
+A8 candidates also failed their existing gates. Positive isolated evidence does not override
+the sequence counterexample. The active plan records representation loss and timing separately.
+
+The separately audited source-calibrated `FP8_E4M3FN_TENSOR_F32M` GDN projections preserve
+the publisher's exact FP32 weight/input scales and have their own qualification. QKV, Z and
+output each permit A16 or explicit A8; A16 remains the default. QKV and output may not both
+select A8, because their combined component output error exceeded the predeclared A8 gate.
+Z can combine with either role. The complete component oracle always uses the public BF16
+input and exact represented weights, never private quantized activations. A8 profile budgets
+were declared before execution: output relative L2 `.04`, convolution history `.04`, and
+FP32 recurrent state `.08`, with gross-relative allowances `.06`, `.06`, and `.12`.
+The state allowance accounts for multiple Q/K/V perturbation paths in the bounded test;
+it is not a universal nonlinear bound. Existing A16 gates remain unchanged. Persistent
+storage is still BF16 convolution history and FP32 recurrence, including under A8.
+Native T=65 and 64+1 component sequences qualify the admitted choices; that is not full-model
+PPL or default-policy approval. Exact source evidence, weight-only loss, and per-role
+arithmetic results are recorded in `../research/qwen4-native-fp8-source.md`.
+
+Calibrated Linear A8 uses a guarded temporary per-token scale:
+`max(stored_input_multiplier, RN(maxabs(public_input) / 448))`. The artifact's
+FP32 calibration remains unchanged and is the floor; in-range inputs retain their
+original scale and codes. Out-of-range tokens expand the temporary scale rather
+than clip to the publisher's calibration range. This is a qualified private arithmetic
+profile, not publisher bitwise equivalence. Exact packing tests cover source-floor
+and expanded-scale cases independently of the ideal floating-point Op oracle.
+
+The native BF16 projection baseline reuses the existing BF16 Linear decode, small-T and MMA
+kernels at ten exact preview geometries. The 320- and 640-wide inputs use the existing 64-wide
+MMA tile at every T because the vector decode phase does not represent those widths. This is
+an activation-preserving correctness baseline, not a measured claim of optimal decode dispatch.
+Its GDN convolution-history oracle rounds the independent FP64 dot directly to BF16, avoiding
+an artificial FP32 double-rounding seam. Direct BF16-weight history uses a BF16-precision gate
+(relative L2 `1/256`, gross error at most maximum reference magnitude divided by `128`):
+legitimate FP32 reduction ordering can cross a BF16 midpoint. The existing packed-weight history,
+complete-output and FP32 recurrent-state criteria are unchanged.
+The signed hash-distributed BF16 fixture observes convolution-history relative L2 from
+`2.6352e-5` (T=3) through `3.0609e-5` (T=65) to `6.1170e-5` (T=257), with maximum absolute
+error `6.1035e-5` to `1.2207e-4`. These are BF16-midpoint crossings, not a reason to tune a
+fixture-specific numerical threshold. Panel versus repeated decode and the 32+33 / 128+129
+chunk continuations retain the existing output and FP32 state checks.
+
+The native BF16/BF16 GR read now retains FP32 normalized values, projection accumulations and
+SILU/up intermediates. Real source layer-0 MLP hyperconnection weights exposed a gross-error
+failure hidden by the synthetic fixture: BF16 staging produced `-0.703125` versus the complete
+FP64 formula's `-0.677012`. Independent temporary seam attribution reproduced the deviation
+(`-0.703299` before final BF16 rounding). The fix preserves public BF16 outputs and write scales,
+does not alter the oracle or numerical criteria, and leaves quantized/mixed GR profiles unchanged.
+It is an accuracy route, not a claim of optimal native-BF16 GR throughput.
+
+Opt-in native source fixtures also exercise layer-0 GDN, layer-3 QSA and both layers' attention/
+MLP GR components with the actual stored BF16 weights. GDN's test-owned execution view explicitly
+permutes every V-side role from source grouped heads to the admitted tiled-head convention and
+folds `-exp(A_log)` to FP32; its internal norm is ordinary gamma. GR/QSA zero-centered norms are
+converted to effective FP32 `1+w`. The source artifacts are unchanged. The same component oracles
+evaluate the resulting represented public inputs; these are real-weight, synthetic-activation
+component checks, not a full Transformer-block composition, source-framework bitwise comparison,
+or end-to-end model quality result. QSA's short first-block case does not qualify multi-block
+indexer cutoff margins or long-context cache quality.
+
+The closed QSA component additionally accepts tensor-calibrated FP8 Q/K/V/O
+matrices with separate FP32 source weight/input multipliers and A16 compute only.
+The indexer stays BF16; norm reductions and rotary/cache boundaries are unchanged.
+The A16 key projection retains FP32 accumulator output through normalization, using
+a narrow `[512,2560]` internal output policy. This does not broaden public Linear's
+BF16 output contract or automatically admit calibrated FP8 in other Ops.
+
+`ninfer_qsa_test --native-fp8-real` qualifies the Senfu source layer-3 calibrated
+Q/K/V/O matrices with the existing protected BF16 source indexer/norms and BF16 KV.
+Its A16 source cases T=1/24/129 and 128+1 passed the unchanged component output and
+state gates, with exact selector trace equality. Each candidate still uses the
+same independent FP64 mathematical oracle; activation packing is not copied into
+that oracle. Final A16-only verification at T=129 measured output relative L2
+`0.00331408` whole / `0.00331413` chunked, maximum absolute error `0.00130981`, and
+K/V state relative L2 `0.00165402`/`0.00166057`; focused QSA and calibrated-FP8
+Linear regressions also passed. A temporary per-role A8 assessment at T=129/128+1 failed those same
+gates: Q-only failed 68 token-output screens in each schedule; K-only failed
+49,066/48,678 state-coordinate screens, and V-only 47,519/47,169. O-only also failed
+output checks (for example `-0.0688477` versus `-0.0595095`); combined A8 failed
+61,392/60,917 checks. The failed candidate policy API, execution CLI, and unused
+FP32 A8 key epilogue were removed. There is no QSA activation-policy escape hatch;
+the independently qualified generic Linear A8 infrastructure remains unchanged.
+These failures do not establish universal A8 unsuitability, but none of these QSA
+profiles is admitted by the current evidence, and no gate was widened.
+These fixtures combine explicit source
+components and seeded inputs; they are not producer-matched full-model PPL evidence.
+
+The public Linear Op additionally qualifies optimized A4/A8 activation-compute routes for NVFP4
+and row-scaled FP8 respectively; BF16 remains A16-only. Permission for those routes at a standalone Linear boundary is not automatically
 permission to use them repeatedly inside a nonlinear/recurrent layer. Native resident MoE uses
 device-selected complete banks and independently qualifies the complete ideal FP64 formula; its
 private projection and activation storage is not reproduced in that oracle.
@@ -64,7 +155,11 @@ activation quantization only at independently qualified dispatch widths; A16 rem
 complete-layer policy.
 
 Native resident MoE qualification uses the complete ideal FP64 formula, not a reference that
-copies its private BF16 projection/SwiGLU stores. Ordinary inputs and decorrelated packed-weight
+copies its private projection/SwiGLU stores. For source BF16 shared gate/up pairs, the existing
+BF16 GEMV/small-T/MMA families retain FP32 projection outputs through SiLU-times-up and cast
+only the dedicated activation panel to BF16 before shared down. The panel does not alias either
+FP32 projection buffer. Mixed/quantized shared pairs and routed expert profiles are unchanged.
+Ordinary inputs and decorrelated packed-weight
 witnesses retain the existing `2.5/255` relative-L2 and gross-error criteria. One retained
 periodic all-NVFP4 input nearly
 cancels: its two reference RMS values are `9.0021e-9` and `4.6865e-10`. An offline attribution
@@ -84,6 +179,84 @@ selection spans all 512 experts; resident weights occupy approximately 1.424 GB 
 2.531 GB (FP8). These are one-layer schedule measurements, not cold-cache medians or full-model
 decode/prefill speeds. NVFP4 grouped execution reuses the Linear A16 SmallT arithmetic; FP8
 grouped execution reuses its BF16 MMA body. Routing and all floating-point execution stay on GPU.
+
+The source-faithful `NVFP4_EXPERT_F32M` bank adds exact per-expert FP32 weight and input
+multipliers; its represented coefficient is signed E2M1 times stored E4M3FN block scale times
+stored weight multiplier, without reciprocal rounding. Default MoE execution remains A16.
+Explicit expert `AllowA4` requires that format for all three routed projections and selects
+W4A4 only for groups with at least 32 occurrences. Gate/up and post-SwiGLU down each use their
+own stored input calibration. GPU-only grouping, compact MMA tile metadata, local activation
+packing and occurrence scatter use caller-owned workspace; routing stays protected and shared
+projections retain their independently selected precision policy. The public header records the private packing profile. This does not claim
+bit-identical NVIDIA inference arithmetic or qualify future-checkpoint PPL.
+
+The explicit `ninfer_qwen4_native_a4_eos_diagnostic` recreates the real 33-token
+BF16 source embedding → GR0 → GDN0 → inject → MLP-GR prefix on the GPU, preserves
+EOS token 15, and repeats its actual MoE input 65 times. The local reference is reset
+to that represented input, so this isolates MoE rather than accumulated prefix drift.
+Selected experts are `411,331,109,152,421,435,148,431,351,466`; groups of 65 and 64
+exercise actual A4, while the one-token tail uses the qualified A16 fallback.
+
+This source input exposes a calibration-range limitation despite passing the existing
+local criteria. Every selected gate/up expert's input multiplier is approximately
+`0.00138928`, giving E2M1/E4M3 finite coverage `6*448*input_multiplier = 3.734375`.
+The represented input maximum is `4.375`: one of 2560 coordinates exceeds coverage
+by 17.155%. Down calibration is separate: its limit is `8.5625`, whereas the existing
+independent FP64 gate/up/SwiGLU formula gives maxima `0.306854..2.82101`, with no
+out-of-range coordinate. That down statistic is an ideal-intermediate diagnostic,
+not a claim of identical private BF16/A4 staging.
+
+On the 5090, A16 and active A4 both passed their unchanged complete FP64 oracle
+criteria and exact routing, whole 65 and 64+1. Supplementary relative L2 against
+the BF16-represented reference was `0.00351252`/`0.00351251` for A16 and
+`0.0928886`/`0.0921723` for A4 (whole/chunked). The latter passes the existing
+16% implementation envelope but is not a small PPL-loss claim. Finite-range
+exceedance is established; the approximately 9.3% total error includes ordinary
+A4 rounding. No kernel, codec, calibration value or gate was changed for this
+diagnostic, and no codec bug was demonstrated.
+
+The diagnostic's `--attribution-only` mode repeats that exact GPU prefix and A16
+local check, then evaluates the selected gate/up FP64 dots using three independently
+constructed inputs: static-scale E4M3/E2M1 quantize/decode, original input clamped
+only to the source finite limit, and a hypothetical guarded quantize/decode with
+FP32 multiplier `max(source_multiplier, maxabs(input)/(6*448))`. Nearest-code
+enumeration uses RNE ties, explicit FP32 codec divisions/products, and exact decoded
+coefficient multiplication in the existing FP64 dot. This is private profile
+attribution, not a candidate GPU kernel or new admission oracle.
+
+On the same EOS witness, activation relative L2 is `0.0942321` static,
+`0.0234538` clamp-only, and `0.0951139` guarded. Selected gate/up dot relative L2
+ranges are respectively `0.0613824..0.103095`, `0.0174037..0.0354197`, and
+`0.0554796..0.110424`. The guard improves 17 of 20 projection relative-L2 values,
+but worsens expert 435 up and both expert 466 projections; worst-case dot error
+also increases. It removes finite-range clipping but changes rounding across
+all blocks, slightly worsening total activation error. These errors are not
+additive: clamp-only is an isolated counterfactual, not a percentage decomposition
+of total A4 error. This single-input mixed result does not justify overriding source
+calibration or admitting a guarded A4 production route. The bounded attribution
+run passed its unchanged prefix/A16 checks on the 5090; no PPL or full guarded-MoE
+quality claim follows.
+
+Native source-calibrated FP8 shared gate/up/down now preserve each projection's exact FP32
+weight and input scalars. Separate explicit shared A16/A8 policies include their packing in
+caller-owned workspace. All eight shared-policy subsets passed the complete ideal FP64 MoE
+oracle with actual layer-0/3 matrices, unchanged exact route IDs and probability criteria,
+T=1/8/9/24/25/65 and 64+1 continuation. Shared A8 uses a predeclared `.04` relative L2 / `.06`
+gross-relative profile with the existing absolute floor, not a new mathematical oracle.
+All combinations with active routed A4 also passed its existing `.16` profile at T65 and
+64+1. A16 remains the default; this does not qualify a future model's PPL. Router/shared
+scalar source BF16 storage and FP32 arithmetic are unchanged. Source weight-only error and
+activation/kernel error are reported separately in `../research/qwen4-native-fp8-source.md`.
+
+The opt-in A4 complete-MoE criterion, declared before measurement, is relative L2 `0.16`,
+absolute floor `1/32768`, and gross allowance `0.16 * max(abs(reference))` against the same
+independent ideal FP64 oracle. It is an implementation conformance envelope, not a quality-loss
+budget. Default A16 criteria are unchanged. Synthetic witnesses cover small/group-boundary/wide
+panels through T=4096, including fixed-hot T=31/32/33 and authentic alternating panels at
+T=63/64/65 with measured expert counts 31/32/33; authentic layer-0/3 banks preserve all 512 experts' codes, scales and
+independent multipliers. The bounded native harness also checks exact routing and probability
+criteria; it uses synthetic inputs, not full-model captured activations. Current measurements
+and integration limitations are recorded in the active architecture plan.
 
 ## 1. Boundary rules and notation
 
@@ -155,8 +328,10 @@ section 8 fixes both consequences explicitly.
 
 The represented-state transition is implemented by `qsa_state_append` in
 `include/ninfer/ops/qsa.h`. It appends T-wide BF16 normalized/rotated core K, projected V, raw index
-keys, and three-axis positions to the fixed C=1 research state. Core K/V are encoded as
-NVFP4-G16. `qsa_verifier` is the admitted actual-artifact T=1..4096 projection-plus-append form: it
+keys, and three-axis positions to the fixed C=1 research state. Native BF16 K/V are copied
+bit-exactly into BF16 `[256,capacity,2]` planes. The explicitly selected diagnostic NVFP4-G16
+profile retains its code/scale planes; no scales exist for BF16. `qsa_verifier` is the admitted
+actual-artifact T=1..4096 projection-plus-append form: it
 uses separate BF16 index-query `[512,2560]` and index-key `[128,2560]` weights and FP32 norm weights.
 The multi-request conceptual entry below remains future design.
 
@@ -195,7 +370,9 @@ public outputs of this entry and raw keys survive the call. A future compressed 
 must be a separately registered state representation and be qualified directly against this same
 logical projection. Packed weights are exact-decoded by the oracle before an FP64 dot product.
 
-The live NVFP4 state view requires four-byte-aligned K/V code planes for packed 32-bit stores,
+The BF16 state view requires four-byte-aligned K/V planes and absent scale storage. Its four
+present planes are pairwise disjoint, and append copies the original BF16 bits without arithmetic.
+The diagnostic NVFP4 state view requires four-byte-aligned K/V code planes for packed 32-bit stores,
 byte-aligned scale planes, two-byte-aligned BF16 raw keys, and four-byte-aligned I32 positions. The
 six state planes are pairwise disjoint. Append K/V inputs are 16-byte aligned for their vectorized
 K16 loads; BF16 raw-key inputs are two-byte aligned and I32 position/id inputs are four-byte
@@ -259,7 +436,7 @@ logical block id is `b`, and its block-start position is the stored three-axis p
 
 For every complete block, load its four represented raw keys, promote each component to FP32,
 compute the four-way mean in FP32, and cast the pooled vector once to the represented raw-key state
-dtype. That cast is semantic. Apply RMSNorm multiplied directly by the converted GGUF gamma to the
+dtype. That cast is semantic. Apply RMSNorm multiplied directly by effective FP32 gamma to the
 represented pooled key, then apply partial interleaved MRoPE to its first `Dr` components at the
 block-start position. Apply the same norm and partial MRoPE to each represented raw query head at
 the current query position.
@@ -307,7 +484,7 @@ valid counts and visible lengths inside the declared maxima without changing sem
 
 The inner cache-consuming attention is implemented by `qsa_selected_attention` in
 `include/ninfer/ops/qsa.h`: the live C=1/T=1..4096 entry accepts already normalized/rotated BF16
-`q [256,24,T]`, maps 24 query heads to two NVFP4-G16 KV heads in groups of 12, decodes every
+`q [256,24,T]`, maps 24 query heads to two BF16 or diagnostic NVFP4-G16 KV heads in groups of 12, reads every
 per-column selected K/V row from state, and emits BF16 `[256,24,T]`. Its I32 selected-id operand is
 `[S,T]` for caller-known `S` in `[1,2051]`; selected counts are device I32 `[T]`. The fixed
 `qsa_verifier` composes that entry with the T-wide state append and selector, actual Q5_K
@@ -386,6 +563,44 @@ selection is the causal boundary that prevents a query from observing K/V append
 columns. These are private implementation profiles and do not change the listed-id formula, FP32
 softmax, cache codec, or public represented outputs.
 
+#### Test-only FP8 KV assessment
+
+`ninfer_qsa_test --native-fp8-kv-assessment`, with `NINFER_QWEN4_NATIVE_LAYERS`,
+evaluates a hypothesis, not a paper-prescribed recipe or admitted runtime format:
+independent K/V scales per token and KV head, FP32 `max(abs(row))/448` (zero rows use
+scale one), E4M3FN RNE/saturate-finite codes, and explicit FP32 code-times-scale
+reconstruction followed by BF16 representation. Its theoretical K/V payload is
+`(256+4)/(256*2) = 50.78125%` of BF16, excluding allocation overhead and unrelated
+index/state storage. Exact independent code vectors cover ties, signed zero,
+subnormal underflow and saturation; zero-row reconstruction is exact.
+
+The source layer-3 BF16 matrices and independent FP64 projection/norm/RoPE oracle
+generate represented BF16 K/V and Q at T=129 with nonzero positions. K-only, V-only,
+and combined compression are separate cells. Residual inputs are seeded synthetic
+BF16 values, not captured text activations. Frozen causal selected IDs exclude
+selector changes; Q, index keys, softmax mathematics and GDN are not quantized.
+The existing BF16-cache attention kernel consumes independently decoded candidate
+values and is checked directly against the same FP64 attention oracle, with its
+unchanged criterion, both whole and 128+1. Separately, FP64 attention and gated
+output-projection differences against the original BF16 cache report storage loss.
+Neither oracle reads a GPU-mutated cache. This does not qualify a GPU FP8 codec,
+FP8 runtime storage, long-context selection, model quality or PPL; storage-loss
+measurements are an assessment rather than a deployment acceptance gate.
+
+On the RTX 5090/CUDA 13.1 build, the assessment and focused QSA tests passed with
+unchanged same-input kernel gates. FP64 storage-loss results for this bounded input:
+
+| Candidate | Attention relative L2 / max absolute | Output projection relative L2 / max absolute |
+|---|---|---|
+| K only | 0.0169408 / 0.0232602 | 0.0195155 / 0.00727305 |
+| V only | 0.0260962 / 0.0175780 | 0.0265606 / 0.00995216 |
+| K and V | 0.0311334 / 0.0227258 | 0.0329898 / 0.0100114 |
+
+Whole and 128+1 same-input attention passed independently; decoded cache bytes and
+frozen selection remained exact. The combined approximately 3.3% projected relative
+L2 is measurable storage error, not evidence of acceptable PPL. Keep BF16 as the
+native reference; this result alone does not admit FP8 KV as its replacement.
+
 `out` is BF16 `[H,W,C]` for the preview. Invalid token columns are exact zero. In the live verifier
 the per-head represented BF16 attention is multiplied by sigmoid of its corresponding
 represented BF16 raw gate, then the concatenated `[6144]` vector crosses the Q5_K output matrix.
@@ -414,7 +629,8 @@ sublayer call.
 ### 5.1 Read formula
 
 The implemented verifier admits C=1 and T=1..4096. For `R` `[H,B,T]`, normalize each branch and
-token separately with its own slice of converted GGUF gamma:
+token separately with its own slice of effective FP32 gamma (native source `1+w`, or
+the diagnostic artifact's already converted scale):
 
 ```text
 Rhat_i = rmsnorm(R_i, eps) * gamma_i
@@ -446,6 +662,37 @@ median of run medians). The unchanged read entry measured 25.86/25.85/25.85 us b
 25.95/26.03/26.04 us after; its 0.7% shift bounds measurement drift rather than a read-path change.
 The supplementary public read/write-minus-read increment fell from about 5.84 us to 3.62 us.
 
+#### Native FP8 residual-storage experiment
+
+The opt-in `ninfer_gated_residual_test --fp8-residual-experiment` uses exact native layer-0 and
+layer-3 attention/MLP GR weights (`NINFER_QWEN4_NATIVE_LAYERS`), 33 synthetic BF16 residual
+tokens, one FP32 scale per token/2560-wide branch (`maxabs/448`), E4M3FN round-to-nearest-even
+storage, and FP32 decode followed by the public BF16 boundary. Gates and all weights retain the
+protected baseline. The same independent FP64 formula compares original BF16 residuals with the
+decoded candidate, isolating storage error from GPU implementation error.
+
+On 2026-09-18 the four read relative-L2 errors were `0.0297841`, `0.0306891`, `0.0288672`, and
+`0.0317548` (layer-0 attention/MLP, then layer-3 attention/MLP), exceeding the unchanged `0.006`
+read gate. Write-scale errors were `0.00407994`, `0.00516035`, `0.00595261`, and `0.00745576`,
+exceeding the unchanged `0.0035` gate. Although payload plus scales would occupy `50.0781%` of
+BF16 storage, this specific profile is rejected. It remains test-only; no persistent-state codec,
+runtime route or default changes. This bounded synthetic-activation result does not reject all
+calibrated FP8 residual schemes or establish model-level quality.
+
+The subsequent `ninfer_qwen4_native_sequence_real_test --fp8-residual-experiment`
+repeats this codec at residual stores throughout contiguous native compute layers 0..3,
+including PLE at layer 1, using BF16 QSA cache and T17 whole/16+1 execution. Each GPU
+consumer still receives explicit decoded BF16 values and is checked against its unchanged
+same-input mathematical oracle; a separately propagated FP64 formula receives its own
+codec round trips. This is decoded-consumer verification, not a GPU FP8 encoder qualification.
+Against the BF16-storage baseline, final GPU output relative L2 is `0.0833825` (maximum
+absolute error `0.21875`); independent formula storage loss is `0.0836543`. Router/selector
+traces differ in 380 ordered ID slots, which is not a count of distinct expert-set changes.
+Local component gates pass, but the unchanged accumulated and whole/chunk screens fail.
+The assessment returns failure and the recipe remains rejected. Inputs are synthetic branch
+residuals and explicit source PLE fixture ordinals, not token-derived activations or a
+calibration corpus; this does not refute a different calibrated FP8 storage recipe.
+
 ### 5.2 Inject formula and effects
 
 For block result `y` `[H,T]`:
@@ -461,6 +708,37 @@ Every element is written. `x` and `write_scale` may not overlap `R` or each othe
 Read entries accept caller-owned fixed-profile workspace; inject requires no global scratch. FP8
 residual storage, if selected later, is a distinct represented-state profile with explicit
 decode/encode boundaries and its own criterion. It is not enabled by the BF16 contract.
+
+### 5.3 Source-defined four-stream stem
+
+`gated_residual_stem` is a closed BF16 Op for the preview's two-projection MTP stem,
+not an MTP rollout, cache transaction, or registered target. It independently offset-RMS
+normalizes the token embedding `[2560,T]` and the entire concatenated hidden state
+`[10240,T]`, with epsilon `1e-6`. Only after the latter normalization does it view the
+hidden state as four 2560-wide branches. The two independent BF16 `[2560,2560]`
+matrices project embedding and hidden branches; the embedding projection is added to
+each branch and the public result is BF16 `[2560,4,T]`. Existing `mtp_fc`/`mtp_pack`
+contracts do not describe this formula and are not used.
+
+The private implementation composes central RMSNorm and A16 BF16 Linear with a
+broadcast-add launcher. Its normalized/projection BF16 workspaces are implementation
+choices, not oracle casts. The complete independent FP64 oracle uses the original
+represented inputs and weights, a single 10240-wide hidden mean square, and no private
+staging casts. Admission criteria declared before measurement are relative L2 `0.01`
+and maximum absolute error `0.005 + 0.02*maxabs(reference)`, with finite outputs.
+All storage is disjoint; workspace is caller-owned and scoped, addresses remain stable
+during CUDA Graph capture/replay, and there is no persistent state or hidden allocation.
+
+On the RTX 5090/CUDA 13.1 builder, `ninfer_gated_residual_stem_test` and
+`ninfer_qwen4_native_mtp_stem_real_test` pass. Synthetic exact-shape widths 1/7/27/28/33
+cover embedding and four-branch GEMV/small-T/MMA transitions with deliberately unequal
+branch variances. The separately acquired four-tensor NVIDIA BF16 source fixture
+`qwen4-mtp-stem.ninfer` passes widths 1/17/28: relative L2 `0.002874..0.002884`, maximum
+absolute error at most `0.018190`. Whole and `(T-1)+1` schedules each pass the same oracle;
+two fixed-route graph replays are exact. Guarded output/workspace, rejected alias/short
+workspace, preserved matrices and workspace-scope restoration also pass. This is
+bounded stem correctness, not full MTP recurrence, selection-reuse, acceptance/fold or
+model-quality qualification; those gates remain in the model authority.
 
 ## 6. Exact n-gram row addressing
 
@@ -553,8 +831,12 @@ Implemented family: `include/ninfer/ops/ple.h`. The admitted host-resident C=1 p
 `ple_iq4_nl_stage_rows` and T-wide `ple_iq4_nl_stage_rows_batch`; the latter copies exactly
 `16*T` 90-byte IQ4_NL rows into fixed caller-owned pinned storage and enqueues one contiguous H2D.
 `ple_iq4_nl_decode_rows` exact-decodes U8 `[90,16,T]` to BF16 `[160,16,T]` on the GPU.
-`ple_inject` implements the complete T=1..4096 injection/state transition with Q8_0 key/value
-projections and FP32 norm/convolution controls. Every column in W is valid; multi-request invalid
+`ple_inject` implements the complete T=1..4096 injection/state transition with BF16/native packed
+or diagnostic Q8_0 projections. Required `PleNormFormat` distinguishes source zero-centered BF16
+norm parameters from effective FP32 gamma; native gamma is evaluated as FP32 `1+w` without
+rewriting the BF16 source. Convolution coefficients independently admit BF16 or FP32, with FP32
+reductions/nonlinearities retained. Workspace queries require explicit projection formats.
+Every column in W is valid; multi-request invalid
 suffixes remain outside this verifier entry.
 
 ### 7.1 Gather/decode boundary
@@ -567,8 +849,7 @@ E[(h*Dn+d),t,c] = decode(table[row_ids[h,t,c],d]),
 
 with `E [Nh*Dn,W,C]`, head-major flattening, and preview shape `[2560,W,C]`. Row ids must be valid
 non-padding rows and are never deduplicated semantically. Exact table codec and scale lookup belong
-to the represented table view. BF16 compares after exact BF16 decode; a future FP8/scaled format
-requires a registered decoder and codec-specific criterion.
+to the represented table view. BF16 compares after exact BF16 decode.
 
 A device-resident table could expose `ngram_embedding_gather(table,row_ids,E,...)` directly. The
 admitted host-resident C=1 path instead takes all `16*T` exact row ids at the round boundary and
@@ -576,10 +857,47 @@ copies their encoded 90-byte spans, in token/head order and without semantic ded
 artifact-owned mapping into one bounded pinned slot. One H2D transfer populates the paired stable
 device slot; `ple_iq4_nl_decode_rows` then performs only exact GPU decode. File I/O, page-fault
 policy, staging-ring ownership, and slot completion remain outside the Op. Neither entry mutates
-the table or row ids. Output and all inputs are non-overlapping. Only the mapped IQ4_NL entry needed
-by the selected research artifact is currently admitted.
+the table or row ids. Output and all inputs are non-overlapping.
+
+The native per-tensor E4M3FN preparation route is `ple_fp8_stage_rows_batch` followed by
+`ple_fp8_decode_rows`. It copies 160 encoded bytes per selected row into U8 `[160,16,T]`,
+then computes `BF16_RNE(E4M3FN(code) * BF16(scale_bits))` on the GPU. The exact stored positive
+finite BF16 scalar is a multiplier; it is not the row-scaled Linear FP8 format. Finite FP8
+values (including signed zero) convert exactly to BF16 before the source multiplication.
+The public raw-code/scale contract is admitted without claiming a native checkpoint binder.
+The artifact owner must eagerly populate and lock the complete encoded host table before use;
+the Op neither duplicates nor expands it. Caller-owned pinned/device slots contain `2560*T`
+bytes each and remain unreusable until the transfer and decode consumers finish.
+
+Source provenance: NVIDIA checkpoint `fc694b54fb0174e0913e6adf86691ef85a4ead47` names producer
+ModelOpt `0.46.0.dev281+g73d778422`. That exact exporter's FP8 decoder casts codes and scales
+to the requested output dtype before multiplying. SGLang's pinned Qwen4 loader confirms
+contiguous row shards: shard `i` begins at `i*ceil(padded_vocab/split_ngram_parts)`; this preview
+has 128 shards of 2,500,012 rows, not one shard per hash head. Its BF16 gather output is multiplied
+by the one BF16 table scale. Source addresses:
+
+- https://github.com/NVIDIA/Model-Optimizer/blob/73d778422388f0e849ecb180375d34ac445711ca/modelopt/torch/quantization/qtensor/fp8_tensor.py
+- https://github.com/sgl-project/sglang/blob/c46bf5e990bdd99e2c200214b04683022100e4df/python/sglang/srt/models/qwen4_exp.py
+
+Exact tests use an independent binary FP8 formula over every finite code, the source scalar
+`0x3951` and other normal/subnormal BF16 scales, repeated rows, non-default-stream staging,
+token/head order, T=1/17/128/4096, chunk boundaries, and output guards. This is codec/selected-row
+qualification, not proof that the complete 47.684 GiB FP8 table fits the current host budget.
 
 ### 7.2 PLE injection boundary
+
+Native NVFP4 PLE uses `ple_nvfp4_stage_rows_batch` and `ple_nvfp4_decode_rows`.
+The resident `NVFP4_PARTITION_F32M` payload preserves partition-major 90-byte rows
+(80 adjacent-pair E2M1 code bytes and ten E4M3 block scales), then one FP32 multiplier
+per partition. The pinned producer's multipliers differ across shards. Staging adds the
+exact four multiplier bytes to each selected record: U8 `[94,16,T]`, with bounded
+`1504*T` pinned and device bytes. GPU reconstruction is FP32 followed by BF16, preserving
+signed zero. The first E2M1/E4M3 product is exactly representable. The full packed payload,
+not just selected rows, must be populated and OS-locked before load succeeds. CPU gather
+performs byte copies only. No IQ codec or whole-table BF16 expansion participates.
+Producer/source cast details and bounded fixture provenance are recorded in
+`../research/qwen4-native-ple-source.md`. Selected-row tests do not prove complete-table
+memory capacity or quantization quality. Gather has no GEMM activation precision policy.
 
 Conceptual entry:
 
@@ -602,8 +920,9 @@ G_i    = sigmoid(g_i) * V
 N_i    = rmsnorm(G_i, eps) * conv_gamma_i.
 ```
 
-The preview weights are `W_key [10240,2560]`, `W_value [2560,2560]`, three independent converted
-GGUF gamma vectors `[10240]`, and mathematical depthwise `conv_weight [10240,4]`, viewed
+The preview weights are `W_key [10240,2560]`, `W_value [2560,2560]`, three independent source
+zero-centered BF16 norm vectors (or diagnostic effective FP32 gamma vectors) `[10240]`, and
+mathematical depthwise `conv_weight [10240,4]`, viewed
 physically as contiguous `[4,10240]` with `weight[c*4+j]`. The represented old
 and new convolution-state views are `[10240,9,C]`. Flatten branch-major `G/N` to channel `c`. With
 dilation three, kernel width four, and old history `N_old[-9..-1,c]`, define `N_all` as old history
@@ -629,6 +948,28 @@ independent exact Op in section 6.
 The workspace query includes projections and any convolution staging for the complete `C,W`
 envelope, not persistent history. One-shot prefill, arbitrary legal chunk partitions, and repeated
 `W=1` calls must produce the same represented outputs and final state under the profile criterion.
+
+The opt-in `ninfer_qwen4_native_ple_real_test` reads exact native BF16 layer-1 projection,
+norm and convolution parameters plus selected authentic FP8/NVFP4 table rows. The pinned
+Transformers reference at `c119ec3cc37ab69642f39cca2de4187714002b08` uses zero-centered grouped
+RMSNorm and source `[10240,1,4]` convolution coefficients: dropping the singleton axis preserves
+channel-major order, not a transpose. Full-model BF16 framework materializations remain a
+cross-check profile; the complete mathematical oracle does not copy private GEMM staging casts.
+Only the represented gathered BF16 embedding and persistent BF16 history are cast boundaries.
+Fixture row IDs are ordinals into extracted rows, not n-gram hashes of a model text sequence;
+these tests do not establish full-table admission, full-model PPL, or producer-matched mixed
+checkpoint quality.
+On the RTX 5090 / CUDA 13.1 builder, the public gather/decode/inject chain passes actual-source
+FP8 and NVFP4 table profiles at T=1,9,10,17,27,28,29, including the BF16 projection small-T/MMA
+boundary, history rollover, nonzero initial history and reset, and exact permitted state/residual
+aliasing. The complete FP64 output criterion is relative L2 `0.02`, absolute floor `1e-4`,
+gross allowance `0.02 * max(abs(reference))`; BF16 history uses relative L2 `1/256`, floor
+`1e-5`, gross allowance `max(abs(reference))/128`. Both reject non-finite results. Gathered
+embedding bits and retained old-history regions compare exactly. Chunk-local oracles consume
+the actual represented incoming history; separate accumulated checks independently propagate
+the complete initial-state formula. These gates were fixed before measurements and were not
+weakened. Synthetic format cases use the same generalized formula; the superseded oracle's
+private projection casts and constant-row simplifications have been removed.
 
 ## 8. Qwen4 GDN profile
 
@@ -725,6 +1066,17 @@ shared   = sigmoid(w_shared_gate x)
 moe      = routed + shared.
 ```
 
+Native resident MoE accepts the source BF16 router and shared scalar-gate pair directly;
+neither weight needs an FP32 device copy. The existing FP32 pair remains the diagnostic
+storage profile. BF16 loads widen exactly for protected FP32 dot products and nonlinearities.
+This changes storage, not the closed Op's ideal logits, exact top-k ordering or observable
+FP32 selected coefficients. The pinned Transformers unfused router instead materializes BF16
+logits before FP32 softmax and casts selected coefficients back to BF16. That framework
+arithmetic profile can create additional ties; bit-identical framework routing is not the
+closed ideal Op's contract. Source-weight fidelity must not be described as framework bit
+parity. Native real-weight and synthetic BF16-control tests use the same complete independent
+MoE oracle and unchanged route/output criteria as the FP32-storage profile.
+
 The `Store` epilogue writes `destination=moe`; the existing `AddResidual` epilogue remains for its
 existing registered geometry. Logical expert id always selects the same router row and two stored
 bank matrix spans. There is no capacity factor, token dropping, duplicate expert, decoded-value
@@ -811,6 +1163,86 @@ capacity, guards, and lower-id ties without weakening the nonzero oracle witness
 remain future
 registered-target work.
 
+## Native BF16 Vision patch and encoder reference
+
+Native BF16 Linear now admits patch `[1152,1536]`, QKV `[3456,1152]`, attention
+output `[1152,1152]`, MLP up `[4304,1152]` and down `[1152,4304]`. These use the
+unchanged canonical BF16 MMA schedule at every positive token width. The real 4304
+dimension requires compile-time masked row/K tiles: invalid source transfers are
+zero-filled and invalid output rows are not stored. Divisible instantiations retain
+their prior load/store branches; no runtime weight repacking or padded artifact exists.
+The kernel-iteration card refused tile-shape tuning at `[1152,4304,T128]`; no such
+optimization was performed. This is correctness-required shape admission, not an
+optimal-throughput or inference-speed claim.
+
+`tools.parity.qwen4.native_endpoint_fixture --component vision-block` audits the pinned
+NVIDIA headers and acquires 15 exact BF16 source tensors: patch weight/bias, position
+table and one complete encoder block. Payload is 39,328,672 bytes, preserving source
+shapes and bytes in `qwen4-vision-block.ninfer`, identity
+`qwen4/native-vision-block-qualification/nvidia-bf16-source`. The flattened patch keeps
+source `[3,2,16,16]` order. The fixture driver uses explicit 2x2 merge-major spatial
+groups, 48x48 align-corners position interpolation, both affine LayerNorms, all four
+projection biases, 72-wide Vision RoPE, segmented noncausal attention, tanh-GELU and
+both residual additions. Existing public Ops execute every stage; this is not a second
+Vision execution backend or a full image/video frontend.
+
+The complete FP64 formula reuses the existing independent LayerNorm, RoPE and attention
+oracles through test-only adapters, and the existing BF16 dot oracle. It propagates
+ideal intermediates without copying private BF16 normalization, projection or activation
+staging; only the documented position-interpolation/addition casts are explicit.
+Every source Linear additionally passes its unchanged represented-input BF16 criterion.
+The accumulated gate was declared before measurement: relative L2 `0.02`, maximum
+absolute error `0.005 + 0.02*maxabs(reference)`, finite outputs.
+
+RTX 5090/CUDA 13.1 results: complete native patch/position/block at P4/P12/P132 passes
+with relative L2 `0.00497801/0.00571211/0.00573572` and maximum absolute error
+`0.0369369/0.0427145/0.0616180`. Perturbing only the second packed segment leaves the
+first segment bit-exact. Synthetic tests of all five geometries at T1/4/128/132 place
+nonzero contributions solely in the final 16 K elements, exercise final output rows,
+and match the independent oracle exactly with guarded outputs. Existing BF16 Linear,
+LayerNorm, RoPE and Vision attention regression suites pass. This qualifies one native
+encoder block and its source shapes, not all 27 blocks, full frontend integration,
+image understanding or multimodal model quality.
+
+## Native BF16 Vision patch merger
+
+`vision_patch_merger` owns the complete preview merger formula, not a target-private
+sequence of partially verified stages. Its BF16 input is `[1152,4,G]`, with each
+merge-major group ordered top-left, top-right, bottom-left, bottom-right. It applies
+learned per-patch LayerNorm (population variance, epsilon `1e-6`), concatenates four
+normalized patches as width 4608, evaluates biased `[4608,4608]` projection, exact
+erf GELU (not the Vision-block tanh approximation), then biased `[2560,4608]`
+projection. The BF16 `[2560,G]` result is the only output. Source matrices, norm
+parameters and biases remain BF16. The implementation reuses existing GPU LayerNorm,
+native BF16 GEMV/small-T/MMA, bias and exact-GELU kernels; private intermediate BF16
+casts are not inserted into its mathematical oracle.
+
+The caller supplies non-overlapping storage and the queried workspace; the Op owns
+no allocation, persistent state, frontend regrouping or Vision tower. Validation
+precedes GPU writes. Two exact BF16 Linear geometries are admitted for the merger,
+`[4608,4608]` and `[2560,4608]`, with their existing independent Linear oracle as
+well as the single complete naive FP64 merger oracle. This is not admission of
+additional Vision geometries by itself or a multimodal Engine target; the separate
+patch/encoder reference qualification above owns those five additional geometries.
+
+`tools/parity/qwen4/native_vision_merger_fixture.py` acquires exactly the six BF16
+source merger tensors (66,079,232 bytes) from the pinned NVIDIA source. The local
+`qwen4-vision-merger.ninfer` identity is
+`qwen4/native-vision-merger-qualification/nvidia-bf16-source`; its JSON records
+source revision, shards, shapes and exact payload sizes. No complete shard or
+Vision checkpoint is downloaded.
+
+`ninfer_vision_patch_merger_test` checks asymmetric synthetic patch groups and
+nonzero affine/bias values, including constant patches. Its `--native-real` mode
+uses the actual six tensors with seeded represented BF16 patch activations.
+Both profiles passed G=1/5/28/129 and 128+1, guard checks and rejection without
+input/output mutation on the RTX 5090. Every execution compares directly with
+the same full FP64 formula under the predeclared, unchanged criterion
+`{0.02,1e-4,0.02}`. Source G=129 relative L2 was `0.00333155` whole /
+`0.00333153` chunked, maximum absolute error `0.0248062`; synthetic G=129 relative
+L2 was `0.00459203`. This is merger mathematics and chunk-execution evidence,
+not full-Vision, image-understanding, throughput or model-quality qualification.
+
 ## 10. Schedule-owned transactions are not Ops
 
 The unregistered `src/targets/qwen4/program.cpp` verifier now composes these live C=1 Ops into the
@@ -868,6 +1300,143 @@ kernel, codec-helper, target, or Transformers code.
 
 ### 11.2 Required conformance cells
 
+The opt-in `ninfer_qwen4_native_sequence_real_test`, with `NINFER_QWEN4_NATIVE_LAYERS`
+pointing to the extracted source fixtures, composes all native compute layers 0 through 3:
+each layer's attention GR, GDN or QSA, injection, MLP GR, resident MoE and injection, with
+source PLE before layer 1's attention read. This is the contiguous first block, not an
+end-to-end model. Default admission uses BF16 QSA cache; `--nvfp4-diagnostics` explicitly
+selects the rejected wider compressed-cache assessment and retains its failing exit status.
+Synthetic represented BF16 residuals at T=5 and T=17 run both as whole
+panels and as T-1 prefill plus T=1 continuation at each public component. GDN starts from zero state;
+QSA runs the BF16-cache baseline and a separately selected diagnostic NVFP4-G16-cache witness.
+The BF16-cache sequence uses native FP8 PLE rows; the diagnostic-NVFP4-cache sequence uses
+native NVFP4 PLE rows. Each is checked independently against its represented-input oracle,
+not compared as a matched weight/cache quantization quality A/B. PLE row IDs are selected-fixture
+ordinals, not hashes for an input text. Its native BF16 parameters and zero-centered norms remain
+source-faithful; complete table residency is a separate qualification gate.
+
+Test-only adapters reuse the existing component fixtures and their single FP64 mathematical
+oracles. Local comparisons use represented actual public inputs and the original component
+criteria. In particular, the local QSA output formula consumes the validated represented actual
+KV state, whereas the accumulated comparison constructs its own ideal BF16 KV values or
+diagnostic NVFP4 codes and scales according to the explicit test profile.
+The accumulated reference independently propagates BF16 public read/write/output
+boundaries, router decisions, recurrent state, and independently represented KV;
+it never substitutes production output or production cache bytes for the propagated reference.
+The accumulated gate, declared before measuring the chain, is relative L2 `0.02` plus a gross
+pointwise cap `0.005 + 0.02 * max(abs(reference))`, with non-finite rejection. Public state and
+route/codec checks retain their component gates; whole/chunk parity is supplementary evidence.
+The earlier, noncontiguous layer-0 → PLE1 → layer-3 witness (omitting the remainder of layer 1
+and all of layer 2) on 2026-09-18 RTX 5090 / CUDA 13.1 at T=17 passed every local/state criterion and the final
+accumulated gate: final relative L2 `0.00686405`/`0.00668704` (whole/partitioned), maximum absolute
+error `0.01953125`/`0.02734375` versus gross cap `0.0353125`. Whole-versus-partitioned output
+relative L2 was `0.00294694`, maximum absolute error `0.03125`.
+These are synthetic-activation operator/composition results, not PPL or
+evidence that the complete native model fits on the GPU.
+
+The additional `--native-text` fixture uses 33 real tokenizer IDs, original BF16 embeddings
+repeated into four branches, and their exact hash-selected FP8 PLE rows. Independent integer
+hash checks and every local/accumulated criterion passed for whole/32+1 on RTX 5090, CUDA
+13.1. Same-input router indices remain exact; independently propagated inputs can cross a
+top-k boundary, so such trace differences are reported separately and are not described as
+bit-identical full-chain routing. The 2% accumulated criterion is unchanged. This panel is
+not a calibration corpus or a substitute for full-model PPL.
+
+The corresponding `--native-text-fp8` panel also passes whole/32+1 with the thirteen
+source-calibrated FP8 projection matrices (GDN layer 0, QSA layer 3, shared experts in
+layers 0/3), all with A16 operands and BF16 cache. QSA same-input output relative L2 is
+`0.00414611`/`0.00414967`; BF16 K/V state relative L2 is approximately `0.00166`.
+The accumulated comparison propagates the represented FP8 weights independently; this
+establishes implementation correctness for that input panel, not equality to BF16 weights
+or a measured full-model weight-quantization loss.
+
+The selective `--native-text-a8` panel uses guarded A8 for GDN layer-0 Z and all
+three shared-expert projections in layers 0/3, with QSA and other GDN projections
+remaining A16. Whole33 and 32+1 pass the unchanged local/state and 2% accumulated
+criteria. The original static-scale attempt failed: EOS token 15 produces a GDN
+input maximum of 49.75 against source range 16.875. Independent attribution gives
+static Z projection relative error 0.212924, dominated by clipping; the guarded
+projection gives 0.00667229 against the ideal formula. QSA same-input output error
+in the guarded chain is 0.00418435/0.00418893. Exact same-input routing checks
+remain in place; independently propagated inputs still change some top-k choices.
+This closes the reproduced calibration-clipping defect for the represented panel,
+not future-checkpoint calibration or full-model quality qualification.
+
+That T=17 witness exposed a premature private BF16 core-K projection cast: using the same
+represented actual input, 170 decoded K values differed from the independent ideal cache, while
+V matched exactly. An attribution-only counterfactual inserting that one cast reproduced the
+actual cache exactly. Native BF16 core K now retains FP32 projection output through norm/RoPE;
+the public BF16 append boundary, NVFP4 codec, indexer and other projection formats are unchanged.
+The canonical BF16 GEMV, small-T and MMA arithmetic/schedules are reused with an FP32 output
+policy, also used by the native shared-MoE gate/up accuracy route. No speed claim follows from
+this precision fix. The corrected same-input witness matches the independent K/V cache exactly;
+its complete output relative L2 is `0.00346`, versus `0.01715` before the fix. The complete-chain
+maximum error fell from `0.04395`/`0.04492` to the passing values above without changing any gate.
+The native QSA component additionally passes at T=`1,5,27,28,128,129`, covering the reused
+GEMV/small-T crossover and partial/full/tail MMA output policies with exact source weights.
+The BF16-cache component repeats these source-weight widths plus T=5 chunk continuation.
+Its state criterion keeps the pre-existing BF16 projection/norm allowance and removes the
+NVFP4 codec allowance; no output gate is relaxed. Exact BF16 append checks all stored and
+untouched bits, including signed zeros/subnormals, permuted append IDs, an invalid suffix,
+and whole versus 17-token chunks. The common independent FP64 attention formula directly checks
+both T=1 short/tiled and T=2 routes at selected counts 0, 1, 63/64/65, 127/128/129,
+2047/2048 and 2051. BF16 selector checks cover the existing exact 2047..2053 budget/tie cases,
+score ordering, malformed visibility and the 4096-token capacity. This is numerical execution
+evidence, not a long-context model-quality result or a BF16-cache performance claim.
+Before adding PLE to the composition, the BF16 and diagnostic-NVFP4 selected-layer T=5/T=17
+whole/chunk sequences both passed the
+unchanged local and accumulated gates. The BF16 T=17 layer-3 token-14 routing set differs
+between independently propagated reference inputs and actual inputs near a small cutoff margin
+(`0.000832` whole / `0.001669` partitioned); routing on the same represented input remains exact.
+This is reported numerical sensitivity, not a claim of identical end-to-end routing.
+
+In the earlier selected-layer composition (layer 0, layer-1 PLE only, then layer 3),
+the T=5/T=17 whole/chunk cells passed on the 5090
+for FP8-table/BF16-KV and NVFP4-table/diagnostic-NVFP4-KV profiles, with unchanged local
+and accumulated gates. Independently propagated reference inputs still expose layer-3
+routing-set sensitivity: BF16-KV T=17 token 8, and diagnostic-NVFP4-KV tokens 0, 1, 3
+at T=5 plus 6, 7, 11 at T=17 (token 6 only in the whole schedule). Routing on each
+same represented input remains exact. These differently represented table/cache profiles
+are separate conformance cells, not a paired quantization-quality comparison.
+
+The stronger contiguous layers 0..3 diagnostic-NVFP4 composition does **not** pass
+the unchanged accumulated 2% screen. At T=5, one failing residual element is
+`0.222656` versus `0.255859`; at T=17 it is `0.742188` versus `0.78125`.
+The T=17 whole/chunk screen also fails (`0.847656` versus `0.886719`). Local
+component criteria still pass. `--nvfp4-diagnostics` retains this failed screen;
+the compressed four-layer chain is not qualified by the earlier narrower pass.
+
+QSA decomposition rules out a same-input codec bug in these witnesses: production
+K/V codes and scales exactly match both independent encoding of the public BF16
+QSA-state comparator and independent FP64 same-input projections followed by the
+specified BF16 append/codec boundary. The comparator is supplementary evidence,
+not a replacement mathematical oracle. Different upstream propagated inputs do
+cross NVFP4 decision boundaries:
+
+| Schedule | K differing codes / scales | V differing codes / scales | QSA local output relative L2 | Propagated-reference output relative L2 |
+|---|---|---|---|---|
+| T=5 | 38/2560 / 3/160 | 35/2560 / 5/160 | 0.00300882 | 0.0346991 |
+| T=17 | 173/8704 / 13/544 | 153/8704 / 14/544 | 0.00322051 | 0.0401914 |
+| T=17, 16+1 | 161/8704 / 10/544 | 143/8704 / 11/544 | 0.00321021 | 0.0395188 |
+
+Local output compares GPU with the FP64 formula over the actual cache and same
+represented input. Propagated output compares independent same-input and propagated
+reference formulas through gating and the output projection. The measured failure
+is accumulated-input sensitivity amplified by coarse KV codes/scales and subsequent
+routing, not grounds to weaken the screen or silently change the oracle. BF16 KV
+remains the native reference; local diagnostic NVFP4 codec/attention qualification
+does not establish compressed-chain quality or PPL.
+
+The same sequence test separately qualifies the narrower MLP residual composition
+`GR read -> MoE AllowA4 -> GR inject` for native layers 0 and 3. A represented residual token is
+repeated across T=65 so selected expert groups actually reach 65 occurrences (64 for the
+prefill-plus-one comparison), exceeding the admitted 32-occurrence A4 cutoff; the single-token
+tail uses the A16 fallback. Exact local routing checks and the unchanged A4 component criterion
+remain active, and the accumulated criterion above is unchanged. On the same 5090, accumulated
+relative L2 was `0.00327633`/`0.00325159` for layer 0 and `0.00165074`/`0.00163827` for layer 3
+(whole/partitioned); maximum absolute errors were `0.005859375` and `0.00390625`, respectively.
+This is active routed-W4A4 MLP-residual evidence, not a full stateful A4 model or PPL claim.
+
 The minimum meaningful matrix is:
 
 | Family | Required cells |
@@ -886,6 +1455,37 @@ Named numeric criteria must be fixed from adversarial and target-representative 
 distributions before a failing candidate is judged. Reduction Ops require both a normwise bound and
 a finite gross pointwise cap, and every criterion rejects non-finite output/state. Exact selector
 ids and integer transforms have no tolerance.
+
+### Native PLE transfer readiness measurement
+
+`ninfer_ple_transfer_bench` measures the public native packed-row gather/H2D/decode path.
+The table is synthetic, eagerly populated and OS-locked; changing random indices use a
+512 MiB footprint exceeding the test CPU's 128 MiB aggregate L3. Only bounded transfer slots
+are CUDA-pinned. One copy-stream event orders GPU decode on the consumer stream, and each
+iteration drains decode-ready before reusing storage. This is an isolated no-overlap measurement,
+not full-table capacity admission, full-model timing, or a guarantee against PLE bottlenecks.
+
+RTX 5090, Ryzen 9 7950X3D, CUDA 13.1.2, 2026-09-18; 10 warmups and 200 measured samples per
+format/width, no concurrent GPU workload. Public validation, CPU row gathering, enqueue,
+H2D, GPU decode and final host synchronization are included in readiness latency:
+
+| T | FP8 median / p95 readiness, µs | NVFP4 median / p95 readiness, µs |
+|---|---:|---:|
+| 1 | 9.060 / 16.810 | 8.990 / 13.881 |
+| 128 | 86.451 / 104.230 | 62.520 / 77.150 |
+| 4096 | 2292.607 / 2446.978 | 1713.316 / 1829.645 |
+
+Transfer payloads are respectively `2560*T` and `1504*T` bytes (NVFP4 records carry their
+partition multiplier). T4096 median submit-call times are 1894.296 / 1387.314 µs, indicating
+that host gathering/enqueue is material at this width. `copy_ready_to_decode_ready` includes
+consumer scheduling gaps and decode; it is not pure kernel time. No independent first-layer
+compute runs here, so production overlap is neither measured nor presumed.
+
+Reproduce using `/build/bench/ninfer_ple_transfer_bench --t T --repetitions 200 --table-mib 512`
+in the existing builder image with the matching build volume and an adequate memlock allowance
+(the measurement used 1 GiB in a temporary container). The ordinary builder's 8 MiB limit
+correctly cannot admit this benchmark table. No global swap or unrelated workload changes
+are necessary.
 
 ## 12. Known-answer fixtures
 

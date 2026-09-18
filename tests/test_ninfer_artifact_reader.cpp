@@ -6,12 +6,18 @@
 #include <array>
 #include <cstdint>
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -201,6 +207,103 @@ void test_fp8_row_layout() {
     }, "FP8 cannot use grouped integer layout");
 }
 
+void test_expert_nvfp4_layout() {
+    for (const auto shape : {std::array<std::uint64_t, 3>{512, 640, 2560},
+                              std::array<std::uint64_t, 3>{512, 2560, 640}}) {
+        const auto g = ninfer::artifact::expert_block_scale_geometry(
+            NumericFormat::NVFP4_EXPERT_F32M, shape);
+        if (g.code_plane_bytes != 419430400 || g.scale_plane_offset != 419430400 ||
+            g.scale_plane_bytes != 52428800 || g.weight_multiplier_offset != 471859200 ||
+            g.input_multiplier_offset != 471861248 || g.encoded_bytes != 471863296) {
+            throw std::runtime_error("source expert bank geometry mismatch");
+        }
+        if (ninfer::artifact::tensor_encoded_size(StorageLayout::ExpertBlockScaleK16M128x4V1,
+                NumericFormat::NVFP4_EXPERT_F32M, shape) != g.encoded_bytes) {
+            throw std::runtime_error("expert layout dispatch mismatch");
+        }
+    }
+    const std::array<std::uint64_t, 2> matrix{640, 2560};
+    expect_artifact_error([&] { ninfer::artifact::expert_block_scale_geometry(
+        NumericFormat::NVFP4_EXPERT_F32M, matrix); }, "rank-two expert bank");
+    auto directory = normative_directory();
+    directory["objects"].push_back({{"name", "experts"}, {"kind", "tensor"},
+        {"shape", {2, 128, 64}}, {"format", "NVFP4_EXPERT_F32M"},
+        {"layout", "expert-blockscale-k16-m128x4-v1"}, {"offset", 5376}, {"bytes", 9232}});
+    auto fixture = write_fixture(directory, "expert-nvfp4");
+    Reader reader(fixture.path);
+    const auto* tensor = std::get_if<TensorDescriptor>(reader.find("experts"));
+    if (tensor == nullptr || tensor->format != NumericFormat::NVFP4_EXPERT_F32M ||
+        tensor->layout != StorageLayout::ExpertBlockScaleK16M128x4V1 ||
+        reader.payload(*tensor).data.size() != 9232) {
+        throw std::runtime_error("NVFP4 expert directory/payload did not round trip");
+    }
+}
+
+void test_partition_nvfp4_layout() {
+    for (const auto shape : {std::array<std::uint64_t, 3>{3, 4, 160},
+                             std::array<std::uint64_t, 3>{128, 2500012, 160}}) {
+        const auto g = ninfer::artifact::partition_block_scale_geometry(
+            NumericFormat::NVFP4_PARTITION_F32M, shape);
+        if (g.row_bytes != 90 || g.multiplier_offset != shape[0] * shape[1] * 90 ||
+            g.encoded_bytes != shape[0] * shape[1] * 90 + 4 * shape[0]) {
+            throw std::runtime_error("partition NVFP4 geometry mismatch");
+        }
+    }
+    auto directory = normative_directory();
+    directory["objects"].push_back({{"name", "ple"}, {"kind", "tensor"},
+        {"shape", {3, 4, 160}}, {"format", "NVFP4_PARTITION_F32M"},
+        {"layout", "partitioned-row-blockscale-k16-v1"}, {"offset", 5376}, {"bytes", 1092}});
+    auto fixture = write_fixture(directory, "partition-nvfp4");
+    Reader reader(fixture.path);
+    const auto* tensor = std::get_if<TensorDescriptor>(reader.find("ple"));
+    if (!tensor || tensor->format != NumericFormat::NVFP4_PARTITION_F32M ||
+        tensor->layout != StorageLayout::PartitionedRowBlockScaleK16V1 ||
+        reader.payload(*tensor).data.size() != 1092) {
+        throw std::runtime_error("partition NVFP4 directory/payload did not round trip");
+    }
+}
+
+void test_tensor_fp8_layout() {
+    const std::array<std::uint64_t, 2> shape{16, 160};
+    const auto g = ninfer::artifact::tensor_scale_geometry(
+        NumericFormat::FP8_E4M3FN_TENSOR_BF16S, shape);
+    if (g.code_plane_bytes != 2560 || g.scale_offset != 2560 || g.encoded_bytes != 2562) {
+        throw std::runtime_error("tensor FP8 geometry mismatch");
+    }
+    auto directory = normative_directory();
+    directory["objects"].push_back({{"name", "ple"}, {"kind", "tensor"},
+        {"shape", {16, 160}}, {"format", "FP8_E4M3FN_TENSOR_BF16S"},
+        {"layout", "tensor-scale-v1"}, {"offset", 5376}, {"bytes", 2562}});
+    auto fixture = write_fixture(directory, "tensor-fp8");
+    Reader reader(fixture.path);
+    const auto* tensor = std::get_if<TensorDescriptor>(reader.find("ple"));
+    if (tensor == nullptr || tensor->format != NumericFormat::FP8_E4M3FN_TENSOR_BF16S ||
+        tensor->layout != StorageLayout::TensorScaleV1 || reader.payload(*tensor).data.size() != 2562) {
+        throw std::runtime_error("tensor FP8 directory/payload did not round trip");
+    }
+}
+
+void test_calibrated_fp8_layout() {
+    const std::array<std::uint64_t, 2> shape{3, 3};
+    const auto g = ninfer::artifact::tensor_calibrated_geometry(
+        NumericFormat::FP8_E4M3FN_TENSOR_F32M, shape);
+    if (g.multiplier_offset != 12 || g.encoded_bytes != 20) {
+        throw std::runtime_error("calibrated FP8 aligned geometry mismatch");
+    }
+    auto directory = normative_directory();
+    directory["objects"].push_back({{"name", "projection"}, {"kind", "tensor"},
+        {"shape", {3, 3}}, {"format", "FP8_E4M3FN_TENSOR_F32M"},
+        {"layout", "tensor-calibrated-v1"}, {"offset", 5376}, {"bytes", 20}});
+    auto fixture = write_fixture(directory, "calibrated-fp8");
+    Reader reader(fixture.path);
+    const auto* tensor = std::get_if<TensorDescriptor>(reader.find("projection"));
+    if (!tensor || tensor->format != NumericFormat::FP8_E4M3FN_TENSOR_F32M ||
+        tensor->layout != StorageLayout::TensorCalibratedV1 ||
+        reader.payload(*tensor).data.size() != 20) {
+        throw std::runtime_error("calibrated FP8 directory/payload did not round trip");
+    }
+}
+
 void test_normative_fixture() {
     auto fixture = write_fixture(normative_directory(), "valid");
     Reader reader(fixture.path);
@@ -326,15 +429,107 @@ void test_file_generation_identity() {
     }
 }
 
+std::uint64_t locked_bytes() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.starts_with("VmLck:")) { return std::stoull(line.substr(6)) * 1024; }
+    }
+    throw std::runtime_error("missing Linux locked-memory accounting");
+}
+
+void test_resident_payload() {
+    const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    auto directory = normative_directory();
+    auto tensor = directory["objects"][1];
+    tensor["shape"] = {page + 17};
+    tensor["bytes"] = 2 * (page + 17);
+    directory["objects"] = Json::array({tensor});
+    auto fixture = write_fixture(directory, "resident-payload");
+    const auto locked_span = 3 * page; // Unaligned payload spans three host pages.
+    const auto before = locked_bytes();
+    ninfer::artifact::ResidentPayload retained;
+    std::vector<std::byte> expected;
+    {
+        Reader reader(fixture.path);
+        const auto& descriptor = *reader.find("bf16");
+        const auto source = reader.payload(descriptor).data;
+        expected.assign(source.begin(), source.end());
+        retained = reader.resident_payload(descriptor);
+        if (locked_bytes() != before + locked_span || retained.locked_bytes != locked_span ||
+            retained.data.size() != 2 * (page + 17)) {
+            throw std::runtime_error("resident tensor did not lock its exact page span");
+        }
+        // Independently owned model instances must not unlock each other's pages.
+        {
+            auto second = reader.resident_payload(descriptor);
+            if (locked_bytes() != before + 2 * locked_span) {
+                throw std::runtime_error("resident mappings unexpectedly share lock lifetime");
+            }
+        }
+        if (locked_bytes() != before + locked_span) {
+            throw std::runtime_error("destroying another owner released live tensor residency");
+        }
+    }
+    const auto base = reinterpret_cast<void*>(
+        reinterpret_cast<std::uintptr_t>(retained.data.data()) / page * page);
+    std::array<unsigned char, 3> resident{};
+    if (::mincore(base, locked_span, resident.data()) != 0 ||
+        !std::all_of(resident.begin(), resident.end(), [](unsigned char value) { return (value & 1) != 0; }) ||
+        !std::equal(retained.data.begin(), retained.data.end(), expected.begin(), expected.end())) {
+        throw std::runtime_error("resident tensor lost bytes or residency after Reader destruction");
+    }
+    auto moved = std::move(retained);
+    moved.backing.reset();
+    if (locked_bytes() != before) { throw std::runtime_error("resident mapping leaked locked pages"); }
+
+    // Isolate limit changes from this test process and the rest of CTest. Drop
+    // root privileges in the child so CAP_IPC_LOCK cannot bypass a zero limit.
+    const auto child = ::fork();
+    if (child < 0) { throw std::runtime_error("fork failed for memory-lock failure test"); }
+    if (child == 0) {
+        try {
+            Reader reader(fixture.path);
+            auto first = reader.resident_payload(*reader.find("bf16"));
+            const auto first_locked = locked_bytes();
+            if (::geteuid() == 0 && ::setuid(65534) != 0) { ::_exit(2); }
+            struct rlimit limit {0, 0};
+            if (::setrlimit(RLIMIT_MEMLOCK, &limit) != 0) { ::_exit(3); }
+            for (int i = 0; i < 16; ++i) {
+                try {
+                    (void)reader.resident_payload(*reader.find("bf16"));
+                    ::_exit(4);
+                } catch (const ninfer::artifact::ArtifactError& error) {
+                    if (std::string_view(error.what()).find("disk-backed fallback is disabled") ==
+                        std::string_view::npos) { ::_exit(5); }
+                }
+            }
+            if (locked_bytes() != first_locked) { ::_exit(6); }
+            first.backing.reset();
+            if (locked_bytes() != 0) { ::_exit(7); }
+            ::_exit(0);
+        } catch (...) { ::_exit(8); }
+    }
+    int status = 0;
+    if (::waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        throw std::runtime_error("resident payload failure/cleanup test failed: " + std::to_string(status));
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_registered_sizes();
+        test_expert_nvfp4_layout();
+        test_tensor_fp8_layout();
+        test_calibrated_fp8_layout();
+        test_partition_nvfp4_layout();
         test_fp8_row_layout();
         test_normative_fixture();
         test_common_validation();
         test_file_generation_identity();
+        test_resident_payload();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

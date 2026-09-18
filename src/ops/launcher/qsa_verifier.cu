@@ -68,7 +68,8 @@ __global__ void core_query_norm_rope_kernel(const __nv_bfloat16* raw,
     output[d + 256LL * (head + 24LL * token)] = __float2bfloat16_rn(result);
 }
 
-__global__ void core_key_norm_rope_kernel(const __nv_bfloat16* raw,
+template<class Input>
+__global__ void core_key_norm_rope_kernel(const Input* raw,
                                            const std::int32_t* position,
                                            const float* norm_weight, __nv_bfloat16* output) {
     __shared__ float normalized[256];
@@ -77,7 +78,7 @@ __global__ void core_key_norm_rope_kernel(const __nv_bfloat16* raw,
     const int head = blockIdx.x;
     const int token = blockIdx.y;
     const int base = head * 256 + token * 512;
-    const float value = __bfloat162float(raw[base + d]);
+    const float value = static_cast<float>(raw[base + d]);
     reduce[d] = value * value;
     __syncthreads();
     for (int stride = 128; stride > 0; stride >>= 1) {
@@ -133,10 +134,15 @@ void qsa_core_norm_rope_launch(const Tensor& raw_query_gate, const Tensor& raw_k
         static_cast<const std::int32_t*>(position.data),
         static_cast<const float*>(query_norm.data), static_cast<__nv_bfloat16*>(query.data));
     CUDA_CHECK(cudaGetLastError());
-    core_key_norm_rope_kernel<<<dim3(2, width), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(raw_key.data),
-        static_cast<const std::int32_t*>(position.data),
-        static_cast<const float*>(key_norm.data), static_cast<__nv_bfloat16*>(key.data));
+    if(raw_key.dtype==DType::FP32) {
+        core_key_norm_rope_kernel<<<dim3(2, width), 256, 0, stream>>>(
+            static_cast<const float*>(raw_key.data),static_cast<const std::int32_t*>(position.data),
+            static_cast<const float*>(key_norm.data),static_cast<__nv_bfloat16*>(key.data));
+    } else {
+        core_key_norm_rope_kernel<<<dim3(2, width), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(raw_key.data),static_cast<const std::int32_t*>(position.data),
+            static_cast<const float*>(key_norm.data),static_cast<__nv_bfloat16*>(key.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

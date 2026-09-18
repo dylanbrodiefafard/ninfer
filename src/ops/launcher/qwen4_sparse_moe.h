@@ -4,6 +4,11 @@
 
 namespace ninfer::ops::detail {
 
+inline constexpr int kQwen4ResidentA4MinOccurrences = 32;
+
+void qwen4_sparse_moe_swiglu_f32_launch(const Tensor& gate, const Tensor& up,
+                                      Tensor& activated, cudaStream_t stream);
+
 void qwen4_sparse_moe_route_launch(const Tensor& x, const Weight& router, Tensor& logits,
                                    Tensor& selected_ids, Tensor& selected_weights,
                                    cudaStream_t stream);
@@ -39,7 +44,13 @@ void qwen4_sparse_moe_resident_grouped_down_launch(
 void qwen4_sparse_moe_resident_native_linear_launch(
     const Tensor& input, const Weight& bank, const Tensor& expert_counts,
     const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& gathered,
-    Tensor& output, bool input_is_ranked, cudaStream_t stream);
+    Tensor& output, bool input_is_ranked, cudaStream_t stream, bool allow_a4 = false);
+
+void qwen4_sparse_moe_a4_tiles_launch(const Tensor& counts, Tensor& tiles, cudaStream_t stream);
+void qwen4_sparse_moe_a4_linear_launch(
+    const Tensor& input, const Weight& bank, const Tensor& counts, const Tensor& offsets,
+    const Tensor& occurrences, const Tensor& selected_ids, const Tensor& tiles,
+    Tensor& codes, Tensor& scales, Tensor& output, bool ranked, cudaStream_t stream);
 
 void qwen4_sparse_moe_shared_gate_up_swiglu_launch(
     const Tensor& x, const Weight& gate, const Weight& up, Tensor& activated,

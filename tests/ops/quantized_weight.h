@@ -141,6 +141,19 @@ inline double decode_e4m3fn(std::uint8_t word) {
     return negative ? -magnitude : magnitude;
 }
 
+// Independent finite-saturating nearest-even E4M3 encoder for codec qualification.
+inline std::uint8_t encode_e4m3fn(float value) {
+    const bool negative=std::signbit(value);
+    const double magnitude=std::abs(static_cast<double>(value));
+    double distance=std::numeric_limits<double>::infinity();
+    int best=0;
+    for(int code=0;code<=126;++code) {
+        const double error=std::abs(decode_e4m3fn(static_cast<std::uint8_t>(code))-magnitude);
+        if(error<distance || (error==distance && !(code&1))) { distance=error; best=code; }
+    }
+    return static_cast<std::uint8_t>(best | (negative?128:0));
+}
+
 struct QuantSpec {
     int bits;
     int group_size;
@@ -245,7 +258,8 @@ struct PackedWeight {
             w.qhigh  = high_plane_bytes == 0
                            ? nullptr
                            : static_cast<std::uint8_t*>(device_payload) + high_plane_offset;
-            w.scales = static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
+            w.scales = scale_plane_bytes == 0 ? nullptr
+                : static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
         } else {
             w.qdata  = nullptr;
             w.qhigh  = nullptr;
@@ -646,6 +660,23 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
         throw std::out_of_range("quantized-weight fixture: logical index out of range");
     }
 
+    if (weight.qtype == QType::BF16_CTRL) {
+        return detail::bf16_to_f32(detail::load_u16_le(
+            packed.payload, (static_cast<std::size_t>(row) * weight.k + column) * 2));
+    }
+    if (weight.qtype == QType::FP8_E4M3FN_TENSOR_F32M) {
+        if (weight.layout != QuantLayout::TensorCalibrated || weight.scale_dtype != DType::FP32) {
+            throw std::invalid_argument("quantized-weight fixture: invalid calibrated FP8 metadata");
+        }
+        const std::uint8_t code = packed.payload[static_cast<std::size_t>(row) * weight.k + column];
+        const auto offset = packed.scale_plane_offset;
+        const std::uint32_t word = static_cast<std::uint32_t>(packed.payload[offset]) |
+            (static_cast<std::uint32_t>(packed.payload[offset+1]) << 8) |
+            (static_cast<std::uint32_t>(packed.payload[offset+2]) << 16) |
+            (static_cast<std::uint32_t>(packed.payload[offset+3]) << 24);
+        const float scale = detail::bits_float(word);
+        return detail::decode_e4m3fn(code) * static_cast<double>(scale);
+    }
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         if (weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
             weight.group != weight.k || weight.group_size != static_cast<std::uint32_t>(weight.k)) {

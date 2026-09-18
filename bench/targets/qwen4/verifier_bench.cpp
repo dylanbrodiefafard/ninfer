@@ -229,8 +229,8 @@ std::vector<std::uint8_t> snapshot_continuation(const verifier::State& state) {
         }
         if (state.qsa()[layer]) {
             const auto& qsa = *state.qsa()[layer];
-            append_tensor_bytes(snapshot, qsa.k_codes);
-            append_tensor_bytes(snapshot, qsa.v_codes);
+            append_tensor_bytes(snapshot, qsa.k);
+            append_tensor_bytes(snapshot, qsa.v);
             append_tensor_bytes(snapshot, qsa.k_scales);
             append_tensor_bytes(snapshot, qsa.v_scales);
             append_tensor_bytes(snapshot, qsa.raw_index_keys);
@@ -386,6 +386,8 @@ int run(const Options& options) {
     std::cout << "diagnostic_snapshots,false\n";
     std::cout << "device_payload_bytes," << stats.h2d_bytes << '\n';
     std::cout << "mapped_tensor_bytes," << stats.mapped_tensor_bytes << '\n';
+    std::cout << "resident_tensor_bytes," << stats.resident_tensor_bytes << '\n';
+    std::cout << "resident_locked_bytes," << stats.resident_locked_bytes << '\n';
     std::cout << "sequence_tokens," << options.inputs.size() << '\n';
     std::cout << "warmup_repetitions," << options.warmup << '\n';
     std::cout << "measured_repetitions," << options.repetitions << '\n';

@@ -1,13 +1,13 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the sixteen persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the twenty persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. Container framing, physical byte layouts, checkpoint
 assignment, kernels, and runtime-state codecs are defined separately.
 
 ## 1. Registered formats
 
-NInfer has exactly sixteen persistent numeric tensor formats in five categories.
+NInfer has exactly twenty persistent numeric tensor formats in six categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -31,9 +31,55 @@ The block-scaled floating-point weight format is:
 | Canonical name | Code | K group | Block scale | Global field |
 |---|---|---:|---|---|
 | `NVFP4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor |
+| `NVFP4_EXPERT_F32M` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | positive FP32 weight and input multipliers per expert |
+| `NVFP4_PARTITION_F32M` | E2M1, 4 bits/value | 16 | one E4M3FN word/group | positive FP32 multiplier per leading partition |
+
+`NVFP4_PARTITION_F32M` is a row-gather representation for the audited native PLE table,
+not a Linear matrix layout. Shape `[P,R,K]` partitions contiguous rows, with K divisible
+by 16. Each represented coefficient is signed E2M1 times its nonnegative finite E4M3FN
+block scale times the exact positive finite FP32 multiplier for partition P. Even K uses
+the low nibble. No input calibration is stored: an embedding lookup has no GEMM activation
+operand. The PLE dequantization boundary rounds reconstruction to FP32, then BF16, matching
+the pinned producer. Per-partition multipliers need not be equal; folding or reciprocating
+them changes the source representation. This does not admit a Linear QType or an Engine target.
+Source/scale ownership evidence is in `../research/qwen4-native-ple-source.md`.
+
+`NVFP4_EXPERT_F32M` preserves source NVFP4 expert banks `[E,N,K]`. Its represented
+weight is `E2M1(code[e,n,k]) * E4M3FN(block_scale[e,n,k/16]) * weight_multiplier[e]`.
+Even K is the low nibble; odd K is the high nibble. Block scales are nonnegative finite
+E4M3FN; both multiplier arrays are finite, strictly positive FP32 source words.
+Input multipliers are separate activation-quantization metadata, not a factor in the
+represented weight. A16 execution preserves them without applying activation quantization.
+Unlike `NVFP4`, this format never reciprocates the source weight multiplier or folds it
+into rounded block scales. The two formats' semantics remain distinct. This format admits
+the audited Qwen4 native expert banks without registering a new Engine target.
 
 The row-scaled floating-point weight format is `FP8_E4M3FN_ROW_BF16S`: one finite
 signed E4M3FN code per weight and one BF16 multiplier per row (Section 3.4).
+
+The tensor-scaled embedding format is `FP8_E4M3FN_TENSOR_BF16S`: finite signed E4M3FN
+codes, including either signed zero, times one strictly positive finite BF16 multiplier
+for the entire positive rank-two tensor. Both source code and multiplier words are
+preserved exactly; no row-scale conversion or BF16 table expansion occurs. The format
+supports the audited Qwen4 PLE table and bounded row fixtures. BF16 gathered outputs are
+an explicit runtime cast after multiplying the represented code and multiplier, not a
+change to storage. This does not add a generic Linear Weight QType or a registered target.
+
+The source-calibrated matrix format is `FP8_E4M3FN_TENSOR_F32M`: finite signed
+E4M3FN codes times one strictly positive finite FP32 weight multiplier for a positive
+rank-two matrix. A second strictly positive finite FP32 scalar is the source input
+dequantization multiplier, not part of the represented weight. Both scalar words are
+preserved exactly. A16 Linear uses represented BF16 inputs without activation
+quantization. The qualified A8 implementation uses the temporary per-token scale
+`max(input_multiplier, RN(maxabs(x_token)/448))`, packs input divided by that scale
+to E4M3FN with round-to-nearest-even and finite saturation, then applies the
+temporary scale and stored weight multiplier to the product. The stored input
+calibration is unchanged; it is the scale floor, not a promise of publisher bit
+parity for guarded tokens. This is distinct from row-scaled FP8 and from
+the BF16-multiplier PLE format; none may silently replace another. Admission is for
+the seven audited native Qwen4 projection geometries in the Linear contract, not a
+new Engine target or a model-quality claim. Source evidence and calibration limits
+are recorded in `../research/qwen4-native-fp8-source.md`.
 
 The source-byte-preserving GGML block formats are:
 

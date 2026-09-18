@@ -11,10 +11,46 @@ future complete custom profile is conditionally eligible only after it passes th
 plan's Phase 0 admission gate.
 
 For an exact Qwen4 target containing this preview-style PLE table, that residency statement excludes
-the table. PLE is deliberately host-resident and artifact-mapped; the GPU-residency gate applies to
+the table. PLE is deliberately host-resident and artifact-mapped; its complete payload must be
+eagerly populated and OS-locked in RAM before model loading succeeds. The GPU-residency gate applies to
 the non-PLE compute core, fixed device state, KV/index pools, workspaces, graphs, and headroom.
 Section 3 of the implementation plan owns the mapped-PLE execution design; this reference does not
 assume that every future Qwen4 checkpoint contains PLE.
+
+### Mandatory startup PLE residency
+
+The binder assigns PLE `ResidentHost`, not ordinary `MappedHost`. Artifact materialization owns
+an independent exact-payload mapping with an eager OS memory lock before it allocates/uploads
+the device model. Successful loading guarantees populated, non-swappable PLE pages for the
+model lifetime; a warm page cache, read-ahead hint or on-fault lock is insufficient. The source
+file remains startup storage, not an inference-time row-fetch path. Read-only maps share physical
+file-cache pages where the OS permits, without duplicating the full payload into another buffer.
+
+The existing IQ4_NL table requires 28,800,138,240 resident bytes plus page alignment. Its
+`resident_tensor_bytes` statistic reports the payload subset of mapped tensor bytes;
+`resident_locked_bytes` reports the actual page-rounded lock capacity. The 48
+routed gate/up banks remain ordinary mapped tensors under the diagnostic-only streaming exception.
+Only bounded row staging buffers are CUDA-pinned; PLE decode/injection mathematics stay on GPU.
+Consumers must drain before `LoadedModel` teardown releases the lock and mapping.
+
+Insufficient RAM, cgroup capacity, or process/container memory-lock allowance is a startup
+failure, never a lazy fallback. Configure an adequate `RLIMIT_MEMLOCK`/container memlock allowance
+and free RAM before a full-table test; do not disable swap globally or kill unrelated workloads.
+The loader reports required bytes and the OS lock failure. In the current dedicated GPU builder,
+the real IQ4_NL artifact correctly rejects before device-weight allocation: its lock requires
+28,800,139,264 page-rounded bytes, exceeding the container's 8,388,608-byte memlock allowance.
+On 2026-09-18 a separate temporary GPU builder with `--ulimit memlock=-1` passed the complete
+`ninfer_qwen4_artifact_real_test` on the actual IQ4_NL artifact. Observed `VmLck` was
+28,125,136 KiB (28,800,139,264 bytes); loading and embedding/PLE checks succeeded with
+26,538,652,160 device payload bytes. The container used the existing builder's
+`NVIDIA_DISABLE_REQUIRE=1` setting (CUDA 13.1.2 binaries, host driver 580.173.02, RTX 5090).
+This is positive full-table admission evidence for IQ4_NL, alongside the insufficient-memlock
+failure test, not evidence that the larger native FP8 table fits every environment.
+Native NVIDIA FP8 PLE has a separate representation: its 128 E4M3 shards total
+51,200,245,760 bytes plus a shared BF16 scale.
+Its exact conversion/decode and full-table capacity gates are in `plans/qwen4-architecture.md`,
+section 0. The exact per-tensor embedding format is `FP8_E4M3FN_TENSOR_BF16S`;
+existing row-scaled FP8 Linear support does not admit that embedding format.
 
 The model mathematics and state are defined in
 [`qwen4-model.md`](qwen4-model.md). Generic future `.ninfer` framing,
@@ -25,6 +61,150 @@ order, names, formats, layouts, placement, aliases, and transforms; this documen
 does not invent those decisions for an unrunnable BF16 preview.
 
 ## Bounded native-format qualification
+
+### Native preparation policy, not a future checkpoint recipe
+
+Storage and execution choices below apply only to the audited preview roles. They
+are not an artifact identity or permission to infer an unreleased model's topology.
+The research recommendations identify candidates; the Op contracts own actual
+numerical admission, including rejected profiles and their unchanged gates.
+
+| Role | Native weight storage | Current execution/state decision |
+|---|---|---|
+| Routed expert gate/up/down | Source NVFP4 codes, block scales and separate FP32 weight/input multipliers per expert and projection | A16 reference; explicit qualified A4 at beneficial expert occurrence counts, independently calibrated after SwiGLU |
+| Shared experts | BF16 reference or source-calibrated FP8 | A16 baseline; individually qualified guarded A8 policies, not a model-wide quality default |
+| GDN large projections | BF16 reference or source-calibrated FP8 | A16 baseline; qualified per-role guarded A8 combinations; simultaneous QKV/output A8 is rejected |
+| QSA core projections | BF16 reference or source-calibrated FP8 | A16; tested A8 candidates are not admitted |
+| Router, shared scalar gate, QSA indexer, GDN and PLE controls | Source-faithful BF16 or explicitly transformed effective FP32 control views | Protected arithmetic and exact selection; FP32 GDN recurrence, BF16 convolution/history |
+| Hyperconnection reads and gates | BF16 baseline | A16 projections, protected gate/reduction arithmetic, BF16 residual storage; tested FP8 residual recipe rejected |
+| PLE table | FP8 or source-faithful partition-scaled NVFP4 | Complete eager OS-locked host payload, packed row staging and GPU decode to BF16; no GEMM activation-bit policy applies to lookup |
+| Token embedding and vocabulary head | BF16 baseline | BF16 gather and A16 head; eight-bit endpoint weights remain a later checkpoint-specific candidate |
+| Vision patch, encoder and merger | BF16 baseline | A16; exact preview geometries require independent admission; text-only quantization results do not qualify vision |
+| MTP stem | BF16 source | Qualified four-stream stem only; no speculative rollout, acceptance or state-fold admission |
+| QSA main KV and index state | Not weight storage | BF16 reference, FP32 pooling; diagnostic NVFP4 KV remains separate, and no FP8 runtime cache is admitted |
+
+Ordinary public activations remain BF16. Temporary A4/A8 packing neither changes
+those public boundaries nor authorizes low-bit routing, recurrent state or residual
+storage. A future target must select its actual matrix formats and activation
+policies explicitly, fit its non-PLE core/state/workspaces on the GPU, and pass
+paired full-model quality and performance gates before registration. Full native
+PLE capacity admission additionally needs its actual complete table and sufficient
+RAM/memory-lock allowance. These requirements cannot be established with selected
+rows or a few compute layers.
+
+### Source-faithful native fixtures
+
+The active native-checkpoint work additionally uses main compute layers 0 through 3 from NVIDIA
+revision `fc694b54fb0174e0913e6adf86691ef85a4ead47`. `tools.parity.qwen4.native_source` acquires
+only their exact tensor intervals, rejecting non-206 or mismatched byte-range responses before
+reading payloads. Each compute layer contains 6,166 source tensors. GDN layers 0/1/2 each have
+1,570,383,296 payload bytes; QSA layer 3 has 1,557,359,104 bytes. Layer 1 crosses two physical
+shards; the tool assembles its exact intervals and excludes the independently acquired PLE
+component rather than duplicating it. These four compute fixtures total 6,268,508,992 source
+bytes, not the complete preview checkpoint. Files are local prerequisites under
+`local_llm/models/qwen4-native-layers`.
+
+`tools.parity.qwen4.native_layer_fixture` preserves every ordinary BF16 tensor and assembles
+three complete routed banks in `NVFP4_EXPERT_F32M`. Codes and E4M3 block scales are unchanged;
+only the block-scale storage permutation changes. Each expert's exact FP32 weight and input
+multipliers remain distinct. They are not converted to the older NVFP4 divisor representation.
+The fixture identity `qwen4/native-layer-qualification` is unregistered. Exact round-trip checks
+against all four acquired source layers passed for all 512 experts in every bank, all scale words,
+and every ordinary BF16 tensor. This proves source payload fidelity, not W4A4 arithmetic or PPL.
+
+`tools.parity.qwen4.native_ple_fixture` acquires sixteen authentic encoded PLE rows and their
+shared BF16 scale, including shard boundaries and repeated rows. It uses
+`FP8_E4M3FN_TENSOR_BF16S`, not row-scaled Linear FP8. Its selected-row fixture can exercise the
+resident-host mapping and exact GPU decoder but cannot establish full-table memory admission.
+
+`tools.parity.qwen4.native_nvfp4_ple_fixture` pins and acquires twelve authentic rows
+from three producer shards, preserving unequal FP32 shard multipliers. Its separate
+`--convert-source` step emits `qwen4-ple-nvfp4-rows.ninfer` with identity
+`qwen4/native-ple-qualification` / `primitive-nvfp4-source-rows` and one
+`NVFP4_PARTITION_F32M` `[3,4,160]` tensor in `partitioned-row-blockscale-k16-v1`.
+These are selected rows, not contiguous original global row ids; the source sidecar records
+their original addresses. Native GPU tests use the local fixture row ids and recompute an
+independent codec oracle. The full native table's producer provenance, scale domains and
+public BF16 reconstruction-loss measurement are in `../research/qwen4-native-ple-source.md`.
+No IQ4_NL representation or GGUF quality evidence defines this native path.
+
+`tools.parity.qwen4.native_text_fixture` acquires a separate 33-token panel with the pinned
+NVIDIA tokenizer, original BF16 token-embedding rows, and the 528 FP8 PLE rows selected by
+the independent exact n-gram oracle. The hash constants must match the already acquired
+source I64 buffers. It downloads 253,442 weight-payload bytes plus tokenizer/header/index
+metadata, not full shards. `qwen4-text-panel.ninfer` preserves token IDs, original global
+row IDs and explicit local fixture remapping. The native-sequence `--native-text` mode
+tests CPU integer and GPU whole/32+1 addressing, repeats each token embedding into four
+residual branches, and feeds the source rows directly through GPU PLE decode/injection.
+`--native-text-fp8` uses the same input panel with the separately pinned calibrated FP8
+GDN layer-0, QSA layer-3 and shared layer-0/3 weights, retaining A16 operands. These remain
+bounded unregistered first-block fixtures, not calibration data, full-model PPL or target
+admission. Their qualification results are recorded separately from synthetic inputs.
+`--native-text-a8` additionally qualifies guarded A8 on GDN-Z and shared projections,
+keeping QSA A16; its reproduced static-calibration failure and corrected whole/chunk
+results are recorded in the Op contract, not hidden by changing acceptance thresholds.
+
+The default contiguous native-sequence numerical admission uses BF16 QSA cache. The
+explicit `--nvfp4-diagnostics` mode retains the compressed-cache experiment and its
+unchanged failed accumulated-error screen; it returns nonzero for that rejected profile.
+Ordinary NVFP4 codec/state and same-input component tests remain hard gates. Separating
+that experiment does not qualify its observed four-layer drift or change its criterion.
+
+With those exact local prerequisites already present, run the bounded native checks in the
+GPU builder (the source layer files are not Engine-loadable models):
+
+```sh
+NINFER_QWEN4_NATIVE_LAYERS=/models/qwen4-native-layers \
+  ctest --test-dir /build --output-on-failure -R 'ninfer_qwen4_native_.*real_test'
+```
+
+The complete-MoE fixture checks both activation-preserving A16 and explicitly permitted
+source-multiplier W4A4; its independent oracle decodes the stored native weights directly.
+Component fixtures cover native BF16 GDN, GR and QSA roles. Missing prerequisites skip these
+opt-in tests rather than initiating a checkpoint download. PLE selected rows, complete IQ4_NL
+table admission, and eventual complete FP8 table admission remain distinct evidence gates.
+
+### Native final Text read and vocabulary head
+
+`tools.parity.qwen4.native_endpoint_fixture --component endpoint` audits source headers and
+acquires only four exact BF16 tensors from NVIDIA revision
+`fc694b54fb0174e0913e6adf86691ef85a4ead47`: final GR norm `[10240]`, read-down
+`[320,10240]`, read-up `[10240,320]`, and the independent `lm_head.weight`
+`[248320,2560]`. Their total source payload is 1,284,526,080 bytes. The tool streams verified
+HTTP byte ranges directly into `qwen4-endpoint.ninfer`; it neither loads complete shards nor
+requantizes source words. Identity is `qwen4/native-endpoint-qualification` /
+`nvidia-bf16-source`, with ordinary BF16 `contiguous-le-v1` tensors. The `.json` sidecar records
+each original name, shape, byte interval, shard and source revision. Source address:
+`https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/tree/fc694b54fb0174e0913e6adf86691ef85a4ead47`.
+
+The opt-in `ninfer_qwen4_native_endpoint_real_test` uses existing GR and Linear Ops. The
+head admits the exact `[248320,2560]` BF16/A16 geometry through the existing decode, small-T
+and MMA implementations; no FP8 head recipe is inferred. Its independent naive FP64 dot
+oracle covers every vocabulary row, using three distinct represented columns at
+T=1/2/27/28/33/129. The complete source final-GR read feeds the head at T=3 and 2+1,
+reusing the GR suite's single mathematical oracle and the explicit BF16 public read-output
+boundary. Linear retains its existing 1/256 relative criterion; the composed read/head screen
+is predeclared at 0.006 relative L2, 0.004 gross absolute and 0.01 gross relative-to-maximum.
+On the RTX 5090/CUDA 13.1 builder, the exact source fixture passed every per-token gate.
+Worst all-vocabulary head relative L2 was 0.00166547 across the listed widths; the T=3
+whole and 2+1 compositions both measured aggregate relative L2 0.00165811, and their
+separate same-input head error was 0.00165810. All three composed-token gates and the
+existing complete-GR read gate passed independently. Output guards passed. These are
+accuracy results, not timing measurements or evidence that the reused schedules are
+optimal for this large BF16 head.
+
+This is bounded endpoint arithmetic qualification, not final-layer activation-distribution
+coverage, logits from all 48 layers, full-model PPL, sampling qualification or product admission.
+
+The same acquisition tool with `--component mtp-stem` emits a separate
+`qwen4-mtp-stem.ninfer`, identity `qwen4/native-mtp-stem-qualification` /
+`nvidia-bf16-source`. It preserves exactly four source BF16 tensors, totaling 26,240,000 bytes:
+`mtp.fc_embedding.weight` and `mtp.fc_hidden.weight` `[2560,2560]`,
+`mtp.pre_fc_norm_embedding.weight` `[2560]`, and `mtp.pre_fc_norm_hidden.weight` `[10240]`.
+This small independent fixture does not make stem tests load the vocabulary head and does
+not imply the remaining private MTP block or speculative state machine is implemented.
+
+### Earlier requantized distribution fixture
 
 Native NVFP4 and `FP8_E4M3FN_ROW_BF16S` projection qualification does not require a complete
 GPU-resident preview checkpoint. `tools.parity.qwen4.mixed_projection_fixture` reads selected

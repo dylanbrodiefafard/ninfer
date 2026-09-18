@@ -4,8 +4,11 @@
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ninfer/ops/linear.h"
+#include "ops/common/projection.h"
 #include "ops/launcher/qwen4_sparse_moe.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8/fp8_tensor.h"
+#include "ops/linear/bf16/bf16_launch.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cuda_runtime.h>
@@ -95,10 +98,12 @@ void require_matrix_tensor(const Tensor& tensor, DType dtype, std::int32_t n0,
     }
 }
 
-void require_dense_router(const Weight& weight) {
-    constexpr std::uint64_t expected_bytes =
-        static_cast<std::uint64_t>(kQwen4SparseMoeExperts) * kQwen4SparseMoeHidden * sizeof(float);
-    if (weight.qtype != QType::FP32_CTRL || weight.layout != QuantLayout::Contiguous ||
+void require_dense_router(const Weight& weight, bool native_bf16 = false) {
+    const QType qtype = native_bf16 ? QType::BF16_CTRL : QType::FP32_CTRL;
+    const std::uint64_t expected_bytes =
+        static_cast<std::uint64_t>(kQwen4SparseMoeExperts) * kQwen4SparseMoeHidden *
+        (native_bf16 ? sizeof(std::uint16_t) : sizeof(float));
+    if (weight.qtype != qtype || weight.layout != QuantLayout::Contiguous ||
         weight.ndim != 2 || weight.n != kQwen4SparseMoeExperts ||
         weight.k != kQwen4SparseMoeHidden || weight.shape[0] != kQwen4SparseMoeExperts ||
         weight.shape[1] != kQwen4SparseMoeHidden || weight.shape[2] != 1 ||
@@ -108,7 +113,7 @@ void require_dense_router(const Weight& weight) {
         weight.qdata != weight.payload || weight.payload_bytes != expected_bytes ||
         weight.qhigh != nullptr ||
         weight.scales != nullptr || weight.high_plane_bytes != 0 || !aligned_to(weight.qdata, 16)) {
-        throw std::invalid_argument("qwen4_sparse_moe: invalid FP32 router");
+        throw std::invalid_argument("qwen4_sparse_moe: invalid protected router");
     }
 }
 
@@ -154,7 +159,8 @@ void require_mapped_bank(const Qwen4MappedRoutedGateUp& bank) {
 }
 
 bool native_weight(QType qtype) {
-    return qtype == QType::NVFP4 || qtype == QType::FP8_E4M3FN_ROW_BF16S;
+    return qtype == QType::NVFP4 || qtype == QType::NVFP4_EXPERT_F32M ||
+           qtype == QType::FP8_E4M3FN_ROW_BF16S;
 }
 
 void require_native_weight(const Weight& weight, std::int32_t matrices,
@@ -168,6 +174,23 @@ void require_native_weight(const Weight& weight, std::int32_t matrices,
         !std::equal(std::begin(weight.shape), std::end(weight.shape),
                     std::begin(weight.padded_shape))) {
         throw std::invalid_argument(std::string("qwen4_sparse_moe: invalid ") + name);
+    }
+    if (weight.qtype == QType::NVFP4_EXPERT_F32M) {
+        const std::uint64_t elements = static_cast<std::uint64_t>(matrices) * rows * columns;
+        const std::uint64_t codes = elements / 2;
+        const std::uint64_t scales = elements / 16;
+        const auto* payload = static_cast<const std::byte*>(weight.payload);
+        if (matrices != kQwen4SparseMoeExperts || rows % 128 != 0 || columns % 64 != 0 ||
+            weight.layout != QuantLayout::ExpertBlockScaleK16M128x4 ||
+            weight.scale_dtype != DType::FP8_E4M3FN || weight.group != 16 ||
+            weight.group_size != 16 || !aligned_to(payload, 256) ||
+            weight.qdata != payload || weight.scales != payload + codes ||
+            weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
+            weight.payload_bytes != codes + scales + 8ULL * matrices ||
+            weight.weight_scale_divisor != 0.0F || weight.input_scale_divisor != 0.0F) {
+            throw std::invalid_argument("qwen4_sparse_moe: invalid native multiplier bank");
+        }
+        return;
     }
     Weight flattened = weight;
     flattened.ndim = 2;
@@ -187,7 +210,14 @@ void require_native_weight(const Weight& weight, std::int32_t matrices,
 void require_resident_projection(const Weight& weight, QType ggml_qtype,
                                   std::int32_t rows, std::int32_t columns,
                                   const char* name) {
-    if (native_weight(weight.qtype)) {
+    if (weight.qtype == QType::FP8_E4M3FN_TENSOR_F32M) {
+        if (weight.n != rows || weight.k != columns) {
+            throw std::invalid_argument("qwen4_sparse_moe: invalid calibrated shared shape");
+        }
+        detail::validate_fp8_tensor_weight(weight, name);
+    } else if (weight.qtype == QType::BF16_CTRL) {
+        detail::validate_native_projection(weight, rows, columns, name);
+    } else if (native_weight(weight.qtype)) {
         require_native_weight(weight, 1, rows, columns, name);
     } else {
         require_ggml_weight(weight, ggml_qtype, 1, rows, columns, name);
@@ -195,9 +225,10 @@ void require_resident_projection(const Weight& weight, QType ggml_qtype,
 }
 
 void resident_projection(const Tensor& x, const Weight& weight, Tensor& out,
-                          WorkspaceArena& workspace, cudaStream_t stream) {
-    if (native_weight(weight.qtype)) {
-        linear(x, weight, out, LinearPolicy::A16Only, workspace, stream);
+                          WorkspaceArena& workspace, cudaStream_t stream,
+                          LinearPolicy policy = LinearPolicy::A16Only) {
+    if (detail::is_native_projection(weight.qtype) || weight.qtype == QType::FP8_E4M3FN_TENSOR_F32M) {
+        linear(x, weight, out, policy, workspace, stream);
     } else {
         ggml_block_linear(x, weight, out, stream);
     }
@@ -210,13 +241,19 @@ void validate_resident_profile(const Qwen4ResidentSparseMoeWeights& weights) {
             ? (routed ? weight.qtype == QType::GGML_IQ1_S || weight.qtype == QType::GGML_IQ2_XXS
                       : weight.qtype == QType::GGML_Q5_K || weight.qtype == QType::GGML_Q6_K)
             : weight.qtype == (routed ? QType::GGML_IQ4_NL : QType::GGML_Q8_0);
-        if ((!ggml && !native_weight(weight.qtype)) || weight.n != rows || weight.k != columns) {
+        const bool shared_bf16 = !routed && weight.qtype == QType::BF16_CTRL;
+        const bool shared_calibrated = !routed && weight.qtype == QType::FP8_E4M3FN_TENSOR_F32M;
+        if ((!ggml && !native_weight(weight.qtype) && !shared_bf16 && !shared_calibrated) ||
+            (!routed && weight.qtype == QType::NVFP4_EXPERT_F32M) ||
+            weight.n != rows || weight.k != columns) {
             throw std::invalid_argument("qwen4_sparse_moe_resident: invalid weight profile");
         }
-        const QuantLayout layout = weight.qtype == QType::NVFP4
+        const QuantLayout layout = weight.qtype == QType::NVFP4_EXPERT_F32M
+            ? QuantLayout::ExpertBlockScaleK16M128x4 : weight.qtype == QType::NVFP4
             ? QuantLayout::BlockScaleK16M128x4
             : weight.qtype == QType::FP8_E4M3FN_ROW_BF16S
-                ? QuantLayout::RowScale : QuantLayout::GgmlBlockRow;
+                ? QuantLayout::RowScale : shared_bf16 ? QuantLayout::Contiguous
+                : shared_calibrated ? QuantLayout::TensorCalibrated : QuantLayout::GgmlBlockRow;
         if (weight.layout != layout) {
             throw std::invalid_argument("qwen4_sparse_moe_resident: invalid weight layout");
         }
@@ -230,11 +267,15 @@ void validate_resident_profile(const Qwen4ResidentSparseMoeWeights& weights) {
     for (const auto pair : {std::pair{&weights.routed_gate, &weights.routed_up},
                             std::pair{&weights.shared_gate_proj, &weights.shared_up}}) {
         if (!native_weight(pair.first->qtype) && !native_weight(pair.second->qtype) &&
+            pair.first->qtype != QType::FP8_E4M3FN_TENSOR_F32M && pair.second->qtype != QType::FP8_E4M3FN_TENSOR_F32M &&
+            !detail::is_native_projection(pair.first->qtype) && !detail::is_native_projection(pair.second->qtype) &&
             pair.first->qtype != pair.second->qtype) {
             throw std::invalid_argument("qwen4_sparse_moe_resident: GGML gate/up formats differ");
         }
     }
-    if (weights.router.qtype != QType::FP32_CTRL || weights.router.n != kQwen4SparseMoeExperts ||
+    if ((weights.router.qtype != QType::FP32_CTRL && weights.router.qtype != QType::BF16_CTRL) ||
+        weights.shared_gate.dtype != (weights.router.qtype == QType::BF16_CTRL ? DType::BF16 : DType::FP32) ||
+        weights.router.n != kQwen4SparseMoeExperts ||
         weights.router.k != kQwen4SparseMoeHidden) {
         throw std::invalid_argument("qwen4_sparse_moe_resident: invalid router profile");
     }
@@ -278,6 +319,7 @@ struct ResidentWideScratch {
     Tensor shared_gate_value;
     Tensor shared_gate_projection;
     Tensor shared_up;
+    Tensor shared_activated;
     Tensor shared;
     Tensor routed_gate;
     Tensor routed_up;
@@ -291,18 +333,33 @@ struct ResidentWideScratch {
 bool resident_native_profile(const Qwen4ResidentSparseMoeWeights& weights) {
     return native_weight(weights.routed_gate.qtype) || native_weight(weights.routed_up.qtype) ||
            native_weight(weights.routed_down.qtype) ||
-           native_weight(weights.shared_gate_proj.qtype) || native_weight(weights.shared_up.qtype) ||
-           native_weight(weights.shared_down.qtype);
+           weights.shared_gate_proj.qtype == QType::FP8_E4M3FN_TENSOR_F32M ||
+           weights.shared_up.qtype == QType::FP8_E4M3FN_TENSOR_F32M ||
+           weights.shared_down.qtype == QType::FP8_E4M3FN_TENSOR_F32M ||
+           detail::is_native_projection(weights.shared_gate_proj.qtype) || detail::is_native_projection(weights.shared_up.qtype) ||
+           detail::is_native_projection(weights.shared_down.qtype);
+}
+
+bool source_bf16_shared(const Qwen4ResidentSparseMoeWeights& weights) {
+    return weights.shared_gate_proj.qtype == QType::BF16_CTRL &&
+           weights.shared_up.qtype == QType::BF16_CTRL;
 }
 
 std::size_t shared_projection_workspace(const Qwen4ResidentSparseMoeWeights& weights,
-                                        std::int32_t width) {
+                                        std::int32_t width, Qwen4SharedExpertPolicy policy) {
     std::size_t capacity = 0;
+    const std::array policies{policy.gate,policy.up,policy.down};
+    std::size_t index=0;
     for (const Weight* weight : {&weights.shared_gate_proj, &weights.shared_up,
                                  &weights.shared_down}) {
-        if (native_weight(weight->qtype)) {
+        const auto selected=policies[index++];
+        if (selected != LinearPolicy::A16Only &&
+            (selected != LinearPolicy::AllowA8 || weight->qtype != QType::FP8_E4M3FN_TENSOR_F32M)) {
+            throw std::invalid_argument("qwen4_sparse_moe: unsupported shared activation policy");
+        }
+        if (detail::is_native_projection(weight->qtype) || weight->qtype == QType::FP8_E4M3FN_TENSOR_F32M) {
             capacity = std::max(capacity, linear_workspace_capacity_bytes(
-                weight->qtype, weight->n, weight->k, LinearPolicy::A16Only, width, width));
+                weight->qtype, weight->n, weight->k, selected, width, width));
         }
     }
     return capacity;
@@ -363,13 +420,14 @@ ResidentScratch allocate_resident_scratch(Allocator& allocator) {
 
 template <class Allocator>
 ResidentWideScratch allocate_resident_wide_scratch(Allocator& allocator,
-                                                   std::int32_t width) {
+                                                   std::int32_t width, bool fp32_shared = false) {
     const std::int32_t occurrences = kQwen4SparseMoeTopK * width;
     return {
         allocator.alloc(DType::FP32, {kQwen4SparseMoeExperts, width}),
         allocator.alloc(DType::FP32, {width}),
-        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, width}),
-        allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, width}),
+        allocator.alloc(fp32_shared ? DType::FP32 : DType::BF16, {kQwen4SparseMoeIntermediate, width}),
+        allocator.alloc(fp32_shared ? DType::FP32 : DType::BF16, {kQwen4SparseMoeIntermediate, width}),
+        fp32_shared ? allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, width}) : Tensor{},
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, width}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
@@ -399,18 +457,51 @@ std::size_t required_prefill_workspace(std::int32_t width) {
 }
 
 
+bool use_a4(const Qwen4ResidentSparseMoeWeights& weights, int width, LinearPolicy policy) {
+    if (policy == LinearPolicy::A16Only) { return false; }
+    if (policy != LinearPolicy::AllowA4 ||
+        weights.routed_gate.qtype != QType::NVFP4_EXPERT_F32M ||
+        weights.routed_up.qtype != QType::NVFP4_EXPERT_F32M ||
+        weights.routed_down.qtype != QType::NVFP4_EXPERT_F32M) {
+        throw std::invalid_argument("qwen4_sparse_moe: A4 requires source multiplier banks");
+    }
+    return width >= detail::kQwen4ResidentA4MinOccurrences;
+}
+
+struct ResidentA4Scratch { Tensor codes, scales, tiles; };
+
+template <class Allocator>
+ResidentA4Scratch allocate_resident_a4(Allocator& allocator, int width) {
+    const int occurrences = kQwen4SparseMoeTopK * width;
+    const int max_tiles = (occurrences + 31) / 32 + kQwen4SparseMoeExperts;
+    return {allocator.alloc(DType::U8, {kQwen4SparseMoeHidden / 2, occurrences}),
+            allocator.alloc(DType::U8, {kQwen4SparseMoeHidden / 16, occurrences}),
+            allocator.alloc(DType::I32, {2, max_tiles + 1})};
+}
+
 std::size_t required_resident_workspace(const Qwen4ResidentSparseMoeWeights& weights,
-                                       std::int32_t width) {
+                                       std::int32_t width,
+                                       LinearPolicy policy = LinearPolicy::A16Only,
+                                       Qwen4SharedExpertPolicy shared_policy = {}) {
     validate_resident_profile(weights);
+    const bool a4 = use_a4(weights, width, policy);
+    const std::size_t shared_child = shared_projection_workspace(weights, width, shared_policy);
     WorkspaceLayoutBuilder layout;
     if (resident_native_profile(weights)) {
-        (void)allocate_resident_wide_scratch(layout, width);
+        (void)allocate_resident_wide_scratch(layout, width, source_bf16_shared(weights));
         // Native expert routes gather sorted occurrences without moving IDs to the host.
         // The scratch is reused by gate, up, and down in stream order.
         const std::size_t gathered = static_cast<std::size_t>(resident_gather_rows(weights)) *
                                      kQwen4SparseMoeTopK * width * sizeof(std::uint16_t);
-        const std::size_t child = std::max(gathered, shared_projection_workspace(weights, width));
-        if (child != 0) { (void)layout.alloc_bytes(child); }
+        const std::size_t child = std::max(gathered, shared_child);
+        if (a4) {
+            auto shared_layout = layout;
+            if (child != 0) { (void)shared_layout.alloc_bytes(child); }
+            (void)allocate_resident_a4(layout, width);
+            return std::max(layout.peak_bytes(), shared_layout.peak_bytes());
+        } else if (child != 0) {
+            (void)layout.alloc_bytes(child);
+        }
     } else if (width == 1) {
         (void)allocate_resident_scratch(layout);
     } else if (width < kResidentGroupedMinWidth) {
@@ -496,12 +587,13 @@ std::size_t qwen4_sparse_moe_prefill_workspace_capacity_bytes(std::int32_t width
 }
 
 std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
-    const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width) {
+    const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width, LinearPolicy expert_policy,
+    Qwen4SharedExpertPolicy shared_policy) {
     if (width <= 0 || width > kQwen4SparseMoePrefillMaxWidth) {
         throw std::invalid_argument(
             "qwen4_sparse_moe_resident_workspace_capacity_bytes: width must be in [1,4096]");
     }
-    return required_resident_workspace(weights, width);
+    return required_resident_workspace(weights, width, expert_policy, shared_policy);
 }
 
 void qwen4_sparse_moe_gate_up_swiglu(const Tensor& x, const Weight& gate,
@@ -1012,18 +1104,21 @@ void qwen4_sparse_moe_resident(const Tensor& x,
                                const Qwen4ResidentSparseMoeWeights& weights,
                                Tensor& selected_ids, Tensor& selected_weights,
                                Tensor& destination, WorkspaceArena& workspace,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, LinearPolicy expert_policy,
+                               Qwen4SharedExpertPolicy shared_policy) {
     const std::int32_t width = x.ne[1];
     require_matrix_tensor(x, DType::BF16, kQwen4SparseMoeHidden, width, "x",
                           "qwen4_sparse_moe_resident");
-    require_tensor(weights.shared_gate, DType::FP32, kQwen4SparseMoeHidden, "shared_gate");
+    const bool native_controls = weights.router.qtype == QType::BF16_CTRL;
+    require_tensor(weights.shared_gate, native_controls ? DType::BF16 : DType::FP32,
+                   kQwen4SparseMoeHidden, "shared_gate");
     require_matrix_tensor(selected_ids, DType::I32, kQwen4SparseMoeTopK, width,
                           "selected_ids", "qwen4_sparse_moe_resident");
     require_matrix_tensor(selected_weights, DType::FP32, kQwen4SparseMoeTopK, width,
                           "selected_weights", "qwen4_sparse_moe_resident");
     require_matrix_tensor(destination, DType::BF16, kQwen4SparseMoeHidden, width,
                           "destination", "qwen4_sparse_moe_resident");
-    require_dense_router(weights.router);
+    require_dense_router(weights.router, native_controls);
     const QType routed_qtype = weights.routed_gate.qtype;
     if (!native_weight(routed_qtype) && routed_qtype != QType::GGML_IQ1_S &&
         routed_qtype != QType::GGML_IQ2_XXS) {
@@ -1049,7 +1144,8 @@ void qwen4_sparse_moe_resident(const Tensor& x,
         require_ggml_weight(weights.routed_down, QType::GGML_IQ4_NL, kQwen4SparseMoeExperts,
                             kQwen4SparseMoeHidden, kQwen4SparseMoeIntermediate, "routed_down");
     }
-    if (!native_weight(weights.shared_gate_proj.qtype) &&
+    if (!detail::is_native_projection(weights.shared_gate_proj.qtype) &&
+        weights.shared_gate_proj.qtype != QType::FP8_E4M3FN_TENSOR_F32M &&
         weights.shared_gate_proj.qtype != QType::GGML_Q5_K &&
         weights.shared_gate_proj.qtype != QType::GGML_Q6_K) {
         throw std::invalid_argument(
@@ -1062,7 +1158,8 @@ void qwen4_sparse_moe_resident(const Tensor& x,
                         kQwen4SparseMoeIntermediate, kQwen4SparseMoeHidden, "shared_up");
     require_resident_projection(weights.shared_down, QType::GGML_Q8_0, kQwen4SparseMoeHidden,
                         kQwen4SparseMoeIntermediate, "shared_down");
-    const std::size_t required = required_resident_workspace(weights, width);
+    const std::size_t required = required_resident_workspace(weights, width, expert_policy, shared_policy);
+    const bool allow_a4 = use_a4(weights, width, expert_policy);
     if (!has_workspace_capacity(workspace, required)) {
         throw std::invalid_argument("qwen4_sparse_moe_resident: insufficient workspace");
     }
@@ -1127,22 +1224,33 @@ void qwen4_sparse_moe_resident(const Tensor& x,
         return;
     }
 
-    ResidentWideScratch scratch = allocate_resident_wide_scratch(workspace, width);
+    const bool fp32_shared = source_bf16_shared(weights);
+    ResidentWideScratch scratch = allocate_resident_wide_scratch(workspace, width, fp32_shared);
     detail::qwen4_sparse_moe_resident_wide_route_launch(
         x, weights.router, weights.shared_gate, scratch.logits, selected_ids,
         selected_weights, scratch.shared_gate_value, stream);
-    resident_projection(x, weights.shared_gate_proj, scratch.shared_gate_projection,
-                         workspace, stream);
-    resident_projection(x, weights.shared_up, scratch.shared_up, workspace, stream);
-    detail::qwen4_sparse_moe_swiglu_launch(
-        scratch.shared_gate_projection, scratch.shared_up,
-        scratch.shared_gate_projection, stream);
-    resident_projection(scratch.shared_gate_projection, weights.shared_down, scratch.shared,
-                         workspace, stream);
+    Tensor activated = fp32_shared ? scratch.shared_activated : scratch.shared_gate_projection;
+    if (fp32_shared) {
+        detail::launch_bf16_f32(x, weights.shared_gate_proj, scratch.shared_gate_projection, stream);
+        detail::launch_bf16_f32(x, weights.shared_up, scratch.shared_up, stream);
+        detail::qwen4_sparse_moe_swiglu_f32_launch(
+            scratch.shared_gate_projection, scratch.shared_up, activated, stream);
+    } else {
+        resident_projection(x, weights.shared_gate_proj, scratch.shared_gate_projection, workspace, stream, shared_policy.gate);
+        resident_projection(x, weights.shared_up, scratch.shared_up, workspace, stream, shared_policy.up);
+        detail::qwen4_sparse_moe_swiglu_launch(scratch.shared_gate_projection, scratch.shared_up, activated, stream);
+    }
+    resident_projection(activated, weights.shared_down, scratch.shared,
+                         workspace, stream, shared_policy.down);
 
     detail::qwen4_sparse_moe_resident_group_launch(
         selected_ids, scratch.expert_counts, scratch.expert_offsets,
         scratch.expert_cursors, scratch.occurrence_slots, stream);
+    ResidentA4Scratch a4;
+    if (allow_a4) {
+        a4 = allocate_resident_a4(workspace, width);
+        detail::qwen4_sparse_moe_a4_tiles_launch(scratch.expert_counts, a4.tiles, stream);
+    }
     Tensor gathered;
     if (const int rows = resident_gather_rows(weights); rows != 0) {
         gathered = workspace.alloc(DType::BF16, {rows, kQwen4SparseMoeTopK * width});
@@ -1152,7 +1260,12 @@ void qwen4_sparse_moe_resident(const Tensor& x,
         if (native_weight(bank.qtype)) {
             detail::qwen4_sparse_moe_resident_native_linear_launch(
                 input, bank, scratch.expert_counts, scratch.expert_offsets,
-                scratch.occurrence_slots, gathered, output, input_is_ranked, stream);
+                scratch.occurrence_slots, gathered, output, input_is_ranked, stream, allow_a4);
+            if (allow_a4) {
+                detail::qwen4_sparse_moe_a4_linear_launch(input, bank, scratch.expert_counts,
+                    scratch.expert_offsets, scratch.occurrence_slots, selected_ids, a4.tiles,
+                    a4.codes, a4.scales, output, input_is_ranked, stream);
+            }
         } else if (input_is_ranked) {
             detail::qwen4_sparse_moe_resident_grouped_down_launch(
                 input, bank, scratch.expert_counts, scratch.expert_offsets,

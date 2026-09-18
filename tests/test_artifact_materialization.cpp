@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 namespace {
 
 constexpr std::array<std::byte, 3> kResource = {
@@ -260,41 +262,54 @@ int main() {
                     materialized.device_arena().used() == plan.device_capacity_bytes,
                 "materialized tensor does not own the planned device backing");
 
-        ninfer::artifact::MaterializedArtifact after_reader;
-        ninfer::artifact::ObjectHandle lifetime_tensor;
-        {
-            ninfer::artifact::Reader lifetime_reader(fixture.path);
-            ninfer::artifact::Binder lifetime_binder(lifetime_reader);
-            const auto lifetime_resource = lifetime_binder.require_resource(
-                "frontend/test.json", ninfer::artifact::ResourceEncoding::RawBytesV1);
-            lifetime_binder.validate_only(lifetime_resource);
-            lifetime_tensor = ninfer::artifact::bind_tensor(
-                lifetime_binder, "weights/test", ninfer::artifact::NumericFormat::BF16, {2},
-                ninfer::artifact::TensorPlacement::MappedHost);
-            const auto lifetime_second = lifetime_binder.require_tensor(
-                "weights/second", ninfer::artifact::NumericFormat::BF16,
-                ninfer::artifact::StorageLayout::ContiguousLeV1, second_shape);
-            lifetime_binder.validate_only(lifetime_second);
-            const auto lifetime_plan = lifetime_binder.finish();
-            after_reader =
-                ninfer::artifact::materialize(lifetime_reader, lifetime_plan, device);
-        }
-        const auto mapped_after_reader = after_reader.mapped_tensor_bytes(lifetime_tensor);
-        require(std::equal(mapped_after_reader.begin(), mapped_after_reader.end(), kTensor.begin(),
-                           kTensor.end()),
-                "mapped tensor did not retain the Reader mapping lifetime");
-        const auto& lifetime_stats = after_reader.stats();
-        require(lifetime_stats.tensor_count == 0 && lifetime_stats.mapped_tensor_count == 1 &&
-                    lifetime_stats.mapped_tensor_bytes == kTensor.size() &&
-                    lifetime_stats.resource_count == 0 && lifetime_stats.file_bytes == 0 &&
-                    lifetime_stats.h2d_bytes == 0 &&
-                    lifetime_stats.device_capacity_bytes == 0 &&
-                    lifetime_stats.retained_resource_bytes == 0 &&
-                    lifetime_stats.peak_staging_bytes == 0 &&
-                    lifetime_stats.upload_seconds == 0.0,
-                "mapped-only materialization statistics are not exact");
-        require_artifact_error([&] { (void)after_reader.device_arena(); },
-                               "mapped-only artifact exposed a device arena");
+        const auto check_mapped_lifetime = [&](ninfer::artifact::TensorPlacement placement) {
+            ninfer::artifact::MaterializedArtifact after_reader;
+            ninfer::artifact::ObjectHandle lifetime_tensor;
+            {
+                ninfer::artifact::Reader lifetime_reader(fixture.path);
+                ninfer::artifact::Binder lifetime_binder(lifetime_reader);
+                const auto lifetime_resource = lifetime_binder.require_resource(
+                    "frontend/test.json", ninfer::artifact::ResourceEncoding::RawBytesV1);
+                lifetime_binder.validate_only(lifetime_resource);
+                lifetime_tensor = ninfer::artifact::bind_tensor(
+                    lifetime_binder, "weights/test", ninfer::artifact::NumericFormat::BF16, {2},
+                    placement);
+                const auto lifetime_second = lifetime_binder.require_tensor(
+                    "weights/second", ninfer::artifact::NumericFormat::BF16,
+                    ninfer::artifact::StorageLayout::ContiguousLeV1, second_shape);
+                lifetime_binder.validate_only(lifetime_second);
+                const auto lifetime_plan = lifetime_binder.finish();
+                require(lifetime_plan.mapped_tensor_objects.front().resident ==
+                            (placement == ninfer::artifact::TensorPlacement::ResidentHost),
+                        "resident placement was lost by the binder");
+                after_reader =
+                    ninfer::artifact::materialize(lifetime_reader, lifetime_plan, device);
+            }
+            const auto mapped_after_reader = after_reader.mapped_tensor_bytes(lifetime_tensor);
+            require(std::equal(mapped_after_reader.begin(), mapped_after_reader.end(),
+                               kTensor.begin(), kTensor.end()),
+                    "mapped tensor did not retain the Reader mapping lifetime");
+            const auto& lifetime_stats = after_reader.stats();
+            const auto resident_bytes = placement == ninfer::artifact::TensorPlacement::ResidentHost
+                                            ? kTensor.size() : 0;
+            const auto locked_bytes = resident_bytes == 0 ? 0 : ::sysconf(_SC_PAGESIZE);
+            require(lifetime_stats.tensor_count == 0 && lifetime_stats.mapped_tensor_count == 1 &&
+                        lifetime_stats.mapped_tensor_bytes == kTensor.size() &&
+                        lifetime_stats.resident_tensor_bytes == resident_bytes &&
+                        lifetime_stats.resident_locked_bytes ==
+                            static_cast<std::uint64_t>(locked_bytes) &&
+                        lifetime_stats.resource_count == 0 && lifetime_stats.file_bytes == 0 &&
+                        lifetime_stats.h2d_bytes == 0 &&
+                        lifetime_stats.device_capacity_bytes == 0 &&
+                        lifetime_stats.retained_resource_bytes == 0 &&
+                        lifetime_stats.peak_staging_bytes == 0 &&
+                        lifetime_stats.upload_seconds == 0.0,
+                    "mapped-only materialization statistics are not exact");
+            require_artifact_error([&] { (void)after_reader.device_arena(); },
+                                   "mapped-only artifact exposed a device arena");
+        };
+        check_mapped_lifetime(ninfer::artifact::TensorPlacement::MappedHost);
+        check_mapped_lifetime(ninfer::artifact::TensorPlacement::ResidentHost);
 
         auto parallel_fixture = write_parallel_fixture();
         ninfer::artifact::Reader parallel_reader(parallel_fixture.path);

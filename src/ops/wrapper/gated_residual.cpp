@@ -3,7 +3,7 @@
 #include "core/layout.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/gated_residual.h"
-#include "ops/common/quantized_projection.h"
+#include "ops/common/projection.h"
 
 #include <algorithm>
 #include <array>
@@ -29,10 +29,11 @@ struct Scratch {
 };
 
 template <class Allocator>
-Scratch allocate_scratch(Allocator& allocator, std::int32_t tokens) {
-    return {allocator.alloc(DType::BF16, {kFlat, tokens}),
-            allocator.alloc(DType::BF16, {kRank, tokens}),
-            allocator.alloc(DType::BF16, {kFlat, tokens})};
+Scratch allocate_scratch(Allocator& allocator, std::int32_t tokens, bool fp32) {
+    const DType type = fp32 ? DType::FP32 : DType::BF16;
+    return {allocator.alloc(type, {kFlat, tokens}),
+            allocator.alloc(type, {kRank, tokens}),
+            allocator.alloc(type, {kFlat, tokens})};
 }
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -50,7 +51,7 @@ void require_tensor(const Tensor& tensor, DType dtype, std::array<std::int32_t, 
 
 void require_q8_weight(const Weight& weight, std::int32_t rows, std::int32_t columns,
                        const char* op, const char* name) {
-    if (detail::is_native_quantized_projection(weight.qtype)) {
+    if (detail::is_native_projection(weight.qtype)) {
         detail::validate_native_projection(weight, rows, columns, op);
         return;
     }
@@ -103,12 +104,12 @@ void require_disjoint(std::span<const AddressRange> ranges) {
 
 std::size_t required_workspace(std::int32_t tokens, QType down, QType up) {
     for (QType type : {down, up}) {
-        if (type != QType::GGML_Q8_0 && !detail::is_native_quantized_projection(type)) {
+        if (type != QType::GGML_Q8_0 && !detail::is_native_projection(type)) {
             throw std::invalid_argument("gated_residual: unsupported projection format");
         }
     }
     WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout, tokens);
+    (void)allocate_scratch(layout, tokens, down == QType::BF16_CTRL && up == QType::BF16_CTRL);
     const auto bytes = std::max(
         detail::projection_workspace_bytes(down, kRank, kFlat, tokens),
         detail::projection_workspace_bytes(up, kFlat, kRank, tokens));
@@ -162,11 +163,20 @@ void run_read(const Tensor& residual, const Tensor& norm_weight, const Weight& d
     require_disjoint(std::span<const AddressRange>(ranges.data(), range_count));
 
     auto scope = workspace.scope();
-    Scratch scratch = allocate_scratch(workspace, tokens);
+    const bool fp32 = down_weight.qtype == QType::BF16_CTRL && up_weight.qtype == QType::BF16_CTRL;
+    Scratch scratch = allocate_scratch(workspace, tokens, fp32);
     detail::gated_residual_normalize_launch(residual, norm_weight, scratch.normalized, stream);
-    detail::quantized_projection(scratch.normalized, down_weight, scratch.low_rank, workspace, stream);
+    if (fp32) {
+        detail::gated_residual_bf16_project_f32_launch(scratch.normalized, down_weight, scratch.low_rank, stream);
+    } else {
+        detail::projection(scratch.normalized, down_weight, scratch.low_rank, workspace, stream);
+    }
     detail::gated_residual_activate_launch(scratch.low_rank, stream);
-    detail::quantized_projection(scratch.low_rank, up_weight, scratch.up_logits, workspace, stream);
+    if (fp32) {
+        detail::gated_residual_bf16_project_f32_launch(scratch.low_rank, up_weight, scratch.up_logits, stream);
+    } else {
+        detail::projection(scratch.low_rank, up_weight, scratch.up_logits, workspace, stream);
+    }
     detail::gated_residual_mix_launch(scratch.normalized, scratch.up_logits, x, stream);
     if (write_weight != nullptr) {
         detail::gated_residual_write_launch(scratch.normalized, *write_weight, *write_scale, stream);

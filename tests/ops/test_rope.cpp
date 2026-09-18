@@ -76,7 +76,8 @@ std::vector<int> make_positions(int axes, int tokens, int first_position) {
 // public input and evaluates the documented split-half rotation naively in FP64. It does not
 // reproduce output storage rounding, production staging, coefficient tables, range reduction,
 // kernel split, or reduction order.
-std::vector<double> rope_oracle(const std::vector<float>& input, const std::vector<int>& positions,
+template<class Scalar>
+std::vector<double> rope_oracle(const std::vector<Scalar>& input, const std::vector<int>& positions,
                                 const Geometry& geometry, int heads) {
     std::vector<double> output(input.begin(), input.end());
     const int half = geometry.rotary_dim / 2;
@@ -412,6 +413,13 @@ int run_vision_packed_case() {
 
 } // namespace
 
+#ifdef NINFER_VISION_ORACLE_ADAPTERS
+namespace ninfer::test::vision_source {
+std::vector<double> rotary(const std::vector<double>& x,const std::vector<int>& p,int tokens) {
+    return rope_oracle(x,p,Geometry{"native Vision",72,72,2,tokens,10000.f},16);
+}
+}
+#else
 int main() {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
@@ -441,3 +449,4 @@ int main() {
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;
 }
+#endif

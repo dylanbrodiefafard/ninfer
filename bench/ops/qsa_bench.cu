@@ -32,6 +32,7 @@ struct State {
 
     ops::QsaStateView view() {
         return {
+            ops::QsaKvFormat::NVFP4G16,
             Tensor(k_codes.p, DType::U8, {128, capacity, 2}),
             Tensor(v_codes.p, DType::U8, {128, capacity, 2}),
             Tensor(k_scales.p, DType::FP8_E4M3FN, {16, capacity, 2}),

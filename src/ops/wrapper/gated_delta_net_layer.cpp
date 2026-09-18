@@ -4,7 +4,8 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/gated_delta_net_layer.h"
-#include "ops/common/quantized_projection.h"
+#include "ops/common/projection.h"
+#include "ops/linear/fp8/fp8_tensor.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,29 @@ constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kQkRows = kQkHeads * kHeadDim;
 constexpr std::int32_t kValueRows = kValueHeads * kHeadDim;
 constexpr std::int32_t kQkvRows = 2 * kQkRows + kValueRows;
+
+bool native_projection(QType type) {
+    return detail::is_native_projection(type) || type == QType::FP8_E4M3FN_TENSOR_F32M;
+}
+
+std::size_t required_projection_bytes(QType type, int rows, int columns, int tokens,
+                              LinearPolicy policy) {
+    if (policy != LinearPolicy::A16Only &&
+        (policy != LinearPolicy::AllowA8 || type != QType::FP8_E4M3FN_TENSOR_F32M)) {
+        throw std::invalid_argument("gated_delta_net_layer: unsupported projection precision policy");
+    }
+    return native_projection(type)
+        ? linear_workspace_capacity_bytes(type, rows, columns, policy, 1, tokens) : 0;
+}
+
+void project(const Tensor& input, const Weight& weight, Tensor& output,
+             WorkspaceArena& workspace, cudaStream_t stream, LinearPolicy policy) {
+    if (native_projection(weight.qtype)) {
+        linear(input, weight, output, policy, workspace, stream);
+    } else {
+        ggml_block_linear(input, weight, output, stream);
+    }
+}
 
 struct Scratch {
     Tensor projected_qkv;
@@ -78,9 +102,16 @@ std::uint64_t ggml_payload_bytes(QType qtype, std::int32_t rows, std::int32_t co
     return static_cast<std::uint64_t>(rows) * (columns / 256) * block_bytes;
 }
 
-void require_ggml_weight(const Weight& weight, std::int32_t rows, std::int32_t columns,
+void require_projection_weight(const Weight& weight, std::int32_t rows, std::int32_t columns,
                          bool allow_q5, const char* name) {
-    if (detail::is_native_quantized_projection(weight.qtype)) {
+    if (weight.qtype == QType::FP8_E4M3FN_TENSOR_F32M) {
+        if (weight.n != rows || weight.k != columns) {
+            throw std::invalid_argument("gated_delta_net_layer: calibrated projection shape");
+        }
+        detail::validate_fp8_tensor_weight(weight, name);
+        return;
+    }
+    if (detail::is_native_projection(weight.qtype)) {
         detail::validate_native_projection(weight, rows, columns, name);
         return;
     }
@@ -135,26 +166,30 @@ bool exact_alias(const Tensor& input, const Tensor& output) {
     return input.data == output.data && input.bytes() == output.bytes();
 }
 
-std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType output) {
-    if (!detail::is_native_quantized_projection(qkv) &&
-        !detail::is_native_quantized_projection(z) && qkv != z) {
+std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType output,
+                               GatedDeltaNetProjectionPolicy policy) {
+    if (policy.qkv == LinearPolicy::AllowA8 && policy.output == LinearPolicy::AllowA8) {
+        throw std::invalid_argument("gated_delta_net_layer: simultaneous QKV/output A8 is not qualified");
+    }
+    if (!native_projection(qkv) &&
+        !native_projection(z) && qkv != z) {
         throw std::invalid_argument("gated_delta_net_layer: GGML input formats differ");
     }
     for (QType type : {qkv, z}) {
         if (type != QType::GGML_Q5_K && type != QType::GGML_Q6_K &&
-            !detail::is_native_quantized_projection(type)) {
+            !native_projection(type)) {
             throw std::invalid_argument("gated_delta_net_layer: unsupported input format");
         }
     }
-    if (output != QType::GGML_Q6_K && !detail::is_native_quantized_projection(output)) {
+    if (output != QType::GGML_Q6_K && !native_projection(output)) {
         throw std::invalid_argument("gated_delta_net_layer: unsupported output format");
     }
     WorkspaceLayoutBuilder layout;
     (void)allocate_scratch(layout, tokens);
     const auto projection_bytes = std::max({
-        detail::projection_workspace_bytes(qkv, kQkvRows, kHidden, tokens),
-        detail::projection_workspace_bytes(z, kValueRows, kHidden, tokens),
-        detail::projection_workspace_bytes(output, kHidden, kValueRows, tokens)});
+        required_projection_bytes(qkv, kQkvRows, kHidden, tokens, policy.qkv),
+        required_projection_bytes(z, kValueRows, kHidden, tokens, policy.z),
+        required_projection_bytes(output, kHidden, kValueRows, tokens, policy.output)});
     if (projection_bytes) { (void)layout.alloc_bytes(projection_bytes); }
     return layout.peak_bytes();
 }
@@ -162,27 +197,29 @@ std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType ou
 } // namespace
 
 std::size_t gated_delta_net_layer_workspace_capacity_bytes(
-    std::int32_t max_tokens, QType qkv, QType z, QType output) {
+    std::int32_t max_tokens, QType qkv, QType z, QType output,
+    GatedDeltaNetProjectionPolicy policy) {
     if (max_tokens <= 0 || max_tokens > 4096) {
         throw std::invalid_argument(
             "gated_delta_net_layer_workspace_capacity_bytes: max_tokens must be in [1,4096]");
     }
-    return required_workspace(max_tokens, qkv, z, output);
+    return required_workspace(max_tokens, qkv, z, output, policy);
 }
 
 void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& weights,
                            const Tensor& conv_state_in, Tensor& conv_state_out,
                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                           WorkspaceArena& workspace, cudaStream_t stream) {
+                           WorkspaceArena& workspace, cudaStream_t stream,
+                           GatedDeltaNetProjectionPolicy policy) {
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 0 || tokens > 4096) {
         throw std::invalid_argument("gated_delta_net_layer: T must be in [1,4096]");
     }
     require_tensor(x, DType::BF16, {kHidden, tokens, 1, 1}, "x");
-    require_ggml_weight(weights.qkv, kQkvRows, kHidden, true, "qkv weight");
-    require_ggml_weight(weights.z, kValueRows, kHidden, true, "z weight");
-    if (!detail::is_native_quantized_projection(weights.z.qtype) &&
-        !detail::is_native_quantized_projection(weights.qkv.qtype) &&
+    require_projection_weight(weights.qkv, kQkvRows, kHidden, true, "qkv weight");
+    require_projection_weight(weights.z, kValueRows, kHidden, true, "z weight");
+    if (!native_projection(weights.z.qtype) &&
+        !native_projection(weights.qkv.qtype) &&
         weights.z.qtype != weights.qkv.qtype) {
         throw std::invalid_argument("gated_delta_net_layer: qkv and z formats differ");
     }
@@ -192,7 +229,7 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     require_tensor(weights.ssm_a, DType::FP32, {kValueHeads, 1, 1, 1}, "ssm_a");
     require_tensor(weights.dt_bias, DType::FP32, {kValueHeads, 1, 1, 1}, "dt_bias");
     require_tensor(weights.norm, DType::FP32, {kHeadDim, 1, 1, 1}, "norm weight");
-    require_ggml_weight(weights.output, kHidden, kValueRows, false, "output weight");
+    require_projection_weight(weights.output, kHidden, kValueRows, false, "output weight");
     require_tensor(conv_state_in, DType::BF16, {kQkvRows, 3, 1, 1}, "conv_state_in");
     require_tensor(conv_state_out, DType::BF16, {kQkvRows, 3, 1, 1}, "conv_state_out");
     require_tensor(ssm_state_in, DType::FP32, {kHeadDim, kHeadDim, kValueHeads, 1},
@@ -212,7 +249,7 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     }
 
     const std::size_t required = required_workspace(
-        tokens, weights.qkv.qtype, weights.z.qtype, weights.output.qtype);
+        tokens, weights.qkv.qtype, weights.z.qtype, weights.output.qtype, policy);
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("gated_delta_net_layer: insufficient workspace");
@@ -244,8 +281,8 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
 
     auto scope = workspace.scope();
     Scratch scratch = allocate_scratch(workspace, tokens);
-    detail::quantized_projection(x, weights.qkv, scratch.projected_qkv, workspace, stream);
-    detail::quantized_projection(x, weights.z, scratch.z, workspace, stream);
+    project(x, weights.qkv, scratch.projected_qkv, workspace, stream, policy.qkv);
+    project(x, weights.z, scratch.z, workspace, stream, policy.z);
     detail::gated_delta_net_layer_control_launch(x, weights.a, weights.b, weights.ssm_a,
                                                   weights.dt_bias, scratch.g, scratch.beta, stream);
     detail::gated_delta_net_layer_conv_launch(scratch.projected_qkv, weights.conv, conv_state_in,
@@ -263,7 +300,7 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     }
     detail::gated_delta_net_layer_norm_launch(scratch.recurrent, scratch.z, weights.norm,
                                                scratch.normalized_gated, stream);
-    detail::quantized_projection(scratch.normalized_gated, weights.output, out, workspace, stream);
+    project(scratch.normalized_gated, weights.output, out, workspace, stream, policy.output);
 }
 
 } // namespace ninfer::ops

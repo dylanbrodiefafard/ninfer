@@ -20,6 +20,9 @@ int qsa_validate_state(const QsaStateView& state, const char* op);
 
 QsaAddressRange qsa_address_range(const Tensor& tensor, const char* op, const char* name);
 QsaAddressRange qsa_address_range(const Weight& weight, const char* op, const char* name);
+/** Scale planes exist only for NVFP4; validate_state rejects any BF16 scale storage. */
+QsaAddressRange qsa_scale_address_range(const Tensor& tensor, QsaKvFormat format,
+                                       const char* op, const char* name);
 
 void qsa_require_disjoint(std::initializer_list<QsaAddressRange> ranges, const char* op);
 

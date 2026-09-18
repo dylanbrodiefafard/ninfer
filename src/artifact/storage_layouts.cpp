@@ -106,8 +106,16 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "W8G32_F16S";
     case NumericFormat::NVFP4:
         return "NVFP4";
+    case NumericFormat::NVFP4_EXPERT_F32M:
+        return "NVFP4_EXPERT_F32M";
+    case NumericFormat::NVFP4_PARTITION_F32M:
+        return "NVFP4_PARTITION_F32M";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::FP8_E4M3FN_TENSOR_BF16S:
+        return "FP8_E4M3FN_TENSOR_BF16S";
+    case NumericFormat::FP8_E4M3FN_TENSOR_F32M:
+        return "FP8_E4M3FN_TENSOR_F32M";
     case NumericFormat::Q8_0:
         return "Q8_0";
     case NumericFormat::Q4_K:
@@ -136,8 +144,16 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::TensorScaleV1:
+        return "tensor-scale-v1";
+    case StorageLayout::TensorCalibratedV1:
+        return "tensor-calibrated-v1";
+    case StorageLayout::PartitionedRowBlockScaleK16V1:
+        return "partitioned-row-blockscale-k16-v1";
     case StorageLayout::GgmlBlockRowV1:
         return "ggml-block-row-v1";
+    case StorageLayout::ExpertBlockScaleK16M128x4V1:
+        return "expert-blockscale-k16-m128x4-v1";
     }
     return {};
 }
@@ -177,8 +193,20 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     if (layout == StorageLayout::BlockScaleK16M128x4V1) {
         return block_scale_geometry(format, shape).encoded_bytes;
     }
+    if (layout == StorageLayout::ExpertBlockScaleK16M128x4V1) {
+        return expert_block_scale_geometry(format, shape).encoded_bytes;
+    }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::TensorScaleV1) {
+        return tensor_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::TensorCalibratedV1) {
+        return tensor_calibrated_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::PartitionedRowBlockScaleK16V1) {
+        return partition_block_scale_geometry(format, shape).encoded_bytes;
     }
     if (layout == StorageLayout::GgmlBlockRowV1) {
         return ggml_block_geometry(format, shape).encoded_bytes;
@@ -239,6 +267,67 @@ BlockScaleGeometry block_scale_geometry(NumericFormat format,
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "NVFP4 weight divisor offset");
     out.encoded_bytes = checked_add(out.weight_divisor_offset, 4, "NVFP4 tensor encoded size");
     return out;
+}
+
+ExpertBlockScaleGeometry expert_block_scale_geometry(
+    NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::NVFP4_EXPERT_F32M || shape.size() != 3 ||
+        shape[0] == 0 || shape[1] == 0 || shape[2] == 0 ||
+        shape[1] % 128 != 0 || shape[2] % 64 != 0) {
+        throw ArtifactError("expert-blockscale-k16-m128x4-v1 requires NVFP4_EXPERT_F32M "
+                            "and positive [E,N,K] with N%128=0 and K%64=0");
+    }
+    ExpertBlockScaleGeometry out;
+    out.experts = shape[0]; out.rows = shape[1]; out.columns = shape[2];
+    const auto elements = checked_mul(checked_mul(shape[0], shape[1], "expert rows"),
+                                       shape[2], "expert elements");
+    out.code_plane_bytes = elements / 2;
+    out.scale_plane_offset = align_up(out.code_plane_bytes, kTensorAlignment, "expert scales");
+    out.scale_plane_bytes = elements / 16;
+    out.weight_multiplier_offset = checked_add(out.scale_plane_offset, out.scale_plane_bytes,
+                                                "expert weight multipliers");
+    const auto multipliers = checked_mul(out.experts, 4, "expert multiplier bytes");
+    out.input_multiplier_offset = checked_add(out.weight_multiplier_offset, multipliers,
+                                               "expert input multipliers");
+    out.encoded_bytes = checked_add(out.input_multiplier_offset, multipliers, "expert payload");
+    return out;
+}
+
+PartitionBlockScaleGeometry partition_block_scale_geometry(
+    NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::NVFP4_PARTITION_F32M || shape.size() != 3 ||
+        shape[0] == 0 || shape[1] == 0 || shape[2] == 0 || shape[2] % 16 != 0) {
+        throw ArtifactError("partitioned-row-blockscale-k16-v1 requires NVFP4_PARTITION_F32M "
+                            "positive [P,R,K], K divisible by 16");
+    }
+    PartitionBlockScaleGeometry out;
+    out.partitions = shape[0]; out.rows = shape[1]; out.columns = shape[2];
+    out.row_bytes = checked_add(shape[2] / 2, shape[2] / 16, "partition row bytes");
+    out.multiplier_offset = checked_mul(checked_mul(shape[0], shape[1], "partition rows"),
+                                        out.row_bytes, "partition payload rows");
+    out.encoded_bytes = checked_add(out.multiplier_offset,
+                                    checked_mul(shape[0], 4, "partition multipliers"),
+                                    "partition payload");
+    return out;
+}
+
+TensorCalibratedGeometry tensor_calibrated_geometry(
+    NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_TENSOR_F32M || shape.size() != 2 || !shape[0] || !shape[1]) {
+        throw ArtifactError("tensor-calibrated-v1 requires FP8_E4M3FN_TENSOR_F32M positive [N,K]");
+    }
+    const auto offset = align_up(checked_mul(shape[0], shape[1], "calibrated FP8 codes"), 4,
+                                 "calibrated FP8 scalar alignment");
+    return {shape[0], shape[1], offset, checked_add(offset, 8, "calibrated FP8 payload")};
+}
+
+TensorScaleGeometry tensor_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_TENSOR_BF16S || shape.size() != 2 ||
+        shape[0] == 0 || shape[1] == 0) {
+        throw ArtifactError("tensor-scale-v1 requires FP8_E4M3FN_TENSOR_BF16S positive [N,K]");
+    }
+    const auto codes = checked_mul(shape[0], shape[1], "tensor-scaled FP8 codes");
+    return {shape[0], shape[1], codes, codes, checked_add(codes, 2, "tensor-scaled FP8 payload")};
 }
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {

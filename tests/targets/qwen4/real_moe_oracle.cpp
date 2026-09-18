@@ -820,7 +820,7 @@ int run_accumulated_layer35_cell(const verifier::LoadedModel& model,
     Tensor residual(device_residual.p, DType::BF16, {kHidden, kBranches});
     Tensor x(device_x.data(), DType::BF16, {kHidden});
     Tensor scale(device_scale.data(), DType::BF16, {kBranches});
-    WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes());
+    WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
     ops::gated_residual_read_write(residual, layer.ffn_gr.norm, layer.ffn_gr.down,
                                    layer.ffn_gr.up, layer.ffn_gr.inject, x, scale,
                                    gr_workspace, device.stream);
@@ -993,7 +993,7 @@ int run_moe_cell(const verifier::LoadedModel& model, ninfer::DeviceContext& devi
     GuardedDeviceBuffer device_x(static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t));
     device_x.fill(0xcd);
     Tensor x(device_x.data(), DType::BF16, {kHidden});
-    WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes());
+    WorkspaceArena gr_workspace(ops::gated_residual_workspace_capacity_bytes(1, QType::GGML_Q8_0, QType::GGML_Q8_0));
     const verifier::GrWeights& ffn_gr = model.view().layers[0].ffn_gr;
     ops::gated_residual_read(gr.attention_residual, ffn_gr.norm, ffn_gr.down, ffn_gr.up, x,
                              gr_workspace, device.stream);

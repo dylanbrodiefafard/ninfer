@@ -13,6 +13,7 @@ namespace ninfer::artifact {
 enum class TensorPlacement : std::uint8_t {
     Device,
     MappedHost,
+    ResidentHost,
     ValidateOnly,
 };
 
@@ -34,6 +35,7 @@ struct HostMaterialization {
 struct MappedTensorMaterialization {
     ObjectHandle object;
     std::uint64_t bytes = 0;
+    bool resident = false;
 };
 
 struct MaterializationPlan {
@@ -57,7 +59,7 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
-    void map_tensor_on_host(ObjectHandle handle);
+    void map_tensor_on_host(ObjectHandle handle, bool resident = false);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();
