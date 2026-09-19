@@ -15,8 +15,9 @@ namespace ninfer::ops {
  *   rn = vec(R) / sqrt(mean(vec(R)^2)+1e-6) * (1+norm_R)
  *   output[:,j] = W_hidden * rn[2560*j:2560*(j+1)] + W_embedding * en
  * Hidden normalization is ONCE over 10240, never separately per branch. The independent
- * ideal evaluates this whole formula in FP64 from represented public inputs; private BF16
- * normalization/projection staging is not semantic. Only the final output is observable.
+ * ideal evaluates this whole formula in FP64 from represented public inputs. The current
+ * implementation keeps normalized values in FP32 and rounds each projection to BF16 before
+ * addition; this private staging is not semantic. Only the final output is observable.
  * T in [1,4096]. All input/weight/output/workspace storage is pairwise disjoint. Caller owns
  * workspace; scope is restored after enqueue. No persistent state or hidden allocation.
  * Async/graph-capturable on stream. Numerical profile: relative L2 <= .01, max absolute

@@ -3,7 +3,7 @@
 This reference freezes the Qwen4 model mathematics and persistent state established from the
 official `Qwen/Qwen3.8-Flash-Next` BF16 preview. The preview is source provenance for this Qwen4
 architecture authority, not the repository identity. The exact native artifact identity is
-`qwen4/native-preview` / `nvfp4-a16`. Its Engine integration is architecture implementation,
+`qwen4/native-preview` / `nvfp4-native`. Its Engine integration is architecture implementation,
 not a claim that the oversized preview can run on the RTX 5090 or an advertised fitting model.
 
 No currently audited preview profile qualifies as a runnable resident RTX 5090 target. The official BF16
@@ -796,7 +796,16 @@ The sole host model-data exception is the already eagerly populated and OS-locke
 Qualified integer n-gram addressing uses each slot's exact two-token raw history. Bounded pinned
 byte gathers upload complete selected FP8 or NVFP4 row records; GPU decoding supplies represented
 BF16 embeddings. FP8 table views exclude the trailing BF16 tensor multiplier from row bytes and
-retain its exact bits separately. Token embeddings and optional source Vision features are
+retain its exact bits separately. As soon as validated input IDs and accepted raw history
+determine the rows, `NativePleFetch` gathers them and starts H2D plus GPU codec decode on its
+own nonblocking stream, before page materialization and control/embedding work. Decoder index0
+(the first layer) has no PLE dependency. Only index1 (the second layer) waits for the ready event
+immediately before injection. Captured graphs retain an external event-wait node, reusing the
+new event generation recorded before each launch; fetches themselves stay outside capture.
+Both transfer and compute consumers drain before staging reuse or teardown, including a
+prepared batch discarded without enqueue. This removes serialization; it does not guarantee
+that transfer is hidden for every host-memory/workload configuration.
+Token embeddings and optional source Vision features are
 prepared before the compute graph, then broadcast into the four residual branches. Source image
 tokens still participate in raw PLE hashing; replacing a visual embedding does not replace its
 token ID. Final GR and the untied head produce physical 248320-row logits, while the shared

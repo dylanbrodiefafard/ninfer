@@ -59,12 +59,14 @@ struct LayerPrecision {
     ops::Qwen4ResidentSparseMoeStorageProfile moe;
 };
 struct Precision {
+    NativePrefillPolicy prefill_policy=NativePrefillPolicy::A16;
     std::array<LayerPrecision,48> layers;
     std::array<QType,2> ple,final;
     QType head;
 };
 inline Precision precision(const NativeModelView& model) {
     Precision p;
+    p.prefill_policy=model.prefill_policy;
     for(int i=0;i<48;++i) {
         const auto& w=model.layers[i];auto& l=p.layers[i];
         l.gr={w.attention_gr.down.qtype,w.attention_gr.up.qtype,w.moe_gr.down.qtype,w.moe_gr.up.qtype};
@@ -84,11 +86,13 @@ inline QType qtype(artifact::NumericFormat format) {
         case N::NVFP4:return QType::NVFP4;
         case N::NVFP4_EXPERT_F32M:return QType::NVFP4_EXPERT_F32M;
         case N::FP8_E4M3FN_TENSOR_F32M:return QType::FP8_E4M3FN_TENSOR_F32M;
+        case N::FP8_E4M3FN_ROW_BF16S:return QType::FP8_E4M3FN_ROW_BF16S;
         default:throw std::invalid_argument("Qwen4 native matrix storage format");
     }
 }
 inline Precision precision(const NativeArtifactPlan& plan) {
     Precision p;
+    p.prefill_policy=plan.prefill_policy;
     const auto type=[&](const std::string& name){return qtype(plan.tensors.at(name).format);};
     const std::string main="model.language_model.";
     for(int i=0;i<48;++i) {
@@ -119,13 +123,15 @@ inline Scratch scratch(const Precision& p,const NativeRuntimeConfig& c) {
         ops::linear_workspace_capacity_bytes(p.head,V,D,ops::LinearPolicy::A16Only,1,n)});
     for(int i=0;i<48;++i) {
         const auto& l=p.layers[i];
+        const auto policy=native_prefill_policy(c.prefill_width>16?p.prefill_policy:NativePrefillPolicy::A16,i);
         result.workspace=std::max({result.workspace,
             ops::gated_residual_workspace_capacity_bytes(n,l.gr[0],l.gr[1]),
             ops::gated_residual_workspace_capacity_bytes(n,l.gr[2],l.gr[3]),
-            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(l.moe,n)});
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(l.moe,n),
+            ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(l.moe,c.prefill_width,policy.routed,policy.shared)});
         if(i%4!=3) result.workspace=std::max({result.workspace,
             ops::gated_delta_net_layer_batch_workspace_capacity_bytes(n,1,l.mixer[0],l.mixer[1],l.mixer[2]),
-            ops::gated_delta_net_layer_workspace_capacity_bytes(c.prefill_width,l.mixer[0],l.mixer[1],l.mixer[2])});
+            ops::gated_delta_net_layer_workspace_capacity_bytes(c.prefill_width,l.mixer[0],l.mixer[1],l.mixer[2],policy.gdn)});
         else for(int b=1;b<=c.requests;++b) {
             const int w=b==1?std::max(c.prefill_width,c.verify_width):c.verify_width;
             result.qsa=std::max(result.qsa,ops::qsa_verifier_workspace_bytes(w,b,

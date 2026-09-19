@@ -185,12 +185,14 @@ void resident_nvfp4_grouped_kernel(
     const __nv_bfloat16* input, const std::uint8_t* codes, const std::uint8_t* scales,
     float inverse_divisor, const float* expert_multipliers,
     const std::int32_t* counts, const std::int32_t* offsets,
-    const std::int32_t* occurrences, __nv_bfloat16* output, bool allow_a4) {
+    const std::int32_t* occurrences, __nv_bfloat16* output, bool allow_a4,
+    int minimum_count, int maximum_count) {
     static_assert(Schedule::kWarpsPerRow == 1);
     static_assert(Schedule::kTokenTile == TileTokens);
     const int expert = static_cast<int>(blockIdx.y);
     const int count = counts[expert];
-    if (count == 0 || (allow_a4 && count >= kQwen4ResidentA4MinOccurrences)) { return; }
+    if (count < minimum_count || count > maximum_count ||
+        (allow_a4 && count >= kQwen4ResidentA4MinOccurrences)) { return; }
     if (expert_multipliers != nullptr) { inverse_divisor = expert_multipliers[expert]; }
     codes += static_cast<std::int64_t>(expert) * Geometry::kOutputRows *
              Geometry::kCodeBytesPerRow;
@@ -317,13 +319,31 @@ __global__ void resident_expert_histogram_kernel(const std::int32_t* selected_id
 __global__ void resident_expert_prefix_kernel(const std::int32_t* expert_counts,
                                               std::int32_t* expert_offsets,
                                               std::int32_t* expert_cursors) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) { return; }
-    std::int32_t offset = 0;
-    for (int expert = 0; expert < kQwen4SparseMoeExperts; ++expert) {
-        expert_offsets[expert] = offset;
-        expert_cursors[expert] = offset;
-        offset += expert_counts[expert];
+    static_assert(kQwen4SparseMoeExperts == 512);
+    __shared__ int warp_totals[16];
+    const int expert = threadIdx.x, lane = expert & 31, warp = expert >> 5;
+    const int count = expert_counts[expert];
+    int inclusive = count;
+#pragma unroll
+    for (int delta = 1; delta < 32; delta *= 2) {
+        const int preceding = __shfl_up_sync(0xffffffffU, inclusive, delta);
+        if (lane >= delta) inclusive += preceding;
     }
+    if (lane == 31) warp_totals[warp] = inclusive;
+    __syncthreads();
+    if (warp == 0) {
+        int total = lane < 16 ? warp_totals[lane] : 0;
+#pragma unroll
+        for (int delta = 1; delta < 16; delta *= 2) {
+            const int preceding = __shfl_up_sync(0xffffffffU, total, delta);
+            if (lane >= delta) total += preceding;
+        }
+        if (lane < 16) warp_totals[lane] = total;
+    }
+    __syncthreads();
+    const int offset = inclusive - count + (warp ? warp_totals[warp - 1] : 0);
+    expert_offsets[expert] = offset;
+    expert_cursors[expert] = offset;
 }
 
 __global__ void resident_expert_scatter_kernel(const std::int32_t* selected_ids,
@@ -1132,7 +1152,7 @@ void qwen4_sparse_moe_resident_group_launch(
         static_cast<const std::int32_t*>(selected_ids.data),
         static_cast<std::int32_t*>(expert_counts.data), occurrences);
     CUDA_CHECK(cudaGetLastError());
-    resident_expert_prefix_kernel<<<1, 1, 0, stream>>>(
+    resident_expert_prefix_kernel<<<1, 512, 0, stream>>>(
         static_cast<const std::int32_t*>(expert_counts.data),
         static_cast<std::int32_t*>(expert_offsets.data),
         static_cast<std::int32_t*>(expert_cursors.data));
@@ -1246,7 +1266,8 @@ void qwen4_sparse_moe_a4_linear_launch(
 template <class Geometry, int TileTokens, int InputTokenDivisor>
 void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
                            const Tensor& offsets, const Tensor& occurrences,
-                           Tensor& output, cudaStream_t stream, bool allow_a4) {
+                           Tensor& output, cudaStream_t stream, bool allow_a4,
+                           int minimum_count, int maximum_count) {
     using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, TileTokens>::Type;
     resident_nvfp4_grouped_kernel<Geometry, TileTokens, InputTokenDivisor>
         <<<dim3(Geometry::kOutputRows / Schedule::kRowsPerCta, kQwen4SparseMoeExperts),
@@ -1262,7 +1283,7 @@ void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor
             static_cast<const std::int32_t*>(counts.data),
             static_cast<const std::int32_t*>(offsets.data),
             static_cast<const std::int32_t*>(occurrences.data),
-            static_cast<__nv_bfloat16*>(output.data), allow_a4);
+            static_cast<__nv_bfloat16*>(output.data), allow_a4, minimum_count, maximum_count);
 }
 
 template <class Geometry, int InputTokenDivisor>
@@ -1271,10 +1292,15 @@ void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor
                            Tensor& output, cudaStream_t stream, bool allow_a4) {
     if (occurrences.ne[0] <= 2 * kQwen4SparseMoeTopK) {
         launch_resident_nvfp4<Geometry, 2, InputTokenDivisor>(input, bank, counts, offsets,
-                                                            occurrences, output, stream, allow_a4);
+                                                            occurrences, output, stream, allow_a4, 1, 2);
     } else {
+        // Routing occupancy, not request width, determines the useful token tile. The
+        // common sparse groups avoid sixteen-token arithmetic; populated groups retain
+        // the existing weight-reuse schedule. Disjoint filters write every occurrence once.
+        launch_resident_nvfp4<Geometry, 2, InputTokenDivisor>(input, bank, counts, offsets,
+                                                            occurrences, output, stream, allow_a4, 1, 2);
         launch_resident_nvfp4<Geometry, 16, InputTokenDivisor>(input, bank, counts, offsets,
-                                                             occurrences, output, stream, allow_a4);
+                                                             occurrences, output, stream, allow_a4, 3, occurrences.ne[0]);
     }
 }
 

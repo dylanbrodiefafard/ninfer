@@ -26,7 +26,6 @@ constexpr std::int32_t kMaskToken         = 248077;
 constexpr std::int32_t kQ6D               = 5120;
 constexpr std::int32_t kW8VisionD         = 2048;
 constexpr std::int32_t kW8TextD           = 5120;
-constexpr std::int32_t kFp8D              = 5120;
 constexpr std::int32_t kDenseRows         = 2304;
 constexpr std::int32_t kDenseD            = 1152;
 constexpr std::int32_t kQ6Group           = 64;
@@ -410,7 +409,7 @@ struct Fp8Row {
     std::uint16_t scale;
 };
 
-class Fp8Table {
+template<int kFp8D> class Fp8Table {
 public:
     Fp8Table()
         : code_plane_bytes_(static_cast<std::size_t>(kVocab) * kFp8D),
@@ -539,8 +538,8 @@ int run_quantized_case(const char* label, Table& table, const std::vector<std::i
     return failures;
 }
 
-int test_fp8() {
-    Fp8Table table;
+template<int kFp8D> int test_fp8() {
+    Fp8Table<kFp8D> table;
     DeviceContext device;
     int failures = 0;
     for (int tokens : {1, 2, 4, 6, 16, 48, 49, 128, 257, 1024}) {
@@ -669,7 +668,8 @@ int main() {
     try {
         failures += test_dense();
         failures += test_q6();
-        failures += test_fp8();
+        failures += test_fp8<5120>();
+        failures += test_fp8<2560>();
         failures += test_w8();
     } catch (const std::exception& error) {
         std::cerr << "embedding test exception: " << error.what() << '\n';

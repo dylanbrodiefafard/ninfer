@@ -45,8 +45,10 @@ int pages(int capacity) {
 std::size_t scratch(int capacity, int slots) {
     if (slots < 1 || slots > 4) throw std::invalid_argument("Qwen4 DFlash invalid slots");
     (void)pages(capacity);
-    return std::max<std::size_t>(256, ops::bidirectional_gqa_attention_workspace_capacity_bytes(
-        {0, std::uint32_t(capacity)}, 1, 7, slots, 256));
+    return std::max<std::size_t>({256, ops::bidirectional_gqa_attention_workspace_capacity_bytes(
+        {0, std::uint32_t(capacity)}, 1, 7, slots, 256),
+        ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,kVocabulary,kHidden,
+            ops::LinearPolicy::A16Only,1,7*slots)});
 }
 void require_shape(const Tensor& t, DType dtype, int n0, int n1, int n2, const char* label) {
     if (t.dtype != dtype || !t.data || !t.is_contiguous() || t.ne[0] != n0 || t.ne[1] != n1 ||
@@ -59,8 +61,9 @@ void project(const Tensor& input, const Weight& weight, Tensor& output, int widt
                                  workspace, stream, width);
 }
 void require_shared_weight(const Weight& weight, const char* label) {
-    if (weight.qtype != QType::BF16_CTRL || weight.n != kVocabulary || weight.k != kHidden)
-        throw std::invalid_argument(std::string("Qwen4 DFlash requires shared target BF16 ") + label);
+    if ((weight.qtype != QType::BF16_CTRL && weight.qtype != QType::FP8_E4M3FN_ROW_BF16S) ||
+        weight.n != kVocabulary || weight.k != kHidden)
+        throw std::invalid_argument(std::string("Qwen4 DFlash requires shared target BF16 or row-FP8 ") + label);
 }
 }
 

@@ -53,10 +53,11 @@ int verify_text_hashes(const TextPanel& panel) {
 }
 
 int main(int argc,char** argv) {
+    const bool resident_moe=argc==2 && std::string(argv[1])=="--native-moe-profile";
     const bool storage_experiment=argc==2 && std::string(argv[1])=="--fp8-residual-experiment";
     const bool nvfp4_diagnostics=argc==2 && std::string(argv[1])=="--nvfp4-diagnostics";
     const bool selective_a8=argc==2 && std::string(argv[1])=="--native-text-a8";
-    const bool calibrated=selective_a8 || (argc==2 && std::string(argv[1])=="--native-text-fp8");
+    const bool calibrated=resident_moe || selective_a8 || (argc==2 && std::string(argv[1])=="--native-text-fp8");
     const bool text_panel=calibrated || (argc==2 && std::string(argv[1])=="--native-text");
     if(argc!=1 && !storage_experiment && !nvfp4_diagnostics && !text_panel) { std::cerr<<"Unknown native-sequence argument\n"; return 1; }
     const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
@@ -91,13 +92,14 @@ int main(int argc,char** argv) {
     std::vector<float> whole,whole_reference;
     std::vector<int> whole_ids;
     for(bool partitioned:{false,true}) {
+        if(resident_moe && partitioned) break;
         Result residual=seed;
         std::vector<int> discrete_ids;
         if(fp8_residual) {
             residual=residual_fp8_store(residual,std::string(root)+"/qwen4-layer-0.ninfer",0,"attn");
             failures+=residual.failures;
         }
-        for(int layer=0;layer<4;++layer) {
+        for(int layer=0;layer<(resident_moe?1:4);++layer) {
             const auto path=std::string(root)+"/qwen4-layer-"+std::to_string(layer)+".ninfer";
             // Full native first block. Optional text panel uses source token embeddings and
             // exact hash-selected rows; neither panel is a full-model quality measurement.

@@ -1,4 +1,5 @@
 #include "targets/qwen4/native_artifact.h"
+#include "targets/qwen4/native_runtime.h"
 #include "artifact_fixture.h"
 #include "ninfer/engine.h"
 
@@ -14,14 +15,28 @@ using L=artifact::StorageLayout;
 
 // Independent exact source-shape directory witness, never an executable checkpoint. Sparse
 // payload holes permit full-inventory binding/admission checks without downloading 100+ GB.
-Json directory(bool fp8_ple,bool draft,bool fp8_projection) {
+Json directory(bool fp8_ple,bool draft,bool fp8_projection,bool row_fp8=false) {
     Json objects=Json::array();std::uint64_t offset=0;
     auto tensor=[&](const std::string& name,std::initializer_list<std::uint64_t> shape,F format=F::BF16) {
+        if(fp8_projection) {
+            if(name=="model.language_model.layers.0.linear_attn.in_proj_z.weight") format=F::FP8_E4M3FN_TENSOR_F32M;
+            for(int layer:{0,3}) for(const char* role:{"gate","up","down"})
+                if(name=="model.language_model.layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight")
+                    format=F::FP8_E4M3FN_TENSOR_F32M;
+        }
+        if(row_fp8) {
+            for(const char* role:{"model.language_model.embed_tokens.weight","lm_head.weight",
+                "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+                "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+                "model.language_model.layers.1.ple.key_proj.weight","model.language_model.layers.1.ple.value_proj.weight"})
+                if(name==role) format=F::FP8_E4M3FN_ROW_BF16S;
+        }
         L layout=L::ContiguousLeV1;
         if(format==F::NVFP4_EXPERT_F32M) layout=L::ExpertBlockScaleK16M128x4V1;
         if(format==F::NVFP4_PARTITION_F32M) layout=L::PartitionedRowBlockScaleK16V1;
         if(format==F::FP8_E4M3FN_TENSOR_BF16S) layout=L::TensorScaleV1;
         if(format==F::FP8_E4M3FN_TENSOR_F32M) layout=L::TensorCalibratedV1;
+        if(format==F::FP8_E4M3FN_ROW_BF16S) layout=L::RowScaleV1;
         if(format==F::NVFP4) layout=L::BlockScaleK16M128x4V1;
         offset=test::artifact_fixture::align_up(offset,artifact::tensor_alignment(layout));
         const auto bytes=artifact::tensor_encoded_size(layout,format,std::span(shape));
@@ -103,12 +118,13 @@ Json directory(bool fp8_ple,bool draft,bool fp8_projection) {
                          "frontend/generation_config.json","frontend/preprocessor_config.json","frontend/video_preprocessor_config.json","native-profile.json"}) {
         objects.push_back({{"name",name},{"kind","resource"},{"encoding","raw-bytes-v1"},{"offset",offset},{"bytes",2}});offset+=2;
     }
-    return {{"identity",{{"model_id","qwen4/native-preview"},{"weights_id","nvfp4-a16"}}},{"objects",objects}};
+    objects.push_back({{"name","native-prefill-policy"},{"kind","resource"},{"encoding","raw-bytes-v1"},{"offset",offset},{"bytes",1}});
+    return {{"identity",{{"model_id","qwen4/native-preview"},{"weights_id","nvfp4-native"}}},{"objects",objects}};
 }
 
-test::artifact_fixture::TemporaryArtifact sparse(const Json& doc,std::uint16_t fp8_scale=0x3e80) {
+test::artifact_fixture::TemporaryArtifact sparse(const Json& doc,std::uint16_t fp8_scale=0x3e80,int policy=0) {
     const auto path=std::filesystem::temp_directory_path()/("ninfer_qwen4_native_metadata_"+std::to_string(getpid())+
-        "_"+std::to_string(fp8_scale)+".ninfer");
+        "_"+std::to_string(fp8_scale)+"_"+std::to_string(policy)+".ninfer");
     if(std::filesystem::exists(path)) throw std::runtime_error("metadata witness path already exists");
     const auto text=doc.dump();const auto base=test::artifact_fixture::align_up(text.size()+16,4096);
     std::uint64_t end=0;for(const auto& o:doc["objects"]) end=std::max(end,o["offset"].get<std::uint64_t>()+o["bytes"].get<std::uint64_t>());
@@ -120,6 +136,9 @@ test::artifact_fixture::TemporaryArtifact sparse(const Json& doc,std::uint16_t f
         object["format"]==artifact::format_name(F::FP8_E4M3FN_TENSOR_BF16S)) {
         file.seekp(base+object["offset"].get<std::uint64_t>()+object["bytes"].get<std::uint64_t>()-2);
         file.put(char(fp8_scale&255));file.put(char(fp8_scale>>8));
+    }
+    for(const auto& object:doc["objects"]) if(object["name"]=="native-prefill-policy") {
+        file.seekp(base+object["offset"].get<std::uint64_t>());file.put(char(policy));
     }
     if(!file) throw std::runtime_error("failed to create sparse metadata-only witness");
     return {path};
@@ -136,6 +155,31 @@ bool rejected(Json doc) {
 int main() {
     try {
         int failures=0;
+        {
+            auto fixture=sparse(directory(false,true,false,true));artifact::Reader reader(fixture.path);
+            const auto plan=q4::bind_native_artifact(reader);
+            failures+=plan.tensors.at("lm_head.weight").format!=F::FP8_E4M3FN_ROW_BF16S;
+            failures+=plan.tensors.at("model.language_model.embed_tokens.weight").format!=F::FP8_E4M3FN_ROW_BF16S;
+            for(bool mtp:{false,true}) {
+                q4::NativeRuntimeConfig c;c.vision=false;c.requests=4;c.prefill_width=65;
+                c.verify_width=4;c.mtp=mtp;c.dflash=!mtp;
+                failures+=q4::NativeRuntime::device_bytes(plan,c)==0;
+            }
+        }
+        for(int policy=0;policy<4;++policy) {
+            auto fixture=sparse(directory(false,false,true),0x3e80,policy);
+            artifact::Reader reader(fixture.path);const auto plan=q4::bind_native_artifact(reader);
+            failures+=int(plan.prefill_policy)!=policy;
+            q4::NativeRuntimeConfig c;c.vision=false;c.requests=4;c.prefill_width=65;
+            const auto candidate_bytes=q4::NativeRuntime::device_bytes(plan,c);
+            auto baseline=plan;baseline.prefill_policy=q4::NativePrefillPolicy::A16;
+            failures+=candidate_bytes<q4::NativeRuntime::device_bytes(baseline,c);
+        }
+        for(int policy:{1,3,4}) {
+            auto fixture=sparse(directory(false,false,false),0x3e80,policy);
+            try {artifact::Reader reader(fixture.path);(void)q4::bind_native_artifact(reader);++failures;}
+            catch(const std::invalid_argument&) {}
+        }
         for(bool fp8:{false,true}) {
             auto fixture=sparse(directory(fp8,fp8,fp8));artifact::Reader reader(fixture.path);
             const auto plan=q4::bind_native_artifact(reader);

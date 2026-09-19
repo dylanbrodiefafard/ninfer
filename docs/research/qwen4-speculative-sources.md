@@ -359,6 +359,33 @@ not same-input kernel-oracle failures, calibrated quality estimates, PPL, or acc
 evidence. The one diagnostic-target context cannot determine a production Pareto choice.
 The local report is `out/qwen4-dflash-target/qwen4-dflash-precision.json`.
 
+The subsequent role-group experiment in the same tool uses accepted context prefixes
+8, 16 and 24, each with the corresponding authentic BF16 anchor embedding and seven queries.
+It keeps all non-matrix controls protected and changes only represented matrix weights.
+The three prefixes overlap; they are not independent calibration or holdout examples.
+
+| BF16 matrix protection over local NVFP4 candidate | Added payload bytes | C8 hidden relative L2 | C16 | C24 |
+|---|---:|---:|---:|---:|
+| None | 0 | 0.336064 | 0.336973 | 0.361924 |
+| Feature fusion FC | 47,103,996 | 0.275892 | 0.300185 | 0.315941 |
+| FC and all five layers' K/V projections | 65,945,556 | 0.286073 | 0.227439 | 0.249289 |
+| FC and all attention projections | 292,044,716 | 0.209180 | 0.198716 | 0.192334 |
+| All MLP projections | 423,935,940 | 0.247269 | 0.284524 | 0.274137 |
+
+The exact byte differences compare stored BF16 and NVFP4 matrix payloads, excluding unchanged
+controls and container framing. FP64 composition also records every layer's hidden drift.
+Neither the small context-entry protection nor the much larger attention/MLP exceptions rescue
+this candidate; error accumulates through both sublayers, and protection is not monotonic across
+prefixes. This is evidence against admitting a guessed protected-role recipe, not against
+well-calibrated NVFP4 generally. Keep the source BF16 baseline and the existing explicit
+experimental NVFP4 opt-in; no production precision policy changes follow. The next useful
+quality evidence is a genuinely calibrated/trained draft checkpoint and representative accepted
+target features, not more uncalibrated exceptions selected on this single prompt.
+
+CPU-only Python 3.11/PyTorch run, exact represented weights, unchanged independent FP64 formula
+and explicit public BF16 boundaries; report:
+`out/qwen4-dflash-target/qwen4-dflash-role-precision.json`.
+
 ### License provenance
 
 The publisher declares the artifact under the Qwen Community License 1.0 and

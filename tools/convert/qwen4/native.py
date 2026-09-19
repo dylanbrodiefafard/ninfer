@@ -3,7 +3,8 @@
 Requires local NVIDIA main/Vision sources, the audited native MTP component, and
 the six official frontend files. No downloads, ordinary-weight streaming at runtime,
 runtime repacking, or invented smaller checkpoint are involved. Default protected
-matrices stay BF16; the optional source-calibrated FP8 override is A16-only.
+matrices stay BF16. Explicit prefill candidates do not change A16 decode/verification
+or establish full-model quality admission.
 """
 from __future__ import annotations
 
@@ -19,7 +20,8 @@ import torch
 from tools.artifact.container import Artifact, ArtifactIdentity, ArtifactWriter, ResourceSpec
 from tools.artifact.layouts import encode_direct, encode_nvfp4_experts, encode_fp8_calibrated, decode_fp8_calibrated_words
 from tools.convert.common.safetensors import ShardReader
-from tools.convert.qwen4.native_inventory import IDENTITY, MAIN, FRONTEND_FILES, FP8_ROLES, tensor_specs
+from tools.convert.common.fp8_quantize import encode_source_fp8
+from tools.convert.qwen4.native_inventory import IDENTITY, MAIN, FRONTEND_FILES, FP8_ROLES, ROW_FP8_ROLES, PREFILL_POLICIES, prefill_policy_bytes, tensor_specs
 from tools.convert.qwen4.native_prepare import transformed
 from tools.reference.qwen4.ngram import NGramConfig, layer_multipliers, layout
 
@@ -181,7 +183,7 @@ def convert(args):
         if bool(fp8)!=bool(args.fp8_role) or bool(fp8)!=bool(args.fp8_controls_audit):
             raise ValueError("FP8 override requires source component, controls audit and explicit role list together")
         if fp8: validate_fp8(fp8,args.fp8_controls_audit,args.fp8_role)
-        specs=tensor_specs(ple_format,draft_format,args.fp8_role)
+        specs=tensor_specs(ple_format,draft_format,args.fp8_role,args.row_fp8_role)
         validate_component(mtp,[s for s in specs if s.name.startswith("mtp.")],source_controls=True)
         if ple: validate_component(ple,[s for s in specs if s.name=="ple.table"])
         if draft: validate_component(draft,[s for s in specs if s.name.startswith("dflash.")],prefix="dflash.")
@@ -191,9 +193,13 @@ def convert(args):
         profile={"source":"nvidia/Qwen3.8-Flash-Next-NVFP4","revision":NVIDIA_REVISION,
                  "mtp_source":"limpincat/flashnext-drafters","mtp_revision":MTP_REVISION,
                  "ple_format":ple_format,"dflash_format":draft_format,"fp8_roles":sorted(args.fp8_role),
-                 "fp8_revision":FP8_REVISION if fp8 else None,"activation_policy":"A16Only",
+                 "row_fp8_roles":sorted(args.row_fp8_role),
+                 "row_fp8_recipe":"source-BF16 per-row maxabs/448, BF16 scale, E4M3FN nearest-even",
+                 "fp8_revision":FP8_REVISION if fp8 else None,"prefill_policy":args.prefill_policy,
+                 "decode_verify_policy":"A16Only","model_quality":"requires full-model qualification",
                  "dflash_quality":"not admitted as a default" if draft_format=="NVFP4" else "checkpoint-specific qualification required"}
         resources["native-profile.json"]=(json.dumps(profile,sort_keys=True)+"\n").encode()
+        resources["native-prefill-policy"]=prefill_policy_bytes(args.prefill_policy,args.fp8_role)
         objects=specs+[ResourceSpec(name,"raw-bytes-v1",len(data)) for name,data in resources.items()]
         args.out.parent.mkdir(parents=True,exist_ok=True)
         temporary=args.out.with_suffix(".ninfer.partial")
@@ -206,6 +212,8 @@ def convert(args):
                     payload=(encode_direct(prepared(name,artifact_bf16(mtp,name)),"FP32")
                              if spec.format=="FP32" else copy_payload(mtp,name))
                 elif spec.format=="FP8_E4M3FN_TENSOR_F32M": payload=fp8_payload(fp8,spec)
+                elif spec.format=="FP8_E4M3FN_ROW_BF16S":
+                    payload=encode_source_fp8(prepared(name,source.get(source_name(name))))
                 elif spec.format=="NVFP4_EXPERT_F32M": payload=expert_payload(source,spec)
                 else: payload=encode_direct(prepared(name,source.get(source_name(name))),spec.format)
                 writer.write(name,payload)
@@ -223,6 +231,10 @@ if __name__=="__main__":
     parser.add_argument("--fp8-projections",type=Path)
     parser.add_argument("--fp8-controls-audit",type=Path)
     parser.add_argument("--fp8-role",action="append",default=[],choices=sorted(FP8_ROLES))
+    parser.add_argument("--row-fp8-role",action="append",default=[],choices=sorted(ROW_FP8_ROLES),
+                        help="explicit original-BF16 weight-only candidate; A16 computation; not quality admission")
+    parser.add_argument("--prefill-policy",default="a16",choices=tuple(PREFILL_POLICIES),
+                        help="explicit full C1 prefill candidate; decode/verify/head remain A16; not quality admission")
     parser.add_argument("--out",type=Path,required=True)
     torch.set_num_threads(2)
     convert(parser.parse_args())

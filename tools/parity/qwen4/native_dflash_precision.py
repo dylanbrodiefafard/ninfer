@@ -1,8 +1,8 @@
 """Bounded mathematical weight-precision ablation on captured diagnostic target features.
 
 This is an offline reference experiment, not a new artifact profile, calibration,
-kernel qualification, or an inference path. Protecting feature fusion is tested
-because this single projection conditions every draft layer's accepted context.
+kernel qualification, or an inference path. Role-group ablations distinguish a
+small context-entry precision exception from broader weight-quantization loss.
 """
 from __future__ import annotations
 
@@ -32,32 +32,56 @@ def run(draft: Path, native: Path, captured: Path, output: Path) -> None:
         tokens = torch.frombuffer(bytearray(artifact.payload("token.ids")), dtype=torch.int32)
         if tokens.tolist() != provenance["token_ids"]:
             raise ValueError("feature/embedding token alignment differs")
-        anchor = torch.frombuffer(bytearray(artifact.payload("token.embeddings")),
-                                  dtype=torch.bfloat16).reshape(33, 2560)[24].clone()
+        anchors = torch.frombuffer(bytearray(artifact.payload("token.embeddings")),
+                                   dtype=torch.bfloat16).reshape(33, 2560).clone()
     with Artifact(draft / "qwen4-dflash-inputs.ninfer") as artifact:
         mask = torch.frombuffer(bytearray(artifact.payload("mask.embedding")),
                                 dtype=torch.bfloat16).clone()
-    embeddings, positions = block_inputs(anchor, mask, 24, 7)
     source = read_weights(draft / "qwen4-dflash-bf16.ninfer")
     quantized = read_weights(draft / "qwen4-dflash-nvfp4.ninfer")
-    profiles = {"bf16_reference": source, "nvfp4": quantized,
-                "nvfp4_protected_feature_fusion": dict(quantized, **{"fc.weight": source["fc.weight"]})}
-    results = {}
-    reference = None
-    for name, weights in profiles.items():
-        result = forward(features, embeddings.bfloat16(), torch.arange(24), positions,
-                         weights, materialize_public_bf16=True)
-        if reference is None:
-            reference = result.hidden
-        error = torch.linalg.vector_norm(result.hidden - reference)
-        norm = torch.linalg.vector_norm(reference)
-        results[name] = {"hidden_relative_l2": float(error / norm)}
-        print(name, results[name], flush=True)
+    matrices = {name for name in source if source[name].ndim == 2}
+    protected = {
+        "bf16_reference": matrices,
+        "nvfp4": set(),
+        "nvfp4_protected_feature_fusion": {"fc.weight"},
+        "nvfp4_protected_context_entry": {"fc.weight"} | {
+            name for name in matrices if ".self_attn.k_proj." in name or ".self_attn.v_proj." in name},
+        "nvfp4_protected_attention_and_fusion": {"fc.weight"} | {
+            name for name in matrices if ".self_attn." in name},
+        "nvfp4_protected_mlp": {name for name in matrices if ".mlp." in name},
+    }
+    results, profiles = {}, {}
+    with Artifact(draft / "qwen4-dflash-bf16.ninfer") as bf, Artifact(draft / "qwen4-dflash-nvfp4.ninfer") as nv:
+        for name, names in protected.items():
+            profiles[name] = {
+                "bf16_matrix_names": sorted(names),
+                "bf16_matrix_parameters": sum(source[key].numel() for key in names),
+                "additional_payload_bytes": sum(len(bf.payload(key)) - len(nv.payload(key)) for key in names),
+            }
+    for count in (8, 16, 24):
+        embeddings, positions = block_inputs(anchors[count], mask, count, 7)
+        reference = None
+        results[str(count)] = {}
+        for name, names in protected.items():
+            weights = {key: source[key] if key in names else value for key, value in quantized.items()}
+            result = forward(features[:count], embeddings.bfloat16(), torch.arange(count), positions,
+                             weights, materialize_public_bf16=True)
+            if reference is None:
+                reference = result
+            def relative(actual, ideal):
+                return float(torch.linalg.vector_norm(actual - ideal) / torch.linalg.vector_norm(ideal))
+            results[str(count)][name] = {
+                "hidden_relative_l2": relative(result.hidden, reference.hidden),
+                "context_relative_l2": relative(result.context, reference.context),
+                "layer_hidden_relative_l2": [relative(a["hidden"], b["hidden"])
+                                             for a, b in zip(result.layers, reference.layers)],
+            }
+            print(count, name, results[str(count)][name], flush=True)
     with output.open("x") as stream:
-        json.dump({"feature_provenance": provenance, "context": 24, "queries": 7,
-                   "results": results,
+        json.dump({"feature_provenance": provenance, "contexts": [8, 16, 24], "queries": 7,
+                   "profiles": profiles, "results": results,
                    "oracle": "Independent FP64 complete formula with explicit public BF16 Op outputs; exact represented weight decode",
-                   "boundary": "One diagnostic-target context; causal precision ablation only. No new storage profile, calibration, GPU qualification, PPL, acceptance or default admission."}, stream, indent=2)
+                   "boundary": "Three overlapping prefixes of one diagnostic-target prompt, not independent holdout data; causal precision ablation only. No new storage profile, calibration, GPU qualification, PPL, acceptance or default admission."}, stream, indent=2)
         stream.write("\n")
 
 

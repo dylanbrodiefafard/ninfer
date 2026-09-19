@@ -4,6 +4,7 @@
 #include "targets/qwen4/native_runtime.h"
 #include "targets/qwen4/native_bf16_fixture.h"
 #include "targets/qwen4/native_text_panel.h"
+#include "artifact/typed_binding.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
@@ -86,6 +87,8 @@ struct Endpoints {
     qwen4_sequence::TextPanel panel;
     direct_bf16_weight::DeviceWeight head;
     DeviceBuffer embedding;
+    std::unique_ptr<artifact::MaterializedArtifact> candidate_owner;
+    Weight candidate_head,candidate_embedding;
     Endpoints(const std::filesystem::path& root,const std::filesystem::path& draft,DeviceContext& device)
         :panel(root.string()),head({V,D,qwen4_native::Bf16Source((root/"qwen4-endpoint.ninfer").string())
              .bits("lm_head.weight",{V,D})}),embedding(std::size_t(V)*D*2) {
@@ -101,7 +104,46 @@ struct Endpoints {
             mask.data(),D*2,cudaMemcpyHostToDevice,device.stream));
         device.synchronize();
     }
+    void use_fp8(const std::filesystem::path& head_path,const std::filesystem::path& rows_path,DeviceContext& device) {
+        artifact::Reader reader(head_path);artifact::Binder binder(reader);
+        require(reader.identity()==artifact::ArtifactIdentity{"qwen4/native-weight-candidates","source-bf16-row-fp8-a16"},
+            "FP8 head candidate identity");
+        artifact::ObjectHandle handle{};
+        for(const auto& object:reader.objects()) {
+            const auto& t=std::get<artifact::TensorDescriptor>(object);
+            const auto h=binder.require_tensor(t.name,t.format,t.layout,t.shape);
+            if(t.name=="head.weight") {binder.materialize_on_device(h);handle=h;}
+            else binder.validate_only(h);
+        }
+        candidate_owner=std::make_unique<artifact::MaterializedArtifact>(artifact::materialize(reader,binder.finish(),device));
+        candidate_head=artifact::materialized_weight(*candidate_owner,handle,artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S,V,D);
+        // Same exact shape as head, but distinct backing and scale plane. Unavailable
+        // source rows stay NaN so this cannot masquerade as a complete embedding table.
+        candidate_embedding=candidate_head;candidate_embedding.payload=candidate_embedding.qdata=embedding.p;
+        const auto shape=std::array<std::uint64_t,2>{V,D};
+        const auto full=artifact::row_scale_geometry(artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S,shape);
+        candidate_embedding.scales=static_cast<std::byte*>(embedding.p)+full.scale_plane_offset;
+        CUDA_CHECK(cudaMemsetAsync(embedding.p,0x7f,full.encoded_bytes,device.stream));
+        artifact::Reader rows(rows_path);
+        require(rows.identity()==artifact::ArtifactIdentity{"qwen4/native-embedding-row-candidate","original-bf16-row-fp8"},
+            "FP8 addressed embedding candidate identity");
+        const auto raw_ids=rows.payload("token.ids").data,raw=rows.payload("embedding.rows").data;
+        require(raw_ids.size()==34*4,"FP8 embedding row IDs");
+        std::array<int,34> ids{};std::memcpy(ids.data(),raw_ids.data(),raw_ids.size());
+        const auto subset=artifact::row_scale_geometry(artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S,
+            std::array<std::uint64_t,2>{34,D});
+        require(raw.size()==subset.encoded_bytes,"FP8 embedding candidate extent");
+        for(int i=0;i<34;++i) {
+            require(ids[i]>=0 && ids[i]<V,"FP8 candidate token range");
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(embedding.p)+std::size_t(ids[i])*D,
+                raw.data()+std::size_t(i)*D,D,cudaMemcpyHostToDevice,device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(embedding.p)+full.scale_plane_offset+std::size_t(ids[i])*2,
+                raw.data()+subset.scale_plane_offset+i*2,2,cudaMemcpyHostToDevice,device.stream));
+        }
+        device.synchronize();
+    }
     void bind(q4::NativeModelView& view) const {
+        if(candidate_owner) {view.output_head=candidate_head;view.token_embedding=candidate_embedding;return;}
         view.output_head=head.view();view.token_embedding=head.view();
         view.token_embedding.payload=view.token_embedding.qdata=embedding.p;
     }
@@ -236,7 +278,9 @@ int dflash_case(Endpoints& endpoint,const std::filesystem::path& root,const std:
     return failures;
 }
 }
-int main() {
+int main(int argc,char** argv) {
+    const bool fp8=argc==2 && std::string_view(argv[1])=="--fp8-endpoints";
+    if(argc!=1 && !fp8) return 1;
     const std::filesystem::path root="/models/qwen4-native-layers",mtp="/models/qwen4-mtp",draft="/models/qwen4-dflash";
     const std::filesystem::path captured="/src/out/qwen4-dflash-target";
     for(const auto& path:{root/"qwen4-endpoint.ninfer",root/"qwen4-text-panel.ninfer",mtp/"qwen4-mtp-nvfp4.ninfer",
@@ -246,6 +290,8 @@ int main() {
     }
     try {
         DeviceContext device;Endpoints endpoint(root,draft,device);
+        if(fp8) endpoint.use_fp8("/src/out/qwen4-native-weight-assessment.ninfer",
+            "/src/out/qwen4-native-embedding-rows-fp8.ninfer",device);
         const int failures=mtp_case(endpoint,mtp,captured,device)+dflash_case(endpoint,draft,captured,device);
         std::cout<<(failures?"FAIL":"PASS")<<" native draft runtime actual components: "<<failures<<'\n';return failures?1:0;
     } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}

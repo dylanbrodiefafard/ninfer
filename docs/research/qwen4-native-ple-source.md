@@ -158,3 +158,129 @@ was automatically removed, releasing the table; original source shards and the
 converted artifact remain available on disk for subsequent startup. This closes the
 complete native NVFP4 PLE residency-capacity and bounded GPU gather/decode gate, not
 model PPL, a registered future target, or an end-to-end performance claim.
+
+## Early native fetching and consuming-layer readiness
+
+`NativeRuntime::prepare` now submits `NativePleFetch` immediately after validated token IDs
+and accepted raw history determine the row addresses, before page/control/embedding setup.
+Host gathering copies represented bytes into bounded pinned storage; the owned nonblocking
+stream performs H2D and exact GPU codec decode.
+Decoder index0 is independent; index1 waits immediately before PLE injection. Capture uses
+an external event-wait node; eager execution uses the ordinary wait flag (CUDA 13.1 rejects
+the external flag outside capture). Both producers and consumers drain before reuse/teardown.
+No ordinary model weight streams and no CPU floating-point inference were added.
+
+The focused fetch test passes both sole exact codec oracles for C1–4, changed graph
+generations, capture before the first event record, deliberately delayed transfers, maximum
+4096 columns, cancellation/reuse and unconsumed teardown. Its artificial callback gate warms
+codec modules first: lazy CUDA module loading can otherwise wait behind the test's deliberately
+blocked producer. The unchanged PLE suite and actual native layers0–3 independent accumulated,
+continuation and C4 graph/state checks also pass.
+
+The optional `NINFER_QWEN4_PLE_OVERLAP=/models/qwen4-ple` section of
+`ninfer_qwen4_native_compute_real_test` measures actual resident layers0–3 with the complete
+NVFP4 table, **28,800,139,264 locked bytes**, bounded pinned staging and **NVFP4-G16 KV**.
+It compares the old serialized transfer/decode with the new stream in the shared eager decoder
+body, uses identical changing
+random-access rows and checks final represented prefix outputs exactly. RTX5090/CUDA13.1.2,
+two warmups and nine measured samples per route/shape, under Nsight CUDA/NVTX tracing:
+
+| Width / compact batch | Async rows ready, median µs | Minimum readiness margin before layer0 ends, µs | Serialized / async prefix4, median µs |
+|---|---:|---:|---:|
+| 1 / 1 | 17.632 | 411.392 | 1762.18 / 1775.90 |
+| 1 / 2 | 14.080 | 450.528 | 1905.06 / 1906.24 |
+| 1 / 3 | 18.304 | 655.071 | 2755.10 / 2761.73 |
+| 1 / 4 | 18.400 | 758.879 | 3127.36 / 3129.89 |
+| 3 / 4 | 27.648 | 916.959 | 4134.50 / 4134.72 |
+| 65 / 1 | 68.224 | 1700.191 | 7855.74 / 7836.35 |
+
+Readiness includes host gather/submission and GPU transfer/decode, measured from the interval's
+start event. NVTX layer ranges and CUDA launch correlations identify each layer's GPU kernels;
+the readiness margin is final layer0 kernel end minus the PLE decode kernel end. PLE runs on
+stream31 and decoder kernels on stream13 in this trace. In all 54 measured asynchronous rounds,
+the rows were ready well before layer0 finished: **no PLE-data wait at layer2 was observed**.
+The ordinary layer boundary gap was 1.28–2.82 µs by shape median. This removes the serialized
+dependency but shows no material whole-prefix throughput improvement on this workload; the
+four-layer compute time dominates. Graph replay ordering/state is qualified separately, not
+benchmarked here. It is neither a full-model tok/s result nor a guarantee for
+every future model, table size, host contention level or prefill width. Full FP8 table-capacity
+performance remains unmeasured; its exact asynchronous codec/order tests pass.
+
+Trace: `profiles/nsys/qwen4-ple-early-fetch/native-prefix4-matched.nsys-rep` and its SQLite
+export. Collection uses `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
+--capture-range=cudaProfilerApi --capture-range-end=stop` around the test with the native
+layer/compute fixture variables and the overlap opt-in above. A temporary 48GiB/no-swap,
+unlimited-memlock container uses the existing builder image; no host settings, installed
+dependencies or model downloads changed. The complete table unlocks at process teardown.
+
+### Graph replay and larger-prefill follow-up
+
+The same complete locked NVFP4 table was qualified again after the resident MoE changes,
+now including graph replay and W257, with NVFP4-G16 QSA KV. The four actual native layers
+use bounded diagnostic inputs and changing full-table row addresses; this is not a full
+prompt/model throughput measurement. All eager/graph and serialized/asynchronous final
+represented outputs match exactly. State/control allocations are address-stable, and the
+captured external event wait uses the new producer generation on each replay.
+
+RTX5090/CUDA13.1.2, two warmups plus nine measured rounds per shape/route:
+
+| Width / batch | Async rows ready eager / graph, µs | Minimum margin before layer0 ends eager / graph, µs |
+|---|---:|---:|
+| 1 / 1 | 12.832 / 19.104 | 400.766 / 392.638 |
+| 1 / 2 | 16.576 / 16.832 | 435.838 / 414.974 |
+| 1 / 3 | 21.312 / 18.144 | 573.341 / 551.901 |
+| 1 / 4 | 23.328 / 20.032 | 610.653 / 594.365 |
+| 3 / 4 | 44.128 / 31.456 | 810.012 / 785.947 |
+| 65 / 1 | 68.352 / 73.472 | 1694.423 / 1653.463 |
+| 257 / 1 | 242.528 / 217.184 | 4526.409 / 4505.577 |
+
+All126 measured asynchronous rounds were ready before layer0 finished. Independent Astra
+trace review mapped graph replay kernels through original graph-node IDs to node creation
+inside the layer0 range, then used actual GPU timestamps—not host NVTX duration. Producer
+stream31 and consumer13 overlap correctly; no PLE-data stall at decoder index1 was observed.
+The W257 graph whole-prefix medians were19.834ms serialized and19.788ms asynchronous; this
+does not support a material whole-prefix speedup claim. Early fetching remains valuable as
+the correct dependency schedule, without promising zero stalls for future compute speeds
+or arbitrary host contention.
+
+Trace: `profiles/nsys/qwen4-ple-final/native-prefix4-graph.nsys-rep` and its SQLite export;
+same command as above plus `--cuda-graph-trace=node`. The temporary48GiB/no-swap/unlimited
+memlock container was removed at exit and released the complete table.
+
+### Complete original FP8 table residency
+
+`tools.parity.qwen4.native_fp8_ple_full_fixture` acquired only the128 PLE code ranges and
+original BF16 multiplier from pinned NVIDIA revision
+`fc694b54fb0174e0913e6adf86691ef85a4ead47`. No ordinary main-model weights were downloaded.
+All51,200,245,760 code bytes are retained; the exact scale footer is `0x3951`, giving a
+51,200,245,762-byte payload. Bounded16MiB download/conversion chunks, manifest-bound resumable
+source parts, finite-code checks and independent scalar boundary decoding were used. The
+converted first/last row of each partition and footer agree exactly with original source bytes.
+
+The initial MemAvailable-only estimate understated this host's available capacity by omitting
+the already-documented clean ZFS ARC allowance. Fresh test admission measured43,847,999,488
+MemAvailable bytes plus29,588,282,112 discounted clean ARC bytes, exceeding68,380,114,946
+required bytes including the unchanged16GiB reserve. No host cache or swap setting changed.
+
+Complete FP8 execution **passed** on RTX5090/CUDA13.1.2 in a temporary64GiB/no-swap,
+unlimited-memlock container. All **12,500,061** payload pages were resident; `VmLck` increased
+by exactly **51,200,249,856 bytes** including page rounding. Reader destruction and moving the
+materialization owner preserved the mapping/lock. All40,960 independent source-boundary BF16
+words match GPU decode exactly, including reordered/repeated T3/T1 gathers. Pinned staging is
+bounded to40,960 bytes. After consumers drained, teardown restored the baseline locked-memory
+count and the temporary container was removed.
+
+This is a capacity, lifetime and exact transfer/decode qualification, not an FP8 full-model
+throughput or PPL result. Host swap occupancy increased during the large residency run even
+though the complete PLE payload was locked and the qualification container itself had no swap;
+the conservative ARC capacity allowance is not a promise that other processes cannot page.
+Production still requires successful eager locking and never falls back to disk-backed row
+faulting. No global swap/cache manipulation was performed to manufacture a pass.
+
+Files remain under `/ssdpool2nvme/local_llm/models/qwen4-ple/`: `qwen4-ple-fp8.ninfer`,
+`qwen4-ple-fp8-boundary-reference.ninfer`, provenance `qwen4-ple-fp8.json`, and original
+`nvidia-fc694b54-fp8/` source parts. Qualification command is
+`NINFER_QWEN4_FULL_PLE=/models/qwen4-ple NINFER_QWEN4_PLE_ZFS_ADMISSION=1 /build/tests/ninfer_qwen4_native_ple_residency_test --fp8`
+with the limits above and read-only model/build mounts. Both complete native PLE storage
+formats now have real residency/transfer evidence; early-fetch performance numbers above
+remain specifically the NVFP4 table measurement.

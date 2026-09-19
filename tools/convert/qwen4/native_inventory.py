@@ -1,7 +1,7 @@
 """Canonical exact native preview inventory; this is not a configurable model graph."""
 from tools.artifact.container import ArtifactIdentity, TensorSpec
 
-IDENTITY = ArtifactIdentity("qwen4/native-preview", "nvfp4-a16")
+IDENTITY = ArtifactIdentity("qwen4/native-preview", "nvfp4-native")
 MAIN = "model.language_model."
 FRONTEND_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                   "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json")
@@ -10,24 +10,51 @@ FP8_ROLES = frozenset(
      for layer in (0, 3) for role in ("gate", "up", "down")]
     + [f"{MAIN}layers.0.linear_attn.{role}.weight" for role in ("in_proj_qkv", "in_proj_z", "out_proj")]
     + [f"{MAIN}layers.3.self_attn.{role}_proj.weight" for role in ("q", "k", "v", "o")])
+PREFILL_POLICIES = {"a16": 0, "selective-a8": 1, "routed-a4": 2, "routed-a4-selective-a8": 3}
+A8_ROLES = frozenset(
+    [f"{MAIN}layers.0.linear_attn.in_proj_z.weight"] +
+    [f"{MAIN}layers.{layer}.mlp.shared_expert.{role}_proj.weight"
+     for layer in (0, 3) for role in ("gate", "up", "down")])
+# Independently selected weight-only candidates; never an A8 activation policy.
+ROW_FP8_ROLES = frozenset(
+    [MAIN+"embed_tokens.weight", "lm_head.weight"] +
+    [MAIN+"hyper_connection_mixer.input_mix_weight_"+role+".weight" for role in ("down", "up")] +
+    [MAIN+"layers.1.ple."+role+"_proj.weight" for role in ("key", "value")])
+
+
+def prefill_policy_bytes(policy, fp8_roles):
+    if policy not in PREFILL_POLICIES:
+        raise ValueError("unknown exact native prefill recipe")
+    value = PREFILL_POLICIES[policy]
+    if value & 1 and not A8_ROLES <= set(fp8_roles):
+        raise ValueError("selective A8 prefill requires all seven audited FP8 roles")
+    return bytes([value])
+
+
 LAYOUTS = {"BF16": "contiguous-le-v1", "FP32": "contiguous-le-v1",
            "NVFP4_EXPERT_F32M": "expert-blockscale-k16-m128x4-v1",
            "FP8_E4M3FN_TENSOR_F32M": "tensor-calibrated-v1",
+           "FP8_E4M3FN_ROW_BF16S": "row-scale-v1",
            "NVFP4": "blockscale-k16-m128x4-v1",
            "NVFP4_PARTITION_F32M": "partitioned-row-blockscale-k16-v1",
            "FP8_E4M3FN_TENSOR_BF16S": "tensor-scale-v1"}
 
 
-def tensor_specs(ple_format="NVFP4_PARTITION_F32M", dflash_format=None, fp8_roles=()):
+def tensor_specs(ple_format="NVFP4_PARTITION_F32M", dflash_format=None, fp8_roles=(), row_fp8_roles=()):
     if ple_format not in ("NVFP4_PARTITION_F32M", "FP8_E4M3FN_TENSOR_BF16S"):
         raise ValueError("native PLE must use an actual NVFP4 or FP8 source codec")
     if dflash_format not in (None, "BF16", "NVFP4") or not set(fp8_roles) <= FP8_ROLES:
         raise ValueError("unqualified native projection profile")
+    if not set(row_fp8_roles) <= ROW_FP8_ROLES:
+        raise ValueError("unqualified native weight-only FP8 role")
     specs = []
     def add(name, shape, fmt="BF16"):
         if name in fp8_roles:
             if fmt != "BF16": raise ValueError("protected control cannot become FP8")
             fmt = "FP8_E4M3FN_TENSOR_F32M"
+        if name in row_fp8_roles:
+            if fmt != "BF16": raise ValueError("weight-only FP8 requires original BF16 matrix")
+            fmt = "FP8_E4M3FN_ROW_BF16S"
         specs.append(TensorSpec(name, tuple(shape), fmt, LAYOUTS[fmt]))
     def gr(p, inject=True):
         add(p+"hc_norm.weight", (10240,), "FP32")

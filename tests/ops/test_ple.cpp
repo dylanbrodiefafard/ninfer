@@ -3,6 +3,7 @@
 #include "ops/op_tester.h"
 #include "ops/native_projection_fixture.h"
 #include "ops/ple_nvfp4_oracle.h"
+#include "ops/ple_fp8_oracle.h"
 #include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
 #include "targets/qwen4/native_bf16_fixture.h"
@@ -33,14 +34,6 @@ using namespace ninfer::test;
 namespace {
 
 constexpr std::size_t kQ8RowBytes = (ops::kPleEmbeddingWidth / 32) * 34;
-
-std::uint16_t fp8_ple_oracle(unsigned code, std::uint16_t scale) {
-    const int exponent=(code>>3)&15, mantissa=code&7;
-    const double magnitude=exponent==0 ? std::ldexp(double(mantissa),-9)
-        : std::ldexp(1+double(mantissa)/8,exponent-7);
-    const double value=std::copysign(magnitude,(code&128)?-1.0:1.0);
-    return f32_to_bf16(float(value*bf16_to_f32(scale)));
-}
 
 int nvfp4_staging_decode_case(int width) {
     constexpr std::size_t partitions = 5, rows_per_partition = 17;

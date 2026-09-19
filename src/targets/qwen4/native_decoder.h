@@ -18,6 +18,9 @@ struct NativeDecoderViews {
     Tensor selected_count;// I32 [W,B].
     Tensor dflash_features; // Optional BF16 [12800,W,B].
     Tensor compact_rows; // I32 [B], exact identity 0..B-1 for compact feature capture.
+    // Optional native fetch dependency. The event is recorded before enqueue/graph launch;
+    // only decoder index1 consumes it. Null means the caller already ordered PLE readiness.
+    cudaEvent_t ple_ready=nullptr;
 };
 
 // The production call supplies all48 distinct source layers. The actual first four-layer
@@ -30,6 +33,7 @@ struct NativeDecoderViews {
 void enqueue_native_decoder(std::span<const NativeLayerWeights> layers,const NativePleWeights& ple,
     NativeState& state,const ops::QsaBatchControls& controls,int max_visible_keys,
     NativeDecoderViews views,bool record_prefix,WorkspaceArena& workspace,
-    Tensor& qsa_workspace,cudaStream_t stream,int full_prefill_slot=-1);
+    Tensor& qsa_workspace,cudaStream_t stream,int full_prefill_slot=-1,
+    NativePrefillPolicy prefill_policy=NativePrefillPolicy::A16);
 
 } // namespace ninfer::targets::qwen4

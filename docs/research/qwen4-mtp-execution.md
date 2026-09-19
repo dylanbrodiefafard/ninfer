@@ -383,8 +383,9 @@ correctly skips without explicit artifact/capture environments. The unchanged in
 `tools/reference/qwen4/mtp.py` oracle checked all public boundaries and actual preceding GPU
 QSA state for the 24-row seed and two draft calls: **zero local Op or state failures**. Largest
 QSA relative L2 was 1.100%; maximum per-row MoE relative L2 was 0.373%. Every injection store
-was exactly nearest-even BF16 of ideal FP64 arithmetic. The independent propagated 2% diagnostic
-still fails one seed carry at 2.052% relative L2; the original threshold remains unchanged.
+was exactly nearest-even BF16 of ideal FP64 arithmetic. At this migration checkpoint the
+independent propagated 2% diagnostic failed one seed carry at 2.052% relative L2. The subsequent
+private-FP32 normalization change below closes that witness without changing the threshold.
 Local correctness and propagated sensitivity are reported separately.
 
 Focused commands, after the staged full-target capture has completed:
@@ -409,8 +410,122 @@ zero state/replay failures, and a fresh represented-input trace at
 `out/qwen4-mtp-paged.dEP04j/qwen4-mtp-target-trace.json`. The unchanged independent FP64 oracle
 again reported zero local Op/state failures; historical represented cache words, all new appends,
 positions, selected IDs/counts, and exact BF16 injection stores passed. The separate propagated
-2% sensitivity screen still has one failed seed carry comparison. This repeats numerical
+2% sensitivity screen then had one failed seed carry comparison. This repeats numerical
 qualification of the migrated compute path; shared-pool request ownership is tested separately.
+
+## Propagated seed precision attribution
+
+`tools/parity/qwen4/native_mtp_precision.py` investigates the remaining actual 24-row seed
+witness without changing the independent Op oracles or the 2% composition screen. The
+`boundary` study replaces the mathematical prefix through a named public boundary by recorded
+GPU words, then independently evaluates the suffix. This is an error-attribution intervention,
+not a new correctness oracle.
+
+Replacing through the stem reduces maximum carry relative L2 from 0.0205172 to 0.00854161;
+replacing through attention reduces it to 0.00381662. No router membership changes occur.
+The original worst row is token 13; subsequent maxima can occur elsewhere. This identifies
+amplified stem error as a lead, not an NVFP4 routing disagreement or a replacement chain oracle.
+
+The separate `stem` study simulates private BF16 normalization with BF16 versus FP32 projection
+stores; worst carry drift against the ideal chain changes from 0.0183212 to 0.0173805. These
+simulations use FP64 dot products before the profile's store, not GPU accumulation. The modest
+predicted gain motivated the measured candidate below; it was not itself admission evidence.
+
+CPU-only Python 3.11/PyTorch, the pinned candidate's exact NVFP4 decode and authentic captured
+target inputs; reports are `qwen4-mtp-seed-precision.json` and
+`qwen4-mtp-stem-precision.json` under `out/qwen4-mtp-paged.dEP04j/`. No gate was widened and
+these attribution results are not acceptance or PPL measurements.
+
+The measured `kdev recipe` card for BF16 `[2560,2560]`, T24, A16, `epilogue_fusion` returned
+conditional `MEASURE`: fusion must reduce traffic. Exact accounting and the current-path profile
+resolved this condition before implementation; the classifier was not changed or bypassed.
+
+For D=2560 and W source tokens, baseline projection/add requested traffic is 34DW bytes:
+embedding projection store 2DW, four-branch embedding reads 8DW, hidden projection store/read
+8DW each, and final output store 8DW. The candidate is 28DW: FP32 embedding store 4DW,
+four-branch reads 16DW, final output 8DW. Norm traffic and both weight passes are unchanged.
+The reduction is 15,360W bytes; scratch falls from 51,200W to 35,840W bytes. These are logical
+requested bytes, not a claim that every request reaches DRAM. The exact-point profile confirmed
+the removable store/read mechanism; this resolved the conditional measurement card for a
+temporary candidate using the existing BF16 schedules, not a new compute family.
+
+RTX 5090 / CUDA 13.1 serial cold public Linear `[2560,2560]` T1/4/24/96 baseline medians were
+16.000/18.432/26.624/43.008 microseconds. The complete stem was measured separately below.
+
+### Measured candidate rejected and deleted
+
+The temporary route retained the embedding projection in FP32 and fused its broadcast addition
+into the canonical hidden-projection epilogue, storing BF16 only after the sum. The complete
+independent stem oracle passed for synthetic and authentic weights; actual-target MTP also
+passed every unchanged local Op/state gate and source-aligned accepted-prefix replay check.
+Local seed stem relative L2 improved from 0.00290292 to 0.00235004. Nevertheless the live
+decision witness worsened: worst propagated seed carry relative L2
+increased from **0.0205172 to 0.0213047**, still at token 13 with no routing-membership changes.
+Lower local stem error therefore did not resolve nonlinear accumulated sensitivity. No numerical
+threshold was changed and this is not evidence of a failing individual Op.
+
+Native public-stem W1/17/24/28 resident-weight medians, using the existing test's opt-in
+`NINFER_QWEN4_NATIVE_TIMING=1`, changed from
+28.480/67.104/71.232/96.448 to 28.736/69.376/71.040/98.400 microseconds. There was no material
+latency improvement to offset the worse propagated witness. The candidate and its extra private
+projection shape were deleted; production arithmetic and workspace sizing are restored exactly.
+
+Nsight Compute 2025.4.1 application replay, no cache flushing, isolated native W24 Op interval:
+
+| Full stem traffic counter | Baseline bytes | Temporary candidate bytes |
+|---|---:|---:|
+| Global-load sectors | 205,864,960 | 205,373,440 |
+| Global-store sectors | 4,055,040 | 3,563,520 |
+| L2 traffic | 73,768,800 | 72,362,880 |
+
+These establish a small intermediate-traffic reduction, not a DRAM or end-to-end speed claim:
+DRAM counters were unavailable and cache state uncontrolled. Profiling used temporary container
+counter permission, without host configuration changes. `NINFER_QWEN4_STEM_PROFILE=1` in the
+existing native-stem test brackets exactly W24.
+
+The baseline profile is `out/qwen4-mtp-paged.dEP04j/qwen4-mtp-stem-ncu-baseline-permitted.csv`;
+candidate profile and authentic target trace remain in `out/qwen4-mtp-stem-fused.e0JJud/`.
+After removal, the rebuilt native stem passed the unchanged FP64 oracle; all three fresh MTP
+records in `out/qwen4-mtp-stem-restored.KAu9B2/` matched the original public-stage/cache/selection
+words exactly, and accepted-prefix replay returned zero failures.
+This completes the bounded precision decision with rejection evidence, not closure of the
+original 2% screen or proof of full-model quality.
+
+## Retained private-FP32 normalization remedy
+
+A distinct intervention keeps both stem normalization results in FP32, while retaining BF16
+FC projection outputs and the BF16 addition output. Hidden normalization remains one10240-wide
+reduction; it is never four branch norms. The public Op formula and independent FP64 oracle
+are unchanged. Protected BF16 weights are unchanged. Private normalized storage is not a
+public cast boundary, and no downstream oracle copies this implementation staging.
+
+The complete-suffix CPU experiment predicts worst carry drift against the ideal chain of
+1.438%, versus1.832% for the former BF16-normalization profile. More importantly, the actual
+GPU24-row seed and two drafts now pass both all local Op/state checks and the original2%
+independently propagated screen: **zero local and zero propagated failures**, with no routing
+change or tolerance adjustment. Worst captured seed carry is1.582% versus the former2.052%.
+Accepted-prefix replay also passes. This closes this captured
+witness; it does not prove full-model quality or acceptance on unseen inputs.
+
+The CUDA implementation reuses each decoded BF16 weight across four FP32-input columns,
+accumulates in FP32 and stores each FC result as BF16. The one-column prototype and retained
+four-column route produced exactly the same three authentic trace records. Private scratch
+planning follows the FP32 normalization buffers; no allocation occurs during execution.
+
+This is an accuracy tradeoff, not a speed win over the former BF16-normalization route.
+RTX5090/CUDA13.1 public-stem medians for W1/17/24/28 are37.024/130.208/165.760/186.656us,
+versus historical28.480/67.104/71.232/96.448us. Four-column reuse improves the first FP32
+prototype's W17/24/28 medians of207.808/283.328/329.184us. Eight-column reuse
+gave no consistent improvement; sixteen columns lost, and neither candidate remains.
+These are resident component measurements, not MTP or Engine tokens/second.
+
+Evidence: `out/qwen4-mtp-fp32-norm.Yg3jfD/qwen4-mtp-target-trace.json` was checked by
+`tools.reference.qwen4.mtp`; the retained-route exact trace comparison used
+`out/qwen4-mtp-fp32-reuse.bGbDQD/qwen4-mtp-target-trace.json`.
+After all retained MoE changes, the fresh trace
+`out/qwen4-mtp-retained.BYUOZe/qwen4-mtp-target-trace.json` again passed the independent oracle
+directly, including the unchanged propagated screen; its records also match the prior
+qualified four-column route exactly.
 
 ## Primary source addresses
 

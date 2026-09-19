@@ -170,8 +170,7 @@ void require_w8_metadata(const Weight& table, const Tensor& out) {
 
 void require_fp8_metadata(const Weight& table, const Tensor& out) {
     constexpr std::int32_t kVocabulary = 248320;
-    constexpr std::int32_t kHidden     = 5120;
-    if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
+    if (table.n != kVocabulary || (table.k != 5120 && table.k != 2560) || out.ne[0] != table.k) {
         throw std::invalid_argument("embedding: unsupported FP8 table shape");
     }
     if ((reinterpret_cast<std::uintptr_t>(out.data) &

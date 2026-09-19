@@ -36,7 +36,7 @@ add_library(ninfer_qwen4_native_state STATIC native_state.cpp)
 ninfer_internal_includes(ninfer_qwen4_native_state)
 target_link_libraries(ninfer_qwen4_native_state PUBLIC ninfer_ops ninfer_core)
 
-add_library(ninfer_qwen4_native_decoder STATIC native_decoder.cpp)
+add_library(ninfer_qwen4_native_decoder STATIC native_decoder.cpp native_ple_fetch.cpp)
 ninfer_internal_includes(ninfer_qwen4_native_decoder)
 target_link_libraries(ninfer_qwen4_native_decoder PUBLIC ninfer_qwen4_native_artifact ninfer_qwen4_native_state)
 

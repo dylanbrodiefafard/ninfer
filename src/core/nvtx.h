@@ -49,6 +49,8 @@ enum class Name : std::size_t {
     SparseMoePrefill,
     SparseMoeSmallT,
     SparseMoeDecode,
+    Qwen4Layer,
+    Qwen4PleFetch,
     Count,
 };
 
@@ -125,6 +127,8 @@ enum class Name : std::size_t {
         "sparse_moe.prefill",
         "sparse_moe.small_t",
         "sparse_moe.decode",
+        "qwen4.layer",
+        "qwen4.ple_fetch",
     };
     static const auto handles = [] {
         std::array<nvtxStringHandle_t, names.size()> out{};

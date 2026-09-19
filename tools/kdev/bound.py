@@ -423,7 +423,7 @@ def classify_idea(idea: str, bound: str, t: int, phase: str) -> dict:
                 "name": idea,
                 "verdict": "allow",
                 "reason": (
-                    "Provably reduces packed-weight passes; benchmark the public GGML Op and "
+                    "Provably reduces packed-weight passes; benchmark the exact public Op and "
                     "retain only a measured winner."
                 ),
             }
@@ -617,7 +617,7 @@ def analyze(
 
     if bound == "profile-required":
         next_step = (
-            "Profile the exact public GGML Op before choosing a compute-side idea; only "
+            "Profile the exact public Op before choosing a compute-side idea; only "
             "weight-pass reduction is admitted without a codec compute roof."
             if is_ggml else
             "Profile the exact public scalar Linear route before choosing a compute-side idea; "
