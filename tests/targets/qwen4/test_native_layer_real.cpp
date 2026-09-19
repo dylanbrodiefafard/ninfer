@@ -4,6 +4,7 @@
 #include "ninfer/ops/ple.h"
 #include "ops/op_tester.h"
 #include "ops/ple_nvfp4_oracle.h"
+#include "ops/launcher/qwen4_sparse_moe.h"
 #include "targets/qwen4/native_sequence_components.h"
 #include "targets/qwen4/native_component_timing.h"
 #include <cuda_profiler_api.h>
@@ -215,7 +216,8 @@ int run(const std::string& path, int layer,
         const qwen4_sequence::Result* sequence_input = nullptr,
         qwen4_sequence::Result* sequence_output = nullptr, bool partitioned = false,
         bool allow_a4 = false, bool calibrated_shared = false,
-        ops::Qwen4SharedExpertPolicy shared_policy = {}, const std::string& source_root = {}) {
+        ops::Qwen4SharedExpertPolicy shared_policy = {}, const std::string& source_root = {},
+        int weight_mask = 7, const std::string& shared_up_nvfp4 = {}) {
     artifact::Reader reader(path);
     if (reader.identity() != artifact::ArtifactIdentity{"qwen4/native-layer-qualification", "nvidia-nvfp4-source"}) {
         throw std::runtime_error("not a native Qwen4 layer fixture");
@@ -293,10 +295,11 @@ int run(const std::string& path, int layer,
         shared_weight("up_proj", I, H), shared_weight("down_proj", H, I)};
     std::unique_ptr<artifact::Reader> calibrated_reader;
     artifact::MaterializedArtifact calibrated_weights;
-    if (calibrated_shared) {
+    if (calibrated_shared && weight_mask) {
         calibrated_reader=std::make_unique<artifact::Reader>(
             ((source_root.empty()?std::filesystem::path(path).parent_path():std::filesystem::path(source_root)) /
-                "qwen4-fp8-projections.ninfer").string());
+                ((layer==1 || layer==2) ? "qwen4-fp8-projection-additional.ninfer" :
+                    "qwen4-fp8-projections.ninfer")).string());
         if (calibrated_reader->identity()!=artifact::ArtifactIdentity{
             "qwen4/native-fp8-projection-qualification","senfu-fp8-source"}) {
             throw std::runtime_error("wrong calibrated shared source");
@@ -307,7 +310,10 @@ int run(const std::string& path, int layer,
             const auto* d=std::get_if<artifact::TensorDescriptor>(&object);
             if(!d) { throw std::runtime_error("non-tensor calibrated source"); }
             const auto handle=source_binder.require_tensor(d->name,d->format,d->layout,d->shape);
-            if(d->name.starts_with(prefix+"shared_expert.")) {
+            const int role_bit=d->name==prefix+"shared_expert.gate_proj.weight"?1:
+                d->name==prefix+"shared_expert.up_proj.weight"?2:
+                d->name==prefix+"shared_expert.down_proj.weight"?4:0;
+            if(role_bit & weight_mask) {
                 if(d->format!=artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M ||
                    d->layout!=artifact::StorageLayout::TensorCalibratedV1) {
                     throw std::runtime_error("wrong calibrated shared format");
@@ -316,7 +322,9 @@ int run(const std::string& path, int layer,
                 source_binder.materialize_on_device(handle);
             } else { source_binder.validate_only(handle); }
         }
-        if(source_handles.size()!=3) { throw std::runtime_error("missing calibrated shared roles"); }
+        if(source_handles.size()!=std::size_t(bool(weight_mask&1)+bool(weight_mask&2)+bool(weight_mask&4))) {
+            throw std::runtime_error("missing calibrated shared roles");
+        }
         calibrated_weights=artifact::materialize(*calibrated_reader,source_binder.finish(),device);
         const auto assign=[&](const char* role,int n,int k,Weight& weight,std::vector<double>& logical) {
             const auto name=prefix+"shared_expert."+role+".weight";
@@ -330,17 +338,67 @@ int run(const std::string& path, int layer,
             logical.resize(std::size_t(n)*k);
             for(std::size_t i=0;i<logical.size();++i) { logical[i]=fp8(std::to_integer<unsigned>(bytes[i]))*scale; }
         };
-        assign("gate_proj",I,H,weights.shared_gate_proj,sg);
-        assign("up_proj",I,H,weights.shared_up,su);
-        assign("down_proj",H,I,weights.shared_down,sd);
+        if(weight_mask&1) assign("gate_proj",I,H,weights.shared_gate_proj,sg);
+        if(weight_mask&2) assign("up_proj",I,H,weights.shared_up,su);
+        if(weight_mask&4) assign("down_proj",H,I,weights.shared_down,sd);
+    }
+    std::unique_ptr<artifact::Reader> nvfp4_reader;
+    artifact::MaterializedArtifact nvfp4_weight;
+    if(!shared_up_nvfp4.empty()) {
+        nvfp4_reader=std::make_unique<artifact::Reader>(shared_up_nvfp4);
+        const auto identity=nvfp4_reader->identity();
+        if(identity.model_id!="qwen4/native-projection-candidate" ||
+           (identity.weights_id!="nvfp4_diagonal_calibrated" && identity.weights_id!="nvfp4_maxabs")) {
+            throw std::runtime_error("invalid bounded shared-up NVFP4 candidate identity");
+        }
+        artifact::Binder candidate(*nvfp4_reader);
+        const auto handle=candidate.require_tensor("weight",artifact::NumericFormat::NVFP4,
+            artifact::StorageLayout::BlockScaleK16M128x4V1,std::array<std::uint64_t,2>{I,H});
+        const auto input_scale=candidate.require_tensor("input_scale_divisor",artifact::NumericFormat::FP32,
+            artifact::StorageLayout::ContiguousLeV1,{});
+        candidate.materialize_on_device(handle);candidate.validate_only(input_scale);
+        const auto raw=nvfp4_reader->payload("weight").data;
+        constexpr std::size_t code_bytes=std::size_t(I)*H/2,scale_bytes=std::size_t(I)*H/16;
+        if(raw.size()!=code_bytes+scale_bytes+4) throw std::runtime_error("invalid shared-up NVFP4 extent");
+        const float divisor=word(raw,code_bytes+scale_bytes);
+        const float activation_divisor=word(nvfp4_reader->payload("input_scale_divisor").data,0);
+        if(!(divisor>0) || !std::isfinite(divisor) || !(activation_divisor>0) || !std::isfinite(activation_divisor))
+            throw std::runtime_error("invalid shared-up NVFP4 divisors");
+        // Independent logical decoder: signed E2M1 times exact E4M3 scale divided
+        // by the stored FP32 matrix divisor; no private staging/rounding casts.
+        constexpr double values[]{0,.5,1,1.5,2,3,4,6,0,-.5,-1,-1.5,-2,-3,-4,-6};
+        for(int row=0;row<I;++row) for(int column=0;column<H;++column) {
+            const unsigned byte=std::to_integer<unsigned>(raw[std::size_t(row)*H/2+column/2]);
+            const unsigned code=(byte>>(4*(column%2)))&15;
+            const int group=column/16;
+            const auto scale_index=((((row/128)*(H/64)+group/4)*32+row%32)*4+(row%128)/32)*4+group%4;
+            const unsigned scale_word=std::to_integer<unsigned>(raw[code_bytes+scale_index]);
+            if(scale_word>=127) throw std::runtime_error("invalid shared-up NVFP4 block scale");
+            su[std::size_t(row)*H+column]=values[code]*fp8(scale_word)/double(divisor);
+        }
+        nvfp4_weight=artifact::materialize(*nvfp4_reader,candidate.finish(),device);
+        const auto* data=static_cast<const std::byte*>(nvfp4_weight.device_data(handle));
+        Weight w{};w.payload=w.qdata=data;w.payload_bytes=raw.size();w.scales=data+code_bytes;
+        w.qtype=QType::NVFP4;w.layout=QuantLayout::BlockScaleK16M128x4;w.scale_dtype=DType::FP8_E4M3FN;
+        w.group=w.group_size=16;w.ndim=2;w.n=w.shape[0]=w.padded_shape[0]=I;
+        w.k=w.shape[1]=w.padded_shape[1]=H;w.weight_scale_divisor=divisor;
+        w.input_scale_divisor=activation_divisor;weights.shared_up=w;
     }
     const int sequence_width = sequence_input ? static_cast<int>(sequence_input->actual.size() / H) : 0;
     const int patterns = sequence_input ? 2 * sequence_width : 2;
+    const bool identical_inputs=sequence_input && sequence_input->actual==sequence_input->reference;
     std::vector<std::vector<double>> inputs(patterns), references(patterns), probabilities(patterns);
     std::vector<std::vector<double>> original_references(patterns);
     std::vector<std::vector<int>> routes(patterns);
     std::vector<double> cutoff_margins(patterns);
     for (int pattern = 0; pattern < patterns; ++pattern) {
+        if(identical_inputs && pattern>=sequence_width) {
+            const int earlier=pattern-sequence_width;
+            inputs[pattern]=inputs[earlier];references[pattern]=references[earlier];
+            probabilities[pattern]=probabilities[earlier];routes[pattern]=routes[earlier];
+            cutoff_margins[pattern]=cutoff_margins[earlier];original_references[pattern]=original_references[earlier];
+            continue;
+        }
         inputs[pattern].resize(H);
         for (int i = 0; i < H; ++i) {
             if (sequence_input) {
@@ -495,8 +553,11 @@ int run(const std::string& path, int layer,
             DeviceArena workspace(ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights, count, policy,shared_policy));
             qwen4_sequence::time_native_component("MoE layer="+std::to_string(layer)+
                 " T="+std::to_string(count)+" routed-A4="+std::to_string(allow_a4)+
-                " shared-FP8="+std::to_string(calibrated_shared)+" shared-A8="+
-                std::to_string(shared_policy.gate==ops::LinearPolicy::AllowA8),[] {},[&] {
+                " shared-FP8-mask="+std::to_string(calibrated_shared?weight_mask:0)+
+                " shared-NV4-up="+std::to_string(!shared_up_nvfp4.empty())+" shared-A8-mask="+
+                std::to_string((shared_policy.gate==ops::LinearPolicy::AllowA8?1:0)|
+                    (shared_policy.up==ops::LinearPolicy::AllowA8?2:0)|
+                    (shared_policy.down==ops::LinearPolicy::AllowA8?4:0)),[] {},[&] {
                 ops::qwen4_sparse_moe_resident(part_input,weights,part_ids,part_probs,part_output,workspace,nullptr,policy,shared_policy);
             });
             if(layer==0 && !partitioned && std::getenv("NINFER_QWEN4_MOE_PROFILE")) {
@@ -527,6 +588,8 @@ int run(const std::string& path, int layer,
         sequence_output->reference.reserve(actual.size());
         for (int t = 0; t < width; ++t) {
             const auto label = "native sequence layer " + std::to_string(layer) + " MoE token=" + std::to_string(t);
+            sequence_output->reference_discrete_ids.insert(sequence_output->reference_discrete_ids.end(),
+                routes[width+t].begin(),routes[width+t].end());
             auto actual_set = routes[t], reference_set = routes[width + t];
             std::sort(actual_set.begin(), actual_set.end());
             std::sort(reference_set.begin(), reference_set.end());
@@ -602,6 +665,102 @@ int run(const std::string& path, int layer,
     }
     }
     return failures;
+}
+// Bounded router diagnosis uses the production route launcher, not expert execution.
+// Its oracle is the represented BF16 matrix/input dot in FP64, with stable ideal ranking.
+int router_input(const std::string& root, const std::string& path) {
+    artifact::Reader reader(root + "/qwen4-layer-3.ninfer");
+    const std::string prefix="model.language_model.layers.3.mlp.";
+    const auto weights=bf16_values(reader,prefix+"gate.weight");
+    const auto bytes=reader.payload(prefix+"gate.weight").data;
+    const auto gate=reader.payload(prefix+"shared_expert_gate.weight").data;
+    const auto size=std::filesystem::file_size(path);
+    if(size==0 || size%(H*4)!=0) throw std::runtime_error("invalid router input extent");
+    std::vector<float> panel(size/4);
+    std::ifstream input_file(path,std::ios::binary);
+    input_file.read(reinterpret_cast<char*>(panel.data()),size);
+    if(!input_file) throw std::runtime_error("cannot read router input");
+    for(float x:panel) if(!std::isfinite(x) || bf16_to_f32(f32_to_bf16(x))!=x)
+        throw std::runtime_error("router input must represent finite BF16");
+    GuardedDeviceBuffer dw(bytes.size()),dg(gate.size());
+    dw.copy_from_host(bytes.data(),bytes.size());dg.copy_from_host(gate.data(),gate.size());
+    Weight weight{};weight.qtype=QType::BF16_CTRL;weight.qdata=dw.data();weight.n=E;weight.k=H;
+    Tensor shared(dg.data(),DType::BF16,{H});
+    int failures=0;
+    auto check=[&](const std::vector<float>& values,const std::vector<double>& matrix,const char* label) {
+        const int width=values.size()/H;
+        auto dx=to_device_bf16(values);
+        GuardedDeviceBuffer dl(2*E*width*4),di(R*width*4),dp(R*width*4),ds(width*4);
+        Tensor x(dx.p,DType::BF16,{H,width}),logits(dl.data(),DType::FP32,{2*E,width}),
+            ids(di.data(),DType::I32,{R,width}),probs(dp.data(),DType::FP32,{R,width}),
+            shared_value(ds.data(),DType::FP32,{width});
+        auto launch=[&] {
+            if(width==1) ops::detail::qwen4_sparse_moe_resident_route_launch(x,weight,shared,logits,ids,probs,shared_value,nullptr);
+            else ops::detail::qwen4_sparse_moe_resident_wide_route_launch(x,weight,shared,logits,ids,probs,shared_value,nullptr);
+        };
+        launch();cuda_synchronize();
+        for(bool graph:{false,true}) {
+            if(graph) {
+                cudaStream_t stream;CUDA_CHECK(cudaStreamCreate(&stream));
+                cudaGraph_t captured;cudaGraphExec_t executable;
+                CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));
+                if(width==1) ops::detail::qwen4_sparse_moe_resident_route_launch(x,weight,shared,logits,ids,probs,shared_value,stream);
+                else ops::detail::qwen4_sparse_moe_resident_wide_route_launch(x,weight,shared,logits,ids,probs,shared_value,stream);
+                CUDA_CHECK(cudaStreamEndCapture(stream,&captured));
+                CUDA_CHECK(cudaGraphInstantiate(&executable,captured,0));
+                CUDA_CHECK(cudaGraphLaunch(executable,stream));CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaGraphExecDestroy(executable));CUDA_CHECK(cudaGraphDestroy(captured));CUDA_CHECK(cudaStreamDestroy(stream));
+            }
+            const auto actual=from_device<int>(ids.data,width*R);
+            const auto actual_p=from_device<float>(probs.data,width*R);
+            for(int t=0;t<width;++t) {
+                std::vector<double> input(values.begin()+t*H,values.begin()+(t+1)*H);
+                const auto score=project(matrix,input);
+                std::vector<int> order(E);std::iota(order.begin(),order.end(),0);
+                std::stable_sort(order.begin(),order.end(),[&](int a,int b){return score[a]>score[b];});
+                order.resize(R);std::vector<double> expected_p(R);double sum=0;
+                for(int rank=0;rank<R;++rank) sum+=expected_p[rank]=std::exp(score[order[rank]]-score[order[0]]);
+                for(double& p:expected_p) p/=sum;
+                const std::string name=std::string(label)+" token="+std::to_string(t)+(graph?" graph":" eager");
+                failures+=verify_exact(name.c_str(),std::vector<int>(actual.begin()+t*R,actual.begin()+(t+1)*R),order);
+                const std::vector<double> got_p(actual_p.begin()+t*R,actual_p.begin()+(t+1)*R);
+                failures+=verify_pointwise(name+" probabilities",got_p,expected_p,route_criterion);
+            }
+        }
+        if(std::getenv("NINFER_QWEN4_ROUTER_TIMING")) {
+        cudaEvent_t begin,end;CUDA_CHECK(cudaEventCreate(&begin));CUDA_CHECK(cudaEventCreate(&end));
+        CUDA_CHECK(cudaEventRecord(begin));for(int repeat=0;repeat<100;++repeat) launch();
+        CUDA_CHECK(cudaEventRecord(end));CUDA_CHECK(cudaEventSynchronize(end));float ms=0;
+        CUDA_CHECK(cudaEventElapsedTime(&ms,begin,end));CUDA_CHECK(cudaEventDestroy(begin));CUDA_CHECK(cudaEventDestroy(end));
+        std::cout<<"ROUTER_ONLY "<<label<<" T="<<width<<" us="<<ms*10<<'\n';
+        }
+        failures+=dl.verify_guards(label)+di.verify_guards(label)+dp.verify_guards(label)+ds.verify_guards(label);
+    };
+    check(panel,weights,"captured native router");
+    if(panel.size()>=3*H) check(std::vector<float>(panel.begin()+2*H,panel.begin()+3*H),weights,"captured token 2");
+    std::vector<double> synthetic(E*H);std::vector<float> x(H,0);x[0]=x[1]=1;
+    // Expert 1 must outrank 0 although both ideal logits round to FP32 1.0.
+    // Experts 2/3 are an exact mathematical tie and retain ascending id order.
+    synthetic[0]=synthetic[H]=1;synthetic[1]=std::ldexp(1.,-26);synthetic[H+1]=std::ldexp(1.,-25);
+    synthetic[2*H]=synthetic[3*H]=.5;
+    std::vector<std::uint16_t> words(synthetic.size());
+    for(std::size_t i=0;i<words.size();++i) words[i]=f32_to_bf16(float(synthetic[i]));
+    dw.copy_from_host(words.data(),words.size()*2);
+    check(x,synthetic,"collapsed FP32 logits");
+    std::vector<float> repeated(17*H);for(int t=0;t<17;++t) std::copy(x.begin(),x.end(),repeated.begin()+t*H);
+    check(repeated,synthetic,"collapsed FP32 logits wide");
+    // Equal ideal sums reached through opposite-sign cancellation must remain a
+    // true tie, despite potentially different high/residue staging histories.
+    x[2]=1;
+    synthetic[2*H]=1;synthetic[2*H+1]=std::ldexp(1.,-25);synthetic[2*H+2]=-1;
+    synthetic[3*H]=-1;synthetic[3*H+1]=std::ldexp(1.,-25);synthetic[3*H+2]=1;
+    for(std::size_t i=0;i<words.size();++i) words[i]=f32_to_bf16(float(synthetic[i]));
+    dw.copy_from_host(words.data(),words.size()*2);
+    check(x,synthetic,"opposite cancellation tie");
+    for(int t=0;t<17;++t) std::copy(x.begin(),x.end(),repeated.begin()+t*H);
+    check(repeated,synthetic,"opposite cancellation tie wide");
+    std::cout<<(failures?"FAIL":"PASS")<<" native router exact-ranking regression\n";
+    return failures?1:0;
 }
 } // namespace
 
@@ -703,20 +862,27 @@ Result moe(const std::string& path, int layer, const Result& input, bool partiti
     return result;
 }
 Result moe_calibrated(const std::string& root, const std::string& path, int layer,
-                      const Result& input, bool partitioned, int mask, bool allow_a4) {
-    if((layer!=0 && layer!=3) || mask<0 || mask>7) {
+                      const Result& input, bool partitioned, int mask, bool allow_a4,
+                      int weight_mask, const std::string& shared_up_nvfp4) {
+    if(layer<0 || layer>3 || mask<0 || mask>7 || weight_mask<0 || weight_mask>7 ||
+       (mask&~weight_mask) || (!shared_up_nvfp4.empty() && (layer!=0 || (weight_mask&2) || (mask&2)))) {
         throw std::invalid_argument("unqualified calibrated shared source/policy");
     }
     using P=ops::LinearPolicy;
     const ops::Qwen4SharedExpertPolicy policy{
         mask&1?P::AllowA8:P::A16Only,mask&2?P::AllowA8:P::A16Only,mask&4?P::AllowA8:P::A16Only};
     Result result;
-    run(path,layer,&input,&result,partitioned,allow_a4,true,policy,root);
+    run(path,layer,&input,&result,partitioned,allow_a4,true,policy,root,weight_mask,shared_up_nvfp4);
     return result;
 }
 }
 #else
 int main(int argc, char** argv) {
+    if(argc==4 && std::string_view(argv[1])=="--router-input") {
+        if(require_cuda()!=0) return 1;
+        try { return router_input(argv[2],argv[3]); }
+        catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
+    }
     const bool shared_fp8=argc==2 && std::string_view(argv[1])=="--native-shared-fp8";
     const char* root = argc == 2 && !shared_fp8 ? argv[1] : std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
     if (!root) { std::cout << "Native Qwen4 layers not configured\n"; return 77; }

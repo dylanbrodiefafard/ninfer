@@ -333,8 +333,10 @@ remain unchanged.
 
 The resident MoE accepts the source-calibrated shared gate/up/down matrices with
 separate explicit A16/A8 policies and per-role source input multipliers. Routed
-NVFP4 banks, BF16 router/shared-scalar storage, and protected FP32 routing arithmetic
-are unchanged. Each role uses caller-owned packing scratch; no global format
+NVFP4 banks and BF16 router/shared-scalar storage are unchanged. Native router
+ranking now retains a two-FP32 summation expansion, as specified in the MoE Op
+contract; selected probabilities and the shared scalar gate remain FP32.
+Each role uses caller-owned packing scratch; no global format
 admission or implicit activation policy was added to other components.
 
 `ninfer_qwen4_native_layer_real_test --native-shared-fp8` composes actual Senfu
@@ -378,6 +380,12 @@ This weight-storage effect is distinct from kernel and activation errors. No
 full-model PPL, text-distribution, future-model default, or speed claim follows.
 
 ## Resident component timing and selective activation assessment
+
+The following 33-token timings describe the earlier thirteen-matrix experimental
+recipe. The disjoint 137/257-token follow-up in
+`qwen4-quantization-recommendations.md` supersedes its storage/A8 admission; current
+test commands use the narrowed qualified role selection. Do not treat these historical
+measurements as timings for that replacement recipe.
 
 On 2026-09-19, RTX 5090 / CUDA 13.1 / `sm_120a`, the existing native first-four-layer
 33-token text panel was measured with device-resident authentic weights. The test-owned
@@ -430,6 +438,83 @@ compute-family rewrite. Those generic projection floors do not model complete ro
 MoE or tensor-calibrated packing. No new kernel, calibration, cutoff, or default precision
 was changed from this measurement; any future routed-kernel change needs an exact-point
 traffic/issue profile and its own unchanged-oracle check.
+
+### Expanded held-out resident precision qualification
+
+The disjoint source study is documented in `qwen4-quantization-recommendations.md`.
+Its retained layer0 shared-up NVFP4/A16 candidate was checked against the complete
+independent represented-weight FP64 MoE on the 257-token `heldout_algorithms`
+actual input, with all other shared weights BF16 and routed experts A16. The
+fitted candidate, max-abs control and original BF16 path all pass unchanged
+per-token output/probability gates, exact expert order and buffer guards. No
+new shared-projection kernel was needed.
+
+On RTX5090/CUDA13.1, complete resident-MoE medians (three warmups, eleven samples;
+loading and host oracle excluded), before the FP32 routed-down repair below,
+are BF16 `3127.52 us`, fitted NVFP4 `3148.26 us`,
+and max-abs NVFP4 `3149.57 us`. This is a storage tradeoff, **not a speedup**:
+shared-up payload falls from3,276,800 to921,604 bytes (71.875% less), with about0.7%
+more complete-Op time in this measurement. Conversion retains the fitted candidate
+with its calibration provenance; max-abs remains the experimental control. Shared
+A4 and mixed FP8+NVFP4 shared compositions are not admitted by this evidence.
+
+On the same actual 257-token multilingual GDN inputs, source tensor-FP8 Z0 only
+(QKV/output BF16) with compensated QKV measures `626.688 us` at A16 versus
+`591.840 us` at guarded A8: 5.56% less complete-GDN time. Row-FP8 Z2 measures
+`645.088 us` at A16 versus `606.176 us` at dynamic A8 (6.03% less).
+These are independent same-input Op A/Bs, not propagated
+chain comparisons. Both use the unchanged represented-weight A8 output criterion
+and unchanged convolution/FP32 recurrent-state gates; Z precision does not alter
+the recurrent update. Row-Z2 codes and BF16 row scales are both head-permuted
+offline and exactly checked. Its payload is15,740,928 bytes versus31,457,280 BF16.
+The finite row-Z A8 route reuses existing Linear kernels; row-QKV/output A8 and
+simultaneous other-projection A8 are not admitted. No end-to-end speedup is claimed.
+
+The strengthened checks compare every one of the257 output tokens directly to
+the same independent complete-GDN oracle, not just a panel aggregate. Before the
+compensated-QKV repair, the recorded Z0 A8
+whole/worst-token relative L2 is0.5650%/0.7878%; row-Z2 A8 is1.0675%/1.4478%.
+Both pass the unchanged4% implementation criterion and gross bound, along with
+the unchanged convolution-history and FP32 recurrent-state gates. These
+represented-weight implementation errors are separate from the2% original-source
+quality screens used to select the candidates. Both A16/A8 Z0 and row-Z2 cases
+also pass these unchanged per-token/state gates with the final compensated-QKV
+implementation used for the timings above.
+
+The expanded mixed-shared layer2 A16 check exposed an implementation failure on
+multilingual token114, coordinate2392: GPU `-0.0849609375`, independent FP64
+`-0.08569099564753313`, absolute error0.0007300581 versus unchanged gross limit
+0.0007026038. Attribution reproduced the result from private BF16 routed-down
+stores before weighted mixing. Retaining those results in FP32 removes that
+premature rounding; changing only shared-up staging would not fix this witness.
+The native NVFP4 A16 path now keeps FP32 down slots through its rank-ordered
+weighted sum, while preserving public BF16 output, gate/up/SwiGLU arithmetic,
+and all other expert-format/policy profiles. The original257-token mixed-shared
+layer2 A16 witness passes the unchanged per-token gates, exact expert order,
+probabilities and guards after the repair. Its complete-Op median is3089.18us
+(3086.18–3096.42us), not a claim of a general throughput improvement.
+
+All four selected shared policies now pass direct per-token complete-MoE oracles
+with both A16 and their selected A8 activations after that repair. The panel for
+each layer is its worst-token source-loss witness among the four held-out
+documents, and each timing pair uses identical represented input and weights.
+
+| Layer / held-out panel | Shared FP8 weights | A8 role | A16 / A8 complete MoE (us) |
+|---|---|---|---:|
+| 0 / reasoning | gate, up | up | 3102.40 / 3090.24 |
+| 1 / algorithms | gate | gate | 2918.94 / 2896.45 |
+| 2 / multilingual | gate | gate | 3089.18 / 3074.85 |
+| 3 / algorithms | gate | gate | 2735.90 / 2721.02 |
+
+The modest0.39–0.77% complete-Op reductions do not establish cold-cache or
+whole-model speedups. Hardware and timing methodology are the same as above;
+the A16 criterion remains `{2.5/255,1/32768,2/255}` and shared-A8 remains
+`{.04,1/32768,.06}`, with exact expert order and unchanged probability/guard checks.
+Results are in `out/qwen4-projection-study/shared-final-op-qualification.json`.
+The final FP32-down profile also rechecks the original BF16 and fitted NVFP4
+shared-up0 candidates on the same257-token algorithms input: both pass unchanged
+gates, with complete-MoE medians3109.47us and3134.18us respectively. The fitted
+storage option remains about0.8% slower at this point, not a speed optimization.
 
 ### Retained resident-MoE occupancy optimization
 

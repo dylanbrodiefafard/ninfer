@@ -15,16 +15,16 @@ constexpr int D=2560,F=10240;
 const std::string Main="model.language_model.";
 
 bool fp8_role(const std::string& name) {
-    for(int layer:{0,3}) for(const char* role:{"gate","up","down"})
-        if(name==Main+"layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight") return true;
-    for(const char* role:{"in_proj_qkv","in_proj_z","out_proj"})
-        if(name==Main+"layers.0.linear_attn."+role+".weight") return true;
-    for(const char* role:{"q_proj","k_proj","v_proj","o_proj"})
-        if(name==Main+"layers.3.self_attn."+role+".weight") return true;
+    for(int layer:{0,1})
+        if(name==Main+"layers."+std::to_string(layer)+".linear_attn.in_proj_z.weight") return true;
+    for(int layer=0;layer<4;++layer) for(const char* role:{"gate","up","down"})
+        if(!(layer==3 && std::string_view(role)=="down") &&
+           name==Main+"layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight") return true;
     return false;
 }
 
 bool row_fp8_role(const std::string& name) {
+    if(name==Main+"layers.2.linear_attn.in_proj_z.weight") return true;
     if(name==Main+"embed_tokens.weight" || name=="lm_head.weight") return true;
     for(const char* role:{"down","up"})
         if(name==Main+"hyper_connection_mixer.input_mix_weight_"+role+".weight") return true;
@@ -52,6 +52,11 @@ public:
             const auto* descriptor=reader.find(name);
             const auto* t=descriptor?std::get_if<artifact::TensorDescriptor>(descriptor):nullptr;
             if(t && t->format==Format::FP8_E4M3FN_ROW_BF16S) format=t->format;
+        }
+        if(name==Main+"layers.0.mlp.shared_expert.up_proj.weight") {
+            const auto* descriptor=reader.find(name);
+            const auto* t=descriptor?std::get_if<artifact::TensorDescriptor>(descriptor):nullptr;
+            if(t && t->format==Format::NVFP4) format=t->format;
         }
         tensor(name,{std::uint64_t(n),std::uint64_t(k)},format);
     }
@@ -110,7 +115,7 @@ public:
         const auto geometry=artifact::block_scale_geometry(t.format,shape);
         float divisor;
         std::memcpy(&divisor,reader.payload(*reader.find(name)).data.data()+geometry.weight_divisor_offset,4);
-        if(!(divisor>0) || !std::isfinite(divisor)) throw std::invalid_argument("invalid native DFlash NVFP4 divisor");
+        if(!(divisor>0) || !std::isfinite(divisor)) throw std::invalid_argument("invalid native NVFP4 matrix divisor");
         const auto* data=static_cast<const std::byte*>(backing.device_data(t.handle));
         Weight w{};w.payload=w.qdata=data;w.payload_bytes=geometry.encoded_bytes;
         w.scales=data+geometry.scale_plane_offset;w.qtype=QType::NVFP4;
@@ -210,14 +215,30 @@ NativeArtifactPlan bind_native_artifact(const artifact::Reader& reader) {
     }
     b.result.frontend=text::qwen::bind_frontend_resources(b.binder);
     b.result.resources.emplace("native-profile.json",artifact::bind_raw_resource(b.binder,"native-profile.json"));
+    std::array<int,4> shared_masks{};
+    constexpr std::array<unsigned,4> admitted_masks{0xdf,0x37,0x3f,0x0f};
+    for(int layer=0;layer<4;++layer) {
+        int bit=1;
+        for(const char* role:{"gate","up","down"}) {
+            const auto name=Main+"layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight";
+            if(b.result.tensors.at(name).format==Format::FP8_E4M3FN_TENSOR_F32M) shared_masks[layer]|=bit;
+            bit<<=1;
+        }
+        if(!(admitted_masks[layer]&(1U<<shared_masks[layer])))
+            throw std::invalid_argument("unqualified native shared tensor-FP8 weight combination");
+    }
+    if(b.result.tensors.at(Main+"layers.0.mlp.shared_expert.up_proj.weight").format==Format::NVFP4 && shared_masks[0])
+        throw std::invalid_argument("unqualified layer-0 NVFP4 shared-up with shared tensor-FP8 weights");
     if(selective_a8(b.result.prefill_policy)) {
         auto require_fp8=[&](const std::string& name) {
             if(b.result.tensors.at(name).format!=Format::FP8_E4M3FN_TENSOR_F32M)
-                throw std::invalid_argument("selective A8 prefill requires all seven audited FP8 roles");
+                throw std::invalid_argument("selective A8 prefill requires exact seven-role mixed-FP8 weight recipe");
         };
         require_fp8(Main+"layers.0.linear_attn.in_proj_z.weight");
-        for(int layer:{0,3}) for(const char* role:{"gate","up","down"})
-            require_fp8(Main+"layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight");
+        if(b.result.tensors.at(Main+"layers.2.linear_attn.in_proj_z.weight").format!=Format::FP8_E4M3FN_ROW_BF16S)
+            throw std::invalid_argument("selective A8 prefill requires row-FP8 layer-2 Z");
+        if(shared_masks!=std::array<int,4>{3,1,1,1})
+            throw std::invalid_argument("selective A8 requires exact shared FP8 weight masks 3,1,1,1");
     }
     b.result.materialization=b.binder.finish();
     return std::move(b.result);

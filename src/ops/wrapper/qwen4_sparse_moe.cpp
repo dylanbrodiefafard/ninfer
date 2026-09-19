@@ -389,7 +389,7 @@ PrefillScratch allocate_prefill_scratch(Allocator& allocator, std::int32_t width
 template <class Allocator>
 ResidentScratch allocate_resident_scratch(Allocator& allocator) {
     return {
-        allocator.alloc(DType::FP32, {kQwen4SparseMoeExperts}),
+        allocator.alloc(DType::FP32, {2 * kQwen4SparseMoeExperts}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden}),
         allocator.alloc(DType::FP32, {1}),
@@ -400,10 +400,11 @@ ResidentScratch allocate_resident_scratch(Allocator& allocator) {
 
 template <class Allocator>
 ResidentWideScratch allocate_resident_wide_scratch(Allocator& allocator,
-                                                   std::int32_t width, bool fp32_shared = false) {
+                                                   std::int32_t width, bool fp32_shared = false,
+                                                   bool fp32_down = false) {
     const std::int32_t occurrences = kQwen4SparseMoeTopK * width;
     return {
-        allocator.alloc(DType::FP32, {kQwen4SparseMoeExperts, width}),
+        allocator.alloc(DType::FP32, {2 * kQwen4SparseMoeExperts, width}),
         allocator.alloc(DType::FP32, {width}),
         allocator.alloc(fp32_shared ? DType::FP32 : DType::BF16, {kQwen4SparseMoeIntermediate, width}),
         allocator.alloc(fp32_shared ? DType::FP32 : DType::BF16, {kQwen4SparseMoeIntermediate, width}),
@@ -411,7 +412,7 @@ ResidentWideScratch allocate_resident_wide_scratch(Allocator& allocator,
         allocator.alloc(DType::BF16, {kQwen4SparseMoeHidden, width}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
         allocator.alloc(DType::BF16, {kQwen4SparseMoeIntermediate, occurrences}),
-        allocator.alloc(DType::BF16,
+        allocator.alloc(fp32_down ? DType::FP32 : DType::BF16,
                         {kQwen4SparseMoeHidden, kQwen4SparseMoeTopK, width}),
         allocator.alloc(DType::I32, {kQwen4SparseMoeExperts}),
         allocator.alloc(DType::I32, {kQwen4SparseMoeExperts}),
@@ -457,6 +458,11 @@ ResidentA4Scratch allocate_resident_a4(Allocator& allocator, int width) {
     return {allocator.alloc(DType::U8, {kQwen4SparseMoeHidden / 2, occurrences}),
             allocator.alloc(DType::U8, {kQwen4SparseMoeHidden / 16, occurrences}),
             allocator.alloc(DType::I32, {2, max_tiles + 1})};
+}
+
+bool fp32_routed_down(QType type, LinearPolicy policy) {
+    return policy == LinearPolicy::A16Only &&
+        (type == QType::NVFP4 || type == QType::NVFP4_EXPERT_F32M);
 }
 
 Qwen4ResidentSparseMoeStorageProfile storage_profile(const Qwen4ResidentSparseMoeWeights& w) {
@@ -506,7 +512,8 @@ std::size_t required_resident_workspace(const Qwen4ResidentSparseMoeStorageProfi
     WorkspaceLayoutBuilder layout;
     if (native) {
         (void)allocate_resident_wide_scratch(layout, width,
-            profile.shared_gate==QType::BF16_CTRL && profile.shared_up==QType::BF16_CTRL);
+            profile.shared_gate==QType::BF16_CTRL && profile.shared_up==QType::BF16_CTRL,
+            fp32_routed_down(profile.routed_down,policy));
         // Native expert routes gather sorted occurrences without moving IDs to the host.
         // The scratch is reused by gate, up, and down in stream order.
         const std::size_t gathered = static_cast<std::size_t>(gather_rows) *
@@ -1257,7 +1264,8 @@ void qwen4_sparse_moe_resident(const Tensor& x,
     }
 
     const bool fp32_shared = source_bf16_shared(weights);
-    ResidentWideScratch scratch = allocate_resident_wide_scratch(workspace, width, fp32_shared);
+    ResidentWideScratch scratch = allocate_resident_wide_scratch(workspace, width, fp32_shared,
+        fp32_routed_down(weights.routed_down.qtype,expert_policy));
     detail::qwen4_sparse_moe_resident_wide_route_launch(
         x, weights.router, weights.shared_gate, scratch.logits, selected_ids,
         selected_weights, scratch.shared_gate_value, stream);

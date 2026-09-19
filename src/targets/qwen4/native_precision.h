@@ -30,8 +30,12 @@ inline NativeLayerPolicy native_prefill_policy(NativePrefillPolicy p,int layer) 
         result.routed=ops::LinearPolicy::AllowA4;
     if(selective_a8(p)) {
         if(layer==0) result.gdn.z=ops::LinearPolicy::AllowA8;
-        if(layer==0 || layer==3)
-            result.shared={ops::LinearPolicy::AllowA8,ops::LinearPolicy::AllowA8,ops::LinearPolicy::AllowA8};
+        if(layer==2) result.gdn.z=ops::LinearPolicy::AllowA8;
+        // Held-out source-loss qualification is role- and layer-specific. Shared
+        // down stays BF16/A16; layer 0 uses FP8 gate/up with only up at A8,
+        // while layers 1..3 use FP8 gate only, with BF16 up/down.
+        if(layer==0) result.shared.up=ops::LinearPolicy::AllowA8;
+        if(layer>=1 && layer<=3) result.shared.gate=ops::LinearPolicy::AllowA8;
     }
     return result;
 }

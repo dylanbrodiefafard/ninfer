@@ -54,7 +54,7 @@ void enqueue_native_decoder(std::span<const NativeLayerWeights> layers,const Nat
             const int recurrent=layer-layer/4;
             auto replay=record?records.layer(recurrent,batch):GdnReplayRecordLayer{};
             if(full_prefill_slot>=0) {
-                // Eager full-prefix prefill retains the existing qualified chunked GDN route.
+                // Full-prefix prefill uses the native FP32 recurrent accuracy profile.
                 // Compact masked decode/verification keeps device-selected state below.
                 auto conv_in=before.conv_slot(recurrent,full_prefill_slot),conv_out=after.conv_slot(recurrent,full_prefill_slot);
                 auto state_in=before.recurrent_slot(recurrent,full_prefill_slot),state_out=after.recurrent_slot(recurrent,full_prefill_slot);

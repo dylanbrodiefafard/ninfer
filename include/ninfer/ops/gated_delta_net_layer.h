@@ -37,9 +37,12 @@ struct GatedDeltaNetLayerWeights {
  * Each projection independently selects its format. A16Only is the default; native
  * tensor-calibrated FP8 roles separately permit AllowA8 with the exact source input scale
  * retained as Linear's per-token guarded activation-scale floor.
+ * Row-scaled FP8 Z separately permits dynamic per-token AllowA8 when QKV/output
+ * remain A16Only. Row-scaled QKV/output do not admit A8.
  * The query includes caller-owned activation packing scratch for the selected policies.
  * QKV and output may not both select AllowA8: that combined approximation failed
- * the predeclared complete-component output gate. Z may combine with either one.
+ * the predeclared complete-component output gate. Tensor-calibrated Z may combine
+ * with either one; row-scaled Z retains the A16-neighbor restriction above.
  * The two legacy GGML input projections retain their matching-format constraint.
  */
 [[nodiscard]] std::size_t
@@ -71,7 +74,9 @@ gated_delta_net_layer_workspace_capacity_bytes(
  * formula naively in FP64. It applies the declared consumer representations between formulas:
  * decoded qkv and z projection outputs are BF16, controls and each recurrent transition are FP32,
  * recurrent output is BF16 before gated norm, and gated-norm output is BF16 before the output
- * projection. Offline conversion stores V-side qkv/z/a/b/ssm_a/dt/conv/output in tiled order, so
+ * projection. Native BF16 QKV uses compensated SIMT or short-partial MMA accumulation before
+ * its BF16 store: an implementation accuracy profile, not an exact-projection guarantee.
+ * Offline conversion stores V-side qkv/z/a/b/ssm_a/dt/conv/output in tiled order, so
  * value head h consumes Q/K head h%16. BF16 convolution state,
  * FP32 recurrent state, and BF16 out are persistent/final observable boundaries. All non-state
  * operands, output, and live workspace are pairwise non-overlapping. Execution is asynchronous on
@@ -79,6 +84,9 @@ gated_delta_net_layer_workspace_capacity_bytes(
  * E4M3 activation codec; it does not change these BF16/FP32 public and state boundaries.
  * A8 approximation is checked against the same represented-input oracle under a separately
  * declared implementation profile, not by feeding quantized private inputs into that oracle.
+ * Native QKV profiles use FP32-normalized recurrent execution at every width: the
+ * private FP16 chunked recurrence failed the fixed output criterion on longer real inputs.
+ * This is an accuracy profile, not a change to public representations or a throughput claim.
  * Admission is bounded component qualification, not whole-model PPL or default-policy approval.
  *
  * Optional replay records expose raw projected QKV as BF16 conv [10240,T,1], expanded

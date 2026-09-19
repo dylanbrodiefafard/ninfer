@@ -17,6 +17,8 @@ void qwen4_sparse_moe_prefill_route_launch(const Tensor& x, const Weight& router
                                            Tensor& logits, Tensor& selected_ids,
                                            Tensor& selected_weights, cudaStream_t stream);
 
+// Private logits scratch reserves two FP32 words per expert/token for the native
+// BF16 summation expansion. Diagnostic FP32 controls use its contiguous prefix.
 void qwen4_sparse_moe_resident_route_launch(
     const Tensor& x, const Weight& router, const Tensor& shared_gate, Tensor& logits,
     Tensor& selected_ids, Tensor& selected_weights, Tensor& shared_gate_value,
@@ -41,6 +43,8 @@ void qwen4_sparse_moe_resident_grouped_down_launch(
     const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& rank_results,
     cudaStream_t stream);
 
+// Native NVFP4 A16 down outputs use private FP32 rank/token storage. Other
+// projections and all AllowA4 groups retain BF16; the finish consumes either dtype.
 void qwen4_sparse_moe_resident_native_linear_launch(
     const Tensor& input, const Weight& bank, const Tensor& expert_counts,
     const Tensor& expert_offsets, const Tensor& occurrence_slots, Tensor& gathered,

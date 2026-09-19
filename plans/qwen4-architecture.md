@@ -47,7 +47,126 @@ requires reading every safetensors header, which can be done with bounded HTTP r
 downloading payloads. A full checkpoint becomes a deliberate conversion and qualification
 prerequisite only after the runnable target identity is selected.
 
-## 0. Native-checkpoint preparation and active native precision implementation
+## 0. Native-checkpoint preparation and native precision qualification
+
+### Completed goal: held-out resident-block precision qualification (2026-09-19)
+
+Assigned after commit `014efc9b`. The previous goal closed its bounded experiments,
+not every research-backed precision candidate. This follow-up uses authentic preview
+components without requiring the complete ordinary compute core to fit the GPU.
+No commit or push is authorized. Calibration and evaluation inputs must be disjoint;
+existing failed recipes remain regression evidence, and criteria must not be widened.
+
+- [x] Build diverse, longer real-input resident-block calibration and held-out panels;
+  measure per-token and propagated error, recurrent state and routing/selection changes.
+- [x] Evaluate original-source shared/GDN/QSA NVFP4 W4A16 and W4A4 candidates;
+  qualify useful implementations or reject with independent mathematical/source-loss evidence.
+- [x] Extend selective FP8/A8 component qualification beyond the current layer-0 Z and
+  layer-0/3 shared panel where authentic weights and correctly propagated inputs permit.
+- [x] Evaluate calibration-backed routed-expert/post-SwiGLU down and DFlash remedies
+  with separate holdouts, retaining failed recipes as regression cases.
+- [x] Broaden embedding/head, final GR-read and PLE-projection FP8 source-loss and
+  composition evidence over representative inputs, distinguishing local from model quality.
+- [x] Complete relevant exact/numerical/state checks, direct performance evidence for
+  retained optimizations, active authority updates and the full C++ regression suite.
+
+Public BF16 boundaries, protected controls, FP32 GDN state, p-less/epsilon sampling,
+speculative transactions and eagerly locked host PLE remain unchanged unless a separately
+qualified explicit design requires otherwise. Full future-model PPL, final precision defaults
+and end-to-end speculative performance are not claims made by resident-component tests.
+
+Progress: eight disjoint authored documents acquired (four calibration at137 tokens,
+four heldout at257), reusing complete local source FP8 PLE for offline row extraction.
+The first longer native panel exposed a local GDN1 output failure and one exact router
+rank-order failure that the original33-token witness missed. Same-input GDN recurrence A/B:
+private chunked profile relative L2=0.003612/maxabs=0.017770 versus unchanged gross
+limit0.010346; FP32 recurrent profile relative L2=0.001684/maxabs=0.003739 passes.
+Native FP32 recurrent dispatch passed all eight panels' original whole-output component checks;
+the subsequent per-token and full-suite results are recorded below. Router diagnosis found FP32 dot-reduction collapse of two distinct source logits;
+compensated native BF16 dots and canonical two-word ranking now pass the captured137-row,
+decode, collapsed-score, true-tie and cancellation witnesses in eager/graph execution, plus
+the complete MoE synthetic oracle suite. Three other137-token calibration documents pass
+the unchanged native local/accumulated gates with the recurrent GDN profile. Corrected science
+and four257-token held-out captures are complete. Seven documents pass the original
+accumulated panel/gross screen; the original heldout_multilingual capture failed at layer2/3 token120. All local
+whole-output Op gates and all same-input exact router orders passed. Final residual panel relative L2 is
+0.7083–1.0452%; worst-token relative L2 is3.8017–5.3879%, including tails in otherwise passing
+panels. At the multilingual witness, a0.5735% router-input difference changes the tenth expert
+from369 to75; independent full-MoE error is21.8289%, falling to0.4728% when the reference
+expert set is held fixed. This is propagated hard-selection sensitivity, not the fixed
+same-input router bug. Before the compensated-QKV repair, native GDN layer1 T137 measured395.264us median through the complete
+public Op (state restore excluded, RTX5090/CUDA13.1, three warmups/eleven samples); no
+before/after speedup claim is made. Resident panels retain the explicit bounded `t+axis`
+MRoPE profile, not literal source-framework full-text execution. Accumulated routing/residual sensitivity is measured
+separately and is not hidden by modifying the mathematical oracle or tolerances. Captured
+public inputs remain usable for same-input counterfactuals even when a propagated-chain screen
+fails; they are not thereby qualified full-model calibration or quality evidence.
+
+The finite calibration remedies are complete, with explicit rejection rather than
+relaxed criteria: routed source/fitted A4 fails every held-out complete-MoE screen;
+DFlash input-MSE improves worst-query hidden error from39.00% to34.11%, but all84
+queries still fail2%. Endpoint/PLE source-loss checks are also complete: PLE value
+and combined FP8 projections have token tails above2%, while row-FP8 head changes
+two of12 sampled argmaxes. Full results and scope are in the existing precision and
+speculative research references. New source-retained implementation candidates are
+layer0 shared-up NVFP4/A16, row-FP8 Z2/A16/A8, and narrower layer-specific tensor-FP8/A8
+roles. Shared-up NVFP4 and Z2 row-FP8 pass complete real-weight GPU oracles;
+NVFP4 is a storage tradeoff, not a speedup. With compensated QKV, complete-GDN A8 saves5.56% for Z0 and6.03%
+for Z2 on identical257-token inputs. The seven-weight selective recipe now contains
+six tensor-FP8 roles plus row-FP8 Z2; conversion/binding rejects missing weights and
+unqualified combinations. All-target C++ compilation and metadata admission pass;
+32 relevant Python checks pass (one optional source-MTP fixture check skipped).
+Strengthened GDN checks pass all257 tokens for Z0 and row-Z2 A8, with unchanged
+convolution/recurrent-state gates. Mixed shared layer2 A16 exposed a separate local
+rounding failure: token114/coordinate2392 is `-0.0849609375` against FP64
+`-0.0856909956`, exceeding the original gross bound. Independent attribution reproduces
+the failure from private per-expert down BF16 stores before the weighted sum; retaining
+the down results until FP32 accumulation predicts `-0.08544921875`, within the bound.
+The native A16 repair now passes the original257-token witness with unchanged
+per-token, exact-route, probability and guard checks; the earlier shared-up rounding
+hypothesis was ruled out. All eight selected shared A16/A8 held-out component checks
+now pass; complete-MoE A8 latency reductions are modest0.39–0.77% on these same-input
+pairs. Final BF16/NVFP4 shared-up controls also pass; the fitted NVFP4 option is
+about0.8% slower but saves71.875% of that matrix's payload. The seven-weight
+runtime integration passes A16/selective-A8 prefill and exact compact/recorded
+graph policy-preservation checks. Selective-A8 whole33 and32+1 continuation also
+pass. The final-route multilingual prefix exposed two GDN1 per-token gross
+failures at tokens20/241, coordinate1883, under the strengthened local checks.
+Attribution identifies QKV projection accumulation error crossing a declared BF16
+store, amplified by one gated-normalization quantum; recurrent/norm/final-dot
+arithmetic is not the cause. K16 MMA partials with compensated cross-partial sums
+now pass the failed input and all four original held-out GDN1 panels. Complete
+GDN T257 is630.752us versus559.104us for the failing profile. Compensated existing
+SIMT execution restores T1 cost to96.256us versus94.144us, avoiding the padded-MMA
+prototype's122.848us. Final mixed-projection and small-width checks pass;
+the measured native-only dispatch uses SIMT through T20 and MMA from T21.
+T21 complete-GDN falls from245.792 to161.824us with unchanged gates;
+generic Linear dispatch is unchanged. Final seven-weight runtime integration and
+selective-A8 whole33/32+1 continuation reruns pass with this profile, as does the
+all-target build. Independent Astra review found no material issues.
+The full-suite MoE witness exposed a race in the newly guarded test workspace:
+default-stream initialization was not ordered before nonblocking-stream execution.
+The preserved pre-fix binary reproduces the exact ID/probability failure; explicit
+setup synchronization alone makes the focused suite pass, without numerical or
+production changes. The final full-suite rerun was GPU-isolated because the
+draft graph-budget check measures device-wide free memory; its initial concurrent
+capture run invalidated that measurement. The isolated draft-runtime test passes.
+Declared BF16 consumer boundaries and all criteria remain unchanged.
+The earlier eight-panel baseline passed whole-output local
+gates, not these subsequently added per-token GDN checks. The final repaired
+multilingual four-block prefix passes all unchanged local output/token/state and
+accumulated panel/gross checks. Final residual L2 is1.026423%, maxabs0.0126953125;
+worst-token L2 is4.152011% at109, so this is not a per-token2% accumulated guarantee.
+The previous token120 gross failure is resolved; hard expert-selection sensitivity
+still exists. The original captures remain immutable inputs to the source study.
+The GPU-isolated full C++ regression suite passes:126 passed,9 optional
+fixture-dependent checks skipped,0 failures (538.94s), using
+`NINFER_DEV_CONTAINER=ninfer-builder-qwen4-mixed NINFER_BUILD_VOLUME=ninfer-build-cache-qwen4-mixed NINFER_DEV_JOBS=8 ./scripts/run-unit-tests.sh`.
+Real resident integration/continuation, the multilingual prefix,32 focused Python
+checks and independent Astra review provide the additional evidence described above;
+one optional Python source-MTP fixture check was skipped. No commit or push was made.
+The earlier unrestricted shared0/3 A8 recipe
+is superseded, not retained as an alternative native recipe.
 
 ### Completed goal: final feasible native mixed-precision readiness (2026-09-19)
 

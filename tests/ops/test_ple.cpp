@@ -842,10 +842,10 @@ int native_ple_case(const std::string& root,
     constexpr ReductionCriterion state_gate{1.0/256,1e-5,1.0/128};
     for(bool nvfp4:{false,true}) {
         if(sequence_input && nvfp4!=nvfp4_table) { continue; }
-        artifact::Reader table_reader(root+(text_panel?"/qwen4-text-panel.ninfer":
-            nvfp4?"/qwen4-ple-nvfp4-rows.ninfer":"/qwen4-ple-rows.ninfer"));
+        artifact::Reader table_reader(text ? text->path : root+
+            (nvfp4?"/qwen4-ple-nvfp4-rows.ninfer":"/qwen4-ple-rows.ninfer"));
         const artifact::ArtifactIdentity expected_identity=text_panel
-            ? artifact::ArtifactIdentity{"qwen4/native-text-qualification","nvidia-source-33"}
+            ? text->reader.identity()
             : artifact::ArtifactIdentity{"qwen4/native-ple-qualification",
                 nvfp4?"primitive-nvfp4-source-rows":"nvidia-fp8-source-rows"};
         if(table_reader.identity()!=expected_identity) {
@@ -858,13 +858,14 @@ int native_ple_case(const std::string& root,
             : artifact::bind_tensor(binder,"ple.rows",artifact::NumericFormat::FP8_E4M3FN_TENSOR_BF16S,
                 {text?text->row_count:16,160},artifact::TensorPlacement::ResidentHost);
         if(text) {
+            const auto width=static_cast<std::uint64_t>(text->tokens.size());
             (void)artifact::bind_tensor(binder,"token.embeddings",artifact::NumericFormat::BF16,
-                {33,2560},artifact::TensorPlacement::ValidateOnly);
+                {width,2560},artifact::TensorPlacement::ValidateOnly);
             (void)artifact::bind_tensor(binder,"token.ids",artifact::NumericFormat::I32,
-                {33},artifact::TensorPlacement::ValidateOnly);
+                {width},artifact::TensorPlacement::ValidateOnly);
             for(const char* name:{"ple.global_rows","ple.local_rows"}) {
                 (void)artifact::bind_tensor(binder,name,artifact::NumericFormat::I32,
-                    {33,16},artifact::TensorPlacement::ValidateOnly);
+                    {width,16},artifact::TensorPlacement::ValidateOnly);
             }
         }
         DeviceContext device(0);

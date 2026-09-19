@@ -287,12 +287,18 @@ void qwen4_sparse_moe_prefill(const Tensor& x, const Qwen4SparseMoeWeights& weig
  * implicitly permit activation quantization at the complete nonlinear Op boundary. Native banks
  * use device-only expert grouping at every T; NVFP4 reads occurrence-mapped activation tiles
  * directly, while FP8 uses bounded caller-owned gathered activations for its A16 MMA mainloop.
+ * Native NVFP4/NVFP4_EXPERT_F32M routed-down results retain FP32 through the
+ * rank-ordered weighted sum under A16Only. This private storage avoids rounding
+ * each expert before cancellation-sensitive mixing; destination remains BF16.
+ * FP8/GGML down formats and the complete AllowA4 profile retain BF16 rank results.
  * A pair of BF16 shared gate/up weights retains FP32 projection values through SiLU-times-up,
  * then writes a dedicated BF16 activation for shared down. These private intermediates avoid
  * premature projection rounding; mixed/quantized shared pairs retain their qualified profiles.
  * Native protected router/shared scalar gate weights remain source BF16 in device storage;
  * the diagnostic pair may remain FP32. The pair uses the same storage dtype, widened exactly
- * inside the existing FP32 dot products. This does not quantize routing, change the ideal
+ * inside the dot products. Native BF16 router dots retain a two-FP32 summation expansion
+ * through ranking; the shared scalar gate and diagnostic FP32 profile retain FP32 dots.
+ * This private arithmetic profile does not quantize routing, change the ideal
  * top-k contract or introduce a BF16 logits/selected-probabilities Store. The source framework's
  * unfused BF16 logits and scores are a distinct arithmetic profile, not promised bit parity.
  *

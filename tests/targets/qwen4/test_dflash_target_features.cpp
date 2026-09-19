@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <numeric>
+#include <set>
 
 using namespace ninfer;
 using namespace ninfer::test;
@@ -64,6 +65,85 @@ void capture(const std::filesystem::path& target,const std::filesystem::path& na
         {"taps",{4,16,24,36,44}},{"token_ids",panel.tokens},
         {"accepted_prompt_tokens",T},{"qsa_kv","NVFP4-G16"},
         {"boundary","Sequential teacher-forced prompt tokens, not generated-token acceptance. The existing full48 diagnostic target produces the attention-GR input taps. PLE is fully populated and locked before load succeeds; ordinary diagnostic expert streaming is unchanged. Not native NVFP4 target features."}});
+}
+
+void capture_corpus(const std::filesystem::path& target,const std::filesystem::path& native,
+                    const std::filesystem::path& corpus,const std::filesystem::path& output,
+                    DeviceContext& device) {
+    constexpr int accepted=128;
+    nlohmann::json manifest;
+    std::ifstream input(corpus);input>>manifest;
+    const auto report=output/"qwen4-dflash-corpus-features.json";
+    if(std::filesystem::exists(report)) throw std::runtime_error("refusing to replace corpus feature report");
+    std::filesystem::create_directories(output);
+    std::set<std::string> names;int calibration=0,heldout=0;
+    for(const auto& item:manifest.at("panels")) {
+        const auto id=item.at("id").get<std::string>();
+        const auto split=item.at("split").get<std::string>();
+        if(id.empty() || id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")!=std::string::npos ||
+           !names.insert(id).second || item.at("tokens").get<int>()<accepted+K+1)
+            throw std::runtime_error("invalid disjoint corpus feature panel");
+        if(split=="calibration") ++calibration;
+        else if(split=="heldout") ++heldout;
+        else throw std::runtime_error("unknown corpus split");
+        if(std::filesystem::exists(output/id))
+            throw std::runtime_error("refusing to replace captured corpus panel");
+    }
+    if(calibration<4 || heldout<4) throw std::runtime_error("requires at least four calibration and four held-out documents");
+    auto slot=to_device_i32({0}),valid=to_device_i32({1});
+    DeviceBuffer feature(F*2);
+    q4::DFlashFeatureSink sink{Tensor(feature.p,DType::BF16,{F,1,1}),
+        Tensor(slot.p,DType::I32,{1}),Tensor(valid.p,DType::I32,{1})};
+    nlohmann::json records=nlohmann::json::array();
+    {
+        auto model=q4::verifier::LoadedModel::load(target,device);
+        q4::verifier::Program program(*model,device,q4::verifier::DiagnosticSnapshots::Disabled);
+        for(const auto& item:manifest.at("panels")) {
+            const auto id=item.at("id").get<std::string>();
+            const auto panel_path=item.at("panel").get<std::string>();
+            if(::setenv("NINFER_QWEN4_TEXT_PANEL",panel_path.c_str(),1)!=0)
+                throw std::runtime_error("failed to select explicit corpus panel");
+            qwen4_sequence::TextPanel panel(native.string());
+            if(panel.tokens.size()!=item.at("tokens").get<std::size_t>())
+                throw std::runtime_error("corpus token extent differs");
+            program.reset();
+            std::vector<std::uint16_t> features(F*accepted);
+            std::vector<std::uint16_t> residuals(10240*accepted),head_inputs(D*accepted);
+            for(int t=0;t<accepted;++t) {
+                const auto result=program.execute_token(panel.tokens[t],panel.tokens[t+1],&sink);
+                device.synchronize();
+                feature.copy_to_host(features.data()+t*F,F*2);
+                CUDA_CHECK(cudaMemcpy(residuals.data()+t*10240,program.state().residual().data,
+                    10240*2,cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(head_inputs.data()+t*D,result.final_hidden.data,D*2,cudaMemcpyDeviceToHost));
+                if(program.frontier()!=t+1) throw std::runtime_error("accepted corpus frontier mismatch");
+                if((t+1)%16==0) std::cout<<"Captured "<<id<<' '<<t+1<<'/'<<accepted<<std::endl;
+            }
+            const auto name=id+"/features.bf16";
+            std::filesystem::create_directory(output/id);
+            const auto save=[&](const std::string& filename,const std::vector<std::uint16_t>& values) {
+                for(auto word:values) if(!std::isfinite(bf16_to_f32(word)))
+                    throw std::runtime_error("nonfinite corpus public boundary");
+                std::ofstream file(output/id/filename,std::ios::binary);
+                file.write(reinterpret_cast<const char*>(values.data()),values.size()*2);
+                if(!file) throw std::runtime_error("corpus public boundary write failed");
+            };
+            save("features.bf16",features);save("target_residual.bf16",residuals);
+            save("target_head_input.bf16",head_inputs);
+            records.push_back({{"id",id},{"split",item.at("split")},{"features",name},
+                {"token_ids",panel.tokens},{"accepted_prompt_tokens",accepted},
+                {"target_residual",{{"file",id+"/target_residual.bf16"},{"shape",{accepted,10240}},
+                    {"role","Actual post-layer47 four-branch residual, before final GR read"}}},
+                {"target_head_input",{{"file",id+"/target_head_input.bf16"},{"shape",{accepted,D}},
+                    {"role","Actual final GR BF16 output consumed by target head"}}}});
+        }
+        device.synchronize();
+    }
+    write_json(report,{{"profile","qwen4-ud-iq1-s-diagnostic-disjoint-corpus"},
+        {"target",target.string()},{"corpus_repository",manifest.at("repository")},
+        {"corpus_revision",manifest.at("revision")},{"taps",{4,16,24,36,44}},
+        {"qsa_kv","NVFP4-G16"},{"dtype","BF16 little-endian [128,12800]"},{"panels",records},
+        {"boundary","Independent documents with reset between prompts, sequential teacher forcing. Full48 UD-IQ1_S diagnostic features, not native NVFP4 features. Complete PLE eagerly locked; only the pre-existing diagnostic expert streaming exception. Not speculative acceptance or PPL."}});
 }
 
 double relative_l2(const std::vector<double>& reference,const std::vector<double>& value) {
@@ -163,11 +243,14 @@ int main(int argc,char** argv) {
     const char* native=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
     const char* draft=std::getenv("NINFER_QWEN4_NATIVE_DFLASH");
     const char* output=std::getenv("NINFER_QWEN4_DFLASH_TARGET_OUTPUT");
-    if(argc!=2 || !native || !draft || !output) return 77;
+    const char* corpus=std::getenv("NINFER_QWEN4_DFLASH_CORPUS");
+    if(argc!=2 || !native || !output) return 77;
     try {
         DeviceContext device;
-        if(std::string(argv[1])=="--capture" && target) capture(target,native,output,device);
-        else if(std::string(argv[1])=="--compare") compare(native,draft,output,device);
+        if(std::string(argv[1])=="--capture-corpus" && target && corpus)
+            capture_corpus(target,native,corpus,output,device);
+        else if(std::string(argv[1])=="--capture" && target) capture(target,native,output,device);
+        else if(std::string(argv[1])=="--compare" && draft) compare(native,draft,output,device);
         else throw std::runtime_error("requires --capture with target or --compare");
         return 0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n';return 1; }

@@ -11,6 +11,7 @@ using namespace ninfer;
 
 namespace {
 int verify_text_hashes(const TextPanel& panel) {
+    const int width=panel.tokens.size();
     const ops::NgramRowConfig config{248320,248044,0,1234,20000000};
     const auto prepared=ops::prepare_ngram_row_config(config);
     std::array<std::int32_t,2> history{248044,248044};
@@ -27,8 +28,8 @@ int verify_text_hashes(const TextPanel& panel) {
         state.copy_from_host(initial,sizeof(initial));
         Tensor state_view(state.data(),DType::I32,{2,1});
         std::vector<std::int32_t> actual;
-        for(int begin=0;begin<33;) {
-            const int count=chunked?std::min(begin==0?32:1,33-begin):33;
+        for(int begin=0;begin<width;) {
+            const int count=chunked?std::min(begin==0?width-1:1,width-begin):width;
             GuardedDeviceBuffer input(count*4),valid(4),rows(count*16*4);
             input.copy_from_host(panel.tokens.data()+begin,count*4);
             valid.copy_from_host(&count,4);
@@ -45,7 +46,7 @@ int verify_text_hashes(const TextPanel& panel) {
         }
         failures+=verify_exact("native text source-oracle GPU hashes",actual,panel.global_rows);
         failures+=verify_exact("native text hash continuation",from_device<std::int32_t>(state.data(),2),
-            std::vector<std::int32_t>{panel.tokens[31],panel.tokens[32]});
+            std::vector<std::int32_t>{panel.tokens[width-2],panel.tokens[width-1]});
         failures+=state.verify_guards("native hash history");
     }
     return failures;
@@ -62,6 +63,8 @@ int main(int argc,char** argv) {
     if(argc!=1 && !storage_experiment && !nvfp4_diagnostics && !text_panel) { std::cerr<<"Unknown native-sequence argument\n"; return 1; }
     const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
     if(!root) { std::cout<<"SKIP native sequence: NINFER_QWEN4_NATIVE_LAYERS unset\n"; return 77; }
+    const char* prepared=std::getenv("NINFER_QWEN4_NATIVE_COMPUTE");
+    if(calibrated && !resident_moe && !prepared) { std::cout<<"SKIP mixed native sequence: NINFER_QWEN4_NATIVE_COMPUTE unset\n"; return 77; }
     if(require_cuda()!=0) { return 1; }
     // Predeclared accumulated gate: BF16 public boundaries, two different stateful
     // mixers, four native MoEs and independently represented BF16/diagnostic NVFP4 KV;
@@ -70,7 +73,7 @@ int main(int argc,char** argv) {
     int failures=0;
     const auto panel=text_panel?std::make_unique<TextPanel>(root):nullptr;
     if(panel) { failures+=verify_text_hashes(*panel); }
-    const std::vector<int> widths=text_panel?std::vector<int>{33}:std::vector<int>{5,17};
+    const std::vector<int> widths=text_panel?std::vector<int>{static_cast<int>(panel->tokens.size())}:std::vector<int>{5,17};
     for(bool diagnostic_nvfp4:{false,true}) for(int tokens:widths) {
     // Native admission uses the BF16 reference. The explicitly selected compressed
     // assessment retains its unchanged failed accumulated gate and nonzero exit status.
@@ -114,9 +117,10 @@ int main(int argc,char** argv) {
                 failures+=residual.failures;
             }
             const auto gr=read(path,layer,residual,"attn",partitioned);
-            const auto mixer=calibrated && layer==3
-                ? qsa_calibrated(root,path,gr.mixed,partitioned)
-                : calibrated && layer==0 ? gdn_calibrated(root,path,layer,gr.mixed,partitioned,selective_a8?2:0)
+            const auto mixer=calibrated && layer==0
+                ? gdn_calibrated(root,path,layer,gr.mixed,partitioned,selective_a8?2:0,2)
+                : calibrated && layer==2 ? gdn_prepared_row_z2(path,
+                    std::string(prepared)+"/qwen4-native-fp8-projections.ninfer",gr.mixed,partitioned,selective_a8)
                 : layer==3 ? qsa(path,gr.mixed,partitioned,diagnostic_nvfp4)
                            : gdn(path,layer,gr.mixed,partitioned);
             auto attention=inject(residual,mixer,gr.scale,partitioned);
@@ -126,8 +130,8 @@ int main(int argc,char** argv) {
                 failures+=attention.failures;
             }
             const auto mlp=read(path,layer,attention,"mlp",partitioned);
-            const auto expert=calibrated && (layer==0 || layer==3)
-                ? moe_calibrated(root,path,layer,mlp.mixed,partitioned,selective_a8?7:0)
+            const auto expert=calibrated
+                ? moe_calibrated(root,path,layer,mlp.mixed,partitioned,selective_a8?(layer==0?2:1):0,false,layer==0?3:1)
                 : moe(path,layer,mlp.mixed,partitioned);
             discrete_ids.insert(discrete_ids.end(),mixer.discrete_ids.begin(),mixer.discrete_ids.end());
             discrete_ids.insert(discrete_ids.end(),expert.discrete_ids.begin(),expert.discrete_ids.end());

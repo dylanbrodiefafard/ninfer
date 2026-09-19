@@ -383,7 +383,11 @@ struct Fixture {
         d_output = to_device(output);
     }
 
-    void calibrated_projections(const std::string& path) {
+    void calibrated_projections(const std::string& path, int layer=0, int weight_mask=7) {
+        if(layer<0 || layer>2 || weight_mask<1 || weight_mask>7 ||
+           (layer!=0 && weight_mask!=2)) {
+            throw std::invalid_argument("unsupported calibrated GDN layer/weight mask");
+        }
         artifact::Reader reader(path);
         if (reader.identity() != artifact::ArtifactIdentity{
             "qwen4/native-fp8-projection-qualification", "senfu-fp8-source"}) {
@@ -391,7 +395,7 @@ struct Fixture {
         }
         const auto replace = [&](quantized_weight::PackedWeight& target,
                                  const char* role, int rows, int columns, int permutation) {
-            const std::string name = std::string("model.language_model.layers.0.linear_attn.") + role + ".weight";
+            const std::string name = "model.language_model.layers."+std::to_string(layer)+".linear_attn." + role + ".weight";
             const auto* object = reader.find(name);
             const auto* descriptor = object ? std::get_if<artifact::TensorDescriptor>(object) : nullptr;
             if (!descriptor || descriptor->format != artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M ||
@@ -428,11 +432,61 @@ struct Fixture {
             target.weight.scale_nb[0] = 4;
             for (int axis=1; axis<4; ++axis) { target.weight.scale_nb[axis] = 8; }
         };
-        replace(native_qkv, "in_proj_qkv", kQkvRows, kHidden, 0);
-        replace(native_z, "in_proj_z", kValueRows, kHidden, 1);
-        replace(native_output, "out_proj", kHidden, kValueRows, 2);
+        if(weight_mask&1) replace(native_qkv, "in_proj_qkv", kQkvRows, kHidden, 0);
+        if(weight_mask&2) replace(native_z, "in_proj_z", kValueRows, kHidden, 1);
+        if(weight_mask&4) replace(native_output, "out_proj", kHidden, kValueRows, 2);
         qkv = native_qkv.payload; z = native_z.payload; output = native_output.payload;
         upload();
+    }
+
+    void row_fp8_z2(const std::string& path, bool source_order=true) {
+        artifact::Reader reader(path);
+        const artifact::ArtifactIdentity identity=source_order ? artifact::ArtifactIdentity{
+            "qwen4/native-projection-candidate","source-bf16-row-fp8"} : artifact::ArtifactIdentity{
+            "qwen4/native-prefill-qualification","mixed-fp8-tiled"};
+        if(reader.identity()!=identity) {
+            throw std::invalid_argument("wrong row-FP8 Z2 source/prepared artifact");
+        }
+        const auto* object=reader.find(source_order?"weight":
+            "model.language_model.layers.2.linear_attn.in_proj_z.weight");
+        const auto* descriptor=object?std::get_if<artifact::TensorDescriptor>(object):nullptr;
+        if(!descriptor || descriptor->format!=artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S ||
+           descriptor->layout!=artifact::StorageLayout::RowScaleV1 ||
+           descriptor->shape!=std::vector<std::uint64_t>{kValueRows,kHidden}) {
+            throw std::invalid_argument("invalid row-FP8 Z2 candidate descriptor");
+        }
+        const auto source=reader.payload(*descriptor).data;
+        const std::size_t codes=std::size_t(kValueRows)*kHidden;
+        if(source.size()!=codes+2*kValueRows) {
+            throw std::invalid_argument("invalid row-FP8 Z2 candidate payload");
+        }
+        native_z.payload.resize(source.size());
+        // Source candidates move code rows AND exact BF16 scale words. Prepared
+        // native artifacts already use execution order. Neither path re-encodes.
+        for(int row=0;row<kValueRows;++row) {
+            const int head=row/kHeadDim;
+            const int source_row=source_order ?
+                ((head%kQkHeads)*3+head/kQkHeads)*kHeadDim+row%kHeadDim : row;
+            std::memcpy(native_z.payload.data()+std::size_t(row)*kHidden,
+                        source.data()+std::size_t(source_row)*kHidden,kHidden);
+            std::memcpy(native_z.payload.data()+codes+2*row,source.data()+codes+2*source_row,2);
+        }
+        native_z.code_plane_bytes=codes;
+        native_z.scale_plane_offset=codes;
+        native_z.scale_plane_bytes=2*kValueRows;
+        auto& weight=native_z.weight;
+        weight.qtype=QType::FP8_E4M3FN_ROW_BF16S;
+        weight.layout=QuantLayout::RowScale;
+        weight.scale_dtype=DType::BF16;
+        weight.payload_bytes=native_z.payload.size();
+        weight.group_size=kHidden;weight.group=kHidden;
+        weight.scale_ne[0]=kValueRows;
+        weight.scale_nb[0]=2;
+        for(int axis=1;axis<4;++axis) {
+            weight.scale_ne[axis]=1;weight.scale_nb[axis]=2*kValueRows;
+        }
+        z=native_z.payload;
+        d_z=to_device(z);
     }
 
     ops::GatedDeltaNetLayerWeights views() {
@@ -1149,7 +1203,8 @@ static Result gdn_component(Fixture& fixture, const Result& input, bool partitio
     const int tokens=input.actual.size()/kHidden;
     std::vector<float> initial_conv(kQkvRows*3),initial_ssm(kHeadDim*kHeadDim*kValueHeads);
     const auto local=oracle(fixture,input.actual,initial_conv,initial_ssm,tokens);
-    const auto propagated=oracle(fixture,input.reference,initial_conv,initial_ssm,tokens);
+    const auto propagated=input.reference==input.actual?local:
+        oracle(fixture,input.reference,initial_conv,initial_ssm,tokens);
     auto dx=to_device_bf16(input.actual),dc=to_device_bf16(initial_conv),ds=to_device_f32(initial_ssm);
     GuardedDeviceBuffer dy(input.actual.size()*2);
     Tensor x(dx.p,DType::BF16,{kHidden,tokens}),y(dy.data(),DType::BF16,{kHidden,tokens}),
@@ -1180,13 +1235,26 @@ static Result gdn_component(Fixture& fixture, const Result& input, bool partitio
     const bool a8=policy.qkv==ops::LinearPolicy::AllowA8 || policy.z==ops::LinearPolicy::AllowA8 ||
         policy.output==ops::LinearPolicy::AllowA8;
     const bool qkv_a8=policy.qkv==ops::LinearPolicy::AllowA8;
-    result.failures=verify_reduction("sequence GDN local output",wide(result.actual),local.output,
-        a8?kA8OutputCriterion:kOutputCriterion);
+    const auto actual_output=wide(result.actual);
+    const auto& output_criterion=a8?kA8OutputCriterion:kOutputCriterion;
+    result.failures=verify_reduction("sequence GDN local output",actual_output,local.output,
+        output_criterion);
+    for(int token=0;token<tokens;++token) {
+        result.failures+=verify_reduction("sequence GDN local token "+std::to_string(token),
+            std::span<const double>(actual_output).subspan(std::size_t(token)*kHidden,kHidden),
+            std::span<const double>(local.output).subspan(std::size_t(token)*kHidden,kHidden),
+            output_criterion);
+    }
     result.failures+=verify_reduction("sequence GDN final conv",from_device_bf16(dc.p,initial_conv.size()),
         local.conv_state,qkv_a8?kA8ConvCriterion:kBf16ConvStateCriterion);
     const auto state=from_device<float>(ds.p,initial_ssm.size());
     result.failures+=verify_reduction("sequence GDN final SSM",wide(state),local.ssm_state,
         qkv_a8?kA8StateCriterion:kStateCriterion);
+    const auto conv_values=from_device_bf16(dc.p,initial_conv.size());
+    result.conv_actual.assign(conv_values.begin(),conv_values.end());
+    result.conv_reference=represented(propagated.conv_state);
+    result.recurrent_actual=state;
+    result.recurrent_reference.assign(propagated.ssm_state.begin(),propagated.ssm_state.end());
     result.failures+=dy.verify_guards("sequence GDN output");
     return result;
 }
@@ -1194,13 +1262,30 @@ Result gdn(const std::string& path, int layer, const Result& input, bool partiti
     Fixture fixture(path,layer);
     return gdn_component(fixture,input,partitioned);
 }
+Result gdn_row_fp8_z2(const std::string& path, const std::string& candidate,
+                      const Result& input, bool partitioned, bool a8) {
+    Fixture fixture(path,2);
+    fixture.row_fp8_z2(candidate);
+    return gdn_component(fixture,input,partitioned,
+        {ops::LinearPolicy::A16Only,a8?ops::LinearPolicy::AllowA8:ops::LinearPolicy::A16Only,
+         ops::LinearPolicy::A16Only});
+}
+Result gdn_prepared_row_z2(const std::string& path, const std::string& prepared,
+                          const Result& input, bool partitioned, bool a8) {
+    Fixture fixture(path,2);
+    fixture.row_fp8_z2(prepared,false);
+    return gdn_component(fixture,input,partitioned,
+        {ops::LinearPolicy::A16Only,a8?ops::LinearPolicy::AllowA8:ops::LinearPolicy::A16Only,
+         ops::LinearPolicy::A16Only});
+}
 Result gdn_calibrated(const std::string& root, const std::string& path, int layer,
-                      const Result& input, bool partitioned, int mask) {
-    if(layer!=0 || mask<0 || mask>7 || (mask&5)==5) {
+                      const Result& input, bool partitioned, int mask, int weight_mask) {
+    if(layer<0 || layer>2 || mask<0 || mask>7 || (mask&5)==5 || (mask&~weight_mask)) {
         throw std::invalid_argument("unqualified calibrated GDN source/policy");
     }
     Fixture fixture(path,layer);
-    fixture.calibrated_projections(root+"/qwen4-fp8-projections.ninfer");
+    fixture.calibrated_projections(root+(layer==0?"/qwen4-fp8-projections.ninfer":
+        "/qwen4-fp8-projection-additional.ninfer"),layer,weight_mask);
     using P=ops::LinearPolicy;
     return gdn_component(fixture,input,partitioned,
         {mask&1?P::AllowA8:P::A16Only,mask&2?P::AllowA8:P::A16Only,mask&4?P::AllowA8:P::A16Only});
@@ -1286,13 +1371,21 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL GDN admitted rejected QKV/output A8 combination\n"; ++failures;
         } catch (const std::invalid_argument&) {}
     }
-    for (auto type : {QType::BF16_CTRL, QType::FP8_E4M3FN_ROW_BF16S}) {
+    for (const auto policy : {
+            ops::GatedDeltaNetProjectionPolicy{ops::LinearPolicy::AllowA8,ops::LinearPolicy::A16Only,ops::LinearPolicy::A16Only},
+            ops::GatedDeltaNetProjectionPolicy{ops::LinearPolicy::A16Only,ops::LinearPolicy::A16Only,ops::LinearPolicy::AllowA8}}) {
         try {
-            (void)ops::gated_delta_net_layer_workspace_capacity_bytes(65,type,type,type,
-                {ops::LinearPolicy::A16Only,ops::LinearPolicy::AllowA8,ops::LinearPolicy::A16Only});
-            std::cerr << "FAIL GDN admitted A8 for an unqualified projection format\n"; ++failures;
+            (void)ops::gated_delta_net_layer_workspace_capacity_bytes(65,
+                QType::FP8_E4M3FN_ROW_BF16S,QType::FP8_E4M3FN_ROW_BF16S,QType::FP8_E4M3FN_ROW_BF16S,policy);
+            std::cerr << "FAIL GDN admitted row-FP8 QKV/output A8\n"; ++failures;
         } catch (const std::invalid_argument&) {}
     }
+    try {
+        (void)ops::gated_delta_net_layer_workspace_capacity_bytes(65,
+            QType::BF16_CTRL,QType::BF16_CTRL,QType::BF16_CTRL,
+            {ops::LinearPolicy::A16Only,ops::LinearPolicy::AllowA8,ops::LinearPolicy::A16Only});
+        std::cerr << "FAIL GDN admitted BF16 Z A8\n"; ++failures;
+    } catch (const std::invalid_argument&) {}
     std::cout << (failures ? "FAIL" : "OK") << " gated_delta_net_layer\n";
     return failures == 0 ? 0 : 1;
 }

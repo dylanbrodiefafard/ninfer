@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -178,14 +179,15 @@ struct ResidentNvfp4Activation {
     }
 };
 
-template <class Geometry, int TileTokens, int InputTokenDivisor,
+template <class Geometry, int TileTokens, int InputTokenDivisor, bool Fp32Output = false,
           class Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, TileTokens>::Type>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm)
 void resident_nvfp4_grouped_kernel(
     const __nv_bfloat16* input, const std::uint8_t* codes, const std::uint8_t* scales,
     float inverse_divisor, const float* expert_multipliers,
     const std::int32_t* counts, const std::int32_t* offsets,
-    const std::int32_t* occurrences, __nv_bfloat16* output, bool allow_a4,
+    const std::int32_t* occurrences,
+    std::conditional_t<Fp32Output,float,__nv_bfloat16>* output, bool allow_a4,
     int minimum_count, int maximum_count) {
     static_assert(Schedule::kWarpsPerRow == 1);
     static_assert(Schedule::kTokenTile == TileTokens);
@@ -233,13 +235,48 @@ void resident_nvfp4_grouped_kernel(
                 }
                 value = warp_reduce_sum(value);
                 if (lane == 0 && token < live) {
-                    output[static_cast<std::int64_t>(occurrences[begin + token]) *
-                               Geometry::kOutputRows + rows[row]] = __float2bfloat16_rn(value);
+                    const auto index=static_cast<std::int64_t>(occurrences[begin + token]) *
+                        Geometry::kOutputRows + rows[row];
+                    if constexpr (Fp32Output) { output[index]=value; }
+                    else { output[index]=__float2bfloat16_rn(value); }
                 }
             }
         }
         __syncthreads();
     }
+}
+
+// BF16 products are exactly represented in FP32. Preserve their addition residue
+// through projection and ranking: rounding a near tie to one FP32 logit can change
+// the observable expert order. These are private arithmetic words, not a new codec.
+__device__ __forceinline__ void router_add(float& high, float& low, float value) {
+    const float sum = __fadd_rn(high, value);
+    const float piece = __fsub_rn(sum, high);
+    const float error = __fadd_rn(__fsub_rn(high, __fsub_rn(sum, piece)),
+                                 __fsub_rn(value, piece));
+    high = sum;
+    low = __fadd_rn(low, error);
+}
+
+struct RouterRank {
+    float high;
+    float low;
+    __device__ operator float() const { return high; }
+    __device__ bool operator>(RouterRank other) const {
+        return high > other.high || (high == other.high && low > other.low);
+    }
+    __device__ bool operator==(RouterRank other) const {
+        return high == other.high && low == other.low;
+    }
+};
+
+__device__ __forceinline__ RouterRank router_rank(float high, float low) {
+    // Canonical nonoverlapping words permit lexicographic FP32 comparisons. Keep
+    // the residual even when both corrected high words round to the same logit.
+    const float sum = __fadd_rn(high, low);
+    const float piece = __fsub_rn(sum, high);
+    return {sum, __fadd_rn(__fsub_rn(high, __fsub_rn(sum, piece)),
+                           __fsub_rn(low, piece))};
 }
 
 template <class Control>
@@ -254,18 +291,21 @@ __global__ void resident_wide_router_logits_kernel(
                                               kQwen4SparseMoeHidden
                                : shared_gate;
     float partial[kAggregateTokens]{};
+    float residue[kAggregateTokens]{};
     for (int column = static_cast<int>(threadIdx.x);
          column < kQwen4SparseMoeHidden; column += blockDim.x) {
         const float weight = static_cast<float>(weights[column]);
 #pragma unroll
         for (int token = 0; token < kAggregateTokens; ++token) {
             if (token < tile_tokens) {
-                partial[token] = fmaf(
-                    weight,
-                    __bfloat162float(x[column +
+                const float value = __bfloat162float(x[column +
                                        static_cast<std::int64_t>(kQwen4SparseMoeHidden) *
-                                           (token_base + token)]),
-                    partial[token]);
+                                           (token_base + token)]);
+                if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                    if (row < kQwen4SparseMoeExperts) {
+                        router_add(partial[token], residue[token], __fmul_rn(weight, value));
+                    } else { partial[token] = fmaf(weight, value, partial[token]); }
+                } else { partial[token] = fmaf(weight, value, partial[token]); }
             }
         }
     }
@@ -274,16 +314,27 @@ __global__ void resident_wide_router_logits_kernel(
 #pragma unroll
     for (int token = 0; token < kAggregateTokens; ++token) {
         for (int offset = 16; offset > 0; offset >>= 1) {
-            partial[token] += __shfl_down_sync(kFullWarp, partial[token], offset);
+            const float other = __shfl_down_sync(kFullWarp, partial[token], offset);
+            if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                const float other_low = __shfl_down_sync(kFullWarp, residue[token], offset);
+                if (row < kQwen4SparseMoeExperts) {
+                    router_add(partial[token], residue[token], other);
+                    residue[token] = __fadd_rn(residue[token], other_low);
+                } else { partial[token] += other; }
+            } else { partial[token] += other; }
         }
     }
     __shared__ float warp_sums[kAggregateTokens][8];
+    __shared__ float warp_residues[kAggregateTokens][8];
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     if (lane == 0) {
 #pragma unroll
         for (int token = 0; token < kAggregateTokens; ++token) {
             warp_sums[token][warp] = partial[token];
+            if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                warp_residues[token][warp] = residue[token];
+            }
         }
     }
     __syncthreads();
@@ -291,14 +342,28 @@ __global__ void resident_wide_router_logits_kernel(
 #pragma unroll
         for (int token = 0; token < kAggregateTokens; ++token) {
             float total = lane < 8 ? warp_sums[token][lane] : 0.0F;
+            float low = 0.0F;
+            if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                low = lane < 8 ? warp_residues[token][lane] : 0.0F;
+            }
             for (int offset = 16; offset > 0; offset >>= 1) {
-                total += __shfl_down_sync(kFullWarp, total, offset);
+                const float other = __shfl_down_sync(kFullWarp, total, offset);
+                if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                    const float other_low = __shfl_down_sync(kFullWarp, low, offset);
+                    if (row < kQwen4SparseMoeExperts) {
+                        router_add(total, low, other);
+                        low = __fadd_rn(low, other_low);
+                    } else { total += other; }
+                } else { total += other; }
             }
             if (lane == 0 && token < tile_tokens) {
                 const int absolute_token = token_base + token;
                 if (row < kQwen4SparseMoeExperts) {
-                    logits[row + static_cast<std::int64_t>(kQwen4SparseMoeExperts) *
-                                     absolute_token] = total;
+                    const auto index = row + static_cast<std::int64_t>(kQwen4SparseMoeExperts) * absolute_token;
+                    if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                        logits[2 * index] = total;
+                        logits[2 * index + 1] = low;
+                    } else { logits[index] = total; }
                 } else {
                     shared_gate_value[absolute_token] = sigmoid(total);
                 }
@@ -779,46 +844,68 @@ __global__ void resident_router_logits_kernel(const __nv_bfloat16* x, const Cont
                                               float* shared_gate_value) {
     const int expert = static_cast<int>(blockIdx.x);
     float sum = 0.0F;
+    float low = 0.0F;
     const auto* row = expert < kQwen4SparseMoeExperts
                           ? weight + static_cast<std::int64_t>(expert) * kQwen4SparseMoeHidden
                           : shared_gate;
     for (int column = static_cast<int>(threadIdx.x); column < kQwen4SparseMoeHidden;
          column += blockDim.x) {
-        sum = fmaf(static_cast<float>(row[column]), __bfloat162float(x[column]), sum);
+        if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+            if (expert < kQwen4SparseMoeExperts) {
+                router_add(sum, low, __fmul_rn(static_cast<float>(row[column]), __bfloat162float(x[column])));
+            } else { sum = fmaf(static_cast<float>(row[column]), __bfloat162float(x[column]), sum); }
+        } else { sum = fmaf(static_cast<float>(row[column]), __bfloat162float(x[column]), sum); }
     }
     __shared__ float partial[kBlock];
+    __shared__ float residues[kBlock];
     partial[threadIdx.x] = sum;
+    if constexpr (std::is_same_v<Control, __nv_bfloat16>) { residues[threadIdx.x] = low; }
     __syncthreads();
     for (int stride = kBlock / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) { partial[threadIdx.x] += partial[threadIdx.x + stride]; }
+        if (threadIdx.x < stride) {
+            if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                if (expert < kQwen4SparseMoeExperts) {
+                    router_add(partial[threadIdx.x], residues[threadIdx.x], partial[threadIdx.x + stride]);
+                    residues[threadIdx.x] = __fadd_rn(residues[threadIdx.x], residues[threadIdx.x + stride]);
+                } else { partial[threadIdx.x] += partial[threadIdx.x + stride]; }
+            } else { partial[threadIdx.x] += partial[threadIdx.x + stride]; }
+        }
         __syncthreads();
     }
     if (threadIdx.x == 0) {
         if (expert < kQwen4SparseMoeExperts) {
-            logits[expert] = partial[0];
+            if constexpr (std::is_same_v<Control, __nv_bfloat16>) {
+                logits[2 * expert] = partial[0];logits[2 * expert + 1] = residues[0];
+            } else { logits[expert] = partial[0]; }
         } else {
             shared_gate_value[0] = sigmoid(partial[0]);
         }
     }
 }
 
+template <bool Compensated = false>
 __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
                              float* selected_weights) {
     static_assert(kBlock * 2 == kQwen4SparseMoeExperts);
-    __shared__ float ranking_logits[kQwen4SparseMoeExperts];
+    using Rank = std::conditional_t<Compensated, RouterRank, float>;
+    __shared__ Rank ranking_logits[kQwen4SparseMoeExperts];
     __shared__ float probabilities[kQwen4SparseMoeExperts];
-    __shared__ float candidate_logit[kBlock];
+    __shared__ Rank candidate_logit[kBlock];
     __shared__ std::int32_t candidate_id[kBlock];
     __shared__ float maximum;
     __shared__ float denominator;
 
     const int lane = static_cast<int>(threadIdx.x);
     const int peer = lane + kBlock;
-    logits += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeExperts;
+    logits += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeExperts * (Compensated ? 2 : 1);
     selected_ids += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeTopK;
     selected_weights += static_cast<std::int64_t>(blockIdx.x) * kQwen4SparseMoeTopK;
-    ranking_logits[lane] = logits[lane];
-    ranking_logits[peer] = logits[peer];
+    if constexpr (Compensated) {
+        ranking_logits[lane] = router_rank(logits[2*lane], logits[2*lane+1]);
+        ranking_logits[peer] = router_rank(logits[2*peer], logits[2*peer+1]);
+    } else {
+        ranking_logits[lane] = logits[lane];ranking_logits[peer] = logits[peer];
+    }
     __syncthreads();
     if (lane == 0) {
         float value = ranking_logits[0];
@@ -828,8 +915,8 @@ __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
         maximum = value;
     }
     __syncthreads();
-    probabilities[lane] = expf(logits[lane] - maximum);
-    probabilities[peer] = expf(logits[peer] - maximum);
+    probabilities[lane] = expf(float(ranking_logits[lane]) - maximum);
+    probabilities[peer] = expf(float(ranking_logits[peer]) - maximum);
     __syncthreads();
     if (lane == 0) {
         float sum = 0.0F;
@@ -844,8 +931,8 @@ __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
     __syncthreads();
 
     for (int rank = 0; rank < kQwen4SparseMoeTopK; ++rank) {
-        const float lane_logit = ranking_logits[lane];
-        const float peer_logit = ranking_logits[peer];
+        const Rank lane_logit = ranking_logits[lane];
+        const Rank peer_logit = ranking_logits[peer];
         if (peer_logit > lane_logit) {
             candidate_logit[lane] = peer_logit;
             candidate_id[lane] = peer;
@@ -856,7 +943,7 @@ __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
         __syncthreads();
         for (int stride = kBlock / 2; stride > 0; stride >>= 1) {
             if (lane < stride) {
-                const float other_logit = candidate_logit[lane + stride];
+                const Rank other_logit = candidate_logit[lane + stride];
                 const std::int32_t other_id = candidate_id[lane + stride];
                 if (other_logit > candidate_logit[lane] ||
                     (other_logit == candidate_logit[lane] &&
@@ -870,7 +957,9 @@ __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
         if (lane == 0) {
             selected_ids[rank] = candidate_id[0];
             selected_weights[rank] = probabilities[candidate_id[0]];
-            ranking_logits[candidate_id[0]] = -CUDART_INF_F;
+            if constexpr (Compensated) {
+                ranking_logits[candidate_id[0]] = RouterRank{-CUDART_INF_F, 0.0F};
+            } else { ranking_logits[candidate_id[0]] = -CUDART_INF_F; }
         }
         __syncthreads();
     }
@@ -886,17 +975,21 @@ __global__ void route_kernel(float* logits, std::int32_t* selected_ids,
     }
 }
 
+template <bool Compensated = false>
 __global__ void resident_route_kernel(float* logits, std::int32_t* selected_ids,
                                       float* selected_weights) {
     static_assert(kQwen4SparseMoeExperts == 512);
-    __shared__ float ranking_logits[kQwen4SparseMoeExperts];
+    using Rank = std::conditional_t<Compensated, RouterRank, float>;
+    __shared__ Rank ranking_logits[kQwen4SparseMoeExperts];
     __shared__ float probabilities[kQwen4SparseMoeExperts];
     __shared__ std::int32_t ranking_ids[kQwen4SparseMoeExperts];
     __shared__ float maximum;
     __shared__ float denominator;
 
     const int expert = static_cast<int>(threadIdx.x);
-    ranking_logits[expert] = logits[expert];
+    if constexpr (Compensated) {
+        ranking_logits[expert] = router_rank(logits[2*expert], logits[2*expert+1]);
+    } else { ranking_logits[expert] = logits[expert]; }
     ranking_ids[expert] = expert;
     __syncthreads();
     if (expert == 0) {
@@ -907,7 +1000,7 @@ __global__ void resident_route_kernel(float* logits, std::int32_t* selected_ids,
         maximum = value;
     }
     __syncthreads();
-    probabilities[expert] = expf(logits[expert] - maximum);
+    probabilities[expert] = expf(float(ranking_logits[expert]) - maximum);
     __syncthreads();
     if (expert == 0) {
         // Preserve the expert-order FP32 sum used by the original implementation. Parallel work
@@ -926,8 +1019,8 @@ __global__ void resident_route_kernel(float* logits, std::int32_t* selected_ids,
         for (int stride = width >> 1; stride > 0; stride >>= 1) {
             const int peer = expert ^ stride;
             if (peer > expert) {
-                const float left_logit = ranking_logits[expert];
-                const float right_logit = ranking_logits[peer];
+                const Rank left_logit = ranking_logits[expert];
+                const Rank right_logit = ranking_logits[peer];
                 const std::int32_t left_id = ranking_ids[expert];
                 const std::int32_t right_id = ranking_ids[peer];
                 const bool left_better =
@@ -1046,7 +1139,8 @@ __global__ void prefill_scatter_kernel(const __nv_bfloat16* expert,
         expert[index];
 }
 
-__global__ void prefill_finish_kernel(const __nv_bfloat16* rank_results,
+template<class RankResult>
+__global__ void prefill_finish_kernel(const RankResult* rank_results,
                                       const float* selected_weights,
                                       const __nv_bfloat16* shared,
                                       const float* shared_gate,
@@ -1060,10 +1154,12 @@ __global__ void prefill_finish_kernel(const __nv_bfloat16* rank_results,
 #pragma unroll
     for (int rank = 0; rank < kQwen4SparseMoeTopK; ++rank) {
         const std::int64_t rank_token = rank + static_cast<std::int64_t>(kQwen4SparseMoeTopK) * token;
-        routed = fmaf(selected_weights[rank_token],
-                      __bfloat162float(rank_results[
-                          column + static_cast<std::int64_t>(kQwen4SparseMoeHidden) * rank_token]),
-                      routed);
+        const auto value=rank_results[column + static_cast<std::int64_t>(kQwen4SparseMoeHidden) * rank_token];
+        if constexpr (std::is_same_v<RankResult,float>) {
+            routed=fmaf(selected_weights[rank_token],value,routed);
+        } else {
+            routed=fmaf(selected_weights[rank_token],__bfloat162float(value),routed);
+        }
     }
     destination[index] = __float2bfloat16_rn(
         fmaf(shared_gate[token], __bfloat162float(shared[index]), routed));
@@ -1111,9 +1207,15 @@ void qwen4_sparse_moe_resident_route_launch(
     if (router.qtype == QType::BF16_CTRL) { project.template operator()<__nv_bfloat16>(); }
     else { project.template operator()<float>(); }
     CUDA_CHECK(cudaGetLastError());
-    resident_route_kernel<<<1, kQwen4SparseMoeExperts, 0, stream>>>(
-        static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
-        static_cast<float*>(selected_weights.data));
+    if (router.qtype == QType::BF16_CTRL) {
+        resident_route_kernel<true><<<1, kQwen4SparseMoeExperts, 0, stream>>>(
+            static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
+            static_cast<float*>(selected_weights.data));
+    } else {
+        resident_route_kernel<<<1, kQwen4SparseMoeExperts, 0, stream>>>(
+            static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
+            static_cast<float*>(selected_weights.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1135,10 +1237,15 @@ void qwen4_sparse_moe_resident_wide_route_launch(
     if (router.qtype == QType::BF16_CTRL) { project.template operator()<__nv_bfloat16>(); }
     else { project.template operator()<float>(); }
     CUDA_CHECK(cudaGetLastError());
-    route_kernel<<<width, kBlock, 0, stream>>>(
-        static_cast<float*>(logits.data),
-        static_cast<std::int32_t*>(selected_ids.data),
-        static_cast<float*>(selected_weights.data));
+    if (router.qtype == QType::BF16_CTRL) {
+        route_kernel<true><<<width, kBlock, 0, stream>>>(
+            static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
+            static_cast<float*>(selected_weights.data));
+    } else {
+        route_kernel<<<width, kBlock, 0, stream>>>(
+            static_cast<float*>(logits.data), static_cast<std::int32_t*>(selected_ids.data),
+            static_cast<float*>(selected_weights.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1263,13 +1370,13 @@ void qwen4_sparse_moe_a4_linear_launch(
     }
 }
 
-template <class Geometry, int TileTokens, int InputTokenDivisor>
+template <class Geometry, int TileTokens, int InputTokenDivisor, bool Fp32Output = false>
 void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
                            const Tensor& offsets, const Tensor& occurrences,
                            Tensor& output, cudaStream_t stream, bool allow_a4,
                            int minimum_count, int maximum_count) {
     using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, TileTokens>::Type;
-    resident_nvfp4_grouped_kernel<Geometry, TileTokens, InputTokenDivisor>
+    resident_nvfp4_grouped_kernel<Geometry, TileTokens, InputTokenDivisor,Fp32Output>
         <<<dim3(Geometry::kOutputRows / Schedule::kRowsPerCta, kQwen4SparseMoeExperts),
            Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(input.data),
@@ -1283,23 +1390,24 @@ void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor
             static_cast<const std::int32_t*>(counts.data),
             static_cast<const std::int32_t*>(offsets.data),
             static_cast<const std::int32_t*>(occurrences.data),
-            static_cast<__nv_bfloat16*>(output.data), allow_a4, minimum_count, maximum_count);
+            static_cast<std::conditional_t<Fp32Output,float,__nv_bfloat16>*>(output.data),
+            allow_a4, minimum_count, maximum_count);
 }
 
-template <class Geometry, int InputTokenDivisor>
+template <class Geometry, int InputTokenDivisor, bool Fp32Output = false>
 void launch_resident_nvfp4(const Tensor& input, const Weight& bank, const Tensor& counts,
                            const Tensor& offsets, const Tensor& occurrences,
                            Tensor& output, cudaStream_t stream, bool allow_a4) {
     if (occurrences.ne[0] <= 2 * kQwen4SparseMoeTopK) {
-        launch_resident_nvfp4<Geometry, 2, InputTokenDivisor>(input, bank, counts, offsets,
+        launch_resident_nvfp4<Geometry, 2, InputTokenDivisor,Fp32Output>(input, bank, counts, offsets,
                                                             occurrences, output, stream, allow_a4, 1, 2);
     } else {
         // Routing occupancy, not request width, determines the useful token tile. The
         // common sparse groups avoid sixteen-token arithmetic; populated groups retain
         // the existing weight-reuse schedule. Disjoint filters write every occurrence once.
-        launch_resident_nvfp4<Geometry, 2, InputTokenDivisor>(input, bank, counts, offsets,
+        launch_resident_nvfp4<Geometry, 2, InputTokenDivisor,Fp32Output>(input, bank, counts, offsets,
                                                             occurrences, output, stream, allow_a4, 1, 2);
-        launch_resident_nvfp4<Geometry, 16, InputTokenDivisor>(input, bank, counts, offsets,
+        launch_resident_nvfp4<Geometry, 16, InputTokenDivisor,Fp32Output>(input, bank, counts, offsets,
                                                              occurrences, output, stream, allow_a4, 3, occurrences.ne[0]);
     }
 }
@@ -1327,8 +1435,14 @@ void qwen4_sparse_moe_resident_native_linear_launch(
     Tensor& output, bool input_is_ranked, cudaStream_t stream, bool allow_a4) {
     if (bank.qtype == QType::NVFP4 || bank.qtype == QType::NVFP4_EXPERT_F32M) {
         if (input_is_ranked) {
-            launch_resident_nvfp4<Nvfp4N2560K640Geometry, 1>(
-                input, bank, counts, offsets, occurrences, output, stream, allow_a4);
+            if(output.dtype==DType::FP32) {
+                if(allow_a4) throw std::invalid_argument("FP32 routed-down storage is A16 only");
+                launch_resident_nvfp4<Nvfp4N2560K640Geometry, 1,true>(
+                    input, bank, counts, offsets, occurrences, output, stream, false);
+            } else {
+                launch_resident_nvfp4<Nvfp4N2560K640Geometry, 1>(
+                    input, bank, counts, offsets, occurrences, output, stream, allow_a4);
+            }
         } else {
             launch_resident_nvfp4<Nvfp4N640K2560Geometry, kQwen4SparseMoeTopK>(
                 input, bank, counts, offsets, occurrences, output, stream, allow_a4);
@@ -1514,13 +1628,23 @@ void qwen4_sparse_moe_prefill_finish_launch(const Tensor& rank_results,
                                             Tensor& destination, cudaStream_t stream) {
     const std::int64_t count =
         static_cast<std::int64_t>(kQwen4SparseMoeHidden) * destination.ne[1];
-    prefill_finish_kernel<<<static_cast<unsigned>((count + kBlock - 1) / kBlock), kBlock, 0,
-                            stream>>>(
-        static_cast<const __nv_bfloat16*>(rank_results.data),
-        static_cast<const float*>(selected_weights.data),
-        static_cast<const __nv_bfloat16*>(shared.data),
-        static_cast<const float*>(shared_gate_value.data),
-        static_cast<__nv_bfloat16*>(destination.data), destination.ne[1]);
+    if(rank_results.dtype==DType::FP32) {
+        prefill_finish_kernel<<<static_cast<unsigned>((count + kBlock - 1) / kBlock), kBlock, 0,
+                                stream>>>(
+            static_cast<const float*>(rank_results.data),
+            static_cast<const float*>(selected_weights.data),
+            static_cast<const __nv_bfloat16*>(shared.data),
+            static_cast<const float*>(shared_gate_value.data),
+            static_cast<__nv_bfloat16*>(destination.data), destination.ne[1]);
+    } else {
+        prefill_finish_kernel<<<static_cast<unsigned>((count + kBlock - 1) / kBlock), kBlock, 0,
+                                stream>>>(
+            static_cast<const __nv_bfloat16*>(rank_results.data),
+            static_cast<const float*>(selected_weights.data),
+            static_cast<const __nv_bfloat16*>(shared.data),
+            static_cast<const float*>(shared_gate_value.data),
+            static_cast<__nv_bfloat16*>(destination.data), destination.ne[1]);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -12,6 +12,9 @@ namespace ninfer::test::qwen4_sequence {
 struct Result {
     std::vector<float> actual, reference; int failures = 0;
     std::vector<int> discrete_ids; // Optional observable router/selector trace for storage experiments.
+    std::vector<int> reference_discrete_ids; // Independently propagated inputs, not same-input GPU gate.
+    // Native corpus captures compare propagated recurrent history, not just same-input output.
+    std::vector<float> conv_actual, conv_reference, recurrent_actual, recurrent_reference;
     Result() = default;
     Result(const std::vector<double>& values, std::vector<float> expected)
         : actual(values.begin(),values.end()), reference(std::move(expected)) {}
@@ -40,8 +43,12 @@ ReadResult read(const std::string& path, int layer, const Result& residual, cons
                 bool partitioned=false);
 Result inject(const Result& residual, const Result& block, const Result& scale, bool partitioned=false);
 Result gdn(const std::string& path, int layer, const Result& input, bool partitioned);
+Result gdn_row_fp8_z2(const std::string& path, const std::string& candidate,
+                      const Result& input, bool partitioned, bool a8=false);
+Result gdn_prepared_row_z2(const std::string& path, const std::string& prepared,
+                          const Result& input, bool partitioned, bool a8);
 Result gdn_calibrated(const std::string& root, const std::string& path, int layer,
-                      const Result& input, bool partitioned, int mask);
+                      const Result& input, bool partitioned, int mask, int weight_mask=7);
 int gdn_a8_input_diagnostic(const std::string& root,const Result& input);
 Result qsa(const std::string& path, const Result& input, bool partitioned, bool diagnostic_nvfp4=false);
 Result qsa_calibrated(const std::string& root,const std::string& path,const Result& input,
@@ -53,5 +60,6 @@ Result moe(const std::string& path, int layer, const Result& input, bool partiti
 void moe_a4_calibration_coverage(const std::string& path,int layer,
                                  std::span<const float> input,std::span<const int> experts);
 Result moe_calibrated(const std::string& root, const std::string& path, int layer,
-                      const Result& input, bool partitioned, int mask, bool allow_a4 = false);
+                      const Result& input, bool partitioned, int mask, bool allow_a4 = false,
+                      int weight_mask = 7, const std::string& shared_up_nvfp4 = {});
 }

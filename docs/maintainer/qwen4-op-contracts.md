@@ -76,6 +76,31 @@ error `6.1035e-5` to `1.2207e-4`. These are BF16-midpoint crossings, not a reaso
 fixture-specific numerical threshold. Panel versus repeated decode and the 32+33 / 128+129
 chunk continuations retain the existing output and FP32 state checks.
 
+Native GDN QKV profiles now use the existing FP32 normalized recurrent route at
+every panel width, including prefill. A longer authentic layer-1 input exposed a failure
+in the private FP16 chunked recurrence: relative L2 `0.003612`, maximum absolute error
+`0.017770` against the unchanged gross limit `0.010346`. On the same represented input,
+the recurrent route gives `0.001684` / `0.003739` and passes. This changes private
+arithmetic and its workspace, not the mathematical oracle, BF16 convolution history or
+FP32 persistent state. The separate diagnostic GGML profile retains its qualified
+chunked route. All eight137/257-token calibration/held-out documents passed the original
+whole-output GDN/state gates. Before the further QKV accumulation repair below,
+the complete layer-1 Op at T137 measured395.264us median on
+RTX5090/CUDA13.1 (three warmups, eleven CUDA-event samples, state restore outside the
+interval). This is historical profile cost, not a measured speedup. Propagated-chain
+routing sensitivity is separate and remains explicitly reported in the active plan.
+
+Stronger per-token checks exposed native BF16 QKV accumulation errors amplified by
+the declared BF16 consumer boundaries. Native `[10240,2560]` QKV now uses compensated
+existing SIMT schedules through T20 and K16 MMA partials with compensated
+cross-partial sums from T21, rounding the accumulator pair directly to BF16.
+This is a private accuracy profile, not a guarantee of exact projection rounding;
+other Linear callers retain their existing arithmetic. The failed 257-token input
+and all four original held-out layer-1 inputs pass the unchanged complete-output,
+per-token and state criteria. Complete-GDN cost on the failed input rises from
+559.104 to630.752us; T1 medians are94.144 versus96.256us with overlapping ranges.
+Public BF16 boundaries and FP32 persistent state remain unchanged.
+
 The native BF16/BF16 GR read now retains FP32 normalized values, projection accumulations and
 SILU/up intermediates. Real source layer-0 MLP hyperconnection weights exposed a gross-error
 failure hidden by the synthetic fixture: BF16 staging produced `-0.703125` versus the complete
@@ -1128,14 +1153,31 @@ moe      = routed + shared.
 
 Native resident MoE accepts the source BF16 router and shared scalar-gate pair directly;
 neither weight needs an FP32 device copy. The existing FP32 pair remains the diagnostic
-storage profile. BF16 loads widen exactly for protected FP32 dot products and nonlinearities.
-This changes storage, not the closed Op's ideal logits, exact top-k ordering or observable
-FP32 selected coefficients. The pinned Transformers unfused router instead materializes BF16
+storage profile. BF16 loads widen exactly. The native router retains a two-FP32 summation
+expansion through dot reduction and ranking; the shared scalar gate and diagnostic FP32
+profile retain their FP32 dots. This avoids losing close expert order merely by rounding a
+private logit to FP32; it is not a claim of exact real arithmetic for every possible input.
+Neither the control storage profile nor the private reduction correction changes the closed
+Op's ideal logits, exact top-k ordering or FP32 selected-coefficient output representation.
+The pinned Transformers unfused router instead materializes BF16
 logits before FP32 softmax and casts selected coefficients back to BF16. That framework
 arithmetic profile can create additional ties; bit-identical framework routing is not the
 closed ideal Op's contract. Source-weight fidelity must not be described as framework bit
 parity. Native real-weight and synthetic BF16-control tests use the same complete independent
 MoE oracle and unchanged route/output criteria as the FP32-storage profile.
+
+The disjoint-corpus calibration-science input reproduced a native layer-3 token-2
+ordering failure: ideal expert logits 412 and 88 differ by `4.90125e-7`, but the former
+FP32 reduction collapsed them to a false tie. The retained correction canonicalizes
+the two-word sum and compares `(high, low)` without FP64 dot products or comparisons.
+The captured 137-row panel, decode witness, distinct logits that round to the same
+FP32 value, and opposite-sign cancellation true ties pass the independent FP64
+ordering/probability oracle in eager and graph execution. The complete MoE synthetic
+oracle also retains a false-tie witness across its native decode/prefill widths.
+On RTX 5090 / CUDA 13.1, isolated projection-plus-ranking CUDA-event medians over
+three 100-call runs changed from `12.34` to `16.42` us at one token and `69.94` to
+`202.79` us at 137 tokens. These are the measured cost of the correctness repair,
+not whole-MoE or model latency claims; no routing or output gate was relaxed.
 
 The `Store` epilogue writes `destination=moe`; the existing `AddResidual` epilogue remains for its
 existing registered geometry. Logical expert id always selects the same router row and two stored
@@ -1402,7 +1444,7 @@ top-k boundary, so such trace differences are reported separately and are not de
 bit-identical full-chain routing. The 2% accumulated criterion is unchanged. This panel is
 not a calibration corpus or a substitute for full-model PPL.
 
-The corresponding `--native-text-fp8` panel also passes whole/32+1 with the thirteen
+The earlier `--native-text-fp8` panel passed whole/32+1 with the thirteen
 source-calibrated FP8 projection matrices (GDN layer 0, QSA layer 3, shared experts in
 layers 0/3), all with A16 operands and BF16 cache. QSA same-input output relative L2 is
 `0.00414611`/`0.00414967`; BF16 K/V state relative L2 is approximately `0.00166`.
@@ -1410,9 +1452,9 @@ The accumulated comparison propagates the represented FP8 weights independently;
 establishes implementation correctness for that input panel, not equality to BF16 weights
 or a measured full-model weight-quantization loss.
 
-The selective `--native-text-a8` panel uses guarded A8 for GDN layer-0 Z and all
+The earlier selective `--native-text-a8` panel used guarded A8 for GDN layer-0 Z and all
 three shared-expert projections in layers 0/3, with QSA and other GDN projections
-remaining A16. Whole33 and 32+1 pass the unchanged local/state and 2% accumulated
+remaining A16. Whole33 and 32+1 passed the unchanged local/state and 2% accumulated
 criteria. The original static-scale attempt failed: EOS token 15 produces a GDN
 input maximum of 49.75 against source range 16.875. Independent attribution gives
 static Z projection relative error 0.212924, dominated by clipping; the guarded
@@ -1421,6 +1463,27 @@ in the guarded chain is 0.00418435/0.00418893. Exact same-input routing checks
 remain in place; independently propagated inputs still change some top-k choices.
 This closes the reproduced calibration-clipping defect for the represented panel,
 not future-checkpoint calibration or full-model quality qualification.
+
+The expanded disjoint 137/257-token corpus supersedes that broad source recipe.
+The current selective policy uses tensor-FP8 Z0 and row-FP8 Z2 with A8, shared layer0 FP8 gate/up
+with **up only** A8, and shared layers1..3 FP8 gate with **gate only** A8. Other
+shared projections and all QSA matrices stay BF16/A16. Z1 remains A16. The A16 text witness uses
+the same narrowed weights without A8; historical timings above/below do not describe
+the replacement recipe. Storage and activation policy admission are checked separately
+by the exact native artifact binder. Source-loss evidence and rejected combinations
+are recorded in `docs/research/qwen4-quantization-recommendations.md`; none is a
+whole-model quality admission.
+
+For resident native NVFP4 or expert-scaled NVFP4 routed-down weights with A16
+expert execution, private per-rank down results remain FP32 through the existing
+rank-ordered FP32 weighted sum. Only the public destination is stored as BF16.
+The mainloop, gate/up and SwiGLU arithmetic are unchanged. This removes premature
+per-expert down rounding exposed by a real mixed-FP8 shared-expert input; it does
+not insert those private intermediates into the mathematical oracle. Workspace
+planning and execution use the same format/policy predicate. The extra capacity is
+51,200 bytes per token (12.55 MiB at T257); FP8/GGML down and the entire explicit
+AllowA4 expert profile retain their existing BF16 rank storage, including A16
+fallback groups within that A4 profile.
 
 That T=17 witness exposed a premature private BF16 core-K projection cast: using the same
 represented actual input, 170 decoded K values differed from the independent ideal cache, while

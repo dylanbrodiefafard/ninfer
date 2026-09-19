@@ -27,33 +27,31 @@ constexpr ReductionCriterion accumulated{.02,.005,.02};
 int prefill_policies(const LoadedNativeFirstBlock& model,const std::string& source,
                     const std::string& prepared,DeviceContext& device) {
     artifact::Reader reader(prepared+"/qwen4-native-fp8-projections.ninfer");
-    if(reader.identity()!=artifact::ArtifactIdentity{"qwen4/native-prefill-qualification","senfu-fp8-tiled"})
+    if(reader.identity()!=artifact::ArtifactIdentity{"qwen4/native-prefill-qualification","mixed-fp8-tiled"})
         throw std::runtime_error("native prefill requires audited prepared FP8 overrides");
     artifact::Binder binder(reader);std::map<std::string,artifact::ObjectHandle> handles;
     for(const auto& obj:reader.objects()) {
         const auto& t=std::get<artifact::TensorDescriptor>(obj);
-        handles.emplace(t.name,artifact::bind_device_tensor(binder,t.name,
-            artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M,{t.shape.at(0),t.shape.at(1)}));
+        const auto format=t.name=="model.language_model.layers.2.linear_attn.in_proj_z.weight"
+            ?artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S:artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M;
+        handles.emplace(t.name,artifact::bind_device_tensor(binder,t.name,format,{t.shape.at(0),t.shape.at(1)}));
     }
     auto owner=artifact::materialize(reader,binder.finish(),device);
     auto layers=model.layers();
-    auto matrix=[&](const std::string& name,int n,int k) {
-        return artifact::materialized_weight(owner,handles.at(name),artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M,n,k);
+    auto matrix=[&](const std::string& name,int n,int k,
+                    artifact::NumericFormat format=artifact::NumericFormat::FP8_E4M3FN_TENSOR_F32M) {
+        return artifact::materialized_weight(owner,handles.at(name),format,n,k);
     };
     const std::string prefix="model.language_model.layers.";
     auto& g=layers[0].gdn;
-    g.qkv=matrix(prefix+"0.linear_attn.in_proj_qkv.weight",10240,D);
     g.z=matrix(prefix+"0.linear_attn.in_proj_z.weight",6144,D);
-    g.output=matrix(prefix+"0.linear_attn.out_proj.weight",D,6144);
+    layers[2].gdn.z=matrix(prefix+"2.linear_attn.in_proj_z.weight",6144,D,
+        artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S);
     auto& q=layers[3].qsa;
-    q.core_query_gate=matrix(prefix+"3.self_attn.q_proj.weight",12288,D);
-    q.core_key=matrix(prefix+"3.self_attn.k_proj.weight",512,D);
-    q.core_value=matrix(prefix+"3.self_attn.v_proj.weight",512,D);
-    q.output=matrix(prefix+"3.self_attn.o_proj.weight",D,6144);
-    for(int l:{0,3}) {
+    for(int l=0;l<4;++l) {
         auto& m=layers[l].moe;const auto p=prefix+std::to_string(l)+".mlp.shared_expert.";
         m.shared_gate_proj=matrix(p+"gate_proj.weight",640,D);
-        m.shared_up=matrix(p+"up_proj.weight",640,D);m.shared_down=matrix(p+"down_proj.weight",D,640);
+        if(l==0) m.shared_up=matrix(p+"up_proj.weight",640,D);
     }
     seq::TextPanel panel(source);seq::Result reference;reference.actual=panel.residual;reference.reference=reference.actual;
     int failures=0;
@@ -63,11 +61,12 @@ int prefill_policies(const LoadedNativeFirstBlock& model,const std::string& sour
         const auto path=source+"/qwen4-layer-"+std::to_string(l)+".ninfer";
         if(l==1) {reference=seq::ple(source,reference,false,false,true);failures+=reference.failures;}
         const auto a=seq::read(path,l,reference);
-        const auto mixer=l==0?seq::gdn_calibrated(source,path,l,a.mixed,false,0):
-            l==3?seq::qsa_calibrated(source,path,a.mixed,false):seq::gdn(path,l,a.mixed,false);
+        const auto mixer=l==0?seq::gdn_calibrated(source,path,l,a.mixed,false,0,2):
+            l==2?seq::gdn_prepared_row_z2(path,prepared+"/qwen4-native-fp8-projections.ninfer",a.mixed,false,false):
+            l==3?seq::qsa(path,a.mixed,false):seq::gdn(path,l,a.mixed,false);
         const auto attention=seq::inject(reference,mixer,a.scale);
         const auto m=seq::read(path,l,attention,"mlp");
-        const auto expert=(l==0||l==3)?seq::moe_calibrated(source,path,l,m.mixed,false,0):seq::moe(path,l,m.mixed);
+        const auto expert=seq::moe_calibrated(source,path,l,m.mixed,false,0,false,l==0?3:1);
         reference=seq::inject(attention,expert,m.scale);
         failures+=a.mixed.failures+a.scale.failures+mixer.failures+attention.failures+
             m.mixed.failures+m.scale.failures+expert.failures+reference.failures;
@@ -143,7 +142,7 @@ int prefill_policies(const LoadedNativeFirstBlock& model,const std::string& sour
         input.actual.assign(mixed.begin(),mixed.end());input.reference=input.actual;
         const auto actual=from_device_bf16(s.block.data,D*65);
         const auto expected=seq::moe_calibrated(source,source+"/qwen4-layer-3.ninfer",3,input,false,
-            selective_a8(policy)?7:0,true);
+            selective_a8(policy)?1:0,true,1);
         failures+=expected.failures;
         failures+=verify_reduction("native routed-A4 decoder final MoE complete oracle",actual,
             seq::wide(expected.reference),ReductionCriterion{.16,1./32768,.16});
