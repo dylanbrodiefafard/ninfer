@@ -378,13 +378,67 @@ Neither the small context-entry protection nor the much larger attention/MLP exc
 this candidate; error accumulates through both sublayers, and protection is not monotonic across
 prefixes. This is evidence against admitting a guessed protected-role recipe, not against
 well-calibrated NVFP4 generally. Keep the source BF16 baseline and the existing explicit
-experimental NVFP4 opt-in; no production precision policy changes follow. The next useful
-quality evidence is a genuinely calibrated/trained draft checkpoint and representative accepted
-target features, not more uncalibrated exceptions selected on this single prompt.
+experimental NVFP4 opt-in; no production precision policy changes follow. These results motivate
+calibration on disjoint accepted-target feature documents, rather than more uncalibrated
+exceptions selected on this single prompt. The bounded calibration study below tests that step.
 
 CPU-only Python 3.11/PyTorch run, exact represented weights, unchanged independent FP64 formula
 and explicit public BF16 boundaries; report:
 `out/qwen4-dflash-target/qwen4-dflash-role-precision.json`.
+
+### Disjoint-document NVFP4 calibration assessment
+
+`ninfer_qwen4_dflash_target_features_test --capture-corpus` consumes an explicit corpus
+manifest and resets the complete UD-IQ1_S diagnostic target between eight authored documents:
+four calibration and four held-out. It captures 128 accepted teacher-forced tokens per
+document, including the five trained feature taps and, separately, post-layer-47 BF16 residuals
+and final-GR BF16 head inputs. The complete 28.8 GB PLE payload was populated and locked before
+execution in a 48 GiB/no-swap container; observed container swap remained zero. Only the
+existing diagnostic routed gate/up streaming exception applies. These are full-depth
+diagnostic-target features with actual text positions, **not native NVFP4 target features**.
+
+`tools/parity/qwen4/native_dflash_calibrate.py` fits the 36 matrices using either ordinary
+weight MSE or `sum_k E_cal[x_k^2] * (W_hat-W)^2` per K16 group. The latter is a diagonal
+second-moment approximation; it deliberately omits cross-column covariance. The fixed scale
+grid is `(0.5,0.625,0.75,0.875,1,1.125,1.25,1.375,1.5)` times each original scale, rounded to
+the existing finite E4M3 scale format. Signed E2M1 codes use nearest-even rounding. The
+original maxabs encoding remains a candidate, each matrix's original FP32 divisor is fixed,
+and every BF16 norm word is protected. Independent exact decode checks all stored code,
+scale and divisor words. No activation policy, codebook or production artifact is changed.
+
+`tools/parity/qwen4/native_dflash_calibration_study.py fit` uses only calibration feature
+bytes and the unchanged source-BF16 composition to collect moments. Both artifacts and all
+parameters are frozen in `fit.json` before `evaluate` reads held-out features. Contexts
+32/64/128 overlap within each document: held-out evidence is four documents, twelve context
+cases and 84 queries, not 84 independent prompts. The complete independent FP64 DFlash
+formula retains explicit public BF16 Op/state outputs; it does not copy private arithmetic.
+The predeclared supplementary source-loss screen requires every final-hidden query to meet
+relative-L2 `0.02` and max-absolute error `0.005 + 0.02 * max(abs(reference))`. This is not a
+same-input Op gate, model-quality budget or runtime admission rule.
+
+CPU Python 3.11/PyTorch evaluation, using captured RTX 5090 / CUDA 13.1.2 inputs:
+
+| Frozen matrix profile | Worst held-out query relative L2 | BF16 top-1 agreement | Mean KL, nats | Mean point-label NLL delta, nats |
+|---|---:|---:|---:|---:|
+| Original maxabs NVFP4 | 0.390006 | 66/84 | 0.0680885 | -0.0149850 |
+| Weight-MSE scale search | 0.365468 | 71/84 | 0.0718627 | -0.0108745 |
+| Input-second-moment scale search | 0.341112 | 73/84 | 0.0544579 | +0.0492845 |
+
+All 84 held-out queries fail the unchanged 2% screen for each profile. The weighted candidate
+has query drift 14.06–34.11%; its seven-query case aggregates are 16.71–28.34%. Better fitting
+loss, KL and top-1 agreement do not establish acceptable propagated fidelity, and point-label
+NLL moves in the opposite direction. The evaluator deliberately exits 1 after retaining the
+report. This bounded remedy is rejected for runtime/default admission; source BF16 remains the
+baseline. It is not a rejection of all possible NVFP4 calibration or training methods.
+
+Head metrics use the identical source BF16 head with an independent FP64 dot, no final BF16
+logit store, full 248,320-row domain and temperature one. They are not the Engine p-less/epsilon
+proposal law, target PPL or speculative acceptance. The original 24-token/three-prefix failed
+recipe is also rerun unchanged as a regression, not reused for fitting or counted as holdout.
+Retained inputs and reports are `out/qwen4-dflash-corpus/`,
+`out/qwen4-dflash-calibrated/fit.json` and `out/qwen4-dflash-calibration-assessment.json`.
+The calibrated artifacts use tool-only identity `qwen4/dflash-calibration-assessment`, not an
+identity accepted by the runtime binder.
 
 ### License provenance
 

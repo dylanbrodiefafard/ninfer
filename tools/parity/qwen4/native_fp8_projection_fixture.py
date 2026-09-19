@@ -1,8 +1,9 @@
 """Acquire exact calibrated per-tensor FP8 projections from the pinned producer.
 
 No expert bank, embedding table, requantization or runtime weight repacking.
-The source-only safetensors fixture can be converted offline once its exact
-canonical numeric format is available.
+The source-only safetensors fixture converts offline to the admitted calibrated
+tensor format without changing codes or either scalar word. The additional-layers
+mode selects only the eight layer-1/2 Z/shared projections.
 """
 
 from __future__ import annotations
@@ -34,6 +35,13 @@ SHAPES = {
        for role, shape in (("gate_proj", (640, 2560)), ("up_proj", (640, 2560)),
                            ("down_proj", (2560, 640)))},
 }
+ADDITIONAL_SHAPES = {
+    **{f"{layer}.linear_attn.in_proj_z": (6144, 2560) for layer in (1, 2)},
+    **{f"{layer}.mlp.shared_expert.{role}": shape
+       for layer in (1, 2)
+       for role, shape in (("gate_proj", (640, 2560)), ("up_proj", (640, 2560)),
+                           ("down_proj", (2560, 640)))},
+}
 
 
 def validate_scalar(raw: bytes) -> float:
@@ -45,14 +53,15 @@ def validate_scalar(raw: bytes) -> float:
     return value
 
 
-def build(output: Path) -> None:
+def build(output: Path, *, additional_layers: bool = False) -> None:
+    shapes = ADDITIONAL_SHAPES if additional_layers else SHAPES
     if output.exists() or output.with_suffix(".json").exists():
         raise FileExistsError(output)
     with urllib.request.urlopen(BASE + "model.safetensors.index.json", timeout=120) as response:
         index = json.load(response)["weight_map"]
     headers, tensors, source_report = {}, {}, {}
     total = 0
-    for role, shape in SHAPES.items():
+    for role, shape in shapes.items():
         report = {}
         for suffix in ("weight", "weight_scale", "input_scale"):
             name = PREFIX + role + "." + suffix
@@ -80,7 +89,7 @@ def build(output: Path) -> None:
             tensors[name] = (dtype, expected_shape, raw)
             total += size
         source_report[PREFIX + role] = report
-    if total != sum(math.prod(shape) + 8 for shape in SHAPES.values()):
+    if total != sum(math.prod(shape) + 8 for shape in shapes.values()):
         raise ValueError("selected FP8 byte count mismatch")
     header, offset = {}, 0
     for name, (dtype, shape, raw) in tensors.items():
@@ -101,10 +110,10 @@ def build(output: Path) -> None:
                   stream, indent=2)
         stream.write("\n")
     print(json.dumps(source_report, indent=2))
-    print(f"Acquired {total} bytes across {len(SHAPES)} projections")
+    print(f"Acquired {total} bytes across {len(shapes)} projections")
 
 
-def audit_controls(source_root: Path, report_path: Path) -> None:
+def audit_controls(source_root: Path, report_path: Path, *, additional_layers: bool = False) -> None:
     """Compare every unquantized selected-layer control byte to local NVIDIA source."""
     if report_path.exists():
         raise FileExistsError(report_path)
@@ -112,13 +121,18 @@ def audit_controls(source_root: Path, report_path: Path) -> None:
         index = json.load(response)["weight_map"]
     headers, comparisons = {}, {}
     total = 0
-    projection_names = {PREFIX + role + ".weight" for role in SHAPES}
-    for layer in (0, 3):
+    shapes = ADDITIONAL_SHAPES if additional_layers else SHAPES
+    projection_names = {PREFIX + role + ".weight" for role in shapes}
+    # These unselected quantized projections are not protected controls and are
+    # not assertions of compatible BF16 source identity.
+    excluded = {PREFIX + f"{layer}.linear_attn.{role}.weight"
+                for layer in (1,2) for role in ('in_proj_qkv','out_proj')} if additional_layers else set()
+    for layer in ((1, 2) if additional_layers else (0, 3)):
         with (source_root / f"qwen4-layer-{layer}.safetensors").open("rb") as stream:
             size = struct.unpack("<Q", stream.read(8))[0]
             local_header = json.loads(stream.read(size))
             for name, item in local_header.items():
-                if item.get("dtype") != "BF16" or ".mlp.experts." in name or name in projection_names:
+                if item.get("dtype") != "BF16" or ".mlp.experts." in name or name in projection_names or name in excluded:
                     continue
                 shard = index[name]
                 if shard not in headers:
@@ -143,6 +157,7 @@ def audit_controls(source_root: Path, report_path: Path) -> None:
                   compared_with_repository="nvidia/Qwen3.8-Flash-Next-NVFP4",
                   compared_with_revision="fc694b54fb0174e0913e6adf86691ef85a4ead47",
                   source_root=str(source_root), compared_bytes=total, exact_equal=comparisons,
+                  excluded_noncontrol_projections=sorted(excluded),
                   limitation="unquantized controls only; no expert or full-model identity assertion")
     with report_path.open("x") as stream:
         json.dump(report, stream, indent=2); stream.write("\n")
@@ -151,7 +166,7 @@ def audit_controls(source_root: Path, report_path: Path) -> None:
         raise ValueError("protected source roles differ; reuse is not admitted")
 
 
-def convert(source: Path, output: Path) -> None:
+def convert(source: Path, output: Path, *, additional_layers: bool = False) -> None:
     """Exact code/scalar rearrangement into the native calibrated tensor format."""
     import torch
     from safetensors import safe_open
@@ -160,16 +175,17 @@ def convert(source: Path, output: Path) -> None:
 
     if output.exists():
         raise FileExistsError(output)
+    shapes = ADDITIONAL_SHAPES if additional_layers else SHAPES
     specs = [TensorSpec(PREFIX + name + ".weight", shape, "FP8_E4M3FN_TENSOR_F32M",
-                        "tensor-calibrated-v1") for name, shape in SHAPES.items()]
+                        "tensor-calibrated-v1") for name, shape in shapes.items()]
     with safe_open(str(source), framework="pt", device="cpu") as src:
-        expected = {PREFIX + role + "." + suffix for role in SHAPES
+        expected = {PREFIX + role + "." + suffix for role in shapes
                     for suffix in ("weight", "weight_scale", "input_scale")}
         if set(src.keys()) != expected:
             raise ValueError("requires exact selected source projection inventory")
         with ArtifactWriter(output, ArtifactIdentity("qwen4/native-fp8-projection-qualification",
                                                      "senfu-fp8-source"), specs) as writer:
-            for role, shape in SHAPES.items():
+            for role, shape in shapes.items():
                 name = PREFIX + role
                 weight = src.get_tensor(name + ".weight")
                 if weight.dtype != torch.float8_e4m3fn or tuple(weight.shape) != shape:
@@ -190,13 +206,15 @@ def convert(source: Path, output: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--additional-layers", action="store_true",
+                        help="exact finite layer-1/2 Z and shared projection extension")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--audit-controls", type=Path, help="local pinned NVIDIA layer source directory")
     action.add_argument("--convert-source", type=Path, help="existing source-only projection safetensors")
     args = parser.parse_args()
     if args.audit_controls:
-        audit_controls(args.audit_controls, args.out)
+        audit_controls(args.audit_controls, args.out, additional_layers=args.additional_layers)
     elif args.convert_source:
-        convert(args.convert_source, args.out)
+        convert(args.convert_source, args.out, additional_layers=args.additional_layers)
     else:
-        build(args.out)
+        build(args.out, additional_layers=args.additional_layers)

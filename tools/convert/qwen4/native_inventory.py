@@ -3,31 +3,65 @@ from tools.artifact.container import ArtifactIdentity, TensorSpec
 
 IDENTITY = ArtifactIdentity("qwen4/native-preview", "nvfp4-native")
 MAIN = "model.language_model."
+NVFP4_SHARED_UP = MAIN+"layers.0.mlp.shared_expert.up_proj.weight"
 FRONTEND_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                   "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json")
-FP8_ROLES = frozenset(
+FP8_ORIGINAL_ROLES = frozenset(
     [f"{MAIN}layers.{layer}.mlp.shared_expert.{role}_proj.weight"
      for layer in (0, 3) for role in ("gate", "up", "down")]
     + [f"{MAIN}layers.0.linear_attn.{role}.weight" for role in ("in_proj_qkv", "in_proj_z", "out_proj")]
     + [f"{MAIN}layers.3.self_attn.{role}_proj.weight" for role in ("q", "k", "v", "o")])
+FP8_ADDITIONAL_ROLES = frozenset(
+    [f"{MAIN}layers.{layer}.linear_attn.in_proj_z.weight" for layer in (1, 2)] +
+    [f"{MAIN}layers.{layer}.mlp.shared_expert.{role}_proj.weight"
+     for layer in (1, 2) for role in ("gate", "up", "down")])
+# Immutable source inventories are not product admission. The additional source bundle
+# includes unqualified candidates; only independently qualified selected roles may be emitted.
+FP8_SOURCE_BUNDLES = {"original13": FP8_ORIGINAL_ROLES, "additional8": FP8_ADDITIONAL_ROLES}
+FP8_SHARED_MASKS = ({0,1,2,3,4,6,7}, {0,1,2,4,5}, {0,1,2,3,4,5}, {0,1,2,3})
+FP8_ROLES = frozenset(
+    [f"{MAIN}layers.{layer}.linear_attn.in_proj_z.weight" for layer in (0,1)] +
+    [f"{MAIN}layers.{layer}.mlp.shared_expert.{role}_proj.weight"
+     for layer in range(4) for bit,role in ((1,"gate"),(2,"up"),(4,"down"))
+     if bit in FP8_SHARED_MASKS[layer]])
 PREFILL_POLICIES = {"a16": 0, "selective-a8": 1, "routed-a4": 2, "routed-a4-selective-a8": 3}
 A8_ROLES = frozenset(
     [f"{MAIN}layers.0.linear_attn.in_proj_z.weight"] +
     [f"{MAIN}layers.{layer}.mlp.shared_expert.{role}_proj.weight"
-     for layer in (0, 3) for role in ("gate", "up", "down")])
-# Independently selected weight-only candidates; never an A8 activation policy.
+     for layer in range(4) for role in (("gate","up") if layer==0 else ("gate",))])
+A8_ROW_ROLES = frozenset([MAIN+"layers.2.linear_attn.in_proj_z.weight"])
+# Storage roles are independent of activation policy; only row-Z2 participates in
+# the explicitly selected complete A8 prefill recipe above.
 ROW_FP8_ROLES = frozenset(
-    [MAIN+"embed_tokens.weight", "lm_head.weight"] +
+    [MAIN+"embed_tokens.weight", "lm_head.weight", MAIN+"layers.2.linear_attn.in_proj_z.weight"] +
     [MAIN+"hyper_connection_mixer.input_mix_weight_"+role+".weight" for role in ("down", "up")] +
     [MAIN+"layers.1.ple."+role+"_proj.weight" for role in ("key", "value")])
 
 
-def prefill_policy_bytes(policy, fp8_roles):
+def validate_fp8_selection(fp8_roles):
+    roles=set(fp8_roles)
+    if not roles<=FP8_ROLES:
+        raise ValueError("unqualified native tensor-FP8 role")
+    masks=[]
+    for layer in range(4):
+        mask=sum(bit for bit,role in ((1,"gate"),(2,"up"),(4,"down"))
+                 if f"{MAIN}layers.{layer}.mlp.shared_expert.{role}_proj.weight" in roles)
+        if mask not in FP8_SHARED_MASKS[layer]:
+            raise ValueError(f"unqualified layer-{layer} shared tensor-FP8 weight combination")
+        masks.append(mask)
+    return masks
+
+
+def prefill_policy_bytes(policy, fp8_roles, row_fp8_roles=()):
     if policy not in PREFILL_POLICIES:
         raise ValueError("unknown exact native prefill recipe")
     value = PREFILL_POLICIES[policy]
-    if value & 1 and not A8_ROLES <= set(fp8_roles):
-        raise ValueError("selective A8 prefill requires all seven audited FP8 roles")
+    masks=validate_fp8_selection(fp8_roles)
+    if not set(row_fp8_roles)<=ROW_FP8_ROLES:
+        raise ValueError("unqualified native row-FP8 role")
+    if value & 1 and (not A8_ROLES <= set(fp8_roles) or masks!=[3,1,1,1] or
+                     not A8_ROW_ROLES <= set(row_fp8_roles)):
+        raise ValueError("selective A8 requires tensor-Z0, row-Z2 and shared FP8 weight masks 3,1,1,1")
     return bytes([value])
 
 
@@ -40,15 +74,21 @@ LAYOUTS = {"BF16": "contiguous-le-v1", "FP32": "contiguous-le-v1",
            "FP8_E4M3FN_TENSOR_BF16S": "tensor-scale-v1"}
 
 
-def tensor_specs(ple_format="NVFP4_PARTITION_F32M", dflash_format=None, fp8_roles=(), row_fp8_roles=()):
+def tensor_specs(ple_format="NVFP4_PARTITION_F32M", dflash_format=None, fp8_roles=(), row_fp8_roles=(), nvfp4_shared_up=False):
     if ple_format not in ("NVFP4_PARTITION_F32M", "FP8_E4M3FN_TENSOR_BF16S"):
         raise ValueError("native PLE must use an actual NVFP4 or FP8 source codec")
-    if dflash_format not in (None, "BF16", "NVFP4") or not set(fp8_roles) <= FP8_ROLES:
+    if dflash_format not in (None, "BF16", "NVFP4"):
         raise ValueError("unqualified native projection profile")
+    validate_fp8_selection(fp8_roles)
+    if nvfp4_shared_up and any(name.startswith(MAIN+"layers.0.mlp.shared_expert.")
+                              for name in set(fp8_roles)|set(row_fp8_roles)):
+        raise ValueError("NVFP4 shared-up cannot mix with unqualified layer-0 shared FP8 weights")
     if not set(row_fp8_roles) <= ROW_FP8_ROLES:
         raise ValueError("unqualified native weight-only FP8 role")
     specs = []
     def add(name, shape, fmt="BF16"):
+        if nvfp4_shared_up and name==NVFP4_SHARED_UP:
+            fmt="NVFP4"
         if name in fp8_roles:
             if fmt != "BF16": raise ValueError("protected control cannot become FP8")
             fmt = "FP8_E4M3FN_TENSOR_F32M"

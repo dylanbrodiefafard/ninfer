@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -130,7 +131,7 @@ bf16_mma_tile_coordinates(std::int32_t linear, std::int32_t tiles_m, std::int32_
     }
 }
 
-template <class Geometry, class Schedule, bool FullTokens, class Output>
+template <class Geometry, class Schedule, bool FullTokens, class Output, bool Compensated = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     std::int32_t tokens) {
@@ -175,6 +176,30 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     const auto output_tile = output.tile(m0);
 
     float accum[MT][NT][4] = {};
+    float residual[Compensated ? MT : 1][Compensated ? NT : 1][4] = {};
+
+    // The native GDN ingress profile bounds each Tensor Core accumulation to one K16 atom.
+    // TwoSum preserves the cross-atom addition residue; it cannot recover rounding inside MMA.
+    auto accumulate = [&](int mi, int ni, unsigned a0, unsigned a1, unsigned a2,
+                          unsigned a3, unsigned b0, unsigned b1) {
+        if constexpr (Compensated) {
+            float partial[4] = {};
+            mma_bf16(partial[0], partial[1], partial[2], partial[3], a0, a1, a2, a3, b0, b1);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float prior = accum[mi][ni][j];
+                const float sum = __fadd_rn(prior, partial[j]);
+                const float recovered = __fsub_rn(sum, prior);
+                const float error = __fadd_rn(__fsub_rn(prior, __fsub_rn(sum, recovered)),
+                                              __fsub_rn(partial[j], recovered));
+                residual[mi][ni][j] = __fadd_rn(residual[mi][ni][j], error);
+                accum[mi][ni][j] = sum;
+            }
+        } else {
+            mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
+                     accum[mi][ni][3], a0, a1, a2, a3, b0, b1);
+        }
+    };
 
     const int a_matrix     = lane >> 3;
     const int a_inner_row  = lane & 7;
@@ -285,8 +310,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[slot][mi][0], a_frag[slot][mi][1],
+                        accumulate(mi, ni, a_frag[slot][mi][0], a_frag[slot][mi][1],
                                  a_frag[slot][mi][2], a_frag[slot][mi][3], b_frag[slot][ni][0],
                                  b_frag[slot][ni][1]);
                     }
@@ -302,8 +326,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(accum[mi][ni][0], accum[mi][ni][1], accum[mi][ni][2],
-                                 accum[mi][ni][3], a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
+                        accumulate(mi, ni, a_frag[mi][0], a_frag[mi][1], a_frag[mi][2],
                                  a_frag[mi][3], b_frag[ni][0], b_frag[ni][1]);
                     }
                 }
@@ -326,7 +349,17 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
         for (int ni = 0; ni < NT; ++ni) {
             const int token0   = n0 + wn * WN + ni * 8 + 2 * lid;
             const int token1   = token0 + 1;
-            const float* value = accum[mi][ni];
+            // The accurate output policy accepts a double only for final rounding of the pair,
+            // not FP64 matrix arithmetic. Ordinary Linear retains its original float epilogue.
+            using StoreValue = typename std::conditional<Compensated, double, float>::type;
+            StoreValue value[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if constexpr (Compensated) {
+                    value[j] = static_cast<double>(accum[mi][ni][j]) +
+                               static_cast<double>(residual[mi][ni][j]);
+                } else { value[j] = accum[mi][ni][j]; }
+            }
             if constexpr (M % BM != 0) {
                 if (row0 < M) {
                     if (FullTokens || token0 < tokens) output_tile.store(row0, token0, value[0]);

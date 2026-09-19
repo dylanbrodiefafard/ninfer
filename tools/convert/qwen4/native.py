@@ -17,11 +17,11 @@ import struct
 
 import torch
 
-from tools.artifact.container import Artifact, ArtifactIdentity, ArtifactWriter, ResourceSpec
+from tools.artifact.container import Artifact, ArtifactIdentity, ArtifactWriter, ResourceSpec, TensorSpec
 from tools.artifact.layouts import encode_direct, encode_nvfp4_experts, encode_fp8_calibrated, decode_fp8_calibrated_words
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.common.fp8_quantize import encode_source_fp8
-from tools.convert.qwen4.native_inventory import IDENTITY, MAIN, FRONTEND_FILES, FP8_ROLES, ROW_FP8_ROLES, PREFILL_POLICIES, prefill_policy_bytes, tensor_specs
+from tools.convert.qwen4.native_inventory import IDENTITY, MAIN, NVFP4_SHARED_UP, FRONTEND_FILES, FP8_ROLES, FP8_SOURCE_BUNDLES, ROW_FP8_ROLES, PREFILL_POLICIES, prefill_policy_bytes, tensor_specs, validate_fp8_selection
 from tools.convert.qwen4.native_prepare import transformed
 from tools.reference.qwen4.ngram import NGramConfig, layer_multipliers, layout
 
@@ -118,20 +118,55 @@ def validate_component(artifact,specs,prefix="",source_controls=False):
             raise ValueError(f"native component representation differs: {obj.name}")
 
 
-def validate_fp8(artifact,audit_path,roles):
+def validate_fp8_bundle(artifact,audit_path):
+    """Validate one immutable finite source bundle, independently of selected product roles."""
     if artifact.identity!=ArtifactIdentity("qwen4/native-fp8-projection-qualification","senfu-fp8-source"):
         raise ValueError("requires audited source-calibrated FP8 projection component")
-    if not roles or not set(roles)<=FP8_ROLES: raise ValueError("FP8 roles must be explicit qualified source projections")
+    names={obj.name for obj in artifact.objects}
+    bundle=next((name for name,roles in FP8_SOURCE_BUNDLES.items() if names==roles),None)
+    if bundle is None: raise ValueError("requires exact original13 or additional8 FP8 source inventory")
+    roles=FP8_SOURCE_BUNDLES[bundle]
     report=json.loads(audit_path.read_text())
-    if report.get("revision")!=FP8_REVISION or report.get("compared_with_revision")!=NVIDIA_REVISION:
+    if (report.get("repository")!="senfu/Qwen3.8-Flash-Next-NVFP4" or
+        report.get("compared_with_repository")!="nvidia/Qwen3.8-Flash-Next-NVFP4" or
+        report.get("revision")!=FP8_REVISION or report.get("compared_with_revision")!=NVIDIA_REVISION):
         raise ValueError("FP8 protected-control provenance mismatch")
+    layers=(0,3) if bundle=="original13" else (1,2)
+    excluded={f"{MAIN}layers.{layer}.linear_attn.{role}.weight"
+              for layer in (1,2) for role in ("in_proj_qkv","out_proj")} if bundle=="additional8" else set()
+    if set(report.get("excluded_noncontrol_projections",[]))!=excluded:
+        raise ValueError("FP8 control audit exclusion scope differs")
     control_names={name for name,(dtype,_) in source_requirements().items()
-                   if dtype=="BF16" and (name.startswith(MAIN+"layers.0.") or name.startswith(MAIN+"layers.3."))
-                   and name not in FP8_ROLES}
+                   if dtype=="BF16" and any(name.startswith(f"{MAIN}layers.{layer}.") for layer in layers)
+                   and ".ple." not in name and name not in roles and name not in excluded}
     if set(report.get("exact_equal",{}))!=control_names or not all(report["exact_equal"].values()):
         raise ValueError("FP8 source protected controls were not compared exactly")
-    expected={s.name:s for s in tensor_specs(fp8_roles=FP8_ROLES) if s.name in FP8_ROLES}
-    validate_component(artifact,list(expected.values()))
+    expected=[TensorSpec(s.name,s.shape,"FP8_E4M3FN_TENSOR_F32M","tensor-calibrated-v1")
+              for s in tensor_specs() if s.name in roles]
+    validate_component(artifact,expected)
+    return bundle
+
+
+def bind_fp8_sources(sources,roles):
+    """One/two audited finite bundles -> unique source owner for each selected matrix."""
+    selected=set(roles)
+    if len(selected)!=len(roles) or not selected<=FP8_ROLES:
+        raise ValueError("FP8 roles must be unique explicit qualified source projections")
+    validate_fp8_selection(selected)
+    if bool(sources)!=bool(selected) or len(sources)>2:
+        raise ValueError("FP8 selection requires one or two audited source bundles and explicit roles")
+    owners={};provenance=[];seen=set()
+    for artifact,audit in sources:
+        bundle=validate_fp8_bundle(artifact,audit)
+        if bundle in seen: raise ValueError("duplicate FP8 source bundle")
+        seen.add(bundle)
+        supplied=selected & FP8_SOURCE_BUNDLES[bundle]
+        if not supplied: raise ValueError("FP8 source bundle has no selected role")
+        owners.update({name:artifact for name in supplied})
+        provenance.append({"bundle":bundle,"roles":sorted(supplied),"revision":FP8_REVISION,
+                           "protected_controls_compared_with_revision":NVIDIA_REVISION})
+    if owners.keys()!=selected: raise ValueError("selected FP8 role has no audited source bundle")
+    return owners,provenance
 
 
 def fp8_payload(artifact,spec):
@@ -141,6 +176,39 @@ def fp8_payload(artifact,spec):
     role=spec.name.split(".",4)[-1]  # main prefix and exact layer index are removed.
     if role.startswith("linear_attn."): codes=transformed(role,codes)
     return encode_fp8_calibrated(codes,wm,im)
+
+
+def validate_nvfp4_shared_up(artifact,component_path,fit_path):
+    """Admit only the frozen, role-bound layer-0 shared-up A16 weight candidate."""
+    profile="nvfp4_diagonal_calibrated"
+    if artifact.identity!=ArtifactIdentity("qwen4/native-projection-candidate",profile):
+        raise ValueError("requires frozen diagonal-calibrated NVFP4 shared-up candidate")
+    validate_component(artifact,[TensorSpec("weight",(640,2560),"NVFP4","blockscale-k16-m128x4-v1"),
+                                 TensorSpec("input_scale_divisor",(),"FP32","contiguous-le-v1")])
+    fit=json.loads(fit_path.read_text())
+    if fit.get("layer")!=0 or fit.get("stage")!="calibration_fit" or fit.get("complete") is not True:
+        raise ValueError("requires completed layer-0 calibration-only fit")
+    role=fit.get("roles",{}).get("shared_up",{})
+    if role.get("source_tensor")!=NVFP4_SHARED_UP or role.get("shape")!=[640,2560]:
+        raise ValueError("frozen NVFP4 candidate is not exact layer-0 shared-up")
+    candidate=role.get("variants",{}).get(profile,{})
+    if Path(candidate.get("artifact","")).resolve()!=component_path.resolve():
+        raise ValueError("explicit NVFP4 component differs from frozen fit artifact")
+    manifest=json.loads(Path(fit["manifest"]).read_text())
+    if manifest.get("repository")!="nvidia/Qwen3.8-Flash-Next-NVFP4" or manifest.get("revision")!=NVIDIA_REVISION:
+        raise ValueError("NVFP4 shared-up calibration source provenance differs")
+    calibration=[p["id"] for p in manifest["panels"] if p["split"]=="calibration"]
+    documents=candidate.get("documents",[])
+    if (not calibration or len(set(calibration))!=len(calibration) or
+        fit.get("calibration_ids")!=calibration or fit.get("evaluated_panels")!=calibration or
+        [p.get("id") for p in documents]!=calibration or any(p.get("split")!="calibration" for p in documents)):
+        raise ValueError("NVFP4 frozen fit must contain only its declared calibration panels")
+    recipe="K16 E4M3 scale factor search minimizing diagonal input-energy weighted error on calibration only; original global FP32 divisor; independent FP64 code decode and dots."
+    if fit.get("recipe")!=recipe:
+        raise ValueError("unqualified NVFP4 shared-up fitting recipe")
+    return {"role":NVFP4_SHARED_UP,"profile":profile,"recipe":recipe,
+            "source_revision":NVIDIA_REVISION,"calibration_ids":calibration,
+            "activation_policy":"A16Only; fitted activation divisor not imported"}
 
 
 def native_fp8_ple(reader):
@@ -179,11 +247,11 @@ def convert(args):
                  ArtifactIdentity("qwen4/native-dflash-qualification","pixelml-nvfp4-a16"):"NVFP4"}
             if draft.identity not in ids: raise ValueError("requires the exact PixelML DFlash companion")
             draft_format=ids[draft.identity]
-        fp8=stack.enter_context(Artifact(args.fp8_projections)) if args.fp8_projections else None
-        if bool(fp8)!=bool(args.fp8_role) or bool(fp8)!=bool(args.fp8_controls_audit):
-            raise ValueError("FP8 override requires source component, controls audit and explicit role list together")
-        if fp8: validate_fp8(fp8,args.fp8_controls_audit,args.fp8_role)
-        specs=tensor_specs(ple_format,draft_format,args.fp8_role,args.row_fp8_role)
+        fp8,fp8_sources=bind_fp8_sources(
+            [(stack.enter_context(Artifact(component)),audit) for component,audit in args.fp8_source],args.fp8_role)
+        shared_up=stack.enter_context(Artifact(args.nvfp4_shared_up[0])) if args.nvfp4_shared_up else None
+        shared_up_profile=validate_nvfp4_shared_up(shared_up,*args.nvfp4_shared_up) if shared_up else None
+        specs=tensor_specs(ple_format,draft_format,args.fp8_role,args.row_fp8_role,shared_up is not None)
         validate_component(mtp,[s for s in specs if s.name.startswith("mtp.")],source_controls=True)
         if ple: validate_component(ple,[s for s in specs if s.name=="ple.table"])
         if draft: validate_component(draft,[s for s in specs if s.name.startswith("dflash.")],prefix="dflash.")
@@ -194,12 +262,13 @@ def convert(args):
                  "mtp_source":"limpincat/flashnext-drafters","mtp_revision":MTP_REVISION,
                  "ple_format":ple_format,"dflash_format":draft_format,"fp8_roles":sorted(args.fp8_role),
                  "row_fp8_roles":sorted(args.row_fp8_role),
+                 "nvfp4_shared_up":shared_up_profile,
                  "row_fp8_recipe":"source-BF16 per-row maxabs/448, BF16 scale, E4M3FN nearest-even",
-                 "fp8_revision":FP8_REVISION if fp8 else None,"prefill_policy":args.prefill_policy,
+                 "fp8_sources":fp8_sources,"prefill_policy":args.prefill_policy,
                  "decode_verify_policy":"A16Only","model_quality":"requires full-model qualification",
                  "dflash_quality":"not admitted as a default" if draft_format=="NVFP4" else "checkpoint-specific qualification required"}
         resources["native-profile.json"]=(json.dumps(profile,sort_keys=True)+"\n").encode()
-        resources["native-prefill-policy"]=prefill_policy_bytes(args.prefill_policy,args.fp8_role)
+        resources["native-prefill-policy"]=prefill_policy_bytes(args.prefill_policy,args.fp8_role,args.row_fp8_role)
         objects=specs+[ResourceSpec(name,"raw-bytes-v1",len(data)) for name,data in resources.items()]
         args.out.parent.mkdir(parents=True,exist_ok=True)
         temporary=args.out.with_suffix(".ninfer.partial")
@@ -211,10 +280,11 @@ def convert(args):
                 elif name.startswith("mtp."):
                     payload=(encode_direct(prepared(name,artifact_bf16(mtp,name)),"FP32")
                              if spec.format=="FP32" else copy_payload(mtp,name))
-                elif spec.format=="FP8_E4M3FN_TENSOR_F32M": payload=fp8_payload(fp8,spec)
+                elif spec.format=="FP8_E4M3FN_TENSOR_F32M": payload=fp8_payload(fp8[name],spec)
                 elif spec.format=="FP8_E4M3FN_ROW_BF16S":
                     payload=encode_source_fp8(prepared(name,source.get(source_name(name))))
                 elif spec.format=="NVFP4_EXPERT_F32M": payload=expert_payload(source,spec)
+                elif name==NVFP4_SHARED_UP and shared_up: payload=copy_payload(shared_up,"weight")
                 else: payload=encode_direct(prepared(name,source.get(source_name(name))),spec.format)
                 writer.write(name,payload)
                 print(name,flush=True)
@@ -228,11 +298,13 @@ if __name__=="__main__":
     parser.add_argument("--mtp",type=Path,required=True,help="audited native NVFP4 MTP component")
     parser.add_argument("--ple",type=Path,help="complete audited native NVFP4 PLE; omitted uses source NVIDIA FP8 table")
     parser.add_argument("--dflash",type=Path,help="optional audited PixelML BF16 or NVFP4 companion")
-    parser.add_argument("--fp8-projections",type=Path)
-    parser.add_argument("--fp8-controls-audit",type=Path)
+    parser.add_argument("--fp8-source",type=Path,nargs=2,action="append",default=[],metavar=("COMPONENT","AUDIT"),
+                        help="one exact original13/additional8 component and its control audit; repeat at most twice")
     parser.add_argument("--fp8-role",action="append",default=[],choices=sorted(FP8_ROLES))
     parser.add_argument("--row-fp8-role",action="append",default=[],choices=sorted(ROW_FP8_ROLES),
-                        help="explicit original-BF16 weight-only candidate; A16 computation; not quality admission")
+                        help="explicit original-BF16 row weight; A16 default, Z2 A8 only in selective prefill; not quality admission")
+    parser.add_argument("--nvfp4-shared-up",type=Path,nargs=2,metavar=("COMPONENT","FIT_JSON"),
+                        help="frozen diagonal-calibrated layer-0 shared-up weight; A16 only, no layer-0 shared FP8 mix")
     parser.add_argument("--prefill-policy",default="a16",choices=tuple(PREFILL_POLICIES),
                         help="explicit full C1 prefill candidate; decode/verify/head remain A16; not quality admission")
     parser.add_argument("--out",type=Path,required=True)

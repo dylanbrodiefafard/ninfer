@@ -12,15 +12,17 @@ import json
 from pathlib import Path
 import struct
 import urllib.request
+from functools import lru_cache
 
 from tokenizers import Tokenizer
 
-from tools.artifact.container import ArtifactIdentity, ArtifactWriter, TensorSpec
+from tools.artifact.container import Artifact, ArtifactIdentity, ArtifactWriter, TensorSpec
 from tools.parity.qwen4.native_source import BASE, REPOSITORY, REVISION, read_header, read_range
 from tools.parity.qwen4.native_ple_fixture import SHARD_ROWS
 from tools.reference.qwen4.ngram import NGramConfig, ids, layer_multipliers, layout
 
 
+@lru_cache(maxsize=4)
 def bounded_file(name: str, limit: int) -> bytes:
     with urllib.request.urlopen(BASE + name, timeout=120) as response:
         data = response.read(limit + 1)
@@ -29,7 +31,8 @@ def bounded_file(name: str, limit: int) -> bytes:
     return data
 
 
-def build(output: Path, component_report: Path) -> None:
+def build(output: Path, component_report: Path, *, texts: list[str] | None = None,
+          width: int = 33, split: str | None = None, ple_table: Path | None = None) -> None:
     if output.exists() or output.with_suffix(".json").exists():
         raise FileExistsError(output)
     config = NGramConfig()
@@ -42,11 +45,18 @@ def build(output: Path, component_report: Path) -> None:
         if constants[prefix + name] != list(expected):
             raise ValueError(f"independent hash constants disagree with source: {name}")
     tokenizer = Tokenizer.from_str(bounded_file("tokenizer.json", 32 * 1024 * 1024).decode())
-    texts = ["Explain why the sky appears blue during the day and red at sunset.",
-             "def square(x):\n    return x * x\nWhat is square(7)?"]
-    tokens = (tokenizer.encode(texts[0], add_special_tokens=False).ids + [config.eos_token_id]
-              + tokenizer.encode(texts[1], add_special_tokens=False).ids)[:33]
-    if len(tokens) != 33 or any(not 0 <= token < config.unigram_vocab_size for token in tokens):
+    if not 2 <= width <= 4096 or split not in (None, "calibration", "heldout"):
+        raise ValueError("invalid bounded text-panel width or split")
+    if texts is None:
+        texts = ["Explain why the sky appears blue during the day and red at sunset.",
+                 "def square(x):\n    return x * x\nWhat is square(7)?"]
+    tokens = []
+    for text in texts:
+        if tokens:
+            tokens.append(config.eos_token_id)
+        tokens.extend(tokenizer.encode(text, add_special_tokens=False).ids)
+    tokens = tokens[:width]
+    if len(tokens) != width or any(not 0 <= token < config.unigram_vocab_size for token in tokens):
         raise ValueError("pinned token panel changed")
     rows, _ = ids(tokens, config=config)
     global_rows = rows.reshape(-1).tolist()
@@ -61,7 +71,7 @@ def build(output: Path, component_report: Path) -> None:
     if embedding["dtype"] != "BF16" or embedding["shape"] != [248320, 2560]:
         raise ValueError("source token embedding representation changed")
     ple_shard = "model-fp8-mtp-ple.safetensors"
-    ple_base, ple_header = read_header(ple_shard)
+    ple_base, ple_header = read_header(ple_shard) if ple_table is None else (None, None)
     ple_prefix = prefix + "ngram_embedding."
 
     def embedding_row(token: int) -> bytes:
@@ -77,14 +87,30 @@ def build(output: Path, component_report: Path) -> None:
         return read_range(BASE + ple_shard, begin, begin + 159)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        token_bytes = b"".join(pool.map(embedding_row, tokens))
+        unique_tokens = sorted(set(tokens))
+        token_cache = dict(zip(unique_tokens, pool.map(embedding_row, unique_tokens)))
+        token_bytes = b"".join(token_cache[token] for token in tokens)
         print(f"acquired {len(tokens)} source token embedding rows", flush=True)
-        ple_bytes = b"".join(pool.map(ple_row, unique_rows))
-    scalar = ple_header[ple_prefix + "weight_scale"]
-    if scalar["dtype"] != "BF16" or scalar["shape"] != [1]:
-        raise ValueError("source PLE scale representation changed")
-    begin, end = scalar["data_offsets"]
-    scale = read_range(BASE + ple_shard, ple_base + begin, ple_base + end - 1)
+        if ple_table is None:
+            ple_bytes = b"".join(pool.map(ple_row, unique_rows))
+    if ple_table is None:
+        scalar = ple_header[ple_prefix + "weight_scale"]
+        if scalar["dtype"] != "BF16" or scalar["shape"] != [1]:
+            raise ValueError("source PLE scale representation changed")
+        begin, end = scalar["data_offsets"]
+        scale = read_range(BASE + ple_shard, ple_base + begin, ple_base + end - 1)
+    else:
+        # Offline fixture extraction only. Engine startup still eagerly locks the full table.
+        with Artifact(ple_table) as source:
+            table_object = source.find("ple.table")
+            if (source.identity != ArtifactIdentity("qwen4/native-ple-qualification", "nvidia-fp8-complete-table")
+                    or table_object.shape != (320001536, 160)
+                    or table_object.format != "FP8_E4M3FN_TENSOR_BF16S"):
+                raise ValueError("requires complete pinned-source FP8 PLE artifact")
+            payload = source.payload(table_object)
+            ple_bytes = b"".join(bytes(payload[row*160:(row+1)*160]) for row in unique_rows)
+            scale = bytes(payload[-2:])
+            del payload
     if scale != b"\x51\x39" or any(code & 0x7f == 0x7f for code in ple_bytes):
         raise ValueError("source PLE scale or finite-code audit failed")
     specs = [TensorSpec("token.embeddings", (len(tokens), 2560), "BF16", "contiguous-le-v1"),
@@ -93,16 +119,17 @@ def build(output: Path, component_report: Path) -> None:
              TensorSpec("ple.global_rows", (len(tokens), 16), "I32", "contiguous-le-v1"),
              TensorSpec("ple.local_rows", (len(tokens), 16), "I32", "contiguous-le-v1")]
     output.parent.mkdir(parents=True, exist_ok=True)
-    with ArtifactWriter(output, ArtifactIdentity("qwen4/native-text-qualification", "nvidia-source-33"), specs) as writer:
+    profile = "nvidia-source-33" if split is None else "nvidia-source-corpus"
+    with ArtifactWriter(output, ArtifactIdentity("qwen4/native-text-qualification", profile), specs) as writer:
         writer.write("token.embeddings", token_bytes)
         writer.write("ple.rows", ple_bytes + scale)
         for name, values in (("token.ids", tokens), ("ple.global_rows", global_rows), ("ple.local_rows", local_rows)):
             writer.write(name, struct.pack(f"<{len(values)}i", *values))
     with output.with_suffix(".json").open("x") as stream:
         json.dump(dict(repository=REPOSITORY, revision=REVISION, texts=texts, token_ids=tokens,
-                       truncated_to=33, unique_ple_rows=unique_rows,
+                       truncated_to=width, split=split, unique_ple_rows=unique_rows,
                        source_payload_bytes=len(token_bytes) + len(ple_bytes) + 2,
-                       boundary="real token embeddings and exact hashed FP8 rows; no calibration or PPL"), stream, indent=2)
+                       boundary="real token embeddings and exact hashed FP8 rows; bounded component inputs, not model PPL"), stream, indent=2)
         stream.write("\n")
     print(f"wrote {output}: {len(tokens)} tokens, {len(unique_rows)} unique PLE rows", flush=True)
 

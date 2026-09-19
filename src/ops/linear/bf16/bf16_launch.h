@@ -22,5 +22,7 @@ void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
 // Private QSA key / MoE shared gate-up precision route; not public Linear FP32 admission.
 // Exact [512,2560] and [640,2560], canonical schedules with FP32 output storage.
 void launch_bf16_f32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+// Native GDN QKV only: short MMA partials plus compensated accumulation, BF16 output.
+void launch_bf16_gdn_qkv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

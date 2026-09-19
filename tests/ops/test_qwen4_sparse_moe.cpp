@@ -2465,6 +2465,14 @@ int native_resident_case(QType gate_format, QType up_format, QType down_format,
         router[static_cast<std::size_t>(experts[rank]) * kHidden + 1] =
             (rank & 1) == 0 ? 0.25F : -0.25F;
     }
+    if (bf16_shared) {
+        // Distinct ideal BF16-input logits collapse to the same FP32 value. The
+        // positive-input pattern must rank expert 1 before 0, not break a false tie
+        // by id. This protects the complete native Op across decode/prefill widths.
+        router[0] = router[kHidden] = 4.0F;
+        router[1] = std::ldexp(1.0F, -26);
+        router[kHidden + 1] = std::ldexp(1.0F, -25);
+    }
     DeviceBuffer router_device = bf16_shared ? to_device_bf16(router) : to_device(router);
     std::vector<float> shared_selector(kHidden, 0.0F);
     shared_selector[0] = -0.75F;
@@ -2540,11 +2548,17 @@ int native_resident_case(QType gate_format, QType up_format, QType down_format,
         const auto capacity=ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights,width,expert_policy);
         if(capacity!=ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(storage_profile,width,expert_policy))
             throw std::runtime_error("metadata-only MoE capacity differs from execution profile");
-        DeviceArena workspace(capacity);
+        // The finite FP32-down profile expands rank storage. Exercise the exact
+        // public capacity with guards for A16, mixed formats and A4 fallback alike.
+        GuardedDeviceBuffer workspace_storage(capacity);
+        DeviceArena workspace(DeviceSpan{workspace_storage.data(),capacity});
         Tensor x(input_device.p, DType::BF16, {kHidden, width});
         Tensor ids(ids_device.data(), DType::I32, {kTopK, width});
         Tensor probabilities(probabilities_device.data(), DType::FP32, {kTopK, width});
         Tensor output(output_device.data(), DType::BF16, {kHidden, width});
+        // Guard fills and fixture uploads use the default stream. The execution stream
+        // is explicitly nonblocking, so setup must finish before the Op can reuse scratch.
+        cuda_synchronize(nullptr);
         ops::qwen4_sparse_moe_resident(x, weights, ids, probabilities, output, workspace, stream, expert_policy);
         cuda_synchronize(stream);
         const auto actual_ids = from_device<int>(ids.data, static_cast<std::size_t>(width) * kTopK);
@@ -2561,7 +2575,7 @@ int native_resident_case(QType gate_format, QType up_format, QType down_format,
                 format_name(down_format) + (bf16_shared ? " BF16 shared" : "") +
                 (decorrelated ? " decorrelated" : " periodic") +
                 (expert_policy == ops::LinearPolicy::AllowA4 ? " allow-a4" : " a16") +
-                " T=" + std::to_string(width);
+                " T=" + std::to_string(width) + " token=" + std::to_string(token);
             const auto ids_begin = actual_ids.begin() + static_cast<std::size_t>(token) * kTopK;
             failures += verify_exact((label + " ids").c_str(),
                 std::vector<int>(ids_begin, ids_begin + kTopK),
@@ -2599,6 +2613,7 @@ int native_resident_case(QType gate_format, QType up_format, QType down_format,
         failures += ids_device.verify_guards("native resident ids");
         failures += probabilities_device.verify_guards("native resident probabilities");
         failures += output_device.verify_guards("native resident output");
+        failures += workspace_storage.verify_guards("native resident caller workspace");
         if (width == 17) {
             DeviceArena short_workspace(
                 ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights, width, expert_policy) - 1);

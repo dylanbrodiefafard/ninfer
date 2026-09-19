@@ -88,21 +88,51 @@ The converter verifies all source n-gram hash buffers against the fixed source
 configuration: physical vocabulary 248320, EOS 248044, module 0, seed 1234, and vocabulary base
 20000000. Physical embedding/head rows are not the tokenizer's 248077-token sampling domain.
 
-Optional calibrated FP8 storage is restricted to the 13 independently audited senfu roles:
-layer-0 GDN qkv/z/output, layer-3 QSA q/k/v/output, and the shared gate/up/down projections in
-layers 0 and 3. Their exact source codes, both FP32 multipliers, head permutation, and unchanged
-protected controls are checked; the format is `FP8_E4M3FN_TENSOR_F32M`. This is W8A16 storage
-admission, not blanket A8 or extrapolated all-layer calibration.
+Source-calibrated tensor-FP8 storage uses `FP8_E4M3FN_TENSOR_F32M`, preserving exact codes,
+both FP32 multipliers and offline head permutation. GDN permits only layer-0/1 Z: layer-1
+remains A16 in every policy. Producer-FP8 layer-0 QKV/output, layer-2 Z and layer-3 QSA
+q/k/v/output failed expanded source-loss screens and are rejected, even though the source
+fixtures retain those matrices for diagnostic comparisons.
 
-Six explicitly selected weight-only candidates additionally accept
+Shared-expert FP8 weight combinations are explicitly bounded. With gate=1, up=2, down=4,
+the admitted nonzero weight masks are layer0 `{1,2,3,4,6,7}`, layer1 `{1,2,4,5}`,
+layer2 `{1,2,3,4,5}`, and layer3 `{1,2,3}`; mask0 preserves the BF16 baseline. A combination
+is not admitted merely because its individual matrices passed separate tests. These are A16
+weight-storage choices, not blanket A8 or extrapolated all-layer calibration.
+
+Source ingestion preserves two distinct finite bundles: `original13` contains
+layer-0 GDN, layer-3 QSA and layer-0/3 shared roles; `additional8` contains layer-1/2 Z and
+shared gate/up/down. Source-bundle membership does not imply product admission. Each bundle must match its entire exact
+inventory and its own pinned protected-control audit. The additional audit covers non-PLE controls
+of layers1/2 and explicitly excludes their four unselected quantized QKV/output matrices. Neither
+audit establishes expert, PLE, or full-model identity between the two source checkpoints.
+
+Seven explicitly selected weight-only candidates additionally accept
 `FP8_E4M3FN_ROW_BF16S` / `row-scale-v1`: token embedding, vocabulary head, the final
-hyperconnection read's down/up matrices, and layer1 PLE key/value projections. Conversion
+hyperconnection read's down/up matrices, layer1 PLE key/value projections, and layer2 GDN Z. Conversion
 uses `--row-fp8-role NAME` and the original NVIDIA BF16 matrix, offline per-row maxabs/448,
 BF16 row scale and nearest-even E4M3FN codes. These are not source-calibrated tensor-FP8
-weights and never enable A8 computation. Each role defaults to BF16. Protected intermediate
+weights and do not by themselves enable A8 computation. Each role defaults to BF16. Protected intermediate
 hyperconnection reads/write gates and PLE controls are not included. Binding, head/scratch
 planning and both private draft consumers support these exact formats; selected source
 embedding rows do not establish complete-table quality.
+Layer2 Z uses the same existing offline V-head permutation before row encoding. Exact real
+fixture tests compare both code rows and BF16 scale words against the frozen source-order
+candidate after independent head-address remapping. It uses A8 only under the fixed selective
+prefill recipe; decode/verification and other row-FP8 roles remain A16. The rejected producer
+tensor-FP8 Z2 format is not admitted by this row-FP8 exception.
+
+One separately qualified NVFP4 weight-only candidate is admitted for layer0 shared-up
+`[640,2560]`, always with A16 activations. `--nvfp4-shared-up COMPONENT FIT_JSON` requires
+the exact `qwen4/native-projection-candidate` / `nvfp4_diagonal_calibrated` component and its
+completed layer0 calibration-fit report. The report must identify that source role, shape,
+explicit artifact path, pinned NVIDIA manifest and calibration-only document set. Conversion
+copies the existing packed weight payload unchanged, records the fit recipe/provenance, and
+does not import the candidate's fitted A4 activation divisor. The baseline maxabs candidate,
+other NVFP4 shared roles/layers and any simultaneous layer0 shared FP8 weights are rejected.
+Consequently this choice cannot coexist with the selective-A8 recipe. Routed expert A4 is
+independent and does not change this shared projection's A16 policy. Source-loss and real
+complete-MoE GPU qualification do not establish full-model PPL or a default recipe.
 
 An explicitly supplied PixelML DFlash companion adds 58 tensors under `dflash.*`, with uniformly
 BF16 or NVFP4 matrices and BF16 norms. This optional artifact presence does not admit the measured
@@ -115,8 +145,14 @@ The required raw resource `native-prefill-policy` is exactly one byte: 0 = A16 r
 execution candidates, not full-model quality admission. Nonzero policy is used only for full,
 unmasked C1 prefill wider than16; compact decode, masked prefill, recorded verification, QSA,
 GR, PLE projections, vocabulary head, Vision and private MTP/DFlash retain A16. Selective A8
-requires all seven audited tensor-calibrated FP8 weights: layer0 GDN Z and layer0/3 shared
-gate/up/down. Missing roles are rejected, never converted or silently substituted. Routed A4
+requires seven recipe weights: six tensor-calibrated FP8 matrices (layer0 GDN Z,
+layer0 shared gate/up and layer1/2/3 shared gate), plus original-source row-FP8 layer2 GDN Z.
+Its shared weight masks are fixed at `{3,1,1,1}` and shared
+activation-A8 masks at `{2,1,1,1}`: layer0 gate uses A16, up uses A8, down remains BF16;
+the other selected shared gates use A8. Layer0/2 Z use A8; optional layer1 Z FP8 still uses
+A16. Incompatible additional shared FP8 weights or missing required roles are rejected,
+never converted or silently substituted. Independently selected row-FP8 endpoints/PLE weights
+remain permitted and A16. Routed A4
 uses only calibrated main-model expert banks and their existing per-expert occurrence cutoff;
 MTP placeholder input scales are not admitted for A4. Startup workspace planning reserves
 both the baseline compact schedule and selected full-prefill packing scratch. Artifact policy
@@ -135,8 +171,10 @@ python3.11 -m tools.convert.qwen4.native --model /path/to/pinned-nvidia-source -
 ```
 
 Omit `--ple` to encode the original NVIDIA FP8 table. `--dflash` explicitly selects an audited
-BF16 or NVFP4 companion; calibrated FP8 overrides require the source projection component,
-protected-control audit, and explicit `--fp8-role` arguments together. Existing output files
+BF16 or NVFP4 companion. Calibrated FP8 overrides require `--fp8-source COMPONENT AUDIT` and explicit
+`--fp8-role NAME` arguments together. Repeat `--fp8-source` once to use both exact source bundles;
+each bundle must supply a selected role. Duplicate bundles, missing role owners, mismatched audits,
+and unqualified selections are rejected before output. Existing output files
 are not replaced. This command needs the complete local source and sufficient disk space; the
 bounded qualification fixtures are not substituted for missing main layers.
 
@@ -208,9 +246,9 @@ numerical admission, including rejected profiles and their unchanged gates.
 | Role | Native weight storage | Current execution/state decision |
 |---|---|---|
 | Routed expert gate/up/down | Source NVFP4 codes, block scales and separate FP32 weight/input multipliers per expert and projection | A16 reference; explicit qualified A4 at beneficial expert occurrence counts, independently calibrated after SwiGLU |
-| Shared experts | BF16 reference or source-calibrated FP8 | A16 baseline; individually qualified guarded A8 policies, not a model-wide quality default |
-| GDN large projections | BF16 reference or source-calibrated FP8 | A16 baseline; qualified per-role guarded A8 combinations; simultaneous QKV/output A8 is rejected |
-| QSA core projections | BF16 reference or source-calibrated FP8 | A16; tested A8 candidates are not admitted |
+| Shared experts | BF16 reference, finite source-calibrated FP8 combinations, or frozen calibrated layer0 shared-up NVFP4 | A16 baseline; fixed qualified guarded A8 recipe; NVFP4 shared-up always A16, not a model-wide quality default |
+| GDN large projections | BF16 reference; source tensor-FP8 only Z0/Z1; original-source row-FP8 Z2 | A16 baseline; fixed selective recipe permits Z0/Z2 A8, never Z1 A8 |
+| QSA core projections | BF16 | A16; producer-FP8 storage and tested A8 candidates are rejected |
 | Router, shared scalar gate, QSA indexer, GDN and PLE controls | Source-faithful BF16 or explicitly transformed effective FP32 control views | Protected arithmetic and exact selection; FP32 GDN recurrence, BF16 convolution/history |
 | Hyperconnection reads and gates | BF16 baseline; optional row-FP8 final-read down/up only | A16 projections, protected gate/reduction arithmetic, BF16 residual storage; tested FP8 residual recipe rejected |
 | PLE key/value projections | BF16 baseline; explicit row-FP8 candidates | A16; source-weight loss assessed separately, with key-only substantially less disruptive than value quantization |
@@ -279,13 +317,16 @@ metadata, not full shards. `qwen4-text-panel.ninfer` preserves token IDs, origin
 row IDs and explicit local fixture remapping. The native-sequence `--native-text` mode
 tests CPU integer and GPU whole/32+1 addressing, repeats each token embedding into four
 residual branches, and feeds the source rows directly through GPU PLE decode/injection.
-`--native-text-fp8` uses the same input panel with the separately pinned calibrated FP8
-GDN layer-0, QSA layer-3 and shared layer-0/3 weights, retaining A16 operands. These remain
+`--native-text-fp8` uses the same input panel with separately pinned calibrated FP8
+GDN-Z layer-0, shared gate/up layer-0 and shared gate layers-1/2/3 weights, plus original-source
+row-FP8 GDN-Z layer-2, retaining A16 operands.
+QSA and the remaining GDN projections retain original BF16 weights. These remain
 bounded unregistered first-block fixtures, not calibration data, full-model PPL or target
 admission. Their qualification results are recorded separately from synthetic inputs.
-`--native-text-a8` additionally qualifies guarded A8 on GDN-Z and shared projections,
-keeping QSA A16; its reproduced static-calibration failure and corrected whole/chunk
-results are recorded in the Op contract, not hidden by changing acceptance thresholds.
+`--native-text-a8` additionally exercises guarded A8 on GDN-Z layers-0/2, shared up layer-0,
+and shared gate layers-1/2/3; the other projections remain A16. Historical failed candidate
+screens and the narrowed recipe's numerical qualification remain separate evidence;
+acceptance thresholds are not changed to accommodate rejected projections.
 
 The default contiguous native-sequence numerical admission uses BF16 QSA cache. The
 explicit `--nvfp4-diagnostics` mode retains the compressed-cache experiment and its

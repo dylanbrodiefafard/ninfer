@@ -3,6 +3,7 @@
 #include "artifact_fixture.h"
 #include "ninfer/engine.h"
 
+#include <algorithm>
 #include <iostream>
 #include <unistd.h>
 
@@ -15,17 +16,31 @@ using L=artifact::StorageLayout;
 
 // Independent exact source-shape directory witness, never an executable checkpoint. Sparse
 // payload holes permit full-inventory binding/admission checks without downloading 100+ GB.
-Json directory(bool fp8_ple,bool draft,bool fp8_projection,bool row_fp8=false) {
+Json directory(bool fp8_ple,bool draft,bool fp8_projection,bool row_fp8=false,const std::string& extra_fp8={},
+               const std::array<int,4>* shared_masks=nullptr,const std::string& nvfp4_matrix={}) {
     Json objects=Json::array();std::uint64_t offset=0;
     auto tensor=[&](const std::string& name,std::initializer_list<std::uint64_t> shape,F format=F::BF16) {
         if(fp8_projection) {
-            if(name=="model.language_model.layers.0.linear_attn.in_proj_z.weight") format=F::FP8_E4M3FN_TENSOR_F32M;
-            for(int layer:{0,3}) for(const char* role:{"gate","up","down"})
-                if(name=="model.language_model.layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight")
+            if(name=="model.language_model.layers.0.linear_attn.in_proj_z.weight" ||
+               name=="model.language_model.layers.1.linear_attn.in_proj_z.weight") format=F::FP8_E4M3FN_TENSOR_F32M;
+            for(int layer=0;layer<4;++layer) for(const char* role:{"gate","up"})
+                if((layer==0 || std::string_view(role)=="gate") &&
+                   name=="model.language_model.layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight")
                     format=F::FP8_E4M3FN_TENSOR_F32M;
         }
+        if(shared_masks) for(int layer=0;layer<4;++layer) {
+            int bit=1;
+            for(const char* role:{"gate","up","down"}) {
+                if(name=="model.language_model.layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight")
+                    format=((*shared_masks)[layer]&bit)?F::FP8_E4M3FN_TENSOR_F32M:F::BF16;
+                bit<<=1;
+            }
+        }
+        if(name==extra_fp8) format=F::FP8_E4M3FN_TENSOR_F32M;
+        if(name==nvfp4_matrix) format=F::NVFP4;
         if(row_fp8) {
             for(const char* role:{"model.language_model.embed_tokens.weight","lm_head.weight",
+                "model.language_model.layers.2.linear_attn.in_proj_z.weight",
                 "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
                 "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
                 "model.language_model.layers.1.ple.key_proj.weight","model.language_model.layers.1.ple.value_proj.weight"})
@@ -70,7 +85,7 @@ Json directory(bool fp8_ple,bool draft,bool fp8_projection,bool row_fp8=false) {
         gr(p+"attn_hyper_connection.",true);gr(p+"mlp_hyper_connection.",true);moe(p+"mlp.");
         if(i%4==3) qsa(p+"self_attn.");else {
             const auto g=p+"linear_attn.";
-            tensor(g+"in_proj_qkv.weight",{10240,2560},i==0 && fp8_projection?F::FP8_E4M3FN_TENSOR_F32M:F::BF16);
+            tensor(g+"in_proj_qkv.weight",{10240,2560});
             tensor(g+"in_proj_z.weight",{6144,2560});tensor(g+"out_proj.weight",{2560,6144});
             tensor(g+"in_proj_a.weight",{48,2560},F::FP32);tensor(g+"in_proj_b.weight",{48,2560},F::FP32);
             tensor(g+"conv1d.weight",{10240,1,4},F::FP32);tensor(g+"ssm_a",{48},F::FP32);
@@ -160,6 +175,10 @@ int main() {
             const auto plan=q4::bind_native_artifact(reader);
             failures+=plan.tensors.at("lm_head.weight").format!=F::FP8_E4M3FN_ROW_BF16S;
             failures+=plan.tensors.at("model.language_model.embed_tokens.weight").format!=F::FP8_E4M3FN_ROW_BF16S;
+            failures+=plan.tensors.at("model.language_model.layers.2.linear_attn.in_proj_z.weight").format!=F::FP8_E4M3FN_ROW_BF16S;
+            for(int policy=0;policy<4;++policy)
+                failures+=q4::native_prefill_policy(static_cast<q4::NativePrefillPolicy>(policy),2).gdn.z!=
+                    (policy&1?ops::LinearPolicy::AllowA8:ops::LinearPolicy::A16Only);
             for(bool mtp:{false,true}) {
                 q4::NativeRuntimeConfig c;c.vision=false;c.requests=4;c.prefill_width=65;
                 c.verify_width=4;c.mtp=mtp;c.dflash=!mtp;
@@ -167,9 +186,11 @@ int main() {
             }
         }
         for(int policy=0;policy<4;++policy) {
-            auto fixture=sparse(directory(false,false,true),0x3e80,policy);
+            auto fixture=sparse(directory(false,false,true,true),0x3e80,policy);
             artifact::Reader reader(fixture.path);const auto plan=q4::bind_native_artifact(reader);
             failures+=int(plan.prefill_policy)!=policy;
+            failures+=plan.tensors.at("model.language_model.layers.1.linear_attn.in_proj_z.weight").format!=F::FP8_E4M3FN_TENSOR_F32M;
+            failures+=q4::native_prefill_policy(plan.prefill_policy,1).gdn.z!=ops::LinearPolicy::A16Only;
             q4::NativeRuntimeConfig c;c.vision=false;c.requests=4;c.prefill_width=65;
             const auto candidate_bytes=q4::NativeRuntime::device_bytes(plan,c);
             auto baseline=plan;baseline.prefill_policy=q4::NativePrefillPolicy::A16;
@@ -177,6 +198,11 @@ int main() {
         }
         for(int policy:{1,3,4}) {
             auto fixture=sparse(directory(false,false,false),0x3e80,policy);
+            try {artifact::Reader reader(fixture.path);(void)q4::bind_native_artifact(reader);++failures;}
+            catch(const std::invalid_argument&) {}
+        }
+        for(int policy:{1,3}) {
+            auto fixture=sparse(directory(false,false,true,false),0x3e80,policy);
             try {artifact::Reader reader(fixture.path);(void)q4::bind_native_artifact(reader);++failures;}
             catch(const std::invalid_argument&) {}
         }
@@ -211,6 +237,37 @@ int main() {
             }
             std::cout<<"Complete native metadata: "<<plan.tensors.size()<<" tensors, "
                 <<plan.materialization.device_capacity_bytes<<" GPU bytes; 32GiB rejected before allocation\n";
+        }
+        for(const char* role:{"model.language_model.layers.2.linear_attn.in_proj_z.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            "model.language_model.layers.3.self_attn.q_proj.weight",
+            "model.language_model.layers.3.self_attn.k_proj.weight",
+            "model.language_model.layers.3.self_attn.v_proj.weight",
+            "model.language_model.layers.3.self_attn.o_proj.weight"})
+            failures+=!rejected(directory(false,false,false,false,role));
+        const std::array<std::vector<int>,4> allowed_masks{{{0,1,2,3,4,6,7},{0,1,2,4,5},{0,1,2,3,4,5},{0,1,2,3}}};
+        const std::string shared_up="model.language_model.layers.0.mlp.shared_expert.up_proj.weight";
+        failures+=rejected(directory(false,false,false,false,{},nullptr,shared_up));
+        for(const char* role:{"gate","down"})
+            failures+=!rejected(directory(false,false,false,false,
+                "model.language_model.layers.0.mlp.shared_expert."+std::string(role)+"_proj.weight",nullptr,shared_up));
+        for(const char* role:{"model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.language_model.layers.1.mlp.shared_expert.up_proj.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight"})
+            failures+=!rejected(directory(false,false,false,false,{},nullptr,role));
+        for(int layer=0;layer<4;++layer) for(int mask=0;mask<8;++mask) {
+            std::array<int,4> masks{};masks[layer]=mask;
+            const bool allowed=std::find(allowed_masks[layer].begin(),allowed_masks[layer].end(),mask)!=allowed_masks[layer].end();
+            failures+=rejected(directory(false,false,false,false,{},&masks))==allowed;
+        }
+        for(const char* role:{"model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.language_model.layers.1.mlp.shared_expert.down_proj.weight",
+            "model.language_model.layers.2.mlp.shared_expert.up_proj.weight",
+            "model.language_model.layers.3.mlp.shared_expert.up_proj.weight"}) {
+            auto fixture=sparse(directory(false,false,true,true,role),0x3e80,1);
+            try {artifact::Reader reader(fixture.path);(void)q4::bind_native_artifact(reader);++failures;}
+            catch(const std::invalid_argument&) {}
         }
         auto missing=directory(false,false,false);
         for(auto it=missing["objects"].begin();it!=missing["objects"].end();++it)

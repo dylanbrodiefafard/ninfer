@@ -7,6 +7,7 @@
 #include "ops/launcher/gated_delta_net_layer.h"
 #include "ops/common/projection.h"
 #include "ops/linear/fp8/fp8_tensor.h"
+#include "ops/linear/bf16/bf16_launch.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <algorithm>
@@ -36,9 +37,11 @@ bool native_projection(QType type) {
 }
 
 std::size_t required_projection_bytes(QType type, int rows, int columns, int tokens,
-                              LinearPolicy policy) {
+                              LinearPolicy policy, bool z_projection = false) {
     if (policy != LinearPolicy::A16Only &&
-        (policy != LinearPolicy::AllowA8 || type != QType::FP8_E4M3FN_TENSOR_F32M)) {
+        (policy != LinearPolicy::AllowA8 ||
+         (type != QType::FP8_E4M3FN_TENSOR_F32M &&
+          !(z_projection && type == QType::FP8_E4M3FN_ROW_BF16S)))) {
         throw std::invalid_argument("gated_delta_net_layer: unsupported projection precision policy");
     }
     return native_projection(type)
@@ -47,7 +50,11 @@ std::size_t required_projection_bytes(QType type, int rows, int columns, int tok
 
 void project(const Tensor& input, const Weight& weight, Tensor& output,
              WorkspaceArena& workspace, cudaStream_t stream, LinearPolicy policy) {
-    if (native_projection(weight.qtype)) {
+    if (weight.qtype == QType::BF16_CTRL && weight.n == kQkvRows) {
+        // Shared by scalar, compact, batch and replay. The public ingress remains BF16;
+        // only private accumulation avoids long-dot rounding amplified by recurrent state.
+        detail::launch_bf16_gdn_qkv(input, weight, output, stream);
+    } else if (native_projection(weight.qtype)) {
         linear(input, weight, output, policy, workspace, stream);
     } else {
         ggml_block_linear(input, weight, output, stream);
@@ -174,6 +181,10 @@ std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType ou
     if (policy.qkv == LinearPolicy::AllowA8 && policy.output == LinearPolicy::AllowA8) {
         throw std::invalid_argument("gated_delta_net_layer: simultaneous QKV/output A8 is not qualified");
     }
+    if (z == QType::FP8_E4M3FN_ROW_BF16S && policy.z == LinearPolicy::AllowA8 &&
+        (policy.qkv != LinearPolicy::A16Only || policy.output != LinearPolicy::A16Only)) {
+        throw std::invalid_argument("gated_delta_net_layer: row-FP8 Z A8 requires other projections A16");
+    }
     if (!native_projection(qkv) &&
         !native_projection(z) && qkv != z) {
         throw std::invalid_argument("gated_delta_net_layer: GGML input formats differ");
@@ -188,10 +199,12 @@ std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType ou
         throw std::invalid_argument("gated_delta_net_layer: unsupported output format");
     }
     WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout, tokens, compact);
+    // Native accuracy profile keeps normalization and recurrent arithmetic in FP32.
+    // The diagnostic GGML profile retains its separately qualified chunked schedule.
+    (void)allocate_scratch(layout, tokens, compact || native_projection(qkv));
     const auto projection_bytes = std::max({
         required_projection_bytes(qkv, kQkvRows, kHidden, tokens, policy.qkv),
-        required_projection_bytes(z, kValueRows, kHidden, tokens, policy.z),
+        required_projection_bytes(z, kValueRows, kHidden, tokens, policy.z, true),
         required_projection_bytes(output, kHidden, kValueRows, tokens, policy.output)});
     if (projection_bytes) { (void)layout.alloc_bytes(projection_bytes); }
     return layout.peak_bytes();
@@ -296,7 +309,8 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     require_disjoint(std::span<const AddressRange>(ranges.data(), range_count));
 
     auto scope = workspace.scope();
-    Scratch scratch = allocate_scratch(workspace, tokens);
+    const bool native_recurrent = native_projection(weights.qkv.qtype);
+    Scratch scratch = allocate_scratch(workspace, tokens, native_recurrent);
     project(x, weights.qkv, scratch.projected_qkv, workspace, stream, policy.qkv);
     project(x, weights.z, scratch.z, workspace, stream, policy.z);
     detail::gated_delta_net_layer_control_launch(x, weights.a, weights.b, weights.ssm_a,
@@ -317,7 +331,10 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
                                      cudaMemcpyDeviceToDevice,stream));
     }
     const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
-    if (scratch.recurrence.bytes == 0) {
+    if (native_recurrent) {
+        detail::gated_delta_net::launch_recurrent_inout(scratch.q,scratch.k,scratch.v,
+            scratch.g,scratch.beta,scale,true,ssm_state_in,ssm_state_out,scratch.recurrent,stream);
+    } else if (scratch.recurrence.bytes == 0) {
         gated_delta_net(scratch.q, scratch.k, scratch.v, scratch.g, scratch.beta, scale, true,
                         workspace, ssm_state_in, ssm_state_out, scratch.recurrent, stream);
     } else {
