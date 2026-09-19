@@ -3,7 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
-#include <ninfer/targets/qwen3_6/frontend.h>
+#include <text/qwen/frontend.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstdint>
@@ -33,9 +33,9 @@ enum class WeightsProfile : std::uint8_t {
     GroupwiseInt,
 };
 
-using Frontend       = qwen3_6::Frontend;
-using PreparedPrompt = qwen3_6::PreparedPrompt;
-using OutputSession  = qwen3_6::OutputSession;
+using Frontend       = text::qwen::Frontend;
+using PreparedPrompt = text::qwen::PreparedPrompt;
+using OutputSession  = text::qwen::OutputSession;
 
 class LoadPlan {
 public:
@@ -76,6 +76,7 @@ private:
 } // namespace detail
 
 struct Package {
+    static constexpr bool supports_host_kv_tiers = true;
     static constexpr std::string_view model_id   = "qwen3.6-35b-a3b";
     static constexpr std::string_view target_key = "qwen3_6_35b_a3b";
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -9,8 +9,8 @@
 namespace ninfer::targets::qwen3_6 {
 
 struct VisionItemControl {
-    PromptModality modality = PromptModality::Image;
-    VisionGrid grid;
+    text::qwen::PromptModality modality = text::qwen::PromptModality::Image;
+    text::qwen::VisionGrid grid;
     std::size_t patch_begin     = 0;
     std::size_t patch_count     = 0;
     std::size_t merged_count    = 0;
@@ -27,6 +27,6 @@ struct VisionControl {
     std::vector<VisionItemControl> items;
 };
 
-[[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt);
+[[nodiscard]] VisionControl build_vision_control(const text::qwen::PreparedPromptData& prompt);
 
 } // namespace ninfer::targets::qwen3_6

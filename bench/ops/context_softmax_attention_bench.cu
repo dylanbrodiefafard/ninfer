@@ -181,7 +181,8 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
 std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
     const ops::GqaContextExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                     static_cast<std::uint32_t>(context)};
-    return ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1);
+    return ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1,
+                                                                    kHeadDim);
 }
 
 class Case {

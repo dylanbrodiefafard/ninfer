@@ -4,6 +4,7 @@
 #include "runtime/engine/request_memory.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
+#include "targets/qwen4/engine_program.h"
 
 #include <memory>
 #include <variant>
@@ -17,6 +18,7 @@ namespace targets {
 
 using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
+using Qwen4 = qwen4::Package;
 
 struct LoadedQwen3_6_27B {
     std::unique_ptr<Qwen3_6_27B::LoadedModel> model;
@@ -78,8 +80,24 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance& operator=(const Qwen3_6_35BA3BInstance&) = delete;
 };
 
-using ActiveTarget =
-    std::variant<std::unique_ptr<Qwen3_6_27BInstance>, std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+struct LoadedQwen4 {
+    std::unique_ptr<Qwen4::LoadedModel> model;
+    Qwen4::Frontend frontend;
+    LoadedQwen4(std::unique_ptr<Qwen4::LoadedModel>,bool vision);
+};
+struct Qwen4Instance {
+    using Package=Qwen4;
+    std::unique_ptr<LoadedQwen4> loaded;
+    runtime::KvCapacityResolution kv_capacity_resolution;
+    runtime::RequestMemory request_memory;
+    const std::uint32_t capacity;
+    std::unique_ptr<Qwen4::Program> program;
+    Qwen4Instance(std::unique_ptr<LoadedQwen4>,runtime::KvCapacityResolution,
+        qwen4::NativeRuntimeConfig,const EngineOptions&,DeviceContext&);
+};
+
+using ActiveTarget = std::variant<std::unique_ptr<Qwen3_6_27BInstance>,
+    std::unique_ptr<Qwen3_6_35BA3BInstance>,std::unique_ptr<Qwen4Instance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

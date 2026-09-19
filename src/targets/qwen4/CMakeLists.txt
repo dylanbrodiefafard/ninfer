@@ -1,8 +1,55 @@
-# Unregistered architecture-verification package. It is intentionally not linked by ninfer_engine.
+# The streamed GGUF diagnostic verifier remains unregistered and is not linked by the Engine.
 add_library(ninfer_qwen4_verifier STATIC verifier.cpp program.cpp)
 ninfer_internal_includes(ninfer_qwen4_verifier)
 target_link_libraries(ninfer_qwen4_verifier PUBLIC ninfer_artifact ninfer_ops)
 
+add_library(ninfer_qwen4_mtp STATIC mtp.cpp)
+ninfer_internal_includes(ninfer_qwen4_mtp)
+target_link_libraries(ninfer_qwen4_mtp PUBLIC ninfer_artifact ninfer_ops)
+
+add_library(ninfer_qwen4_vision_frontend STATIC vision_frontend.cpp)
+ninfer_internal_includes(ninfer_qwen4_vision_frontend)
+target_link_libraries(ninfer_qwen4_vision_frontend PUBLIC ninfer_media_prepare ninfer_media_decode
+  PRIVATE ninfer_core)
+
+add_library(ninfer_qwen4_vision STATIC vision.cpp)
+ninfer_internal_includes(ninfer_qwen4_vision)
+target_link_libraries(ninfer_qwen4_vision PUBLIC ninfer_artifact ninfer_ops ninfer_qwen4_vision_frontend)
+
 add_executable(ninfer_qwen4_prefill_bench prefill_bench.cpp)
 ninfer_internal_includes(ninfer_qwen4_prefill_bench)
 target_link_libraries(ninfer_qwen4_prefill_bench PRIVATE ninfer_qwen4_verifier)
+
+add_library(ninfer_qwen4_dflash STATIC dflash.cpp)
+ninfer_internal_includes(ninfer_qwen4_dflash)
+target_link_libraries(ninfer_qwen4_dflash PUBLIC ninfer_artifact ninfer_ops)
+
+add_library(ninfer_qwen4_native_artifact STATIC native_artifact.cpp)
+ninfer_internal_includes(ninfer_qwen4_native_artifact)
+target_link_libraries(ninfer_qwen4_native_artifact PUBLIC ninfer_artifact ninfer_ops ninfer_qwen_frontend)
+
+add_library(ninfer_qwen4_native_compute STATIC native_compute.cpp)
+ninfer_internal_includes(ninfer_qwen4_native_compute)
+target_link_libraries(ninfer_qwen4_native_compute PUBLIC ninfer_qwen4_native_artifact ninfer_ops)
+
+add_library(ninfer_qwen4_native_state STATIC native_state.cpp)
+ninfer_internal_includes(ninfer_qwen4_native_state)
+target_link_libraries(ninfer_qwen4_native_state PUBLIC ninfer_ops ninfer_core)
+
+add_library(ninfer_qwen4_native_decoder STATIC native_decoder.cpp)
+ninfer_internal_includes(ninfer_qwen4_native_decoder)
+target_link_libraries(ninfer_qwen4_native_decoder PUBLIC ninfer_qwen4_native_artifact ninfer_qwen4_native_state)
+
+add_library(ninfer_qwen4_native_runtime STATIC native_runtime.cpp native_draft_runtime.cpp)
+ninfer_internal_includes(ninfer_qwen4_native_runtime)
+target_link_libraries(ninfer_qwen4_native_runtime PUBLIC ninfer_qwen4_native_decoder
+  ninfer_qwen4_mtp ninfer_qwen4_dflash ninfer_qwen4_vision)
+
+add_library(ninfer_qwen4_transaction STATIC transaction.cpp)
+ninfer_internal_includes(ninfer_qwen4_transaction)
+target_link_libraries(ninfer_qwen4_transaction PUBLIC ninfer_qwen4_native_compute ninfer_runtime_sampling)
+
+add_library(ninfer_qwen4_engine_program STATIC engine_program.cpp)
+ninfer_internal_includes(ninfer_qwen4_engine_program)
+target_link_libraries(ninfer_qwen4_engine_program PUBLIC ninfer_qwen4_native_artifact
+  ninfer_qwen4_native_runtime ninfer_runtime_sampling ninfer_qwen_frontend ninfer_ops)

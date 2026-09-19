@@ -2534,7 +2534,13 @@ int native_resident_case(QType gate_format, QType up_format, QType down_format,
         GuardedDeviceBuffer ids_device(static_cast<std::size_t>(width) * kTopK * sizeof(int));
         GuardedDeviceBuffer probabilities_device(static_cast<std::size_t>(width) * kTopK * sizeof(float));
         GuardedDeviceBuffer output_device(static_cast<std::size_t>(width) * kHidden * sizeof(std::uint16_t));
-        DeviceArena workspace(ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights, width, expert_policy));
+        const ops::Qwen4ResidentSparseMoeStorageProfile storage_profile{
+            weights.routed_gate.qtype,weights.routed_up.qtype,weights.routed_down.qtype,
+            weights.shared_gate_proj.qtype,weights.shared_up.qtype,weights.shared_down.qtype};
+        const auto capacity=ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights,width,expert_policy);
+        if(capacity!=ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(storage_profile,width,expert_policy))
+            throw std::runtime_error("metadata-only MoE capacity differs from execution profile");
+        DeviceArena workspace(capacity);
         Tensor x(input_device.p, DType::BF16, {kHidden, width});
         Tensor ids(ids_device.data(), DType::I32, {kTopK, width});
         Tensor probabilities(probabilities_device.data(), DType::FP32, {kTopK, width});
@@ -2648,10 +2654,10 @@ int main() {
             [] { (void)ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4097); },
             "excessive prefill width");
         failures += expect_invalid(
-            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes({}, 0); },
+            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(ops::Qwen4ResidentSparseMoeWeights{}, 0); },
             "zero resident width");
         failures += expect_invalid(
-            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes({}, 4097); },
+            [] { (void)ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(ops::Qwen4ResidentSparseMoeWeights{}, 4097); },
             "excessive resident width");
         if (ops::qwen4_sparse_moe_prefill_workspace_capacity_bytes(4096) == 0) {
             throw std::runtime_error("Qwen4 sparse MoE maximum prefill workspace is empty");

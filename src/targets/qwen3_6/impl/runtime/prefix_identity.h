@@ -2,7 +2,7 @@
 
 // Compact host identity for the model inputs licensed by the resident KV/GDN state.
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 
 #include <array>
 #include <cstddef>
@@ -28,13 +28,13 @@ class ResidentPrefixIdentity {
 public:
     void reserve(std::size_t tokens);
     void clear() noexcept;
-    void assign(const PreparedPromptData& prompt);
+    void assign(const text::qwen::PreparedPromptData& prompt);
     void append_generated(std::size_t count, std::int32_t rope_delta);
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
-    [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
+    [[nodiscard]] bool matches(const text::qwen::PreparedPromptData& prompt, std::size_t count) const;
 
     [[nodiscard]] std::span<const std::uint8_t> token_types() const noexcept {
         return token_types_;
@@ -42,7 +42,7 @@ public:
     [[nodiscard]] std::span<const std::int32_t> positions(std::size_t axis) const {
         return positions_.at(axis);
     }
-    [[nodiscard]] std::span<const VisionItem> vision_items() const noexcept { return vision_items_; }
+    [[nodiscard]] std::span<const text::qwen::VisionItem> vision_items() const noexcept { return vision_items_; }
 
     [[nodiscard]] std::size_t packed_bytes() const;
     void pack(void* dst) const;
@@ -53,13 +53,13 @@ public:
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;
-    std::vector<VisionItem> vision_items_;
+    std::vector<text::qwen::VisionItem> vision_items_;
 };
 
-[[nodiscard]] bool prefix_items_complete_at(const std::vector<VisionItem>& items,
+[[nodiscard]] bool prefix_items_complete_at(const std::vector<text::qwen::VisionItem>& items,
                                             std::size_t tokens);
 
-[[nodiscard]] bool prefix_matches(const PreparedPromptData& prompt,
+[[nodiscard]] bool prefix_matches(const text::qwen::PreparedPromptData& prompt,
                                   const std::vector<TokenId>& resident_tokens,
                                   const ResidentPrefixIdentity& resident_identity,
                                   std::size_t count);
@@ -70,7 +70,7 @@ private:
     std::span<const TokenId> right_tokens, const ResidentPrefixIdentity& right,
     std::size_t limit);
 
-[[nodiscard]] std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt);
+[[nodiscard]] std::vector<PrefixHash128> prefix_hash_chain(const text::qwen::PreparedPromptData& prompt);
 
 [[nodiscard]] PrefixHash128 prefix_hash_at(std::span<const TokenId> tokens,
                                            const ResidentPrefixIdentity& identity,

@@ -1397,6 +1397,60 @@ int verifier_composite_real_shape_case(QType type = QType::GGML_Q5_K) {
     failures += verify_pointwise("qsa batched verifier complete FP64 oracle", actual, expected,
                                  PointwiseCriterion{0.025, 0.02});
 
+    // A reused MTP domain is an immutable input, not a fresh causal selection. Newly appended
+    // private rows must update cache/index state but must NOT enter attention implicitly.
+    std::vector<std::int32_t> frozen_ids(ops::kQsaSelectedCapacity * width, -1);
+    const std::vector<std::int32_t> frozen_domain{0, 2, 5, 7};
+    for (int token = 0; token < width; ++token) {
+        std::copy(frozen_domain.begin(), frozen_domain.end(),
+                  frozen_ids.begin() + token * ops::kQsaSelectedCapacity);
+    }
+    auto dfrozen = to_device(frozen_ids);
+    auto dfrozen_count = to_device(std::vector<std::int32_t>{4, 4});
+    Tensor frozen_t(dfrozen.p, DType::I32, {ops::kQsaSelectedCapacity, width});
+    Tensor frozen_count_t(dfrozen_count.p, DType::I32, {width});
+    for (int round = 0; round < 3; ++round) {
+        const std::vector<std::int32_t> append{10 + 2 * round, 11 + 2 * round};
+        const std::vector<std::int32_t> rope{31 + round, 7, 91, 103 + round, 12, 2};
+        auto da = to_device(append);
+        auto dp = to_device(rope);
+        Tensor at(da.p, DType::I32, {width});
+        Tensor pt(dp.p, DType::I32, {3, width});
+        ops::qsa_verifier_selected(x_t, at, pt, weights, state_view, frozen_t,
+                                   frozen_count_t, out_t, workspace_t, nullptr);
+        cuda_synchronize();
+        failures += verify_exact("qsa frozen selection is immutable",
+            from_device<std::int32_t>(dfrozen.p, frozen_ids.size()), frozen_ids);
+        failures += verify_exact("qsa frozen counts are immutable",
+            from_device<std::int32_t>(dfrozen_count.p, width), std::vector<std::int32_t>{4, 4});
+        for (int token = 0; token < width; ++token) {
+            const std::array<std::int32_t, 3> p{rope[3 * token], rope[3 * token + 1], rope[3 * token + 2]};
+            const auto query = oracle_core_norm_rope(raw_q, core_gamma, p);
+            // Only old frozen rows are consumed, so the previously captured exact cache
+            // remains the complete represented input to this independent oracle.
+            for (int head = 0; head < 10; ++head) {
+                const auto a = oracle_attention_head(query, frozen_domain, head / 12,
+                    capacity, k_codes, k_scales, v_codes, v_scales);
+                const double gate = 1.0 / (1.0 + std::exp((head & 1) == 0 ? -1.0 : 1.0));
+                for (int d = 0; d < 256; ++d) {
+                    expected[d + 256 * (head + 10 * token)] = gate * a[d];
+                }
+            }
+        }
+        failures += verify_pointwise("qsa frozen-domain complete FP64 oracle",
+            from_device_bf16(dout.data(), 2560 * width), expected, PointwiseCriterion{0.025, 0.02});
+        const auto positions_after = from_device<std::int32_t>(state.positions.data(), 3 * capacity);
+        const auto index_after = from_device<std::uint16_t>(state.raw_keys.data(), 128 * capacity);
+        for (int token = 0; token < width; ++token) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (positions_after[3 * append[token] + axis] != rope[3 * token + axis]) { ++failures; }
+            }
+            for (int d = 0; d < 128; ++d) {
+                if (index_after[128 * append[token] + d] != f32_to_bf16(d == 0 ? 1.0F : 0.0F)) { ++failures; }
+            }
+        }
+    }
+
     // Composite validation is a synchronous transaction boundary: neither an alias nor a
     // malformed state may enqueue even the leading projections. Fill every mutable external
     // range, then make workspace itself the input so any missed preflight is observable.

@@ -395,7 +395,7 @@ ssize_t pwritev_with_test_limit(int fd, iovec* iov, int count, off_t offset,
 }
 
 [[nodiscard]] bool valid_rewrite_kind(std::uint8_t kind) noexcept {
-    return kind <= static_cast<std::uint8_t>(RewriteCheckpointKind::ResponseReplay);
+    return kind <= static_cast<std::uint8_t>(text::qwen::RewriteCheckpointKind::ResponseReplay);
 }
 
 [[nodiscard]] bool valid_state_kind(std::uint8_t kind) {
@@ -650,7 +650,7 @@ DiskCheckpointSlot decode_slot(InBuf& r) {
         meta.dflash_context_frontier  = r.u32();
         meta.tail_hidden_valid        = r.u8() != 0;
         meta.rewrite_valid            = r.u8() != 0;
-        meta.rewrite_kind             = static_cast<RewriteCheckpointKind>(r.u8());
+        meta.rewrite_kind             = static_cast<text::qwen::RewriteCheckpointKind>(r.u8());
         meta.hash_c_valid             = r.u8() != 0;
         meta.rewrite_frontier         = r.u32();
         meta.hash_f.lo                = r.u64();
@@ -825,8 +825,8 @@ void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want)
                               "backend_plane_schema");
 }
 
-[[nodiscard]] PrefixReusePath rewrite_path(RewriteCheckpointKind kind) {
-    return kind == RewriteCheckpointKind::ResponseReplay
+[[nodiscard]] PrefixReusePath rewrite_path(text::qwen::RewriteCheckpointKind kind) {
+    return kind == text::qwen::RewriteCheckpointKind::ResponseReplay
                ? PrefixReusePath::RestoreResponseCheckpoint
                : PrefixReusePath::RestoreTurnCheckpoint;
 }
@@ -4109,7 +4109,7 @@ bool KVDiskCache::decode_state_parallel(std::vector<StateDecodeJob>& jobs) {
     return true;
 }
 
-std::optional<DiskMatch> KVDiskCache::plan_match(const PreparedPromptData& prompt,
+std::optional<DiskMatch> KVDiskCache::plan_match(const text::qwen::PreparedPromptData& prompt,
                                                  std::span<const PrefixHash128> hash_chain,
                                                  const ReuseBackendPolicy& policy) {
     std::lock_guard lock(mutex_);
@@ -4480,11 +4480,11 @@ bool KVDiskCache::claim(std::uint64_t entry_id, PrefixHash128 expected_hash_f,
             return meta.execution_frontier == base && hidden_ok(meta.current_hidden_id);
         case PrefixReusePath::RestoreTurnCheckpoint:
             return meta.rewrite_valid && meta.rewrite_frontier == base &&
-                   meta.rewrite_kind == RewriteCheckpointKind::TurnClosure &&
+                   meta.rewrite_kind == text::qwen::RewriteCheckpointKind::TurnClosure &&
                    hidden_ok(meta.rewrite_hidden_id);
         case PrefixReusePath::RestoreResponseCheckpoint:
             return meta.rewrite_valid && meta.rewrite_frontier == base &&
-                   meta.rewrite_kind == RewriteCheckpointKind::ResponseReplay &&
+                   meta.rewrite_kind == text::qwen::RewriteCheckpointKind::ResponseReplay &&
                    hidden_ok(meta.rewrite_hidden_id);
         case PrefixReusePath::RestoreTurnRollback:
             return meta.rollback.frontier == base &&

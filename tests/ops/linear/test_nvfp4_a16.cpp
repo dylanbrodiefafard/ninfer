@@ -86,6 +86,18 @@ int run_nvfp4_a16() {
                                exact_geometry_invocations});
     }
     constexpr std::array<std::int32_t, 3> dflash_batches{2, 3, 4};
+    constexpr std::array qwen4_dflash_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{7, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{129, CallForm::Policy, ops::LinearPolicy::AllowA4},
+    };
+    for (const auto [n, k] : {std::pair{2560,12800}, std::pair{7680,2560}, std::pair{2560,7680}}) {
+        failures += run_shape("NVFP4_A16 native DFlash geometry", ActivationCompute::A16,
+                              make_nvfp4_weight, {n, k, 773U, Comparison::Sampled, true,
+                                                 qwen4_dflash_invocations});
+    }
     failures += run_packed_sequences_matches_panels(
         "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, 5,
         dflash_batches);

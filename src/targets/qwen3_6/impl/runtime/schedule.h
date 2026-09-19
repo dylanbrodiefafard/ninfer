@@ -10,10 +10,10 @@
 #include "ninfer/ops/swa.h"
 #include "core/decode_graph.h"
 #include "runtime/contract/transient_region.h"
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "runtime/contract/tool_masks.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -28,8 +28,8 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
-using qwen3_6::PreparedPromptData;
-using qwen3_6::PromptModality;
+using text::qwen::PreparedPromptData;
+using text::qwen::PromptModality;
 
 // Large aligned extents use the full 8192-token workspace efficiently. A large unaligned tail
 // sends every major projection through its remainder schedule; cap that unit at 4096 so only the
@@ -106,7 +106,7 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    runtime::ToolMaskExchange* tool_masks = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -117,7 +117,7 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    runtime::ToolMaskExchange* tool_masks = nullptr;
 };
 
 struct DFlashAppendContext {
@@ -166,7 +166,7 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    runtime::ToolMaskExchange* tool_masks = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -182,7 +182,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
 
 [[nodiscard]] PrefillChunkResult
-prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
+prefill_multimodal_chunk(PrefillContext& state, const text::qwen::PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
                          bool finalize_at_end);
@@ -199,7 +199,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
                             const Tensor* next_embedding = nullptr);
-void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
+void mtp_bridge_multimodal(PrefillContext& state, const text::qwen::PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge);
 
 // Executes one exact-B ordinary decode traversal. All request rows enter through the stable

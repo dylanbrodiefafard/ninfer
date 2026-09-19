@@ -182,14 +182,25 @@ __device__ __forceinline__ float state_value(const __nv_bfloat16* old_state,
                                                      logical_index]);
 }
 
-template <typename Coefficient>
+template <typename Coefficient, bool Batched = false>
 __global__ void ple_conv_inject_kernel(const __nv_bfloat16* residual, const float* gated,
                                        const Coefficient* conv_weight,
                                        const __nv_bfloat16* old_state,
                                        const __nv_bfloat16* current, __nv_bfloat16* output,
-                                       int width) {
+                                       int width, const int* slots = nullptr,
+                                       const int* valid_columns = nullptr) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= kPleChannels) { return; }
+    const int batch = Batched ? int(blockIdx.y) : 0;
+    const int valid = Batched ? valid_columns[batch] : width;
+    if constexpr (Batched) {
+        const auto offset = static_cast<std::int64_t>(batch) * width * kPleChannels;
+        residual += offset;
+        gated += offset;
+        current += offset;
+        output += offset;
+        old_state += static_cast<std::int64_t>(slots[batch]) * kPleChannels * kPleConvHistory;
+    }
     for (int token = 0; token < width; ++token) {
         float conv = 0.0F;
 #pragma unroll
@@ -200,15 +211,25 @@ __global__ void ple_conv_inject_kernel(const __nv_bfloat16* residual, const floa
         const float activated = conv / (1.0F + expf(-conv));
         const std::int64_t index = channel + static_cast<std::int64_t>(kPleChannels) * token;
         const float value = __bfloat162float(residual[index]) + gated[index] + activated;
-        output[index] = __float2bfloat16_rn(value);
+        output[index] = __float2bfloat16_rn(token < valid ? value : 0.0F);
     }
 }
 
+template <bool Batched = false>
 __global__ void ple_state_update_kernel(const __nv_bfloat16* old_state,
                                         const __nv_bfloat16* current,
-                                        __nv_bfloat16* new_state, int width) {
+                                        __nv_bfloat16* new_state, int width,
+                                        const int* slots = nullptr, const int* valid_columns = nullptr) {
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= kPleChannels) { return; }
+    const int batch = Batched ? int(blockIdx.y) : 0;
+    const int valid = Batched ? valid_columns[batch] : width;
+    if constexpr (Batched) {
+        const auto state_offset = static_cast<std::int64_t>(slots[batch]) * kPleChannels * kPleConvHistory;
+        old_state += state_offset;
+        new_state += state_offset;
+        current += static_cast<std::int64_t>(batch) * width * kPleChannels;
+    }
     __nv_bfloat16 old[kPleConvHistory];
 #pragma unroll
     for (int i = 0; i < kPleConvHistory; ++i) {
@@ -216,11 +237,33 @@ __global__ void ple_state_update_kernel(const __nv_bfloat16* old_state,
     }
 #pragma unroll
     for (int i = 0; i < kPleConvHistory; ++i) {
-        const int sequence_index = width + i - kPleConvHistory;
+        const int sequence_index = valid + i - kPleConvHistory;
         new_state[channel + static_cast<std::int64_t>(kPleChannels) * i] =
             sequence_index < 0
                 ? old[sequence_index + kPleConvHistory]
                 : current[channel + static_cast<std::int64_t>(kPleChannels) * sequence_index];
+    }
+}
+
+__global__ void ple_commit_prefix_kernel(const __nv_bfloat16* records,const int* tokens,
+    const int* counts,const int* slots,__nv_bfloat16* conv,int* history,int width,int capacity) {
+    const int channel=blockIdx.x*blockDim.x+threadIdx.x,b=blockIdx.y;
+    const int count=counts[b];
+    if(count<=0 || count>width || channel>=kPleChannels) return;
+    const int slot=slots[b];
+    if(slot<0 || slot>=capacity) return;
+    auto* state=conv+std::int64_t(slot)*kPleChannels*9;
+    const auto* current=records+std::int64_t(b)*kPleChannels*width;
+    __nv_bfloat16 old[9];
+    for(int h=0;h<9;++h) old[h]=state[h*kPleChannels+channel];
+    for(int h=0;h<9;++h) {
+        const int source=count+h-9;
+        state[h*kPleChannels+channel]=source<0?old[source+9]:current[source*kPleChannels+channel];
+    }
+    if(channel==0) {
+        const int previous=history[slot*2+1];
+        history[slot*2]=count==1?previous:tokens[b*width+count-2];
+        history[slot*2+1]=tokens[b*width+count-1];
     }
 }
 
@@ -316,10 +359,49 @@ void ple_conv_inject_launch(const Tensor& residual, const Tensor& gated,
 void ple_state_update_launch(const Tensor& old_state, const Tensor& current_state,
                              Tensor& new_state, cudaStream_t stream) {
     constexpr int block = 256;
-    ple_state_update_kernel<<<(kPleChannels + block - 1) / block, block, 0, stream>>>(
+    ple_state_update_kernel<><<<(kPleChannels + block - 1) / block, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(old_state.data),
         static_cast<const __nv_bfloat16*>(current_state.data),
         static_cast<__nv_bfloat16*>(new_state.data), current_state.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ple_conv_batch_launch(const Tensor& residual, const Tensor& gated,
+    const Tensor& conv_weight, const Tensor& old_state, const Tensor& current_state,
+    const Tensor& slots, const Tensor& valid_columns, int width,
+    Tensor& new_state, Tensor& out, cudaStream_t stream) {
+    const dim3 grid((kPleChannels + 255) / 256, slots.ne[0]);
+    const auto* ids = static_cast<const int*>(slots.data);
+    const auto* valid = static_cast<const int*>(valid_columns.data);
+    if (conv_weight.dtype == DType::BF16) {
+        ple_conv_inject_kernel<__nv_bfloat16,true><<<grid,256,0,stream>>>(
+            static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(gated.data),
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(old_state.data),
+            static_cast<const __nv_bfloat16*>(current_state.data),
+            static_cast<__nv_bfloat16*>(out.data),width,ids,valid);
+    } else {
+        ple_conv_inject_kernel<float,true><<<grid,256,0,stream>>>(
+            static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(gated.data),
+            static_cast<const float*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(old_state.data),
+            static_cast<const __nv_bfloat16*>(current_state.data),
+            static_cast<__nv_bfloat16*>(out.data),width,ids,valid);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    ple_state_update_kernel<true><<<grid,256,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(old_state.data),
+        static_cast<const __nv_bfloat16*>(current_state.data),
+        static_cast<__nv_bfloat16*>(new_state.data),width,ids,valid);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ple_commit_prefix_launch(const Tensor& records,const Tensor& token_ids,
+    const Tensor& counts,const Tensor& slots,Tensor& conv,Tensor& history,cudaStream_t stream) {
+    ple_commit_prefix_kernel<<<dim3((kPleChannels+255)/256,records.ne[2]),256,0,stream>>>(
+        static_cast<const __nv_bfloat16*>(records.data),static_cast<const int*>(token_ids.data),
+        static_cast<const int*>(counts.data),static_cast<const int*>(slots.data),
+        static_cast<__nv_bfloat16*>(conv.data),static_cast<int*>(history.data),records.ne[1],conv.ne[2]);
     CUDA_CHECK(cudaGetLastError());
 }
 

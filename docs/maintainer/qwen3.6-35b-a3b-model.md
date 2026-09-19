@@ -942,7 +942,7 @@ The registered implementation maps these concerns as follows:
 | exact 934-tensor/six-resource binding, conditional residency, and immutable Text/MTP/Vision/MoE/DFlash views | `src/targets/qwen3_6_35b_a3b/impl/load/` |
 | fused attention projection, fused staged GDN projection/control, sparse-MoE post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_6_35b_a3b/impl/variant.h`, `impl/variant.cpp` |
 | fixed Text/MTP/Vision/DFlash execution, planning, Program lifecycle, workspace composition, prefix/state transactions, speculative verification/acceptance, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
-| tokenizer, template, multimodal processing, and output decoding | `src/targets/qwen3_6/impl/frontend/` |
+| tokenizer, template, multimodal processing, and output decoding | `text/qwen/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |

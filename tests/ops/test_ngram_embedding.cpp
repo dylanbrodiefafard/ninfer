@@ -1,4 +1,5 @@
 #include "ninfer/ops/ngram_embedding.h"
+#include "core/device.h"
 #include "ops/op_tester.h"
 
 #include <array>
@@ -401,6 +402,34 @@ int host_step_case() {
     return failures;
 }
 
+int history_commit_case() {
+    int failures=0;
+    for(int width:{1,2,16,257,4096}) {
+        std::vector<int> ids(width*3);
+        for(std::size_t i=0;i<ids.size();++i) ids[i]=(i%13==0)?248044:int(i%248000);
+        const std::vector<int> slots{3,0,2},counts{width,1,0},initial{7,9,11,13,248044,19,23,29};
+        auto expected=initial;
+        for(int b=0;b<3;++b) {
+            std::vector<int> sequence{initial[2*slots[b]],initial[2*slots[b]+1]};
+            sequence.insert(sequence.end(),ids.begin()+width*b,ids.begin()+width*b+counts[b]);
+            expected[2*slots[b]]=sequence[sequence.size()-2];
+            expected[2*slots[b]+1]=sequence.back();
+        }
+        auto di=to_device(ids),ds=to_device(slots),dc=to_device(counts),dh=to_device(initial);
+        Tensor input(di.p,DType::I32,{width,3}),indices(ds.p,DType::I32,{3}),n(dc.p,DType::I32,{3}),
+            history(dh.p,DType::I32,{2,4});
+        cudaStream_t stream;CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+        ops::ngram_history_commit(input,n,indices,history,stream);
+        cudaGraph_t graph;cudaGraphExec_t exec;
+        CUDA_CHECK(cudaStreamEndCapture(stream,&graph));CUDA_CHECK(cudaGraphInstantiate(&exec,graph,0));
+        CUDA_CHECK(cudaGraphLaunch(exec,stream));CUDA_CHECK(cudaStreamSynchronize(stream));
+        failures+=verify_exact("raw-history selected prefix exact graph",from_device<int>(dh.p,8),expected);
+        CUDA_CHECK(cudaGraphExecDestroy(exec));CUDA_CHECK(cudaGraphDestroy(graph));CUDA_CHECK(cudaStreamDestroy(stream));
+    }
+    return failures;
+}
+
 int validation_cases() {
     const ops::NgramRowConfig good{101, 100, 0, 1234, 1009};
     GuardedDeviceBuffer input(sizeof(std::int32_t) * 2);
@@ -468,6 +497,7 @@ int main() {
     failures += batched_oracle_case(true);
     failures += chained_schedule_case();
     failures += host_step_case();
+    failures += history_commit_case();
     failures += validation_cases();
     std::cout << (failures ? "FAIL" : "OK") << " ngram_embedding\n";
     return failures ? 1 : 0;

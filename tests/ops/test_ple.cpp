@@ -538,6 +538,7 @@ struct Inputs {
 struct RunResult {
     std::vector<std::uint16_t> output;
     std::vector<std::uint16_t> state;
+    std::vector<std::uint16_t> records;
     int guards = 0;
 };
 
@@ -556,6 +557,7 @@ RunResult run_inject(std::span<const float> residual, std::span<const float> emb
     auto dold = to_device(std::vector<std::uint16_t>(old_state.begin(), old_state.end()));
     GuardedDeviceBuffer dnew(old_state.size_bytes());
     GuardedDeviceBuffer dout(residual.size()*sizeof(std::uint16_t));
+    GuardedDeviceBuffer drecords(std::size_t(ops::kPleChannels)*width*2);
     DeviceArena workspace(ops::ple_workspace_capacity_bytes(width, weights.key.qtype, weights.value.qtype));
     Tensor residual_t(dresidual.p, DType::BF16, {ops::kPleEmbeddingWidth, 4, width});
     Tensor embedding_t = device_embedding ? device_embedding->reshape({ops::kPleEmbeddingWidth,width}) :
@@ -570,15 +572,18 @@ RunResult run_inject(std::span<const float> residual, std::span<const float> emb
     Tensor out_t(dout.data(), DType::BF16, {ops::kPleEmbeddingWidth, 4, width});
     Tensor& state_out = in_place_state ? old_t : new_t;
     Tensor& output = in_place_residual ? residual_t : out_t;
+    Tensor records(drecords.data(),DType::BF16,{ops::kPleChannels,width});
     ops::ple_inject(residual_t, embedding_t, weights.key, weights.value, key_norm_t,
                     query_norm_t, conv_norm_t, conv_t, old_t, state_out, output, workspace,
                     inputs.native_parameters ? ops::PleNormFormat::ZeroCenteredBf16 : ops::PleNormFormat::EffectiveFp32,
-                    nullptr);
+                    nullptr,&records);
     cuda_synchronize();
     RunResult result;
     result.output = from_device<std::uint16_t>(in_place_residual ? dresidual.p : dout.data(),
                                                residual.size());
     result.state = from_device<std::uint16_t>(in_place_state ? dold.p : dnew.data(), old_state.size());
+    result.records=from_device<std::uint16_t>(drecords.data(),std::size_t(ops::kPleChannels)*width);
+    result.guards+=drecords.verify_guards("PLE explicit convolution records");
     if (!in_place_residual) { result.guards += dout.verify_guards("PLE injection output"); }
     if (!in_place_state) { result.guards += dnew.verify_guards("PLE new convolution state"); }
     return result;
@@ -587,6 +592,7 @@ RunResult run_inject(std::span<const float> residual, std::span<const float> emb
 struct OracleResult {
     std::vector<double> output;
     std::vector<std::uint16_t> state;
+    std::vector<std::uint16_t> records;
 };
 
 OracleResult oracle(const Inputs& input, const Weights& weights,
@@ -640,7 +646,84 @@ OracleResult oracle(const Inputs& input, const Weights& weights,
         const int t=input.width-9+h;
         final_state[C*h+c]=t<0 ? initial_state[C*(t+9)+c] : f32_to_bf16(current[C*t+c]);
     }
-    return {std::move(output),std::move(final_state)};
+    std::vector<std::uint16_t> records(current.size());
+    std::transform(current.begin(),current.end(),records.begin(),[](double x) { return f32_to_bf16(float(x)); });
+    return {std::move(output),std::move(final_state),std::move(records)};
+}
+
+int compact_injection_case(QType type,int width,int batch,bool native_parameters) {
+    constexpr int D=2560,F=10240,C=4;
+    Inputs input(width*batch); input.native_parameters=native_parameters;
+    if(native_parameters) {
+        std::fill(input.norm.begin(),input.norm.end(),-.25F);
+        input.query_norm=input.conv_norm=input.norm;
+        round_to_bf16(input.conv_weight);
+    }
+    Weights weights(type);
+    std::vector<std::uint16_t> initial(std::size_t(F)*9*C);
+    for(std::size_t i=0;i<initial.size();++i) initial[i]=f32_to_bf16(.001F*float(int(i%37)-18));
+    std::vector<int> slots{2,0,3,1},valid{width,std::max(1,width-1),0,width};
+    slots.resize(batch);valid.resize(batch);
+    std::vector<double> expected_output(std::size_t(F)*width*batch);
+    auto expected_state=initial;
+    std::vector<OracleResult> refs(batch);
+    for(int b=0;b<batch;++b) if(valid[b]) {
+        Inputs row=input; row.width=valid[b];
+        row.residual.assign(input.residual.begin()+std::size_t(b)*width*F,
+            input.residual.begin()+(std::size_t(b)*width+valid[b])*F);
+        row.embedding.assign(input.embedding.begin()+std::size_t(b)*width*D,
+            input.embedding.begin()+(std::size_t(b)*width+valid[b])*D);
+        refs[b]=oracle(row,weights,std::span(initial).subspan(std::size_t(slots[b])*F*9,F*9));
+        std::copy(refs[b].output.begin(),refs[b].output.end(),expected_output.begin()+std::size_t(b)*width*F);
+        std::copy(refs[b].state.begin(),refs[b].state.end(),expected_state.begin()+std::size_t(slots[b])*F*9);
+    }
+    auto dr=to_device_bf16(input.residual),de=to_device_bf16(input.embedding),dold=to_device(initial);
+    auto dk=native_parameters?to_device_bf16(input.norm):to_device_f32(input.norm);
+    auto dq=native_parameters?to_device_bf16(input.query_norm):to_device_f32(input.query_norm);
+    auto dn=native_parameters?to_device_bf16(input.conv_norm):to_device_f32(input.conv_norm);
+    auto dc=native_parameters?to_device_bf16(input.conv_weight):to_device_f32(input.conv_weight);
+    auto di=to_device(slots),dv=to_device(valid);
+    GuardedDeviceBuffer dout(input.residual.size()*2),dnew(initial.size()*2),drecords(input.residual.size()*2);
+    const auto dtype=native_parameters?DType::BF16:DType::FP32;
+    Tensor residual(dr.p,DType::BF16,{D,4,width,batch}),embedding(de.p,DType::BF16,{D,width,batch}),
+        old(dold.p,DType::BF16,{F,9,C}),state(dnew.data(),DType::BF16,{F,9,C}),
+        out(dout.data(),DType::BF16,{D,4,width,batch}),records(drecords.data(),DType::BF16,{F,width,batch}),
+        keynorm(dk.p,dtype,{F}),querynorm(dq.p,dtype,{F}),convnorm(dn.p,dtype,{F}),conv(dc.p,dtype,{4,F}),
+        ids(di.p,DType::I32,{batch}),counts(dv.p,DType::I32,{batch});
+    WorkspaceArena ws(ops::ple_workspace_capacity_bytes(width*batch,weights.key.qtype,weights.value.qtype));
+    cudaStream_t stream;CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    int failures=0;
+    for(bool graph:{false,true}) {
+        CUDA_CHECK(cudaMemcpyAsync(state.data,old.data,old.bytes(),cudaMemcpyDeviceToDevice,stream));
+        CUDA_CHECK(cudaMemcpyAsync(out.data,residual.data,residual.bytes(),cudaMemcpyDeviceToDevice,stream));
+        if(graph) CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+        ops::ple_inject_batch(graph?out:residual,embedding,weights.key,weights.value,keynorm,querynorm,convnorm,
+            conv,graph?state:old,state,ids,counts,out,ws,
+            native_parameters?ops::PleNormFormat::ZeroCenteredBf16:ops::PleNormFormat::EffectiveFp32,stream,&records);
+        cudaGraph_t captured=nullptr;cudaGraphExec_t exec=nullptr;
+        if(graph) {
+            CUDA_CHECK(cudaStreamEndCapture(stream,&captured));
+            CUDA_CHECK(cudaGraphInstantiate(&exec,captured,0));CUDA_CHECK(cudaGraphLaunch(exec,stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto actual=from_device_bf16(out.data,input.residual.size());
+        failures+=verify_pointwise("compact PLE independent formula",actual,expected_output,PointwiseCriterion{.02,.01});
+        failures+=verify_exact("compact PLE independent state plus untouched slots",
+            from_device<std::uint16_t>(state.data,initial.size()),expected_state);
+        for(int b=0;b<batch;++b) {
+            for(int t=valid[b];t<width;++t) for(int d=0;d<F;++d)
+                if(actual[(std::size_t(b)*width+t)*F+d]!=0) {++failures;break;}
+            if(valid[b]) failures+=verify_exact("compact PLE independent records",
+                from_device<std::uint16_t>(static_cast<std::uint16_t*>(records.data)+std::size_t(b)*width*F,
+                    refs[b].records.size()),refs[b].records);
+        }
+        if(exec) CUDA_CHECK(cudaGraphExecDestroy(exec));
+        if(captured) CUDA_CHECK(cudaGraphDestroy(captured));
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    failures+=verify_exact("compact PLE immutable input history",from_device<std::uint16_t>(old.data,initial.size()),initial);
+    for(const auto* buffer:{&dout,&dnew,&drecords}) failures+=buffer->verify_guards("compact PLE buffers");
+    return failures;
 }
 
 int injection_state_case(QType type = QType::GGML_Q8_0, bool native_parameters = false) {
@@ -676,6 +759,7 @@ int injection_state_case(QType type = QType::GGML_Q8_0, bool native_parameters =
                                  PointwiseCriterion{0.02, 0.01});
     failures += verify_exact("PLE injection independent final BF16 state", one.state,
                              expected.state);
+    failures += verify_exact("PLE injection independent complete BF16 records",one.records,expected.records);
     const RunResult in_place = run_inject(input.residual, input.embedding, width, initial_state, input,
                                           weights, false, true);
     failures += verify_exact("PLE distinct vs in-place residual output", one.output,
@@ -919,6 +1003,10 @@ Result ple(const std::string& root,const Result& input,bool partitioned,bool nvf
 #else
 int main(int argc, char** argv) {
     if (require_cuda() != 0) { return 1; }
+    const int compact_failures=compact_injection_case(QType::BF16_CTRL,3,3,true)+
+        compact_injection_case(QType::NVFP4,16,4,false)+
+        compact_injection_case(QType::FP8_E4M3FN_ROW_BF16S,1,4,true);
+    if(argc==2 && std::string_view(argv[1])=="--compact") return compact_failures?1:0;
     if (argc == 2 && std::string_view(argv[1]) == "--native-real") {
         const char* root = std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
         if (!root) { return 77; }
@@ -927,7 +1015,7 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     static_assert(ops::kPleMaxStagedBytes == 5'898'240);
-    int failures = 0;
+    int failures = compact_failures;
     for (const int width : {1, 17, 128, 4096}) { failures += nvfp4_staging_decode_case(width); }
     for (const int width : {1, 17, 128, 4096}) { failures += fp8_staging_decode_case(width); }
     failures += staging_decode_case();

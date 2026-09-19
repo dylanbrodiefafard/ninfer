@@ -10,18 +10,18 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <int Tokens, class Launch>
+template <class G, int Tokens, class Launch>
 void dispatch_token_case(Launch&& launch) {
-    constexpr int Warps = (Tokens + 3) / 4;
+    constexpr int Warps = (Tokens * G::kGroup + 15) / 16;
     launch.template operator()<Tokens, Warps>();
 }
 
-template <class Launch>
+template <class G, class Launch>
 void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     switch (tokens) {
 #define NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(TOKENS)                                                \
     case TOKENS:                                                                                   \
-        dispatch_token_case<TOKENS>(launch);                                                       \
+        dispatch_token_case<G, TOKENS>(launch);                                                    \
         return
         NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(1);
         NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(2);
@@ -48,14 +48,18 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 } // namespace
 
 BidirectionalGqaPlan bidirectional_gqa_resolve_plan(std::int32_t tokens,
-                                                    GqaContextExecutionEnvelope envelope) {
+                                                    GqaContextExecutionEnvelope envelope,
+                                                    std::int32_t head_dim) {
     if (tokens < 1 || tokens > 16) {
         throw std::invalid_argument("bidirectional_gqa_attention plan: T must be 1..16");
     }
     if (envelope.min_context > envelope.max_context) {
         throw std::invalid_argument("bidirectional_gqa_attention plan: invalid envelope");
     }
-    const std::int32_t warps = (tokens + 3) / 4;
+    if (head_dim != 128 && head_dim != 256) {
+        throw std::invalid_argument("bidirectional_gqa_attention plan: D must be 128 or 256");
+    }
+    const std::int32_t warps = (tokens * (head_dim == 128 ? 4 : 12) + 15) / 16;
     const bool direct        = envelope.max_context == 0;
     const std::int32_t key_block =
         direct || tokens <= 8 || envelope.max_context <= 65536u ? 32 : 64;
@@ -91,14 +95,15 @@ const char* bidirectional_gqa_route_name(BidirectionalGqaRoute route) {
     return "unknown";
 }
 
-void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
+template <class G>
+void launch_geometry(const Tensor& q, const Tensor& query_k,
                                         const Tensor& query_v, const Tensor& context_lengths,
                                         const Tensor& valid_columns, const Tensor& table_rows,
                                         float scale, const PagedKVBatchLayerView& context,
                                         const BidirectionalGqaPlan& plan, Tensor& partial_acc,
                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                         cudaStream_t stream) {
-    dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
+    dispatch_tokens<G>(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == BidirectionalGqaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
             plan.split_capacity > kBidirectionalGqaMaxSplit) {
@@ -110,9 +115,14 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             }
             constexpr int KeyBlock = 32;
             constexpr std::size_t SmemBytes =
-                2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
-            const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
-            bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, true>
+                std::max(2 * KeyBlock, Warps * 16) * G::kHeadDim * sizeof(__nv_bfloat16);
+            if constexpr (SmemBytes > 48u * 1024u) {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, true, G>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, SmemBytes));
+            }
+            const dim3 direct_grid(G::kKVHeads, 1, q.ne[3]);
+            bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, true, G>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
@@ -125,7 +135,7 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, 1, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<typename G::Partial*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
@@ -138,9 +148,14 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
 
         const auto launch_split = [&]<int KeyBlock>() {
             constexpr std::size_t SmemBytes =
-                2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
-            const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
-            bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
+                std::max(2 * KeyBlock, Warps * 16) * G::kHeadDim * sizeof(__nv_bfloat16);
+            if constexpr (SmemBytes > 48u * 1024u) {
+                CUDA_CHECK(cudaFuncSetAttribute(
+                    bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, false, G>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, SmemBytes));
+            }
+            const dim3 partial_grid(G::kKVHeads, plan.split_capacity, q.ne[3]);
+            bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, false, G>
                 <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
@@ -153,13 +168,13 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
-                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<typename G::Partial*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
-            const dim3 reduce_grid(kBidirectionalGqaQHeads, Tokens, q.ne[3]);
-            bidirectional_gqa_reduce_kernel<Tokens, KeyBlock><<<reduce_grid, 128, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
+            const dim3 reduce_grid(G::kQHeads, Tokens, q.ne[3]);
+            bidirectional_gqa_reduce_kernel<Tokens, KeyBlock, G><<<reduce_grid, 128, 0, stream>>>(
+                static_cast<const typename G::Partial*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(context_lengths.data),
@@ -180,6 +195,22 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
         }
         throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
     });
+}
+
+void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
+                                        const Tensor& query_v, const Tensor& context_lengths,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        float scale, const PagedKVBatchLayerView& context,
+                                        const BidirectionalGqaPlan& plan, Tensor& partial_acc,
+                                        Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                        cudaStream_t stream) {
+    if (q.ne[0] == 256) {
+        launch_geometry<BidirectionalGqa256>(q, query_k, query_v, context_lengths, valid_columns,
+            table_rows, scale, context, plan, partial_acc, partial_m, partial_l, out, stream);
+    } else {
+        launch_geometry<BidirectionalGqa128>(q, query_k, query_v, context_lengths, valid_columns,
+            table_rows, scale, context, plan, partial_acc, partial_m, partial_l, out, stream);
+    }
 }
 
 } // namespace ninfer::ops::detail

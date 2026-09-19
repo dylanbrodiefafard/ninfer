@@ -45,11 +45,24 @@ void control_kernel(const __nv_bfloat16* x, const float* a_weight, const float* 
     }
 }
 
+template <bool Batched = false>
 __global__ void conv_kernel(const __nv_bfloat16* projected, const float* weight,
                             const __nv_bfloat16* state_in, __nv_bfloat16* state_out,
-                            __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, int tokens) {
+                            __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, int tokens,
+                            const std::int32_t* slots = nullptr,
+                            const std::int32_t* valid_columns = nullptr) {
     const int channel = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (channel >= kQkvRows) { return; }
+    const int batch = Batched ? static_cast<int>(blockIdx.y) : 0;
+    const int valid = Batched ? valid_columns[batch] : tokens;
+    if constexpr (Batched) {
+        state_in += static_cast<std::int64_t>(slots[batch]) * kQkvRows * 3;
+        state_out += static_cast<std::int64_t>(slots[batch]) * kQkvRows * 3;
+        projected += static_cast<std::int64_t>(batch) * tokens * kQkvRows;
+        q += static_cast<std::int64_t>(batch) * tokens * kValueRows;
+        k += static_cast<std::int64_t>(batch) * tokens * kValueRows;
+        v += static_cast<std::int64_t>(batch) * tokens * kValueRows;
+    }
     float s0 = __bfloat162float(state_in[channel]);
     float s1 = __bfloat162float(state_in[kQkvRows + channel]);
     float s2 = __bfloat162float(state_in[2 * kQkvRows + channel]);
@@ -61,7 +74,7 @@ __global__ void conv_kernel(const __nv_bfloat16* projected, const float* weight,
         sum       = fmaf(channel_weight[1], s1, sum);
         sum       = fmaf(channel_weight[2], s2, sum);
         sum       = fmaf(channel_weight[3], p, sum);
-        const __nv_bfloat16 result = __float2bfloat16_rn(silu(sum));
+        const __nv_bfloat16 result = __float2bfloat16_rn(token < valid ? silu(sum) : 0.0F);
         const std::int64_t token_base = static_cast<std::int64_t>(token) * kValueRows;
         if (channel < kQkRows) {
 #pragma unroll
@@ -77,17 +90,15 @@ __global__ void conv_kernel(const __nv_bfloat16* projected, const float* weight,
         } else {
             v[token_base + channel - 2 * kQkRows] = result;
         }
-        s0 = s1;
-        s1 = s2;
-        s2 = p;
+        if (token < valid) {
+            s0 = s1;
+            s1 = s2;
+            s2 = p;
+        }
     }
-    for (int column = 0; column < 3; ++column) {
-        const int source = tokens + column - 3;
-        state_out[static_cast<std::int64_t>(column) * kQkvRows + channel] =
-            source < 0
-                ? state_in[static_cast<std::int64_t>(source + 3) * kQkvRows + channel]
-                : projected[static_cast<std::int64_t>(source) * kQkvRows + channel];
-    }
+    state_out[channel] = __float2bfloat16_rn(s0);
+    state_out[kQkvRows + channel] = __float2bfloat16_rn(s1);
+    state_out[2 * kQkvRows + channel] = __float2bfloat16_rn(s2);
 }
 
 __global__ __launch_bounds__(kHeadDim)
@@ -125,13 +136,30 @@ void gated_delta_net_layer_conv_launch(const Tensor& projected_qkv, const Tensor
                                           const Tensor& conv_state_in, Tensor& conv_state_out,
                                           Tensor& q, Tensor& k, Tensor& v,
                                           cudaStream_t stream) {
-    conv_kernel<<<(kQkvRows + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+    conv_kernel<><<<(kQkvRows + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(projected_qkv.data),
         static_cast<const float*>(conv_weight.data),
         static_cast<const __nv_bfloat16*>(conv_state_in.data),
         static_cast<__nv_bfloat16*>(conv_state_out.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(v.data),
         projected_qkv.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gated_delta_net_layer_conv_batch_launch(const Tensor& projected_qkv,
+    const Tensor& conv_weight, const Tensor& state_in, Tensor& state_out,
+    const Tensor& slots, const Tensor& valid_columns, std::int32_t width,
+    Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream) {
+    conv_kernel<true><<<dim3((kQkvRows + kBlock - 1) / kBlock, slots.ne[0]),
+                        kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(projected_qkv.data),
+        static_cast<const float*>(conv_weight.data),
+        static_cast<const __nv_bfloat16*>(state_in.data),
+        static_cast<__nv_bfloat16*>(state_out.data),
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(v.data), width,
+        static_cast<const std::int32_t*>(slots.data),
+        static_cast<const std::int32_t*>(valid_columns.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

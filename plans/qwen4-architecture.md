@@ -49,7 +49,190 @@ prerequisite only after the runnable target identity is selected.
 
 ## 0. Native-checkpoint preparation and active native precision implementation
 
-### Active goal: native NVFP4 mixed precision (2026-09-18)
+### Completed implementation goal: native architecture and Engine integration (2026-09-18)
+
+The completed bounded tranche below is component evidence, not completion of the requested
+implementation. The user explicitly requires the remaining feasible implementation. The full
+preview's device footprint blocks full-checkpoint execution and PPL on this GPU; it does not
+block writing and qualifying the missing native runtime. No commit or push is authorized here.
+
+- [x] Bind and convert one complete exact native artifact: all 48 distinct source layers,
+  endpoints, protected controls, complete locked PLE, source frontend assets, Vision and MTP,
+  with explicitly optional checkpoint-specific DFlash and honest capacity admission.
+- [x] Implement paged QSA including K/V, index keys and positions, long-context selection,
+  compact batches and per-column causal visibility; preserve exact selection/tie semantics.
+- [x] Implement compact batched GDN and PLE state transitions, masked prefixes and replay,
+  using one layer-major decoder schedule rather than serial per-request model execution.
+- [x] Implement full native embedding, 48-layer prefill/decode, final projection and sampling,
+  with all ordinary compute weights GPU-resident and padded vocabulary rows excluded.
+- [x] Own all 36 recurrent and 12 QSA states, PLE histories, continuation and sampling counts;
+  implement prefix commit/retention/restore and address-stable graph execution.
+- [x] Integrate native MTP and checkpoint-specific DFlash proposal/verification/replay with
+  the shared p-less epsilon/floor law. Keep GPU proposal egress and locked-RAM PLE gathering
+  outside captured target graphs; retain only accepted feature/cache prefixes.
+- [x] Join source-correct Vision preprocessing/encoding/placement to Text and the existing
+  Engine scheduler; share frontend ownership without copying another family's runtime.
+- [x] Qualify independent numerical/codec/state oracles, realistic bounded source compositions,
+  Engine admission and existing-product regressions; resolve actionable precision findings
+  without relaxing criteria or asserting unavailable whole-model quality evidence.
+- [x] Complete Astra finished-code review/fix loops and the full correct-container C++ suite;
+  update affected ownership, model, artifact and operation authorities consistently.
+
+Implementation qualification is deliberately distinct from full-artifact execution: the native
+converter/binder is checked against every real source header and bounded real transforms, not an
+unavailable complete conversion run. The shared production decoder body passes actual layers0–3
+against the independent accumulated formula, compact B4 eager/graph exact state, and real65-row
+chunked-prefill route comparison. Native MTP/DFlash shared owners pass actual-component C4,
+shared-page admission, source-aligned reseeding and two distinct same-frontier checkpoint images.
+All identified Astra findings are fixed and re-reviewed, including high-position QSA/DFlash
+phase accuracy, unexecuted-prepare cancellation, and scoring against retained peer-page owners.
+The full C++ regression gate passed in `ninfer-builder-qwen4-mixed` on RTX5090/CUDA13.1:
+133 selected tests, 125 passed, eight explicitly artifact-dependent skips, zero failures,
+543.36 seconds. The command was
+`NINFER_DEV_CONTAINER=ninfer-builder-qwen4-mixed NINFER_BUILD_VOLUME=ninfer-build-cache-qwen4-mixed NINFER_DEV_JOBS=8 ./scripts/run-unit-tests.sh`.
+Nine focused converter/metadata Python tests also pass. Full48 PPL, acceptance and throughput
+still require a fitting exact checkpoint; none is inferred from bounded tests. This broader
+architecture plan remains the admission roadmap for that external checkpoint, not an assertion
+that its future model-level qualification has already passed. No commit or push was made.
+
+### Completed bounded goal: native runtime, MTP and checkpoint-specific DFlash (2026-09-18)
+
+The user requests all follow-up architecture work after the native mixed-precision tranche,
+including a primary-source Hugging Face search for a compatible Flash-Next DFlash drafter.
+The starting branch is `21b0b867`, rebased on experimental `e04fad37`. Shared sampling now
+contains p-less epsilon slack and its unrelaxed `1/1024` probability floor; ordinary and
+speculative paths must retain that single sampling law. No commit/push is requested for
+this new goal.
+
+- [x] Find and pin an exact Qwen4/Flash-Next-compatible DFlash/DFlash2 checkpoint, audit
+  training target, feature taps, source mathematics, tokenizer/vocabulary and tensor inventory.
+  Implement the actual checkpoint architecture, not a resized dense-27B drafter. Main draft
+  matrices should use independently qualified NVFP4; preserve BF16 codebooks if the selected
+  architecture actually has them, and protect source-required controls.
+- [x] Freeze executable MTP recurrence, QSA-selection reuse, cache positions and observable
+  casts from primary implementations; acquire the bounded authentic private block and
+  independently qualify its NVFP4 conversion and higher-precision exceptions.
+- [x] Implement complete bounded MTP draft execution, carried four-stream state, independent
+  draft cache ownership and multi-step selection reuse. Qualify complete local formulas and
+  state transitions, not just the stem. The separate propagated-chain/target quality admission
+  gate remains failed/unqualified as recorded below; this check is not rollout admission.
+- [x] Implement the compatible DFlash draft model and source-defined target feature capture,
+  context/draft cache and position behavior, independently qualified logits/proposals and
+  NVFP4 execution. Do not invent a codebook for a drafter that has none.
+- [x] Implement provisional target/draft state, verification, rejection/partial/full acceptance
+  and accepted-prefix fold across QSA, GDN, PLE/token history, positions and published tokens.
+  Preserve common p-less/epsilon/floor, masks, correction/bonus and RNG semantics. Native target
+  composition is qualified on actual layers 0–3; full48 target/drafter integration remains an
+  external capacity/admission gate, not a claim made by this bounded transaction.
+- [x] Complete feasible native artifact binding and fixed Qwen4 Text model scheduling beyond
+  the diagnostic GGUF verifier; actual native layers 0–3 are bound and executed without runtime
+  repacking. Keep complete product GPU residency and a complete exact inventory as full48
+  admission conditions; do not substitute repeated layers for absent weights.
+- [x] Complete source-defined Vision schedule/frontend and visual placement, using the
+  qualified native BF16 block/merger and independent frontend/position references.
+- [x] Integrate address-stable CUDA Graphs, startup-fixed C=1..4 request isolation, prefix
+  retention and restore with the bounded native Qwen4 transaction/state ownership model.
+- [x] Qualify full native PLE eager population/OS locking and bounded transfer lifetime using
+  an actual chosen complete table if accessible within the local resource envelope; selected
+  rows do not establish full-payload capacity. Never fall back to inference-time disk paging.
+- [x] Evaluate actionable compression/precision alternatives without admitting the previously
+  failed KV/residual profiles or weakening numerical gates. Real diagnostic-target DFlash
+  features expose substantial NVFP4 weight loss; protecting only feature fusion reduces but
+  does not remove it, so neither recipe is admitted as a quality default. Fitting-artifact
+  memory/performance and final precision policies remain external model-level gates.
+- [x] Complete independent codec/Op/state/sampling-law checks and bounded real-source
+  compositions, full C++ regression suite, and Astra finished-code review/fix loops.
+
+Current bounded implementation evidence (not whole-target admission):
+
+- The exact PixelML five-layer DFlash v1 companion is acquired and converted. It has no
+  DFlash2 codebook. Source BF16 and converted NVFP4/A16 schedules, learned-GR feature taps,
+  accepted-context-only caches, shifted positions, all seven query outputs, shared authentic
+  248320-row head, exact proposal selection, C=4 isolation and CUDA Graph replay pass focused
+  checks. Same-input FP64 checks cover 604 boundaries. An avoidable BF16 attention split-partial
+  rounding was corrected with FP32 D256 partials; D128 is unchanged. Five raw RMS gross screens
+  remain explicitly failed, with independent proofs that their entire outputs are exactly the
+  nearest BF16 values and those thresholds are unattainable in BF16. Public-boundary composition
+  passes; the separate BF16 C65/K7 no-cast ideal 2% screen still fails at 2.4304%. NVFP4-versus-BF16
+  draft quality and real-target acceptance are not qualified. Astra found no actionable issue in
+  the finished slice. See `docs/research/qwen4-speculative-sources.md`.
+- Native MTP binds the authentic private block and implements four-stream carry, complete
+  frozen-domain selection, independent caches, discard/replay and target-hidden accepted replay.
+  Actual-input local oracles and state/selection tests pass; an Astra-found historical-cache
+  oracle input mismatch was fixed and the re-review is clear. The independently propagated
+  chain retains seven failed 2% screens, including one changed expert membership; no rollout
+  quality or acceptance-rate admission is inferred. Startup-captured draft graphs and four
+  interleaved private owners sharing weights match independent eager outputs and complete
+  caches exactly; Astra review is clear. See `docs/research/qwen4-mtp-execution.md`.
+- Complete 27-block BF16 Vision and source-defined image/video preprocessing pass source
+  references, graph and isolation checks. Fused projection+bias removed an erroneous extra BF16
+  cast without widening the gate. Astra review is clear. This is not multimodal Engine registration.
+- All 128 real NVFP4 PLE partitions now form a 28,800,138,752-byte canonical payload. The real
+  resident-host materializer populated every page and eagerly locked 28,800,139,264 bytes;
+  all partition boundaries matched an independent source-to-GPU decode oracle, with bounded
+  staging and successful owner-lifetime/teardown tests. See `docs/research/qwen4-native-ple-source.md`.
+- Qwen4's expanded 48/48-head replay and 36-layer accepted-prefix fold pass independent FP64
+  recurrence, exact zero-accept/history, request-isolation, tree/path and CUDA Graph tests.
+  The complete GDN layer emits independently checked raw replay records. PLE prefix-state
+  recording/commit passes independent exact tail/history oracles at W1/7/16, including accepted
+  EOS and zero-prefix no-op; Astra review is clear.
+- Native binding and scheduling now run actual layers 0–3 with offline exact GDN permutations,
+  resident native weights, independently qualified layer boundaries, whole/chunk continuation,
+  C4 graphs and exact comparison with independent C1 owners. Astra review is clear. This is not
+  a fabricated full model or full48 qualification. Native transaction publication/rollback,
+  retained complete state, common sampling counts and typed graph ownership pass independent
+  state/control checks and C1–4 graph/eager comparisons. A stale-output publication defect was
+  fixed by requiring actual eager execution or validated typed graph launch; capture alone and
+  repeated launches cannot publish. Astra's final transaction review is clear.
+- A bounded header-only audit independently validates all 48 native compute inventories:
+  295,968 tensors and 75,222,107,904 non-PLE payload bytes, before endpoints or runtime state.
+  This alone exceeds the 5090's VRAM. Nine exact header ranges total 39,984,296 bytes; no
+  full native weight payload was downloaded. Three parser regressions and Astra review pass.
+- Full C++ regression on the correct `ninfer-builder-qwen4-mixed` container passes:
+  126 standard CTests listed, 121 passed, five prerequisite skips, zero failures (505.17 s).
+  The skipped Qwen4 endpoint, full PLE residency and transaction cases have separate successful
+  real-fixture runs; the other two skips are existing target load-plan prerequisites. The
+  Qwen4 Python suite passes 113 tests with two optional external-codec cross-check skips;
+  the subsequently added three native-inventory tests also pass. New acquisition/reference
+  Python modules compile. The subsequently added diagnostic feature and staged-round targets
+  build and pass focused execution/default-skip checks; their finished Astra reviews are clear.
+- Real diagnostic-target DFlash contexts 8/16/24 give BF16-versus-NVFP4 hidden relative L2
+  0.33629/0.33771/0.36222, logit relative L2 0.13069/0.14516/0.16288, and 16/21 top-1 matches.
+  Those differences are weight-precision diagnostics, not kernel-oracle failures or PPL.
+  Independent FP64/public-BF16 C24 ablation changes hidden drift from 0.361924 to 0.315941
+  when only feature fusion stays BF16; no new runtime profile is admitted.
+- A complete staged diagnostic DFlash round uses its target's exact shared endpoints, seven
+  real proposals, eight target verification columns and unchanged common p-less/epsilon
+  acceptance. One draft is accepted in the observed round. Cancellation and partial/full
+  publication reproduce all 157,147,144 bytes of continuation state exactly after accepted-input
+  replay, with exact count rollback and next-anchor continuation. This proves a bounded full48
+  integration, not native product scheduling, model acceptance quality, or performance.
+- Actual diagnostic-target MTP handoff now pairs pre-final-GR `R_t` with the next token's
+  embedding at private position `t`, as pinned source code requires. The 24-row seed, two
+  feedback steps, shared endpoint sampling/count probe, graph/eager execution and actual
+  target-hidden replay prefixes 0/1/2 pass. The independent same-input FP64 oracle reports
+  zero failures; QSA relative L2 is at most 1.100%, MoE per-row at most 0.373%. A separate
+  propagated-chain diagnostic still fails its unchanged 2% screen at seed token 13 (2.05172%);
+  draft carry is at most 1.2367%. Legacy injection gross screens retain their independently
+  proven nearest-BF16 limitations. Accepted replay inputs came from the DFlash round, so this
+  does not claim MTP acceptance qualification. Focused build/GPU/default-skip and Astra review
+  pass; see `docs/research/qwen4-mtp-execution.md`.
+
+The feasible bounded implementation/qualification tranche is complete. No commit or push was
+made. It does not declare the failed or unmeasured model-quality gates passed. Full native
+48-layer execution, registered scheduling, native-target MTP/DFlash acceptance/PPL and final
+activation/weight defaults need a fitting exact checkpoint (the audited preview core alone is
+70.06 GiB), or a separately authorized change to the product's GPU-residency contract. A future
+smaller target's shape/inventory cannot be inferred or fabricated from the preview.
+
+Exact unreleased-model identity/topology, complete-model paired PPL/task/long-context quality,
+end-to-end speeds and final registration need suitable actual artifacts. They remain requested
+external qualification gates, not evidence obtainable by inventing a future checkpoint or
+substituting component error for model quality. Continue independent implementation work while
+one artifact-dependent gate is unavailable; report concrete blockers only after feasible paths
+are exhausted.
+
+### Completed goal: native NVFP4 mixed precision (2026-09-18)
 
 The new goal supersedes the earlier tranche's completion claim as a statement of overall
 native readiness. That tranche's checks remain valid bounded evidence; its rejected A8 and

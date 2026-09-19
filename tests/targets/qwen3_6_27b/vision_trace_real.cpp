@@ -8,7 +8,7 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
@@ -120,7 +120,7 @@ private:
 };
 
 Json item_json(const ninfer::targets::qwen3_6::VisionItemControl& item) {
-    return {{"modality", item.modality == ninfer::targets::qwen3_6::PromptModality::Image
+    return {{"modality", item.modality == ninfer::text::qwen::PromptModality::Image
                               ? "image"
                               : "video"},
             {"grid", {item.grid.temporal, item.grid.height, item.grid.width}},
@@ -192,9 +192,10 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
     ninfer::artifact::MaterializedArtifact materialized =
         ninfer::artifact::materialize(reader, load.materialization, device);
     LoadedModelData model(std::move(load.bindings), std::move(materialized));
-    auto frontend = ninfer::targets::qwen3_6::make_frontend(model.frontend, true);
+    auto frontend = ninfer::text::qwen::make_frontend(model.frontend, true,
+        ninfer::text::qwen::FrontendProfile::Qwen3_6);
     auto prepared = frontend.prepare(std::move(input));
-    auto prompt = ninfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(prepared));
+    auto prompt = ninfer::text::qwen::PreparedPromptAccess::take(std::move(prepared));
     const ninfer::targets::qwen3_6::VisionControl control =
         ninfer::targets::qwen3_6::build_vision_control(prompt);
     if (control.items.empty()) { throw std::invalid_argument("Vision trace prompt has no media"); }

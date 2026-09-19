@@ -207,6 +207,24 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
     }
 }
 
+void launch_recurrent_batch_inout(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& g, const Tensor& beta, float scale,
+                                 const Tensor& slots, const Tensor& valid_columns,
+                                 const Tensor& state_in, Tensor& state_out, Tensor& out,
+                                 cudaStream_t stream) {
+    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const dim3 grid(v.ne[1], q.ne[3], kStateDim / kBlockDv);
+    const dim3 block(kWarpSize, kNumWarps, 1);
+    recurrent_bf16_direct_kernel<true, true><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
+        static_cast<const float*>(beta.data), static_cast<const float*>(state_in.data),
+        static_cast<float*>(state_out.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
+        heads, scale, static_cast<const std::int32_t*>(slots.data),
+        static_cast<const std::int32_t*>(valid_columns.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                const Tensor& beta, float scale, bool normalize_qk,
                                Tensor& ssm_states, const Tensor& valid_columns,
@@ -349,6 +367,13 @@ void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 }
 
+void launch_replay_fold_layer(const GdnReplayRecords& records,
+                              LinearAttentionStateAllLayersView states,
+                              const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                              cudaStream_t stream) {
+    launch_replay_fold_fixed<FoldGeometry1x48>(records, states, rows, active_rows, stream);
+}
+
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
@@ -364,6 +389,13 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
         records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
         records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
         launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
+        return;
+    }
+    if (records.spec.layers == FoldGeometry36x48::kLayers &&
+        records.spec.qk_heads == FoldGeometry36x48::kQkHeads &&
+        records.spec.value_heads == FoldGeometry36x48::kValueHeads &&
+        records.spec.conv_channels == FoldGeometry36x48::kConvChannels) {
+        launch_replay_fold_fixed<FoldGeometry36x48>(records, states, rows, active_rows, stream);
         return;
     }
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");

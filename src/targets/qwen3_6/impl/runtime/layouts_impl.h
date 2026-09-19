@@ -678,7 +678,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity},
                                                                            width, width, batch),
                                          ops::bidirectional_gqa_attention_workspace_capacity_bytes(
-                                             {0, plan.capacity}, width, width, batch)));
+                                             {0, plan.capacity}, width, width, batch,
+                                             DFlashConfig::head_dim)));
                         scratch(layout, ops::linear_add_workspace_capacity_bytes(
                                             QType::W8G32_F16S, DFlashConfig::hidden,
                                             DFlashConfig::query_size, tokens, tokens));

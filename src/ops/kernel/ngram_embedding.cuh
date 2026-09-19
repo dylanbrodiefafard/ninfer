@@ -50,23 +50,30 @@ __global__ void ngram_row_ids_kernel(const std::int32_t* input_ids,
         config.offset[head] + ngram_euclidean_remainder(mixed, config.prime[head]);
 }
 
+template <bool Selected = false>
 __global__ void ngram_history_kernel(const std::int32_t* input_ids,
                                      const std::int32_t* valid_tokens,
                                      const std::int32_t* old_history, std::int32_t* new_history,
-                                     std::int32_t width, std::int32_t requests) {
+                                     std::int32_t width, std::int32_t requests,
+                                     const std::int32_t* slots = nullptr) {
     const std::int32_t request = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (request >= requests) { return; }
     const std::int32_t valid = valid_tokens[request];
     const std::int64_t base  = static_cast<std::int64_t>(request) * width;
+    const int slot=Selected?slots[request]:request;
+    old_history+=2*slot;
+    new_history+=2*slot;
     if (valid == 0) {
-        new_history[2 * request]     = old_history[2 * request];
-        new_history[2 * request + 1] = old_history[2 * request + 1];
+        if constexpr (!Selected) {
+            new_history[0] = old_history[0];
+            new_history[1] = old_history[1];
+        }
     } else if (valid == 1) {
-        new_history[2 * request]     = old_history[2 * request + 1];
-        new_history[2 * request + 1] = input_ids[base];
+        new_history[0] = old_history[1];
+        new_history[1] = input_ids[base];
     } else {
-        new_history[2 * request]     = input_ids[base + valid - 2];
-        new_history[2 * request + 1] = input_ids[base + valid - 1];
+        new_history[0] = input_ids[base + valid - 2];
+        new_history[1] = input_ids[base + valid - 1];
     }
 }
 

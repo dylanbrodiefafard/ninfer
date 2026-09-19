@@ -2,16 +2,18 @@
 
 This reference freezes the Qwen4 model mathematics and persistent state established from the
 official `Qwen/Qwen3.8-Flash-Next` BF16 preview. The preview is source provenance for this Qwen4
-architecture authority, not the repository identity. This is **not** a registered NInfer target,
-an advertised model, or permission to weaken the one-resident-model RTX 5090 product contract.
+architecture authority, not the repository identity. The exact native artifact identity is
+`qwen4/native-preview` / `nvfp4-a16`. Its Engine integration is architecture implementation,
+not a claim that the oversized preview can run on the RTX 5090 or an advertised fitting model.
 
-No currently audited preview profile qualifies as a registered resident RTX 5090 target. The official BF16
+No currently audited preview profile qualifies as a runnable resident RTX 5090 target. The official BF16
 tensor payload is 359,999,963,128 bytes. Excluding the entire 51,233,085,475-value PLE component
 still leaves 128,766,895,984 checkpoint values; even an impossible uniform four-bit encoding of all
 of them would occupy 64,383,447,992 bytes (59.96 GiB) before scales, state, KV, workspaces, CUDA
 Graphs, and the required 1 GiB headroom. The audited UD-IQ1_S profile still has 43,735,298,560
-non-PLE tensor bytes (40.73 GiB). No registered target, `.ninfer` product weights profile, or
-fallback product lane is defined by this document. The selected UD-IQ1_S artifact has one
+non-PLE tensor bytes (40.73 GiB). The canonical native mixed-weight inventory requires
+80,369,063,936 GPU payload bytes before runtime state and therefore fails device admission.
+Native admission never selects a fallback product lane. The selected UD-IQ1_S artifact has one
 unregistered C=1 eager numeric-token Program with T=1 decode and T=1..4096 chunked prefill solely
 for native architecture verification. A
 complete custom profile converted from the
@@ -39,9 +41,9 @@ only optimized decompositions. A future product target must freeze its own exact
 none of the constants here is inherited merely because it is called Qwen4.
 
 MTP is different: Transformers deliberately ignores `mtp.*`, and the paper does not completely
-specify rollout and transaction behavior. Section 11 records only the structure on which the two
-independent serving implementations agree. That structure remains a candidate contract until
-golden traces settle every listed boundary.
+specify rollout and transaction behavior. Section 11 records the shared recurrence, the explicit
+vLLM/TokenSpeed frozen-domain qualification profile, and SGLang's differing later-step tail.
+Bounded private-block correctness does not establish full-target speculative admission.
 
 ## 2. Exact topology
 
@@ -404,21 +406,28 @@ profile. Vision LayerNorm has learned weight and bias and epsilon `1e-6`. The me
 `Linear(4608,4608)`, exact GELU, and `Linear(4608,2560)`, both with bias. There are no deep-stack
 outputs.
 
+The complete native BF16 preview Vision schedule and source pixel preparation are implemented
+as an unregistered qualification route in `src/targets/qwen4/vision.{h,cpp}` and
+`vision_frontend.{h,cpp}`. Biased projections use the closed central `linear_bias` Op, with no
+intermediate BF16 cast before bias. The source inventory, numerical qualification, caller
+lifetime contract, and remaining integration boundary are recorded in
+`docs/research/qwen4-native-vision.md`. This route does not register a full Qwen4 Engine target.
+
 Text-only positions use four equal rows initially: one causal-mask row and three MRoPE rows. For
 multimodal input, the frontend constructs the causal text-position row plus temporal, height, and
 width MRoPE rows. Text QSA uses the three MRoPE rows for both core Q/K and index Q/block K; the
 separate text row determines causal visibility. All four rows, not merely a scalar decode cursor,
 are observable continuation state.
 
-## 11. MTP: established structure and admission gate
+## 11. MTP: native private block and explicit execution profile
 
 The checkpoint contains one private QSA/MoE decoder layer, separate attention and MoE GR modules,
 a separate final read-only GR, `fc_embedding`, `fc_hidden`, and two pre-projection norms. It shares
 the main token embedding and untied output head. It contains no PLE tensors. The exact 31 private
 tensors are inventoried in the artifact reference.
 
-Pinned vLLM and the independently maintained SGLang integration agree on this candidate stem and
-two-stream recurrence. For target token-aligned embedding `e` and carried four-stream hidden `R`:
+Pinned vLLM and the independently maintained SGLang integration agree on this stem and
+four-stream recurrence. For target token-aligned embedding `e` and carried four-stream hidden `R`:
 
 ```text
 e' = fc_embedding(offset_rmsnorm(e))                 # [2560]
@@ -431,32 +440,139 @@ logits = shared_output_head(h_logits)
 next_carried_state = R1                              # [4,2560], before final read
 ```
 
+Here target alignment means **`R_t` paired with `embedding(x_{t+1})`**, while the private
+RoPE/cache row retains source position `t`; its output predicts `x_{t+2}`. It does not
+pair `R_t` with `x_t`, shift RoPE to `t+1`, or substitute the collapsed final-GR read.
+For a prompt `x[0:N]`, seed rows use hidden `R[0:N]`, shifted embeddings
+`x[1:N] + [next_anchor]`, and original positions `0..N-1`. The next anchor may be
+teacher-provided in a declared diagnostic; otherwise it is selected by the target sampler.
+Subsequent private draft calls advance their independent source positions by one and consume
+the previous private carry plus the preceding proposal's embedding. After a verified input
+prefix of length `L`, target replay pairs verified hidden row `j` with licensed output token
+`j` at original verified position `N+j`; the final pair uses the correction/bonus new anchor.
+Only those `L` verified inputs are retained, not the correction/bonus as an additional input.
+The current pinned vLLM generic proposer and GPU autoregressive preparer independently perform
+this left token shift while preserving target positions; exact references are in the MTP
+execution research note.
+
 `pre_fc_norm_hidden` is not the branch-grouped GR norm: it takes one variance over the complete
 10240-wide concatenated state. Reshaping into four streams occurs only after that normalization.
 
 The target model likewise retains its pre-final-read four-stream state for draft step zero while
 ordinary target logits consume the final GR read. Later draft steps carry the prior draft layer's
 pre-final-read state. Both implementations select QSA indices for the target-aligned draft-extend
-row and reuse that per-request selection for later top-1 chain steps. Target verification computes
-its own indices. The expanded selection width is 2051: 2048 selected complete-block token slots
-plus up to three tail slots.
+row. They **do not agree on later-step tails**, including at the original pins. NInfer's bounded
+native private-block implementation explicitly chooses the audited **vLLM + TokenSpeed frozen
+complete-domain profile**: later steps consume the exact seed token IDs/count, while still
+appending their private core K/V, raw index keys, and independent RoPE positions. They do not
+append newly drafted tokens to the attention domain. SGLang instead appends the post-capture
+draft interval. This selection is an execution profile, not a claim of training-time authority or
+SGLang parity. Target verification always computes its own indices. The maximum attended count
+is 2051 (2048 complete-block slots plus three seed-tail slots); vLLM's extra packed count column
+does not increase that to 2052 tokens. Source pins and formulas are in
+`docs/research/qwen4-mtp-execution.md`.
 
-This agreement is sufficient to implement oracle fixtures for the stem and carried state, but not
-to register MTP as correct. Before admission, golden traces from an execution environment capable
-of running the source must freeze and compare:
+`LoadedMtp` binds the independently acquired `qwen4/native-mtp-qualification` private artifact:
+three NVFP4 expert banks, plus 29 source BF16 protected tensors. Every BF16 word matches the
+pinned NVIDIA source; every expert code, block scale and multiplier is independently checked.
+The publisher explicitly marks expert input scales as placeholders, so `MtpProgram` enforces
+**A16Only**, with no A4 policy switch. The canonical native artifact instead supplies the same
+already-prepared semantic weight view from its one owner. `MtpProgram` is one compact batched
+compute/scratch owner over externally owned BF16 paged QSA views and device controls; it owns no
+request frontier, private cache allocation, carry, or graph. `NativeDraftRuntime` owns one shared
+exclusive page pool, per-slot carry/domain/target-hidden images, fixed compact staging, and
+startup graph shapes for C=1…4. There is no serialized complete per-slot MTP program. Integer
+staging and carry/domain gathers occur outside capture; captured execution is the same batched
+GPU schedule as the eager numerical path. Historical bounded C4 interleaving evidence below
+concerns the earlier qualification harness, not proof of the new shared-pool owner.
 
-- target pre-final-GR state and final-read logits input;
-- normalized/projected embedding and each normalized/projected hidden branch;
-- MTP layer pre/post attention-GR and MoE-GR states;
-- all 2051 selected/tail slots at draft extend and at every reused step;
-- absolute positions, core KV/index-cache alignment, and carried state for at least four steps;
-- proposal probabilities/tokens and target-verification probabilities; and
-- rejection, partial acceptance, full acceptance, cache fold, and published-token results.
+The separate actual-component `test_native_draft_runtime.cpp` now checks the new owner with
+native private weights and authentic shared BF16 endpoints: ragged compact C4 graph/eager
+logits and every live paged/cache/seed word agree exactly, including frozen-domain discard,
+retained last-key restoration after reseeding, and unbind/rebind. Independent Prompt and
+Retained images at the same frontier but different anchor seeds each restore their exact
+last cache row and complete seed state. Fresh whole-prefix versus
+one-row reseeding has relative L2 0.00430…0.01449 within the unchanged 2% component-composition
+criterion; this different-shape comparison is not asserted bit-identical. Local Op correctness
+remains qualified separately against the independent represented-input oracle.
 
-SGLang pin `78c...` is the head of an open integration and vLLM's MTP logic is not an independent
-mathematical oracle. If their traces disagree, MTP remains disabled. There is no implicit
-MTP-free product variant of this checkpoint: such a variant would be a different exact artifact
-and product decision.
+`NativeDraftRuntime::extend_mtp` consumes target-aligned hidden rows; `draft_mtp` consumes previous
+private pre-final-GR carry. `discard_mtp` restores the seed carry/domain/frontier. Accepted rows
+are replayed through `extend_mtp` using their
+**target** hidden states, never committed from draft hidden states. Physical provisional rows
+above the restored logical frontier are invisible and are overwritten by retained-row replay.
+
+Real private-weight tests execute a five-row seed and four draft steps with distinct logical
+cache/RoPE coordinates, immutable selection reuse, exact rejection/replay, and accepted counts
+0–4. Independent FP64 formulas check each Op from its actual represented public input, including
+the preceding GPU-recorded QSA cache/domain. Old transformed K is not normalized or rotated again;
+historical rows are checked exactly and new appends independently. A second,
+fully propagated oracle is a sensitivity diagnostic: its strict 2% chain screen fails at later
+steps despite passing local Op criteria, including one changed top-10 expert at step 3. This is
+not full-model numerical/PPL or acceptance-rate proof.
+
+An additional staged diagnostic captures 24 actual full-target pre-final-GR rows, unloads that
+target, and runs native MTP with its exact original shared Q4_K embedding/head fully resident on
+GPU. This is diagnostic-checkpoint provenance, not a native NVFP4 full target or proposed future
+weight recipe. The source-aligned seed, two frozen-domain draft steps, exact eager/graph replay,
+common p-less/epsilon head sampling, and replay of actual verified target rows for retained
+prefixes 0/1/2 pass. Those verified rows were captured from a DFlash proposal round; they test
+MTP target-hidden replay, not acceptance of MTP proposals. Initial anchor is teacher-provided.
+All represented-input FP64 local Op/state gates pass on these actual inputs. The independent
+propagated 2% diagnostic retains one failed seed carry comparison (2.052% relative L2); no
+threshold was changed. Registered integration, MTP acceptance quality, full-model PPL and
+throughput still need a fitting exact supported target.
+
+### 11.1 Exact PixelML DFlash companion
+
+The acquired PixelML companion is a five-layer DFlash v1 model, not DFlash2 and not native MTP.
+It consumes the attention-GR block inputs at main layers `[4,16,24,36,44]`, concatenated in that
+order. These correspond to the publisher's previous-layer tap labels `[3,15,23,35,43]`;
+arithmetic branch means or raw four-stream residuals are not interchangeable features.
+
+`LoadedDFlash` binds the exact 58-tensor source BF16 or separately converted NVFP4/A16 artifact.
+`DFlashProgram` borrows five GPU BF16 accepted-context paged views and owns only compact scratch
+for one to four slots. `NativeDraftRuntime` owns their single shared exclusive page pool,
+reservation/frontiers/checkpoints and startup draft graphs. The fused/normalized context is shared across draft layers; only the noise-query stream
+receives each layer's input norm. All live queries attend accepted context strictly before the
+anchor plus every live noise query. Noise K/V are never persisted. Anchor then six mask embeddings
+produce seven predictions, starting at query zero. RoPE uses full 256-wide split-half rotation
+with theta `1e7`, independently from QSA's interleaved MRoPE. Logical cache positions and anchor
+RoPE positions are explicit distinct inputs at the component boundary. The exact native PixelML
+schedule uses causal token ordinals for both context and anchor, not the target's three-axis
+MRoPE coordinates or `rope_delta`, as required by its pinned training source. The target supplies the shared BF16 embedding/head;
+there is no learned codebook or selector in this checkpoint.
+
+The full-D256 rotary implementation uses FP64 frequency/phase/trigonometry with FP32 rotation
+coefficients to preserve its qualified BF16 output profile through source position 262143.
+Near-ceiling paired Q/K and single-K cases compare against the existing independent FP64 RoPE
+formula and unchanged pair-norm error criterion. They reproduced key/output errors with FP32
+phase evaluation and pass with the corrected profile; D128 routes are unchanged.
+
+The actual native shared-owner integration also checks C4 graph/eager logits and all five live
+cache layers exactly, proposal non-mutation, shorter Prompt-checkpoint restoration, independent
+C1 correspondence, and shared P64 entitlement exhaustion/release. Its captured target-feature
+panel and native BF16 endpoints are component evidence, not full native target PPL or a claim
+that the separately measured NVFP4 drafter quantization loss is acceptable.
+
+Source-specific capture, BF16/NVFP4 A16 execution, shared full-vocabulary endpoint, accepted
+context append, C=4 isolation and CUDA Graph replay have bounded independent qualification.
+Converted NVFP4-versus-BF16 draft quality, real-target acceptance and full speculative transaction
+admission are separate gates. `docs/research/qwen4-speculative-sources.md` records source pins,
+complete formulas and retained failed ideal-chain/RMS screening results.
+
+A separate staged diagnostic run now exercises the complete existing 48-layer verification
+target, the native NVFP4/A16 drafter, that diagnostic target's actual Q4_K embedding/head, and
+the unchanged shared p-less/epsilon accept Op. Target and drafter lifetimes do not overlap.
+One natural seven-proposal round accepted one draft; cancellation, proper-prefix publication,
+full licensed publication, and correction continuation matched fresh causal execution bitwise
+over all 157,147,144 bytes of GDN/QSA/PLE/residual state and exact occurrence counts. This is
+tool-only reset/replay qualification, not registered native speculative scheduling or an
+acceptance-rate benchmark. On separate actual target feature panels, converted NVFP4 versus
+source BF16 drafter top-1 agreement was 16/21 with 33.6–36.2% hidden relative-L2 drift; these
+different-weight results leave converted draft quality unadmitted despite correct kernels and
+state plumbing. The research reference records both experiments and their distinct endpoint
+representations and numerical criteria.
 
 ## 12. Complete logical persistent state
 
@@ -510,6 +626,216 @@ enqueue. After enqueue, state is mutated in place; the Program publishes the new
 PLE history only after both streams synchronize successfully. A failure after enqueue poisons the
 Program until `reset`, which drains both streams before restoring all state.
 
+### 12.2 Owned native first-block qualification runtime
+
+`LoadedNativeFirstBlock` binds actual NVIDIA layers 0–3 with source NVFP4 expert banks,
+protected BF16 matrices, and the offline control/head-layout preparation defined in the artifact
+reference. `NativeFirstBlock` runs exactly GDN0, PLE1/GDN1, GDN2 and QSA3, with each layer's
+attention and MoE GR transitions. It never repeats those weights as a claimed 48-layer model.
+Its four-stream inputs and decoded PLE embeddings are represented GPU values supplied by the
+caller; token embedding, n-gram table/hash ownership, final GR/head and sampling remain separate.
+
+One to four startup-fixed slots share immutable resident weights and ordered scratch but own
+independent committed/provisional GDN and PLE state, BF16 QSA cache, controls, output hidden and
+layer-boundary four-stream views (not DFlash attention-GR feature taps). `prepare` validates/stages input and logical/RoPE metadata outside
+capture. Fixed-width `enqueue` has only GPU work: committed GDN/PLE state is read, provisional
+state is written, and QSA appends only the logically provisional suffix. Visibility uses stable
+capacity-bounded buffers and dynamic causal offsets, so advancing a frontier does not require a
+different captured pointer/extent. Source metadata copies are not inside a CUDA Graph.
+
+Widths 2–16 optionally expose all three GDN replay records and PLE convolution records. The
+transaction owner folds only accepted input columns before publishing the accepted frontier;
+rejected physical QSA suffix rows remain invisible. Full-width baseline commit explicitly copies
+provisional GDN/PLE state. Retention restores the complete committed state before restoring its
+logical frontier. `NativeFirstBlock` owns no token-publication or sampling decision.
+
+The RTX 5090/CUDA 13.1 `ninfer_qwen4_native_compute_real_test` runs the actual four prepared
+layers against the existing independent source-weight formulas at every layer boundary, with
+the predeclared accumulated criterion `{relative_l2=.02, gross_absolute=.005,
+gross_relative_to_max_reference=.02}`. It also compares a five-token panel with 4+1 continuation,
+and exact C4 eager/graph output and complete state across two advancing frontiers. These focused
+checks pass, including exact comparison of every interleaved C4 slot against a separate C1
+owner's output and complete state. The graph test does not substitute its pairwise equality
+for the source oracle.
+
+This is a bounded native qualification runtime, not a registered Engine target, full native
+48-layer execution, full-model PPL proof, or an inference throughput claim. The exact full preview
+requires a separate complete inventory and capacity admission; missing layers cannot be replaced
+by repetitions or ordinary-weight CPU/disk streaming under this GPU-resident profile.
+
+### 12.3 Native first-block speculative transaction qualification
+
+`src/targets/qwen4/transaction.{h,cpp}` owns a bounded native **first-four-layer** text
+transaction around `NativeFirstBlock`: three GDN layers, layer-1 PLE, and one QSA layer.
+This is not a 48-layer target, Engine registration, MTP/DFlash end-to-end rollout, or
+acceptance/throughput qualification. Weights, represented input embeddings and PLE values
+are supplied by the separately qualified native component owners.
+
+One startup-fixed owner serves C=1..4 independent slots, verification width 1..16 and an
+explicit cache capacity. Preparation stores `[old_anchor,drafts...]` and text T/H/W positions;
+each coordinate advances by one per verified input, independently of cache addresses. Eager
+execution or a typed captured transaction graph reads committed GDN/PLE state and writes
+provisional state/records plus the append-only QSA tail. Captured graphs retain their exact
+slot/width membership and stable output views. Capture alone cannot license a commit, stale
+records cannot satisfy a new preparation, and repeated enqueue/launch/publication is rejected.
+
+Resolution consumes the existing common `runtime::GeneratedRound` and `OutputDecision`.
+It does not implement another sampler or acceptance policy. If the output decision publishes
+N tokens, exactly N **verified input columns** are folded, and the Nth licensed output becomes
+the new anchor. For A accepted drafts plus a correction/bonus, N=A+1 processes
+`[old_anchor,drafts[:A]]`, never that correction/bonus. A shorter structured-output prefix
+instead leaves its final licensed draft as the next anchor. Zero/rejected publication preserves
+all committed state and logical sampling positions.
+
+Three qualified per-layer GDN folds update FP32 recurrence and BF16 convolution history;
+the exact PLE prefix Op updates its nine-column convolution and two raw token IDs, retaining
+EOS unchanged. Width one copies the complete provisional GDN state and uses the represented
+final PLE convolution column. Historical QSA KV/index/position rows remain unchanged; rejected
+physical suffix rows stay invisible behind the committed frontier and are overwritten later.
+Continuation hidden is the last accepted input's four-stream output, not a rejected tail.
+
+Mutable occurrence counts are slot-owned. Common positive-temperature speculative acceptance
+may update them provisionally; after consumer drain, the shared
+`runtime::rollback_sampling_counts` removes every licensed-but-unpublished suffix occurrence
+before any host publication. Its semantics were extracted unchanged from the existing Qwen3.6
+runtime; that runtime calls the same helper. P-less epsilon/support-floor, penalty and
+counter-based RNG laws remain in the existing central sampling/accept Ops. Seed/config and
+publication policy remain caller-owned, while authoritative frontier/anchor override provisional
+sampler scratch lengths/anchors at the next ingress.
+
+One independently owned, startup-allocated retained snapshot per slot includes every GDN/PLE
+state, visible QSA prefix, raw token history, continuation hidden, occurrence counts, frontier,
+anchor positions and published-token ledger. Capture/restore and commit drain consumers before
+host metadata becomes visible; execution allocates no buffers. Failures poison affected slots
+until reset or a valid retained restore. Graph objects and borrowed views cannot outlive the
+transaction/model/stream owners.
+
+Focused real-weight qualification uses `ninfer_qwen4_native_transaction_test` with
+`NINFER_QWEN4_NATIVE_LAYERS` and `NINFER_QWEN4_NATIVE_COMPUTE` set to the prepared fixtures.
+It covers all counts 0..4, the width-16 full prefix, independent FP64 GDN recurrence and exact
+record-tail/raw-history oracles, supplementary fresh accepted-prefix execution, retained
+restoration, untouched historical QSA rows, and C=1,2,3,4 graph/eager request isolation across
+advancing frontiers. A real common p-less accept invocation with repeated token IDs verifies
+counts, cancellation, proper-prefix publication and logical positions; controlled logits isolate
+transaction semantics rather than claim model acceptance quality. Missing fixtures skip by
+default. The numerical GDN fold criterion remains relative L2 2.7e-3 with gross bound
+1e-5 + 3.9e-3 times maximum reference magnitude; supplementary whole-composition comparisons
+retain the existing 2% criterion. Exact state/control checks remain bitwise.
+
+### 12.4 Native Engine control boundary
+
+The native preview's concrete `EngineProgram` is separate from the dense-family Program:
+`src/targets/qwen4/engine_program.{h,cpp}` binds the common `ConcurrentExecutor` publication
+contract to `NativeRuntime`. The common scheduler, output sessions, tool grammar, p-less
+epsilon/floor law, and licensed-suffix occurrence-count rollback remain shared. Native
+runtime integration is not evidence that the full preview fits a 5090 or that full native
+PPL has been measured.
+
+`src/text/qwen` owns the shared tokenizer/template, prepared prompts, output semantics and
+encoded-history cache. The explicit Qwen4 processor profile calls its source pixel frontend;
+the dense profile retains its existing preparation behavior. The native artifact owns all six
+frontend resources. The pinned NVIDIA tokenizer has **248077** valid IDs; the physical shared
+head has **248320** rows. Registered sampling, proposal argmax and NLL normalization exclude
+the padded head rows. The source generation configuration recommends temperature 1, top-k20,
+top-p0.95; the product's common p-less override still takes precedence when enabled.
+
+Input columns, output tokens and private seeds have distinct ownership. A licensed prefix of
+length L commits exactly L verified target inputs `[old_anchor,drafts[:L-1]]`; its final
+licensed output is the new, unconsumed anchor. Rejection/cancellation commits zero inputs and
+rolls back every licensed occurrence count. MTP pairs each committed actual `R_t` with the
+licensed next token at source position t. Exact-prefix reuse that samples a different anchor
+replaces the private last seed at the same position, not the target prefix. DFlash receives only
+accepted target feature rows. Neither backend defines an alternative acceptance law.
+
+The Qwen4 target has two concrete complete checkpoint images: retained and prompt/rewrite.
+They own recurrent, PLE, continuation, private-backend and frontend identity state over one
+exclusive QSA page allocation. Append cancellation may restore the old retained prefix; cold
+reset invalidates it before overwriting its KV rows. Prompt/rewrite capture splits prefill at
+the exact requested frontier. The target has no host KV tiers or dense-family checkpoint
+ladder: explicit nonempty ladder settings and host-tier options are startup errors, while
+default options do not implicitly enable those capabilities. PLE's required locked-RAM table
+is independent of this KV capability. Source QSA supports BF16 and NVFP4-G16 KV, not dense
+Sage/tile-skip/XAttention modes.
+
+Scoring uses the same exclusive shared page budget. Because it runs outside the generation
+scheduler, the adapter first selects the minimum required LRU idle-retained victim set with
+nonmutating admission queries, then evicts and reserves. A retained peer prefix cannot prevent
+an otherwise admitted full-context score. The state-owner regression covers C2/context128 with
+only128 pooled tokens and a retained64-token peer; failed trial admission leaves that peer intact.
+
+`ninfer_qwen4_native_draft_runtime_test` exercises the actual native NVFP4 private MTP and DFlash
+components with the authentic full BF16 shared head and exact addressed native embedding rows.
+Unavailable fixture embedding rows are poisoned, not synthesized. Target carry/features come from
+the separately identified diagnostic full48 capture: this is component/runtime integration, not
+native-target quality or speculative acceptance evidence. C4 graph/eager logits and logical live
+cache/seed state match exactly; retained seed-tail restore, draft discard, DFlash prompt restore,
+request isolation, unbind/rebind and shared-page admission are checked. The supplementary MTP
+whole-prefix versus one-row reseed comparison uses the existing `{.02,.005,.02}` composition
+profile because those shapes select different A16 arithmetic routes (observed relative L2
+0.0043–0.0145). Independent represented-input FP64 component oracles remain the mathematical
+authority; same-route state transformations retain exact criteria.
+
+Frontend source resources used for this boundary:
+
+- `https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/fc694b54fb0174e0913e6adf86691ef85a4ead47/tokenizer_config.json`
+- `https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/fc694b54fb0174e0913e6adf86691ef85a4ead47/generation_config.json`
+
+### 12.5 Complete native runtime ownership
+
+`NativeRuntime` binds one complete `NativeModelView` and executes all 48 distinct layers through
+`enqueue_native_decoder`. GR, linear and expert operations flatten independent compact columns;
+GDN, PLE and paged QSA retain explicit slot, live-prefix and frontier controls. Decode has one
+layer-major batch for one to four requests, not a loop over complete per-request models.
+Single-request prefill admits widths through 4096; multi-request verification admits widths
+through 16. All ordinary weights and floating-point computation remain GPU-resident.
+Full, single-request eager prefill retains the existing qualified chunked GDN route on its
+host-proven slot; masked compact decode/verification uses device-selected recurrent state.
+Both routes are covered by the shared startup workspace recipe.
+
+The sole host model-data exception is the already eagerly populated and OS-locked PLE table.
+Qualified integer n-gram addressing uses each slot's exact two-token raw history. Bounded pinned
+byte gathers upload complete selected FP8 or NVFP4 row records; GPU decoding supplies represented
+BF16 embeddings. FP8 table views exclude the trailing BF16 tensor multiplier from row bytes and
+retain its exact bits separately. Token embeddings and optional source Vision features are
+prepared before the compute graph, then broadcast into the four residual branches. Source image
+tokens still participate in raw PLE hashing; replacing a visual embedding does not replace its
+token ID. Final GR and the untied head produce physical 248320-row logits, while the shared
+sampler restricts valid token IDs to 248077.
+
+`NativeState` owns all 36 FP32 recurrent/BF16 convolution states, PLE history, carried residual,
+and twelve P64 QSA layers in one exclusive shared page pool. QSA K/V, raw index keys and original
+three-axis positions use the same page-group map. Each slot has committed and provisional fixed
+state, plus two typed complete images: retained and prompt/rewrite. Only causal prefixes are
+retained; later cache rows are unobservable. Growth reservations account for all active requests
+before materialization. Prospective admission may consider an earlier restored prefix, but actual
+reservation cannot truncate live state. Cancelling before enqueue returns mapped provisional
+pages to the committed frontier without losing the growth entitlement.
+
+Verification records every actual GDN and PLE input needed to fold exactly the accepted prefix.
+Only accepted input columns advance raw history, continuation and state; a correction/bonus token
+is the next anchor, not an extra committed input. Stream drain precedes host frontier publication.
+The runtime joins these state transitions with `NativeDraftRuntime`'s independent paged backend
+and exact retained seed state. Current/retained/prompt Vision feature images and placement metadata
+are also owned, so a later media preparation cannot mutate a retained checkpoint. A failed GPU
+transaction makes the runtime unusable until teardown rather than publishing reusable partial state.
+
+Device arenas, pinned staging, state images and exact-batch ordinary/verification graph addresses
+are fixed at startup. Uncaptured legal prefill widths execute eagerly over the same body. The
+allocation recipe is shared with pre-load metadata sizing; CUDA-driver graph memory has a separate
+conservative allowance checked against observed startup allocation, not a purported exact formula.
+These mechanisms do not establish full-preview throughput on hardware that cannot admit its weights.
+
+The real `ninfer_qwen4_native_compute_real_test` additionally executes the **same shared decoder
+body** on actual layers 0–3. Its final represented output passes the independent accumulated source
+formula criterion from section 12.2. Two advancing compact B4 rounds have exact eager/graph output
+and defined real-prefix state equality. A real 65-column prefix additionally checks the chunked
+GDN route against compact recurrence under the unchanged accumulated criterion; this pairwise
+check supplements, not replaces, the independent component formulas. No absent layer is repeated
+or fabricated. Full36-layer
+state-owner tests separately qualify prefix folds, raw history, checkpoint restore and shared-page
+admission for both BF16 and NVFP4 QSA storage. These are bounded numerical/integration evidence,
+not full-checkpoint generation, PPL, speculative acceptance or performance measurements.
+
 ## 13. Oracle and quality requirements
 
 This authority does not make framework parity the mathematical oracle. Independent target-private
@@ -520,7 +846,8 @@ reference code must consume represented artifact inputs and evaluate:
   already-folded gamma directly, followed by FP64 GR, PLE, QSA scores/attention, MoE, and Vision
   formulas;
 - the complete GDN recurrence with FP32 persistent-state boundaries; and
-- MTP stem/state/fold only after Section 11's golden evidence closes it.
+- MTP stem, private-block recurrence and target-hidden replay under Section 11's explicit profile,
+  separately from full-target speculative acceptance and quality qualification.
 
 QSA selected ids and PLE row ids are exact. Floating-point outputs use named criteria fixed from
 adversarial and real-shape error distributions before product qualification. Every eager/graph,
@@ -528,7 +855,7 @@ prefill/decode, compressed-cache, and quantized-weight route compares directly t
 
 Whole-model qualification additionally requires artifact-native layer taps and per-token NLL,
 paired perplexity on frozen raw-text corpora, long-context retrieval, multimodal goldens, MTP
-acceptance distributions, request isolation for startup-fixed batch 1 through 8, and exact prefix
+acceptance distributions, request isolation for startup-fixed batch 1 through 4, and exact prefix
 restore. Perplexity is integration evidence and never substitutes for an Op or state-transition
 oracle.
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <text/qwen/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
 #include <ninfer/targets/qwen3_6/vision.h>
@@ -128,7 +128,7 @@ struct DFlash2Plan {
 };
 
 struct BindingPlan {
-    qwen3_6::FrontendResourcePlan frontend;
+    text::qwen::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
 
     WeightPlan token_embedding;
@@ -219,7 +219,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    qwen3_6::FrontendResources frontend;
+    text::qwen::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

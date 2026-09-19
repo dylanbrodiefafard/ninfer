@@ -131,6 +131,9 @@ using Nvfp4N2560K640Geometry    = Nvfp4GemvGeometry<2560, 640>;
 using Nvfp4N10240K320Geometry   = Nvfp4GemvGeometry<10240, 320>;
 using Nvfp4N2560K2560Geometry   = Nvfp4GemvGeometry<2560, 2560>;
 using Nvfp4N248320K2560Geometry = Nvfp4GemvGeometry<248320, 2560>;
+using Nvfp4N2560K12800Geometry  = Nvfp4GemvGeometry<2560, 12800>;
+using Nvfp4N7680K2560Geometry   = Nvfp4GemvGeometry<7680, 2560>;
+using Nvfp4N2560K7680Geometry   = Nvfp4GemvGeometry<2560, 7680>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
@@ -163,16 +166,23 @@ enum class Nvfp4Problem : std::uint8_t {
     N10240K320,
     N2560K2560,
     N248320K2560,
+    N2560K12800,
+    N7680K2560,
+    N2560K7680,
 };
 
 inline constexpr bool is_nvfp4_a16_only_problem(Nvfp4Problem problem) {
     return problem == Nvfp4Problem::DflashFeature || problem == Nvfp4Problem::DflashQkv ||
            problem == Nvfp4Problem::DflashAttnOut || problem == Nvfp4Problem::DflashConvProj ||
-           problem == Nvfp4Problem::DflashSelector || problem == Nvfp4Problem::N248320K2560;
+           problem == Nvfp4Problem::DflashSelector || problem == Nvfp4Problem::N248320K2560 ||
+           problem == Nvfp4Problem::N2560K12800 || problem == Nvfp4Problem::N7680K2560 ||
+           problem == Nvfp4Problem::N2560K7680;
 }
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
-    return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
+    return (output_rows == 2560 && (input_rows == 12800 || input_rows == 7680)) ||
+           (output_rows == 7680 && input_rows == 2560) ||
+           (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
             input_rows == Nvfp4AttnInputGeometry::kInputRows) ||
            (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
             input_rows == Nvfp4GdnInputGeometry::kInputRows) ||
@@ -219,6 +229,9 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    if (output_rows == 2560 && input_rows == 12800) { return Nvfp4Problem::N2560K12800; }
+    if (output_rows == 7680 && input_rows == 2560) { return Nvfp4Problem::N7680K2560; }
+    if (output_rows == 2560 && input_rows == 7680) { return Nvfp4Problem::N2560K7680; }
     if (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
         input_rows == Nvfp4AttnInputGeometry::kInputRows) {
         return Nvfp4Problem::AttnInput;
@@ -350,6 +363,9 @@ inline constexpr std::int32_t nvfp4_exact_a16_gemm_first_t(Nvfp4Problem problem)
     case Nvfp4Problem::N6144K2560:
     case Nvfp4Problem::N1280K2560:
     case Nvfp4Problem::N2560K2560:
+    case Nvfp4Problem::N2560K12800:
+    case Nvfp4Problem::N7680K2560:
+    case Nvfp4Problem::N2560K7680:
         return 128;
     case Nvfp4Problem::N10240K2560:
     case Nvfp4Problem::N12288K2560:

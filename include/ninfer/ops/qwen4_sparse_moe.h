@@ -69,6 +69,12 @@ struct Qwen4ResidentSparseMoeWeights {
     Weight shared_down;      // device BF16, Q8_0 or NVFP4/FP8 [2560,640]
 };
 
+/** Allocation-free storage metadata for the same fixed geometry; no weight addresses. */
+struct Qwen4ResidentSparseMoeStorageProfile {
+    QType routed_gate, routed_up, routed_down;
+    QType shared_gate, shared_up, shared_down;
+};
+
 struct Qwen4SharedExpertPolicy {
     LinearPolicy gate = LinearPolicy::A16Only;
     LinearPolicy up = LinearPolicy::A16Only;
@@ -140,6 +146,10 @@ struct Qwen4SparseMoePrefillPipeline {
 /** Caller-owned transient device capacity for qwen4_sparse_moe_resident at exact width T. */
 [[nodiscard]] std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
     const Qwen4ResidentSparseMoeWeights& weights, std::int32_t width,
+    LinearPolicy expert_policy = LinearPolicy::A16Only,
+    Qwen4SharedExpertPolicy shared_policy = {});
+[[nodiscard]] std::size_t qwen4_sparse_moe_resident_workspace_capacity_bytes(
+    const Qwen4ResidentSparseMoeStorageProfile& profile, std::int32_t width,
     LinearPolicy expert_policy = LinearPolicy::A16Only,
     Qwen4SharedExpertPolicy shared_policy = {});
 

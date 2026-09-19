@@ -106,7 +106,7 @@ struct VisionChunk {
 class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
-                         WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
+                         WorkspaceArena& workspace, text::qwen::PreparedPromptData& prompt,
                          const VisionPrefillPlan& plan, runtime::TransientRegion transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
@@ -118,7 +118,7 @@ private:
 
     DeviceContext& device_;
     WorkspaceArena& workspace_;
-    qwen3_6::PreparedPromptData& prompt_;
+    text::qwen::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
     VisionContext context_;

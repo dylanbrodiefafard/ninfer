@@ -142,8 +142,14 @@ Tests, benchmarks, and maintainer tools are excluded from the default build. The
 C++ unit suite is `./scripts/run-unit-tests.sh`, which uses the Dockerfile `build`
 stage as the `ninfer-builder` GPU container; see [Tests](tests/README.md).
 
-The Qwen4 work is an unregistered architecture verifier, not another CLI or Engine model. Its
-current verification weights are converted from the Qwen3.8-Flash-Next UD-IQ1_S preview checkpoint.
+The exact native Qwen4 preview has an NVFP4/A16 artifact and Engine implementation, with a
+fully RAM-locked PLE table. Its ordinary GPU weights alone exceed 80 GB, so this is not a runnable
+5090 model or a qualified full-model PPL/performance result; native loading rejects insufficient
+VRAM instead of offloading weights. See the [native artifact](docs/maintainer/qwen4-artifact.md)
+and [model reference](docs/maintainer/qwen4-model.md) for its bounded real-source qualification.
+
+The separate Qwen4 architecture verifier remains unregistered and cannot be an Engine fallback.
+Its diagnostic weights are converted from the Qwen3.8-Flash-Next UD-IQ1_S preview checkpoint.
 Maintainers with the converted `.ninfer` artifact can run the complete four-token C=1
 Text/reset-replay diagnostic directly:
 

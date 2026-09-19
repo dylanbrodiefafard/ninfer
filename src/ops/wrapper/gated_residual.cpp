@@ -1,6 +1,7 @@
 #include "ninfer/ops/gated_residual.h"
 
 #include "core/layout.h"
+#include "core/device.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/gated_residual.h"
 #include "ops/common/projection.h"
@@ -237,6 +238,21 @@ void gated_residual_inject(const Tensor& residual, const Tensor& block_output,
         }
     }
     detail::gated_residual_inject_launch(residual, block_output, write_scale, residual_out, stream);
+}
+
+void gated_residual_broadcast(const Tensor& embedding,Tensor& residual,cudaStream_t stream) {
+    constexpr const char* op="gated_residual_broadcast";
+    const int tokens=embedding.ne[1];
+    if(tokens<1 || tokens>4096) throw std::invalid_argument("gated_residual_broadcast: T");
+    require_tensor(embedding,DType::BF16,{kHidden,tokens,1,1},op,"embedding");
+    require_tensor(residual,DType::BF16,{kHidden,kBranches,tokens,1},op,"residual");
+    const std::array<AddressRange,2> ranges{
+        address_range(embedding.data,embedding.bytes(),"embedding"),
+        address_range(residual.data,residual.bytes(),"residual")};
+    require_disjoint(ranges);
+    for(int branch=0;branch<kBranches;++branch)
+        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(residual.data)+branch*kHidden*2,
+            kHidden*kBranches*2,embedding.data,kHidden*2,kHidden*2,tokens,cudaMemcpyDeviceToDevice,stream));
 }
 
 } // namespace ninfer::ops

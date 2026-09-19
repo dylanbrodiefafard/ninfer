@@ -33,13 +33,13 @@ benchmark-report, and external protocol behavior. Repository verification princi
   activation alignment, rejection, and peak semantics;
 - `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
   `test_anthropic_schema.cpp` — current protocol translation and Responses Item/state/SSE behavior;
-- `targets/qwen3_6/test_tool_grammar.cpp` and `test_frontend.cpp` — declared-schema masks,
+- `text/qwen/test_tool_grammar.cpp` and `test_frontend.cpp` — declared-schema masks,
   speculative grammar transitions, orphan-closing-tag rejection across token boundaries,
   prohibition of tool envelopes inside reasoning and normal reasoning-to-call transitions,
   typed calls, and transactional publication preserving XML-valued arguments. The optional
   real-tokenizer probe compares masks with direct byte acceptance over the represented
   vocabulary at free-text and call-closing boundaries;
-- `targets/qwen3_6/test_generation_recovery.cpp` — contextual duplicate detection, truthful
+- `text/qwen/test_generation_recovery.cpp` — contextual duplicate detection, truthful
   reasoning-only retry notices, preservation of real messages/results, and legitimate
   changed reads/results and polling;
 - `test_typical_cycle.cpp` — suffix-square boundaries, exact repeated-passage evidence,

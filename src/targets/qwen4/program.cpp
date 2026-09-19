@@ -290,7 +290,8 @@ void Program::reset() {
     reset_ = true;
 }
 
-TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t target_id) {
+TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t target_id,
+                                       const DFlashFeatureSink* features) {
     if (!reset_) { throw std::logic_error("Qwen4 Program must be reset before execution"); }
     if (token_id < 0 || token_id >= kVocabulary || target_id < 0 ||
         target_id >= kVocabulary) {
@@ -378,6 +379,7 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
                 weights.attention_gr.up, weights.attention_gr.inject, mixed, write_scale,
                 workspace, stream_);
         }
+        if (features) features->capture(static_cast<int>(layer), mixed.view({kHidden,1,1}), stream_);
         if (weights.gdn) {
             const GdnStateView& gdn = *state_.gdn()[layer];
             WorkspaceArena workspace = state_.workspace();
@@ -480,7 +482,8 @@ TokenResultView Program::execute_token(std::int32_t token_id, std::int32_t targe
     };
 }
 
-PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids) {
+PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids,
+                                        const DFlashFeatureSink* features) {
     if (!reset_) { throw std::logic_error("Qwen4 Program must be reset before prefill"); }
     if (token_ids.empty() || token_ids.size() >
                                  static_cast<std::size_t>(kMaximumPrefillChunk)) {
@@ -620,6 +623,7 @@ PrefillResultView Program::prefill_chunk(std::span<const std::int32_t> token_ids
                 weights.attention_gr.up, weights.attention_gr.inject, mixed, write_scale,
                 workspace, stream_);
         }
+        if (features) features->capture(static_cast<int>(layer), mixed.view({kHidden,width,1}), stream_);
         if (weights.gdn) {
             const GdnStateView& gdn = *state_.gdn()[layer];
             WorkspaceArena workspace(

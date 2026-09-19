@@ -74,6 +74,12 @@ void launch_nvfp4_exact_geometry_small_t(const Tensor& x, const Weight& weight, 
         return launchers<Nvfp4N2560K2560Geometry>()[index](x, weight, out, stream);
     case Nvfp4Problem::N248320K2560:
         return launchers<Nvfp4N248320K2560Geometry>()[index](x, weight, out, stream);
+    case Nvfp4Problem::N2560K12800:
+        return launchers<Nvfp4N2560K12800Geometry>()[index](x, weight, out, stream);
+    case Nvfp4Problem::N7680K2560:
+        return launchers<Nvfp4N7680K2560Geometry>()[index](x, weight, out, stream);
+    case Nvfp4Problem::N2560K7680:
+        return launchers<Nvfp4N2560K7680Geometry>()[index](x, weight, out, stream);
     default:
         throw std::invalid_argument("nvfp4 exact-geometry SmallT: unsupported problem");
     }

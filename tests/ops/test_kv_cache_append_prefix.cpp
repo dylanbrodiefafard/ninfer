@@ -16,8 +16,8 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kHeadDim       = 128;
-constexpr int kKVHeads       = 8;
+int kHeadDim       = 128;
+int kKVHeads       = 8;
 constexpr int kPage          = 64;
 constexpr int kLogicalPages  = 3;
 constexpr int kPhysicalPages = 6;
@@ -439,6 +439,15 @@ int main() {
     failures += cyclic_graph_replay_case();
     failures += paged_graph_replay_case();
     failures += batch_selector_case(true);
+    failures += batch_selector_case(false);
+
+    kHeadDim = 256;
+    kKVHeads = 2;
+    for (int count : {0, 1, 3, 6, 7}) {
+        failures += run_case(7, count, 60, false, {5, 1, 4});
+    }
+    failures += run_case(16, 16, 120, false, {2, 5, 0});
+    failures += paged_graph_replay_case();
     failures += batch_selector_case(false);
 
     if (failures != 0) {

@@ -77,7 +77,7 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 } // namespace
 
 RequestBasePlan
-ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
+ProgramImplCore::plan_request_base(const text::qwen::PreparedPromptData& prompt,
                                    const runtime::ResolvedExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
@@ -186,7 +186,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     }
 
     if (prompt.identity.rewrite_checkpoint) {
-        const RewriteCheckpointSpec candidate = *prompt.identity.rewrite_checkpoint;
+        const text::qwen::RewriteCheckpointSpec candidate = *prompt.identity.rewrite_checkpoint;
         if (candidate.frontier == 0 || candidate.frontier > base->summary.prompt_tokens) {
             throw std::invalid_argument(
                 "rewrite checkpoint frontier must lie at or inside the prompt frontier");
@@ -202,14 +202,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     if (prompt.generation_recovery && base->sampling.p_less) {
-        base->summary.service_work_quanta += qwen3_6::GenerationRecoveryContext::maximum_attempts *
+        base->summary.service_work_quanta += text::qwen::GenerationRecoveryContext::maximum_attempts *
             (schedule::prefill_chunk_count(reserved_context_tokens, prefill_chunk) + 2ULL);
     }
     return RequestBasePlan(std::move(base));
 }
 
 void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const ResidentStateView& view,
-                                           const PreparedPromptData& prompt,
+                                           const text::qwen::PreparedPromptData& prompt,
                                            const RequestBasePlanImpl& base) {
     if (!base.allow_prefix_reuse || base.force_cold_prefill || !prompt.identity.reusable ||
         view.ledger == nullptr || view.identity == nullptr) {
@@ -248,9 +248,9 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
 }
 
 void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
-                                          const PreparedPromptData& prompt,
+                                          const text::qwen::PreparedPromptData& prompt,
                                           const RequestBasePlanImpl& base) {
-    const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    const std::optional<text::qwen::RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     const bool existing_checkpoint_matches =
         view != nullptr && desired && plan.reuse != ReusePath::FullReset &&
         view->rewrite_checkpoint.valid && view->ledger != nullptr && view->identity != nullptr &&
@@ -350,7 +350,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits);
     if (prompt.generation_recovery && plan.sampling.p_less) {
-        plan.summary.service_work_quanta += qwen3_6::GenerationRecoveryContext::maximum_attempts *
+        plan.summary.service_work_quanta += text::qwen::GenerationRecoveryContext::maximum_attempts *
             (schedule::prefill_chunk_count(plan.summary.prompt_tokens +
                 (plan.summary.effective_output_tokens == 0 ? 0U :
                  plan.summary.effective_output_tokens - 1U), prefill_chunk) + 2ULL);
@@ -358,7 +358,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
 }
 
 RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
-                                                   const PreparedPromptData& prompt,
+                                                   const text::qwen::PreparedPromptData& prompt,
                                                    const RequestBasePlan& base_plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
@@ -398,7 +398,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     return RequestPlan(std::move(plan));
 }
 
-RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
+RequestPlan ProgramImplCore::plan_ram_reuse(const text::qwen::PreparedPromptData& prompt,
                                             const RequestBasePlan& base_plan) {
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;
@@ -457,7 +457,7 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     return RequestPlan(std::move(plan));
 }
 
-RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
+RequestPlan ProgramImplCore::plan_disk_reuse(const text::qwen::PreparedPromptData& prompt,
                                              const RequestBasePlan& base_plan) {
     if (base_plan.impl_ == nullptr) { throw std::logic_error("request base plan is empty"); }
     const RequestBasePlanImpl& base = *base_plan.impl_;

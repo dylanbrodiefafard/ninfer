@@ -2,7 +2,7 @@
 #include "ninfer/engine.h"
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
-#include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "text/qwen/tokenizer.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -166,7 +166,7 @@ void encode_text_file(const std::string& weights, const std::string& text_path,
         load_resource(reader, "frontend/tokenizer_config.json");
     const std::string generation_config_json =
         load_resource(reader, "frontend/generation_config.json");
-    const ninfer::targets::qwen3_6::frontend_internal::Tokenizer tokenizer(
+    const ninfer::text::qwen::frontend_internal::Tokenizer tokenizer(
         {.tokenizer_json         = tokenizer_json,
          .tokenizer_config_json  = tokenizer_config_json,
          .generation_config_json = generation_config_json});

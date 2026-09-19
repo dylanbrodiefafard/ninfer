@@ -310,12 +310,13 @@ std::size_t ple_workspace_capacity_bytes(std::int32_t width, QType key, QType va
     return required_workspace(width, key, value);
 }
 
-void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
+static void ple_inject_impl(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
                 const Weight& value_weight, const Tensor& key_norm_weight,
                 const Tensor& query_norm_weight, const Tensor& conv_norm_weight,
                 const Tensor& conv_weight, const Tensor& old_conv_state,
                 Tensor& new_conv_state, Tensor& residual_out, WorkspaceArena& workspace,
-                PleNormFormat norm_format, cudaStream_t stream) {
+                PleNormFormat norm_format, cudaStream_t stream, Tensor* conv_records,
+                const Tensor* slots = nullptr, const Tensor* valid = nullptr) {
     constexpr const char* op = "ple_inject";
     const int width = residual.ne[2];
     if (width <= 0 || width > 4096) {
@@ -335,12 +336,14 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
         throw std::invalid_argument("ple_inject: unsupported convolution weight dtype");
     }
     require_tensor(conv_weight, conv_weight.dtype, 4, kPleChannels, 1, op, "conv_weight");
-    require_tensor(old_conv_state, DType::BF16, kPleChannels, kPleConvHistory, 1, op,
+    const int capacity = slots ? old_conv_state.ne[2] : 1;
+    require_tensor(old_conv_state, DType::BF16, kPleChannels, kPleConvHistory, capacity, op,
                    "old_conv_state");
-    require_tensor(new_conv_state, DType::BF16, kPleChannels, kPleConvHistory, 1, op,
+    require_tensor(new_conv_state, DType::BF16, kPleChannels, kPleConvHistory, capacity, op,
                    "new_conv_state");
     require_tensor(residual_out, DType::BF16, kPleEmbeddingWidth, kPleBranches, width, op,
                    "residual_out");
+    if(conv_records) require_tensor(*conv_records,DType::BF16,kPleChannels,width,1,op,"conv_records");
     require_q8_weight(key_weight, kPleChannels, "key_weight");
     require_q8_weight(value_weight, kPleEmbeddingWidth, "value_weight");
     const std::size_t required = required_workspace(width, key_weight.qtype, value_weight.qtype);
@@ -361,7 +364,7 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
           old_conv_state.bytes() == new_conv_state.bytes())) {
         throw std::invalid_argument("ple_inject: convolution states partially overlap");
     }
-    std::array<Range, 12> ranges{};
+    std::array<Range, 15> ranges{};
     std::size_t range_count = 0;
     ranges[range_count++] = residual_range;
     ranges[range_count++] = range(embedding.data, embedding.bytes(), op);
@@ -377,6 +380,11 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
     ranges[range_count++] = range(workspace.base(), workspace.capacity(), op);
     if (residual_out.data != residual.data) { ranges[range_count++] = output_range; }
     if (new_conv_state.data != old_conv_state.data) { ranges[range_count++] = new_range; }
+    if(conv_records) ranges[range_count++]=range(conv_records->data,conv_records->bytes(),op);
+    if (slots) {
+        ranges[range_count++] = range(slots->data,slots->bytes(),op);
+        ranges[range_count++] = range(valid->data,valid->bytes(),op);
+    }
     require_disjoint(std::span<const Range>(ranges.data(), range_count), op);
 
     auto scope     = workspace.scope();
@@ -386,9 +394,76 @@ void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& k
     detail::ple_gate_launch(residual, scratch.key, scratch.value, key_norm_weight,
                             query_norm_weight, scratch.gated, norm_format, stream);
     detail::ple_conv_input_launch(scratch.gated, conv_norm_weight, scratch.current_state, norm_format, stream);
-    detail::ple_conv_inject_launch(residual, scratch.gated, conv_weight, old_conv_state,
+    if(conv_records) CUDA_CHECK(cudaMemcpyAsync(conv_records->data,scratch.current_state.data,
+        conv_records->bytes(),cudaMemcpyDeviceToDevice,stream));
+    if (slots) {
+        detail::ple_conv_batch_launch(residual,scratch.gated,conv_weight,old_conv_state,
+            scratch.current_state,*slots,*valid,width/slots->ne[0],new_conv_state,residual_out,stream);
+    } else {
+        detail::ple_conv_inject_launch(residual, scratch.gated, conv_weight, old_conv_state,
                                    scratch.current_state, residual_out, stream);
-    detail::ple_state_update_launch(old_conv_state, scratch.current_state, new_conv_state, stream);
+        detail::ple_state_update_launch(old_conv_state, scratch.current_state, new_conv_state, stream);
+    }
+}
+
+void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
+    const Weight& value_weight, const Tensor& key_norm_weight, const Tensor& query_norm_weight,
+    const Tensor& conv_norm_weight, const Tensor& conv_weight, const Tensor& old_state,
+    Tensor& new_state, Tensor& out, WorkspaceArena& workspace, PleNormFormat norm_format,
+    cudaStream_t stream, Tensor* records) {
+    ple_inject_impl(residual,embedding,key_weight,value_weight,key_norm_weight,query_norm_weight,
+        conv_norm_weight,conv_weight,old_state,new_state,out,workspace,norm_format,stream,records);
+}
+
+void ple_inject_batch(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
+    const Weight& value_weight, const Tensor& key_norm_weight, const Tensor& query_norm_weight,
+    const Tensor& conv_norm_weight, const Tensor& conv_weight, const Tensor& old_state,
+    Tensor& new_state, const Tensor& slots, const Tensor& valid, Tensor& out,
+    WorkspaceArena& workspace, PleNormFormat norm_format, cudaStream_t stream, Tensor* records) {
+    constexpr const char* op = "ple_inject_batch";
+    const int width=residual.ne[2], batch=residual.ne[3], capacity=old_state.ne[2];
+    if (batch<1 || batch>4 || capacity<batch || capacity>4 || width<1 || width>4096/batch ||
+        residual.dtype!=DType::BF16 || residual.ne[0]!=kPleEmbeddingWidth ||
+        residual.ne[1]!=kPleBranches || !residual.is_contiguous() ||
+        out.dtype!=residual.dtype || !out.is_contiguous() ||
+        !std::equal(std::begin(residual.ne),std::end(residual.ne),std::begin(out.ne)))
+        throw std::invalid_argument("ple_inject_batch: invalid compact geometry");
+    require_tensor(embedding,DType::BF16,kPleEmbeddingWidth,width,batch,op,"embedding");
+    require_tensor(slots,DType::I32,batch,1,1,op,"slots",4);
+    require_tensor(valid,DType::I32,batch,1,1,op,"valid",4);
+    if (key_weight.qtype==QType::GGML_Q8_0 || value_weight.qtype==QType::GGML_Q8_0)
+        throw std::invalid_argument("ple_inject_batch: native projections required");
+    auto flat_residual=residual.reshape({kPleEmbeddingWidth,kPleBranches,width*batch});
+    auto flat_embedding=embedding.reshape({kPleEmbeddingWidth,width*batch});
+    auto flat_out=out.reshape({kPleEmbeddingWidth,kPleBranches,width*batch});
+    Tensor flat_records;
+    if (records) {
+        require_tensor(*records,DType::BF16,kPleChannels,width,batch,op,"records");
+        flat_records=records->reshape({kPleChannels,width*batch});
+    }
+    ple_inject_impl(flat_residual,flat_embedding,key_weight,value_weight,key_norm_weight,
+        query_norm_weight,conv_norm_weight,conv_weight,old_state,new_state,flat_out,workspace,
+        norm_format,stream,records?&flat_records:nullptr,&slots,&valid);
+}
+
+void ple_commit_prefix(const Tensor& records,const Tensor& token_ids,
+    const Tensor& counts,const Tensor& slots,Tensor& conv,Tensor& history,cudaStream_t stream) {
+    constexpr const char* op="ple_commit_prefix";
+    const int width=records.ne[1],batch=records.ne[2],capacity=conv.ne[2];
+    if(width<1 || width>16 || batch<1 || batch>capacity || capacity>4)
+        throw std::invalid_argument("ple_commit_prefix: invalid startup geometry");
+    require_tensor(records,DType::BF16,kPleChannels,width,batch,op,"records");
+    require_tensor(token_ids,DType::I32,width,batch,1,op,"token_ids",4);
+    require_tensor(counts,DType::I32,batch,1,1,op,"counts",4);
+    require_tensor(slots,DType::I32,batch,1,1,op,"slots",4);
+    require_tensor(conv,DType::BF16,kPleChannels,9,capacity,op,"conv_state");
+    require_tensor(history,DType::I32,2,capacity,1,op,"token_history",4);
+    const std::array<Range,6> ranges{range(records.data,records.bytes(),op),
+        range(token_ids.data,token_ids.bytes(),op),range(counts.data,counts.bytes(),op),
+        range(slots.data,slots.bytes(),op),range(conv.data,conv.bytes(),op),
+        range(history.data,history.bytes(),op)};
+    require_disjoint(ranges,op);
+    detail::ple_commit_prefix_launch(records,token_ids,counts,slots,conv,history,stream);
 }
 
 } // namespace ninfer::ops

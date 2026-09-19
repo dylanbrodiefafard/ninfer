@@ -78,7 +78,7 @@ PrefillChunkResult prefill_text_chunk(
 }
 
 PrefillChunkResult
-prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
+prefill_multimodal_chunk(PrefillContext& state, const text::qwen::PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
                          std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
                          bool finalize_at_end) {
@@ -101,7 +101,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
-void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prompt,
+void mtp_bridge_multimodal(PrefillContext& state, const text::qwen::PreparedPromptData& prompt,
                            VisionPrefillSession& vision, const MtpBridgeInput& bridge) {
     if (!state.mtp_kv.valid() || bridge.previous_hidden == nullptr || state.text_kv_base == 0 ||
         bridge.position < 0 ||

@@ -120,7 +120,9 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
             const double p = weights[static_cast<std::size_t>(token)] / total;
             collision += p * p;
         }
-        const double cut = ops::p_less_membership_cut(collision, config.temperature);
+        // Evaluate the public law independently; do not call the production cut helper.
+        const double cut = std::max(collision * std::exp(-0.125 / config.temperature),
+                                    1.0 / 1024.0);
         Distribution out;
         double kept = 0.0;
         for (int token = 0; token < token_domain; ++token) {
@@ -1483,6 +1485,44 @@ int masked_p_less_distribution(int domain, int physical) {
     return failures;
 }
 
+int qwen4_full_vocabulary() {
+    constexpr int domain=248320, eos=248044;
+    std::vector<float> column(domain,-40.F);
+    column[eos]=40.F; // Explicit suppression must precede the support calculation.
+    column[248077]=2.F;
+    column[248200]=1.95F;
+    column[domain-1]=1.90F;
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature=2.F; config.p_less=1; config.seed=711;
+    config.suppressed_token_count=1; config.suppressed_tokens[0]=eos;
+    int failures=0;
+    for(int excluded:{-1,domain-1}) {
+        config.typical_exclude=excluded;
+        const auto expected=distribution_oracle(column,domain,config);
+        const std::vector<int> support=excluded<0?std::vector<int>{248077,248200,domain-1}:
+                                                  std::vector<int>{248077,248200};
+        failures+=verify_exact("Qwen4 full-vocabulary support",expected.tokens,support);
+        const auto result=run_repeated(column,domain,1024,8,config,53,ops::kSamplePurposeDecode);
+        failures+=result.integrity_failures;
+        failures+=verify_distribution("Qwen4 upper-vocabulary p-less",result.tokens,expected);
+    }
+    // A nearly flat full vocabulary has no atom at the unrelaxed 1/1024 floor.
+    // Its eligible maximum is the final real token, not padded/unused storage.
+    std::fill(column.begin(),column.end(),0.F); column[domain-1]=.125F;
+    for(int excluded:{-1,domain-1}) {
+        config.typical_exclude=excluded;
+        const auto expected=distribution_oracle(column,domain,config);
+        failures+=verify_exact("Qwen4 empty-support oracle",expected.tokens,
+                                std::vector<int>{excluded<0?domain-1:0});
+        const auto result=run_repeated(column,domain,32,4,config,54,ops::kSamplePurposeDecode);
+        failures+=result.integrity_failures;
+        failures+=verify_exact("Qwen4 empty-support fallback",result.tokens,
+                                std::vector<int>(32,expected.tokens.front()));
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1497,6 +1537,9 @@ int main() {
     failures += eligibility_masks(248077, 248320);
     failures += masked_p_less_distribution(64, 64);
     failures += masked_p_less_distribution(248077, 248320);
+    failures += eligibility_masks(248320, 248320);
+    failures += masked_p_less_distribution(248320, 248320);
+    failures += qwen4_full_vocabulary();
     const std::size_t at_16 = ops::sampling_workspace_capacity_bytes(257, 16, 16);
     if (ops::sampling_workspace_capacity_bytes(256, 1, 16) != 0 || at_16 == 0 ||
         ops::sampling_workspace_capacity_bytes(257, 17, 17) != 0 ||

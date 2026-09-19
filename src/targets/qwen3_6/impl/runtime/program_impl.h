@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "runtime/contract/typical_cycle.h"
+#include "runtime/contract/sampling.h"
 
 #include <functional>
 
@@ -11,7 +12,7 @@
 #include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/nll_from_logits.h"
-#include "targets/qwen3_6/impl/runtime/score_index.h"
+#include "runtime/contract/score.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
@@ -124,31 +125,7 @@ void trim_speculative_stats_to_commit(RequestControl& request, const PendingCand
     }
 }
 
-void rollback_sampling_counts(const ops::SamplingConfig& sampling,
-                              std::span<const TokenId> tokens) {
-    if (sampling.temperature <= 0.0F || sampling.token_counts == nullptr) { return; }
-    for (std::size_t index = 0; index < tokens.size(); ++index) {
-        if (std::find(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(index),
-                      tokens[index]) !=
-            tokens.begin() + static_cast<std::ptrdiff_t>(index)) {
-            continue;
-        }
-        const auto occurrences = static_cast<std::int32_t>(
-            std::count(tokens.begin() + static_cast<std::ptrdiff_t>(index), tokens.end(),
-                       tokens[index]));
-        std::int32_t count = 0;
-        CUDA_CHECK(cudaMemcpy(&count, sampling.token_counts + tokens[index], sizeof(count),
-                              cudaMemcpyDeviceToHost));
-        if (count < occurrences) {
-            throw std::logic_error("rejected sampling token count underflow");
-        }
-        count -= occurrences;
-        CUDA_CHECK(cudaMemcpy(sampling.token_counts + tokens[index], &count, sizeof(count),
-                              cudaMemcpyHostToDevice));
-    }
-}
-
-std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
+std::array<std::int32_t, 3> prompt_rope_position(const text::qwen::PreparedPromptData& prompt,
                                                  std::uint32_t token) {
     const std::size_t tokens = prompt.token_ids.size();
     if (token >= tokens || prompt.positions.size() != 3 * tokens) {
@@ -376,7 +353,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
     token_counts                    = plan.persistent.token_counts.bind(backing);
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
-    tool_masks = std::make_unique<qwen3_6::ToolMaskExchange>(
+    tool_masks = std::make_unique<runtime::ToolMaskExchange>(
         plan.persistent.tool_token_masks.bind(backing),
         plan.persistent.tool_sampling_config.bind(backing));
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
@@ -632,10 +609,10 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 }
 
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
-                                                               PreparedPromptData&& prompt,
+                                                               text::qwen::PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
                                                                runtime::TransientRegion transient,
-                                                               const qwen3_6::OutputSession* output) {
+                                                               const text::qwen::OutputSession* output) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -1218,7 +1195,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     speculative_backend == SpeculativeBackend::Mtp
                         ? mtp_host_egress->licensed_tokens.data() + row * width
                         : dflash_host_egress->licensed_tokens.data() + row * width;
-                rollback_sampling_counts(
+                ninfer::runtime::rollback_sampling_counts(
                     request.sampling_host,
                     std::span<const TokenId>(token_base, pending.produced));
                 rollback_speculative_stats(request, pending);
@@ -1825,7 +1802,7 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
 }
 
 void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
-                                                  const PreparedPromptData& prompt, ReusePath reuse,
+                                                  const text::qwen::PreparedPromptData& prompt, ReusePath reuse,
                                                   std::uint32_t base, std::uint32_t prompt_tokens,
                                                   bool capture_enabled, bool request_pin) {
     const bool enabled = capture_enabled && captures_context_checkpoints() &&
@@ -3147,7 +3124,7 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                            request.sampling_host.frequency_penalty != 0.0F;
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
-    const std::array<const qwen3_6::OutputSession*, 1> outputs{request.output};
+    const std::array<const text::qwen::OutputSession*, 1> outputs{request.output};
     const std::array<ops::SamplingConfig, 1> configs{request.sampling_host};
     tool_masks->bind(outputs, configs);
     // The prefill owner is exclusive. Root storage can be shared with later
@@ -3160,7 +3137,7 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
 }
 
 void ProgramImplCore::bind_tool_mask_batch(std::span<const std::uint32_t> lanes) {
-    std::array<const qwen3_6::OutputSession*, kMaximumConcurrency> outputs{};
+    std::array<const text::qwen::OutputSession*, kMaximumConcurrency> outputs{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> configs{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         outputs[row] = requests[lanes[row]].output;
@@ -3468,7 +3445,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         staged.step_tokens.push_back(processed_prompt_tokens);
         staged.step_seconds.push_back(final_step_seconds);
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
-        const std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture =
+        const std::optional<text::qwen::RewriteCheckpointSpec> rewrite_checkpoint_capture =
             staged.rewrite_checkpoint_capture;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
@@ -4477,7 +4454,7 @@ void ProgramImplCore::accumulate_decode_nll(const Tensor& logits, TokenId target
     record_score_nll(result, static_cast<double>(host_nll));
 }
 
-void ProgramImplCore::run_prefill_score(PreparedPromptData&& prompt, RequestPlan&& plan,
+void ProgramImplCore::run_prefill_score(text::qwen::PreparedPromptData&& prompt, RequestPlan&& plan,
                                         runtime::TransientRegion transient,
                                         std::span<const TokenId> ids, std::uint32_t skip,
                                         ScoreResult& result) {
@@ -4503,7 +4480,7 @@ void ProgramImplCore::run_prefill_score(PreparedPromptData&& prompt, RequestPlan
     }
 }
 
-void ProgramImplCore::run_decode_score(PreparedPromptData&& prompt,
+void ProgramImplCore::run_decode_score(text::qwen::PreparedPromptData&& prompt,
                                        runtime::TransientRegion transient,
                                        std::span<const TokenId> ids, std::uint32_t prefix,
                                        ScoreResult& result) {
@@ -4601,7 +4578,7 @@ void ProgramImplCore::run_decode_score(PreparedPromptData&& prompt,
     }
 }
 
-ScoreResult ProgramImplCore::score(PreparedPromptData&& prompt, RequestPlan&& plan,
+ScoreResult ProgramImplCore::score(text::qwen::PreparedPromptData&& prompt, RequestPlan&& plan,
                                    runtime::TransientRegion transient, ScoreOptions options) {
     const auto started                   = Clock::now();
     const std::uint32_t prompt_tokens    = static_cast<std::uint32_t>(prompt.token_ids.size());

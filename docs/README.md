@@ -34,6 +34,14 @@ The executable `--help` output is the exact source for command-line option spell
 
 - [Qwen4 weight, activation and state precision recommendations](research/qwen4-quantization-recommendations.md)
   — evidence and candidates for a future smaller checkpoint; not a qualified implementation contract.
+- [Qwen4 native MTP execution](research/qwen4-mtp-execution.md)
+  — exact source recurrence, private-block qualification and retained quality limitations.
+- [Qwen4 checkpoint-specific DFlash](research/qwen4-speculative-sources.md)
+  — companion discovery, source formulas, conversion and numerical qualification.
+- [Qwen4 native PLE source](research/qwen4-native-ple-source.md)
+  — native packed formats and complete eager host-residency evidence.
+- [Qwen4 native Vision](research/qwen4-native-vision.md)
+  — complete source tower/frontend qualification, separate from Engine admission.
 
 ## Maintainer references
 
@@ -64,7 +72,7 @@ Artifact and model references:
 - [Qwen3.6-35B-A3B model semantics](maintainer/qwen3.6-35b-a3b-model.md)
 - [Qwen3.6-35B-A3B artifact contracts](maintainer/qwen3.6-35b-a3b-artifact.md)
 - [Qwen4 architecture model semantics](maintainer/qwen4-model.md)
-- [Qwen4 verification artifact and preview-source inventory](maintainer/qwen4-artifact.md)
+- [Qwen4 native artifact, diagnostic artifact and preview-source inventory](maintainer/qwen4-artifact.md)
 - [Qwen4 Op contracts and qualification fixtures](maintainer/qwen4-op-contracts.md)
 
 Pending plans:

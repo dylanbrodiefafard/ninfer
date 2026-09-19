@@ -488,8 +488,8 @@ The inner cache-consuming attention is implemented by `qsa_selected_attention` i
 per-column selected K/V row from state, and emits BF16 `[256,24,T]`. Its I32 selected-id operand is
 `[S,T]` for caller-known `S` in `[1,2051]`; selected counts are device I32 `[T]`. The fixed
 `qsa_verifier` composes that entry with the T-wide state append and selector, actual Q5_K
-core/output projections, converted-gamma norms, partial MRoPE, and the output gate. The generalized
-multi-request entry below remains a proposed future composite. The verifier validates the complete state view
+core/output projections, converted-gamma norms, partial MRoPE, and the output gate. The diagnostic
+CSR entry is distinct from the native compact paged overloads in section 4.3. The verifier validates the complete state view
 and the pairwise separation of every caller-owned input, weight, state, output, and workspace range
 synchronously before its first projection launch; a rejected call queues no work and mutates no
 storage.
@@ -608,6 +608,37 @@ The cache write and
 the complete output are the only effects. Output may not alias `x`, selected ids, weights, or cache;
 the only permitted state alias is exact old/new cache alias. Workspace covers projections,
 softmax/reduction scratch, page addressing, and codec staging for the complete declared envelope.
+
+### 4.3 Native compact paged execution
+
+The `QsaPagedStateView` overloads share one P64 logical-to-physical block table across core K/V,
+optional NVFP4-G16 scales, raw BF16 index keys, and three-axis I32 positions. Every plane is
+page-major and caller-owned; paging changes neither represented values nor the selector formula.
+Native capacity is bounded by the exact source context, 262144 tokens. Device controls select
+distinct table rows for compact B=1..4, per-row valid lengths and append frontiers, and per-column
+MRoPE coordinates. B=1 admits W=1..4096; B=2..4 admits W=1..16. Query j sees exactly logical
+rows `[0,frontier+j]`, independently of the numerical MRoPE coordinates. The host maximum-visible
+envelope bounds execution but never changes visibility. Mappings remain stable until the stream
+drains; the runtime owns allocation, reservation, prefix retention, and frontier commit.
+
+Selection forms complete four-token visible-rank blocks, retains the highest 512 with lower-rank
+tie breaking, and appends the incomplete causal tail. A fixed 512-block streaming merge uses
+8192 bytes per query, independent of context capacity; no capacity-sized shared sort is used.
+Invalid columns have count zero and selected IDs -1, produce zero output, and cannot append state.
+`qsa_verifier_selected` instead consumes an explicitly frozen, unique visible subset, preserving
+the source MTP selection domain. It still performs the same projection and represented cache append.
+Device controls and page tables are read on-stream and support fixed-shape CUDA Graph replay.
+
+The native selector and shared core Q/K MRoPE implementation evaluate frequency, position product,
+and trigonometric functions in FP64 before their FP32 rotation arithmetic. This is a qualified
+private precision profile, not a new semantic cast: large source coordinates must not amplify
+FP32 frequency/phase error into incorrect selection or persistent keys. The independent oracle
+evaluates the full FP64 norm and rotation from represented inputs, followed only by the explicit
+BF16/cache-codec state boundary. `ninfer_qsa_paged_test` checks exact selector IDs through context
+262144, fragmented mappings and ties, independent FP64 attention, and complete sparse-matrix
+composites with exact persistent K/V checks at low and near-ceiling source positions. Normal and
+frozen-selection graph routes retain the unchanged 2% composite output criterion; this is kernel
+and state evidence, not a model-quality or throughput claim.
 
 ## 5. Gated Residual read and inject
 
@@ -971,7 +1002,22 @@ the complete initial-state formula. These gates were fixed before measurements a
 weakened. Synthetic format cases use the same generalized formula; the superseded oracle's
 private projection casts and constant-row simplifications have been removed.
 
+### 7.3 Explicit PLE accepted-prefix state
+
+`ple_inject` may emit every represented normalized gated-value column as disjoint BF16
+`[10240,W]` records. `ple_commit_prefix` appends a caller-selected prefix of those records to
+the nine-column convolution history and the matching verified input IDs to the two-token raw
+n-gram history. The histories retain their last nine/two values respectively. EOS is copied
+unchanged; the hash Op, not commit, owns its following-token reset rule. Device counts and distinct
+slots support startup-fixed C=1..4 and CUDA Graph replay. Zero count is a strict no-op; rejected
+suffixes and other slots are untouched. The exact sequence-concatenation oracle checks full/partial/
+zero prefixes, history rollover and slot permutations. Choosing the accepted count and publishing
+licensed output tokens are target/runtime decisions, not part of this exact state transformation.
+
 ## 8. Qwen4 GDN profile
+
+The native formats and per-role policies qualified above apply to the same complete formula;
+the historical GGML profile below is diagnostic provenance, not the native storage policy.
 
 Implemented first profile: `include/ninfer/ops/gated_delta_net_layer.h`. It is one semantically
 closed C=1/T=1..4096 layer entry over the converted UD-IQ1_S checkpoint storage: qkv and z are GGML
@@ -1001,10 +1047,24 @@ Its live artifact verifier profile has:
    128-wide value head, followed by output projection `[2560,6144]`; and
 4. distinct or exact in-place BF16 convolution state and FP32 recurrence state.
 
-Batched multi-request snapshot/replay/fold admission remains a future target-schedule tranche. The
-live C=1 entry accepts arbitrary T partitions, updates the three-column BF16 convolution history
+The live C=1 entry accepts arbitrary T partitions, updates the three-column BF16 convolution history
 sequentially, and composes the recurrence in 64-token tiles while preserving one FP32 final state.
 Program owns which in-place state becomes committed.
+
+For verification widths 2..16 the complete layer can also expose raw replay records: BF16
+projected QKV, expanded post-convolution/pre-normalization K/V, and FP32 interleaved decay/update
+controls. These are explicit public outputs, independently checked against the same complete FP64
+formula. The ordinary provisional output and final state math do not change. Rollback callers
+retain disjoint initial state and decide which recorded prefix to apply.
+
+The central record primitive admits `(Hq,Hv)=(48,48)` with identity mapping over the already
+expanded keys. Fold admits the actual 36-layer Qwen4 bank `(36,48,48,10240)` and an explicit
+single-layer overload over real convolution/recurrence tensor pools. Both reuse the same recurrence
+kernel, normalize raw recorded keys, retain FP32 recurrence, and copy accepted convolution history
+exactly. Counts zero, partial/full prefixes, explicit paths, C=4 slot isolation and graph replay
+pass independent FP64 state/exact-transform checks. The fold's host row controls are captured by
+value: changing acceptance requires a new enqueue, not mutating captured host storage. This is Op
+qualification; target transaction/publication ownership remains separate.
 
 For exact post-expansion `Hq=Hv=48` prefill, measured private Q and K routes begin at 448 and 512
 full-chunk tokens respectively. The Q route normalizes raw BF16 Q directly into the output CTA's
@@ -1441,9 +1501,9 @@ The minimum meaningful matrix is:
 
 | Family | Required cells |
 |---|---|
-| QSA projection/composite | live verifier: separate BF16 512x2560/128x2560 index projections, Q5_K 12288x2560/512x2560/2560x6144 core/output projections, FP32 norms, C=1/T=1..4096, exact per-column selected ids and current-token NVFP4 round-trip, complete FP64 output oracle. Future registered batched entry qualifies C=4,8 and distinct-state forms |
+| QSA projection/composite | diagnostic verifier: separate BF16 512x2560/128x2560 index projections, Q5_K 12288x2560/512x2560/2560x6144 core/output projections, FP32 norms, C=1/T=1..4096. Native paged entry: compact B=1..4, exact per-column selection and persistent BF16/NVFP4 state, independent FP64 output oracle, normal/frozen graph execution, near-ceiling MRoPE coordinates; section 4.3 |
 | QSA selector | visible counts 0..5 and 2047..2053; 512-block saturation; non-contiguous visible ids; unequal C lanes; fragmented pages; multimodal positions; all-zero and boundary ties; BF16 pool/cast witnesses |
-| QSA attention | live verifier: real 24/2/256 T=1..4096 geometry; newly appended NVFP4-G16 cache reads under per-query causal CSR; selected count 1, 2048, and 2051; nonuniform and batched complete FP64 oracles; short/tiled T=1 and one-CTA/head/token T-wide routes. Future registered entry qualifies fragmented pages and other cache codecs |
+| QSA attention | real 24/2/256 geometry; diagnostic causal CSR and native prefix-causal paged views; selected count 1, 2048, and 2051; nonuniform independent FP64 oracles; compact B=1..4, fragmented/remapped pages, represented BF16/NVFP4 cache reads, invalid suffixes and slot isolation |
 | GR | live verifier: real 4x2560/R=320; FP32 norm/write and Q8_0 down/up; read-only/read-write/inject; C=1/T=1..4096; exact Q8_0 decode oracle; in-place inject. Future registered batched entry qualifies C=4,8 and graph envelopes |
 | n-gram | exact vectors below; empty/short history; EOS as current and prior token; one-shot/chunk/T=1; C lane isolation; every admitted PLE-module index |
 | PLE gather | first/last valid row, repeated and permuted ids, 16-head/token order, codec edges, and exact T=1/16/17/128/4096 decode against the independent IQ4_NL oracle |

@@ -46,6 +46,24 @@ constexpr auto kOutputLaunchers = make_launchers<OutputGeometry>(
 
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kBf16SmallTMinTokens);
+    if (weight.n == 2560 && weight.k == 12800) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<2560, 12800>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 7680 && weight.k == 2560) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<7680, 2560>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 2560 && weight.k == 7680) {
+        static constexpr auto launchers = make_launchers<Bf16GemvGeometry<2560, 7680>>(
+            std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
+        launchers[index](x, weight, out, stream);
+        return;
+    }
     if (weight.n == 4608 && weight.k == 4608) {
         static constexpr auto launchers=make_launchers<Bf16GemvGeometry<4608,4608>>(
             std::make_index_sequence<kBf16SmallTMaxTokens-kBf16SmallTMinTokens+1>{});

@@ -1,6 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
@@ -123,28 +123,28 @@ Program<Variant>::~Program() noexcept = default;
 
 template <>
 RequestBasePlan<Variant>
-Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
+Program<Variant>::plan_request_base(const text::qwen::PreparedPrompt& prompt,
                                     const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request_base(PreparedPromptAccess::view(prompt), options);
+    return impl_->plan_request_base(text::qwen::PreparedPromptAccess::view(prompt), options);
 }
 
 template <>
 RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
-                                                             const PreparedPrompt& prompt,
+                                                             const text::qwen::PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base) {
-    return impl_->plan_request_for_lane(lane, PreparedPromptAccess::view(prompt), base);
+    return impl_->plan_request_for_lane(lane, text::qwen::PreparedPromptAccess::view(prompt), base);
 }
 
 template <>
-RequestPlan<Variant> Program<Variant>::plan_ram_reuse(const PreparedPrompt& prompt,
+RequestPlan<Variant> Program<Variant>::plan_ram_reuse(const text::qwen::PreparedPrompt& prompt,
                                                       const RequestBasePlan<Variant>& base) {
-    return impl_->plan_ram_reuse(PreparedPromptAccess::view(prompt), base);
+    return impl_->plan_ram_reuse(text::qwen::PreparedPromptAccess::view(prompt), base);
 }
 
 template <>
-RequestPlan<Variant> Program<Variant>::plan_disk_reuse(const PreparedPrompt& prompt,
+RequestPlan<Variant> Program<Variant>::plan_disk_reuse(const text::qwen::PreparedPrompt& prompt,
                                                        const RequestBasePlan<Variant>& base) {
-    return impl_->plan_disk_reuse(PreparedPromptAccess::view(prompt), base);
+    return impl_->plan_disk_reuse(text::qwen::PreparedPromptAccess::view(prompt), base);
 }
 
 template <>
@@ -173,10 +173,10 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 
 template <>
 runtime::PrefillStepResult
-Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
+Program<Variant>::start_prefill_lane(std::uint32_t lane, text::qwen::PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
-                                     runtime::TransientRegion transient, const OutputSession* output) {
-    return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
+                                     runtime::TransientRegion transient, const text::qwen::OutputSession* output) {
+    return impl_->start_prefill_lane(lane, text::qwen::PreparedPromptAccess::take(std::move(prompt)),
                                      std::move(plan), transient, output);
 }
 
@@ -454,9 +454,9 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
-ScoreResult Program<Variant>::score(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+ScoreResult Program<Variant>::score(text::qwen::PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
                                     runtime::TransientRegion transient, ScoreOptions options) {
-    return impl_->score(PreparedPromptAccess::take(std::move(prompt)), std::move(plan), transient,
+    return impl_->score(text::qwen::PreparedPromptAccess::take(std::move(prompt)), std::move(plan), transient,
                         options);
 }
 

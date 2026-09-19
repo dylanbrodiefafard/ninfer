@@ -83,6 +83,16 @@ product. This is a trusted local, single-owner project, and requirements from a 
 workload, trust model, or deployment model are out of scope until the contract is explicitly
 changed.
 
+The explicitly assigned Qwen4 architecture work extends this contract with the exact audited
+`qwen4/native-preview` native artifact and its independently owned family runtime. Implement
+complete GPU-resident ordinary compute, source-correct Vision, MTP and optional checkpoint-specific
+DFlash, and compact C=1..4 execution through the existing Engine scheduler. Artifact capacity and
+quality admission remain mandatory: this exception does not declare the oversized preview runnable
+on the 5090 or authorize CPU compute, ordinary-weight streaming, or invented future checkpoints.
+Qwen4 GPU prefix retention is in scope; host/disk KV tiers are not supported by this target and
+requested tier options must fail admission explicitly. Shared frontend semantics belong to
+`src/text/qwen`; concrete family media profiles retain their source-specific arithmetic.
+
 For an exact Qwen4 target whose artifact authority contains the preview-style n-gram/PLE embedding
 table, “one resident model instance” does not require that random-access table to reside in VRAM.
 Such a target uses one artifact-owned host mapping whose complete PLE payload is populated and
@@ -143,7 +153,9 @@ them, updating the corresponding authorities and implementation together.
 | `src/core` | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV-cache containers, raw transfer mechanisms | |
 | `src/artifact` | generic `.ninfer` framing, descriptors, binding primitives, materialization | checkpoint execution semantics |
 | `src/ops` | every semantically closed Op implementation, including fused, fixed-shape, and device-specialized paths; ownership follows the mathematical or state-transition contract, not the first model caller or demonstrated cross-target reuse | |
-| `src/targets/qwen3_6` | Qwen3.6-family invariants shared by 27B and 35B-A3B: tokenizer/template and output semantics, media preprocessing and MRoPE prompt construction, owning prepared-prompt/output-session types, semantic weight-view schemas, passive Vision definitions, and the fixed planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms | target identity, registry entry, artifact binder, target leaf implementation, storage for a live Program instance |
+| `src/text/qwen` | shared Qwen tokenizer/template, owning prepared-prompt/output-session and recovery semantics, explicit family media preparation profiles | model execution or persistent GPU state |
+| `src/targets/qwen3_6` | Qwen3.6-family invariants shared by 27B and 35B-A3B: semantic weight-view schemas, passive Vision definitions, and the fixed planning/Program/Text/Vision/speculative/state/workspace/CUDA-Graph algorithms | target identity, registry entry, artifact binder, target leaf implementation, storage for a live Program instance |
+| `src/targets/qwen4` | exact preview artifact binding and Qwen4 planning/Text/Vision/speculative/state/workspace/graph algorithms, locked PLE gather scheduling and admission | copied Qwen3.6 execution algorithms, CPU model math, ordinary-weight streaming in the native path; closed mathematical Ops remain in `src/ops` |
 | `src/targets/<package>` | registered checkpoint identities, storage profiles, binder, `LoadedModel`, configuration, populated family model-view values and private leaf payloads, diagnostics, graph frontier values, and exactly three execution-leaf families (attention projection, GDN projection/control, post-mixer); aliases and instantiates the family runtime types | a copied Program, Text/Vision/speculative schedule, workspace composition, state transaction, or graph-capture algorithm; leaf Ops remain in `src/ops` |
 | `src/runtime` | common contracts, generated-token transaction/publication policy, public Engine PIMPL | model mathematics or target state |
 | `src/media/decode` | consuming already-owned bytes | URL/path/data acquisition, which belongs to `src/product/media_acquire`, CLI, or serving and is not linked into a target |

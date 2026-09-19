@@ -28,7 +28,7 @@ float coordinate(std::int32_t index, std::int32_t size) {
 
 } // namespace
 
-VisionControl build_vision_control(const PreparedPromptData& prompt) {
+VisionControl build_vision_control(const text::qwen::PreparedPromptData& prompt) {
     if (prompt.token_ids.size() != prompt.token_types.size()) {
         throw std::invalid_argument("vision control token types must cover the prompt");
     }
@@ -37,7 +37,7 @@ VisionControl build_vision_control(const PreparedPromptData& prompt) {
 
     std::size_t patch_cursor = 0;
     std::size_t token_cursor = 0;
-    for (const VisionItem& item : prompt.vision_items) {
+    for (const text::qwen::VisionItem& item : prompt.vision_items) {
         const std::int32_t t = item.grid.temporal;
         const std::int32_t h = item.grid.height;
         const std::int32_t w = item.grid.width;
@@ -52,7 +52,7 @@ VisionControl build_vision_control(const PreparedPromptData& prompt) {
             throw std::invalid_argument("vision control patch ranges are not canonical");
         }
         const std::size_t expected_spans =
-            item.modality == PromptModality::Video ? static_cast<std::size_t>(t) : 1;
+            item.modality == text::qwen::PromptModality::Video ? static_cast<std::size_t>(t) : 1;
         if (item.token_spans.size() != expected_spans) {
             throw std::invalid_argument("vision control token spans do not match modality grid");
         }
@@ -74,7 +74,7 @@ VisionControl build_vision_control(const PreparedPromptData& prompt) {
             token_cursor == 0
                 ? 0
                 : static_cast<std::size_t>(out.items.back().scatter_indices.back()) + 1;
-        for (const TokenSpan& span : item.token_spans) {
+        for (const text::qwen::TokenSpan& span : item.token_spans) {
             if (span.count == 0 || span.begin > prompt.token_types.size() ||
                 span.count > prompt.token_types.size() - span.begin) {
                 throw std::invalid_argument("vision control token span exceeds prompt");

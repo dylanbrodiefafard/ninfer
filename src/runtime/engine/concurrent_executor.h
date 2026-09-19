@@ -7,8 +7,8 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/generation_recovery.h"
+#include "text/qwen/frontend.h"
+#include "text/qwen/generation_recovery.h"
 #include "runtime/contract/reasoning_recovery.h"
 
 #include <algorithm>
@@ -42,6 +42,17 @@ public:
     using BasePlan = typename Package::RequestBasePlan;
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
+
+    // Target capabilities select storage paths, not scheduling or publication policy.
+    // A GPU-only KV target never instantiates a host-tier target API.
+    [[nodiscard]] bool kv_copies_ready() const {
+        if constexpr (Package::supports_host_kv_tiers) return instance_.program->kv_copies_ready();
+        else return true;
+    }
+    [[nodiscard]] bool kv_ram_copies_ready() const {
+        if constexpr (Package::supports_host_kv_tiers) return instance_.program->kv_ram_copies_ready();
+        else return true;
+    }
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
@@ -119,7 +130,7 @@ public:
         friend class ConcurrentExecutor;
     };
 
-    Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
+    Submission submit(text::qwen::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
                       OutputDelivery delivery,
                       Clock::time_point pending_deadline = {}, HostInputLease host_input = {}) {
@@ -205,7 +216,7 @@ public:
         return out;
     }
 
-    [[nodiscard]] ScoreResult score(targets::qwen3_6::PreparedPrompt prompt,
+    [[nodiscard]] ScoreResult score(text::qwen::PreparedPrompt prompt,
                                     ScoreOptions options = {}) {
         std::scoped_lock execution_lock(execution_mutex_);
         {
@@ -291,6 +302,7 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
+        if constexpr (Package::supports_host_kv_tiers) {
         const auto ram                    = instance_.program->kv_ram_snapshot();
         snapshot.kv_ram_captures          = ram.captures;
         snapshot.kv_ram_restores          = ram.restores;
@@ -311,6 +323,7 @@ private:
         snapshot.kv_disk_capacity_bytes   = disk.capacity_bytes;
         snapshot.kv_disk_used_bytes       = disk.used_bytes;
         snapshot.kv_disk_entry_count      = disk.entry_count;
+        }
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
     }
@@ -380,8 +393,8 @@ private:
     }
 
     struct Request {
-        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
-                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
+        Request(std::uint64_t request_identity, text::qwen::PreparedPrompt input,
+                text::qwen::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
                 OutputDelivery output_delivery, Clock::time_point limit,
                 Clock::time_point submit_time, HostInputLease input_lease,
@@ -399,8 +412,8 @@ private:
         const std::uint64_t id;
         std::uint64_t queue_order = 0;
         HostInputLease host_input;
-        targets::qwen3_6::PreparedPrompt prompt;
-        targets::qwen3_6::OutputSession output;
+        text::qwen::PreparedPrompt prompt;
+        text::qwen::OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
@@ -418,7 +431,7 @@ private:
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
         bool stop_suppression_active = false;
-        std::shared_ptr<const targets::qwen3_6::GenerationRecoveryContext> recovery_context;
+        std::shared_ptr<const text::qwen::GenerationRecoveryContext> recovery_context;
         GenerationRecoveryStats recovery;
         std::uint32_t cycle_exclusions = 0;
         std::string recovery_cause;
@@ -527,7 +540,7 @@ private:
     }
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output, bool notify = true) {
+                       text::qwen::PublishedOutput output, bool notify = true) {
         if (output.empty()) { return; }
         for (OutputDelta& delta : output) {
             std::string& full = delta.channel == OutputChannel::Reasoning ? request->reasoning
@@ -656,7 +669,7 @@ private:
         result.recovery = request->recovery;
         if (!request->output.has_tool_grammar()) {
             result.undeclared_tool_call_names =
-                targets::qwen3_6::unconstrained_tool_call_names(result.content, 128);
+                text::qwen::unconstrained_tool_call_names(result.content, 128);
         }
         for (std::size_t index = 0; index < result.tool_calls.size(); ++index) {
             result.tool_calls[index].id = "call_" + std::to_string(request->id) + "_" +
@@ -820,7 +833,7 @@ private:
             // The failed attempt may end mid-word. Keep it visible, but do not
             // concatenate the new attempt onto that unfinished word in SSE/JSON.
             if (!request->reasoning.empty()) {
-                targets::qwen3_6::PublishedOutput separator;
+                text::qwen::PublishedOutput separator;
                 separator.push_back(OutputDelta{OutputChannel::Reasoning, "\n\n"});
                 append_output(request, std::move(separator));
             }
@@ -852,7 +865,7 @@ private:
         request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
         request->recovery_cause = "repeated_reasoning";
         publish_recovery(request, RecoveryEventKind::RetryTriggered, request->recovery_cause);
-        if (request->recovery.attempts >= targets::qwen3_6::GenerationRecoveryContext::maximum_attempts ||
+        if (request->recovery.attempts >= text::qwen::GenerationRecoveryContext::maximum_attempts ||
             request->budget->remaining() == 0) {
             recovery_exhausted(request, "persistent reasoning exhausted its retry or output-token budget");
             return true;
@@ -882,7 +895,7 @@ private:
             request->recovery.discarded_reasoning_tokens += request->output.reasoning_tokens();
             request->recovery_cause = "duplicate_tool_call";
             publish_recovery(request, RecoveryEventKind::RetryTriggered, request->recovery_cause);
-            if (request->recovery.attempts >= targets::qwen3_6::GenerationRecoveryContext::maximum_attempts ||
+            if (request->recovery.attempts >= text::qwen::GenerationRecoveryContext::maximum_attempts ||
                 request->budget->remaining() == 0) {
                 recovery_exhausted(request, "no retry or output-token budget remains");
                 return;
@@ -1176,6 +1189,7 @@ private:
     }
 
     void ensure_ram_candidate(const std::shared_ptr<Request>& request) {
+        if constexpr (Package::supports_host_kv_tiers) {
         if (!request->options.execution.allow_prefix_reuse) {
             request->ram_plan.reset();
             return;
@@ -1196,9 +1210,11 @@ private:
             // and remember this index version so allocation pressure cannot spin.
         }
         request->ram_index_version = version;
+        }
     }
 
     void ensure_disk_candidate(const std::shared_ptr<Request>& request) {
+        if constexpr (Package::supports_host_kv_tiers) {
         if (!request->options.execution.allow_prefix_reuse) {
             request->disk_plan.reset();
             return;
@@ -1219,6 +1235,7 @@ private:
             // and remember this index version so allocation pressure cannot spin.
         }
         request->disk_index_version = version;
+        }
     }
 
     [[nodiscard]] std::optional<LaneChoice>
@@ -1333,6 +1350,7 @@ private:
     }
 
     void harvest_kv_copy_seconds(const std::shared_ptr<Request>& request) noexcept {
+        if constexpr (Package::supports_host_kv_tiers) {
         if (request == nullptr) { return; }
         try {
             const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
@@ -1345,6 +1363,7 @@ private:
             request->kv_disk_load_seconds += copies.load;
             request->kv_disk_h2d_seconds += copies.h2d;
         } catch (...) {}
+        }
     }
 
     [[nodiscard]] static bool is_request_local_admission_error(std::exception_ptr error) {
@@ -1360,7 +1379,7 @@ private:
         if (!copy_hold_) { return; }
         const std::uint32_t lane = copy_hold_->lane;
         try {
-            instance_.program->cancel_disk_restore();
+            if constexpr (Package::supports_host_kv_tiers) instance_.program->cancel_disk_restore();
         } catch (...) {}
         try {
             instance_.program->synchronize_all();
@@ -1368,13 +1387,13 @@ private:
         harvest_kv_copy_seconds(copy_hold_->request);
         if (copy_hold_->ram_claimed && !copy_hold_->ram_consumed) {
             try {
-                instance_.program->release_ram_entry(copy_hold_->ram_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->release_ram_entry(copy_hold_->ram_entry_id);
             } catch (...) {}
             copy_hold_->ram_claimed = false;
         }
         if (copy_hold_->disk_claimed && !copy_hold_->disk_consumed) {
             try {
-                instance_.program->release_disk_entry(copy_hold_->disk_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->release_disk_entry(copy_hold_->disk_entry_id);
             } catch (...) {}
             copy_hold_->disk_claimed = false;
         }
@@ -1408,13 +1427,13 @@ private:
             throw std::logic_error("copy-hold request is not occupying its lane");
         }
 
-        auto copies_ready = [&] { return instance_.program->kv_copies_ready(); };
+        auto copies_ready = [&] { return kv_copies_ready(); };
 
         try {
             if (!hold.victims_evicted) {
-                if (!instance_.program->kv_ram_copies_ready()) {
+                if (!kv_ram_copies_ready()) {
                     if (!membership_empty) { return AdmissionProgress::CopyHold; }
-                    instance_.program->wait_kv_ram_copies();
+                    if constexpr (Package::supports_host_kv_tiers) instance_.program->wait_kv_ram_copies();
                 }
                 for (const std::uint32_t victim : std::span(hold.victim_lanes).first(hold.victim_count)) {
                     instance_.program->evict_retained_lane(victim);
@@ -1424,28 +1443,29 @@ private:
             }
 
             if (hold.ram_hit && !hold.restored) {
-                instance_.program->restore_ram_entry(lane, hold.ram_entry_id, hold.plan);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->restore_ram_entry(lane, hold.ram_entry_id, hold.plan);
                 hold.restored = true;
             }
             if (hold.disk_hit && !hold.restored) {
-                instance_.program->restore_disk_entry(lane, hold.disk_entry_id, hold.plan);
-                hold.disk_restore_epoch = instance_.program->pending_disk_restore_ticket();
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->restore_disk_entry(lane, hold.disk_entry_id, hold.plan);
+                if constexpr (Package::supports_host_kv_tiers)
+                    hold.disk_restore_epoch = instance_.program->pending_disk_restore_ticket();
                 hold.restored = true;
             }
-            instance_.program->pump_disk_restore();
+            if constexpr (Package::supports_host_kv_tiers) instance_.program->pump_disk_restore();
 
-            if (instance_.program->kv_disk_restore_failed()) {
-                instance_.program->wait_kv_disk_copies();
+            if constexpr (Package::supports_host_kv_tiers) {
+                if (instance_.program->kv_disk_restore_failed()) instance_.program->wait_kv_disk_copies();
             }
             if (!copies_ready() && !membership_empty) { return AdmissionProgress::CopyHold; }
             if (!copies_ready()) {
-                instance_.program->wait_kv_ram_copies();
-                instance_.program->wait_kv_disk_copies();
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->wait_kv_ram_copies();
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->wait_kv_disk_copies();
             } else {
-                instance_.program->wait_kv_disk_copies();
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->wait_kv_disk_copies();
             }
 
-            instance_.program->wait_kv_ram_copies_on_compute();
+            if constexpr (Package::supports_host_kv_tiers) instance_.program->wait_kv_ram_copies_on_compute();
 
             runtime::TransientRegion transient{};
             if (hold.needs_prefill) {
@@ -1457,6 +1477,7 @@ private:
             }
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(hold.plan), transient, &request->output);
+            if constexpr (Package::supports_host_kv_tiers) {
             const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
             request->kv_ram_save_seconds += copies.save;
             request->kv_ram_load_seconds += copies.load;
@@ -1464,13 +1485,14 @@ private:
             request->kv_disk_save_seconds += disk_copies.save;
             request->kv_disk_load_seconds += disk_copies.load;
             request->kv_disk_h2d_seconds += disk_copies.h2d;
+            }
             if (hold.ram_hit) {
-                instance_.program->consume_ram_entry(hold.ram_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->consume_ram_entry(hold.ram_entry_id);
                 hold.ram_consumed = true;
                 ram_consumed      = true;
             }
             if (hold.disk_hit) {
-                instance_.program->consume_disk_entry(hold.disk_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->consume_disk_entry(hold.disk_entry_id);
                 hold.disk_consumed = true;
                 disk_consumed      = true;
             }
@@ -1491,19 +1513,19 @@ private:
                 prefill_lane_ || request->begin || !request->generated.empty()) {
                 throw;
             }
-            instance_.program->cancel_disk_restore();
+            if constexpr (Package::supports_host_kv_tiers) instance_.program->cancel_disk_restore();
             instance_.program->synchronize_all();
             harvest_kv_copy_seconds(request);
             if (copy_hold_->ram_claimed && !copy_hold_->ram_consumed) {
-                instance_.program->release_ram_entry(ram_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->release_ram_entry(ram_entry_id);
                 copy_hold_->ram_claimed = false;
-                instance_.program->discard_ram_capture(ram_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->discard_ram_capture(ram_entry_id);
             }
             if (copy_hold_->disk_claimed && !copy_hold_->disk_consumed) {
-                instance_.program->release_disk_entry(disk_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->release_disk_entry(disk_entry_id);
                 copy_hold_->disk_claimed = false;
             }
-            if (copy_hold_->disk_hit) { instance_.program->invalidate_disk_entry(disk_entry_id); }
+            if (copy_hold_->disk_hit) { if constexpr (Package::supports_host_kv_tiers) instance_.program->invalidate_disk_entry(disk_entry_id); }
             instance_.program->abort_lane(lane);
             copy_hold_.reset();
             slots_[lane].reset();
@@ -1535,12 +1557,12 @@ private:
             } else {
                 if (ram_claimed && !ram_consumed) {
                     try {
-                        instance_.program->release_ram_entry(ram_entry_id);
+                        if constexpr (Package::supports_host_kv_tiers) instance_.program->release_ram_entry(ram_entry_id);
                     } catch (...) {}
                 }
                 if (disk_claimed && !disk_consumed) {
                     try {
-                        instance_.program->release_disk_entry(disk_entry_id);
+                        if constexpr (Package::supports_host_kv_tiers) instance_.program->release_disk_entry(disk_entry_id);
                     } catch (...) {}
                 }
             }
@@ -1607,13 +1629,13 @@ private:
         auto release_host_if_needed = [&]() {
             if (ram_claimed) {
                 try {
-                    instance_.program->release_ram_entry(choice.ram_entry_id);
+                    if constexpr (Package::supports_host_kv_tiers) instance_.program->release_ram_entry(choice.ram_entry_id);
                 } catch (...) {}
                 ram_claimed = false;
             }
             if (disk_claimed) {
                 try {
-                    instance_.program->release_disk_entry(choice.disk_entry_id);
+                    if constexpr (Package::supports_host_kv_tiers) instance_.program->release_disk_entry(choice.disk_entry_id);
                 } catch (...) {}
                 disk_claimed = false;
             }
@@ -1621,13 +1643,14 @@ private:
         auto rollback_ram_captures = [&]() {
             for (const std::uint64_t id : std::span(captured_ram_ids).first(captured_ram_count)) {
                 try {
-                    instance_.program->discard_ram_capture(id);
+                    if constexpr (Package::supports_host_kv_tiers) instance_.program->discard_ram_capture(id);
                 } catch (...) {}
             }
             captured_ram_count = 0;
         };
 
         try {
+            if constexpr (Package::supports_host_kv_tiers) {
             if (disk_hit) {
                 const auto disk_summary = winning_plan.summary();
                 if (!instance_.program->claim_disk_entry(choice.disk_entry_id,
@@ -1642,10 +1665,11 @@ private:
                     return AdmissionProgress::None;
                 }
                 disk_claimed = true;
-                instance_.program->prefetch_disk_plan(choice.disk_entry_id, winning_plan);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->prefetch_disk_plan(choice.disk_entry_id, winning_plan);
+            }
             }
             if (ram_hit) {
-                instance_.program->claim_ram_entry(choice.ram_entry_id);
+                if constexpr (Package::supports_host_kv_tiers) instance_.program->claim_ram_entry(choice.ram_entry_id);
                 ram_claimed = true;
             }
             std::array<std::uint32_t, kMaximumConcurrency> victims{};
@@ -1678,7 +1702,7 @@ private:
                     std::uint64_t ram_id = 0;
                     // Saving a completed prefix is optional. Even if its host
                     // image is dropped, this free lane can release its GPU pages.
-                    (void)instance_.program->capture_retained_lane(*victim, &ram_id);
+                    if constexpr (Package::supports_host_kv_tiers) (void)instance_.program->capture_retained_lane(*victim, &ram_id);
                     if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                     victims[victim_count++] = *victim;
                 }
@@ -1687,7 +1711,7 @@ private:
             if (instance_.program->has_retained_lane(lane) &&
                 (ram_hit || disk_hit || winning_plan.summary().reusable_prompt_tokens == 0)) {
                 std::uint64_t ram_id = 0;
-                (void)instance_.program->capture_retained_lane(lane, &ram_id);
+                if constexpr (Package::supports_host_kv_tiers) (void)instance_.program->capture_retained_lane(lane, &ram_id);
                 if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                 if (std::find(victims.begin(), victims.begin() + victim_count, lane) ==
                     victims.begin() + victim_count) {
@@ -1704,6 +1728,7 @@ private:
                 request->lane_plans[lane].reset();
             }
             if (!erase_pending(request)) {
+                if constexpr (Package::supports_host_kv_tiers) {
                 const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
                 request->kv_ram_save_seconds += copies.save;
                 request->kv_ram_load_seconds += copies.load;
@@ -1711,6 +1736,7 @@ private:
                 request->kv_disk_save_seconds += disk_copies.save;
                 request->kv_disk_load_seconds += disk_copies.load;
                 request->kv_disk_h2d_seconds += disk_copies.h2d;
+                }
                 rollback_ram_captures();
                 release_host_if_needed();
                 return AdmissionProgress::None;
@@ -1765,6 +1791,7 @@ private:
             try {
                 instance_.program->synchronize_all();
             } catch (...) {}
+            if constexpr (Package::supports_host_kv_tiers) {
             try {
                 const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
                 request->kv_ram_save_seconds += copies.save;
@@ -1776,6 +1803,7 @@ private:
                 request->kv_disk_load_seconds += copies.load;
                 request->kv_disk_h2d_seconds += copies.h2d;
             } catch (...) {}
+            }
             if (!(copy_hold_ && copy_hold_->lane == lane)) {
                 rollback_ram_captures();
             }
@@ -2132,8 +2160,8 @@ private:
                         bool copies_ready = false;
                         if (!copy_hold_) {
                             try {
-                                copies_ready = instance_.program->kv_copies_ready();
-                                if (copies_ready) { instance_.program->request_idle_spill(); }
+                                copies_ready = kv_copies_ready();
+                                if (copies_ready) { if constexpr (Package::supports_host_kv_tiers) instance_.program->request_idle_spill(); }
                             } catch (...) {}
                         }
                         if (copies_ready) {
@@ -2150,7 +2178,7 @@ private:
                         std::scoped_lock execution_lock(execution_mutex_);
                         drain_copy_hold_before_abort();
                         try {
-                            instance_.program->shutdown_kv_tiers(load_progress_);
+                            if constexpr (Package::supports_host_kv_tiers) instance_.program->shutdown_kv_tiers(load_progress_);
                         } catch (...) {}
                     }
                     fail_all(std::make_exception_ptr(RequestError(
@@ -2186,7 +2214,7 @@ private:
                             "copy-hold lane must not join decode membership before admit-complete");
                     }
                     if (!membership.empty() && !held_in_membership &&
-                        !instance_.program->kv_ram_copies_ready()) {
+                        !kv_ram_copies_ready()) {
                         run_membership_decode();
                     } else {
                         const AdmissionProgress progress = admit_complete(membership.empty());
@@ -2231,7 +2259,7 @@ private:
                     std::scoped_lock execution_lock(execution_mutex_);
                     drain_copy_hold_before_abort();
                     try {
-                        instance_.program->shutdown_kv_tiers(load_progress_);
+                        if constexpr (Package::supports_host_kv_tiers) instance_.program->shutdown_kv_tiers(load_progress_);
                     } catch (...) {}
                 }
                 fail_all(std::current_exception());

@@ -132,6 +132,12 @@ void launch_nvfp4_exact_geometry_a16_gemm(const Tensor& x, const Weight& weight,
         return launch_registered<Nvfp4N2560K2560Geometry>(x, weight, out, first_gemm_t, stream);
     case Nvfp4Problem::N248320K2560:
         return launch_registered<Nvfp4N248320K2560Geometry>(x, weight, out, first_gemm_t, stream);
+    case Nvfp4Problem::N2560K12800:
+        return launch_registered<Nvfp4N2560K12800Geometry>(x, weight, out, first_gemm_t, stream);
+    case Nvfp4Problem::N7680K2560:
+        return launch_registered<Nvfp4N7680K2560Geometry>(x, weight, out, first_gemm_t, stream);
+    case Nvfp4Problem::N2560K7680:
+        return launch_registered<Nvfp4N2560K7680Geometry>(x, weight, out, first_gemm_t, stream);
     default:
         throw std::invalid_argument("nvfp4 exact-geometry A16 GEMM: unsupported problem");
     }

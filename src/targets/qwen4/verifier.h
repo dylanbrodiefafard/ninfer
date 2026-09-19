@@ -1,5 +1,7 @@
 #pragma once
 
+#include "targets/qwen4/dflash_features.h"
+
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
@@ -306,8 +308,10 @@ public:
 
     void reset();
     [[nodiscard]] TokenResultView execute_token(std::int32_t token_id,
-                                                std::int32_t target_id);
-    [[nodiscard]] PrefillResultView prefill_chunk(std::span<const std::int32_t> token_ids);
+                                                std::int32_t target_id,
+                                                const DFlashFeatureSink* features = nullptr);
+    [[nodiscard]] PrefillResultView prefill_chunk(std::span<const std::int32_t> token_ids,
+                                                 const DFlashFeatureSink* features = nullptr);
 
     [[nodiscard]] std::int32_t frontier() const noexcept { return frontier_; }
     [[nodiscard]] const State& state() const noexcept { return state_; }

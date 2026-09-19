@@ -105,7 +105,9 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    const bool registered_heads =
+        (qk_heads == 16 && (value_heads == 48 || value_heads == 32)) ||
+        (qk_heads == 48 && value_heads == 48);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -173,13 +175,19 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
                              spec.conv_channels == 10240;
     const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
                              spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 48 && spec.value_heads == 48 &&
+                             spec.conv_channels == 10240;
+    return geometry_48 || geometry_30 || geometry_36;
 }
 
-void validate_fold_records(const GdnReplayRecords& records) {
+void validate_fold_records(const GdnReplayRecords& records, bool single_layer = false) {
     constexpr const char* kOp       = "gdn_replay_fold";
     const GdnReplayRecordSpec& spec = records.spec;
-    if (!is_registered_fold_geometry(spec) || spec.record_capacity <= 0 ||
+    const bool geometry = single_layer
+                              ? spec.layers == 1 && spec.qk_heads == 48 &&
+                                    spec.value_heads == 48 && spec.conv_channels == 10240
+                              : is_registered_fold_geometry(spec);
+    if (!geometry || spec.record_capacity <= 0 ||
         spec.record_capacity > kMaximumRows || spec.width < 2 || spec.width > 16 ||
         spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported record geometry");
@@ -396,6 +404,45 @@ void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLay
         validate_fold_rows(records, states, rows);
     detail::gated_delta_net::launch_replay_fold(records, states, packed,
                                                 static_cast<std::int32_t>(rows.size()), stream);
+}
+
+void gdn_replay_fold(const GdnReplayRecordLayer& records, Tensor& conv_states,
+                     Tensor& recurrent_states, std::span<const GdnReplayFoldRow> rows,
+                     cudaStream_t stream) {
+    // Bind the actual single layer to the canonical validator/launcher layout.
+    // These are non-owning views, not a fabricated model state pool or allocation.
+    GdnReplayRecords layer;
+    layer.conv = records.conv;
+    layer.key = records.key;
+    layer.value = records.value;
+    layer.gate = records.gate;
+    layer.spec = {.layers = 1,
+                  .record_capacity = records.key.ne[3],
+                  .width = records.key.ne[2],
+                  .conv_channels = 10240,
+                  .qk_heads = 48,
+                  .value_heads = 48,
+                  .key_dim = kStateDim,
+                  .value_dim = kStateDim};
+    validate_fold_records(layer, true);
+    const LinearAttentionStateAllLayersView states{
+        .conv_layer0 = conv_states,
+        .recurrent_layer0 = recurrent_states,
+        .conv_layer_stride_bytes = static_cast<std::int64_t>(conv_states.bytes()),
+        .recurrent_layer_stride_bytes = static_cast<std::int64_t>(recurrent_states.bytes()),
+        .spec = {.layers = 1,
+                 .conv_channels = 10240,
+                 .conv_width = 3,
+                 .value_heads = 48,
+                 .value_head_dim = kStateDim,
+                 .key_head_dim = kStateDim,
+                 .slot_count = recurrent_states.ne[3],
+                 .conv_dtype = DType::BF16}};
+    validate_fold_states(layer, states);
+    require_records_disjoint_from_states(layer, states);
+    const auto packed = validate_fold_rows(layer, states, rows);
+    detail::gated_delta_net::launch_replay_fold_layer(
+        layer, states, packed, static_cast<std::int32_t>(rows.size()), stream);
 }
 
 } // namespace ninfer::ops

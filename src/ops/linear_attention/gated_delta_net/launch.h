@@ -35,6 +35,12 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                             cudaStream_t stream);
 
+void launch_recurrent_batch_inout(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& g, const Tensor& beta, float scale,
+                                 const Tensor& slots, const Tensor& valid_columns,
+                                 const Tensor& state_in, Tensor& state_out, Tensor& out,
+                                 cudaStream_t stream);
+
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                const Tensor& beta, float scale, bool normalize_qk,
                                Tensor& ssm_states, const Tensor& valid_columns,
@@ -62,6 +68,11 @@ void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v,
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
+
+void launch_replay_fold_layer(const GdnReplayRecords& records,
+                              LinearAttentionStateAllLayersView states,
+                              const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                              cudaStream_t stream);
 
 std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens);
 

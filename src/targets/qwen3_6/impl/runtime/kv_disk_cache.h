@@ -105,7 +105,7 @@ struct DiskRestoredHost {
     std::uint32_t dflash_context_frontier = 0;
     bool tail_hidden_valid                = false;
     bool rewrite_valid                    = false;
-    RewriteCheckpointKind rewrite_kind    = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind rewrite_kind    = text::qwen::RewriteCheckpointKind::TurnClosure;
     std::uint32_t rewrite_frontier        = 0;
     bool backend_image_present            = false;
     std::vector<TokenId> ledger;
@@ -201,7 +201,7 @@ public:
     KVDiskCache(KVDiskCache&&)                 = delete;
     KVDiskCache& operator=(KVDiskCache&&)      = delete;
 
-    [[nodiscard]] std::optional<DiskMatch> plan_match(const PreparedPromptData& prompt,
+    [[nodiscard]] std::optional<DiskMatch> plan_match(const text::qwen::PreparedPromptData& prompt,
                                                       std::span<const PrefixHash128> hash_chain,
                                                      const ReuseBackendPolicy& policy = {});
     [[nodiscard]] std::optional<DiskRestoredHost> load_host(std::uint64_t entry_id) const;

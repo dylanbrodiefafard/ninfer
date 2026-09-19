@@ -27,8 +27,8 @@ bool cuda_unavailable(cudaError_t err) {
     return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
 }
 
-ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
-    ninfer::targets::qwen3_6::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids = std::move(tokens);
     prompt.token_types.assign(prompt.token_ids.size(), 0);
     prompt.positions.resize(3 * prompt.token_ids.size());
@@ -87,9 +87,9 @@ int expect_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocat
 
 int capture_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::PagedKVPool& pool,
                   ninfer::PagedKVAllocation& alloc,
-                  const ninfer::targets::qwen3_6::PreparedPromptData& prompt, cudaStream_t stream,
+                  const ninfer::text::qwen::PreparedPromptData& prompt, cudaStream_t stream,
                   ninfer::LinearAttentionStatePool* gdn, const ninfer::Tensor* hidden) {
-    ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();

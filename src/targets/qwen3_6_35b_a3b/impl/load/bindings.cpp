@@ -97,7 +97,7 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
-    out.frontend        = qwen3_6::bind_frontend_resources(binder);
+    out.frontend        = text::qwen::bind_frontend_resources(binder);
     out.features        = features;
     out.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
                                                        NumericFormat::W8G32_F16S, {248320, 2048});
@@ -225,7 +225,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
-    frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+    frontend = text::qwen::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;

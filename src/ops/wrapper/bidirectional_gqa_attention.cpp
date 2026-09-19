@@ -13,11 +13,6 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 128;
-constexpr std::int32_t kQHeads  = 32;
-constexpr std::int32_t kKVHeads = 8;
-constexpr float kExpectedScale  = 0.08838834764831844055f;
-
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
     if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
@@ -34,9 +29,10 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
-std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char* op) {
+std::uint32_t validate_context(const PagedKVBatchLayerView& context, int head_dim, int kv_heads,
+                               const char* op) {
     if (context.dtype != DType::BF16 || context.quant_group != 0 ||
-        context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim) {
+        context.num_kv_heads != kv_heads || context.head_dim != head_dim) {
         throw std::invalid_argument(std::string(op) + ": invalid context geometry or dtype");
     }
     const std::int32_t physical_pages = context.k_pages.ne[2];
@@ -47,9 +43,9 @@ std::uint32_t validate_context(const PagedKVBatchLayerView& context, const char*
     if (context.k_pages.dtype != DType::BF16 || context.v_pages.dtype != DType::BF16) {
         throw std::invalid_argument(std::string(op) + ": context K/V must be BF16");
     }
-    require_shape(context.k_pages, kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads, op,
+    require_shape(context.k_pages, head_dim, kPagedKVPageSize, physical_pages, kv_heads, op,
                   "context k pages");
-    require_shape(context.v_pages, kHeadDim, kPagedKVPageSize, physical_pages, kKVHeads, op,
+    require_shape(context.v_pages, head_dim, kPagedKVPageSize, physical_pages, kv_heads, op,
                   "context v pages");
     require_contiguous_nonnull(context.k_pages, op, "context k pages");
     require_contiguous_nonnull(context.v_pages, op, "context v pages");
@@ -78,11 +74,13 @@ struct PartialWorkspace {
 
 template <class Allocator>
 PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens, std::int32_t splits,
-                                    std::int32_t batch_size) {
+                                    std::int32_t batch_size, std::int32_t head_dim) {
+    const int q_heads = head_dim == 128 ? 32 : 24;
     return {
-        workspace.alloc(DType::BF16, {kHeadDim, kQHeads, tokens, splits * batch_size}),
-        workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
-        workspace.alloc(DType::FP32, {kQHeads, tokens, splits * batch_size}),
+        workspace.alloc(head_dim == 256 ? DType::FP32 : DType::BF16,
+                        {head_dim, q_heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
     };
 }
 
@@ -90,18 +88,19 @@ PartialWorkspace allocate_workspace(Allocator& workspace, std::int32_t tokens, s
 
 std::size_t bidirectional_gqa_attention_workspace_capacity_bytes(
     GqaContextExecutionEnvelope envelope, std::int32_t min_tokens, std::int32_t max_tokens,
-    std::int32_t batch_size) {
+    std::int32_t batch_size, std::int32_t head_dim) {
     if (min_tokens < 1 || max_tokens < min_tokens || max_tokens > 16 || batch_size < 1 ||
-        batch_size > 8 || envelope.min_context > envelope.max_context ||
+        batch_size > 8 || (head_dim != 128 && head_dim != 256) ||
+        envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument(
             "bidirectional_gqa_attention workspace: invalid envelope or token interval");
     }
     const auto endpoint_capacity = [&](std::int32_t tokens) {
-        const auto plan = detail::bidirectional_gqa_resolve_plan(tokens, envelope);
+        const auto plan = detail::bidirectional_gqa_resolve_plan(tokens, envelope, head_dim);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
+        (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size, head_dim);
         return layout.peak_bytes(1);
     };
 
@@ -129,19 +128,25 @@ void bidirectional_gqa_attention(const Tensor& q, const Tensor& query_k, const T
     }
     const std::int32_t tokens = q.ne[2];
     const std::int32_t batch  = q.ne[3];
+    const int head_dim = q.ne[0];
+    if (head_dim != 128 && head_dim != 256) {
+        throw std::invalid_argument("bidirectional_gqa_attention: unsupported head dimension");
+    }
+    const int q_heads = head_dim == 128 ? 32 : 24;
+    const int kv_heads = head_dim == 128 ? 8 : 2;
     if (tokens < 1 || tokens > 16) {
         throw std::invalid_argument("bidirectional_gqa_attention: optimized domain is T=1..16");
     }
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("bidirectional_gqa_attention: B must be 1..8");
     }
-    require_shape(q, kHeadDim, kQHeads, tokens, batch, op, "q");
-    require_shape(query_k, kHeadDim, kKVHeads, tokens, batch, op, "query k");
-    require_shape(query_v, kHeadDim, kKVHeads, tokens, batch, op, "query v");
+    require_shape(q, head_dim, q_heads, tokens, batch, op, "q");
+    require_shape(query_k, head_dim, kv_heads, tokens, batch, op, "query k");
+    require_shape(query_v, head_dim, kv_heads, tokens, batch, op, "query v");
     require_shape(context_lengths, batch, 1, 1, 1, op, "context lengths");
     require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns");
     require_shape(table_rows, batch, 1, 1, 1, op, "table rows");
-    require_shape(out, kHeadDim, kQHeads, tokens, batch, op, "out");
+    require_shape(out, head_dim, q_heads, tokens, batch, op, "out");
     require_contiguous_nonnull(q, op, "q");
     require_contiguous_nonnull(query_k, op, "query k");
     require_contiguous_nonnull(query_v, op, "query v");
@@ -149,17 +154,17 @@ void bidirectional_gqa_attention(const Tensor& q, const Tensor& query_k, const T
     require_contiguous_nonnull(valid_columns, op, "valid columns");
     require_contiguous_nonnull(table_rows, op, "table rows");
     require_contiguous_nonnull(out, op, "out");
-    const std::uint32_t logical_capacity = validate_context(context, op);
+    const std::uint32_t logical_capacity = validate_context(context, head_dim, kv_heads, op);
     if (envelope.min_context > envelope.max_context || envelope.max_context > logical_capacity) {
         throw std::invalid_argument("bidirectional_gqa_attention: invalid execution envelope");
     }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1e-7f) {
-        throw std::invalid_argument("bidirectional_gqa_attention: scale must be 1/sqrt(128)");
+    if (!std::isfinite(scale) || std::abs(scale - 1.0f / std::sqrt(float(head_dim))) > 1e-7f) {
+        throw std::invalid_argument("bidirectional_gqa_attention: scale must be 1/sqrt(D)");
     }
 
     auto scope               = workspace.scope();
-    const auto plan          = detail::bidirectional_gqa_resolve_plan(tokens, envelope);
-    PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
+    const auto plan          = detail::bidirectional_gqa_resolve_plan(tokens, envelope, head_dim);
+    PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch, head_dim);
     detail::bidirectional_gqa_attention_launch(q, query_k, query_v, context_lengths, valid_columns,
                                                table_rows, scale, context, plan, partial.acc,
                                                partial.m, partial.l, out, stream);
