@@ -5,7 +5,7 @@
 #include "runtime/contract/types.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_snapshot.h"
 #include "targets/qwen3_6/impl/runtime/kv_disk_snapshot.h"
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -147,14 +147,14 @@ public:
     // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
     // owns target state images and executes one immutable decode batch membership.
     [[nodiscard]] RequestBasePlan<Variant>
-    plan_request_base(const PreparedPrompt& prompt,
+    plan_request_base(const text::qwen::PreparedPrompt& prompt,
                       const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
-                                                             const PreparedPrompt& prompt,
+                                                             const text::qwen::PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base);
-    [[nodiscard]] RequestPlan<Variant> plan_ram_reuse(const PreparedPrompt& prompt,
+    [[nodiscard]] RequestPlan<Variant> plan_ram_reuse(const text::qwen::PreparedPrompt& prompt,
                                                       const RequestBasePlan<Variant>& base);
-    [[nodiscard]] RequestPlan<Variant> plan_disk_reuse(const PreparedPrompt& prompt,
+    [[nodiscard]] RequestPlan<Variant> plan_disk_reuse(const text::qwen::PreparedPrompt& prompt,
                                                        const RequestBasePlan<Variant>& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
@@ -166,10 +166,10 @@ public:
         std::span<const std::uint32_t> release_lanes) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPrompt&& prompt,
+                                                                text::qwen::PreparedPrompt&& prompt,
                                                                 RequestPlan<Variant>&& plan,
                                                                 runtime::TransientRegion transient,
-                                                                const OutputSession* output = nullptr);
+                                                                const text::qwen::OutputSession* output = nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -240,7 +240,7 @@ public:
     void reset_memory_peaks() noexcept;
 
     // Teacher-forced NLL. Generate/serve do not call this.
-    [[nodiscard]] ScoreResult score(PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+    [[nodiscard]] ScoreResult score(text::qwen::PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
                                     runtime::TransientRegion transient, ScoreOptions options = {});
 
 private:

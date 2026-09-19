@@ -49,6 +49,9 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::MtpFc:
         return tokens >= kNvfp4FirstW4a4MtpFc ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::N248320K2560:
+    case Nvfp4Problem::N2560K12800:
+    case Nvfp4Problem::N7680K2560:
+    case Nvfp4Problem::N2560K7680:
         return Nvfp4LinearRoute::A16;
     case Nvfp4Problem::N10240K2560:
     case Nvfp4Problem::N6144K2560:

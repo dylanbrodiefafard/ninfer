@@ -21,11 +21,20 @@ void ngram_row_ids_launch(const Tensor& input_ids, const Tensor& valid_tokens,
 
     constexpr int history_block = 32;
     const int history_grid       = div_up(input_ids.ne[1], history_block);
-    ngram_history_kernel<<<history_grid, history_block, 0, stream>>>(
+    ngram_history_kernel<><<<history_grid, history_block, 0, stream>>>(
         static_cast<const std::int32_t*>(input_ids.data),
         static_cast<const std::int32_t*>(valid_tokens.data),
         static_cast<const std::int32_t*>(old_history.data),
         static_cast<std::int32_t*>(new_history.data), input_ids.ne[0], input_ids.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ngram_history_commit_launch(const Tensor& ids,const Tensor& counts,const Tensor& slots,
+                                 Tensor& history,cudaStream_t stream) {
+    ngram_history_kernel<true><<<1,32,0,stream>>>(
+        static_cast<const std::int32_t*>(ids.data),static_cast<const std::int32_t*>(counts.data),
+        static_cast<const std::int32_t*>(history.data),static_cast<std::int32_t*>(history.data),
+        ids.ne[0],ids.ne[1],static_cast<const std::int32_t*>(slots.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

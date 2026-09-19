@@ -33,10 +33,14 @@ __global__ void bf16_project_kernel(const __nv_bfloat16* x, const __nv_bfloat16*
 
 __device__ __forceinline__ float rotated(float lo, float hi, int pair, bool upper,
                                          const std::int32_t* position) {
-    const float inv = powf(1.0e7F, -static_cast<float>(pair) / 32.0F);
-    float sine;
-    float cosine;
-    sincosf(static_cast<float>(position[pair % 3]) * inv, &sine, &cosine);
+    // Large source coordinates amplify FP32 frequency/phase error into different
+    // represented persistent keys. Match the native selector's FP64 phase profile.
+    const double inv = pow(1.0e7, -static_cast<double>(pair) / 32.0);
+    double sine64;
+    double cosine64;
+    sincos(static_cast<double>(position[pair % 3]) * inv, &sine64, &cosine64);
+    const float sine = static_cast<float>(sine64);
+    const float cosine = static_cast<float>(cosine64);
     return upper ? hi * cosine + lo * sine : lo * cosine - hi * sine;
 }
 

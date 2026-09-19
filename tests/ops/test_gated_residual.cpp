@@ -398,6 +398,23 @@ int fp8_residual_experiment(const Fixture& fixture, const std::string& label) {
     return read.first_non_finite >= 0 || write.first_non_finite >= 0 ? 1 : 0;
 }
 
+int broadcast_case() {
+    int failures=0;
+    for(int width:{1,3,64,257}) {
+        std::vector<std::uint16_t> source(std::size_t(2560)*width);
+        for(std::size_t i=0;i<source.size();++i) source[i]=std::uint16_t(i*173+97);
+        std::vector<std::uint16_t> expected(source.size()*4);
+        for(int t=0;t<width;++t) for(int branch=0;branch<4;++branch)
+            std::copy_n(source.begin()+t*2560,2560,expected.begin()+(t*4+branch)*2560);
+        auto input=to_device(source);GuardedDeviceBuffer output(expected.size()*2);
+        Tensor x(input.p,DType::BF16,{2560,width}),y(output.data(),DType::BF16,{2560,4,width});
+        ops::gated_residual_broadcast(x,y,nullptr);cuda_synchronize();
+        failures+=verify_exact("GR branch broadcast exact words",from_device<std::uint16_t>(y.data,expected.size()),expected);
+        failures+=output.verify_guards("GR branch broadcast");
+    }
+    return failures;
+}
+
 } // namespace
 
 #ifdef NINFER_QWEN4_SEQUENCE_COMPONENTS
@@ -534,7 +551,7 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     Fixture fixture;
-    int failures = run_case(fixture, 1, "gated residual T=1");
+    int failures = broadcast_case()+run_case(fixture, 1, "gated residual T=1");
     failures += run_case(fixture, 3, "gated residual uneven T=3");
     failures += run_case(fixture, 64, "gated residual T=64");
     failures += run_case(fixture, 65, "gated residual T=65");

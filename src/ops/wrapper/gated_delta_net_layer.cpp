@@ -1,11 +1,13 @@
 #include "ninfer/ops/gated_delta_net_layer.h"
 
 #include "core/layout.h"
+#include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/ggml_block_linear.h"
 #include "ops/launcher/gated_delta_net_layer.h"
 #include "ops/common/projection.h"
 #include "ops/linear/fp8/fp8_tensor.h"
+#include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -65,9 +68,9 @@ struct Scratch {
 };
 
 template <class Allocator>
-Scratch allocate_scratch(Allocator& allocator, std::int32_t tokens) {
+Scratch allocate_scratch(Allocator& allocator, std::int32_t tokens, bool compact = false) {
     const std::size_t recurrence_bytes =
-        gated_delta_net_workspace_capacity_bytes(kValueHeads, kValueHeads, true, 1, tokens);
+        compact ? 0 : gated_delta_net_workspace_capacity_bytes(kValueHeads, kValueHeads, true, 1, tokens);
     Scratch scratch{
         allocator.alloc(DType::BF16, {kQkvRows, tokens}),
         allocator.alloc(DType::BF16, {kHeadDim, kValueHeads, tokens}),
@@ -167,7 +170,7 @@ bool exact_alias(const Tensor& input, const Tensor& output) {
 }
 
 std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType output,
-                               GatedDeltaNetProjectionPolicy policy) {
+                               GatedDeltaNetProjectionPolicy policy, bool compact = false) {
     if (policy.qkv == LinearPolicy::AllowA8 && policy.output == LinearPolicy::AllowA8) {
         throw std::invalid_argument("gated_delta_net_layer: simultaneous QKV/output A8 is not qualified");
     }
@@ -185,7 +188,7 @@ std::size_t required_workspace(std::int32_t tokens, QType qkv, QType z, QType ou
         throw std::invalid_argument("gated_delta_net_layer: unsupported output format");
     }
     WorkspaceLayoutBuilder layout;
-    (void)allocate_scratch(layout, tokens);
+    (void)allocate_scratch(layout, tokens, compact);
     const auto projection_bytes = std::max({
         required_projection_bytes(qkv, kQkvRows, kHidden, tokens, policy.qkv),
         required_projection_bytes(z, kValueRows, kHidden, tokens, policy.z),
@@ -210,7 +213,8 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
                            const Tensor& conv_state_in, Tensor& conv_state_out,
                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                            WorkspaceArena& workspace, cudaStream_t stream,
-                           GatedDeltaNetProjectionPolicy policy) {
+                           GatedDeltaNetProjectionPolicy policy,
+                           const GdnReplayRecordLayer* replay) {
     const std::int32_t tokens = x.ne[1];
     if (tokens <= 0 || tokens > 4096) {
         throw std::invalid_argument("gated_delta_net_layer: T must be in [1,4096]");
@@ -237,6 +241,14 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     require_tensor(ssm_state_out, DType::FP32, {kHeadDim, kHeadDim, kValueHeads, 1},
                    "ssm_state_out");
     require_tensor(out, DType::BF16, {kHidden, tokens, 1, 1}, "out");
+    if (replay) {
+        if (tokens < 2 || tokens > 16)
+            throw std::invalid_argument("gated_delta_net_layer: replay width must be 2..16");
+        require_tensor(replay->conv, DType::BF16, {kQkvRows,tokens,1,1}, "conv replay");
+        require_tensor(replay->key, DType::BF16, {kHeadDim,kValueHeads,tokens,1}, "key replay");
+        require_tensor(replay->value, DType::BF16, {kHeadDim,kValueHeads,tokens,1}, "value replay");
+        require_tensor(replay->gate, DType::FP32, {2,kValueHeads,tokens,1}, "gate replay");
+    }
 
     const bool conv_alias = exact_alias(conv_state_in, conv_state_out);
     const bool ssm_alias = exact_alias(ssm_state_in, ssm_state_out);
@@ -254,7 +266,7 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("gated_delta_net_layer: insufficient workspace");
     }
-    std::array<AddressRange, 16> ranges{};
+    std::array<AddressRange, 20> ranges{};
     std::size_t range_count = 0;
     ranges[range_count++] = address_range(x.data, x.bytes(), "x");
     ranges[range_count++] =
@@ -277,6 +289,10 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
         address_range(workspace.base(), workspace.capacity(), "workspace");
     if (!conv_alias) { ranges[range_count++] = conv_out; }
     if (!ssm_alias) { ranges[range_count++] = ssm_out; }
+    if (replay) {
+        for (const Tensor* plane : {&replay->conv,&replay->key,&replay->value,&replay->gate})
+            ranges[range_count++] = address_range(plane->data,plane->bytes(),"replay record");
+    }
     require_disjoint(std::span<const AddressRange>(ranges.data(), range_count));
 
     auto scope = workspace.scope();
@@ -288,6 +304,18 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     detail::gated_delta_net_layer_conv_launch(scratch.projected_qkv, weights.conv, conv_state_in,
                                                conv_state_out, scratch.q, scratch.k, scratch.v,
                                                stream);
+    if (replay) {
+        for (const auto& pair : {std::pair{&replay->conv,&scratch.projected_qkv},
+                                std::pair{&replay->key,&scratch.k},
+                                std::pair{&replay->value,&scratch.v}})
+            CUDA_CHECK(cudaMemcpyAsync(pair.first->data,pair.second->data,pair.first->bytes(),
+                                       cudaMemcpyDeviceToDevice,stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(replay->gate.data,8,scratch.g.data,4,4,kValueHeads*tokens,
+                                     cudaMemcpyDeviceToDevice,stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(replay->gate.data)+4,8,
+                                     scratch.beta.data,4,4,kValueHeads*tokens,
+                                     cudaMemcpyDeviceToDevice,stream));
+    }
     const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDim));
     if (scratch.recurrence.bytes == 0) {
         gated_delta_net(scratch.q, scratch.k, scratch.v, scratch.g, scratch.beta, scale, true,
@@ -301,6 +329,105 @@ void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& wei
     detail::gated_delta_net_layer_norm_launch(scratch.recurrent, scratch.z, weights.norm,
                                                scratch.normalized_gated, stream);
     project(scratch.normalized_gated, weights.output, out, workspace, stream, policy.output);
+}
+
+std::size_t gated_delta_net_layer_batch_workspace_capacity_bytes(
+    std::int32_t width, std::int32_t batch, QType qkv, QType z, QType output,
+    GatedDeltaNetProjectionPolicy policy) {
+    if (batch < 1 || batch > 4 || width < 1 || width > 4096 / batch ||
+        !native_projection(qkv) || !native_projection(z) || !native_projection(output))
+        throw std::invalid_argument("gated_delta_net_layer_batch: invalid native profile");
+    return required_workspace(width * batch, qkv, z, output, policy, true);
+}
+
+void gated_delta_net_layer_batch(const Tensor& x, const GatedDeltaNetLayerWeights& w,
+    const Tensor& conv_in, Tensor& conv_out, const Tensor& ssm_in, Tensor& ssm_out,
+    const Tensor& slots, const Tensor& valid, Tensor& out,
+    WorkspaceArena& workspace, cudaStream_t stream,
+    GatedDeltaNetProjectionPolicy policy, const GdnReplayRecordLayer* replay) {
+    const int width = x.ne[1], batch = x.ne[2], capacity = conv_in.ne[2];
+    const auto required = gated_delta_net_layer_batch_workspace_capacity_bytes(
+        width, batch, w.qkv.qtype, w.z.qtype, w.output.qtype, policy);
+    const int tokens = width * batch;
+    if (capacity < batch || capacity > 4)
+        throw std::invalid_argument("gated_delta_net_layer_batch: state capacity");
+    require_tensor(x, DType::BF16, {kHidden,width,batch,1}, "x");
+    require_tensor(out, DType::BF16, {kHidden,width,batch,1}, "out");
+    require_tensor(slots, DType::I32, {batch,1,1,1}, "slots");
+    require_tensor(valid, DType::I32, {batch,1,1,1}, "valid_columns");
+    require_projection_weight(w.qkv,kQkvRows,kHidden,false,"qkv");
+    require_projection_weight(w.z,kValueRows,kHidden,false,"z");
+    require_projection_weight(w.output,kHidden,kValueRows,false,"output");
+    require_tensor(w.a,DType::FP32,{kHidden,kValueHeads,1,1},"a");
+    require_tensor(w.b,DType::FP32,{kHidden,kValueHeads,1,1},"b");
+    require_tensor(w.conv,DType::FP32,{4,kQkvRows,1,1},"conv");
+    require_tensor(w.ssm_a,DType::FP32,{kValueHeads,1,1,1},"ssm_a");
+    require_tensor(w.dt_bias,DType::FP32,{kValueHeads,1,1,1},"dt_bias");
+    require_tensor(w.norm,DType::FP32,{kHeadDim,1,1,1},"norm");
+    require_tensor(conv_in,DType::BF16,{kQkvRows,3,capacity,1},"conv in");
+    require_tensor(conv_out,DType::BF16,{kQkvRows,3,capacity,1},"conv out");
+    require_tensor(ssm_in,DType::FP32,{kHeadDim,kHeadDim,kValueHeads,capacity},"ssm in");
+    require_tensor(ssm_out,DType::FP32,{kHeadDim,kHeadDim,kValueHeads,capacity},"ssm out");
+    if (replay) {
+        if (width < 2 || width > 16)
+            throw std::invalid_argument("gated_delta_net_layer_batch: replay width");
+        require_tensor(replay->conv,DType::BF16,{kQkvRows,width,batch,1},"conv record");
+        require_tensor(replay->key,DType::BF16,{kHeadDim,kValueHeads,width,batch},"key record");
+        require_tensor(replay->value,DType::BF16,{kHeadDim,kValueHeads,width,batch},"value record");
+        require_tensor(replay->gate,DType::FP32,{2,kValueHeads,width,batch},"gate record");
+    }
+    if (!workspace.base() || workspace.used() > workspace.capacity() ||
+        required > workspace.capacity() - workspace.used())
+        throw std::invalid_argument("gated_delta_net_layer_batch: workspace capacity");
+    std::array<AddressRange,24> ranges{};
+    std::size_t count = 0;
+    for (const auto* t : std::initializer_list<const Tensor*>{&x,&out,&slots,&valid,&w.a,&w.b,
+                          &w.conv,&w.ssm_a,&w.dt_bias,&w.norm,&conv_in,&ssm_in})
+        ranges[count++] = address_range(t->data,t->bytes(),"batch operand");
+    for (const auto* weight : {&w.qkv,&w.z,&w.output})
+        ranges[count++] = address_range(weight->payload,weight->payload_bytes,"batch weight");
+    if (!exact_alias(conv_in,conv_out))
+        ranges[count++] = address_range(conv_out.data,conv_out.bytes(),"conv output");
+    if (!exact_alias(ssm_in,ssm_out))
+        ranges[count++] = address_range(ssm_out.data,ssm_out.bytes(),"ssm output");
+    if (replay) for (const auto* t : {&replay->conv,&replay->key,&replay->value,&replay->gate})
+        ranges[count++] = address_range(t->data,t->bytes(),"batch record");
+    ranges[count++] = address_range(workspace.base(),workspace.capacity(),"workspace");
+    require_disjoint(std::span<const AddressRange>(ranges.data(),count));
+
+    auto scope = workspace.scope();
+    auto scratch = allocate_scratch(workspace,tokens,true);
+    auto flat_x = x.reshape({kHidden,tokens});
+    auto flat_out = out.reshape({kHidden,tokens});
+    project(flat_x,w.qkv,scratch.projected_qkv,workspace,stream,policy.qkv);
+    project(flat_x,w.z,scratch.z,workspace,stream,policy.z);
+    detail::gated_delta_net_layer_control_launch(flat_x,w.a,w.b,w.ssm_a,w.dt_bias,
+                                               scratch.g,scratch.beta,stream);
+    detail::gated_delta_net_layer_conv_batch_launch(scratch.projected_qkv,w.conv,
+        conv_in,conv_out,slots,valid,width,scratch.q,scratch.k,scratch.v,stream);
+    if (replay) {
+        for (const auto& pair : {std::pair{&replay->conv,&scratch.projected_qkv},
+                                 std::pair{&replay->key,&scratch.k},
+                                 std::pair{&replay->value,&scratch.v}})
+            CUDA_CHECK(cudaMemcpyAsync(pair.first->data,pair.second->data,pair.first->bytes(),
+                                       cudaMemcpyDeviceToDevice,stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(replay->gate.data,8,scratch.g.data,4,4,kValueHeads*tokens,
+                                     cudaMemcpyDeviceToDevice,stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(replay->gate.data)+4,8,
+                                     scratch.beta.data,4,4,kValueHeads*tokens,
+                                     cudaMemcpyDeviceToDevice,stream));
+    }
+    auto q=scratch.q.reshape({kHeadDim,kValueHeads,width,batch});
+    auto k=scratch.k.reshape({kHeadDim,kValueHeads,width,batch});
+    auto v=scratch.v.reshape({kHeadDim,kValueHeads,width,batch});
+    auto g=scratch.g.reshape({kValueHeads,width,batch});
+    auto beta=scratch.beta.reshape({kValueHeads,width,batch});
+    auto recurrent=scratch.recurrent.reshape({kHeadDim,kValueHeads,width,batch});
+    detail::gated_delta_net::launch_recurrent_batch_inout(q,k,v,g,beta,
+        1.0F/std::sqrt(float(kHeadDim)),slots,valid,ssm_in,ssm_out,recurrent,stream);
+    detail::gated_delta_net_layer_norm_launch(scratch.recurrent,scratch.z,w.norm,
+                                             scratch.normalized_gated,stream);
+    project(scratch.normalized_gated,w.output,flat_out,workspace,stream,policy.output);
 }
 
 } // namespace ninfer::ops

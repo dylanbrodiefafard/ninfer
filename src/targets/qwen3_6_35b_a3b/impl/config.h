@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_6/dflash_kind.h>
-#include <ninfer/targets/qwen3_6/frontend.h>
+#include <text/qwen/frontend.h>
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
@@ -16,7 +16,7 @@ struct TextConfig {
     static constexpr int intermediate = 512;
 
     static constexpr int output_rows  = 248320;
-    static constexpr int token_domain = static_cast<int>(qwen3_6::kTokenDomain);
+    static constexpr int token_domain = static_cast<int>(text::qwen::kTokenDomain);
 
     static constexpr int gdn_conv_kernel      = 4;
     static constexpr int gdn_conv_state_width = gdn_conv_kernel - 1;

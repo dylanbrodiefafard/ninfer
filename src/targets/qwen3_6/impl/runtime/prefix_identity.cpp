@@ -54,7 +54,7 @@ void mix_token(PrefixHash128& hash, TokenId token, std::uint8_t type, std::int32
     mix_i32(hash, p2);
 }
 
-void mix_vision_item(PrefixHash128& hash, const VisionItem& item) {
+void mix_vision_item(PrefixHash128& hash, const text::qwen::VisionItem& item) {
     mix_u8(hash, static_cast<std::uint8_t>(item.modality));
     mix_i32(hash, item.grid.temporal);
     mix_i32(hash, item.grid.height);
@@ -65,15 +65,15 @@ void mix_vision_item(PrefixHash128& hash, const VisionItem& item) {
     mix_le32(hash, static_cast<std::uint32_t>(item.timestamps.size()));
     for (double timestamp : item.timestamps) { mix_f64(hash, timestamp); }
     mix_le32(hash, static_cast<std::uint32_t>(item.token_spans.size()));
-    for (const TokenSpan& span : item.token_spans) {
+    for (const text::qwen::TokenSpan& span : item.token_spans) {
         mix_le64(hash, static_cast<std::uint64_t>(span.begin));
         mix_le64(hash, static_cast<std::uint64_t>(span.count));
     }
 }
 
-std::size_t item_end(const VisionItem& item) {
+std::size_t item_end(const text::qwen::VisionItem& item) {
     if (item.token_spans.empty()) { return 0; }
-    const TokenSpan& last = item.token_spans.back();
+    const text::qwen::TokenSpan& last = item.token_spans.back();
     return last.begin + last.count;
 }
 
@@ -148,34 +148,34 @@ struct Reader {
     }
 };
 
-bool same_grid(const VisionGrid& left, const VisionGrid& right) {
+bool same_grid(const text::qwen::VisionGrid& left, const text::qwen::VisionGrid& right) {
     return left.temporal == right.temporal && left.height == right.height &&
            left.width == right.width;
 }
 
-bool same_spans(const std::vector<TokenSpan>& left, const std::vector<TokenSpan>& right) {
+bool same_spans(const std::vector<text::qwen::TokenSpan>& left, const std::vector<text::qwen::TokenSpan>& right) {
     return left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin(),
-                                                     [](const TokenSpan& a, const TokenSpan& b) {
+                                                     [](const text::qwen::TokenSpan& a, const text::qwen::TokenSpan& b) {
                                                          return a.begin == b.begin &&
                                                                 a.count == b.count;
                                                      });
 }
 
-bool same_item(const VisionItem& left, const VisionItem& right) {
+bool same_item(const text::qwen::VisionItem& left, const text::qwen::VisionItem& right) {
     return left.modality == right.modality && same_grid(left.grid, right.grid) &&
            left.patch_begin == right.patch_begin && left.patch_count == right.patch_count &&
            left.content_digest == right.content_digest && left.timestamps == right.timestamps &&
            same_spans(left.token_spans, right.token_spans);
 }
 
-bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
+bool prefix_item_count(const std::vector<text::qwen::VisionItem>& items, std::size_t tokens,
                        std::size_t* count) {
     *count          = 0;
     bool saw_suffix = false;
-    for (const VisionItem& item : items) {
+    for (const text::qwen::VisionItem& item : items) {
         if (item.token_spans.empty()) { return false; }
-        const TokenSpan& first = item.token_spans.front();
-        const TokenSpan& last  = item.token_spans.back();
+        const text::qwen::TokenSpan& first = item.token_spans.front();
+        const text::qwen::TokenSpan& last  = item.token_spans.back();
         if (first.count == 0 || last.count == 0 ||
             last.begin > std::numeric_limits<std::size_t>::max() - last.count) {
             return false;
@@ -207,7 +207,7 @@ void ResidentPrefixIdentity::clear() noexcept {
     vision_items_.clear();
 }
 
-void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
+void ResidentPrefixIdentity::assign(const text::qwen::PreparedPromptData& prompt) {
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
@@ -253,7 +253,7 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     vision_items_.resize(retained_items);
 }
 
-bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
+bool ResidentPrefixIdentity::matches(const text::qwen::PreparedPromptData& prompt, std::size_t count) const {
     const std::size_t prompt_tokens = prompt.token_ids.size();
     if (count > prompt_tokens || count > size() || prompt.token_types.size() != prompt_tokens ||
         prompt.positions.size() != 3 * prompt_tokens) {
@@ -304,8 +304,8 @@ std::size_t longest_matching_prefix(
     const auto left_items = left.vision_items();
     const auto right_items = right.vision_items();
     for (std::size_t i = 0; i < std::max(left_items.size(), right_items.size()); ++i) {
-        const VisionItem* a = i < left_items.size() ? &left_items[i] : nullptr;
-        const VisionItem* b = i < right_items.size() ? &right_items[i] : nullptr;
+        const text::qwen::VisionItem* a = i < left_items.size() ? &left_items[i] : nullptr;
+        const text::qwen::VisionItem* b = i < right_items.size() ? &right_items[i] : nullptr;
         const std::size_t a_begin = a ? a->token_spans.front().begin : count;
         const std::size_t b_begin = b ? b->token_spans.front().begin : count;
         const std::size_t begin = std::min(a_begin, b_begin);
@@ -319,12 +319,12 @@ std::size_t longest_matching_prefix(
     return count;
 }
 
-bool prefix_items_complete_at(const std::vector<VisionItem>& items, std::size_t tokens) {
+bool prefix_items_complete_at(const std::vector<text::qwen::VisionItem>& items, std::size_t tokens) {
     std::size_t count = 0;
     return prefix_item_count(items, tokens, &count);
 }
 
-bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
+bool prefix_matches(const text::qwen::PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
     return std::equal(prompt.token_ids.begin(),
@@ -337,7 +337,7 @@ std::size_t ResidentPrefixIdentity::packed_bytes() const {
     std::size_t bytes = 8; // token_count, vision_item_count
     bytes += token_types_.size();
     bytes += 3 * token_types_.size() * sizeof(std::int32_t);
-    for (const VisionItem& item : vision_items_) {
+    for (const text::qwen::VisionItem& item : vision_items_) {
         bytes += 1 + 12 + 16 + 32 + 4 + item.timestamps.size() * 8 + 4 +
                  item.token_spans.size() * 16;
     }
@@ -356,7 +356,7 @@ void ResidentPrefixIdentity::pack(void* dst) const {
     for (std::size_t axis = 0; axis < 3; ++axis) {
         for (std::int32_t position : positions_[axis]) { w.i32(position); }
     }
-    for (const VisionItem& item : vision_items_) {
+    for (const text::qwen::VisionItem& item : vision_items_) {
         w.u8(static_cast<std::uint8_t>(item.modality));
         w.i32(item.grid.temporal);
         w.i32(item.grid.height);
@@ -367,7 +367,7 @@ void ResidentPrefixIdentity::pack(void* dst) const {
         w.u32(static_cast<std::uint32_t>(item.timestamps.size()));
         for (double timestamp : item.timestamps) { w.f64(timestamp); }
         w.u32(static_cast<std::uint32_t>(item.token_spans.size()));
-        for (const TokenSpan& span : item.token_spans) {
+        for (const text::qwen::TokenSpan& span : item.token_spans) {
             w.u64(static_cast<std::uint64_t>(span.begin));
             w.u64(static_cast<std::uint64_t>(span.count));
         }
@@ -401,8 +401,8 @@ void ResidentPrefixIdentity::unpack(const void* src, std::size_t bytes) {
         throw std::logic_error("prefix identity unpack vision list is truncated");
     }
     vision_items_.resize(item_count);
-    for (VisionItem& item : vision_items_) {
-        item.modality      = static_cast<PromptModality>(r.u8());
+    for (text::qwen::VisionItem& item : vision_items_) {
+        item.modality      = static_cast<text::qwen::PromptModality>(r.u8());
         item.grid.temporal = r.i32();
         item.grid.height   = r.i32();
         item.grid.width    = r.i32();
@@ -420,7 +420,7 @@ void ResidentPrefixIdentity::unpack(const void* src, std::size_t bytes) {
             throw std::logic_error("prefix identity unpack token spans are truncated");
         }
         item.token_spans.resize(span_count);
-        for (TokenSpan& span : item.token_spans) {
+        for (text::qwen::TokenSpan& span : item.token_spans) {
             span.begin = static_cast<std::size_t>(r.u64());
             span.count = static_cast<std::size_t>(r.u64());
         }
@@ -435,7 +435,7 @@ void ResidentPrefixIdentity::test_tamper_content_digest(std::size_t item, std::u
     vision_items_[item].content_digest[0] = byte;
 }
 
-std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
+std::vector<PrefixHash128> prefix_hash_chain(const text::qwen::PreparedPromptData& prompt) {
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
@@ -449,7 +449,7 @@ std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
         mix_token(hash, prompt.token_ids[i], prompt.token_types[i], prompt.positions[i],
                   prompt.positions[tokens + i], prompt.positions[2 * tokens + i]);
         while (item_cursor < prompt.vision_items.size()) {
-            const VisionItem& item = prompt.vision_items[item_cursor];
+            const text::qwen::VisionItem& item = prompt.vision_items[item_cursor];
             if (item.token_spans.empty()) {
                 ++item_cursor;
                 continue;
@@ -477,7 +477,7 @@ PrefixHash128 prefix_hash_at(std::span<const TokenId> tokens, const ResidentPref
         mix_token(hash, tokens[i], identity.token_types()[i], identity.positions(0)[i],
                   identity.positions(1)[i], identity.positions(2)[i]);
         while (item_cursor < items.size()) {
-            const VisionItem& item = items[item_cursor];
+            const text::qwen::VisionItem& item = items[item_cursor];
             if (item.token_spans.empty()) {
                 ++item_cursor;
                 continue;

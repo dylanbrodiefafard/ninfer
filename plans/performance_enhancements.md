@@ -5,7 +5,7 @@ live in `docs/performance.md`. Update this file when an attempt is measured
 or abandoned so the next pass does not repeat it.
 
 Measure product-path CPU with `NINFER_BENCH_ENCODE=1` on
-`ninfer_qwen3_6_frontend_test` (Release `-O3`). That splits chat render, BPE
+`ninfer_qwen_frontend_test` (Release `-O3`). That splits chat render, BPE
 encode, full-sequence `Tokenizer::decode`, and per-token `decode_token_bytes`.
 Do not use GPU tok/s to judge these diffs; generate is kernel-bound.
 
@@ -44,7 +44,7 @@ Engine PIMPL cache: longest memcmp prefix at a Tokenizer loop-pos, cap 16 /
 48 MiB. `Frontend::prepare` stays cold. See
 [`incremental-host-encode.md`](incremental-host-encode.md).
 
-`NINFER_BENCH_PREPARE=1` on `ninfer_qwen3_6_incremental_encode_test`
+`NINFER_BENCH_PREPARE=1` on `ninfer_qwen_incremental_encode_test`
 (Release): cold `plain_150k` prepare 22.7 ms, second-turn append 1.5 ms,
 hit flag true, ids match cold encode. Metric is second-turn `prepare`,
 not GPU tok/s.

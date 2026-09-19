@@ -63,6 +63,7 @@ struct FoldProfile {
     std::int32_t layers;
     std::int32_t value_heads;
     std::int32_t conv_channels;
+    std::int32_t qk_heads = 16;
 };
 
 constexpr ReductionCriterion recurrent_state_criterion() {
@@ -74,7 +75,9 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
                        std::uint32_t seed, const std::vector<std::uint16_t>& key_records,
                        const std::vector<std::uint16_t>& value_records,
                        const std::vector<std::uint32_t>& gate_records,
-                       const std::vector<float>& actual) {
+                       const std::vector<float>& actual, std::int32_t layer = 0,
+                       std::int32_t row = 0) {
+    const std::int32_t kQkHeads = profile.qk_heads;
     gdn_ref::Inputs input;
     input.head_dim    = kStateDim;
     input.qk_heads    = kQkHeads;
@@ -85,22 +88,28 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
     input.v.resize(static_cast<std::size_t>(kStateDim) * profile.value_heads * commit);
     input.g.resize(static_cast<std::size_t>(profile.value_heads) * commit);
     input.beta.resize(input.g.size());
-    input.state.assign(actual.size(), signed_pattern(seed + 500009U, 0.01F));
+    input.state.assign(actual.size(),
+                       signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F));
 
     for (std::int32_t token = 0; token < commit; ++token) {
-        const std::int64_t column = token;
+        const std::int64_t column =
+            (static_cast<std::int64_t>(layer) * kRecordCapacity + row) * width + token;
         for (std::int32_t head = 0; head < kQkHeads; ++head) {
             const std::size_t base =
                 static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
+            const std::size_t destination =
+                static_cast<std::size_t>((token * kQkHeads + head) * kStateDim);
             for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                input.k[base + dim] = bf16_to_f32(key_records[base + dim]);
+                input.k[destination + dim] = bf16_to_f32(key_records[base + dim]);
             }
         }
         for (std::int32_t head = 0; head < profile.value_heads; ++head) {
             const std::size_t value_base =
                 static_cast<std::size_t>((column * profile.value_heads + head) * kStateDim);
+            const std::size_t destination_base =
+                static_cast<std::size_t>((token * profile.value_heads + head) * kStateDim);
             for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                input.v[value_base + dim] = bf16_to_f32(value_records[value_base + dim]);
+                input.v[destination_base + dim] = bf16_to_f32(value_records[value_base + dim]);
             }
             const std::size_t gate_base =
                 static_cast<std::size_t>((column * profile.value_heads + head) * 2);
@@ -125,10 +134,24 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
     return slots;
 }
 
+void fold_test_records(const GdnReplayRecords& records, LinearAttentionStatePool& states,
+                       std::span<const ops::GdnReplayFoldRow> rows, cudaStream_t stream) {
+    if (records.spec.layers == 1) {
+        ops::gdn_replay_fold(records.layer(0, static_cast<std::int32_t>(rows.size())),
+                             states.conv[0], states.recurrent[0], rows, stream);
+    } else {
+        ops::gdn_replay_fold(records, states.all_layers_view(), rows, stream);
+    }
+}
+
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
-             const std::vector<std::int32_t>& commits, std::uint32_t seed) {
-    const std::vector<std::int32_t> slots = selected_slots(rows);
-    const std::int32_t slot_count         = rows == 1 ? 3 : 11;
+             const std::vector<std::int32_t>& commits, std::uint32_t seed,
+             bool graph = false) {
+    const std::int32_t kQkHeads = profile.qk_heads;
+    const bool single_slot = profile.layers == 1 && rows == 1;
+    const std::vector<std::int32_t> slots =
+        single_slot ? std::vector<std::int32_t>{0} : selected_slots(rows);
+    const std::int32_t slot_count = single_slot ? 1 : rows == 1 ? 3 : 11;
     const std::int32_t outer              = profile.layers * kRecordCapacity;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
@@ -173,12 +196,14 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                         bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
                 }
                 for (std::int32_t head = 0; head < kQkHeads; ++head) {
+                    // The 48-head geometry receives native cyclic expansion h % 16.
+                    // Fold must consume those represented heads with identity mapping.
                     const std::size_t base =
                         static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
                     for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                         key_records[base + dim] =
                             bf16_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
-                                             head * 5U + dim,
+                                             (head % 16) * 5U + dim,
                                          0.08F);
                     }
                 }
@@ -393,7 +418,28 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         fold_rows[static_cast<std::size_t>(row)] = {slots[static_cast<std::size_t>(row)],
                                                     commits[static_cast<std::size_t>(row)]};
     }
-    ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
+    if (graph) {
+        cudaStream_t stream = nullptr;
+        cudaGraph_t definition = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        cuda_check(cudaStreamCreate(&stream), "create fold graph stream");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture fold");
+        fold_test_records(records, state_pool, fold_rows, stream);
+        cuda_check(cudaStreamEndCapture(stream, &definition), "end fold capture");
+        cuda_check(cudaGraphInstantiate(&executable, definition, nullptr, nullptr, 0),
+                   "instantiate fold graph");
+        if (profile.layers == 1) {
+            // The graph captured host controls by value, not by a retained span.
+            for (auto& row : fold_rows) { row.commit_columns = 0; }
+        }
+        cuda_check(cudaGraphLaunch(executable, stream), "launch fold graph");
+        cuda_check(cudaStreamSynchronize(stream), "synchronize fold graph");
+        cuda_check(cudaGraphExecDestroy(executable), "destroy fold graph executable");
+        cuda_check(cudaGraphDestroy(definition), "destroy fold graph");
+        cuda_check(cudaStreamDestroy(stream), "destroy fold graph stream");
+    } else {
+        fold_test_records(records, state_pool, fold_rows, nullptr);
+    }
     cuda_synchronize();
 
     int failures             = 0;
@@ -426,6 +472,12 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 commits[0] == 2) {
                 failures += verify_fold_oracle(profile, width, commits[0], seed, key_records,
                                                value_records, gate_records, actual_recurrent);
+            }
+            if (profile.qk_heads == 48 && commits[static_cast<std::size_t>(row)] > 0) {
+                failures += verify_fold_oracle(profile, width,
+                                               commits[static_cast<std::size_t>(row)], seed,
+                                               key_records, value_records, gate_records,
+                                               actual_recurrent, layer, row);
             }
 
             const Tensor actual_history = state_pool.conv_slot(
@@ -714,8 +766,8 @@ int run_record_fold_rounds() {
     return failures;
 }
 
-int run_path_fold_case() {
-    constexpr FoldProfile kProfile{48, 48, 10240};
+int run_path_fold_case(FoldProfile kProfile = {48, 48, 10240}) {
+    const std::int32_t kQkHeads = kProfile.qk_heads;
     constexpr std::int32_t kWidth     = 6;
     constexpr std::int32_t kSlotCount = 3;
     constexpr std::int32_t kSlot      = 2;
@@ -759,7 +811,8 @@ int run_path_fold_case() {
                             static_cast<std::size_t>((dest_column * kQkHeads + head) * kStateDim);
                         for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                             key[base + dim] = bf16_pattern(
-                                kSeed + 100003U + layer * 197U + token * 11U + head * 5U + dim,
+                                kSeed + 100003U + layer * 197U + token * 11U +
+                                    (head % 16) * 5U + dim,
                                 0.08F);
                         }
                     }
@@ -863,7 +916,8 @@ int run_path_fold_case() {
     DeviceBuffer seq_storage(seq_builder.finish(256));
     seq_storage.fill(0xff);
     GdnReplayRecords seq_records({seq_storage.p, seq_storage.bytes}, seq_layout);
-    fill_records(kSeqWidth, seq_records, kPath, tree_conv, tree_key, tree_value, tree_gate, true);
+    const auto [seq_conv, seq_key, seq_value, seq_gate] =
+        fill_records(kSeqWidth, seq_records, kPath, tree_conv, tree_key, tree_value, tree_gate, true);
 
     const auto make_pool = [&]() {
         LayoutBuilder state_builder;
@@ -910,11 +964,11 @@ int run_path_fold_case() {
     tree_row.commit_columns    = 0;
     tree_row.path        = std::array<std::int32_t, 16>{0, 1, 3, 5};
     tree_row.path_length = 4;
-    ops::gdn_replay_fold(tree_records, tree_pool.all_layers_view(),
-                         std::span<const ops::GdnReplayFoldRow>(&tree_row, 1), nullptr);
+    fold_test_records(tree_records, tree_pool,
+                       std::span<const ops::GdnReplayFoldRow>(&tree_row, 1), nullptr);
 
     const std::array seq_rows{ops::GdnReplayFoldRow{kSlot, kSeqWidth}};
-    ops::gdn_replay_fold(seq_records, seq_pool.all_layers_view(), seq_rows, nullptr);
+    fold_test_records(seq_records, seq_pool, seq_rows, nullptr);
     cuda_synchronize();
 
     int failures = 0;
@@ -928,6 +982,11 @@ int run_path_fold_case() {
             std::cerr << "path fold recurrent differs from sequential packed path layer=" << layer
                       << "\n";
             return failures + 1;
+        }
+        if (kProfile.qk_heads == 48) {
+            failures += verify_fold_oracle(
+                kProfile, kSeqWidth, kSeqWidth, kSeed, seq_key, seq_value, seq_gate,
+                from_device<float>(tree_recurrent.data, recurrent_slot_elements), layer);
         }
         const Tensor tree_conv_state = tree_pool.conv_slot(static_cast<std::uint32_t>(layer), kSlot);
         const Tensor seq_conv_state  = seq_pool.conv_slot(static_cast<std::uint32_t>(layer), kSlot);
@@ -944,8 +1003,8 @@ int run_path_fold_case() {
     rejected.commit_columns    = 2;
     rejected.path_length       = -1;
     auto [prefix_storage, prefix_pool] = make_pool();
-    ops::gdn_replay_fold(tree_records, prefix_pool.all_layers_view(),
-                         std::span<const ops::GdnReplayFoldRow>(&rejected, 1), nullptr);
+    fold_test_records(tree_records, prefix_pool,
+                       std::span<const ops::GdnReplayFoldRow>(&rejected, 1), nullptr);
     cuda_synchronize();
     const Tensor path_state  = tree_pool.recurrent_slot(0, kSlot);
     const Tensor prefix_state = prefix_pool.recurrent_slot(0, kSlot);
@@ -1129,6 +1188,13 @@ int main() {
     failures += run_record_fold_rounds();
     failures += run_path_fold_case();
     failures += run_identity_path_matches_prefix_fold();
+    failures += run_case({36, 48, 10240, 48}, 2, 1, {2}, 1901U);
+    failures += run_case({36, 48, 10240, 48}, 7, 4, {0, 1, 4, 7}, 1911U, true);
+    failures += run_path_fold_case({36, 48, 10240, 48});
+    failures += run_case({1, 48, 10240, 48}, 2, 1, {2}, 1921U);
+    failures += run_case({1, 48, 10240, 48}, 7, 4, {0, 1, 4, 7}, 1931U, true);
+    failures += run_case({1, 48, 10240, 48}, 16, 1, {16}, 1941U);
+    failures += run_path_fold_case({1, 48, 10240, 48});
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
 }

@@ -1,6 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 
 #include "ops/op_tester.h"
+#include "ops/gdn_ref.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +34,76 @@ std::vector<std::uint16_t> make_bf16(std::size_t count, std::uint32_t seed) {
     return bits;
 }
 
+// Evaluate complete recurrences from represented inputs, not another GPU route or
+// production normalization/rounding stages. Tree nodes use their actual ancestor path.
+int verify_record_oracle(std::int32_t qk_heads, std::int32_t value_heads,
+                         std::int32_t width, const std::vector<std::int32_t>& valid,
+                         const std::vector<std::int32_t>& slots,
+                         const std::vector<std::uint16_t>& q,
+                         const std::vector<std::uint16_t>& k,
+                         const std::vector<std::uint16_t>& v, const std::vector<float>& g,
+                         const std::vector<float>& beta, const std::vector<float>& state,
+                         const std::vector<std::uint16_t>& actual,
+                         const std::vector<std::int32_t>& parents = {}) {
+    constexpr ReductionCriterion criterion{/*relative_l2=*/4.1e-3,
+                                            /*gross_absolute=*/5.0e-6,
+                                            /*gross_relative_to_max_reference=*/5.5e-3};
+    const std::size_t qk_column = static_cast<std::size_t>(kStateDim) * qk_heads;
+    const std::size_t v_column = static_cast<std::size_t>(kStateDim) * value_heads;
+    const std::size_t state_size = static_cast<std::size_t>(kStateDim) * v_column;
+    int failures = 0;
+    for (std::size_t row = 0; row < valid.size(); ++row) {
+        std::vector<double> expected(static_cast<std::size_t>(valid[row]) * v_column);
+        const std::int32_t calls = parents.empty() ? 1 : valid[row];
+        for (std::int32_t call = 0; call < calls; ++call) {
+            std::vector<std::int32_t> path;
+            if (parents.empty()) {
+                for (std::int32_t t = 0; t < valid[row]; ++t) { path.push_back(t); }
+            } else {
+                for (std::int32_t t = call; t >= 0; t = parents[row * width + t]) {
+                    path.push_back(t);
+                }
+                std::reverse(path.begin(), path.end());
+            }
+            gdn_ref::Inputs input;
+            input.head_dim = kStateDim;
+            input.qk_heads = qk_heads;
+            input.value_heads = value_heads;
+            input.tokens = static_cast<std::int64_t>(path.size());
+            const auto first = state.begin() + static_cast<std::ptrdiff_t>(slots[row] * state_size);
+            input.state.assign(first, first + static_cast<std::ptrdiff_t>(state_size));
+            for (const std::int32_t token : path) {
+                const std::size_t column = row * width + token;
+                for (std::size_t i = 0; i < qk_column; ++i) {
+                    input.q.push_back(bf16_to_f32(q[column * qk_column + i]));
+                    input.k.push_back(bf16_to_f32(k[column * qk_column + i]));
+                }
+                for (std::size_t i = 0; i < v_column; ++i) {
+                    input.v.push_back(bf16_to_f32(v[column * v_column + i]));
+                }
+                for (std::int32_t h = 0; h < value_heads; ++h) {
+                    input.g.push_back(g[column * value_heads + h]);
+                    input.beta.push_back(beta[column * value_heads + h]);
+                }
+            }
+            const auto oracle = gdn_ref::evaluate(input, 1.0 / std::sqrt(128.0), true);
+            if (parents.empty()) {
+                expected = oracle.out;
+            } else {
+                std::copy_n(oracle.out.end() - static_cast<std::ptrdiff_t>(v_column), v_column,
+                            expected.begin() + static_cast<std::ptrdiff_t>(call * v_column));
+            }
+        }
+        std::vector<double> observed(expected.size());
+        for (std::size_t i = 0; i < observed.size(); ++i) {
+            observed[i] = bf16_to_f32(actual[row * width * v_column + i]);
+        }
+        failures += verify_reduction("replay record independent FP64 row=" + std::to_string(row),
+                                      observed, expected, criterion);
+    }
+    return failures;
+}
+
 int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs,
                  const std::vector<std::uint16_t>& rhs) {
     if (lhs == rhs) { return 0; }
@@ -48,8 +119,8 @@ int verify_equal(const std::string& label, const std::vector<std::uint32_t>& lhs
 }
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
-             std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
+             std::vector<std::int32_t> valid_columns, std::uint32_t seed,
+             std::int32_t kQkHeads = 16) {
     const bool dense                = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
@@ -127,9 +198,29 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
     ops::gated_delta_net_snapshot(q, k, v, g_tensor, beta_tensor, kScale, true, snapshot_states,
                                   valid, initial, bases, snapshot_output, nullptr);
-    ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states, valid,
-                                       initial, key_record_tensor, value_record_tensor,
-                                       gate_record_tensor, record_output, nullptr);
+    const auto record = [&](cudaStream_t stream) {
+        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
+                                           valid, initial, key_record_tensor, value_record_tensor,
+                                           gate_record_tensor, record_output, stream);
+    };
+    if (kQkHeads == 48 && batch == 4) {
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        cuda_check(cudaStreamCreate(&stream), "create record graph stream");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture record");
+        record(stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "end record capture");
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                   "instantiate record graph");
+        cuda_check(cudaGraphLaunch(executable, stream), "launch record graph");
+        cuda_check(cudaStreamSynchronize(stream), "synchronize record graph");
+        cuda_check(cudaGraphExecDestroy(executable), "destroy record graph executable");
+        cuda_check(cudaGraphDestroy(graph), "destroy record graph");
+        cuda_check(cudaStreamDestroy(stream), "destroy record graph stream");
+    } else {
+        record(nullptr);
+    }
     cuda_synchronize();
 
     int failures             = 0;
@@ -141,6 +232,10 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         from_device<std::uint16_t>(record_out, value_elements);
     failures +=
         verify_equal("replay record output" + suffix, snapshot_output_bits, record_output_bits);
+    if (kQkHeads == 48) {
+        failures += verify_record_oracle(kQkHeads, value_heads, width, valid_columns, initial_slots,
+                                         q_bits, k_bits, v_bits, g, beta, state, record_output_bits);
+    }
 
     const std::vector<std::uint16_t> key_bits_after =
         from_device<std::uint16_t>(key_record, qk_elements);
@@ -283,11 +378,16 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     failures += verify_equal("replay record overlay vs T=1 snapshot" + suffix,
                              from_device<std::uint16_t>(overlay_out, value_elements),
                              from_device<std::uint16_t>(t1_out, value_elements));
+    if (kQkHeads == 48) {
+        failures += verify_record_oracle(
+            kQkHeads, value_heads, width, valid_columns, initial_slots, q_bits, k_bits, v_bits,
+            g, beta, state, from_device<std::uint16_t>(overlay_out, value_elements));
+    }
     return failures;
 }
 
-int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
+int run_tree_case(std::int32_t value_heads, std::uint32_t seed,
+                   std::int32_t kQkHeads = 16, bool overlay = true) {
     constexpr std::int32_t kWidth   = 3;
     constexpr std::int32_t kBatch   = 1;
     constexpr std::int32_t kSlots   = 2;
@@ -400,11 +500,21 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
         ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, states, valid,
                                            initial, key_record_tensor, value_record_tensor,
                                            gate_record_tensor, out_tensor, nullptr, parent_arg,
-                                           parent_arg != nullptr ? &tile_workspace : nullptr);
+                                           parent_arg != nullptr && overlay ? &tile_workspace
+                                                                           : nullptr);
         cuda_synchronize();
         const std::vector<float> state_after = from_device<float>(device_state, state_elements);
         if (state_after != state) {
             std::cerr << "tree replay record modified source state\n";
+        }
+        int oracle_failures = 0;
+        if (kQkHeads == 48) {
+            oracle_failures = verify_record_oracle(
+                kQkHeads, value_heads, width, {width}, {initial_slot}, q_host, k_host, v_host,
+                g_host, beta_host, state,
+                from_device<std::uint16_t>(out, static_cast<std::size_t>(kStateDim) *
+                                                   value_heads * width),
+                parent != nullptr ? parent_host : std::vector<std::int32_t>{});
         }
         return std::tuple{from_device<std::uint16_t>(out, static_cast<std::size_t>(kStateDim) *
                                                               value_heads * width),
@@ -414,7 +524,7 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
                               value_record, static_cast<std::size_t>(kStateDim) * value_heads * width),
                           from_device<std::uint32_t>(gate_record, static_cast<std::size_t>(value_heads) *
                                                                      width * 2),
-                          state_after != state};
+                          state_after != state || oracle_failures != 0};
     };
 
     Tensor dummy_parent;
@@ -579,6 +689,11 @@ int main() {
     failures += run_tree_case(48, 1761U);
     failures += run_tree_chain_matches_sequential(48, 12, 1766U);
     failures += run_tree_chain_matches_sequential(48, 16, 1771U);
+    failures += run_case(48, 2, 1, {}, 1781U, 48);
+    failures += run_case(48, 7, 4, {7, 4, 2, 1}, 1791U, 48);
+    failures += run_case(48, 16, 1, {9}, 1801U, 48);
+    failures += run_tree_case(48, 1811U, 48);
+    failures += run_tree_case(48, 1811U, 48, false);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

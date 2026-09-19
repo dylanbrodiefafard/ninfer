@@ -155,6 +155,58 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
+LoadedQwen4::LoadedQwen4(std::unique_ptr<Qwen4::LoadedModel> source,bool vision)
+    :model(std::move(source)),frontend(text::qwen::make_frontend(model->frontend_resources(),vision,
+        text::qwen::FrontendProfile::Qwen4)) {}
+Qwen4Instance::Qwen4Instance(std::unique_ptr<LoadedQwen4> source,
+    runtime::KvCapacityResolution resolution,qwen4::NativeRuntimeConfig config,
+    const EngineOptions& options,DeviceContext& device)
+    :loaded(std::move(source)),kv_capacity_resolution(resolution),request_memory(device,0),
+     capacity(config.context_tokens),program(std::make_unique<Qwen4::Program>(loaded->model->view(),
+        config,options,device)) {}
+
+namespace {
+ConstructedTarget construct_qwen4(const EngineOptions& options,DeviceContext& device,
+    artifact::Reader& reader,Clock::time_point load_start) {
+    auto plan=qwen4::bind_native_artifact(reader);
+    const std::uint32_t context_pages=(options.max_context+63)/64;
+    const std::uint32_t minimum_pages=std::max(context_pages,options.max_concurrency);
+    const std::uint32_t maximum_pages=context_pages*options.max_concurrency;
+    auto config=qwen4::native_runtime_config(options,minimum_pages*64);
+    if(config.dflash&&!plan.dflash)
+        throw std::invalid_argument("Qwen4 artifact has no source DFlash companion");
+    // Complete metadata and resource validation precedes all allocations and PLE locking.
+    // Reject the exact full preview on insufficient VRAM; never silently offload GPU weights.
+    const auto available=runtime_bytes_after_planned_weights(plan.materialization.device_capacity_bytes);
+    const auto minimum=qwen4::NativeRuntime::device_bytes(plan,config)+qwen4::engine_control_device_bytes(config);
+    std::size_t stride=0;
+    if(minimum_pages<maximum_pages) {
+        config.kv_tokens=(minimum_pages+1)*64;
+        const auto next=qwen4::NativeRuntime::device_bytes(plan,config)+qwen4::engine_control_device_bytes(config);
+        stride=next-minimum;
+    }
+    runtime::SequenceCapacityCurve curve{64,minimum_pages,maximum_pages,minimum,stride};
+    auto resolution=runtime::resolve_kv_capacity(options.kv_capacity,curve,available);
+    config.kv_tokens=resolution.resolved_tokens;
+    const auto exact=qwen4::NativeRuntime::device_bytes(plan,config)+qwen4::engine_control_device_bytes(config);
+    if(exact!=resolution.runtime_reservation_bytes)
+        throw std::logic_error("Qwen4 KV reservation is not its exact allocation recipe");
+    auto model=qwen4::LoadedNativeModel::load(options.artifact_path,device,exact);
+    const auto stats=model->stats();
+    auto loaded=std::make_unique<LoadedQwen4>(std::move(model),options.enable_vision);
+    auto instance=std::make_unique<Qwen4Instance>(std::move(loaded),resolution,config,options,device);
+    device.synchronize();instance->kv_capacity_resolution.available_after_startup_bytes=current_free_device_bytes();
+    LoadSummary summary;summary.target=Qwen4::target_key;summary.model_id=reader.identity().model_id;
+    summary.weights_id=reader.identity().weights_id;summary.load_seconds=std::chrono::duration<double>(Clock::now()-load_start).count();
+    summary.upload_seconds=stats.upload_seconds;summary.artifact_bytes_read=stats.file_bytes;
+    summary.host_to_device_bytes=stats.h2d_bytes;summary.peak_staging_bytes=stats.peak_staging_bytes;
+    summary.tensor_count=stats.tensor_count;summary.resource_count=stats.resource_count;
+    // Pinned checkpoint generation_config.json: identical source recommendation for both modes.
+    const SamplingPreset source{1.0F,20,0.95F,0.0F,0.0F,0.0F};
+    return {ActiveTarget(std::move(instance)),std::move(summary),{source,source}};
+}
+} // namespace
+
 LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model)
     : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model)) {}
 
@@ -198,6 +250,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.model_id == Qwen4::model_id) {
+        return construct_qwen4(options,device,reader,load_start);
+    }
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);

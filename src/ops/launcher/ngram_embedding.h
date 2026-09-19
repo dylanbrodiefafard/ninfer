@@ -11,6 +11,9 @@ namespace ninfer::ops::detail {
 
 using NgramRowLaunchConfig = PreparedNgramRowConfig;
 
+void ngram_history_commit_launch(const Tensor& ids,const Tensor& counts,const Tensor& slots,
+                                 Tensor& history,cudaStream_t stream);
+
 void ngram_row_ids_launch(const Tensor& input_ids, const Tensor& valid_tokens,
                           const Tensor& old_history, const NgramRowLaunchConfig& config,
                           Tensor& row_ids, Tensor& new_history, cudaStream_t stream);

@@ -18,6 +18,7 @@ void validate_plan(const Tensor& k, const KVCacheAppendPrefixPlan& plan) {
     }
 }
 
+template <int D, int Heads>
 void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
                   const Tensor& table_rows, PagedKVBatchLayerView cache,
                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
@@ -32,8 +33,9 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
     const auto* rows    = static_cast<const std::int32_t*>(table_rows.data);
     const auto* tables  = static_cast<const std::int32_t*>(cache.block_tables.data);
 
-    const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
-    kv_cache_append_prefix_paged_kernel<<<grid, kBlock, 0, stream>>>(
+    constexpr int TokensPerBlock = kBlock / (D * Heads / 16);
+    const dim3 grid(1 + (plan.max_count - 1) / TokensPerBlock, k.ne[3], 1);
+    kv_cache_append_prefix_paged_kernel<D, Heads><<<grid, kBlock, 0, stream>>>(
         input_k, input_v, pos, count, rows, cache_k, cache_v, tables, cache.k_pages.ne[2],
         cache.block_tables.ne[0], plan.min_count, plan.max_count, plan.tokens);
     CUDA_CHECK(cudaGetLastError());
@@ -83,7 +85,11 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    const Tensor& counts, const Tensor& table_rows,
                                    PagedKVBatchLayerView cache, const KVCacheAppendPrefixPlan& plan,
                                    cudaStream_t stream) {
-    launch_paged(k, v, positions, counts, table_rows, cache, plan, stream);
+    if (k.ne[0] == 256) {
+        launch_paged<256, 2>(k, v, positions, counts, table_rows, cache, plan, stream);
+    } else {
+        launch_paged<128, 8>(k, v, positions, counts, table_rows, cache, plan, stream);
+    }
 }
 
 void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tensor& positions,

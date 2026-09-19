@@ -1,6 +1,6 @@
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/frontend_resources.h>
+#include <text/qwen/prepared_prompt.h>
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -92,8 +92,9 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 
 Package::Frontend Package::make_frontend(const LoadedModel& model) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  model.impl_->data.runtime.features.vision);
+    return text::qwen::make_frontend(model.impl_->data.frontend,
+                                  model.impl_->data.runtime.features.vision,
+                                  text::qwen::FrontendProfile::Qwen3_6);
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,

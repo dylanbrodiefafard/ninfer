@@ -443,7 +443,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
-    out.frontend     = qwen3_6::bind_frontend_resources(binder);
+    out.frontend     = text::qwen::bind_frontend_resources(binder);
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
@@ -614,7 +614,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
-    frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+    frontend = text::qwen::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;

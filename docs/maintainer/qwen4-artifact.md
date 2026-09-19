@@ -1,14 +1,11 @@
 # Qwen4 Verification Artifact and Preview Source Inventory
 
-This reference freezes the exact official BF16 preview-checkpoint inventory used to implement the
-Qwen4 architecture and the selected native verification artifact. The preview checkpoint name is
-source provenance, not the repository identity. There is no registered `qwen4` product identity,
-weights profile, or executable target, because
-neither currently audited checkpoint profile can satisfy the one-resident-model 32 GB RTX 5090
-product contract. The target-private `src/targets/qwen4` verifier package binds the selected
-host-staged `.ninfer`, owns its C=1 verification state, and remains deliberately unregistered. A
-future complete custom profile is conditionally eligible only after it passes the implementation
-plan's Phase 0 admission gate.
+This reference fixes the exact preview source inventory, the canonical native artifact, and the
+separate diagnostic verification artifact. The preview checkpoint name is source provenance, not
+the repository identity. The native artifact is `qwen4/native-preview` / `nvfp4-a16`; its full
+48-layer converter and metadata binder do not imply that the preview's GPU-resident compute fits
+the 32 GB RTX 5090. The separate host-staged diagnostic remains deliberately unregistered and
+must not become a fallback when native capacity admission fails.
 
 For an exact Qwen4 target containing this preview-style PLE table, that residency statement excludes
 the table. PLE is deliberately host-resident and artifact-mapped; its complete payload must be
@@ -55,12 +52,130 @@ existing row-scaled FP8 Linear support does not admit that embedding format.
 The model mathematics and state are defined in
 [`qwen4-model.md`](qwen4-model.md). Generic future `.ninfer` framing,
 format, and layout choices remain governed by [`artifact-container.md`](artifact-container.md),
-[`tensor-formats.md`](tensor-formats.md), and [`storage-layouts.md`](storage-layouts.md). A fitting
-Qwen4 target must receive a separate artifact reference that fixes its complete compiled object
-order, names, formats, layouts, placement, aliases, and transforms; this document deliberately
-does not invent those decisions for an unrunnable BF16 preview.
+[`tensor-formats.md`](tensor-formats.md), and [`storage-layouts.md`](storage-layouts.md). The exact
+native preview grammar below does not invent a smaller checkpoint or parameterized model graph.
+
+## Canonical complete native artifact
+
+`tools/convert/qwen4/native.py` converts a complete local NVIDIA source directory, an explicitly
+selected audited native MTP component, and either the original FP8 PLE or the complete primitive
+NVFP4 PLE component into one `.ninfer`. The canonical identity is `qwen4/native-preview` /
+`nvfp4-a16`. `native_inventory.py` fixes the full object grammar; `native_prepare.py` owns offline
+source-to-execution transforms. `src/targets/qwen4/native_artifact.{h,cpp}` independently binds the
+same fixed inventory before any GPU allocation or host PLE lock. Missing, extra, wrong-format,
+wrong-shape, or wrong-layout objects are rejected. Capacity admission includes exact owned runtime
+buffers and a separately checked conservative CUDA-driver graph allowance, and rejects oversized
+native compute instead of streaming it.
+
+The mandatory inventory is 1,577 tensors: all 48 actual main layers (QSA at 3,7,…,47, GDN
+otherwise), token embedding and vocabulary head, final GR, the layer-1 PLE projections/controls
+and complete host table, all 27 Vision blocks with patch/position/merger weights, and the native
+MTP stem/private layer/final GR. Source names are preserved under `model.language_model.*`,
+`model.visual.*`, `lm_head.weight`, and `mtp.*`; the complete PLE table is `ple.table`.
+Routed expert banks use `NVFP4_EXPERT_F32M` with the exact source signed codes, E4M3 group scales,
+and per-expert FP32 weight/input multipliers. Protected matrices remain BF16. GDN V-side head
+permutations, `-exp(A_log)`, effective `1+w` GR/QSA norms, and FP32 control widenings happen once
+offline, identically to the qualified real first-block preparation. No runtime repacking is
+permitted. Native MTP placeholder input scales remain A16-only, not A4 calibration evidence.
+
+The baseline NVFP4-PLE payload is 109,169,195,488 bytes before container/alignment overhead;
+28,800,138,752 bytes belong to the host table, not GPU compute. Alternatively, NVIDIA PLE uses
+`FP8_E4M3FN_TENSOR_BF16S` `[320001536,160]`, 51,200,245,762 bytes. Both placements are
+`ResidentHost`. Its FP8 gather view exposes only the 51,200,245,760 code bytes; the positive
+finite BF16 footer is extracted separately as exact `fp8_scale_bits` for GPU row decode. The
+complete encoded payload, including that footer, remains in the artifact-owned locked mapping.
+The converter verifies all source n-gram hash buffers against the fixed source
+configuration: physical vocabulary 248320, EOS 248044, module 0, seed 1234, and vocabulary base
+20000000. Physical embedding/head rows are not the tokenizer's 248077-token sampling domain.
+
+Optional calibrated FP8 storage is restricted to the 13 independently audited senfu roles:
+layer-0 GDN qkv/z/output, layer-3 QSA q/k/v/output, and the shared gate/up/down projections in
+layers 0 and 3. Their exact source codes, both FP32 multipliers, head permutation, and unchanged
+protected controls are checked; the format is `FP8_E4M3FN_TENSOR_F32M`. This is W8A16 storage
+admission, not blanket A8 or extrapolated all-layer calibration. All other protected matrices
+remain BF16.
+
+An explicitly supplied PixelML DFlash companion adds 58 tensors under `dflash.*`, with uniformly
+BF16 or NVFP4 matrices and BF16 norms. This optional artifact presence does not admit the measured
+NVFP4 candidate's generation quality; runtime selection must retain the separate qualification
+policy. Six mandatory raw frontend resources use the shared Qwen resource contract, and
+`native-profile.json` records provenance only. Execution mathematics never depend on its strings.
+
+Qualification uses all nine cached real source headers (296,315 required source fields, including
+Vision/endpoints/PLE controls), an independent fixed 48-layer grammar, real source FP8 preparation
+checks, and sparse **metadata-only** full-inventory C++ witnesses. Those sparse payloads are never
+executed or presented as numerical checkpoints. Full native conversion/execution/PPL cannot be
+claimed from this evidence: no complete oversized source payload was downloaded or allocated.
+
+Complete local conversion (the converter performs no downloads):
+
+```sh
+python3.11 -m tools.convert.qwen4.native --model /path/to/pinned-nvidia-source --mtp /path/to/qwen4-mtp-nvfp4.ninfer --ple /path/to/qwen4-ple-nvfp4.ninfer --out /path/to/qwen4-native-preview.ninfer
+```
+
+Omit `--ple` to encode the original NVIDIA FP8 table. `--dflash` explicitly selects an audited
+BF16 or NVFP4 companion; calibrated FP8 overrides require the source projection component,
+protected-control audit, and explicit `--fp8-role` arguments together. Existing output files
+are not replaced. This command needs the complete local source and sufficient disk space; the
+bounded qualification fixtures are not substituted for missing main layers.
 
 ## Bounded native-format qualification
+
+### Complete native 48-layer metadata audit
+
+`tools/parity/qwen4/native_inventory.py` checks all 48 main-compute layers of NVIDIA revision
+`fc694b54fb0174e0913e6adf86691ef85a4ead47` against an independently declared exact name/dtype/shape
+grammar. It validates source byte spans, rejects overlaps and header/index mapping disagreement,
+and excludes the separately owned PLE namespace. Each layer must contain 6,166 source tensors:
+512 experts × three projections × four NVFP4 fields, plus 22 protected BF16 tensors. Layers
+3,7,…,47 are QSA; the other 36 are GDN. This checks every real layer's metadata, not a repeated
+four-layer surrogate or an extrapolation from the first block.
+
+The 2026-09-18 audit passed for all **295,968 tensors**. Only the index and exact header ranges
+were fetched: nine shard headers totaling **39,984,296 bytes**, no weight payload. The source
+non-PLE compute inventory is exactly:
+
+| Stored component | Bytes |
+|---|---:|
+| NVFP4 packed expert codes | 60,397,977,600 |
+| E4M3 expert group scales | 7,549,747,200 |
+| FP32 expert weight/input multipliers | 589,824 |
+| Protected BF16 matrices and controls | 7,273,793,280 |
+| **48-layer compute total** | **75,222,107,904** |
+
+Each GDN layer contributes 1,570,383,296 bytes and each QSA layer 1,557,359,104 bytes.
+The total already exceeds 32 GiB before token embeddings, final GR, vocabulary head, PLE
+component, converted-control overhead, KV/state, workspace, or speculative companions. Host PLE
+residency cannot solve this distinct GPU-compute capacity shortfall. Metadata qualification is
+complete; full native GPU-resident execution and full-model PPL remain unavailable on this 5090.
+This audit alone is not authority for streaming native compute weights or manufacturing a checkpoint
+by repeating qualified layers. The complete native binder is separately specified above; scale values and arithmetic require
+the separate real-payload numerical checks. The local report and bounded metadata cache are
+`out/qwen4-native-inventory/qwen4-native-inventory.json` and its neighboring header files.
+
+### Exact native first-block execution preparation
+
+`tools/parity/qwen4/native_compute_fixture.py` prepares the four already acquired real NVIDIA
+layers 0–3 for the target-owned native qualification schedule. Source artifacts remain unchanged.
+The output identity is `qwen4/native-first-block-qualification` / `nvidia-nvfp4-a16-tiled`, with
+files `qwen4-native-layer-{0,1,2,3}.ninfer`. These are bounded components, not an alternative
+Engine artifact or a checkpoint with repeated/omitted layers. The binder rejects unprepared
+source identities and binds/uploads stored bytes without runtime weight repacking.
+
+Routed banks retain every `NVFP4_EXPERT_F32M` code, block-scale, weight-multiplier and activation-
+scale word. The runtime uses A16Only; this does not enable a new A4 policy. Protected BF16
+matrices remain BF16. GDN source value head `3*(h%16)+floor(h/16)` becomes execution head `h`:
+the V section of QKV, Z, a/b, convolution channels, dt bias, decay, and output columns all receive
+the same exact offline permutation. Q/K rows remain unchanged. Controls a/b/conv/dt/plain GDN
+norm are widened exactly to FP32. Source `A_log` becomes the explicitly named `linear_attn.ssm_a`
+control `FP32_RNE(-exp(A_log))`. GR and QSA zero-centered norm parameters become effective FP32
+`1+w`; GR injection weights are widened without an offset. PLE retains its separate six-tensor
+source BF16 component and the Op's explicit zero-centered-norm policy.
+
+Preparation checks every output word against an independent scalar head-address mapping and
+copies packed banks byte-exactly. All four local preparations and two synthetic exact mapping/
+control regression tests pass. The native runtime's numerical and state evidence is separate;
+see `qwen4-model.md` §12.2. No whole-model quality claim follows from artifact preparation.
 
 ### Native preparation policy, not a future checkpoint recipe
 
@@ -79,8 +194,9 @@ numerical admission, including rejected profiles and their unchanged gates.
 | Hyperconnection reads and gates | BF16 baseline | A16 projections, protected gate/reduction arithmetic, BF16 residual storage; tested FP8 residual recipe rejected |
 | PLE table | FP8 or source-faithful partition-scaled NVFP4 | Complete eager OS-locked host payload, packed row staging and GPU decode to BF16; no GEMM activation-bit policy applies to lookup |
 | Token embedding and vocabulary head | BF16 baseline | BF16 gather and A16 head; eight-bit endpoint weights remain a later checkpoint-specific candidate |
-| Vision patch, encoder and merger | BF16 baseline | A16; exact preview geometries require independent admission; text-only quantization results do not qualify vision |
-| MTP stem | BF16 source | Qualified four-stream stem only; no speculative rollout, acceptance or state-fold admission |
+| Vision patch, encoder and merger | BF16 baseline | A16; complete source tower/frontend independently qualified, not multimodal Engine registration |
+| MTP private block | Source-derived NVFP4 experts, protected BF16 projections/controls | A16 only for the audited extracted block; complete bounded carry/cache/replay checks pass, propagated-chain quality screens remain failed |
+| PixelML DFlash v1 companion | Published BF16; separately converted NVFP4 matrix candidate, BF16 norms | Both A16 schedules and source-specific shared endpoints qualified locally; converted draft quality and target acceptance are not admitted; no codebook exists |
 | QSA main KV and index state | Not weight storage | BF16 reference, FP32 pooling; diagnostic NVFP4 KV remains separate, and no FP8 runtime cache is admitted |
 
 Ordinary public activations remain BF16. Temporary A4/A8 packing neither changes
@@ -88,9 +204,12 @@ those public boundaries nor authorizes low-bit routing, recurrent state or resid
 storage. A future target must select its actual matrix formats and activation
 policies explicitly, fit its non-PLE core/state/workspaces on the GPU, and pass
 paired full-model quality and performance gates before registration. Full native
-PLE capacity admission additionally needs its actual complete table and sufficient
-RAM/memory-lock allowance. These requirements cannot be established with selected
-rows or a few compute layers.
+PLE capacity admission needs its actual complete table and sufficient RAM/memory-lock
+allowance. The complete Primitive NVFP4 table has now passed that test: its
+28,800,138,752-byte payload was eagerly populated and OS-locked, every partition's
+boundary rows passed independent GPU decode checks, and teardown released the lock.
+This does not establish full-table capacity for NVIDIA's larger FP8 representation
+or remove startup admission checks. See `../research/qwen4-native-ple-source.md`.
 
 ### Source-faithful native fixtures
 

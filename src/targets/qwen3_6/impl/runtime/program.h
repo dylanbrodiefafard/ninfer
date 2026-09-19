@@ -7,8 +7,8 @@
 #include "core/gdn_replay_records.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
-#include <ninfer/targets/qwen3_6/generation_recovery.h>
+#include <text/qwen/prepared_prompt.h>
+#include <text/qwen/generation_recovery.h>
 
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
@@ -20,7 +20,7 @@
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "runtime/contract/tool_masks.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
@@ -34,9 +34,6 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
-using PreparedPromptData    = qwen3_6::PreparedPromptData;
-using RewriteCheckpointKind = qwen3_6::RewriteCheckpointKind;
-using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 
 using ReusePath = ninfer::PrefixReusePath;
 
@@ -48,7 +45,7 @@ using ReusePath = ninfer::PrefixReusePath;
     return qwen3_6::detail::is_complete_checkpoint_restore(path);
 }
 
-[[nodiscard]] constexpr ReusePath restore_path(RewriteCheckpointKind kind) noexcept {
+[[nodiscard]] constexpr ReusePath restore_path(text::qwen::RewriteCheckpointKind kind) noexcept {
     return qwen3_6::detail::rewrite_restore_path(kind);
 }
 
@@ -77,7 +74,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
-    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<text::qwen::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
     bool force_cold_prefill = false;
     bool capture_context_checkpoint = false;
@@ -94,7 +91,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
-    std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    std::optional<text::qwen::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -145,7 +142,7 @@ enum class Lifecycle : std::uint8_t {
 
 struct RewriteCheckpoint {
     bool valid                 = false;
-    RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind kind = text::qwen::RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
 };
 
@@ -220,7 +217,7 @@ struct SequenceState {
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
     // Borrowed from the occupying Engine request until its lane is resolved.
-    const qwen3_6::OutputSession* output = nullptr;
+    const text::qwen::OutputSession* output = nullptr;
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
@@ -236,11 +233,11 @@ struct RequestControl {
     std::uint32_t restored_context_checkpoint_tokens = 0;
 
     struct Prefill {
-        PreparedPromptData prompt;
+        text::qwen::PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
-        std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
+        std::optional<text::qwen::RewriteCheckpointSpec> rewrite_checkpoint_capture;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -272,14 +269,14 @@ public:
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
-    plan_request_base(const PreparedPromptData& prompt,
+    plan_request_base(const text::qwen::PreparedPromptData& prompt,
                       const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
-                                                    const PreparedPromptData& prompt,
+                                                    const text::qwen::PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
-    [[nodiscard]] RequestPlan plan_ram_reuse(const PreparedPromptData& prompt,
+    [[nodiscard]] RequestPlan plan_ram_reuse(const text::qwen::PreparedPromptData& prompt,
                                              const RequestBasePlan& base);
-    [[nodiscard]] RequestPlan plan_disk_reuse(const PreparedPromptData& prompt,
+    [[nodiscard]] RequestPlan plan_disk_reuse(const text::qwen::PreparedPromptData& prompt,
                                               const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
@@ -290,10 +287,10 @@ public:
         const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPromptData&& prompt,
+                                                                text::qwen::PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
                                                                 runtime::TransientRegion transient,
-                                                                const qwen3_6::OutputSession* output = nullptr);
+                                                                const text::qwen::OutputSession* output = nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -363,7 +360,7 @@ public:
 
     void reset_memory_peaks() noexcept;
 
-    [[nodiscard]] ScoreResult score(PreparedPromptData&& prompt, RequestPlan&& plan,
+    [[nodiscard]] ScoreResult score(text::qwen::PreparedPromptData&& prompt, RequestPlan&& plan,
                                     runtime::TransientRegion transient, ScoreOptions options);
 
     const LoadedModelData& model;
@@ -404,7 +401,7 @@ public:
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
-    std::unique_ptr<qwen3_6::ToolMaskExchange> tool_masks;
+    std::unique_ptr<runtime::ToolMaskExchange> tool_masks;
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
@@ -496,23 +493,23 @@ private:
     };
 
     void apply_reuse_decision(RequestPlanImpl& plan, const ResidentStateView& view,
-                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
+                              const text::qwen::PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
-                             const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
+                             const text::qwen::PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
     void accumulate_prefill_nll(std::span<const TokenId> ids, std::uint32_t chunk_begin,
                                 std::uint32_t chunk_tokens, std::uint32_t skip, ScoreResult& result);
     void accumulate_decode_nll(const Tensor& logits, TokenId target, ScoreResult& result,
                                DeviceArena& score_workspace);
-    void run_prefill_score(PreparedPromptData&& prompt, RequestPlan&& plan,
+    void run_prefill_score(text::qwen::PreparedPromptData&& prompt, RequestPlan&& plan,
                            runtime::TransientRegion transient, std::span<const TokenId> ids,
                            std::uint32_t skip, ScoreResult& result);
-    void run_decode_score(PreparedPromptData&& prompt, runtime::TransientRegion transient,
+    void run_decode_score(text::qwen::PreparedPromptData&& prompt, runtime::TransientRegion transient,
                           std::span<const TokenId> ids, std::uint32_t prefix, ScoreResult& result);
     void maybe_freeze_context_checkpoint(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t chunk_tokens);
     void maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
-                                     const PreparedPromptData& prompt, ReusePath reuse,
+                                     const text::qwen::PreparedPromptData& prompt, ReusePath reuse,
                                      std::uint32_t base, std::uint32_t prompt_tokens,
                                      bool capture_enabled, bool request_pin);
     void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);

@@ -18,7 +18,8 @@ struct BidirectionalGqaPlan {
 };
 
 [[nodiscard]] BidirectionalGqaPlan
-bidirectional_gqa_resolve_plan(std::int32_t tokens, GqaContextExecutionEnvelope envelope);
+bidirectional_gqa_resolve_plan(std::int32_t tokens, GqaContextExecutionEnvelope envelope,
+                               std::int32_t head_dim);
 
 [[nodiscard]] const char* bidirectional_gqa_route_name(BidirectionalGqaRoute route);
 

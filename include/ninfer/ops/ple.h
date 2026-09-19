@@ -157,12 +157,47 @@ enum class PleNormFormat { EffectiveFp32, ZeroCenteredBf16 };
  *
  * Projections and every subsequent floating operation execute on the GPU. W is positive and
  * at most 4096. The caller owns interval-sized workspace and all lifetimes through stream.
+ * Optional conv_records is disjoint BF16 [10240,W] and receives every represented N column
+ * for subsequent accepted-prefix commit; recording changes neither outputs nor state math.
  */
 void ple_inject(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
                 const Weight& value_weight, const Tensor& key_norm_weight,
                 const Tensor& query_norm_weight, const Tensor& conv_norm_weight,
                 const Tensor& conv_weight, const Tensor& old_conv_state,
                 Tensor& new_conv_state, Tensor& residual_out, WorkspaceArena& workspace,
-                PleNormFormat norm_format, cudaStream_t stream);
+                PleNormFormat norm_format, cudaStream_t stream, Tensor* conv_records = nullptr);
+
+/** Exact accepted-prefix PLE state transition. records is BF16 [10240,W,B], token_ids I32
+ * [W,B], accepted_counts and slots I32 [B]. For each row b, append its first counts[b]
+ * represented columns to convolution state [10240,9,C] at slots[b], retaining the last nine;
+ * append the corresponding raw tokens to I32 token_history [2,C], retaining the last two.
+ * EOS is retained unchanged: n-gram addressing owns the following-token reset rule.
+ * Counts in [0,W], distinct slots in [0,C), W=1..16, B<=C<=4 are caller promises.
+ * Zero count is a strict no-op without reading that row's records/tokens/state.
+ * Every tensor is contiguous and pairwise disjoint, states alone are mutated, and rejected
+ * suffix columns and inactive slots cannot affect them. No allocation, sync or workspace;
+ * device controls and fixed shapes support CUDA Graph replay.
+ */
+void ple_commit_prefix(const Tensor& records,const Tensor& token_ids,
+    const Tensor& accepted_counts,const Tensor& slots,Tensor& conv_state,
+    Tensor& token_history,cudaStream_t stream);
+
+/** Compact independent-request form of ple_inject, with the same complete formula.
+ * Residual/out BF16 [2560,4,W,B], embedding BF16 [2560,W,B], B=1..4,W*B<=4096.
+ * Device slots/valid I32[B] select distinct slots in [0,C) and prefix lengths [0,W].
+ * Old/new convolution pools BF16[10240,9,C], B<=C<=4; only selected new slots are written,
+ * including a copy of unchanged history for a zero prefix. Invalid output columns are zero.
+ * Optional records BF16[10240,W,B] contain all normalized convolution inputs; only valid
+ * prefixes may be committed. Native projection formats only, A16. Corresponding state pools
+ * and residual/out may exactly alias; other storage is disjoint. Device control values are
+ * caller-proven, read on stream and graph-replay mutable. No allocation/synchronization.
+ * Workspace is ple_workspace_capacity_bytes(W*B,key.qtype,value.qtype).
+ */
+void ple_inject_batch(const Tensor& residual, const Tensor& embedding, const Weight& key_weight,
+    const Weight& value_weight, const Tensor& key_norm_weight, const Tensor& query_norm_weight,
+    const Tensor& conv_norm_weight, const Tensor& conv_weight, const Tensor& old_state,
+    Tensor& new_state, const Tensor& slots, const Tensor& valid, Tensor& out,
+    WorkspaceArena& workspace, PleNormFormat norm_format, cudaStream_t stream,
+    Tensor* records = nullptr);
 
 } // namespace ninfer::ops

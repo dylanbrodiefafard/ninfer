@@ -10,6 +10,13 @@
 
 namespace ninfer::ops {
 
+/** Exact branch initialization: out[d,b,t]=embedding[d,t] for b=0..3.
+ * Contiguous BF16 embedding [2560,T], output [2560,4,T], T=1..4096. Storage is
+ * disjoint and 16-byte aligned. Every represented word is preserved, without arithmetic.
+ * No workspace or synchronization; capture-safe on stream.
+ */
+void gated_residual_broadcast(const Tensor& embedding,Tensor& residual,cudaStream_t stream);
+
 /** Caller-owned transient capacity for C=1, T<=max_tokens and the explicit projection formats.
  * Native formats use Linear A16Only; no diagnostic quantization is selected implicitly. */
 [[nodiscard]] std::size_t

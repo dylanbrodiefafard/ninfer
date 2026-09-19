@@ -48,7 +48,7 @@ dtype. DFlash score is rejected.
 |---|---|---|
 | NLL Op | `ninfer_nll_from_logits_test` | production vocab `[248320,248077]`, T=1 and T=64, vs FP64 logsumexp |
 | GQA | `ninfer_gqa_attention_test` | BF16/INT8/NVFP4, both geometries, T=1 at page ±1 (`63/64/65`) |
-| Score index | `ninfer_qwen3_6_score_index_test` | skip, chunk targets, terrible-token recording |
+| Score index | `ninfer_score_test` | skip, chunk targets, terrible-token recording |
 
 Do not put 8k/32k, WikiText fetch, or codec Δ gates in ctest. A new attention
 kernel is admitted by extending the GQA oracle first, then adding a `schemes.py`

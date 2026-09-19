@@ -4,10 +4,10 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/concurrent_executor.h"
-#include "targets/qwen3_6/impl/frontend/encoded_history_cache.h"
+#include "text/qwen/encoded_history_cache.h"
 #include "targets/registry.h"
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 
 #include <stdexcept>
 #include <string>
@@ -41,14 +41,14 @@ std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t ma
 class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, double frontend_seconds, SamplingMode mode,
-         targets::qwen3_6::PreparedPrompt prepared)
+         text::qwen::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare_seconds(frontend_seconds),
           sampling_mode(mode), value(std::move(prepared)) {}
 
     PromptSummary summary;
     double prepare_seconds     = 0.0;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    targets::qwen3_6::PreparedPrompt value;
+    text::qwen::PreparedPrompt value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -65,7 +65,7 @@ const PromptSummary& PreparedPrompt::summary() const noexcept {
 
 std::span<const TokenId> PreparedPrompt::token_ids() const {
     if (impl_ == nullptr) { return {}; }
-    return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
+    return text::qwen::PreparedPromptAccess::view(impl_->value).token_ids;
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
@@ -136,8 +136,9 @@ class Engine::Impl {
 public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
     using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
+    using Executor4 = runtime::ConcurrentExecutor<targets::Qwen4Instance>;
     using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>,std::unique_ptr<Executor4>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -151,8 +152,10 @@ public:
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     return std::make_unique<Executor27>(*target_ptr, options);
-                } else {
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BInstance>) {
                     return std::make_unique<Executor35>(*target_ptr, options);
+                } else {
+                    return std::make_unique<Executor4>(*target_ptr, options);
                 }
             },
             active);
@@ -171,7 +174,7 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Executor executor;
-    mutable targets::qwen3_6::frontend_internal::EncodedHistoryCache host_encode_cache;
+    mutable text::qwen::frontend_internal::EncodedHistoryCache host_encode_cache;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -187,7 +190,7 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared = targets::qwen3_6::EncodedHistoryPrepare::prepare(
+            auto prepared = text::qwen::EncodedHistoryPrepare::prepare(
                 target_ptr->loaded->frontend, std::move(input), impl_->host_encode_cache);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
@@ -228,7 +231,7 @@ std::uint32_t Engine::count_tokens(PromptInput input) const {
     return std::visit(
         [&](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return targets::qwen3_6::EncodedHistoryPrepare::count_tokens(
+            return text::qwen::EncodedHistoryPrepare::count_tokens(
                 target_ptr->loaded->frontend, std::move(input), impl_->host_encode_cache);
         },
         impl_->active);

@@ -23,5 +23,11 @@ void ple_conv_inject_launch(const Tensor& residual, const Tensor& gated,
                             const Tensor& current_state, Tensor& out, cudaStream_t stream);
 void ple_state_update_launch(const Tensor& old_state, const Tensor& current_state,
                              Tensor& new_state, cudaStream_t stream);
+void ple_conv_batch_launch(const Tensor& residual, const Tensor& gated,
+    const Tensor& conv_weight, const Tensor& old_state, const Tensor& current_state,
+    const Tensor& slots, const Tensor& valid_columns, int width,
+    Tensor& new_state, Tensor& out, cudaStream_t stream);
+void ple_commit_prefix_launch(const Tensor& records,const Tensor& token_ids,
+    const Tensor& counts,const Tensor& slots,Tensor& conv,Tensor& history,cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

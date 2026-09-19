@@ -181,9 +181,12 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     case Nvfp4Problem::DflashConvProj:
     case Nvfp4Problem::DflashSelector:
     case Nvfp4Problem::N248320K2560:
+    case Nvfp4Problem::N2560K12800:
+    case Nvfp4Problem::N7680K2560:
+    case Nvfp4Problem::N2560K7680:
         break;
     }
-    throw std::invalid_argument("nvfp4 W4A4 linear: DFlash2 problems are A16-only");
+    throw std::invalid_argument("nvfp4 W4A4 linear: registered problem is A16-only");
 }
 
 } // namespace ninfer::ops::detail

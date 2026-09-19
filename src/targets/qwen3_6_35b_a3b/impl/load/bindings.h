@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <text/qwen/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
 #include <ninfer/targets/qwen3_6/vision.h>
@@ -87,7 +87,7 @@ struct DFlashPlan {
 };
 
 struct BindingPlan {
-    qwen3_6::FrontendResourcePlan frontend;
+    text::qwen::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -146,7 +146,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    qwen3_6::FrontendResources frontend;
+    text::qwen::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

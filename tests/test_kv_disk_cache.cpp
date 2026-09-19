@@ -272,8 +272,8 @@ plan_paged_cache(std::uint32_t pages, std::uint32_t logical_pages, std::int32_t 
     return PlannedPagedCache{std::move(layout), builder.finish(256)};
 }
 
-q36::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
-    q36::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids = std::move(tokens);
     prompt.token_types.assign(prompt.token_ids.size(), 0);
     prompt.positions.resize(3 * prompt.token_ids.size());
@@ -352,7 +352,7 @@ struct TmpDir {
     TmpDir& operator=(const TmpDir&) = delete;
 };
 
-q36::detail::RamCaptureSource make_source(q36::PreparedPromptData& retained,
+q36::detail::RamCaptureSource make_source(ninfer::text::qwen::PreparedPromptData& retained,
                                           q36::detail::ResidentPrefixIdentity& identity,
                                           ninfer::PagedKVAllocation& alloc, ninfer::PagedKVPool& pool,
                                           cudaStream_t stream, std::uint32_t execution_frontier) {
@@ -400,7 +400,7 @@ std::uint64_t capture_tokens(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& 
 std::uint64_t capture_prepared_prompt(q36::detail::KVRamCache& ram, ninfer::PagedKVPool& pool,
                                       ninfer::PagedKVAllocation& alloc,
                                       ninfer::DeviceContext& ctx,
-                                      const q36::PreparedPromptData& prompt) {
+                                      const ninfer::text::qwen::PreparedPromptData& prompt) {
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::logic_error("prepared-prompt cache fixture has invalid identity geometry");
@@ -788,8 +788,8 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
         prompt.positions[64 + token] = static_cast<std::int32_t>(token - 16);
         prompt.positions[128 + token] = static_cast<std::int32_t>(token % 4);
     }
-    q36::VisionItem item;
-    item.modality      = q36::PromptModality::Image;
+    ninfer::text::qwen::VisionItem item;
+    item.modality      = ninfer::text::qwen::PromptModality::Image;
     item.grid          = {.temporal = 1, .height = 4, .width = 4};
     item.patch_begin   = 0;
     item.patch_count   = 16;
@@ -1134,8 +1134,8 @@ int test_spill_sharing_respects_identity(ninfer::DeviceContext& ctx,
             alloc.materialize_pages(3, ctx.stream);
             fill_logical_pages(pool, alloc, 11);
             auto parent = text_prompt(std::vector<ninfer::TokenId>(128, 7));
-            q36::VisionItem item;
-            item.modality = q36::PromptModality::Image;
+            ninfer::text::qwen::VisionItem item;
+            item.modality = ninfer::text::qwen::PromptModality::Image;
             item.grid = {.temporal = 1, .height = 4, .width = 4};
             item.patch_count = 16;
             item.token_spans = {{.begin = 80, .count = 4}};
@@ -7821,7 +7821,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     source.gdn_current_slot      = 0;
     source.gdn_checkpoint_slot  = 1;
     source.rewrite_valid       = true;
-    source.rewrite_kind         = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind         = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier     = 2;
     source.hash_c_valid        = true;
     source.hash_c               = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
@@ -7945,7 +7945,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     response_source.gdn_current_slot = 0;
     response_source.gdn_checkpoint_slot = 1;
     response_source.rewrite_valid = true;
-    response_source.rewrite_kind = q36::RewriteCheckpointKind::ResponseReplay;
+    response_source.rewrite_kind = ninfer::text::qwen::RewriteCheckpointKind::ResponseReplay;
     response_source.rewrite_frontier = 2;
     response_source.hash_c_valid = true;
     response_source.hash_c =
@@ -8061,7 +8061,7 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     source.tail_hidden                = &hidden;
     source.rewrite_checkpoint_hidden = &hidden_rw;
     source.rewrite_valid             = true;
-    source.rewrite_kind               = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind               = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier            = 2;
     source.hash_c_valid              = true;
     source.hash_c                     = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
@@ -13358,7 +13358,7 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
     source.gdn_current_slot     = 0;
     source.gdn_checkpoint_slot  = 0;
     source.rewrite_valid        = true;
-    source.rewrite_kind         = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind         = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier      = 4;
     source.hash_c_valid         = true;
     source.hash_c               = q36::detail::prefix_hash_at(retained.token_ids, identity, 4);

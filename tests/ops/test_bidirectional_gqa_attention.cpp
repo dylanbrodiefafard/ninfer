@@ -18,12 +18,12 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kD       = 128;
-constexpr int kQHeads  = 32;
-constexpr int kKVHeads = 8;
-constexpr int kGroup   = 4;
+int kD       = 128;
+int kQHeads  = 32;
+int kKVHeads = 8;
+int kGroup   = 4;
 constexpr int kPage    = 64;
-constexpr float kScale = 0.08838834764831844055f;
+float kScale = 0.08838834764831844055f;
 
 constexpr ReductionCriterion kBidirectionalGqaBf16Criterion{
     .relative_l2                     = 2.95e-3,
@@ -296,7 +296,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
     const ops::GqaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes =
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1);
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1, kD);
     DeviceArena workspace(workspace_bytes);
 
     ops::bidirectional_gqa_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
@@ -304,7 +304,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
                                      workspace, out_tensor, nullptr);
     cuda_synchronize();
 
-    std::string label = "bidirectional_gqa_attention T=" + std::to_string(tokens) +
+    std::string label = "bidirectional_gqa_attention D=" + std::to_string(kD) +
+                        " T=" + std::to_string(tokens) +
                         " L=" + std::to_string(context_length) +
                         " mapping=" + mapping_name(mapping_pattern);
     if (envelope_max != context_length) {
@@ -409,7 +410,7 @@ int graph_mapping_replay_case() {
         make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
     constexpr ops::GqaContextExecutionEnvelope envelope{0, context_length};
     DeviceArena workspace(
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1));
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1, kD));
 
     cudaStream_t stream        = nullptr;
     cudaGraph_t graph          = nullptr;
@@ -525,7 +526,7 @@ int batch_table_case() {
 
     std::vector<std::uint16_t> expected(row_q_count * batch);
     DeviceArena single_workspace(
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1));
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1, kD));
     for (int b = 0; b < batch; ++b) {
         GuardedDeviceBuffer single_out(row_q_count * sizeof(std::uint16_t));
         Tensor single_out_tensor(single_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
@@ -545,7 +546,7 @@ int batch_table_case() {
     }
 
     DeviceArena workspace(
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, batch));
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, batch, kD));
     ops::bidirectional_gqa_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
                                      valid_tensor, table_row_tensor, kScale, context, envelope,
                                      workspace, out_tensor, nullptr);
@@ -560,25 +561,25 @@ int batch_table_case() {
 
 } // namespace
 
-int main() {
-    if (cuda_unavailable()) {
-        std::cerr << "FAIL: no usable CUDA device\n";
-        return 1;
-    }
-
+int run_geometry(int head_dim) {
+    kD = head_dim;
+    kQHeads = kD == 128 ? 32 : 24;
+    kKVHeads = kD == 128 ? 8 : 2;
+    kGroup = kQHeads / kKVHeads;
+    kScale = 1.0f / std::sqrt(float(kD));
     int failures = 0;
     constexpr ops::GqaContextExecutionEnvelope capacity_envelope{0, 196609};
     const std::size_t interval =
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 1, 16, 1);
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 1, 16, 1, kD);
     const std::size_t witness = std::max(
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 8, 8, 1),
-        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 16, 16, 1));
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 8, 8, 1, kD),
+        ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 16, 16, 1, kD));
     if (interval != witness) {
         std::cerr << "bidirectional GQA interval capacity missed a token-band endpoint\n";
         ++failures;
     }
     try {
-        (void)ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9, 8, 1);
+        (void)ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9, 8, 1, kD);
         std::cerr << "bidirectional GQA accepted an invalid token interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
@@ -587,13 +588,23 @@ int main() {
     failures += run_case(1, 63);
     failures += run_case(2, 64, InputProfile::Random, -1, MappingPattern::Offset);
     failures += run_case(4, 65, InputProfile::Random, -1, MappingPattern::Fragmented);
+    failures += run_case(7, 127, InputProfile::Random, -1, MappingPattern::Fragmented);
+    failures += run_case(7, 0, InputProfile::QueryVisibility);
     failures += run_case(8, 95, InputProfile::Random, 4096, MappingPattern::Fragmented);
     failures += run_case(16, 257);
     failures += run_case(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
     failures += run_case(4, 0, InputProfile::QueryVisibility);
     failures += graph_mapping_replay_case();
     failures += batch_table_case();
+    return failures;
+}
 
+int main() {
+    if (cuda_unavailable()) {
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
+    }
+    const int failures = run_geometry(128) + run_geometry(256);
     if (failures != 0) {
         std::cerr << "bidirectional_gqa_attention failures=" << failures << '\n';
         return 1;

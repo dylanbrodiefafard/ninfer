@@ -2,8 +2,7 @@
 #include "core/arena.h"
 #include "core/layout.h"
 #include "ninfer/ops/layer_norm.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/add_bias.h"
+#include "ninfer/ops/linear_bias.h"
 #include "ninfer/ops/gelu.h"
 #include "ops/common/projection.h"
 
@@ -79,10 +78,8 @@ void vision_patch_merger(const Tensor& x,const VisionPatchMergerWeights& w,
     auto buffers=scratch(arena,groups);
     layer_norm(x,w.norm_weight,w.norm_bias,1e-6F,buffers[0],stream);
     auto merged=buffers[0].reshape({4608,groups});
-    linear(merged,w.fc1,buffers[1],LinearPolicy::A16Only,arena,stream);
-    add_bias(w.fc1_bias,buffers[1],stream);
+    linear_bias(merged,w.fc1,w.fc1_bias,buffers[1],stream);
     gelu(buffers[1],GeluMode::Exact,stream);
-    linear(buffers[1],w.fc2,y,LinearPolicy::A16Only,arena,stream);
-    add_bias(w.fc2_bias,y,stream);
+    linear_bias(buffers[1],w.fc2,w.fc2_bias,y,stream);
 }
 } // namespace ninfer::ops

@@ -69,7 +69,7 @@ struct RamCaptureSource {
     std::uint32_t dflash_context_frontier = 0;
     bool tail_hidden_valid                = false;
     bool rewrite_valid                    = false;
-    RewriteCheckpointKind rewrite_kind    = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind rewrite_kind    = text::qwen::RewriteCheckpointKind::TurnClosure;
     std::uint32_t rewrite_frontier        = 0;
 
     std::span<const TokenId> ledger;
@@ -135,7 +135,7 @@ struct RamRestoredHost {
     std::uint32_t dflash_context_frontier = 0;
     bool tail_hidden_valid                = false;
     bool rewrite_valid                    = false;
-    RewriteCheckpointKind rewrite_kind    = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind rewrite_kind    = text::qwen::RewriteCheckpointKind::TurnClosure;
     std::uint32_t rewrite_frontier        = 0;
     bool backend_image_present            = false;
     std::vector<TokenId> ledger;
@@ -169,7 +169,7 @@ public:
     KVRamCache(KVRamCache&&)                 = delete;
     KVRamCache& operator=(KVRamCache&&)      = delete;
 
-    [[nodiscard]] std::optional<RamMatch> plan_match(const PreparedPromptData& prompt,
+    [[nodiscard]] std::optional<RamMatch> plan_match(const text::qwen::PreparedPromptData& prompt,
                                                      std::span<const PrefixHash128> hash_chain,
                                                      const ReuseBackendPolicy& policy = {});
 

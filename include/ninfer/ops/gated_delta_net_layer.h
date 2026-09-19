@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 
@@ -79,11 +80,42 @@ gated_delta_net_layer_workspace_capacity_bytes(
  * A8 approximation is checked against the same represented-input oracle under a separately
  * declared implementation profile, not by feeding quantized private inputs into that oracle.
  * Admission is bounded component qualification, not whole-model PPL or default-policy approval.
+ *
+ * Optional replay records expose raw projected QKV as BF16 conv [10240,T,1], expanded
+ * post-convolution/pre-L2 K and V as BF16 [128,48,T,1], and controls {g,beta} as FP32
+ * [2,48,T,1], for T=2..16. They are disjoint caller-owned observable outputs, used by
+ * the 36-layer accepted-prefix fold. Recording does not change the full provisional
+ * state/output calculation. The caller retains the initial state separately when it needs
+ * rollback or partial commit; this Op never decides acceptance or mutates a frontier.
  */
 void gated_delta_net_layer(const Tensor& x, const GatedDeltaNetLayerWeights& weights,
                            const Tensor& conv_state_in, Tensor& conv_state_out,
                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                            WorkspaceArena& workspace, cudaStream_t stream,
-                           GatedDeltaNetProjectionPolicy policy = {});
+                           GatedDeltaNetProjectionPolicy policy = {},
+                           const GdnReplayRecordLayer* replay = nullptr);
+
+/** Compact independent-request form of the same complete formula.
+ * x/out are BF16 [2560,W,B], B=1..4 and W*B<=4096. Device I32 slots/valid_columns [B]
+ * name distinct state slots in [0,C) and valid prefixes in [0,W]. Convolution pools are
+ * BF16 [10240,3,C], recurrent pools FP32 [128,128,48,C], B<=C<=4. Selected output slots
+ * receive the state after their valid prefix (including an unchanged copy for zero); other
+ * output slots are untouched. Invalid output columns are zero. Corresponding state pools
+ * may exactly alias; all other operands and scratch are disjoint. Controls are read on the
+ * supplied stream; their values are caller-proven and may change between captured replays.
+ * Optional records have the shapes above with B replacing 1, W=2..16. All conv/key/value/gate
+ * columns are written; invalid columns are outside the replay contract and must not be folded.
+ * Matrices are projected once across the compact W*B panel, never one model per request.
+ * Native projection formats only; the activation policy remains explicit and defaults A16.
+ */
+[[nodiscard]] std::size_t gated_delta_net_layer_batch_workspace_capacity_bytes(
+    std::int32_t width, std::int32_t batch, QType qkv, QType z, QType output,
+    GatedDeltaNetProjectionPolicy policy = {});
+void gated_delta_net_layer_batch(const Tensor& x, const GatedDeltaNetLayerWeights& weights,
+    const Tensor& conv_state_in, Tensor& conv_state_out,
+    const Tensor& ssm_state_in, Tensor& ssm_state_out,
+    const Tensor& slots, const Tensor& valid_columns, Tensor& out,
+    WorkspaceArena& workspace, cudaStream_t stream,
+    GatedDeltaNetProjectionPolicy policy = {}, const GdnReplayRecordLayer* replay = nullptr);
 
 } // namespace ninfer::ops

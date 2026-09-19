@@ -63,8 +63,8 @@ std::vector<ninfer::PagedKVPlaneSpec> int8_text_planes() {
     return planes;
 }
 
-q36::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
-    q36::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids = std::move(tokens);
     prompt.token_types.assign(prompt.token_ids.size(), 0);
     prompt.positions.resize(3 * prompt.token_ids.size());

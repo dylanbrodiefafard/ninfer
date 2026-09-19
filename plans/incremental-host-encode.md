@@ -27,7 +27,7 @@ Cache lives in `Engine::Impl` (`mutable`, mutex). CLI/HTTP/eval call
 `Frontend::prepare(PromptInput)` stays a cold encode (in-tree frontend
 tests). Engine calls an **impl-header** `prepare_with_cache` that
 `engine.cpp` includes. Do **not** put `EncodedHistoryCache` or a cache
-argument on `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h`.
+argument on `src/text/qwen/frontend.h`.
 
 `prepare_tokens` never touches the cache. Destroying the Engine drops it.
 Two Engines do not share.

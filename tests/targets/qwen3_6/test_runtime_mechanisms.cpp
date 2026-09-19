@@ -198,22 +198,22 @@ void test_mtp_alignment() {
 }
 
 void test_vision_control() {
-    q36::PreparedPromptData prompt;
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids.resize(7);
-    prompt.token_types           = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
-                                    0, static_cast<std::uint8_t>(q36::PromptModality::Video),
-                                    0, static_cast<std::uint8_t>(q36::PromptModality::Video),
+    prompt.token_types           = {0, static_cast<std::uint8_t>(ninfer::text::qwen::PromptModality::Image),
+                                    0, static_cast<std::uint8_t>(ninfer::text::qwen::PromptModality::Video),
+                                    0, static_cast<std::uint8_t>(ninfer::text::qwen::PromptModality::Video),
                                     0};
     prompt.prepare.media_items   = 2;
     prompt.prepare.raw_patches   = 12;
     prompt.prepare.vision_tokens = 3;
     prompt.vision_items          = {
-        q36::VisionItem{.modality    = q36::PromptModality::Image,
+        ninfer::text::qwen::VisionItem{.modality    = ninfer::text::qwen::PromptModality::Image,
                                  .grid        = {.temporal = 1, .height = 2, .width = 2},
                                  .patch_begin = 0,
                                  .patch_count = 4,
                                  .token_spans = {{.begin = 1, .count = 1}}},
-        q36::VisionItem{.modality    = q36::PromptModality::Video,
+        ninfer::text::qwen::VisionItem{.modality    = ninfer::text::qwen::PromptModality::Video,
                                  .grid        = {.temporal = 2, .height = 2, .width = 2},
                                  .patch_begin = 4,
                                  .patch_count = 8,
@@ -242,14 +242,14 @@ void test_vision_control() {
            "video item control offsets");
 }
 
-q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
-    q36::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids   = {10, 248056, 248056, 11};
-    prompt.token_types = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
-                          static_cast<std::uint8_t>(q36::PromptModality::Image), 0};
+    prompt.token_types = {0, static_cast<std::uint8_t>(ninfer::text::qwen::PromptModality::Image),
+                          static_cast<std::uint8_t>(ninfer::text::qwen::PromptModality::Image), 0};
     prompt.positions   = {0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 2, 3};
     prompt.rope_delta  = 0;
-    q36::VisionItem item{.modality    = q36::PromptModality::Image,
+    ninfer::text::qwen::VisionItem item{.modality    = ninfer::text::qwen::PromptModality::Image,
                          .grid        = {.temporal = 1, .height = 2, .width = 4},
                          .patch_begin = 0,
                          .patch_count = 8,
@@ -259,7 +259,7 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     return prompt;
 }
 
-void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
+void append_text_token(ninfer::text::qwen::PreparedPromptData& prompt, ninfer::TokenId token,
                        std::int32_t position) {
     const std::size_t old_tokens = prompt.token_ids.size();
     std::vector<std::int32_t> positions;
@@ -276,7 +276,7 @@ void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
 }
 
 void test_prefix_identity() {
-    q36::PreparedPromptData original    = identity_prompt();
+    ninfer::text::qwen::PreparedPromptData original    = identity_prompt();
     std::vector<ninfer::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
     resident.reserve(16);
@@ -285,7 +285,7 @@ void test_prefix_identity() {
     expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
            "identical multimodal prefix identity");
 
-    q36::PreparedPromptData changed_media = identity_prompt(2);
+    ninfer::text::qwen::PreparedPromptData changed_media = identity_prompt(2);
     expect(!q36::detail::prefix_matches(changed_media, ledger, resident,
                                         changed_media.token_ids.size()),
            "different media content must not reuse placeholder tokens");
@@ -294,7 +294,7 @@ void test_prefix_identity() {
     expect(!q36::detail::prefix_matches(original, ledger, resident, 2),
            "frontier must not divide one Vision item");
 
-    q36::PreparedPromptData changed_position = identity_prompt();
+    ninfer::text::qwen::PreparedPromptData changed_position = identity_prompt();
     changed_position.positions[0] += 1;
     expect(!q36::detail::prefix_matches(changed_position, ledger, resident,
                                         changed_position.token_ids.size()),
@@ -306,7 +306,7 @@ void test_prefix_identity() {
     expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
            "generated multimodal continuation identity");
 
-    const q36::PreparedPromptData prompt_only = identity_prompt();
+    const ninfer::text::qwen::PreparedPromptData prompt_only = identity_prompt();
     resident.truncate(prompt_only.token_ids.size());
     ledger.resize(prompt_only.token_ids.size());
     expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
@@ -334,7 +334,7 @@ void test_prefix_identity() {
 }
 
 void test_prefix_hash_and_dflash_gate() {
-    q36::PreparedPromptData original = identity_prompt();
+    ninfer::text::qwen::PreparedPromptData original = identity_prompt();
     const auto chain                 = q36::detail::prefix_hash_chain(original);
     expect(chain.size() == original.token_ids.size() + 1, "hash chain includes the empty prefix");
 
@@ -348,7 +348,7 @@ void test_prefix_hash_and_dflash_gate() {
         const std::size_t e = std::min<std::size_t>(2, original.token_ids.size());
         const auto hash_e   = q36::detail::prefix_hash_at(original.token_ids, resident, e);
         std::vector<ninfer::TokenId> longer = original.token_ids;
-        q36::PreparedPromptData assigned    = original;
+        ninfer::text::qwen::PreparedPromptData assigned    = original;
         append_text_token(assigned, 99, 99);
         longer.push_back(99);
         resident.assign(assigned);
@@ -357,24 +357,24 @@ void test_prefix_hash_and_dflash_gate() {
         resident.assign(original);
     }
 
-    q36::PreparedPromptData changed_token = original;
+    ninfer::text::qwen::PreparedPromptData changed_token = original;
     changed_token.token_ids.back() += 1;
     const auto token_chain = q36::detail::prefix_hash_chain(changed_token);
     expect(token_chain[original.token_ids.size() - 1] == chain[original.token_ids.size() - 1] &&
                token_chain.back() != chain.back(),
            "token difference changes only hashes at and after the mutated token");
 
-    q36::PreparedPromptData changed_type = original;
+    ninfer::text::qwen::PreparedPromptData changed_type = original;
     changed_type.token_types[0]          = 1;
     expect(q36::detail::prefix_hash_chain(changed_type)[1] != chain[1],
            "token_type difference changes the hash chain");
 
-    q36::PreparedPromptData changed_position = original;
+    ninfer::text::qwen::PreparedPromptData changed_position = original;
     changed_position.positions[0] += 1;
     expect(q36::detail::prefix_hash_chain(changed_position).back() != chain.back(),
            "position-axis difference changes the hash chain");
 
-    q36::PreparedPromptData changed_digest = identity_prompt(2);
+    ninfer::text::qwen::PreparedPromptData changed_digest = identity_prompt(2);
     const auto digest_chain                = q36::detail::prefix_hash_chain(changed_digest);
     expect(digest_chain[2] == chain[2] && digest_chain[3] != chain[3],
            "completing vision item changes the hash at its end");
@@ -528,13 +528,13 @@ void test_prefill_context_marks() {
     expect(q36::detail::retain_context_checkpoint_head(8192, 12288), "keep heads before F");
     expect(!q36::detail::retain_context_checkpoint_head(24576, 12288), "drop heads after F");
 
-    q36::PreparedPromptData prompt;
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids   = {1, 2, 3, 4};
     prompt.token_types = {0, 0, 0, 0};
     prompt.positions   = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
     expect(q36::detail::prefix_items_complete_at(prompt.vision_items, 4),
            "text-only frontier is complete");
-    q36::PreparedPromptData vision = identity_prompt();
+    ninfer::text::qwen::PreparedPromptData vision = identity_prompt();
     expect(!q36::detail::prefix_items_complete_at(vision.vision_items, 2),
            "frontier that splits a vision item is not capturable");
     expect(q36::detail::prefix_items_complete_at(vision.vision_items, 3),
@@ -889,8 +889,8 @@ void test_prefill_context_marks() {
 } // namespace
 
 // Plain text prompt of `tokens` tokens, no media, identity position axes.
-q36::PreparedPromptData text_prompt(std::uint32_t tokens) {
-    q36::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData text_prompt(std::uint32_t tokens) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     std::vector<std::int32_t> positions;
     positions.reserve(3 * static_cast<std::size_t>(tokens));
     for (std::uint32_t i = 0; i < tokens; ++i) {
@@ -909,7 +909,7 @@ q36::PreparedPromptData text_prompt(std::uint32_t tokens) {
 // Multi-turn resident state: the prompt extends a 4-token prefix with two new tokens; the
 // resident ledger/identity retain the prefix at execution frontier 4.
 struct ResidentReuseFixture {
-    q36::PreparedPromptData prompt;
+    ninfer::text::qwen::PreparedPromptData prompt;
     std::vector<ninfer::TokenId> ledger;
     q36::detail::ResidentPrefixIdentity identity;
     q36::detail::ResidentReuseState state;
@@ -917,14 +917,14 @@ struct ResidentReuseFixture {
     ResidentReuseFixture()
         : prompt(text_prompt(6)),
           ledger(text_prompt(4).token_ids),
-          state{&ledger, &identity, 4, false, q36::RewriteCheckpointKind::TurnClosure, 0, 0, 0,
+          state{&ledger, &identity, 4, false, ninfer::text::qwen::RewriteCheckpointKind::TurnClosure, 0, 0, 0,
                 false, false, {}} {
         identity.assign(text_prompt(4));
     }
 };
 
 q36::detail::PrefillReuseSelection decide(const q36::detail::ResidentReuseState& state,
-                                          const q36::PreparedPromptData& prompt,
+                                          const ninfer::text::qwen::PreparedPromptData& prompt,
                                           ninfer::SpeculativeBackend backend,
                                           bool mtp_cache = true, bool dflash = false,
                                           bool dflash_full_layers = false) {
@@ -962,7 +962,7 @@ void test_cancelled_dflash_exact_prefix_reuse() {
 
 void test_resident_reuse_decision() {
     using Path    = ninfer::PrefixReusePath;
-    using Kind    = q36::RewriteCheckpointKind;
+    using Kind    = ninfer::text::qwen::RewriteCheckpointKind;
     using Backend = ninfer::SpeculativeBackend;
     ResidentReuseFixture fixture;
     const auto& prompt  = fixture.prompt;

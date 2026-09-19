@@ -12,7 +12,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/gqa_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <text/qwen/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 
 #include <array>
@@ -210,10 +210,10 @@ public:
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     [[nodiscard]] PrefillChunkResult
-    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+    prefill_chunk(const text::qwen::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
     [[nodiscard]] PrefillChunkResult
-    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+    prefill_chunk(const text::qwen::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end,
                   DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,

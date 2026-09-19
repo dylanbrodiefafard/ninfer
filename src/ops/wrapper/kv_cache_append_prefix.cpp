@@ -54,8 +54,11 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("kv_cache_append_prefix: B must be 1..8");
     }
-    require_shape(k, kHeadDim, kKVHeads, tokens, batch, "k");
-    require_shape(v, kHeadDim, kKVHeads, tokens, batch, "v");
+    if (!((k.ne[0] == 128 && k.ne[1] == 8) || (k.ne[0] == 256 && k.ne[1] == 2))) {
+        throw std::invalid_argument("kv_cache_append_prefix: unsupported K/V geometry");
+    }
+    require_shape(k, k.ne[0], k.ne[1], tokens, batch, "k");
+    require_shape(v, k.ne[0], k.ne[1], tokens, batch, "v");
     require_shape(positions, tokens, batch, 1, 1, "positions");
     require_shape(counts, batch, 1, 1, 1, "counts");
     require_shape(selectors, batch, 1, 1, 1, "selectors");
@@ -68,9 +71,9 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
 }
 
 void validate_paged_cache(const PagedKVBatchLayerView& cache,
-                          KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
-        cache.head_dim != kHeadDim || cache.k_pages.ne[2] <= 0 ||
+                          KVCacheAppendPrefixExecutionEnvelope envelope, int head_dim, int heads) {
+    if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != heads ||
+        cache.head_dim != head_dim || cache.k_pages.ne[2] <= 0 ||
         cache.k_pages.ne[2] != cache.v_pages.ne[2] || cache.block_tables.ne[0] <= 0 ||
         envelope.max_count >
             static_cast<std::uint32_t>(cache.block_tables.ne[0]) * kPagedKVPageSize) {
@@ -78,10 +81,10 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
     }
     const std::int32_t physical_pages = cache.k_pages.ne[2];
     if (cache.k_pages.dtype != DType::BF16 || cache.v_pages.dtype != DType::BF16 ||
-        cache.k_pages.ne[0] != kHeadDim || cache.k_pages.ne[1] != kPagedKVPageSize ||
-        cache.k_pages.ne[3] != kKVHeads || cache.v_pages.ne[0] != kHeadDim ||
+        cache.k_pages.ne[0] != head_dim || cache.k_pages.ne[1] != kPagedKVPageSize ||
+        cache.k_pages.ne[3] != heads || cache.v_pages.ne[0] != head_dim ||
         cache.v_pages.ne[1] != kPagedKVPageSize || cache.v_pages.ne[2] != physical_pages ||
-        cache.v_pages.ne[3] != kKVHeads || cache.k_scale_pages.data != nullptr ||
+        cache.v_pages.ne[3] != heads || cache.k_scale_pages.data != nullptr ||
         cache.v_scale_pages.data != nullptr || cache.block_tables.dtype != DType::I32 ||
         cache.block_tables.ne[1] <= 0 || cache.block_tables.ne[2] != 1 ||
         cache.block_tables.ne[3] != 1) {
@@ -121,7 +124,7 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             PagedKVBatchLayerView cache, cudaStream_t stream) {
     const auto plan = validate_inputs(k, v, positions, counts, table_rows, envelope);
-    validate_paged_cache(cache, envelope);
+    validate_paged_cache(cache, envelope, k.ne[0], k.ne[1]);
     detail::kv_cache_append_prefix_launch(k, v, positions, counts, table_rows, cache, plan, stream);
 }
 
@@ -130,6 +133,9 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, cudaStream_t stream) {
     const auto plan = validate_inputs(k, v, positions, counts, lanes, envelope);
+    if (k.ne[0] != kHeadDim || k.ne[1] != kKVHeads) {
+        throw std::invalid_argument("kv_cache_append_prefix: cyclic geometry must be (128,8)");
+    }
     validate_cyclic_cache(cache, envelope);
     detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
 }

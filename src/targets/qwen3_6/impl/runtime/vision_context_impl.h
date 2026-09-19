@@ -361,7 +361,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, Workspace
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                                            WorkspaceArena& workspace,
-                                           qwen3_6::PreparedPromptData& prompt,
+                                           text::qwen::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
                                            runtime::TransientRegion transient)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
@@ -513,7 +513,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         throw std::logic_error("Vision prefill item index is out of range");
     }
     const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
-    const qwen3_6::VisionItem& source         = prompt_.vision_items[active->item_index];
+    const text::qwen::VisionItem& source         = prompt_.vision_items[active->item_index];
     if (source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
         source.grid.height != control.grid.height || source.grid.width != control.grid.width ||
         source.patch_begin != control.patch_begin || source.patch_count != control.patch_count) {

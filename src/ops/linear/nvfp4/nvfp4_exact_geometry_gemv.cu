@@ -60,6 +60,12 @@ void launch_nvfp4_exact_geometry_decode(const Tensor& x, const Weight& weight, T
         return launch_exact<Nvfp4N2560K2560Geometry>(x, weight, out, stream);
     case Nvfp4Problem::N248320K2560:
         return launch_exact<Nvfp4N248320K2560Geometry>(x, weight, out, stream);
+    case Nvfp4Problem::N2560K12800:
+        return launch_exact<Nvfp4N2560K12800Geometry>(x, weight, out, stream);
+    case Nvfp4Problem::N7680K2560:
+        return launch_exact<Nvfp4N7680K2560Geometry>(x, weight, out, stream);
+    case Nvfp4Problem::N2560K7680:
+        return launch_exact<Nvfp4N2560K7680Geometry>(x, weight, out, stream);
     default:
         throw std::invalid_argument("nvfp4 exact-geometry decode: unsupported problem");
     }

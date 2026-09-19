@@ -654,7 +654,7 @@ complete artifact inventory is still validated before these resident views are p
 | immutable Text/MTP/Vision/DFlash2 bindings | `src/targets/qwen3_6_27b/impl/load/` |
 | split attention projection, staged GDN projection/control, dense post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_6_27b/impl/variant.h`, `impl/variant.cpp` |
 | Text/MTP/Vision execution, planning, Program lifecycle, workspace composition, prefix/state transactions, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
-| tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6/impl/frontend/` |
+| shared Qwen tokenizer, template, prompt ownership and output decoder; explicit checkpoint media profile | `src/text/qwen/` |
 | DFlash2 SWA-2048, grouped dynamic conv, and path selector | `include/ninfer/ops/swa.h`, `include/ninfer/ops/grouped_dynamic_conv.h`, `include/ninfer/ops/dflash2_path_select.h` |
 | Qwen3.8 NVFP4 DFlash2 conversion | [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), `tools/convert/qwen3_8_27b/convert_nvfp4.py` |
 | growing GQA paged cache pools, allocations, and per-layer views | `src/core/paged_kv_cache.*` |
@@ -679,7 +679,7 @@ are peer compile-time Variants of one identity-free Qwen3.6 family runtime
 (`src/targets/qwen3_6`).
 
 The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and `Program<Variant>`
-algorithms; frontend and output semantics; Text/Vision/speculative schedules; state transactions;
+algorithms; Text/Vision/speculative schedules; state transactions;
 workspace composition; and CUDA Graph capture/replay mechanics. Each package separately owns its
 registered artifact identities and bindings, immutable model view, dimensions/storage facts, three
 closed execution-leaf families (attention projection, GDN projection/control, post-mixer), graph
@@ -688,4 +688,7 @@ frontier data, and Program instance bytes.
 Invariants: no mutable state or device allocation is shared between Programs; neither package is
 defined as a delta from the other; and there is no runtime family selection or target-dependent
 branch inside family scheduling. All artifacts embed the same six frontend resources, and a
-prepared prompt carries no exact-target tag.
+prepared prompt carries no exact-target tag. Tokenizer/template/output/recovery and prepared-prompt
+ownership reside in `src/text/qwen`; packages select the explicit `Qwen3_6` media profile.
+The exact Qwen4 preview selects its separate source pixel policy while sharing these same owning
+types and publication semantics. This does not make Qwen4 a Variant of the Qwen3.6 GPU runtime.

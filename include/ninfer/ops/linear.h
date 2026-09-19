@@ -68,6 +68,8 @@ enum class LinearPolicy : std::uint8_t {
  * Both NVFP4 and FP8 additionally admit the Qwen4 projection geometries
  * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144],
  * [640,2560], [1280,2560], [2560,640], [10240,320], [2560,2560], [248320,2560]}`.
+ * NVFP4 additionally admits `[2560,12800]`, `[7680,2560]`, and `[2560,7680]` as A16-only
+ * DFlash projections; these three are not registered FP8 geometries.
  * FP8 additionally admits `[320,10240]`; that shape is not a legal NVFP4 block-scale layout.
  * Tensor-calibrated FP8_E4M3FN_TENSOR_F32M separately admits exactly
  * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [2560,6144],
@@ -83,7 +85,9 @@ enum class LinearPolicy : std::uint8_t {
  * Contiguous BF16 additionally admits the native preview non-routed projections
  * `{[10240,2560], [6144,2560], [12288,2560], [512,2560], [640,2560],
  * [2560,2560], [2560,6144], [320,10240], [10240,320], [2560,640], [248320,2560],
- * [4608,4608], [2560,4608]}`. The last two are the native BF16 Vision merger.
+ * [4608,4608], [2560,4608], [2560,12800], [7680,2560], [2560,7680]}`.
+ * The 4608-input matrices are the native BF16 Vision merger; the last three are
+ * the additional native DFlash fusion and dense-MLP geometries.
  * Native BF16 Vision patch/encoder additionally admits `[1152,1536]`, `[3456,1152]`,
  * `[1152,1152]`, `[4304,1152]` and `[1152,4304]` using the canonical MMA schedule,
  * with zero-filled partial row/K tiles for the real 4304 dimension (no weight repacking).

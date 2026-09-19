@@ -219,7 +219,7 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
-template <bool NormalizeQK>
+template <bool NormalizeQK, bool Batched = false>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
                                  const __nv_bfloat16* __restrict__ k,
@@ -227,7 +227,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const float* __restrict__ beta,
                                  const float* __restrict__ state_read,
                                  float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
-                                 std::int32_t width, head_map heads, float scale) {
+                                 std::int32_t width, head_map heads, float scale,
+                                 const std::int32_t* slots = nullptr,
+                                 const std::int32_t* valid_columns = nullptr) {
     const int lane           = threadIdx.x;
     const int warp_id        = threadIdx.y;
     const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
@@ -235,7 +237,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const std::uint32_t dv_base =
         static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
     const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * kQkPerLane);
-    const float* read_h = state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    const int batch = Batched ? static_cast<int>(blockIdx.y) : 0;
+    const int valid = Batched ? valid_columns[batch] : width;
+    const int slot = Batched ? slots[batch] : 0;
+    const std::int64_t state_offset =
+        (static_cast<std::int64_t>(slot) * heads.H_v + h_v) * kStateDim * kStateDim;
+    const std::int64_t first_column = static_cast<std::int64_t>(batch) * width;
+    const float* read_h = state_read + state_offset;
 
     __align__(16) float state[kDvPerWarp][kQkPerLane];
 #pragma unroll
@@ -244,16 +252,17 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                      dqk_base);
     }
 
-    RawQkLane key = load_raw_qk_lane(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
+    RawQkLane key = load_raw_qk_lane(
+        k + (first_column * heads.H_qk + h_qk) * kStateDim, dqk_base);
     normalize_qk_lane<NormalizeQK>(key.value, lane);
-    for (std::int32_t token = 0; token < width; ++token) {
-        const std::int64_t column = token;
+    for (std::int32_t token = 0; token < valid; ++token) {
+        const std::int64_t column = first_column + token;
         const RawGatePair gate    = load_source_gate(g, beta, column * heads.H_v + h_v);
         const RawValueLane value =
             load_value_lane(v + (column * heads.H_v + h_v) * kStateDim, lane, dv_base);
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
 
-        if (token + 1 < width) {
+        if (token + 1 < valid) {
             key = load_raw_qk_lane(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
             normalize_qk_lane<NormalizeQK>(key.value, lane);
         }
@@ -263,7 +272,15 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                        dv_base, lane, scale);
     }
 
-    float* write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    if constexpr (Batched) {
+        if (lane < kDvPerWarp) {
+            for (int token = valid; token < width; ++token) {
+                out[((first_column + token) * heads.H_v + h_v) * kStateDim + dv_base + lane] =
+                    __float2bfloat16(0.0F);
+            }
+        }
+    }
+    float* write_h = state_write + state_offset;
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
@@ -677,6 +694,8 @@ struct FoldGeometry {
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
+using FoldGeometry36x48 = FoldGeometry<36, 48, 48, 10240>;
+using FoldGeometry1x48 = FoldGeometry<1, 48, 48, 10240>;
 
 template <class Geometry>
 struct FoldAccess {

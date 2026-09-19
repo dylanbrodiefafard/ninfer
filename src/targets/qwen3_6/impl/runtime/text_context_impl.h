@@ -1419,7 +1419,7 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
                         finalize_at_end);
 }
 
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
+PrefillChunkResult TextContext::prefill_chunk(const text::qwen::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
                                               VisionPrefillSession& vision, bool finalize_at_end) {
     if (begin >= input.token_ids.size() || nominal_length == 0 ||
@@ -1433,7 +1433,7 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
                         finalize_at_end);
 }
 
-PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
+PrefillChunkResult TextContext::prefill_chunk(const text::qwen::PreparedPromptData& input,
                                               std::uint32_t begin, std::uint32_t nominal_length,
                                               VisionPrefillSession& vision, bool finalize_at_end,
                                               DFlashFeatureSink& sink) {

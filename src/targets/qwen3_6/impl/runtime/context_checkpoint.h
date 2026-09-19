@@ -281,7 +281,7 @@ struct ResidentReuseState {
     const ResidentPrefixIdentity* identity              = nullptr;
     std::uint32_t execution_frontier                    = 0;
     bool rewrite_valid                                   = false;
-    RewriteCheckpointKind rewrite_kind                  = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind rewrite_kind                  = text::qwen::RewriteCheckpointKind::TurnClosure;
     std::uint32_t rewrite_frontier                      = 0;
     std::uint32_t mtp_kv_valid                          = 0;
     std::uint32_t dflash_context_frontier               = 0;
@@ -292,8 +292,8 @@ struct ResidentReuseState {
 
 // The restore path a rewrite checkpoint kind replays through.
 [[nodiscard]] constexpr ninfer::PrefixReusePath rewrite_restore_path(
-    RewriteCheckpointKind kind) noexcept {
-    return kind == RewriteCheckpointKind::TurnClosure
+    text::qwen::RewriteCheckpointKind kind) noexcept {
+    return kind == text::qwen::RewriteCheckpointKind::TurnClosure
                ? ninfer::PrefixReusePath::RestoreTurnCheckpoint
                : ninfer::PrefixReusePath::RestoreResponseCheckpoint;
 }
@@ -340,7 +340,7 @@ struct ReuseBackendPolicy {
 // checkpoint instead of forcing a FullReset later. Among the non-append candidates the
 // longest matching head that the backend can legally continue wins.
 [[nodiscard]] inline PrefillReuseSelection decide_resident_reuse(
-    const ResidentReuseState& state, const PreparedPromptData& prompt,
+    const ResidentReuseState& state, const text::qwen::PreparedPromptData& prompt,
     ninfer::SpeculativeBackend backend, bool mtp_cache_present, bool dflash_present,
     bool dflash_full_layers) {
     const ReuseBackendPolicy policy{backend, mtp_cache_present, dflash_present, dflash_full_layers};

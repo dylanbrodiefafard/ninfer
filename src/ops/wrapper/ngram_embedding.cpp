@@ -209,4 +209,22 @@ void ngram_row_ids(const Tensor& input_ids, const Tensor& valid_tokens,
                                  new_history, stream);
 }
 
+void ngram_history_commit(const Tensor& ids,const Tensor& counts,const Tensor& slots,
+                           Tensor& history,cudaStream_t stream) {
+    const int width=ids.ne[0],batch=ids.ne[1],capacity=history.ne[1];
+    const std::array<const Tensor*,4> tensors{&ids,&counts,&slots,&history};
+    for(const auto* t:tensors) {
+        require_i32_contiguous(*t,"history commit operand");
+        if(reinterpret_cast<std::uintptr_t>(t->data)%4)
+            throw std::invalid_argument("ngram_history_commit: unaligned tensor");
+    }
+    if(width<1 || batch<1 || batch>capacity || capacity>4)
+        throw std::invalid_argument("ngram_history_commit: invalid geometry");
+    require_shape(ids,width,batch,1,"ids");require_shape(counts,batch,1,1,"counts");
+    require_shape(slots,batch,1,1,"slots");require_shape(history,2,capacity,1,"history");
+    for(int i=0;i<4;++i) for(int j=0;j<i;++j) if(overlaps(*tensors[i],*tensors[j]))
+        throw std::invalid_argument("ngram_history_commit: overlapping tensors");
+    detail::ngram_history_commit_launch(ids,counts,slots,history,stream);
+}
+
 } // namespace ninfer::ops

@@ -1,5 +1,8 @@
 #include "runtime/contract/sampling.h"
+#include "core/device.h"
+#include "ninfer/ops/sampling.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -31,6 +34,30 @@ void validate(const ResolvedSamplingParameters& sampling) {
 }
 
 } // namespace
+
+void rollback_sampling_counts(const ops::SamplingConfig& sampling,
+                              std::span<const TokenId> tokens) {
+    if (sampling.temperature <= 0.0F || sampling.token_counts == nullptr) { return; }
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        if (std::find(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(index),
+                      tokens[index]) !=
+            tokens.begin() + static_cast<std::ptrdiff_t>(index)) {
+            continue;
+        }
+        const auto occurrences = static_cast<std::int32_t>(
+            std::count(tokens.begin() + static_cast<std::ptrdiff_t>(index), tokens.end(),
+                       tokens[index]));
+        std::int32_t count = 0;
+        CUDA_CHECK(cudaMemcpy(&count, sampling.token_counts + tokens[index], sizeof(count),
+                              cudaMemcpyDeviceToHost));
+        if (count < occurrences) {
+            throw std::logic_error("rejected sampling token count underflow");
+        }
+        count -= occurrences;
+        CUDA_CHECK(cudaMemcpy(sampling.token_counts + tokens[index], &count, sizeof(count),
+                              cudaMemcpyHostToDevice));
+    }
+}
 
 ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& defaults,
                                             SamplingMode mode, const SamplingOverrides& overrides) {

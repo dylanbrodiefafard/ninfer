@@ -258,8 +258,8 @@ int round_trip_pool(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
     return failures;
 }
 
-ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
-    ninfer::targets::qwen3_6::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids   = std::move(tokens);
     prompt.token_types.assign(prompt.token_ids.size(), 0);
     prompt.positions.resize(3 * prompt.token_ids.size());
@@ -274,10 +274,10 @@ ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::vector<ninfer::Tok
 
 int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
                        ninfer::PagedKVPool& pool, ninfer::PagedKVAllocation& alloc,
-                       const ninfer::targets::qwen3_6::PreparedPromptData& prompt,
+                       const ninfer::text::qwen::PreparedPromptData& prompt,
                        cudaStream_t stream, std::uint32_t checkpoint_frontier = 0,
                        bool tail_hidden_valid = true, std::uint32_t backend_frontier = 0) {
-    ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -303,7 +303,7 @@ int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
         retained.token_ids, identity, source.execution_frontier);
     if (checkpoint_frontier != 0) {
         source.rewrite_valid     = true;
-        source.rewrite_kind      = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
+        source.rewrite_kind      = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
         source.rewrite_frontier  = checkpoint_frontier;
         source.hash_c_valid      = true;
         source.hash_c            = ninfer::targets::qwen3_6::detail::prefix_hash_at(
@@ -317,9 +317,9 @@ int capture_text_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
 
 int capture_with_hidden(ninfer::targets::qwen3_6::detail::KVRamCache& cache,
                         ninfer::PagedKVPool& pool, ninfer::PagedKVAllocation& alloc,
-                        const ninfer::targets::qwen3_6::PreparedPromptData& prompt,
+                        const ninfer::text::qwen::PreparedPromptData& prompt,
                         const ninfer::Tensor& hidden, cudaStream_t stream) {
-    ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -445,14 +445,14 @@ int test_kv_ram_index(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
         ++failures;
     }
 
-    q36::PreparedPromptData vision = prompt_a;
-    q36::VisionItem item;
-    item.modality    = q36::PromptModality::Image;
+    ninfer::text::qwen::PreparedPromptData vision = prompt_a;
+    ninfer::text::qwen::VisionItem item;
+    item.modality    = ninfer::text::qwen::PromptModality::Image;
     item.grid        = {.temporal = 1, .height = 2, .width = 4};
     item.patch_count = 8;
     item.token_spans = {{.begin = 0, .count = 4}};
     item.content_digest.fill(1);
-    vision.token_types.assign(4, static_cast<std::uint8_t>(q36::PromptModality::Image));
+    vision.token_types.assign(4, static_cast<std::uint8_t>(ninfer::text::qwen::PromptModality::Image));
     vision.vision_items.push_back(item);
     q36::detail::KVRamCache vision_cache(4ULL << 20);
     if (capture_text_entry(vision_cache, pool, alloc, vision, ctx.copy_stream) != 0) {
@@ -1066,7 +1066,7 @@ int test_copy_compute_stream_overlap(ninfer::DeviceContext& ctx, ninfer::PagedKV
                           {static_cast<std::int32_t>(kBulkBytes)});
 
     const auto prompt = text_prompt({70, 71, 72, 73});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -1431,7 +1431,7 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     source.materialize_pages(2, ctx.stream);
     fill_logical_pages(pool, source, 81);
     const auto prompt = text_prompt({80, 81, 82, 83});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -1456,7 +1456,7 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     cap.text_kv_valid             = cap.execution_frontier;
     cap.tail_hidden_valid         = true;
     cap.rewrite_valid             = true;
-    cap.rewrite_kind              = q36::RewriteCheckpointKind::ResponseReplay;
+    cap.rewrite_kind              = ninfer::text::qwen::RewriteCheckpointKind::ResponseReplay;
     cap.rewrite_frontier          = 2;
     cap.hash_c_valid              = true;
     cap.ledger                    = retained.token_ids;
@@ -1526,7 +1526,7 @@ int test_restore_throw_then_replay(ninfer::DeviceContext& ctx, ninfer::PagedKVPo
     cache.consume(match->entry_id);
     ctx.synchronize_all();
     int failures = 0;
-    if (!host.rewrite_valid || host.rewrite_kind != q36::RewriteCheckpointKind::ResponseReplay ||
+    if (!host.rewrite_valid || host.rewrite_kind != ninfer::text::qwen::RewriteCheckpointKind::ResponseReplay ||
         host.rewrite_frontier != 2) {
         std::cerr << "response-checkpoint host metadata mismatch after failed unpack\n";
         ++failures;
@@ -1974,7 +1974,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -1995,7 +1995,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     source.mtp_kv_valid       = 3;
     source.tail_hidden_valid  = true;
     source.rewrite_valid      = true;
-    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind       = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier   = 2;
     source.hash_c_valid       = true;
     source.ledger             = retained.token_ids;
@@ -2175,7 +2175,7 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -2220,7 +2220,7 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
     source.mtp_kv_valid       = source.execution_frontier;
     source.tail_hidden_valid  = true;
     source.rewrite_valid      = true;
-    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind       = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier   = 6;
     source.hash_c_valid       = true;
     source.ledger             = retained.token_ids;
@@ -2438,7 +2438,7 @@ int test_context_checkpoint_two_ram_entries(ninfer::DeviceContext& ctx) {
 
     const auto make_retained = [](std::vector<ninfer::TokenId> tokens) {
         auto prompt = text_prompt(std::move(tokens));
-        q36::PreparedPromptData retained = prompt;
+        ninfer::text::qwen::PreparedPromptData retained = prompt;
         retained.token_ids.push_back(0);
         retained.token_types.push_back(0);
         const std::size_t n = retained.token_ids.size();
@@ -2451,8 +2451,8 @@ int test_context_checkpoint_two_ram_entries(ninfer::DeviceContext& ctx) {
         }
         return retained;
     };
-    q36::PreparedPromptData retained_a = make_retained({1, 2, 3, 4});
-    q36::PreparedPromptData retained_b = make_retained({9, 8, 7, 6});
+    ninfer::text::qwen::PreparedPromptData retained_a = make_retained({1, 2, 3, 4});
+    ninfer::text::qwen::PreparedPromptData retained_b = make_retained({9, 8, 7, 6});
     q36::detail::ResidentPrefixIdentity identity_a;
     q36::detail::ResidentPrefixIdentity identity_b;
     identity_a.assign(retained_a);
@@ -2486,7 +2486,7 @@ int test_context_checkpoint_two_ram_entries(ninfer::DeviceContext& ctx) {
     hidden_b_buf.fill(0xb3);
     ninfer::Tensor hidden_b(hidden_b_buf.p, ninfer::DType::U8, {32});
 
-    auto capture = [&](q36::PreparedPromptData& retained, q36::detail::ResidentPrefixIdentity& id,
+    auto capture = [&](ninfer::text::qwen::PreparedPromptData& retained, q36::detail::ResidentPrefixIdentity& id,
                        ninfer::PagedKVAllocation& text, ninfer::Tensor& hidden,
                        std::vector<q36::detail::RamLadderHead> ladders) {
         q36::detail::RamCaptureSource source;
@@ -2616,7 +2616,7 @@ int test_context_checkpoint_ladder_beats_rewrite(ninfer::DeviceContext& ctx) {
     fill_logical_pages(text_pool, text, 5);
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8, 9});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -2649,7 +2649,7 @@ int test_context_checkpoint_ladder_beats_rewrite(ninfer::DeviceContext& ctx) {
     source.text_kv_valid      = source.execution_frontier;
     source.tail_hidden_valid  = true;
     source.rewrite_valid      = true;
-    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind       = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier   = 4;
     source.hash_c_valid       = true;
     source.ledger             = retained.token_ids;
@@ -2693,7 +2693,7 @@ int test_context_checkpoint_equal_execution_is_append(ninfer::DeviceContext& ctx
     fill_logical_pages(text_pool, text, 5);
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -2726,7 +2726,7 @@ int test_context_checkpoint_equal_execution_is_append(ninfer::DeviceContext& ctx
     source.text_kv_valid      = source.execution_frontier;
     source.tail_hidden_valid  = true;
     source.rewrite_valid      = true;
-    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind       = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier   = 4;
     source.hash_c_valid       = true;
     source.ledger             = retained.token_ids;
@@ -2769,7 +2769,7 @@ int test_context_checkpoint_hash_mismatch(ninfer::DeviceContext& ctx) {
     text.materialize_pages(2, ctx.stream);
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -2840,7 +2840,7 @@ int test_context_checkpoint_rollback_recapture(ninfer::DeviceContext& ctx) {
     fill_logical_pages(text_pool, text, 9);
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -2953,7 +2953,7 @@ int test_context_checkpoint_consume_waits_copies(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
 
     const auto prompt = text_prompt({1, 2, 3, 4});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3064,7 +3064,7 @@ int test_context_checkpoint_catch_up_frontier(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {32});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3210,7 +3210,7 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3242,7 +3242,7 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
     source.mtp_kv_valid       = source.execution_frontier;
     source.tail_hidden_valid  = true;
     source.rewrite_valid      = true;
-    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind       = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier   = 2;
     source.hash_c_valid       = true;
     source.ledger             = retained.token_ids;
@@ -3374,7 +3374,7 @@ int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3416,7 +3416,7 @@ int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
     source.mtp_kv_valid            = source.execution_frontier;
     source.tail_hidden_valid       = true;
     source.rewrite_valid           = true;
-    source.rewrite_kind            = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind            = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier        = 2;
     source.hash_c_valid            = true;
     source.ledger                  = retained.token_ids;
@@ -3649,7 +3649,7 @@ int test_context_checkpoint_dflash_cyclic_isolation(ninfer::DeviceContext& ctx) 
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3776,7 +3776,7 @@ int test_same_f_rewrite_beats_ram_rollback(ninfer::DeviceContext& ctx) {
     fill_logical_pages(text_pool, text, 5);
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3810,7 +3810,7 @@ int test_same_f_rewrite_beats_ram_rollback(ninfer::DeviceContext& ctx) {
     source.text_kv_valid      = source.execution_frontier;
     source.tail_hidden_valid  = true;
     source.rewrite_valid      = true;
-    source.rewrite_kind       = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind       = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier   = 4;
     source.hash_c_valid       = true;
     source.ledger             = retained.token_ids;
@@ -3888,7 +3888,7 @@ int test_rollback_skips_ahead_rewrite_gdn(ninfer::DeviceContext& ctx) {
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -3920,7 +3920,7 @@ int test_rollback_skips_ahead_rewrite_gdn(ninfer::DeviceContext& ctx) {
     source.mtp_kv_valid              = source.execution_frontier;
     source.tail_hidden_valid         = true;
     source.rewrite_valid             = true;
-    source.rewrite_kind              = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind              = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier          = 8;
     source.hash_c_valid              = true;
     source.ledger                    = retained.token_ids;
@@ -4050,7 +4050,7 @@ int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
     ninfer::Tensor rewrite(rewrite_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -4082,7 +4082,7 @@ int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
     source.mtp_kv_valid              = source.execution_frontier;
     source.tail_hidden_valid         = true;
     source.rewrite_valid             = true;
-    source.rewrite_kind              = q36::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind              = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier          = 2;
     source.hash_c_valid              = true;
     source.ledger                    = retained.token_ids;
@@ -4212,7 +4212,7 @@ int test_rollback_head_gdn_geometry_mismatch(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {128});
 
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    q36::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -4331,7 +4331,7 @@ int test_context_checkpoint_same_f_fifo_first_wins(ninfer::DeviceContext& ctx) {
 
     auto make_retained = []() {
         auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-        q36::PreparedPromptData retained = prompt;
+        ninfer::text::qwen::PreparedPromptData retained = prompt;
         retained.token_ids.push_back(0);
         retained.token_types.push_back(0);
         const std::size_t n = retained.token_ids.size();
@@ -4344,8 +4344,8 @@ int test_context_checkpoint_same_f_fifo_first_wins(ninfer::DeviceContext& ctx) {
         }
         return retained;
     };
-    q36::PreparedPromptData retained_a = make_retained();
-    q36::PreparedPromptData retained_b = make_retained();
+    ninfer::text::qwen::PreparedPromptData retained_a = make_retained();
+    ninfer::text::qwen::PreparedPromptData retained_b = make_retained();
     q36::detail::ResidentPrefixIdentity identity_a;
     q36::detail::ResidentPrefixIdentity identity_b;
     identity_a.assign(retained_a);
@@ -4365,7 +4365,7 @@ int test_context_checkpoint_same_f_fifo_first_wins(ninfer::DeviceContext& ctx) {
     hidden_b_buf.fill(0xb3);
     ninfer::Tensor hidden_b(hidden_b_buf.p, ninfer::DType::U8, {32});
 
-    const auto capture = [&](q36::PreparedPromptData& retained,
+    const auto capture = [&](ninfer::text::qwen::PreparedPromptData& retained,
                              q36::detail::ResidentPrefixIdentity& identity,
                              ninfer::PagedKVAllocation& text, ninfer::Tensor& hidden,
                              const std::vector<unsigned char>& conv,
@@ -4496,7 +4496,7 @@ int test_failed_second_capture_discards_first(ninfer::DeviceContext& ctx, ninfer
         std::cerr << "abandoned-capture missing first id\n";
         return 1;
     }
-    q36::PreparedPromptData retained = prompt_b;
+    ninfer::text::qwen::PreparedPromptData retained = prompt_b;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -5299,7 +5299,7 @@ int test_claimed_capacity_capture_preserves_fifo(ninfer::DeviceContext& ctx,
     // the middle claimed exercise enough bytes split across noncontiguous gaps.
     for (const std::size_t residents : {2U, 3U}) {
         q36::detail::KVRamCache cache(residents * small_bytes);
-        std::vector<q36::PreparedPromptData> prompts;
+        std::vector<ninfer::text::qwen::PreparedPromptData> prompts;
         std::vector<std::uint64_t> ids;
         for (std::size_t i = 0; i < residents; ++i) {
             prompts.push_back(text_prompt(std::vector<ninfer::TokenId>(64, 17 + i)));

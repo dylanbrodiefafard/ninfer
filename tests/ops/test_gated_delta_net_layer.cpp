@@ -1,4 +1,5 @@
 #include "ninfer/ops/gated_delta_net_layer.h"
+#include "core/device.h"
 
 #include "ops/op_tester.h"
 #include "ops/native_projection_fixture.h"
@@ -455,6 +456,7 @@ struct OracleResult {
     std::vector<double> output;
     std::vector<double> conv_state;
     std::vector<double> ssm_state;
+    std::vector<double> conv_records, key_records, value_records, gate_records;
 };
 
 std::vector<double> project(const std::vector<float>& weight, std::int32_t rows,
@@ -576,6 +578,8 @@ OracleResult oracle(const Fixture& fixture, const std::vector<float>& input,
     std::vector<double> state(initial_ssm.begin(), initial_ssm.end());
     std::vector<double> recurrent(static_cast<std::size_t>(kValueRows) * tokens);
     std::vector<double> delta(kHeadDim);
+    std::vector<double> gate_records(std::size_t(2)*kValueHeads*tokens);
+    std::vector<double> key_records(std::size_t(kValueRows)*tokens);
     const double query_scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
     for (std::int32_t head = 0; head < kValueHeads; ++head) {
         // GGUF stores V-side heads tiled by repeat group, so represented head h consumes h%16.
@@ -593,6 +597,9 @@ OracleResult oracle(const Fixture& fixture, const std::vector<float>& input,
                 softplus(a[control] + fixture.dt_bias[head])));
             const double beta =
                 static_cast<double>(static_cast<float>(sigmoid(b[control])));
+            gate_records[control*2]=g;
+            gate_records[control*2+1]=beta;
+            std::copy_n(k.data()+qk_base,kHeadDim,key_records.data()+value_base);
             const double alpha = std::exp(g);
             for (std::int32_t row = 0; row < kHeadDim; ++row) {
                 double dot = 0.0;
@@ -648,7 +655,110 @@ OracleResult oracle(const Fixture& fixture, const std::vector<float>& input,
             output[static_cast<std::size_t>(token) * kHidden + row] = token_output[row];
         }
     }
-    return {std::move(output), std::move(conv_state), std::move(state)};
+    return {std::move(output), std::move(conv_state), std::move(state),
+            std::move(raw),std::move(key_records),std::move(v),std::move(gate_records)};
+}
+
+int run_compact_case(Fixture& fixture, int width, int batch) {
+    constexpr int capacity=4;
+    const std::size_t conv_size=std::size_t(kQkvRows)*3;
+    const std::size_t state_size=std::size_t(kHeadDim)*kHeadDim*kValueHeads;
+    std::vector<float> input(std::size_t(kHidden)*width*batch), initial_conv(conv_size*capacity),
+        initial_ssm(state_size*capacity);
+    fill_uniform(input,851,-.20F,.20F); round_to_bf16(input);
+    fill_uniform(initial_conv,852,-.05F,.05F); round_to_bf16(initial_conv);
+    fill_uniform(initial_ssm,853,-.002F,.002F);
+    std::vector<int> slots{2,0,3,1}, valid{width,std::max(1,width-1),0,width};
+    slots.resize(batch); valid.resize(batch);
+    std::vector<double> expected_output(input.size(),0), expected_conv(initial_conv.begin(),initial_conv.end()),
+        expected_ssm(initial_ssm.begin(),initial_ssm.end());
+    std::vector<OracleResult> references(batch);
+    for (int b=0;b<batch;++b) {
+        if (!valid[b]) continue;
+        std::vector<float> row(input.begin()+std::size_t(b)*width*kHidden,
+            input.begin()+(std::size_t(b)*width+valid[b])*kHidden);
+        std::vector<float> conv(initial_conv.begin()+slots[b]*conv_size,
+                                initial_conv.begin()+(slots[b]+1)*conv_size);
+        std::vector<float> state(initial_ssm.begin()+slots[b]*state_size,
+                                initial_ssm.begin()+(slots[b]+1)*state_size);
+        references[b]=oracle(fixture,row,conv,state,valid[b]);
+        const auto& ref=references[b];
+        std::copy(ref.output.begin(),ref.output.end(),expected_output.begin()+std::size_t(b)*width*kHidden);
+        std::copy(ref.conv_state.begin(),ref.conv_state.end(),expected_conv.begin()+slots[b]*conv_size);
+        std::copy(ref.ssm_state.begin(),ref.ssm_state.end(),expected_ssm.begin()+slots[b]*state_size);
+    }
+    auto dx=to_device_bf16(input), dc=to_device_bf16(initial_conv), ds=to_device_f32(initial_ssm);
+    auto di=to_device(slots), dv=to_device(valid);
+    GuardedDeviceBuffer dy(input.size()*2), co(initial_conv.size()*2), so(initial_ssm.size()*4);
+    Tensor x(dx.p,DType::BF16,{kHidden,width,batch}), out(dy.data(),DType::BF16,{kHidden,width,batch}),
+        ci(dc.p,DType::BF16,{kQkvRows,3,capacity}), cout(co.data(),DType::BF16,{kQkvRows,3,capacity}),
+        si(ds.p,DType::FP32,{128,128,48,capacity}), sout(so.data(),DType::FP32,{128,128,48,capacity}),
+        ids(di.p,DType::I32,{batch}), counts(dv.p,DType::I32,{batch});
+    const auto weights=fixture.views();
+    WorkspaceArena workspace(ops::gated_delta_net_layer_batch_workspace_capacity_bytes(
+        width,batch,weights.qkv.qtype,weights.z.qtype,weights.output.qtype));
+    GuardedDeviceBuffer rc(std::size_t(kQkvRows)*width*batch*2),
+        rk(std::size_t(kValueRows)*width*batch*2), rv(std::size_t(kValueRows)*width*batch*2),
+        rg(std::size_t(kValueHeads)*width*batch*8);
+    GdnReplayRecordLayer records{Tensor(rc.data(),DType::BF16,{kQkvRows,width,batch}),
+        Tensor(rk.data(),DType::BF16,{128,48,width,batch}),Tensor(rv.data(),DType::BF16,{128,48,width,batch}),
+        Tensor(rg.data(),DType::FP32,{2,48,width,batch})};
+    cudaStream_t stream; CUDA_CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    int failures=0;
+    for (bool graph : {false,true}) {
+        CUDA_CHECK(cudaMemcpyAsync(co.data(),dc.p,ci.bytes(),cudaMemcpyDeviceToDevice,stream));
+        CUDA_CHECK(cudaMemcpyAsync(so.data(),ds.p,si.bytes(),cudaMemcpyDeviceToDevice,stream));
+        if (graph) CUDA_CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+        // Graph route exercises exact in-place state; eager route preserves immutable source pools.
+        const Tensor& cin=graph?cout:ci; const Tensor& sin=graph?sout:si;
+        ops::gated_delta_net_layer_batch(x,weights,cin,cout,sin,sout,ids,counts,out,
+            workspace,stream,{},width>=2?&records:nullptr);
+        cudaGraph_t captured=nullptr; cudaGraphExec_t exec=nullptr;
+        if (graph) {
+            CUDA_CHECK(cudaStreamEndCapture(stream,&captured));
+            CUDA_CHECK(cudaGraphInstantiate(&exec,captured,0));
+            CUDA_CHECK(cudaGraphLaunch(exec,stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto output=from_device_bf16(dy.data(),input.size());
+        failures+=verify_reduction("compact GDN independent output",output,expected_output,kOutputCriterion);
+        failures+=verify_reduction("compact GDN independent conv",from_device_bf16(co.data(),initial_conv.size()),
+            expected_conv,conv_state_criterion(fixture.input_qtype));
+        const auto state=from_device<float>(so.data(),initial_ssm.size());
+        failures+=verify_reduction("compact GDN independent SSM",std::vector<double>(state.begin(),state.end()),
+            expected_ssm,kStateCriterion);
+        for(int b=0;b<batch;++b) for(int t=valid[b];t<width;++t) for(int d=0;d<kHidden;++d)
+            if(output[(std::size_t(b)*width+t)*kHidden+d]!=0) {++failures;break;}
+        for(int slot=0;slot<capacity;++slot) {
+            const auto it=std::find(slots.begin(),slots.end(),slot);
+            if(it!=slots.end() && valid[it-slots.begin()]) continue;
+            failures+=verify_exact("compact GDN untouched/empty state",
+                std::vector<float>(state.begin()+slot*state_size,state.begin()+(slot+1)*state_size),
+                std::vector<float>(initial_ssm.begin()+slot*state_size,initial_ssm.begin()+(slot+1)*state_size));
+        }
+        if(width>=2) for(int b=0;b<batch;++b) if(valid[b]) {
+            const auto& ref=references[b];
+            failures+=verify_reduction("compact GDN raw QKV record",
+                from_device_bf16(static_cast<std::uint16_t*>(rc.data())+std::size_t(b)*width*kQkvRows,ref.conv_records.size()),
+                ref.conv_records,conv_state_criterion(fixture.input_qtype));
+            failures+=verify_reduction("compact GDN raw K record",
+                from_device_bf16(static_cast<std::uint16_t*>(rk.data())+std::size_t(b)*width*kValueRows,ref.key_records.size()),
+                ref.key_records,kOutputCriterion);
+            failures+=verify_reduction("compact GDN raw V record",
+                from_device_bf16(static_cast<std::uint16_t*>(rv.data())+std::size_t(b)*width*kValueRows,ref.value_records.size()),
+                ref.value_records,kOutputCriterion);
+            const auto controls=from_device<float>(static_cast<float*>(rg.data())+std::size_t(b)*width*96,ref.gate_records.size());
+            failures+=verify_reduction("compact GDN gate record",std::vector<double>(controls.begin(),controls.end()),
+                ref.gate_records,{1e-5,1e-6,1e-5});
+        }
+        if(exec) CUDA_CHECK(cudaGraphExecDestroy(exec));
+        if(captured) CUDA_CHECK(cudaGraphDestroy(captured));
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    failures+=verify_exact("compact GDN read-only conv",from_device<std::uint16_t>(dc.p,initial_conv.size()),bf16_bits(initial_conv));
+    failures+=verify_exact("compact GDN read-only SSM",from_device<float>(ds.p,initial_ssm.size()),initial_ssm);
+    for(const auto* buffer:{&dy,&co,&so,&rc,&rk,&rv,&rg}) failures+=buffer->verify_guards("compact GDN buffers");
+    return failures;
 }
 
 int run_complete_case(Fixture& fixture, std::int32_t tokens, const char* label) {
@@ -680,13 +790,39 @@ int run_complete_case(Fixture& fixture, std::int32_t tokens, const char* label) 
     const std::size_t full_bytes = ops::gated_delta_net_layer_workspace_capacity_bytes(
         tokens, weights.qkv.qtype, weights.z.qtype, weights.output.qtype);
     WorkspaceArena full_workspace(full_bytes);
+    const bool record=tokens>=2 && tokens<=16;
+    GuardedDeviceBuffer record_conv(std::size_t(kQkvRows)*tokens*2),
+        record_key(std::size_t(kValueRows)*tokens*2),record_value(std::size_t(kValueRows)*tokens*2),
+        record_gate(std::size_t(kValueHeads)*tokens*8);
+    GdnReplayRecordLayer replay{Tensor(record_conv.data(),DType::BF16,{kQkvRows,tokens,1}),
+        Tensor(record_key.data(),DType::BF16,{kHeadDim,kValueHeads,tokens,1}),
+        Tensor(record_value.data(),DType::BF16,{kHeadDim,kValueHeads,tokens,1}),
+        Tensor(record_gate.data(),DType::FP32,{2,kValueHeads,tokens,1})};
     ops::gated_delta_net_layer(x, weights, conv_in, conv_out, ssm_in, ssm_out, output,
-                               full_workspace, nullptr);
+                               full_workspace, nullptr,{},record?&replay:nullptr);
     cuda_synchronize();
 
     int failures = verify_reduction(std::string(label) + " panel output",
                                     from_device_bf16(d_output.data(), expected.output.size()),
                                     expected.output, kOutputCriterion);
+    if(record) {
+        failures+=verify_reduction(std::string(label)+" observable raw QKV records",
+            from_device_bf16(record_conv.data(),expected.conv_records.size()),
+            expected.conv_records,conv_state_criterion(fixture.input_qtype));
+        failures+=verify_reduction(std::string(label)+" observable expanded raw K records",
+            from_device_bf16(record_key.data(),expected.key_records.size()),
+            expected.key_records,kOutputCriterion);
+        failures+=verify_reduction(std::string(label)+" observable raw V records",
+            from_device_bf16(record_value.data(),expected.value_records.size()),
+            expected.value_records,kOutputCriterion);
+        const auto controls=from_device<float>(record_gate.data(),expected.gate_records.size());
+        failures+=verify_reduction(std::string(label)+" observable FP32 control records",
+            std::vector<double>(controls.begin(),controls.end()),expected.gate_records,{1e-5,1e-6,1e-5});
+        failures+=record_conv.verify_guards("GDN raw QKV replay");
+        failures+=record_key.verify_guards("GDN raw K replay");
+        failures+=record_value.verify_guards("GDN raw V replay");
+        failures+=record_gate.verify_guards("GDN FP32 controls replay");
+    }
     failures += verify_reduction(std::string(label) + " distinct conv state",
                                  from_device_bf16(d_conv_out.data(), initial_conv.size()),
                                  expected.conv_state, conv_state_criterion(fixture.input_qtype));
@@ -1060,6 +1196,16 @@ Result gdn_calibrated(const std::string& root, const std::string& path, int laye
 #else
 int main(int argc, char** argv) {
     if (const int unavailable = require_cuda()) { return unavailable; }
+    if(argc==2 && std::string_view(argv[1])=="--compact") {
+        int failures=0;
+        for(auto type:{QType::BF16_CTRL,QType::NVFP4,QType::FP8_E4M3FN_ROW_BF16S}) {
+            Fixture fixture(type);
+            failures+=run_compact_case(fixture,3,3);
+            failures+=run_compact_case(fixture,1,4);
+            if(type==QType::NVFP4) failures+=run_compact_case(fixture,16,4);
+        }
+        return failures?1:0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--native-fp8-real") {
         const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
         if(!root) { return 77; }
@@ -1070,6 +1216,7 @@ int main(int argc, char** argv) {
         if (!root) { return 77; }
         Fixture fixture(std::string(root) + "/qwen4-layer-0.ninfer");
         int failures = bf16_state_rounding_witness();
+        failures += run_compact_case(fixture,3,3);
         failures += run_complete_case(fixture, 1, "native source GDN T1");
         failures += run_complete_case(fixture, 3, "native source GDN T3");
         failures += run_partition_case(fixture, 65, {32, 33}, "native source GDN continuation");
@@ -1085,6 +1232,9 @@ int main(int argc, char** argv) {
     failures += run_complete_case(q6_fixture, 1, "GDN layer-2 Q6_K/Q6_K");
     for (QType type : {QType::BF16_CTRL, QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S}) {
         Fixture native(type);
+        failures += run_compact_case(native,3,3);
+        failures += run_compact_case(native,1,4);
+        if(type==QType::NVFP4) failures+=run_compact_case(native,16,4);
         failures += run_complete_case(native, 3, type == QType::BF16_CTRL ? "GDN BF16" :
             type == QType::NVFP4 ? "GDN NVFP4" : "GDN FP8");
         failures += run_partition_case(native, 65, {32, 33}, "GDN native partition");

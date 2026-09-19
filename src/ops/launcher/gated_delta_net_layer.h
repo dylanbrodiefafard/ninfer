@@ -19,4 +19,9 @@ void gated_delta_net_layer_norm_launch(const Tensor& recurrent, const Tensor& z,
                                        const Tensor& norm_weight, Tensor& normalized_gated,
                                        cudaStream_t stream);
 
+void gated_delta_net_layer_conv_batch_launch(const Tensor& projected_qkv,
+    const Tensor& conv_weight, const Tensor& state_in, Tensor& state_out,
+    const Tensor& slots, const Tensor& valid_columns, std::int32_t width,
+    Tensor& q, Tensor& k, Tensor& v, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

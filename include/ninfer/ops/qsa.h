@@ -40,6 +40,63 @@ struct QsaStateView {
     Tensor positions;
 };
 
+/** Native growing state. Every plane uses the same page-group IDs and page size 64.
+ * K/V are BF16 [256,64,2,P] or NVFP4 U8 [128,64,2,P], with FP8_E4M3FN
+ * scales [16,64,2,P]. Raw keys are BF16 [128,64,1,P], positions I32 [3,64,1,P].
+ * block_tables is I32 [L,C], C=1..4. All planes are contiguous page-major, disjoint,
+ * and caller-owned. Logical capacity is 64*L, at most the source context 262144.
+ * Paging changes no codec or selection mathematics. This view owns no frontier.
+ */
+struct QsaPagedStateView {
+    QsaKvFormat format = QsaKvFormat::BF16;
+    Tensor k, v, k_scales, v_scales, raw_index_keys, positions, block_tables;
+};
+
+/** Device controls for exact compact B rows, not padded to C. table_rows [B] selects
+ * distinct writable table rows; valid_columns [B] is in [0,W]; frontiers [B] is the
+ * length before append. positions is I32 [3,W,B] (MRoPE coordinates, not KV ordinals).
+ * Query j writes logical frontiers[b]+j and sees precisely [0,frontiers[b]+j].
+ * Only j<valid_columns[b] is live. Mappings for all live reads/writes are materialized
+ * and stable until the stream drains. No host readback occurs, including graph replay.
+ */
+struct QsaBatchControls {
+    Tensor table_rows, valid_columns, frontiers, positions;
+};
+
+/** Native overloads: B=1 permits W=1..4096 prefill; B=2..4 permits W=1..16.
+ * max_visible_keys is a host execution envelope in [1,64*L], covering every live
+ * frontier+valid count. It controls launch extent, never logical visibility.
+ * All storage is non-overlapping and remains alive through stream completion.
+ * K/V [256,2,W,B], raw keys [128,W,B]. Invalid suffixes never write state.
+ */
+void qsa_state_append(const Tensor& k, const Tensor& v, const Tensor& raw_index_keys,
+                      const QsaBatchControls& controls, QsaPagedStateView state,
+                      std::int32_t max_visible_keys, cudaStream_t stream);
+
+/** Raw query [128,4,W,B], selected I32 [2051,W,B], count I32 [W,B]. The complete
+ * visible-rank blocks are [4*r,4*r+4); source pooling/norm/MRoPE and stable top512
+ * are identical to the diagnostic CSR formula. Append the incomplete causal tail.
+ * Invalid suffixes are count zero / selected -1. Scratch is independent of context
+ * capacity: a fixed 512-block streaming merge; no capacity-sized shared sort.
+ */
+[[nodiscard]] std::size_t qsa_index_select_workspace_bytes(std::int32_t width,
+                                                         std::int32_t batch);
+void qsa_index_select(const Tensor& raw_query, const QsaPagedStateView& state,
+                      const QsaBatchControls& controls, std::int32_t max_visible_keys,
+                      const Tensor& query_norm_weight, const Tensor& key_norm_weight,
+                      Tensor& selected_ids, Tensor& selected_count, Tensor& workspace,
+                      cudaStream_t stream);
+
+/** Q/out BF16 [256,24,W,B]. Selected [S,W,B], S<=2051, count [W,B]. The caller
+ * promises unique visible logical IDs in each prefix, including an explicitly frozen
+ * subset when requested. Invalid suffixes/empty selections produce exact zero.
+ * No workspace or cache mutation. Reads the represented BF16/NVFP4 state directly.
+ */
+void qsa_selected_attention(const Tensor& q, const Tensor& selected_ids,
+                            const Tensor& selected_count, const QsaPagedStateView& state,
+                            const QsaBatchControls& controls, std::int32_t max_visible_keys,
+                            Tensor& out, cudaStream_t stream);
+
 /**
  * Append normalized/rotated K and projected V from BF16 [256,2,W], copying every bit unchanged
  * for BF16 state or encoding the exact registered NVFP4-G16 codec for diagnostic state, and
@@ -144,5 +201,37 @@ void qsa_verifier(const Tensor& x, const Tensor& append_ids, const Tensor& posit
                   const QsaVerifierWeights& weights, QsaStateView state,
                   Tensor& selected_ids, Tensor& selected_count, Tensor& out,
                   Tensor& workspace, cudaStream_t stream);
+
+/** Same projection, norm/RoPE, cache append, selected attention and output formula as
+ * qsa_verifier, but consumes caller-specified I32 selected_ids [2051,W] / count [W]
+ * without recomputing or mutating them. The caller promises unique visible IDs in each
+ * prefix and valid counts; those IDs may deliberately exclude newly appended rows.
+ * Raw index keys and core K/V are still appended at the supplied logical append IDs.
+ * This is the explicit-input primitive for the audited frozen-domain MTP profile, not
+ * a claim that all upstream MTP implementations use identical tail semantics.
+ * Workspace/alias/lifetime requirements match qsa_verifier; no visibility CSR exists.
+ */
+void qsa_verifier_selected(const Tensor& x, const Tensor& append_ids, const Tensor& position,
+                           const QsaVerifierWeights& weights, QsaStateView state,
+                           const Tensor& selected_ids, const Tensor& selected_count, Tensor& out,
+                           Tensor& workspace, cudaStream_t stream);
+
+/** Native paged composite with the same projection/norm/gate formula and public
+ * cast boundaries as above. x/out [2560,W,B]; controls, selection and storage obey
+ * the native overloads. Workspace is contiguous U8, 256-byte aligned. Invalid output
+ * suffixes are zero; no frontier is advanced. Frozen selection is never mutated.
+ */
+[[nodiscard]] std::size_t qsa_verifier_workspace_bytes(
+    std::int32_t width, std::int32_t batch, QType query_gate, QType key,
+    QType value, QType output);
+void qsa_verifier(const Tensor& x, const QsaBatchControls& controls,
+                  std::int32_t max_visible_keys, const QsaVerifierWeights& weights,
+                  QsaPagedStateView state, Tensor& selected_ids, Tensor& selected_count,
+                  Tensor& out, Tensor& workspace, cudaStream_t stream);
+void qsa_verifier_selected(const Tensor& x, const QsaBatchControls& controls,
+                           std::int32_t max_visible_keys, const QsaVerifierWeights& weights,
+                           QsaPagedStateView state, const Tensor& selected_ids,
+                           const Tensor& selected_count, Tensor& out, Tensor& workspace,
+                           cudaStream_t stream);
 
 } // namespace ninfer::ops

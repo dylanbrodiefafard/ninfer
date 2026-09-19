@@ -81,6 +81,9 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     case Nvfp4Problem::N10240K320:
     case Nvfp4Problem::N2560K2560:
     case Nvfp4Problem::N248320K2560:
+    case Nvfp4Problem::N2560K12800:
+    case Nvfp4Problem::N7680K2560:
+    case Nvfp4Problem::N2560K7680:
         launch_nvfp4_exact_geometry_decode(x, weight, out, stream);
         return;
     }

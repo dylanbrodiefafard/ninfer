@@ -44,8 +44,8 @@ double gbs(std::size_t bytes, double ms, int copies) {
     return (static_cast<double>(copies) * static_cast<double>(bytes) / 1.0e9) / (ms / 1000.0);
 }
 
-ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
-    ninfer::targets::qwen3_6::PreparedPromptData prompt;
+ninfer::text::qwen::PreparedPromptData text_prompt(std::vector<ninfer::TokenId> tokens) {
+    ninfer::text::qwen::PreparedPromptData prompt;
     prompt.token_ids = std::move(tokens);
     prompt.token_types.assign(prompt.token_ids.size(), 0);
     prompt.positions.resize(3 * prompt.token_ids.size());
@@ -175,7 +175,7 @@ int capture_bundle(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::
                    ninfer::PagedKVAllocation& alloc, ninfer::LinearAttentionStatePool& gdn,
                    const ninfer::Tensor& hidden, const ninfer::Tensor& rewrite, cudaStream_t stream) {
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
-    ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
+    ninfer::text::qwen::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
     retained.token_types.push_back(0);
     const std::size_t tokens = retained.token_ids.size();
@@ -194,7 +194,7 @@ int capture_bundle(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::
     source.text_kv_valid           = source.execution_frontier;
     source.tail_hidden_valid       = true;
     source.rewrite_valid           = true;
-    source.rewrite_kind            = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
+    source.rewrite_kind            = ninfer::text::qwen::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier        = 4;
     source.hash_c_valid            = true;
     source.ledger                  = retained.token_ids;

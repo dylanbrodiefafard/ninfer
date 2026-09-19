@@ -445,6 +445,8 @@ int main() {
     failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);
     failures +=
         run_single_case({"35b dflash context k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
+    failures += run_pair_case({"qwen4 dflash native-context proposal",256,256,1,7,kTextTheta},24,2,262'137);
+    failures += run_single_case({"qwen4 dflash native-context K",256,256,1,128,kTextTheta},2,262'016,16);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

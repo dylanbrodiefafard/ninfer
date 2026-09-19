@@ -103,6 +103,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/prepare_masked_block.cu
   ops/launcher/qwen4_sparse_moe.cu
   ops/launcher/qsa.cu
+  ops/launcher/qsa_paged.cu
   ops/launcher/qsa_verifier.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
@@ -283,6 +284,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
   ops/wrapper/vision_patch_merger.cpp
+  ops/wrapper/linear_bias.cpp
+  ops/launcher/linear_bias.cu
   ops/wrapper/linear_add.cpp
   ops/wrapper/linear_pair.cpp
   ops/wrapper/linear_swiglu.cpp
@@ -297,6 +300,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/qwen4_sparse_moe.cpp
   ops/wrapper/qsa.cpp
+  ops/wrapper/qsa_paged.cpp
   ops/wrapper/qsa_verifier.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
@@ -327,6 +331,9 @@ add_library(ninfer_media_decode STATIC
 ninfer_internal_includes(ninfer_media_decode)
 target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
 
+add_library(ninfer_media_prepare STATIC media/prepare/pixels.cpp)
+ninfer_internal_includes(ninfer_media_prepare)
+
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
   add_library(ninfer_media_acquire STATIC
@@ -351,9 +358,26 @@ endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
+add_library(ninfer_qwen_frontend STATIC
+  text/qwen/chat_template.cpp
+  text/qwen/digest.cpp
+  text/qwen/encoded_history_cache.cpp
+  text/qwen/frontend.cpp
+  text/qwen/processor.cpp
+  text/qwen/resources.cpp
+  text/qwen/tokenizer.cpp
+  text/qwen/tool_grammar.cpp
+  text/qwen/generation_recovery.cpp)
+ninfer_internal_includes(ninfer_qwen_frontend)
+target_link_libraries(ninfer_qwen_frontend PUBLIC ninfer_artifact ninfer_text
+  PRIVATE ninfer_tool_grammar ninfer_media_decode ninfer_media_prepare ninfer_qwen4_vision_frontend)
+
+add_library(ninfer_runtime_sampling STATIC runtime/contract/sampling.cpp runtime/contract/tool_masks.cpp)
+ninfer_internal_includes(ninfer_runtime_sampling)
+target_link_libraries(ninfer_runtime_sampling PUBLIC ninfer_core PRIVATE ninfer_qwen_frontend)
+
 add_library(ninfer_engine STATIC
   targets/registry.cpp
-  runtime/contract/sampling.cpp
   runtime/engine/engine.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
@@ -369,11 +393,14 @@ if(ZSTD_CFLAGS_OTHER)
 endif()
 target_link_libraries(ninfer_engine
   PRIVATE
+    ninfer_runtime_sampling
+    ninfer_qwen4_engine_program
+    ninfer_qwen_frontend
     ninfer_artifact
     ninfer_core
     ninfer_ops
     ninfer_text
-    ninfer_media_decode
+    ninfer_media_decode ninfer_media_prepare
     ${ZSTD_LIBRARIES})
 add_library(ninfer::engine ALIAS ninfer_engine)
 

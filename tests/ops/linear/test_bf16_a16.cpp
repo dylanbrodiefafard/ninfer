@@ -178,6 +178,13 @@ int run_bf16_linear() {
             failures += run_bf16_linear_case(merger_weight,tokens);
         }
     }
+    for (const auto [rows, columns] : std::array<std::pair<int,int>,3>{
+            {{2560,12800}, {7680,2560}, {2560,7680}}}) {
+        DeviceWeight draft_weight(make_patterned(rows, columns, 431U));
+        for (int tokens : {1,7,33,129}) {
+            failures += run_bf16_linear_case(draft_weight, tokens);
+        }
+    }
     return failures;
 }
 

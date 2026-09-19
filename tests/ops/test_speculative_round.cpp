@@ -1573,7 +1573,9 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
         const double p = weights[static_cast<std::size_t>(token)] / total;
         collision += p * p;
     }
-    const double cut = ops::p_less_membership_cut(collision, config.temperature);
+    // Independent public-law calculation, not the implementation's cut helper.
+    const double cut = std::max(collision * std::exp(-0.125 / config.temperature),
+                                1.0 / 1024.0);
     std::vector<int> support;
     for (int token = 0; token < token_domain; ++token) {
         if (p_less_token_suppressed(config, token) || !(total > 0.0)) { continue; }
@@ -2887,13 +2889,15 @@ int remap_case(int token_count) {
     return failures;
 }
 
-int column_eligibility_cases(int domain, int physical) {
+int column_eligibility_cases(int domain, int physical, bool upper_vocabulary=false) {
     const int stride = (domain + 31) / 32 + 3;
     std::vector<std::uint32_t> masks(5 * stride, 0);
-    const std::vector<int> allowed{22, 31, 44, 41, 55};
+    const auto id=[&](int token) { return upper_vocabulary?domain-56+token:token; };
+    const int suppressed=upper_vocabulary?248044:8;
+    const std::vector<int> allowed{id(22), id(31), id(44), id(41), id(55)};
     for (int col = 0; col < 5; ++col) {
         masks[col * stride + allowed[col] / 32] |= 1u << (allowed[col] % 32);
-        masks[col * stride] |= 1u << 8; // explicitly suppressed despite grammar eligibility
+        masks[col * stride + suppressed/32] |= 1u << (suppressed%32);
     }
     DeviceBuffer device_masks = to_device(masks);
     std::vector<std::int32_t> counts(domain, 0);
@@ -2906,24 +2910,28 @@ int column_eligibility_cases(int domain, int physical) {
         cfg.allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p);
         cfg.allowed_token_column_stride = stride;
         cfg.suppressed_token_count = 1;
-        cfg.suppressed_tokens[0] = 8;
+        cfg.suppressed_tokens[0] = suppressed;
         const std::string label = "column eligibility V=" + std::to_string(domain) +
                                   " p_less=" + std::to_string(p_less);
         // The independent expected law is a singleton after intersecting eligibility
         // and explicit suppression. A much larger forbidden logit must have no mass.
         const auto chain_logits = peaked_column_logits(physical, 3, {0, 0, 0});
-        const std::vector<std::int32_t> drafts{22, 31};
+        const std::vector<std::int32_t> drafts{id(22), id(31)};
         failures += execute_accept_case(label + " chain", {0, 0, 0}, chain_logits,
-            physical, drafts, 40, domain, cfg, counts, accept_state_oracle(drafts, 2, 44, 40));
-        const std::vector<std::int32_t> invalid_drafts{22, 8};
+            physical, drafts, 40, domain, cfg, counts, accept_state_oracle(drafts, 2, id(44), 40));
+        const std::vector<std::int32_t> invalid_drafts{id(22), suppressed};
         failures += execute_accept_case(label + " correction", {0, 0, 0}, chain_logits,
             physical, invalid_drafts, 40, domain, cfg, counts,
-            accept_state_oracle(invalid_drafts, 1, 31, 40));
+            accept_state_oracle(invalid_drafts, 1, id(31), 40));
+        const std::vector<std::int32_t> rejected_drafts{suppressed, id(31)};
+        failures += execute_accept_case(label + " first rejection", {0, 0, 0}, chain_logits,
+            physical, rejected_drafts, 40, domain, cfg, counts,
+            accept_state_oracle(rejected_drafts, 0, id(22), 40));
         // Traversal 0 -> 2 -> 4: selecting a mask by depth instead of node is wrong.
         failures += execute_tree_case(label + " tree", domain, physical, 5,
-            {-1, 0, 0, 1, 2}, {7, 11, 22, 33, 44}, {0, 0, 0, 0, 0},
+            {-1, 0, 0, 1, 2}, {id(7), id(11), id(22), id(33), id(44)}, {0, 0, 0, 0, 0},
             peaked_column_logits(physical, 5, {0, 0, 0, 0, 0}), 4, 5, cfg, counts,
-            {22, 44, 55, 0, 0}, 2, 4, {0, 2, 4, 0, 0});
+            {id(22), id(44), id(55), 0, 0}, 2, 4, {0, 2, 4, 0, 0});
     }
     failures += verify_exact("eligibility masks unchanged",
         from_device<std::uint32_t>(device_masks, masks.size()), masks);
@@ -2942,6 +2950,7 @@ int main() {
     failures += column_eligibility_cases(64, 64);
     failures += column_eligibility_cases(4096, 4096);
     failures += column_eligibility_cases(248077, 248320);
+    failures += column_eligibility_cases(248320, 248320, true);
     const std::size_t k15 =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
     if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||

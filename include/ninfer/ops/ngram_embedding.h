@@ -94,4 +94,14 @@ void ngram_row_ids(const Tensor& input_ids, const Tensor& valid_tokens,
                    const Tensor& old_history, const NgramRowConfig& config, Tensor& row_ids,
                    Tensor& new_history, cudaStream_t stream);
 
+/** Exact raw-history prefix commit. ids I32[W,B], counts/slots I32[B], history I32[2,C].
+ * For each distinct selected slot, history becomes tail_2(old history || ids[0:count,b]).
+ * Counts are caller-proven in [0,W], slots in [0,C), B<=C<=4. Zero is a strict no-op;
+ * raw EOS remains a token, not a reset operation. Unselected histories are untouched.
+ * All tensors are contiguous, pairwise disjoint and naturally aligned. No workspace,
+ * allocation or synchronization; controls are device values and graph-replay mutable.
+ */
+void ngram_history_commit(const Tensor& ids,const Tensor& counts,const Tensor& slots,
+                           Tensor& history,cudaStream_t stream);
+
 } // namespace ninfer::ops

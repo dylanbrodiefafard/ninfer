@@ -224,6 +224,14 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
         if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
+        } else if (axes == 1 && head_dim == 256 && rotary_dim == 256 && theta == 1.0e7F) {
+            // Qwen4's full-width DFlash rotation reaches the same native context as QSA.
+            // FP32 frequency/phase loses represented key accuracy near its upper bound.
+            const double frequency = pow(1.0e7, -static_cast<double>(pair) / 128.0);
+            double sine, cosine;
+            sincos(static_cast<double>(positions[token]) * frequency, &sine, &cosine);
+            sin_cache[pair] = static_cast<float>(sine);
+            cos_cache[pair] = static_cast<float>(cosine);
         } else {
             int axis       = 0;
             float exponent = 0.0F;

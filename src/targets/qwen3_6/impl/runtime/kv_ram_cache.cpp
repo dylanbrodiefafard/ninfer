@@ -126,7 +126,7 @@ struct HeaderView {
     std::uint32_t dflash_context_frontier = 0;
     bool tail_hidden_valid                = false;
     bool rewrite_valid                    = false;
-    RewriteCheckpointKind rewrite_kind    = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind rewrite_kind    = text::qwen::RewriteCheckpointKind::TurnClosure;
     bool hash_c_valid                     = false;
     std::uint32_t rewrite_frontier        = 0;
     std::uint32_t text_mapped_pages       = 0;
@@ -231,7 +231,7 @@ HeaderView read_header(const void* block, std::size_t bytes) {
     h.dflash_context_frontier = r.u32();
     h.tail_hidden_valid       = r.u8() != 0;
     h.rewrite_valid           = r.u8() != 0;
-    h.rewrite_kind            = static_cast<RewriteCheckpointKind>(r.u8());
+    h.rewrite_kind            = static_cast<text::qwen::RewriteCheckpointKind>(r.u8());
     h.hash_c_valid            = r.u8() != 0;
     h.rewrite_frontier        = r.u32();
     h.text_mapped_pages       = r.u32();
@@ -854,7 +854,7 @@ KVRamCache::HostKvView KVRamCache::host_kv(std::uint64_t entry_id) const {
     return view;
 }
 
-std::optional<RamMatch> KVRamCache::plan_match(const PreparedPromptData& prompt,
+std::optional<RamMatch> KVRamCache::plan_match(const text::qwen::PreparedPromptData& prompt,
                                                std::span<const PrefixHash128> hash_chain,
                                                const ReuseBackendPolicy& policy) {
     std::lock_guard lock(io_mutex_);
@@ -1228,7 +1228,7 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         record.execution_frontier  = source.execution_frontier;
         record.checkpoint_frontier = source.rewrite_frontier;
         record.checkpoint_valid    = source.rewrite_valid;
-        record.checkpoint_path     = source.rewrite_kind == RewriteCheckpointKind::TurnClosure
+        record.checkpoint_path     = source.rewrite_kind == text::qwen::RewriteCheckpointKind::TurnClosure
                                          ? PrefixReusePath::RestoreTurnCheckpoint
                                          : PrefixReusePath::RestoreResponseCheckpoint;
         if (fail_next_capture_metadata_allocation_) {

@@ -118,7 +118,7 @@ struct DiskMeta {
     std::uint32_t dflash_context_frontier = 0;
     bool tail_hidden_valid            = false;
     bool rewrite_valid                = false;
-    RewriteCheckpointKind rewrite_kind = RewriteCheckpointKind::TurnClosure;
+    text::qwen::RewriteCheckpointKind rewrite_kind = text::qwen::RewriteCheckpointKind::TurnClosure;
     bool hash_c_valid                 = false;
     std::uint32_t rewrite_frontier    = 0;
     PrefixHash128 hash_f{};
