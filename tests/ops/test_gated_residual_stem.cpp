@@ -1,6 +1,8 @@
 #include "ninfer/ops/gated_residual_stem.h"
 #include "ops/direct_bf16_weight.h"
 #include "artifact/reader.h"
+#include "targets/qwen4/native_component_timing.h"
+#include <cuda_profiler_api.h>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -94,6 +96,13 @@ int run(const Fixture& f,int t,bool graph) {
         ops::gated_residual_stem(et,ht,en,hn,dew.view(),dhw.view(),out,arena,stream);
         if(arena.used()!=0) throw std::runtime_error("stem failed workspace scope restoration");
     };
+    qwen4_sequence::time_native_component("MTP_stem_W"+std::to_string(t),[] {},[&] {call(0,t,nullptr);});
+    if(t==24 && std::getenv("NINFER_QWEN4_STEM_PROFILE")) {
+        cuda_check(cudaProfilerStart(),"stem profiler start");
+        call(0,t,nullptr);
+        cuda_check(cudaDeviceSynchronize(),"stem profile synchronize");
+        cuda_check(cudaProfilerStop(),"stem profiler stop");
+    }
     call(0,t,nullptr);
     auto got=from_device_bf16(dy.data(),F*t);
     int failures=verify_reduction("stem whole T="+std::to_string(t),got,expected,criterion);
@@ -140,7 +149,7 @@ int main(int argc,char** argv) {
             const char* root=std::getenv("NINFER_QWEN4_NATIVE_LAYERS");
             if(!root) { std::cout<<"SKIP: native MTP stem fixture not configured\n"; return 77; }
             Fixture f(std::string(root)+"/qwen4-mtp-stem.ninfer");
-            for(int t:{1,17,28}) failures+=run(f,t,t==17);
+            for(int t:{1,17,24,28}) failures+=run(f,t,t==17);
         } else {
             Fixture f;
             for(int t:{1,7,27,28,33}) failures+=run(f,t,t==7);

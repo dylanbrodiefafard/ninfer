@@ -5,6 +5,7 @@
 #include "ops/native_projection_fixture.h"
 #include "targets/qwen4/native_bf16_fixture.h"
 #include "targets/qwen4/native_sequence_components.h"
+#include "targets/qwen4/native_component_timing.h"
 #include "ops/launcher/gated_delta_net_layer.h"
 
 #include <algorithm>
@@ -1159,6 +1160,18 @@ static Result gdn_component(Fixture& fixture, const Result& input, bool partitio
     for(int start=0;start<tokens;) {
         const int chunk=partitioned && start==0 ? std::max(1,tokens-1) : tokens-start;
         auto cx=x.slice(1,start,chunk),cy=y.slice(1,start,chunk);
+        if(native_timing_enabled()) {
+            DeviceBuffer saved_conv(initial_conv.size()*2),saved_ssm(initial_ssm.size()*4);
+            cuda_check(cudaMemcpyAsync(saved_conv.p,conv.data,initial_conv.size()*2,cudaMemcpyDeviceToDevice),"save conv");
+            cuda_check(cudaMemcpyAsync(saved_ssm.p,ssm.data,initial_ssm.size()*4,cudaMemcpyDeviceToDevice),"save SSM");
+            time_native_component("GDN T="+std::to_string(chunk)+" qtype="+
+                std::to_string(int(weights.z.qtype))+" Z-A8="+
+                std::to_string(policy.z==ops::LinearPolicy::AllowA8),[&] {
+                cuda_check(cudaMemcpyAsync(conv.data,saved_conv.p,initial_conv.size()*2,cudaMemcpyDeviceToDevice),"restore conv");
+                cuda_check(cudaMemcpyAsync(ssm.data,saved_ssm.p,initial_ssm.size()*4,cudaMemcpyDeviceToDevice),"restore SSM");
+            },[&] { ops::gated_delta_net_layer(cx,weights,conv,conv,ssm,ssm,cy,workspace,nullptr,policy); });
+            cuda_synchronize(); // Saved buffers must outlive the final asynchronous restore.
+        }
         ops::gated_delta_net_layer(cx,weights,conv,conv,ssm,ssm,cy,workspace,nullptr,policy);
         start+=chunk;
     }

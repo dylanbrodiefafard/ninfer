@@ -3,6 +3,7 @@
 #include "ops/native_projection_fixture.h"
 #include "targets/qwen4/native_bf16_fixture.h"
 #include "targets/qwen4/native_sequence_components.h"
+#include "targets/qwen4/native_component_timing.h"
 
 #include <algorithm>
 #include <array>
@@ -1676,6 +1677,11 @@ int native_qsa_case(const std::string& path, int width, bool partitioned = false
     Tensor st(selected.data(),DType::I32,{ops::kQsaSelectedCapacity,width}),ct(counts.data(),DType::I32,{width});
     Tensor yt(out.data(),DType::BF16,{2560,width}),wt(workspace.data(),DType::U8,{static_cast<int>(workspace.bytes())});
     if (!partitioned) {
+        qwen4_sequence::time_native_component("QSA T="+std::to_string(width)+
+            " core="+(fp8_path.empty()?std::string("BF16"):std::string("FP8-A16")),[] {},[&] {
+            // All visible cache slots are overwritten by this same full-width call.
+            ops::qsa_verifier(xt,it,pt,vt,ot,weights,state_view,st,ct,yt,wt,nullptr);
+        });
         ops::qsa_verifier(xt,it,pt,vt,ot,weights,state_view,st,ct,yt,wt,nullptr);
     } else {
         for (int start = 0; start < width;) {

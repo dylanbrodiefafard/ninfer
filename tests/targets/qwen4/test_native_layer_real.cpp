@@ -5,6 +5,8 @@
 #include "ops/op_tester.h"
 #include "ops/ple_nvfp4_oracle.h"
 #include "targets/qwen4/native_sequence_components.h"
+#include "targets/qwen4/native_component_timing.h"
+#include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <array>
@@ -491,6 +493,19 @@ int run(const std::string& path, int layer,
             Tensor part_ids(static_cast<int*>(ids.data) + offset * R, DType::I32, {R, count});
             Tensor part_probs(static_cast<float*>(probs.data) + offset * R, DType::FP32, {R, count});
             DeviceArena workspace(ops::qwen4_sparse_moe_resident_workspace_capacity_bytes(weights, count, policy,shared_policy));
+            qwen4_sequence::time_native_component("MoE layer="+std::to_string(layer)+
+                " T="+std::to_string(count)+" routed-A4="+std::to_string(allow_a4)+
+                " shared-FP8="+std::to_string(calibrated_shared)+" shared-A8="+
+                std::to_string(shared_policy.gate==ops::LinearPolicy::AllowA8),[] {},[&] {
+                ops::qwen4_sparse_moe_resident(part_input,weights,part_ids,part_probs,part_output,workspace,nullptr,policy,shared_policy);
+            });
+            if(layer==0 && !partitioned && std::getenv("NINFER_QWEN4_MOE_PROFILE")) {
+                // One exact complete resident Op; excludes fixture loading and CPU oracles.
+                ops::qwen4_sparse_moe_resident(part_input,weights,part_ids,part_probs,part_output,workspace,nullptr,policy,shared_policy);
+                cuda_synchronize();CUDA_CHECK(cudaProfilerStart());
+                ops::qwen4_sparse_moe_resident(part_input,weights,part_ids,part_probs,part_output,workspace,nullptr,policy,shared_policy);
+                cuda_synchronize();CUDA_CHECK(cudaProfilerStop());
+            }
             ops::qwen4_sparse_moe_resident(part_input, weights, part_ids, part_probs, part_output, workspace, nullptr, policy,shared_policy);
             cuda_synchronize();
             if (allow_a4) {

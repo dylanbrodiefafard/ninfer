@@ -3,6 +3,7 @@
 #include "targets/qwen4/native_runtime_layout.h"
 #include "targets/qwen4/native_decoder.h"
 #include "targets/qwen4/native_draft_runtime.h"
+#include "targets/qwen4/native_ple_fetch.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/embedding.h"
@@ -55,6 +56,7 @@ struct NativeRuntime::Impl {
     DeviceBuffer qsa;
     native_layout::Shared buffers;
     PinnedHostBuffer staging;
+    NativePleFetch ple_fetch;
     std::unique_ptr<VisionProgram> vision;
     std::unique_ptr<NativeDraftRuntime> draft;
     std::array<std::array<DecodeGraphExecutable,4>,2> graphs;
@@ -120,25 +122,17 @@ struct NativeRuntime::Impl {
             view(buffers.mixed,{D,w,b}),view(buffers.block,{D,w,b}),view(buffers.scale,{4,w,b}),
             view(buffers.routes,{10,w,b}),view(buffers.probabilities,{10,w,b}),
             view(buffers.selected,{2051,w,b}),view(buffers.selected_count,{w,b}),
-            config.dflash?view(buffers.features,{12800,w,b}):Tensor{},view(buffers.compact_rows,{b})};
+            config.dflash?view(buffers.features,{12800,w,b}):Tensor{},view(buffers.compact_rows,{b}),ple_fetch.ready()};
     }
     void body(int w,int b,bool record,int visible) {
         workspace.reset();const int n=w*b;
-        auto ple=view(buffers.ple_embedding,{160,16,n});
-        if(model.ple_table.format==NativePleFormat::Nvfp4) {
-            auto rows=view(buffers.packed_rows,{94,16,n});
-            ops::ple_nvfp4_decode_rows(rows,ple,device.stream);
-        } else {
-            auto rows=view(buffers.packed_rows,{160,16,n});
-            ops::ple_fp8_decode_rows(rows,model.ple_table.fp8_scale_bits,ple,device.stream);
-        }
         auto embedding=view(buffers.embedding,{D,n});
         auto residual=view(buffers.residual,{D,4,n});
         ops::gated_residual_broadcast(embedding,residual,device.stream);
         auto scratch=Tensor(qsa.p,DType::U8,{static_cast<int>(qsa.bytes)});
         enqueue_native_decoder(model.layers,model.ple,state,controls(w,b),visible,
             decoder_views(w,b),record,workspace,scratch,device.stream,
-            b==1 && w>16 && lengths[0]==w && !record?slots[0]:-1);
+            b==1 && w>16 && lengths[0]==w && !record?slots[0]:-1,model.prefill_policy);
         auto output=view(buffers.mixed,{D,n});const auto& g=model.final_gr;
         ops::gated_residual_read(residual,g.norm,g.down,g.up,output,workspace,device.stream);
         auto logits=view(buffers.logits,{V,n});
@@ -187,7 +181,7 @@ MemorySummary NativeRuntime::memory_summary() const {
     m.workspace_logical_peak_bytes=p.workspace.peak_used();return m;
 }
 void NativeRuntime::reset_memory_peaks() {impl_->workspace.reset_peak();impl_->shared.reset_peak();}
-void NativeRuntime::synchronize() {impl_->device.synchronize();}
+void NativeRuntime::synchronize() {impl_->device.synchronize();impl_->ple_fetch.synchronize();}
 void NativeRuntime::reset(int s) {
     auto& p=*impl_;p.idle();p.slot(s);p.device.synchronize();p.state.reset(s);
     if(p.draft) p.draft->reset(s);
@@ -232,6 +226,7 @@ void NativeRuntime::prepare(std::span<const NativeInputRow> rows,int envelope) {
     }
     // Reuse of pinned input/staging is legal only after every prior consumer drains.
     p.device.synchronize();
+    p.ple_fetch.synchronize();
     std::fill_n(p.ids,n,p.model.ngram.eos_token_id);std::fill_n(p.positions,3*n,0);
     for(int i=0;i<b;++i) {
         const auto& row=rows[i];p.slots[i]=row.slot;p.lengths[i]=row.token_ids.size();
@@ -248,21 +243,18 @@ void NativeRuntime::prepare(std::span<const NativeInputRow> rows,int envelope) {
         }
     }
     try {
+        // IDs and raw accepted history now determine every row. Start immediately, before
+        // page materialization, control uploads or embedding work. A dedicated lane gathers
+        // bytes, transfers and decodes; layer0 has no dependency on this lane.
+        p.ple_fetch.enqueue(p.model.ple_table,{p.row_ids.data(),std::size_t(16)*n},n,p.packed,
+            std::size_t(2560)*n,
+            view(p.buffers.packed_rows,{p.model.ple_table.format==NativePleFormat::Nvfp4?94:160,16,n}),
+            view(p.buffers.ple_embedding,{160,16,n}));
         for(int i=0;i<b;++i)p.state.materialize(p.slots[i],p.frontiers[i]+p.lengths[i]);
         p.upload(view(p.buffers.ids,{envelope,b}),p.ids);
         p.upload(view(p.buffers.positions,{3,envelope,b}),p.positions);
         p.upload(view(p.buffers.slots,{b}),p.slots);p.upload(view(p.buffers.valid,{b}),p.lengths);
         p.upload(view(p.buffers.frontiers,{b}),p.frontiers);p.upload(view(p.buffers.compact_rows,{b}),p.compact);
-        const std::span<const int> rowids(p.row_ids.data(),16*n);
-        if(p.model.ple_table.format==NativePleFormat::Nvfp4) {
-            auto device_rows=view(p.buffers.packed_rows,{94,16,n});
-            ops::ple_nvfp4_stage_rows_batch(p.model.ple_table.nvfp4,rowids,n,p.packed,std::size_t(2560)*n,
-                device_rows,p.device.stream);
-        } else {
-            auto device_rows=view(p.buffers.packed_rows,{160,16,n});
-            ops::ple_fp8_stage_rows_batch(p.model.ple_table.fp8,rowids,n,p.packed,std::size_t(2560)*n,
-                device_rows,p.device.stream);
-        }
         auto token_ids=view(p.buffers.ids,{n});auto embedding=view(p.buffers.embedding,{D,n});
         ops::embedding(token_ids,p.model.token_embedding,embedding,p.device.stream);
         // Byte-only copies replace the represented embedding at media columns. This staging
@@ -321,7 +313,7 @@ void NativeRuntime::commit(std::span<const NativeCommitRow> rows) {
 void NativeRuntime::discard() {
     auto& p=*impl_;p.check();if(!p.prepared)return;
     if(!p.enqueued) {
-        try {p.state.discard_materialization({p.slots,std::size_t(p.batch)});p.prepared=false;}
+        try {p.ple_fetch.synchronize();p.state.discard_materialization({p.slots,std::size_t(p.batch)});p.prepared=false;}
         catch(...) {p.poisoned=true;throw;}
         return;
     }

@@ -229,7 +229,7 @@ def render_filled(card: dict) -> str:
         f"          weight={_fmt_bytes(card['weight_bytes'])}  "
         f"act={_fmt_bytes(card['activation_bytes'])}",
     ]
-    if is_ggml:
+    if card["bound"] == "profile-required":
         lines.extend([
             f"          useful_flops={_fmt_flops(card['useful_flops'])}  "
             f"one-read AI={card['ai_flop_per_byte']:.1f} FLOP/B",
@@ -265,9 +265,9 @@ def render_filled(card: dict) -> str:
         lines.append(f"          {idea['reason']}")
     else:
         lines.append("4. Idea   unknown  — pass --idea <class>. If it does not attack this bound, stop.")
-    if card["sm120"]["legal"] and is_ggml:
+    if card["sm120"]["legal"] and card["mma_atom"] is None:
         lines.append(
-            f"5. SM120  legal  current scalar GGML codec family  "
+            f"5. SM120  legal  current scalar codec family  "
             f"smem<={bound.SMEM_LIMIT_BYTES} B  cluster=1  no TMEM/tcgen05"
         )
     elif card["sm120"]["legal"]:
@@ -283,9 +283,9 @@ def render_filled(card: dict) -> str:
             "6. Family DRAM-bound. Do not fork a compute family. "
             "Attack extra bytes or raise T per weight pass."
         )
-    elif is_ggml:
+    elif card["bound"] == "profile-required":
         lines.append(
-            "6. Family GGML codec compute is unmodeled. Profile physical bytes/throughput, "
+            "6. Family scalar codec compute is unmodeled. Profile physical bytes/throughput, "
             "instruction pipes, occupancy, and spills before choosing a compute-side idea."
         )
     else:
@@ -301,7 +301,7 @@ def render_filled(card: dict) -> str:
     lines.append("8. Lose   Delete the candidate. Do not leave a second path.")
     lines.append("")
     lines.extend(_group_lines(_classified(card)))
-    if card["t_issue_us"] is None and card["bound"] != "DRAM" and not is_ggml:
+    if card["t_issue_us"] is None and card["bound"] not in ("DRAM", "profile-required"):
         lines.append("")
         lines.append(
             "t_issue=n/a  run `python3 -m tools.kdev mma` once; bound/recipe pick up "
@@ -509,6 +509,10 @@ def _self_test() -> int:
     check("ggml-op", _layer2(ggml)["op"] == "ggml_block_linear", _layer2(ggml)["op"])
     check("ggml-profile-required", "bound=profile-required" in render_filled(ggml))
     check("ggml-profile-one-rep", "--repetitions 1" in _layer2(ggml)["ncu"])
+    scalar = bound.analyze(640, 2560, 33, "nvfp4", policy="a16", idea="aggregate_T")
+    scalar_payload = filled_payload(scalar)
+    check("native-scalar-profile", "bound=profile-required" in scalar_payload["gate"])
+    check("native-scalar-bench", _LINEAR_BENCH in scalar_payload["layer2"]["bench"])
 
     if failures:
         print("self-test FAIL")

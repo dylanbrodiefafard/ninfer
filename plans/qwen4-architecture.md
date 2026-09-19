@@ -49,6 +49,136 @@ prerequisite only after the runnable target identity is selected.
 
 ## 0. Native-checkpoint preparation and active native precision implementation
 
+### Completed goal: final feasible native mixed-precision readiness (2026-09-19)
+
+The user assigned all six follow-up workstreams below. Preserve the completed, uncommitted
+resident-component/early-PLE work. No commit or push is authorized by this goal. Weight
+storage, GEMM activation precision, accumulation and persistent state remain independent
+choices; the quantization-recommendations research is candidate authority, not blanket
+default admission. A rejected candidate closes its experiment, not an unrelated implementation
+obligation. Do not repeat a rejected experiment without a materially different hypothesis.
+
+- [x] Integrate explicitly qualified native precision policies across conversion, binding,
+  workspace planning, prefill, compact decode and speculative verification, retaining A16
+  reference and protected controls. Distinguish bounded candidate execution from full-model
+  quality admission; do not invent future checkpoint topology or precision inventories.
+- [x] Optimize measured resident MoE grouping/reuse/launch/packing costs, including natural
+  low-occupancy decode, under the kernel-iteration classifier and unchanged independent
+  numerical criteria. Use resident component evidence, not streamed-expert throughput.
+- [x] Evaluate actual-weight eight-bit vocabulary endpoints, selected GR-read/PLE projections
+  and appropriate NVFP4 projection alternatives; complete justified support or record concrete
+  rejection. Preserve A16 head reference, BF16 protected gates and FP32 recurrent state.
+- [x] Investigate distinct actionable remedies for MTP propagated error, DFlash NVFP4 loss
+  and NVFP4-KV accumulated sensitivity. Separate kernel correctness, represented-weight loss,
+  activation quantization and propagated rounding; never widen criteria to admit a candidate.
+- [x] Resolve whether materially distinct FP8-residual/QSA-A8 recipes have a supported path;
+  complete FP8-KV runtime admission if its measured quality/capacity benefit warrants it,
+  otherwise retain evidence-backed non-admission. Existing failed recipes stay rejected.
+- [x] Qualify early PLE overlap under graph replay and larger prefill; acquire/qualify the
+  complete authentic FP8 table with eager OS-locked RAM residency when local capacity permits.
+  Preserve bounded pinned staging, immediate eligible fetching, exact decode, drain lifetime,
+  graph ordering and no disk fallback or native ordinary-weight streaming.
+- [x] Obtain finished-code Astra review; run relevant exact/numerical/state/graph/lifetime
+  checks and full correct-container C++ unit suite. Update active authorities with actual
+  decisions, material evidence and limitations; preserve p-less/epsilon sampling semantics.
+
+External completion gates, not claims achievable with component fixtures: a fitting exact
+checkpoint is required for full-model paired PPL/task and long-context quality, final per-layer
+recipe/default selection, and end-to-end MTP/DFlash acceptance and throughput. These gates
+must remain explicit and must not stop independent feasible work above.
+
+Progress: fixed artifact-owned prefill recipe binding/planning/decoder wiring is implemented
+and metadata admission plus seven converter tests pass. Real native33 A16/selective-A8 chains
+pass the unchanged2% accumulated screen. Both routed-A4 recipes execute at least64 actual
+expert occurrences and pass the existing complete-MoE oracle; this is not whole-chain quality
+admission. All four policies preserve exact A16 compact/recorded graph output and state.
+A16 remains mandatory for compact decode/verification and private drafts. Astra's
+read-only precision review found no evidence-backed drop-in QSA A8 or FP8 residual remedy:
+QSA's rejected path was already dynamically scaled, and residual loss is confirmed in the
+independent formula. Those existing candidates stay rejected. Distinct K-only FP8/BF16-V
+composition assessment is complete: aggregate losses pass but per-token drift and routing
+changes do not justify FP8-K runtime admission. NVFP4 K-only fails; BF16 remains the reference.
+The initial FP8 PLE RAM estimate omitted documented reclaimable clean ZFS ARC. Fresh conservative
+capacity was75.39GB versus68.38GB required including16GiB reserve, enabling complete
+pinned-source acquisition/conversion without host settings changes. Full FP8 residency now
+passes: all12,500,061 pages present,51,200,249,856 bytes eagerly locked, all256 source
+boundary rows decoded exactly, and teardown restored the original lock count. Other host swap
+occupancy increased during this resource-intensive check; PLE itself remained locked and
+the test container had no swap. Capacity admission is not a no-paging promise for other apps.
+MTP private FP32 normalization, retaining original BF16 FC/add stores, passes the actual
+captured24-row seed/two-draft local and propagated2% screens with unchanged routing and
+criteria. Four-column weight reuse reduces its latency, but it remains slower than the former
+BF16-normalization stem; this is a retained accuracy tradeoff, not a speed claim. Final retained
+MTP trace records remain exact after the MoE changes. Resident MoE occupancy tiles and parallel
+integer prefix scan pass the same oracles, with whole33 layer0 latency1.987→0.993ms and
+natural one-token continuation163.616→145.600us. Optional row-FP8 endpoint/final-GR/PLE paths
+pass independent represented-weight checks; FP8 endpoints additionally pass real C4 MTP/DFlash
+graph/state/replay integration. Source-loss assessments are separate; uncalibrated NVFP4 head
+is rejected (13.011% source-logit loss versus3.595% FP8). DFlash guessed protection recipes
+remain rejected; BF16 source execution is retained. Both Astra reviews are clear.
+PLE graph/W257 overlap passed exact output comparisons and independent trace review: all126
+measured async rounds were ready before layer0 finished. All focused implementation and
+complete-table checks are finished. The full correct-container C++ build and suite passed:
+**135 selected, 126 passed, nine opt-in artifact skips, zero failures**, 592.23 seconds.
+Command: `NINFER_DEV_CONTAINER=ninfer-builder-qwen4-mixed NINFER_BUILD_VOLUME=ninfer-build-cache-qwen4-mixed NINFER_DEV_JOBS=8 ./scripts/run-unit-tests.sh`.
+The actual-weight projection, MTP target-input, FP8 endpoint draft, native precision-policy
+and complete FP8 PLE residency checks were also run separately with their required artifacts.
+Seven affected Python converter tests, kdev recipe/bound self-tests and affected Python
+compilation pass. No numerical criterion was widened, and no commit or push was made.
+
+### Completed goal: resident-component performance and precision (2026-09-19)
+
+Base implementation is committed as `c307678c`. No new commit/push is authorized.
+This goal uses existing authentic preview components; full-model PPL, acceptance and
+throughput remain unavailable until an exact compute core fits the GPU.
+
+- [x] Begin PLE row addressing/gather/H2D immediately when validated input IDs/history are
+  known; overlap transfer with independent GPU work and wait only at decoder index1 (the
+  second layer). Preserve complete eager RAM locking, bounded pinned storage, exact NVFP4/
+  FP8 decode, graph ordering, accepted-prefix history and teardown/cancellation lifetime.
+  Measure the consuming layer's remaining wait, not merely asynchronous API submission.
+- [x] Profile authentic resident NVFP4/FP8 projection, MoE, GDN and QSA components separately
+  from diagnostic streamed-expert overhead; fix measured worthwhile bottlenecks using the
+  kernel-iteration classifier before any kernel speed change.
+- [x] Localize remaining MTP propagated error and DFlash NVFP4 quality loss; evaluate targeted
+  higher-precision exceptions against unchanged independent mathematical oracles.
+  MTP stem attribution led to a same-schedule FP32/fused-add candidate with measured traffic
+  reduction, but actual propagated seed error worsened 2.052%→2.130% with no latency win;
+  candidate deleted and original arithmetic/gates restored. DFlash FC/KV, all-attention and
+  MLP protections on authentic C8/16/24 features did not rescue the uncalibrated NVFP4 head.
+  Neither the original 2% sensitivity screen nor draft quality/PPL is claimed resolved.
+- [x] Evaluate selective A4/A8 against protected A16 with authentic weights/inputs, without
+  converting component evidence into blanket activation/default or whole-model PPL admission.
+  Resident native-33 whole/chunk and same-input EOS-65 measurements pass unchanged oracles;
+  GDN Z-A8 saves 11.7%, while concentrated routed A4 is 2.446x faster but retains 9.29%
+  represented-reference error under its existing 16% profile. QSA stays A16. Existing thirteen
+  native FP8 Linear measurements are retained rather than repeated. Exact methodology,
+  propagated-input/routing caveats and the next resident-MoE aggregation priority are in
+  `docs/research/qwen4-native-fp8-source.md`; no new kernel/default admission follows.
+- [x] Extend existing streamed/long-sequence diagnostics only for concrete remaining
+  correctness/performance questions, or document why existing evidence resolves them.
+- [x] Complete independent Astra review, relevant numerical/state/graph/lifetime checks,
+  affected authorities and the full correct-container C++ regression gate.
+
+Final verification: Astra reviewed the retained PLE implementation/tests, independently
+recomputed all54 readiness margins from the CUDA trace, and cleared the retained precision/
+timing changes. The full correct-container C++ build and suite passed: **134 selected,
+126 passed, eight opt-in artifact skips, zero failures**, 533.61 seconds. Command:
+`NINFER_DEV_CONTAINER=ninfer-builder-qwen4-mixed NINFER_BUILD_VOLUME=ninfer-build-cache-qwen4-mixed NINFER_DEV_JOBS=8 ./scripts/run-unit-tests.sh`.
+Separately, the complete locked-table/real-prefix4 test, native33 A16/A8 and EOS65 component
+oracles, actual-target restored MTP replay, and 22 Python reference checks pass. The restored
+MTP trace matches its pre-experiment public outputs/state exactly. No precision gate was
+widened: the MTP2% propagated screen and DFlash NVFP4 quality concerns remain explicit, not
+misrepresented as model-quality admission. No commit or push was made in this goal.
+
+No new full streamed-model trace is needed for this tranche. MTP and DFlash attribution reuse
+the already captured authentic target-state panels, so another quantized/offloaded rollout would
+not isolate the live precision question. Existing paged QSA independent tests cover selection at
+2051/2115/4099/4101 and 262144 visible positions, ties, compact batches, masks, mapped pages,
+BF16/NVFP4 represented caches and positions near 262143. PLE ordering is checked directly at
+its new stream/graph boundary rather than inferred from plausible generated text. None of this
+is full48 long-context/PPL qualification; that remains fitting-checkpoint admission work.
+
 ### Completed implementation goal: native architecture and Engine integration (2026-09-18)
 
 The completed bounded tranche below is component evidence, not completion of the requested

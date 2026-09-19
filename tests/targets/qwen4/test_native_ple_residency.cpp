@@ -1,4 +1,4 @@
-// Opt-in, real 28.8 GB host payload. Never part of ordinary resource-light tests.
+// Opt-in complete native 28.8 GB NVFP4 / 51.2 GB FP8 host payloads.
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/device.h"
@@ -15,7 +15,6 @@ using namespace ninfer;
 using namespace ninfer::test;
 namespace {
 constexpr std::uint64_t partitions=128, rows_per_partition=2500012;
-constexpr std::uint64_t payload_bytes=partitions*rows_per_partition*90+partitions*4;
 
 std::uint64_t proc_bytes(const char* file,const char* key) {
     std::ifstream input(file);
@@ -27,7 +26,7 @@ std::uint64_t proc_bytes(const char* file,const char* key) {
 }
 std::uint64_t locked() { return proc_bytes("/proc/self/status","VmLck:"); }
 
-std::uint64_t available_capacity() {
+std::uint64_t available_capacity(std::uint64_t payload_bytes) {
     const auto available=proc_bytes("/proc/meminfo","MemAvailable:");
     std::uint64_t reclaimable=0;
     // Explicit local qualification opt-in, never production memory admission.
@@ -77,27 +76,32 @@ void resident(std::span<const std::byte> bytes,std::size_t locked_bytes) {
     std::cout<<"All "<<flags.size()<<" payload pages resident and "<<extent<<" bytes locked\n";
 }
 
-int run(const std::string& root) {
+int run(const std::string& root,bool fp8) {
+    const std::uint64_t payload_bytes=fp8?partitions*rows_per_partition*160+2:
+        partitions*rows_per_partition*90+partitions*4;
+    const int row_bytes=fp8?160:94;
+    const std::string stem=fp8?"qwen4-ple-fp8":"qwen4-ple-nvfp4";
     // Hard guard, not a fallback: leave at least 16 GiB of host RAM available.
     constexpr std::uint64_t margin=16ULL*1024*1024*1024;
-    if(available_capacity()<payload_bytes+margin)
+    if(available_capacity(payload_bytes)<payload_bytes+margin)
         throw std::runtime_error("full PLE qualification needs payload plus 16 GiB available RAM");
     DeviceContext device;
     constexpr int max_width=16;
-    PinnedHostBuffer pinned(94*16*max_width);
-    DeviceBuffer packed(94*16*max_width), decoded(160*16*max_width*2);
+    PinnedHostBuffer pinned(row_bytes*16*max_width);
+    DeviceBuffer packed(row_bytes*16*max_width), decoded(160*16*max_width*2);
     const auto baseline=locked();
     artifact::MaterializedArtifact loaded;
     artifact::ObjectHandle handle;
     {
-        artifact::Reader reader(root+"/qwen4-ple-nvfp4.ninfer");
+        artifact::Reader reader(root+"/"+stem+".ninfer");
         if(reader.identity()!=artifact::ArtifactIdentity{"qwen4/native-ple-qualification",
-                                                        "primitive-nvfp4-complete-table"})
+                                fp8?"nvidia-fp8-complete-table":"primitive-nvfp4-complete-table"})
             throw std::runtime_error("wrong complete native PLE fixture identity");
         artifact::Binder binder(reader);
-        const std::array<std::uint64_t,3> shape{partitions,rows_per_partition,160};
-        handle=binder.require_tensor("ple.table",artifact::NumericFormat::NVFP4_PARTITION_F32M,
-                                    artifact::StorageLayout::PartitionedRowBlockScaleK16V1,shape);
+        if(fp8) handle=binder.require_tensor("ple.table",artifact::NumericFormat::FP8_E4M3FN_TENSOR_BF16S,
+            artifact::StorageLayout::TensorScaleV1,std::array<std::uint64_t,2>{partitions*rows_per_partition,160});
+        else handle=binder.require_tensor("ple.table",artifact::NumericFormat::NVFP4_PARTITION_F32M,
+            artifact::StorageLayout::PartitionedRowBlockScaleK16V1,std::array<std::uint64_t,3>{partitions,rows_per_partition,160});
         binder.map_tensor_on_host(handle,true);
         loaded=artifact::materialize(reader,binder.finish(),device);
     } // Reader destruction must not release the resident materialization owner.
@@ -108,7 +112,7 @@ int run(const std::string& root) {
         throw std::runtime_error("full PLE materialization residency accounting differs");
     const auto bytes=owner.mapped_tensor_bytes(handle);
     resident(bytes,stats.resident_locked_bytes);
-    artifact::Reader reference(root+"/qwen4-ple-nvfp4-boundary-reference.ninfer");
+    artifact::Reader reference(root+"/"+stem+"-boundary-reference.ninfer");
     if(reference.identity()!=artifact::ArtifactIdentity{"qwen4/native-ple-reference","source-scalar-bf16"})
         throw std::runtime_error("wrong boundary source oracle identity");
     const auto source_ids=read<std::int32_t>(reference,"row_ids");
@@ -120,8 +124,15 @@ int run(const std::string& root) {
            source_ids[2*part+1]!=(part+1)*rows_per_partition-1)
             throw std::runtime_error("oracle must cover both ends of all 128 partitions");
     }
-    const ops::PleResidentNvfp4Table table{
+    const ops::PleResidentNvfp4Table nvfp4_table{
         reinterpret_cast<const std::uint8_t*>(bytes.data()),partitions,rows_per_partition,bytes.size()};
+    ops::PleResidentFp8Table fp8_table{};
+    std::uint16_t fp8_scale_bits=0;
+    if(fp8) {
+        fp8_table={reinterpret_cast<const std::uint8_t*>(bytes.data()),partitions*rows_per_partition,bytes.size()-2};
+        std::memcpy(&fp8_scale_bits,bytes.data()+bytes.size()-2,2);
+        if(!fp8_scale_bits || fp8_scale_bits>=0x7f80) throw std::runtime_error("invalid source FP8 table scale");
+    }
     int failures=0;
     for(int width:{16,3,1}) {
         std::vector<std::int32_t> ids(width*16);
@@ -131,10 +142,15 @@ int run(const std::string& root) {
             ids[i]=source_ids[source];
             std::copy_n(source_expected.data()+source*160,160,expected.data()+i*160);
         }
-        Tensor input(packed.p,DType::U8,{94,16,width});
+        Tensor input(packed.p,DType::U8,{row_bytes,16,width});
         Tensor output(decoded.p,DType::BF16,{160,16,width});
-        ops::ple_nvfp4_stage_rows_batch(table,ids,width,pinned.data(),pinned.size(),input,device.stream);
-        ops::ple_nvfp4_decode_rows(input,output,device.stream);
+        if(fp8) {
+            ops::ple_fp8_stage_rows_batch(fp8_table,ids,width,pinned.data(),pinned.size(),input,device.stream);
+            ops::ple_fp8_decode_rows(input,fp8_scale_bits,output,device.stream);
+        } else {
+            ops::ple_nvfp4_stage_rows_batch(nvfp4_table,ids,width,pinned.data(),pinned.size(),input,device.stream);
+            ops::ple_nvfp4_decode_rows(input,output,device.stream);
+        }
         device.synchronize(); // owner and pinned staging retained through the consumer.
         std::vector<std::uint16_t> actual(expected.size());
         decoded.copy_to_host(actual.data(),actual.size()*2);
@@ -149,10 +165,12 @@ int run(const std::string& root) {
     return failures;
 }
 }
-int main() {
+int main(int argc,char** argv) {
+    const bool fp8=argc==2 && std::string_view(argv[1])=="--fp8";
+    if(argc!=1 && !fp8) return 1;
     const char* root=std::getenv("NINFER_QWEN4_FULL_PLE");
-    if(!root) {std::cout<<"SKIP: opt-in complete 28.8 GB PLE qualification\n";return 77;}
-    try {return run(root);} catch(const std::exception& error) {
+    if(!root) {std::cout<<"SKIP: opt-in complete native PLE qualification\n";return 77;}
+    try {return run(root,fp8);} catch(const std::exception& error) {
         std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;
     }
 }

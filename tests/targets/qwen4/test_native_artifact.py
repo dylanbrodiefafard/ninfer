@@ -8,8 +8,19 @@ import torch
 from tools.artifact.container import Artifact, plan_objects
 from tools.artifact.layouts import decode_fp8_calibrated_words
 from tools.convert.qwen4.native import source_requirements, prepared, fp8_payload, validate_fp8, validate_component, artifact_bf16
-from tools.convert.qwen4.native_inventory import MAIN, FP8_ROLES, tensor_specs
+from tools.convert.qwen4.native_inventory import MAIN, FP8_ROLES, ROW_FP8_ROLES, A8_ROLES, prefill_policy_bytes, tensor_specs
 from tools.parity.qwen4.native_inventory import layer_grammar
+
+
+def test_prefill_candidate_recipe_encoding_and_required_weights():
+    assert prefill_policy_bytes("a16", []) == b"\x00"
+    assert prefill_policy_bytes("routed-a4", []) == b"\x02"
+    assert prefill_policy_bytes("selective-a8", A8_ROLES) == b"\x01"
+    assert prefill_policy_bytes("routed-a4-selective-a8", FP8_ROLES) == b"\x03"
+    for missing in A8_ROLES:
+        with pytest.raises(ValueError):
+            prefill_policy_bytes("selective-a8", A8_ROLES - {missing})
+    with pytest.raises(ValueError): prefill_policy_bytes("qsa-a8", FP8_ROLES)
 
 
 def test_complete_canonical_inventory_matches_independent_source_grammar():
@@ -27,6 +38,17 @@ def test_complete_canonical_inventory_matches_independent_source_grammar():
     assert len(tensor_specs(dflash_format="NVFP4"))==1635
     assert sum(o.bytes for o in objects if o.name!="ple.table")>32*1024**3
     with pytest.raises(ValueError): tensor_specs(fp8_roles=[MAIN+"layers.1.mlp.gate.weight"])
+
+
+def test_weight_only_fp8_storage_is_independent_of_activations_and_controls():
+    specs=tensor_specs(row_fp8_roles=ROW_FP8_ROLES)
+    assert {s.name for s in specs if s.format=="FP8_E4M3FN_ROW_BF16S"}==ROW_FP8_ROLES
+    assert all(s.layout=="row-scale-v1" for s in specs if s.name in ROW_FP8_ROLES)
+    assert prefill_policy_bytes("a16",[])==b"\x00"
+    with pytest.raises(ValueError): prefill_policy_bytes("selective-a8",ROW_FP8_ROLES)
+    for name in (MAIN+"layers.0.attn_hyper_connection.input_mix_weight_down.weight",
+                 MAIN+"layers.1.ple.norm_key.weight",MAIN+"layers.0.mlp.gate.weight"):
+        with pytest.raises(ValueError): tensor_specs(row_fp8_roles=[name])
 
 
 def test_main_and_mtp_source_controls_keep_their_distinct_norm_boundaries():

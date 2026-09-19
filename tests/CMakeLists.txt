@@ -281,6 +281,10 @@ ninfer_add_op_test(ninfer_qwen4_native_endpoint_real_test
   LIBRARIES ninfer_ops ninfer_artifact)
 target_compile_definitions(ninfer_qwen4_native_endpoint_real_test PRIVATE NINFER_QWEN4_SEQUENCE_COMPONENTS)
 set_tests_properties(ninfer_qwen4_native_endpoint_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_op_test(ninfer_qwen4_native_weight_candidates_test
+  SOURCES targets/qwen4/test_native_weight_candidates.cpp
+  LIBRARIES ninfer_ops ninfer_artifact)
+set_tests_properties(ninfer_qwen4_native_weight_candidates_test PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(ninfer_qwen4_gdn_a8_diagnostic
   targets/qwen4/test_native_gdn_a8_diagnostic.cpp ops/test_gated_residual.cpp
   ops/test_gated_delta_net_layer.cpp)
@@ -468,6 +472,9 @@ set_tests_properties(ninfer_qwen4_native_ple_residency_test PROPERTIES SKIP_RETU
 ninfer_add_op_test(ninfer_qwen4_native_state_test
   SOURCES targets/qwen4/test_native_state.cpp
   LIBRARIES ninfer_qwen4_native_state)
+ninfer_add_op_test(ninfer_qwen4_native_ple_fetch_test
+  SOURCES targets/qwen4/test_native_ple_fetch.cpp
+  LIBRARIES ninfer_qwen4_native_decoder)
 ninfer_add_op_test(ninfer_qwen4_native_draft_runtime_test
   SOURCES targets/qwen4/test_native_draft_runtime.cpp
   LIBRARIES ninfer_qwen4_native_runtime)
@@ -526,6 +533,15 @@ ninfer_add_op_test(ninfer_qwen4_native_sequence_real_test
           targets/qwen4/test_native_layer_real.cpp
   LIBRARIES ninfer_ops ninfer_artifact)
 target_compile_definitions(ninfer_qwen4_native_sequence_real_test PRIVATE NINFER_QWEN4_SEQUENCE_COMPONENTS)
+add_executable(ninfer_qwen4_native_kv_assessment_capture
+  targets/qwen4/native_kv_assessment_capture.cpp ops/test_gated_residual.cpp
+  ops/test_gated_delta_net_layer.cpp ops/test_qsa.cpp ops/test_ple.cpp
+  targets/qwen4/test_native_layer_real.cpp)
+target_link_libraries(ninfer_qwen4_native_kv_assessment_capture PRIVATE ninfer_ops ninfer_artifact)
+target_include_directories(ninfer_qwen4_native_kv_assessment_capture PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+target_compile_options(ninfer_qwen4_native_kv_assessment_capture PRIVATE -fno-fast-math -ffp-contract=off)
+target_compile_definitions(ninfer_qwen4_native_kv_assessment_capture PRIVATE NINFER_QWEN4_SEQUENCE_COMPONENTS)
 ninfer_add_op_test(ninfer_qwen4_native_compute_real_test
   SOURCES targets/qwen4/test_native_compute.cpp ops/test_gated_residual.cpp
           ops/test_gated_delta_net_layer.cpp ops/test_qsa.cpp ops/test_ple.cpp
@@ -533,6 +549,8 @@ ninfer_add_op_test(ninfer_qwen4_native_compute_real_test
   LIBRARIES ninfer_qwen4_native_compute ninfer_qwen4_native_decoder ninfer_ops ninfer_artifact)
 target_compile_definitions(ninfer_qwen4_native_compute_real_test PRIVATE NINFER_QWEN4_SEQUENCE_COMPONENTS)
 set_tests_properties(ninfer_qwen4_native_compute_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen4_native_prefill_policy_real_test COMMAND ninfer_qwen4_native_compute_real_test --prefill-policies)
+set_tests_properties(ninfer_qwen4_native_prefill_policy_real_test PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(ninfer_qwen4_native_a4_eos_diagnostic
   targets/qwen4/test_native_a4_eos.cpp ops/test_gated_residual.cpp
   ops/test_gated_delta_net_layer.cpp targets/qwen4/test_native_layer_real.cpp)

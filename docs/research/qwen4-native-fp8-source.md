@@ -266,6 +266,69 @@ aggregate-T dispatch work; actual tensor-calibrated public-Op timings above, not
 the generic row-scale byte model, determine the cutoffs. No new MMA schedule is
 introduced. These are public-Op timings, not cold-cache or model token/s.
 
+## Distinct KV composition assessment and non-admission
+
+The authentic33-token original-BF16 native prefix was captured at layer3, after all preceding
+GR/GDN/MoE/PLE boundaries passed their existing oracles. An independent CPU counterfactual
+then evaluates QSA through the final layer3 residual with FP8 K and BF16 V, using per-head
+FP32 maxabs/448 scales, signed nearest-even E4M3 and explicit BF16 reconstructed operands.
+The BF16 calculation is cross-checked against the existing independent QSA formula and
+captured component results. This is not a GPU codec or a new runtime cache format.
+
+FP8-K gives aggregate QSA/final residual relative L2 of1.868%/0.995% versus the independently
+propagated BF16 reference. These are supplementary whole-panel screens, not the native QSA
+Op's per-token, same-represented-input admission gate. Storage-only worst-token QSA drift is
+2.054%; worst-token suffix drift is3.906%, with two router-membership changes. QSA's aggregate
+gross-error margin is only0.000211. The theoretical K/V payload becomes75.391% of BF16,
+excluding unchanged index keys, positions and page metadata.
+
+This is insufficient evidence for FP8 runtime admission: retain BF16 as the numerical
+reference, without claiming the candidate can never qualify. It needs a materially stronger
+quality case and exact GPU codec/composition qualification before adding a runtime format.
+NVFP4 K-only is not a rescue: aggregate QSA/final drift is6.655%/2.341%; NVFP4 both is
+11.511%/2.795%. This separates represented-cache loss from the already-qualified diagnostic
+NVFP4 codec/kernel behavior. No criterion was widened, and no new production KV path was added.
+Report: `out/qwen4-native-kv-composition.json`.
+
+The existing all-role QSA-A8 and FP8-residual candidates remain rejected: their actual dynamic
+scaling/formula losses were already measured, so retrying the same recipe would not resolve
+an implementation gap. Similarly, guessed DFlash BF16 protection subsets did not rescue the
+uncalibrated NVFP4 drafter. Its source BF16 option remains available; calibrated draft quality
+needs independent captured features/holdout evidence, not another permutation of one prompt.
+
+## Original-BF16 weight-only endpoint and read candidates
+
+The six finite row-FP8 candidates are distinct from the calibrated tensor-FP8 source above.
+`tools.parity.qwen4.native_weight_candidates` uses original BF16 endpoint/PLE artifacts and
+authentic captured MTP hidden/final-read inputs. The existing offline encoder stores each row
+with E4M3FN codes and a BF16 scale; the independent oracle decodes signed codes with that exact
+scale and evaluates the complete formula in FP64. GPU A16 Linear checks cover the full248320
+head and final-GR/PLE projection shapes, T3, one-row splitting and graph replay. Complete
+final-GR and PLE key-only/both output/history checks pass their existing numerical profiles.
+The embedding kernel now supports exact width2560 alongside5120; independent exact decode,
+tail rows, signed zero, subnormal scales and repeated graphs pass.
+
+Storage loss is measured separately from kernel correctness. On the same authentic three-row
+panel: row-FP8 head source-logit relative L2 is3.595%; final-GR both-FP8 source-read loss is
+0.156%; PLE key-only injection/history loss is0.077%/0.122%, versus2.336%/2.241% for value
+quantization. Selected token/mask embedding source loss is2.631%, not a whole-vocabulary
+quality measurement. All three head argmax values agree, but that is not PPL or acceptance
+evidence. Any reported softmax KL is over the physical248320-row head, not the masked248077
+token domain or p-less/epsilon sampling distribution.
+
+The more aggressive, explicitly uncalibrated NVFP4 head was also assessed using NInfer's
+existing two-level maxabs recipe and independent signed E2M1/E4M3 decode. Source-logit loss
+is13.011% (individual inputs8.989–15.367%), versus row-FP8's3.595%, despite identical three
+argmaxes. This recipe is rejected for native head admission; no NVFP4 head default or
+activation policy was inferred from the dense27B target. No indiscriminate four-bit GR
+projection experiment is justified by the research, which specifically identifies those
+weights as sensitive.
+
+Reports: `out/qwen4-native-weight-assessment.json`,
+`out/qwen4-native-head-nvfp4-assessment.json`. These optional represented-weight paths do not
+choose the final smaller-checkpoint recipe. Protected controls and all activation defaults
+remain unchanged.
+
 ## Closed shared-expert MoE qualification
 
 The resident MoE accepts the source-calibrated shared gate/up/down matrices with
@@ -313,3 +376,89 @@ ideal complete MoE produces relative L2 `.01823`–`.01869` for layer 0 and
 `.02958`–`.03334` for layer 3 across the two deterministic BF16 input patterns.
 This weight-storage effect is distinct from kernel and activation errors. No
 full-model PPL, text-distribution, future-model default, or speed claim follows.
+
+## Resident component timing and selective activation assessment
+
+On 2026-09-19, RTX 5090 / CUDA 13.1 / `sm_120a`, the existing native first-four-layer
+33-token text panel was measured with device-resident authentic weights. The test-owned
+`NINFER_QWEN4_NATIVE_TIMING=1` option reports three warmups and eleven complete-Op
+CUDA-event intervals, summarized by median/min/max. Loading, host mathematical oracles,
+and GDN snapshot restoration are outside the intervals. QSA rewrites the same visible
+append slots. Ordinary oracle calls still run after timing, with restored GDN input state
+and unchanged output/state/selection criteria. These are warm-resident component numbers,
+not cold-cache bandwidth measurements, Engine throughput, or host-streaming timings.
+
+Run `ninfer_qwen4_native_sequence_real_test --native-text-fp8` and
+`--native-text-a8`, with that timing option and `NINFER_QWEN4_NATIVE_LAYERS` set to the
+existing source-fixture directory. Both whole 33 and 32+1 passed the existing complete
+component oracles and accumulated 2% screen. Whole-33 medians in microseconds:
+
+| Component | Calibrated A16 chain | Selective A8 chain |
+|---|---:|---:|
+| Layer 0 GDN, FP8 projections | 208.640 | 184.320 (Z only) |
+| Layer 0 resident routed-NVFP4 MoE | 1987.390 | 1934.110 (shared gate/up/down only) |
+| Layer 1 BF16 GDN | 223.232 | 223.232 |
+| Layer 1 resident routed-NVFP4 MoE | 1592.160 | 1591.040 |
+| Layer 2 BF16 GDN | 225.280 | 225.312 |
+| Layer 2 resident routed-NVFP4 MoE | 1467.740 | 1460.540 |
+| Layer 3 QSA, FP8 A16 projections and BF16 cache | 408.448 | 407.264 (still A16) |
+| Layer 3 resident routed-NVFP4 MoE | 1034.720 | 973.568 (shared gate/up/down only) |
+
+GDN0 sees the same input and saves 11.7% with its previously qualified Z-A8 route.
+Later components see the corresponding propagated chain inputs, and some routing decisions
+change; their table differences are not isolated shared-kernel speedups. Routed MoE remains
+the dominant measured component. The one-token continuation retains A16 dispatch: calibrated
+GDN0 measured 32.736 us in both policies. No protected QSA A8 profile was reintroduced.
+The earlier thirteen-matrix packing-inclusive Linear sweep remains the projection-level
+evidence; it was not repeated merely because the timing harness is available.
+
+The same timing option on `ninfer_qwen4_native_a4_eos_diagnostic` measures a controlled
+same-input routed comparison: actual source EOS token 15's MoE input repeated 65 times,
+identical exact routing, BF16 shared weights, ten expert groups with 65 occurrences.
+Complete resident MoE median was 783.680 us for A16 and 320.352 us for active A4,
+a 2.446x speedup (59.1% less time). Whole 65 and 64+1 still passed their unchanged
+complete FP64 oracle gates. Represented-reference relative L2 remained .00351252 for
+A16 and .0928886 for A4 whole 65; the latter is within the explicit 16% implementation
+profile, not a small-quality-loss or full-model PPL qualification. The concentrated EOS
+panel does not predict how often a natural prompt reaches 32 occurrences per expert.
+
+The measured priority is useful token aggregation within the existing resident expert
+schedule, not another projection MMA family or blanket A4 admission. Existing kdev cards
+for `[640,2560,T65]` NVFP4/A4 and `[6144,2560,T33]` FP8/A8 classify the projection
+problems as DRAM-bound and permit aggregate-T investigation; they refuse an unmotivated
+compute-family rewrite. Those generic projection floors do not model complete routed
+MoE or tensor-calibrated packing. No new kernel, calibration, cutoff, or default precision
+was changed from this measurement; any future routed-kernel change needs an exact-point
+traffic/issue profile and its own unchanged-oracle check.
+
+### Retained resident-MoE occupancy optimization
+
+The follow-up profiled the complete resident layer0 MoE on the same33-token panel, then the
+three attributed NVFP4 grouped kernels. Before changing code, `kdev recipe` classified the
+scalar NVFP4/A16 point as `profile-required`; its dense single-matrix floor is not a complete
+MoE roof. Nsight Systems attributed491/483/833us to gate/up/down and16.5us to the serial
+512-expert prefix sum. Nsight Compute reported128 registers/thread, about33% active warps,
+and5.61billion predicated-on FFMA instructions per projection. Sparse groups were doing a
+sixteen-token tile's arithmetic even when only one or two occurrences were present.
+
+The retained route dispatches disjoint occurrence-count ranges: counts1–2 use the existing
+two-token NVFP4/A16 Linear schedule, and larger groups retain the sixteen-token reuse
+schedule. Both skip the same eligible A4 groups when that explicit policy is enabled.
+An exact512-thread prefix scan replaces the serial integer scan. No codec, represented
+weights, router, accumulation criterion or activation cutoff changed. This is SM120 scalar
+schedule work, not a new MMA family. The kdev scalar-card printer was fixed to handle the
+already-classified `profile-required`/no-MMA case; classifier acceptance was not loosened.
+
+The final whole33 plus32/1 execution passes the independent local and accumulated2% checks.
+Warm-resident complete layer0 MoE medians are992.832us versus1987.30us before, approximately
+2.00x faster; the natural one-token continuation is145.600us versus163.616us, about11.0%
+less time. Layers1/2/3 whole33 measured931.680/883.584/774.048us. The earlier narrowed
+one-layer harness measured901.088us for the first tile candidate; do not substitute that
+number for the final four-layer workload. These are component, not Engine or streamed-model,
+measurements on RTX5090/CUDA13.1.2, three warmups and11 CUDA-event samples per median.
+
+Commands: `NINFER_QWEN4_NATIVE_TIMING=1` with the actual native fixture and
+`ninfer_qwen4_native_sequence_real_test --native-text-fp8`. Attribution artifacts are
+`profiles/nsys/qwen4-resident-moe/native33-baseline.nsys-rep` and
+`profiles/ncu/qwen4-resident-moe/native33-baseline.csv`. Profiler-instrumented kernel durations
+are not mixed with the unprofiled whole-Op timings above.

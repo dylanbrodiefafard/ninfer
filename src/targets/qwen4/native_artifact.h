@@ -4,6 +4,7 @@
 #include "targets/qwen4/mtp.h"
 #include "targets/qwen4/dflash.h"
 #include "targets/qwen4/vision.h"
+#include "targets/qwen4/native_precision.h"
 #include "ninfer/ops/gated_delta_net_layer.h"
 #include "ninfer/ops/ngram_embedding.h"
 #include "ninfer/ops/ple.h"
@@ -36,6 +37,7 @@ struct NativePleTable {
 // Non-owning semantic views of the exact complete preview. Every referenced byte belongs to
 // LoadedNativeModel; all programs/graphs must drain before that owner is destroyed.
 struct NativeModelView {
+    NativePrefillPolicy prefill_policy=NativePrefillPolicy::A16;
     std::array<NativeLayerWeights,48> layers;
     NativePleWeights ple;
     NativePleTable ple_table;
@@ -55,6 +57,7 @@ struct NativeArtifactTensor {
 // Complete metadata binding is independently usable before GPU allocation or host PLE locking.
 // Names are startup-only binding keys, never an execution graph or runtime layer dispatch.
 struct NativeArtifactPlan {
+    NativePrefillPolicy prefill_policy=NativePrefillPolicy::A16;
     artifact::MaterializationPlan materialization;
     std::map<std::string,NativeArtifactTensor> tensors;
     std::map<std::string,artifact::ObjectHandle> resources;

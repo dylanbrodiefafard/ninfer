@@ -24,6 +24,15 @@ bool fp8_role(const std::string& name) {
     return false;
 }
 
+bool row_fp8_role(const std::string& name) {
+    if(name==Main+"embed_tokens.weight" || name=="lm_head.weight") return true;
+    for(const char* role:{"down","up"})
+        if(name==Main+"hyper_connection_mixer.input_mix_weight_"+role+".weight") return true;
+    for(const char* role:{"key","value"})
+        if(name==Main+"layers.1.ple."+role+"_proj.weight") return true;
+    return false;
+}
+
 class Bind {
 public:
     explicit Bind(const artifact::Reader& reader):reader(reader),binder(reader) {}
@@ -38,6 +47,11 @@ public:
             const auto* descriptor=reader.find(name);
             const auto* t=descriptor?std::get_if<artifact::TensorDescriptor>(descriptor):nullptr;
             if(t && t->format==Format::FP8_E4M3FN_TENSOR_F32M) format=t->format;
+        }
+        if(row_fp8_role(name)) {
+            const auto* descriptor=reader.find(name);
+            const auto* t=descriptor?std::get_if<artifact::TensorDescriptor>(descriptor):nullptr;
+            if(t && t->format==Format::FP8_E4M3FN_ROW_BF16S) format=t->format;
         }
         tensor(name,{std::uint64_t(n),std::uint64_t(k)},format);
     }
@@ -139,9 +153,14 @@ public:
 } // namespace
 
 NativeArtifactPlan bind_native_artifact(const artifact::Reader& reader) {
-    if(reader.identity()!=artifact::ArtifactIdentity{"qwen4/native-preview","nvfp4-a16"})
+    if(reader.identity()!=artifact::ArtifactIdentity{"qwen4/native-preview","nvfp4-native"})
         throw std::invalid_argument("requires the complete exact native preview artifact");
     Bind b(reader);
+    b.result.resources.emplace("native-prefill-policy",artifact::bind_raw_resource(b.binder,"native-prefill-policy"));
+    const auto policy_bytes=reader.payload("native-prefill-policy").data;
+    if(policy_bytes.size()!=1 || std::to_integer<unsigned>(policy_bytes[0])>3)
+        throw std::invalid_argument("native prefill policy must be one registered recipe byte");
+    b.result.prefill_policy=static_cast<NativePrefillPolicy>(std::to_integer<unsigned>(policy_bytes[0]));
     for(int layer=0;layer<48;++layer) {
         const auto p=Main+"layers."+std::to_string(layer)+".";
         b.gr(p+"attn_hyper_connection.",true);b.gr(p+"mlp_hyper_connection.",true);b.moe(p+"mlp.");
@@ -191,6 +210,15 @@ NativeArtifactPlan bind_native_artifact(const artifact::Reader& reader) {
     }
     b.result.frontend=text::qwen::bind_frontend_resources(b.binder);
     b.result.resources.emplace("native-profile.json",artifact::bind_raw_resource(b.binder,"native-profile.json"));
+    if(selective_a8(b.result.prefill_policy)) {
+        auto require_fp8=[&](const std::string& name) {
+            if(b.result.tensors.at(name).format!=Format::FP8_E4M3FN_TENSOR_F32M)
+                throw std::invalid_argument("selective A8 prefill requires all seven audited FP8 roles");
+        };
+        require_fp8(Main+"layers.0.linear_attn.in_proj_z.weight");
+        for(int layer:{0,3}) for(const char* role:{"gate","up","down"})
+            require_fp8(Main+"layers."+std::to_string(layer)+".mlp.shared_expert."+role+"_proj.weight");
+    }
     b.result.materialization=b.binder.finish();
     return std::move(b.result);
 }
@@ -229,6 +257,7 @@ std::unique_ptr<LoadedNativeModel> LoadedNativeModel::load(const std::filesystem
     result->resources_=plan.resources;
     result->frontend_=text::qwen::take_frontend_resources(result->backing_,plan.frontend);
     const Views r(reader,plan,result->backing_);auto& w=result->view_;
+    w.prefill_policy=plan.prefill_policy;
     for(int layer=0;layer<48;++layer) {
         const auto p=Main+"layers."+std::to_string(layer)+".";auto& l=w.layers[layer];
         l.attention_gr=r.gr(p+"attn_hyper_connection.",true);l.moe_gr=r.gr(p+"mlp_hyper_connection.",true);

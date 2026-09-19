@@ -1,5 +1,6 @@
 #include "targets/qwen4/native_draft_runtime.h"
 #include "targets/qwen4/native_runtime.h"
+#include "targets/qwen4/native_runtime_layout.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear.h"
@@ -97,16 +98,16 @@ struct NativeDraftRuntime::Impl {
             .block_tables=pool->block_tables(),.head_dim=256,.num_kv_heads=2,.dtype=DType::BF16};
         return result;
     }
-    static std::size_t head_bytes(const NativeRuntimeConfig& c) {
+    static std::size_t head_bytes(const NativeRuntimeConfig& c,QType type) {
         if(!enabled(c)) return 0;
         const auto p=plan(c);
         return std::max<std::size_t>(256,ops::linear_workspace_capacity_bytes(
-            QType::BF16_CTRL,V,D,ops::LinearPolicy::A16Only,1,p.columns));
+            type,V,D,ops::LinearPolicy::A16Only,1,p.columns));
     }
     Impl(const NativeModelView& m,const NativeRuntimeConfig& c,DeviceContext& device)
         :model(m),config(c),stream(device.stream),layout(plan(c)),backing(layout.bytes),
          staging(enabled(c)?std::make_unique<PinnedHostBuffer>(layout.pinned):nullptr),
-         head_workspace(enabled(c)?std::make_unique<WorkspaceArena>(head_bytes(c)):nullptr) {
+         head_workspace(enabled(c)?std::make_unique<WorkspaceArena>(head_bytes(c,m.output_head.qtype)):nullptr) {
         seed_frontier.fill(-1);
         if(!enabled(c)) return;
         CUDA_CHECK(cudaMemsetAsync(backing.p,0,backing.bytes,stream));
@@ -227,14 +228,17 @@ struct NativeDraftRuntime::Impl {
 NativeDraftRuntime::NativeDraftRuntime(const NativeModelView& m,const NativeRuntimeConfig& c,DeviceContext& d)
     :impl_(std::make_unique<Impl>(m,c,d)) {}
 NativeDraftRuntime::~NativeDraftRuntime() {if(impl_) (void)cudaStreamSynchronize(impl_->stream);}
-std::uint64_t NativeDraftRuntime::device_bytes(const NativeModelView&,const NativeRuntimeConfig& c) {
+std::uint64_t NativeDraftRuntime::device_bytes(const NativeModelView& m,const NativeRuntimeConfig& c) {
     if(!enabled(c)) return 0;
     const auto p=plan(c);
-    return p.bytes+Impl::head_bytes(c)+(c.mtp?MtpProgram::device_bytes(p.width,c.requests):DFlashProgram::device_bytes(c.context_tokens,p.width,c.requests));
+    return p.bytes+Impl::head_bytes(c,m.output_head.qtype)+(c.mtp?MtpProgram::device_bytes(p.width,c.requests):DFlashProgram::device_bytes(c.context_tokens,p.width,c.requests));
 }
 std::uint64_t NativeDraftRuntime::device_bytes(const NativeArtifactPlan& a,const NativeRuntimeConfig& c) {
     if(c.dflash && !a.dflash) throw std::invalid_argument("native artifact has no DFlash companion");
-    return device_bytes(NativeModelView{},c);
+    if(!enabled(c)) return 0;
+    const auto p=plan(c);
+    const auto type=native_layout::qtype(a.tensors.at("lm_head.weight").format);
+    return p.bytes+Impl::head_bytes(c,type)+(c.mtp?MtpProgram::device_bytes(p.width,c.requests):DFlashProgram::device_bytes(c.context_tokens,p.width,c.requests));
 }
 std::uint64_t NativeDraftRuntime::pinned_bytes(const NativeRuntimeConfig& c) {return plan(c).pinned;}
 std::uint64_t NativeDraftRuntime::graph_allowance(const NativeRuntimeConfig& c) {

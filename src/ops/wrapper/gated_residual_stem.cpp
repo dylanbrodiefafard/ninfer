@@ -1,5 +1,4 @@
 #include "ninfer/ops/gated_residual_stem.h"
-#include "ninfer/ops/rmsnorm.h"
 #include "ops/common/projection.h"
 #include "ops/launcher/gated_residual_stem.h"
 #include "core/layout.h"
@@ -10,7 +9,7 @@ namespace ninfer::ops {
 namespace {
 struct Scratch { Tensor en, hn, ep, hp; };
 template<class A> Scratch scratch(A& a, int t) {
-    return {a.alloc(DType::BF16,{2560,t}), a.alloc(DType::BF16,{10240,t}),
+    return {a.alloc(DType::FP32,{2560,t}), a.alloc(DType::FP32,{10240,t}),
             a.alloc(DType::BF16,{2560,t}), a.alloc(DType::BF16,{2560,4*t})};
 }
 void tensor(const Tensor& x, std::array<int,4> shape) {
@@ -23,8 +22,6 @@ std::size_t gated_residual_stem_workspace_capacity_bytes(std::int32_t t) {
     if(t<1 || t>4096) throw std::invalid_argument("gated_residual_stem: T outside [1,4096]");
     WorkspaceLayoutBuilder a;
     (void)scratch(a,t);
-    const auto bytes=detail::projection_workspace_bytes(QType::BF16_CTRL,2560,2560,4*t);
-    if(bytes) (void)a.alloc_bytes(bytes);
     return a.peak_bytes();
 }
 void gated_residual_stem(const Tensor& e, const Tensor& h, const Tensor& en, const Tensor& hn,
@@ -51,11 +48,11 @@ void gated_residual_stem(const Tensor& e, const Tensor& h, const Tensor& en, con
     auto scope=workspace.scope();
     auto s=scratch(workspace,t);
     Tensor flat(h.data,DType::BF16,{10240,t});
-    rmsnorm(e,en,1e-6f,true,s.en,stream);
-    rmsnorm(flat,hn,1e-6f,true,s.hn,stream);
-    Tensor branches(s.hn.data,DType::BF16,{2560,4*t});
-    detail::projection(s.en,ew,s.ep,workspace,stream);
-    detail::projection(branches,hw,s.hp,workspace,stream);
+    detail::gated_residual_stem_normalize_launch(e,en,s.en,stream);
+    detail::gated_residual_stem_normalize_launch(flat,hn,s.hn,stream);
+    Tensor branches(s.hn.data,DType::FP32,{2560,4*t});
+    detail::gated_residual_stem_project_launch(s.en,ew,s.ep,stream);
+    detail::gated_residual_stem_project_launch(branches,hw,s.hp,stream);
     detail::gated_residual_stem_add_launch(s.ep,s.hp,out,stream);
 }
 }
