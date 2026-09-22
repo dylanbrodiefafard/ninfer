@@ -618,32 +618,15 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
                               {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
                               {"prefill_ms", json_decimal3(recovery.prefill_seconds * 1000.0)}};
     }
-    if (timings->kv_ram_capacity_bytes != 0) {
-        // Host KV RAM tier: live engine-wide gauges at request end, this request's
-        // D2H/H2D copy time, and engine-lifetime cumulative counters.
-        ninfer["kv_ram"] = {{"used_bytes", timings->kv_ram_used_bytes},
-                            {"entry_count", timings->kv_ram_entry_count},
-                            {"save_ms", json_decimal3(timings->kv_ram_save_ms)},
-                            {"load_ms", json_decimal3(timings->kv_ram_load_ms)},
-                            {"lifetime",
-                             {{"captures", timings->kv_ram_captures},
-                              {"restores", timings->kv_ram_restores},
-                              {"evictions", timings->kv_ram_evictions},
-                              {"drops", timings->kv_ram_drops}}}};
+    if (timings->kv_ram_save_ms != 0.0 || timings->kv_ram_load_ms != 0.0) {
+        ninfer["kv_ram"] = {{"save_ms", json_decimal3(timings->kv_ram_save_ms)},
+                            {"load_ms", json_decimal3(timings->kv_ram_load_ms)}};
     }
-    if (timings->kv_disk_capacity_bytes != 0) {
-        // Host KV disk tier: live gauges, this request's SSD-to-host restore wall,
-        // post-disk H2D wall, and engine-lifetime cumulative counters.
-        ninfer["kv_disk"] = {{"used_bytes", timings->kv_disk_used_bytes},
-                             {"entry_count", timings->kv_disk_entry_count},
-                             {"save_ms", json_decimal3(timings->kv_disk_save_ms)},
+    if (timings->kv_disk_save_ms != 0.0 || timings->kv_disk_load_ms != 0.0 ||
+        timings->kv_disk_h2d_ms != 0.0) {
+        ninfer["kv_disk"] = {{"save_ms", json_decimal3(timings->kv_disk_save_ms)},
                              {"load_ms", json_decimal3(timings->kv_disk_load_ms)},
-                             {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)},
-                             {"lifetime",
-                              {{"captures", timings->kv_disk_captures},
-                               {"restores", timings->kv_disk_restores},
-                               {"evictions", timings->kv_disk_evictions},
-                               {"drops", timings->kv_disk_drops}}}};
+                             {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)}};
     }
     ptd["ninfer"] = std::move(ninfer);
     out["prompt_tokens_details"] = std::move(ptd);

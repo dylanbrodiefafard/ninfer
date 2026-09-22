@@ -312,7 +312,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
-state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
+state, and function calls) plus Anthropic Messages, token counting, and multimodal input.
+`GET /metrics` and `GET /metrics.json` expose the same process snapshot. See
 [HTTP serving](docs/serving.md).
 
 ## Capabilities

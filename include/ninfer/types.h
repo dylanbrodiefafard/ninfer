@@ -423,17 +423,6 @@ enum class RequestErrorKind : std::uint8_t {
     RecoveryExhausted,
 };
 
-class RequestError final : public std::invalid_argument {
-public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
-
-    [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
-
-private:
-    RequestErrorKind kind_;
-};
-
 struct PromptSummary {
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
@@ -507,6 +496,14 @@ struct GenerationTimings {
     // (fully reused prefix).
     double prefill_tail_tok_s     = 0.0;
     double prefill_tail_window_s  = 0.0;
+    // Wall from Engine submit until the request leaves the pending FIFO with a lane.
+    // A cache-restore fallback that requeues adds the later pending interval and
+    // does not include copy-hold.
+    double queued_seconds = 0.0;
+    // Wall spent inside copy-hold (victim spill and RAM/disk restore), including
+    // resumes, until prefill or the first decode unit starts. 0 if the request
+    // never entered copy-hold. This is blocked wall, not CUDA copy elapsed.
+    double copy_hold_seconds = 0.0;
 };
 
 struct SpeculativeStats {
@@ -548,6 +545,22 @@ struct GenerationRecoveryStats {
     std::uint64_t prefill_tokens = 0;
     double prepare_seconds = 0.0;
     double prefill_seconds = 0.0;
+    // True exclusion count for the request. RecoveryEvent CycleExclusion lines are
+    // powers-of-two samples and are not this total.
+    std::uint32_t cycle_exclusions = 0;
+};
+
+class RequestError final : public std::invalid_argument {
+public:
+    RequestError(RequestErrorKind kind, std::string message, GenerationRecoveryStats recovery = {})
+        : std::invalid_argument(std::move(message)), kind_(kind), recovery_(std::move(recovery)) {}
+
+    [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+    [[nodiscard]] const GenerationRecoveryStats& recovery() const noexcept { return recovery_; }
+
+private:
+    RequestErrorKind kind_;
+    GenerationRecoveryStats recovery_;
 };
 
 struct GenerationResult {
@@ -659,6 +672,22 @@ struct RuntimeStats {
     std::size_t kv_disk_capacity_bytes  = 0;
     std::size_t kv_disk_used_bytes      = 0;
     std::size_t kv_disk_entry_count     = 0;
+    // Physical page groups in each pool. capacity is the pool size, entitled is
+    // the admission reservation, mapped is materialized pages, and free is the
+    // unmapped remainder. spec is the MTP/DFlash pool and stays 0 without one.
+    std::uint32_t gpu_kv_main_capacity_pages = 0;
+    std::uint32_t gpu_kv_main_entitled_pages = 0;
+    std::uint32_t gpu_kv_main_mapped_pages   = 0;
+    std::uint32_t gpu_kv_main_free_pages     = 0;
+    std::uint32_t gpu_kv_spec_capacity_pages = 0;
+    std::uint32_t gpu_kv_spec_entitled_pages = 0;
+    std::uint32_t gpu_kv_spec_mapped_pages   = 0;
+    std::uint32_t gpu_kv_spec_free_pages     = 0;
+    // Process-monotonic host wall from the last SSD byte of a disk restore until
+    // that restore's H2D completes. Folded from harvested copy seconds.
+    double kv_disk_h2d_seconds = 0;
+    // RAM or disk restore failed and the request was requeued for cold prefill.
+    std::uint64_t kv_cache_fallbacks = 0;
 };
 
 enum class ScoreSchedule : std::uint8_t {

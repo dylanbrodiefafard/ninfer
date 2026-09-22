@@ -140,7 +140,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 17, "request-log schema is not version 17");
+    failures += check(kRequestLogSchemaVersion == 18, "request-log schema is not version 18");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -394,56 +394,48 @@ int main() {
         Json::parse(format_request_done_json("serve-test", 3003, context, outcome));
     failures += check(vram_hit.at("result").at("reuse_source") == "vram_resident",
                       "vram_resident reuse_source missing");
-    outcome.metrics.kv_ram_capacity_bytes = 1024ULL * 1024ULL;
-    outcome.metrics.kv_ram_used_bytes     = 512ULL * 1024ULL;
-    outcome.metrics.kv_ram_entry_count    = 1;
-    outcome.metrics.kv_ram_captures       = 4;
-    outcome.metrics.kv_ram_restores       = 2;
-    outcome.metrics.kv_ram_drops          = 1;
-    outcome.metrics.kv_ram_save_seconds   = 0.008;
-    outcome.metrics.kv_ram_load_seconds   = 0.014;
+    outcome.metrics.kv_ram_save_seconds = 0.008;
+    outcome.metrics.kv_ram_load_seconds = 0.014;
+    outcome.metrics.queued_seconds      = 0.2;
+    outcome.metrics.copy_hold_seconds   = 0.05;
+    outcome.metrics.prepare_cpu_seconds = 0.01;
+    outcome.metrics.media_wait_seconds  = 0.02;
+    outcome.metrics.media_fetch_seconds = 0.03;
+    outcome.metrics.http_tail_seconds   = 0.004;
+    outcome.metrics.recovery.cycle_exclusions = 4;
     const Json ram_done =
         Json::parse(format_request_done_json("serve-test", 3004, context, outcome));
-    failures += check(ram_done.at("result").at("kv_ram_capacity_bytes") == 1048576 &&
-                          ram_done.at("result").at("kv_ram_used_bytes") == 524288 &&
-                          ram_done.at("result").at("kv_ram_entry_count") == 1 &&
-                          ram_done.at("result").at("kv_ram_captures") == 4 &&
-                          ram_done.at("result").at("kv_ram_drops") == 1 &&
+    failures += check(!ram_done.at("result").contains("kv_ram_capacity_bytes") &&
+                          !ram_done.at("result").contains("kv_ram_used_bytes") &&
+                          !ram_done.at("result").contains("kv_ram_captures") &&
                           ram_done.at("timings_seconds").at("kv_ram_save") == 0.008 &&
-                          ram_done.at("timings_seconds").at("kv_ram_load") == 0.014,
-                      "request_done JSON omitted live KV RAM occupancy");
-    outcome.metrics.kv_disk_capacity_bytes = 2ULL * 1024ULL * 1024ULL;
-    outcome.metrics.kv_disk_used_bytes     = 1024ULL * 1024ULL;
-    outcome.metrics.kv_disk_entry_count    = 2;
-    outcome.metrics.kv_disk_captures       = 3;
-    outcome.metrics.kv_disk_restores       = 1;
-    outcome.metrics.kv_disk_drops          = 0;
-    outcome.metrics.kv_disk_save_seconds   = 0.005;
-    outcome.metrics.kv_disk_load_seconds   = 0.009;
-    outcome.metrics.kv_disk_h2d_seconds    = 0.012;
+                          ram_done.at("timings_seconds").at("kv_ram_load") == 0.014 &&
+                          ram_done.at("timings_seconds").at("queued") == 0.2 &&
+                          ram_done.at("timings_seconds").at("copy_hold") == 0.05 &&
+                          ram_done.at("timings_seconds").at("prepare_cpu") == 0.01 &&
+                          ram_done.at("timings_seconds").at("media_wait") == 0.02 &&
+                          ram_done.at("timings_seconds").at("media_fetch") == 0.03 &&
+                          ram_done.at("timings_seconds").at("http_tail") == 0.004 &&
+                          ram_done.at("recovery").at("cycle_exclusions") == 4,
+                      "request_done JSON still carries process KV or dropped phase clocks");
+    outcome.metrics.kv_disk_save_seconds = 0.005;
+    outcome.metrics.kv_disk_load_seconds = 0.009;
+    outcome.metrics.kv_disk_h2d_seconds  = 0.012;
     const Json disk_done =
         Json::parse(format_request_done_json("serve-test", 3007, context, outcome));
-    failures += check(disk_done.at("result").at("kv_disk_capacity_bytes") == 2097152 &&
-                          disk_done.at("result").at("kv_disk_used_bytes") == 1048576 &&
+    failures += check(!disk_done.at("result").contains("kv_disk_capacity_bytes") &&
+                          !disk_done.at("result").contains("kv_disk_used_bytes") &&
                           disk_done.at("timings_seconds").at("kv_disk_save") == 0.005 &&
                           disk_done.at("timings_seconds").at("kv_disk_load") == 0.009 &&
                           disk_done.at("timings_seconds").at("kv_disk_h2d") == 0.012,
-                      "request_done JSON omitted live KV disk occupancy");
-    failures += check(format_request_done(context, outcome).find("kv-disk=1 MiB n=2 restores=1") !=
-                              std::string::npos &&
-                          format_request_done(context, outcome).find("h2d=12ms") !=
-                              std::string::npos,
-                      "human request log omits KV disk occupancy when the tier is enabled");
-    failures += check(format_request_done(context, outcome).find("kv-ram=0.5 MiB n=1 restores=2") !=
-                              std::string::npos &&
-                          format_request_done(context, outcome).find("evicts=0 drops=1") !=
-                              std::string::npos &&
-                          format_request_done(context, outcome).find("save=8ms load=14ms") !=
-                              std::string::npos &&
-                          format_request_done(context, outcome).find("ram_captures=") ==
-                              std::string::npos &&
-                          format_request_done(context, outcome).find(" used=") == std::string::npos,
-                      "human request log omits KV RAM occupancy when the tier is enabled");
+                      "request_done JSON omitted this request's disk copy time");
+    const std::string human_done = format_request_done(context, outcome);
+    failures += check(human_done.find("kv-disk=") == std::string::npos &&
+                          human_done.find("kv-ram=") == std::string::npos &&
+                          human_done.find("kv_ram_save=8ms") != std::string::npos &&
+                          human_done.find("kv_ram_load=14ms") != std::string::npos &&
+                          human_done.find("kv_disk_h2d=12ms") != std::string::npos,
+                      "human request log still prints process KV occupancy");
     outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
@@ -581,6 +573,20 @@ int main() {
     failures += check(error.at("event") == "request_error", "request error event mismatch");
     failures += check(error.at("error").at("message") == "generation failed",
                       "request error message missing");
+    ninfer::RecoveryEvent cycle_recovery;
+    cycle_recovery.kind = ninfer::RecoveryEventKind::CycleExclusion;
+    cycle_recovery.cause = "reasoning_cycle";
+    cycle_recovery.cycle_exclusions = 4;
+    cycle_recovery.generated_tokens = 128;
+    cycle_recovery.remaining_tokens = 8000;
+    const Json recovery_line =
+        Json::parse(format_recovery_event_json("serve-test", 4100, 7, cycle_recovery));
+    failures += check(recovery_line.at("event") == "recovery" &&
+                          recovery_line.at("request").at("id") == 7 &&
+                          recovery_line.at("kind") == "cycle_exclusion" &&
+                          recovery_line.at("cause") == "reasoning_cycle" &&
+                          recovery_line.at("cycle_exclusions") == 4,
+                      "recovery event JSON mismatch");
 
     failures += check(format_request_start(context).find("thinking=off") != std::string::npos,
                       "human request log omits resolved thinking mode");
@@ -638,6 +644,10 @@ int main() {
     ram_throughput.scheduler.kv_disk_restores = 4;
     ram_throughput.kv_disk_save_seconds       = 0.005;
     ram_throughput.kv_disk_load_seconds       = 0.009;
+    ram_throughput.kv_disk_h2d_seconds        = 0.012;
+    ram_throughput.scheduler.gpu_kv_main_capacity_pages = 128;
+    ram_throughput.scheduler.gpu_kv_main_entitled_pages = 40;
+    ram_throughput.scheduler.kv_cache_fallbacks = 2;
     const std::string human_disk_throughput   = format_throughput(ram_throughput);
     failures += check(human_disk_throughput.find("kv-disk=1 MiB n=1 restores=4") !=
                               std::string::npos,
@@ -650,7 +660,11 @@ int main() {
                           ram_throughput_json.at("scheduler").at("kv_ram_captures") == 3 &&
                           ram_throughput_json.at("scheduler").at("kv_ram_restores") == 1 &&
                           ram_throughput_json.at("timings_seconds").at("kv_ram_save") == 0.008 &&
-                          ram_throughput_json.at("timings_seconds").at("kv_ram_load") == 0.014,
+                          ram_throughput_json.at("timings_seconds").at("kv_ram_load") == 0.014 &&
+                          ram_throughput_json.at("timings_seconds").at("kv_disk_h2d") == 0.012 &&
+                          ram_throughput_json.at("scheduler").at("gpu_kv_main_capacity_pages") == 128 &&
+                          ram_throughput_json.at("scheduler").at("gpu_kv_main_entitled_pages") == 40 &&
+                          ram_throughput_json.at("scheduler").at("kv_cache_fallbacks") == 2,
                       "enabled KV RAM occupancy missing from throughput JSON");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));

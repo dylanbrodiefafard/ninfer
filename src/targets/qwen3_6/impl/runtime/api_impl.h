@@ -367,6 +367,11 @@ qwen3_6::detail::KvDiskCopySeconds Program<Variant>::harvest_kv_disk_copy_second
 }
 
 template <>
+qwen3_6::detail::KvGpuSnapshot Program<Variant>::kv_gpu_snapshot() const noexcept {
+    return impl_->kv_gpu_snapshot();
+}
+
+template <>
 bool Program<Variant>::kv_ram_copies_ready() const {
     return impl_->kv_ram_copies_ready();
 }

@@ -47,25 +47,18 @@ struct GenerationMetrics {
     ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
     std::uint32_t captured_context_checkpoint_tokens = 0;
     std::uint32_t restored_context_checkpoint_tokens = 0;
-    std::size_t kv_ram_capacity_bytes = 0;
-    std::size_t kv_ram_used_bytes     = 0;
-    std::size_t kv_ram_entry_count    = 0;
-    std::uint64_t kv_ram_captures     = 0;
-    std::uint64_t kv_ram_restores     = 0;
-    std::uint64_t kv_ram_evictions    = 0;
-    std::uint64_t kv_ram_drops        = 0;
     double kv_ram_save_seconds        = 0;
     double kv_ram_load_seconds        = 0;
-    std::size_t kv_disk_capacity_bytes = 0;
-    std::size_t kv_disk_used_bytes     = 0;
-    std::size_t kv_disk_entry_count    = 0;
-    std::uint64_t kv_disk_captures     = 0;
-    std::uint64_t kv_disk_restores     = 0;
-    std::uint64_t kv_disk_evictions    = 0;
-    std::uint64_t kv_disk_drops        = 0;
     double kv_disk_save_seconds        = 0;
     double kv_disk_load_seconds        = 0;
     double kv_disk_h2d_seconds         = 0;
+    double prepare_cpu_seconds         = 0;
+    double media_wait_seconds          = 0;
+    double media_fetch_seconds         = 0;
+    double queued_seconds              = 0;
+    double copy_hold_seconds           = 0;
+    // HTTP handler clock minus engine e2e. Set by the HTTP layer, not the Engine.
+    double http_tail_seconds           = 0;
 };
 
 struct GenerationOutcome {
@@ -106,6 +99,9 @@ struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds                 = 0.0;
+    double prepare_cpu_seconds             = 0.0;
+    double media_wait_seconds              = 0.0;
+    double media_fetch_seconds             = 0.0;
     int prompt_tokens                      = 0;
     bool include_usage                     = false;
     bool tool_capable                      = false;
@@ -128,6 +124,8 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] std::size_t in_flight_requests() const;
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }
@@ -139,7 +137,8 @@ public:
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, std::uint64_t request_id, const StreamSink* sink,
-                          std::function<bool()> is_cancelled = {});
+                          std::function<bool()> is_cancelled = {},
+                          std::function<void(const ninfer::RecoveryEvent&)> on_recovery = {});
 
     void warmup();
 
