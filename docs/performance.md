@@ -18,6 +18,30 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash2 automatic KV capacity
+
+Qualified on RTX 5090, driver 580.173.02, CUDA 13.1, `sm_120a`, using
+`qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`.
+The server workload used `--max-context 260000 --kv-capacity auto --max-concurrency 4
+--prefill-chunk 4096 --kv-dtype nvfp4 --spec dflash --draft-tokens 5 --adaptive-draft
+--lm-head-draft`, temperature 1.5, 32768 MiB RAM cache, and 100000 MiB disk cache.
+
+DFlash2 reserves 12 MiB per `(K, B, topology)` graph executable, or 144 MiB for this
+configuration, instead of inheriting the autoregressive DFlash allowance of 1152 MiB.
+With the same reported 13.26 GiB free after weights, server startup resolved 558656 tokens,
+up from the reported 501312-token configuration: the 1008 MiB reduction buys exactly 896
+64-token pages (57344 tokens). Measured graph usage was 54 MiB and free memory after startup
+was 1.05 GiB. The 1 GiB sizing headroom and address-stable workspace/KV allocations are unchanged.
+A separate cold single-request startup with fixed `K=5` used 4 MiB of its 12 MiB graph allowance
+and completed generation, covering the smallest executable-count budget.
+
+`ninfer_qwen3_8_27b_dflash_capacity_real_test` passed with automatic capacity, 68 full
+4096-token prefill chunks, a 259744-token prompt, and forced live `K=3,4,5,4,5,3` transitions
+at every batch size 1–4. Allocator-observed workspace peak stayed within 610.3 MiB; free device
+memory changed from 1110 to 1108 MiB across the complete prefill/decode exercise. These forced
+host selections test memory and graph transitions independently of timing-based adaptive policy.
+The opt-in reproduction command is in `tests/README.md`.
+
 ## Selective FP8 328 MiB qualification (2026-09-11)
 
 The eight-matrix recipe and CPU reproduction command are documented in

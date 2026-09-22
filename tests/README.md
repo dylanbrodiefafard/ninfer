@@ -349,6 +349,21 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
 ```
 
+`ninfer_qwen3_8_27b_dflash_capacity_real_test` uses the DFlash artifact named by
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` on an otherwise idle RTX 5090. It resolves automatic
+KV capacity at context 260000, concurrency 4, NVFP4 KV, and prefill chunk 4096. It checks that
+the graph allowance fits the measured allocation without stranding more than 128 MiB, executes
+full prefill chunks and partial tails up to 259744 tokens, then drives the production Program
+through `K=3,4,5,4,5,3` at every batch size 1–4. The test sets the host adaptive selection at
+round boundaries to make width transitions deterministic; it checks actual executed K, token
+counts, workspace bounds, and device-memory stability. Adaptive policy selection itself is
+covered by `ninfer_qwen3_6_adaptive_draft_test`.
+
+```bash
+NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_8_27b_dflash_capacity_real_test$'
+```
+
 `--system-prepend` is applied on every request, including follow-ups, so the leading system
 tokens stay in the reusable prefix. `ninfer_serve_system_prepend_real_test` checks VRAM reuse on
 turn 2 and a host-RAM restore after an unrelated chat spills the first turn:
