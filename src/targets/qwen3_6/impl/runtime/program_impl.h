@@ -2432,6 +2432,25 @@ qwen3_6::detail::KvDiskCopySeconds ProgramImplCore::harvest_kv_disk_copy_seconds
                           : qwen3_6::detail::KvDiskCopySeconds{};
 }
 
+qwen3_6::detail::KvGpuSnapshot ProgramImplCore::kv_gpu_snapshot() const noexcept {
+    qwen3_6::detail::KvGpuSnapshot out;
+    if (decoder) {
+        const PagedKVPool& pool = decoder->text_kv.pool();
+        out.main.page_group_count = pool.page_group_count();
+        out.main.entitled_pages   = pool.entitled_pages();
+        out.main.mapped_pages     = pool.mapped_pages();
+        out.main.free_pages       = pool.free_pages();
+    }
+    if (const qwen3_6::PagedKVCache* backend = backend_kv_cache()) {
+        const PagedKVPool& pool = backend->pool();
+        out.spec.page_group_count = pool.page_group_count();
+        out.spec.entitled_pages   = pool.entitled_pages();
+        out.spec.mapped_pages     = pool.mapped_pages();
+        out.spec.free_pages       = pool.free_pages();
+    }
+    return out;
+}
+
 bool ProgramImplCore::kv_ram_copies_ready() const {
     return !kv_ram_cache_ || kv_ram_cache_->pending_copies_ready();
 }

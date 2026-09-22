@@ -41,7 +41,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   changed reads/results and polling;
 - `test_typical_cycle.cpp` — suffix-square boundaries, exact repeated-passage evidence,
   non-overlapping coverage, changing/large periods, and productive-length negative controls;
-- `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
+- `test_serve_metrics.cpp`, `test_request_log.cpp`, and `test_http_error_handler.cpp` — Prometheus
+  exposition, generation lifecycle records,
   live recovery stages and cumulative counts, preparation rejections, protocol-shaped
   payload-limit errors, and application-error preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v14 reports;

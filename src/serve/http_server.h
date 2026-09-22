@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/metrics.h"
 #include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
@@ -61,8 +62,20 @@ private:
     void log_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
+    void emit_openai_error(httplib::Response& response, const ApiError& error);
+    void emit_messages_error(httplib::Response& response, const ApiError& error);
+    void record_generation(const RequestLogContext& context, GenerationOutcome outcome, bool tools,
+                           bool capture, bool media, std::chrono::steady_clock::time_point started);
+    void record_rejection(const RequestRejectionLogContext& context, const GenerationRequest& request);
+    void record_failure(const RequestLogContext& context, bool tools, bool capture, bool media,
+                        const std::string& message, const ApiError* error,
+                        bool count_api_error = true);
+    [[nodiscard]] std::function<void(const ninfer::RecoveryEvent&)>
+    recovery_callback(std::uint64_t request_id);
+    void handle_metrics_scrape(httplib::Response& response, bool json);
 
     GenerationService* service_ = nullptr;
+    ServeMetrics metrics_;
     ServeOptions options_;
     std::string public_model_id_;
     ResponseStore response_store_;

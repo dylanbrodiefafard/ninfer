@@ -193,6 +193,7 @@ Json paginated_input_items(const httplib::Request& request, const std::vector<Js
 } // namespace
 
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
+    const auto generation_started = std::chrono::steady_clock::now();
     ResponsesRequest request;
     ResponseContext previous_context;
     try {
@@ -211,10 +212,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         }
         compose_responses_generation_messages(request, flatten_response_context(previous_context));
     } catch (const ApiException& exception) {
-        write_error(res, responses_error(exception.error()));
+        emit_openai_error(res, responses_error(exception.error()));
         return;
     } catch (const std::exception& exception) {
-        write_error(res, internal_error(exception));
+        emit_openai_error(res, internal_error(exception));
         return;
     }
 
@@ -224,17 +225,22 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error));
-        write_error(res, error);
+        record_rejection(make_request_rejection_log_context(req_id, "openai_responses",
+                                                            request.generation, error),
+                         request.generation);
+        emit_openai_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
-        log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error));
-        write_error(res, error);
+        record_rejection(make_request_rejection_log_context(req_id, "openai_responses",
+                                                            request.generation, error),
+                         request.generation);
+        emit_openai_error(res, error);
         return;
     }
+    const bool generation_tools   = request.generation.uses_tools();
+    const bool generation_capture = request.generation.capture_context_checkpoint;
+    const bool generation_media   = request.generation.media_item_count() != 0;
 
     const std::string id       = new_response_id();
     const std::int64_t created = unix_time_now();
@@ -244,8 +250,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome =
-                service_->run(prepared, log_context.id, nullptr, [&req] { return disconnected(req); });
+            GenerationOutcome outcome = service_->run(
+                prepared, log_context.id, nullptr, [&req] { return disconnected(req); },
+                recovery_callback(log_context.id));
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
             if (request.store) {
@@ -257,15 +264,19 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 stored.preserve_thinking = prepared.preserve_thinking;
                 response_store_.put(std::move(stored));
             }
-            log_request_done(log_context, outcome);
-            set_owned_content(res, response.body.dump(), prepared.lifetime);
+            const std::string body = response.body.dump();
+            record_generation(log_context, std::move(outcome), generation_tools, generation_capture,
+                              generation_media, generation_started);
+            set_owned_content(res, body, prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
-            log_request_error(log_context, error.message);
-            write_error(res, error);
+            record_failure(log_context, generation_tools, generation_capture, generation_media,
+                           error.message, &error, false);
+            emit_openai_error(res, error);
         } catch (const std::exception& exception) {
-            log_request_error(log_context, exception.what());
-            write_error(res, internal_error(exception));
+            record_failure(log_context, generation_tools, generation_capture, generation_media,
+                           exception.what(), nullptr, false);
+            emit_openai_error(res, internal_error(exception));
         }
         return;
     }
@@ -282,7 +293,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     res.set_header("X-Accel-Buffering", "no");
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream](std::size_t, httplib::DataSink& sink) -> bool {
+        [this, stream, generation_started, generation_tools, generation_capture,
+         generation_media](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
                 return true;
@@ -302,8 +314,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, stream->log_context.id, &output);
-                ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
+                GenerationOutcome outcome =
+                    service_->run(stream->prepared, stream->log_context.id, &output, {},
+                                  recovery_callback(stream->log_context.id));
+                ResponsesStreamFinish finished = stream->encoder->finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;
                     stored.id          = finished.response.body.at("id").get<std::string>();
@@ -315,16 +329,22 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     response_store_.put(std::move(stored));
                 }
                 write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
-                log_request_done(stream->log_context, outcome);
                 write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
+                record_generation(stream->log_context, std::move(outcome), generation_tools,
+                                  generation_capture, generation_media, generation_started);
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
-                log_request_error(stream->log_context, exception.what());
+                ApiError error;
+                error.code = "client_disconnected";
+                error.message = exception.what();
+                record_failure(stream->log_context, generation_tools, generation_capture,
+                               generation_media, exception.what(), &error);
                 return false;
             } catch (const ApiException& exception) {
                 const ApiError error = responses_error(exception.error());
-                log_request_error(stream->log_context, error.message);
+                record_failure(stream->log_context, generation_tools, generation_capture,
+                               generation_media, error.message, &error);
                 try {
                     write_stream_item(sink, *stream, stream->encoder->failed(error));
                     sink.done();
@@ -332,7 +352,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 } catch (const ClientDisconnected&) { return false; }
             } catch (const std::exception& exception) {
                 const ApiError error = internal_error(exception);
-                log_request_error(stream->log_context, error.message);
+                record_failure(stream->log_context, generation_tools, generation_capture,
+                               generation_media, error.message, &error);
                 try {
                     write_stream_item(sink, *stream, stream->encoder->failed(error));
                     sink.done();
@@ -344,6 +365,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 }
 
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {
+    observe_token_count(metrics_, "openai_responses");
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -353,15 +375,15 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
             service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
-        write_error(res, responses_error(exception.error()));
-    } catch (const std::exception& exception) { write_error(res, internal_error(exception)); }
+        emit_openai_error(res, responses_error(exception.error()));
+    } catch (const std::exception& exception) { emit_openai_error(res, internal_error(exception)); }
 }
 
 void HttpServer::handle_response_get(const httplib::Request& req, httplib::Response& res) {
     const std::string id                               = path_response_id(req);
     const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
     if (!stored) {
-        write_error(res, response_not_found(id));
+        emit_openai_error(res, response_not_found(id));
         return;
     }
     res.set_content(stored->response.dump(), "application/json");
@@ -370,7 +392,7 @@ void HttpServer::handle_response_get(const httplib::Request& req, httplib::Respo
 void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!response_store_.erase(id)) {
-        write_error(res, response_not_found(id));
+        emit_openai_error(res, response_not_found(id));
         return;
     }
     res.set_content(Json{{"id", id}, {"object", "response.deleted"}, {"deleted", true}}.dump(),
@@ -381,18 +403,18 @@ void HttpServer::handle_response_input_items(const httplib::Request& req, httpli
     const std::string id                               = path_response_id(req);
     const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
     if (!stored) {
-        write_error(res, response_not_found(id));
+        emit_openai_error(res, response_not_found(id));
         return;
     }
     try {
         res.set_content(paginated_input_items(req, stored->input_items).dump(), "application/json");
-    } catch (const ApiException& exception) { write_error(res, exception.error()); }
+    } catch (const ApiException& exception) { emit_openai_error(res, exception.error()); }
 }
 
 void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
     const std::string id = path_response_id(req);
     if (!response_store_.get(id)) {
-        write_error(res, response_not_found(id));
+        emit_openai_error(res, response_not_found(id));
         return;
     }
     ApiError error;
@@ -401,7 +423,7 @@ void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Re
     error.code    = "background_not_supported";
     error.message = "only background responses can be cancelled; NInfer does not support "
                     "background execution";
-    write_error(res, error);
+    emit_openai_error(res, error);
 }
 
 void HttpServer::handle_response_compact(const httplib::Request&, httplib::Response& res) {
@@ -411,7 +433,7 @@ void HttpServer::handle_response_compact(const httplib::Request&, httplib::Respo
     error.param   = "context_management";
     error.code    = "compaction_not_supported";
     error.message = "Responses compaction is not supported";
-    write_error(res, error);
+    emit_openai_error(res, error);
 }
 
 } // namespace ninfer::serve

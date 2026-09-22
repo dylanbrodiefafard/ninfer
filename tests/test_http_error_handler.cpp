@@ -1,5 +1,6 @@
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
+#include "serve/metrics.h"
 
 #include <nlohmann/json.hpp>
 
@@ -21,6 +22,11 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    failures += check(ninfer::serve::is_unauthenticated_path("/health") &&
+                          ninfer::serve::is_unauthenticated_path("/metrics") &&
+                          ninfer::serve::is_unauthenticated_path("/metrics.json") &&
+                          !ninfer::serve::is_unauthenticated_path("/v1/chat/completions"),
+                      "metrics routes are authenticated");
     ServeOptions options;
     options.max_request_bytes = 1234;
 

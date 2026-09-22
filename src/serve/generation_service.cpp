@@ -80,8 +80,9 @@ void reject_unavailable_context_checkpoint_capture(bool capture_requested,
 
 ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     ApiError error;
-    error.param   = "messages";
-    error.message = exception.what();
+    error.param    = "messages";
+    error.message  = exception.what();
+    error.recovery = exception.recovery();
     switch (exception.kind()) {
     case ninfer::RequestErrorKind::InvalidToolSchema:
         error.status = 400;
@@ -235,13 +236,15 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink* sink, std::uint64_t request_id)
-        : sink_(sink), request_id_(request_id) {}
+    ServiceOutputSink(const StreamSink* sink, std::uint64_t request_id,
+                      std::function<void(const ninfer::RecoveryEvent&)> on_recovery)
+        : sink_(sink), request_id_(request_id), on_recovery_(std::move(on_recovery)) {}
 
     void recovery_event(const ninfer::RecoveryEvent& event) override {
         write_console_log(event.kind == ninfer::RecoveryEventKind::Exhausted
                               ? ConsoleLogLevel::Warning : ConsoleLogLevel::Info,
                           format_recovery_event(request_id_, event));
+        if (on_recovery_) { on_recovery_(event); }
     }
 
     void publish(ninfer::OutputDelta delta) override {
@@ -265,6 +268,7 @@ private:
     const StreamSink* sink_ = nullptr;
     std::uint64_t request_id_ = 0;
     std::size_t content_bytes_ = 0;
+    std::function<void(const ninfer::RecoveryEvent&)> on_recovery_;
 };
 
 } // namespace
@@ -359,6 +363,11 @@ GenerationService::acquire_media_input(Clock::time_point deadline,
     }
 }
 
+std::size_t GenerationService::in_flight_requests() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->active;
+}
+
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     reject_unavailable_context_checkpoint_capture(request.capture_context_checkpoint,
@@ -387,7 +396,10 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.lifetime = acquire_request_lifetime();
     HostInputLease host_input;
     if (request_has_media) {
+        const Clock::time_point wait_started = Clock::now();
         host_input = acquire_media_input(prepared.lifetime->deadline, is_cancelled);
+        prepared.media_wait_seconds =
+            std::chrono::duration<double>(Clock::now() - wait_started).count();
     }
 
     try {
@@ -395,8 +407,13 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         ninfer::PromptInput input =
             to_prompt_input(request, semantics,
                             [&](const ContentPart& part) {
-                                return acquire_media(part, prepared.lifetime->deadline,
-                                                     is_cancelled, remaining_media_bytes);
+                                const Clock::time_point fetch_started = Clock::now();
+                                auto media = acquire_media(part, prepared.lifetime->deadline,
+                                                           is_cancelled, remaining_media_bytes);
+                                prepared.media_fetch_seconds +=
+                                    std::chrono::duration<double>(Clock::now() - fetch_started)
+                                        .count();
+                                return media;
                             },
                             options_.system_prepend);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -405,6 +422,8 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        prepared.prepare_cpu_seconds = std::max(
+            0.0, prepared.prepare_seconds - prepared.media_wait_seconds - prepared.media_fetch_seconds);
         const ninfer::OutputDelivery delivery = request.stream
             ? ninfer::OutputDelivery::Streaming
             : ninfer::OutputDelivery::TerminalOnly;
@@ -454,10 +473,10 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 }
 
-GenerationOutcome GenerationService::run(PreparedRequest& prepared, std::uint64_t request_id,
-                                         const StreamSink* sink,
-                                         std::function<bool()> is_cancelled) {
-    ServiceOutputSink output_sink(sink, request_id);
+GenerationOutcome GenerationService::run(
+    PreparedRequest& prepared, std::uint64_t request_id, const StreamSink* sink,
+    std::function<bool()> is_cancelled, std::function<void(const ninfer::RecoveryEvent&)> on_recovery) {
+    ServiceOutputSink output_sink(sink, request_id, std::move(on_recovery));
     ninfer::OutputSink* public_sink = &output_sink;
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
@@ -481,6 +500,11 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, std::uint64_
     outcome.metrics.recovery = result.recovery;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+    outcome.metrics.prepare_cpu_seconds = prepared.prepare_cpu_seconds;
+    outcome.metrics.media_wait_seconds = prepared.media_wait_seconds;
+    outcome.metrics.media_fetch_seconds = prepared.media_fetch_seconds;
+    outcome.metrics.queued_seconds = result.timings.queued_seconds;
+    outcome.metrics.copy_hold_seconds = result.timings.copy_hold_seconds;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
@@ -499,23 +523,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, std::uint64_
         result.captured_context_checkpoint_tokens;
     outcome.metrics.restored_context_checkpoint_tokens =
         result.restored_context_checkpoint_tokens;
-    const ninfer::RuntimeStats stats            = engine_->runtime_stats();
-    outcome.metrics.kv_ram_capacity_bytes       = stats.kv_ram_capacity_bytes;
-    outcome.metrics.kv_ram_used_bytes           = stats.kv_ram_used_bytes;
-    outcome.metrics.kv_ram_entry_count          = stats.kv_ram_entry_count;
-    outcome.metrics.kv_ram_captures             = stats.kv_ram_captures;
-    outcome.metrics.kv_ram_restores             = stats.kv_ram_restores;
-    outcome.metrics.kv_ram_evictions            = stats.kv_ram_evictions;
-    outcome.metrics.kv_ram_drops                = stats.kv_ram_drops;
     outcome.metrics.kv_ram_save_seconds         = result.kv_ram_save_seconds;
     outcome.metrics.kv_ram_load_seconds         = result.kv_ram_load_seconds;
-    outcome.metrics.kv_disk_capacity_bytes      = stats.kv_disk_capacity_bytes;
-    outcome.metrics.kv_disk_used_bytes          = stats.kv_disk_used_bytes;
-    outcome.metrics.kv_disk_entry_count         = stats.kv_disk_entry_count;
-    outcome.metrics.kv_disk_captures            = stats.kv_disk_captures;
-    outcome.metrics.kv_disk_restores            = stats.kv_disk_restores;
-    outcome.metrics.kv_disk_evictions           = stats.kv_disk_evictions;
-    outcome.metrics.kv_disk_drops               = stats.kv_disk_drops;
     outcome.metrics.kv_disk_save_seconds        = result.kv_disk_save_seconds;
     outcome.metrics.kv_disk_load_seconds        = result.kv_disk_load_seconds;
     outcome.metrics.kv_disk_h2d_seconds         = result.kv_disk_h2d_seconds;

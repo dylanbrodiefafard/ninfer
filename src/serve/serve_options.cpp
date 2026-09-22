@@ -124,6 +124,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy] [--no-p-less-sampling]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       GET /health, GET /metrics, and GET /metrics.json stay unauthenticated\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"

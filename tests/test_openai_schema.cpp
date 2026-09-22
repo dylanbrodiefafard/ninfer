@@ -593,13 +593,6 @@ int test_response_serialization() {
     failures += check(!j.contains("timings"), "top-level timings field present");
 
     CompletionTimings timings = make_completion_timings(10, 3, 0.25, 1.0);
-    timings.kv_ram_capacity_bytes = 1048576;
-    timings.kv_ram_used_bytes     = 524288;
-    timings.kv_ram_entry_count    = 1;
-    timings.kv_ram_captures       = 4;
-    timings.kv_ram_restores       = 2;
-    timings.kv_ram_evictions      = 0;
-    timings.kv_ram_drops          = 1;
     timings.kv_ram_save_ms        = 8.0;
     timings.kv_ram_load_ms        = 14.0;
     timings.prefix_reuse_source   = ninfer::PrefixReuseSource::HostRam;
@@ -640,30 +633,20 @@ int test_response_serialization() {
     // over 1.0s.
     failures += check(ninfer_ptd.at("decode").at("tok_s") == 2.0, "decode tok_s");
     const Json& kv_ram = ninfer_ptd.at("kv_ram");
-    failures += check(kv_ram.at("used_bytes") == 524288, "kv_ram used_bytes gauge");
-    failures += check(kv_ram.at("entry_count") == 1, "kv_ram entry_count gauge");
+    failures += check(!kv_ram.contains("used_bytes") && !kv_ram.contains("entry_count") &&
+                          !kv_ram.contains("lifetime"),
+                      "kv_ram still publishes process occupancy");
     failures += check(kv_ram.at("save_ms") == 8.0, "kv_ram per-request save_ms");
     failures += check(kv_ram.at("load_ms") == 14.0, "kv_ram per-request load_ms");
-    failures += check(kv_ram.at("lifetime").at("captures") == 4, "kv_ram lifetime captures");
-    failures += check(kv_ram.at("lifetime").at("restores") == 2, "kv_ram lifetime restores");
-    failures += check(kv_ram.at("lifetime").at("evictions") == 0, "kv_ram lifetime evictions");
-    failures += check(kv_ram.at("lifetime").at("drops") == 1, "kv_ram lifetime drops");
-    failures += check(!kv_ram.contains("capacity_bytes"), "kv_ram serializes pin capacity");
-    timings.kv_disk_capacity_bytes = 2097152;
-    timings.kv_disk_used_bytes     = 1048576;
-    timings.kv_disk_entry_count    = 2;
-    timings.kv_disk_captures       = 5;
-    timings.kv_disk_restores       = 3;
-    timings.kv_disk_evictions      = 1;
-    timings.kv_disk_drops          = 0;
-    timings.kv_disk_save_ms        = 5.0;
-    timings.kv_disk_load_ms        = 9.0;
-    timings.kv_disk_h2d_ms         = 12.0;
+    timings.kv_disk_save_ms = 5.0;
+    timings.kv_disk_load_ms = 9.0;
+    timings.kv_disk_h2d_ms  = 12.0;
     const Json disk_usage = Json::parse(
         make_chat_completion_response("id-1k", "m", 111, "hello world", "", "stop", usage, &timings));
     const Json& kv_disk =
         disk_usage.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk");
-    failures += check(kv_disk.at("used_bytes") == 1048576, "kv_disk used_bytes gauge");
+    failures += check(!kv_disk.contains("used_bytes") && !kv_disk.contains("lifetime"),
+                      "kv_disk still publishes process occupancy");
     failures += check(kv_disk.at("load_ms") == 9.0, "kv_disk per-request load_ms");
     failures += check(kv_disk.at("h2d_ms") == 12.0, "kv_disk per-request h2d_ms");
     timings.kv_disk_h2d_ms = 0.0;
@@ -672,7 +655,7 @@ int test_response_serialization() {
     failures += check(disk_zero.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk").at(
                           "h2d_ms") == 0.0,
                       "kv_disk emits zero h2d_ms by default");
-    failures += check(kv_disk.at("lifetime").at("restores") == 3, "kv_disk lifetime restores");
+    failures += check(!kv_disk.contains("lifetime"), "kv_disk lifetime restores remain on the request");
 
     // completion_tokens_details carries only OpenAI-standard keys.
     const Json& ctd = usage_t.at("completion_tokens_details");
@@ -927,13 +910,6 @@ int test_chunk_serialization() {
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
 
     CompletionTimings ram_timings = make_completion_timings(2, 5, 0.25, 1.0);
-    ram_timings.kv_ram_capacity_bytes = 1048576;
-    ram_timings.kv_ram_used_bytes     = 524288;
-    ram_timings.kv_ram_entry_count    = 1;
-    ram_timings.kv_ram_captures       = 3;
-    ram_timings.kv_ram_restores       = 2;
-    ram_timings.kv_ram_evictions      = 0;
-    ram_timings.kv_ram_drops          = 1;
     ram_timings.kv_ram_save_ms        = 8.0;
     ram_timings.kv_ram_load_ms        = 14.0;
     ram_timings.prefix_reuse_source   = ninfer::PrefixReuseSource::VramResident;
@@ -943,7 +919,7 @@ int test_chunk_serialization() {
                       "usage chunk does not nest prompt_tokens_details");
     failures += check(!ram_chunk.at("usage").contains("kv_ram_used_bytes"),
                       "usage chunk duplicates kv stats at top level");
-    failures += check(ram_ninfer.at("kv_ram").at("used_bytes") == 524288,
+    failures += check(!ram_ninfer.at("kv_ram").contains("used_bytes"),
                       "usage chunk kv_ram used_bytes");
     failures += check(ram_ninfer.at("kv_ram").at("load_ms") == 14.0, "usage chunk kv_ram load_ms");
     failures += check(ram_ninfer.at("reuse_source") == "vram_resident", "usage chunk reuse_source");

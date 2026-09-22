@@ -31,6 +31,8 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    // Engine recovery totals when this error ended a generation. Empty otherwise.
+    ninfer::GenerationRecoveryStats recovery;
 };
 
 class ApiException : public std::runtime_error {
@@ -96,29 +98,12 @@ struct CompletionTimings {
     ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
     std::uint32_t captured_context_checkpoint_tokens = 0;
     std::uint32_t restored_context_checkpoint_tokens = 0;
-    // Host KV RAM tier stats, all zero when the tier is off. used_bytes / entry_count
-    // are live engine-level gauges at request end; the *_total counters are
-    // engine-lifetime cumulative; save_ms / load_ms are this request's D2H/H2D copy
-    // time. capacity_bytes is the static pin budget (not serialized).
-    std::size_t kv_ram_capacity_bytes = 0;
-    std::size_t kv_ram_used_bytes     = 0;
-    std::size_t kv_ram_entry_count    = 0;
-    std::uint64_t kv_ram_captures     = 0;
-    std::uint64_t kv_ram_restores     = 0;
-    std::uint64_t kv_ram_evictions    = 0;
-    std::uint64_t kv_ram_drops        = 0;
-    double kv_ram_save_ms             = 0.0;
-    double kv_ram_load_ms             = 0.0;
-    std::size_t kv_disk_capacity_bytes = 0;
-    std::size_t kv_disk_used_bytes     = 0;
-    std::size_t kv_disk_entry_count    = 0;
-    std::uint64_t kv_disk_captures     = 0;
-    std::uint64_t kv_disk_restores     = 0;
-    std::uint64_t kv_disk_evictions    = 0;
-    std::uint64_t kv_disk_drops        = 0;
-    double kv_disk_save_ms             = 0.0;
-    double kv_disk_load_ms             = 0.0;
-    double kv_disk_h2d_ms              = 0.0;
+    // This request's KV copy time. Process occupancy and lifetime counters are scrape gauges.
+    double kv_ram_save_ms  = 0.0;
+    double kv_ram_load_ms  = 0.0;
+    double kv_disk_save_ms = 0.0;
+    double kv_disk_load_ms = 0.0;
+    double kv_disk_h2d_ms  = 0.0;
 };
 
 enum class ContentKind {
