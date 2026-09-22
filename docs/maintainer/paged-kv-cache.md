@@ -141,6 +141,12 @@ persistent 部分直接来自生产 `LayoutBuilder`，workspace 来自生产 sch
 resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation probing。最终 plan 再由同一 builder
 按 `M` 生成并核对 reservation curve。
 
+DFlash2 的 CUDA Graph allowance 按每个 `(K, B, topology)` executable 计 12 MiB，包含其
+reachable definitions；adaptive `K={3,4,5}`、`C=4` 的当前单 topology 共 144 MiB。
+不能套用 autoregressive DFlash 的 64/96 MiB unroll allowance。所有 definitions 和 executables
+在 startup 建立，实测 graph allocation 超过 allowance 时启动失败。4096-token prefill 和 adaptive
+K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV pool。
+
 `R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
 等同于 arena payload；因此 Instance 与 Graph 完整建立并同步后再次查询实际 free memory，并与 policy、
 planned slack 一起报告。默认 1 GiB 同时吸收这部分差值，并为同一 GPU 上后续的小额占用留下实际余量。

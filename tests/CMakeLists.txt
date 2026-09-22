@@ -210,6 +210,13 @@ ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash_capacity_real_test
+  SOURCES targets/qwen3_6_27b/test_dflash_capacity_real.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_8_27b_dflash_capacity_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_capacity_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_mtp_nvfp4_real_test
   SOURCES targets/qwen3_6_27b/test_engine_mtp_nvfp4_real.cpp
   LIBRARIES ninfer_engine)

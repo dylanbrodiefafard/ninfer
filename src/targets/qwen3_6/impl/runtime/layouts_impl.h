@@ -1084,7 +1084,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 const std::uint64_t final_visible = std::min<std::uint64_t>(
                     impl->capacity,
                     static_cast<std::uint64_t>(expanded[i].max) + expanded_w[i]);
-                const std::size_t allowance = (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                // DFlash2 captures one parallel proposal/verify schedule, not the
+                // autoregressive DFlash unroll. Its definitions share one executable
+                // per (K, B, topology), just like the other graph families. Budget
+                // 12 MiB for that executable and its definitions; prepare_graphs
+                // checks the complete measured allocation against this allowance.
+                const std::size_t allowance =
+                    (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2
+                         ? 12ULL
+                         : (final_visible <= 4096 ? 64ULL : 96ULL)) * kMiB;
                 const auto existing =
                     std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
                         return entry.first == expanded[i].topology_class;
