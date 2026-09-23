@@ -8,6 +8,10 @@
 #include <stdexcept>
 #include <string_view>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
 using Json = nlohmann::ordered_json;
@@ -272,6 +276,16 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
                  {"end", "</think>"}}, format})}};
     }
     std::scoped_lock lock(mutex_);
+    // Compile temporaries are freed before this returns, including a rejected
+    // schema. malloc_trim releases the free space at the top of each glibc
+    // arena and leaves the compiler cache in place.
+    struct ReleaseCompileHeap {
+        ~ReleaseCompileHeap() noexcept {
+#if defined(__GLIBC__)
+            ::malloc_trim(0);
+#endif
+        }
+    } release_compile_heap;
     if (!compiler_) {
         std::vector<std::string> vocab(kTokenDomain);
         for (std::size_t id = 0; id < kTokenDomain; ++id) {

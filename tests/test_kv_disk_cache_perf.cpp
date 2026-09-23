@@ -361,7 +361,6 @@ q36::detail::DiskOpenConfig make_cfg(const fs::path& location, q36::detail::KVRa
         ninfer::SpeculativeBackend::None, pool, nullptr, nullptr, nullptr);
     cfg.text_pool            = &pool;
     cfg.logical_page_bytes  = ninfer::paged_kv_logical_page_bytes(pool);
-    cfg.gdn_staging_bytes    = 256;
     cfg.restore_window_slots = window;
     cfg.restore_io_threads  = io_threads;
     cfg.pack_page_batch      = page_batch;
@@ -811,7 +810,6 @@ int main() {
         state_cfg.fingerprint = q36::detail::make_disk_fingerprint(
             "qwen3.6-27b", "groupwise-int", "disk-perf-artifact", ninfer::KvCacheStorage::Int8Group64,
             ninfer::SpeculativeBackend::None, pool, nullptr, &gdn, nullptr);
-        state_cfg.gdn_staging_bytes = state_bytes;
         q36::detail::KVDiskCache state_disk(std::move(state_cfg));
         auto state_prompt = text_prompt({7, 7, 7, 7});
         auto state_retained = state_prompt;

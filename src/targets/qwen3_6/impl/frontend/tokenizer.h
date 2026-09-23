@@ -7,7 +7,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -88,14 +87,16 @@ private:
     [[nodiscard]] std::optional<std::pair<std::size_t, int>>
     find_leftmost_added(std::string_view text, std::size_t pos) const;
 
-    std::vector<std::string> id_to_token_;
-    std::vector<std::string> id_to_decoded_bytes_;
+    // One byte blob and one id blob. Per-token strings and the vocab hash
+    // exist only while the constructor is building these tables.
+    std::string decoded_bytes_;
+    std::vector<std::size_t> decoded_offsets_;
     std::vector<std::uint8_t> valid_token_ids_;
     std::vector<std::uint8_t> special_token_ids_;
     std::vector<std::uint8_t> added_token_ids_;
-    std::unordered_map<std::string, int> vocab_token_to_id_;
     BpePairTable bpe_pair_table_;
-    std::vector<std::vector<int>> intern_emit_ids_;
+    std::vector<int> intern_emit_ids_;
+    std::vector<std::size_t> intern_emit_offsets_;
     std::array<int, 256> byte_to_intern_id_{};
     bool has_bpe_merges_ = true;
     std::vector<AddedToken> added_tokens_;

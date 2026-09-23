@@ -182,7 +182,6 @@ struct DiskOpenConfig {
     const PagedKVPool* text_pool        = nullptr;
     const PagedKVPool* backend_pool     = nullptr;
     std::size_t logical_page_bytes      = 0;
-    std::size_t gdn_staging_bytes       = 0;
     std::uint64_t hidden_bytes           = 0;
     std::uint32_t max_index_entries     = 1u << 18;
     std::uint32_t restore_window_slots = 2;
@@ -889,9 +888,6 @@ private:
     cudaEvent_t state_arena_idle_ = nullptr;
     bool state_arena_h2d_pending_ = false;
     cudaStream_t state_h2d_stream_ = nullptr;
-    std::vector<std::uint8_t> spill_scratch_;
-    std::vector<std::uint8_t> spill_zstd_;
-    std::vector<std::uint8_t> decode_zstd_;
 
     std::atomic<bool> fail_publication_allocation_{false};
     void (*publication_install_hook_)(bool) noexcept = nullptr;

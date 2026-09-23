@@ -23,6 +23,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
 
@@ -680,7 +684,8 @@ bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
 
 void append_bpe_word(std::vector<int>& ids, std::string_view word, const BpePairTable& pair_table,
                      const std::array<int, 256>& byte_to_intern_id,
-                     const std::vector<std::vector<int>>& intern_emit_ids) {
+                     const std::vector<int>& intern_emit_ids,
+                     const std::vector<std::size_t>& intern_emit_offsets) {
     if (word.empty()) { return; }
     struct Node {
         int intern_id = -1;
@@ -725,18 +730,26 @@ void append_bpe_word(std::vector<int>& ids, std::string_view word, const BpePair
     }
     for (int index = 0; index >= 0; index = nodes[static_cast<std::size_t>(index)].next) {
         const int intern_id = nodes[static_cast<std::size_t>(index)].intern_id;
-        if (intern_id < 0 || static_cast<std::size_t>(intern_id) >= intern_emit_ids.size() ||
-            intern_emit_ids[static_cast<std::size_t>(intern_id)].empty()) {
+        if (intern_id < 0 ||
+            static_cast<std::size_t>(intern_id) + 1 >= intern_emit_offsets.size()) {
             throw std::invalid_argument("Tokenizer::encode produced a symbol outside vocabulary");
         }
-        const std::vector<int>& emitted = intern_emit_ids[static_cast<std::size_t>(intern_id)];
-        ids.insert(ids.end(), emitted.begin(), emitted.end());
+        const std::size_t emit_begin = intern_emit_offsets[static_cast<std::size_t>(intern_id)];
+        const std::size_t emit_end =
+            intern_emit_offsets[static_cast<std::size_t>(intern_id) + 1];
+        if (emit_begin >= emit_end || emit_end > intern_emit_ids.size()) {
+            throw std::invalid_argument("Tokenizer::encode produced a symbol outside vocabulary");
+        }
+        ids.insert(ids.end(),
+                   intern_emit_ids.begin() + static_cast<std::ptrdiff_t>(emit_begin),
+                   intern_emit_ids.begin() + static_cast<std::ptrdiff_t>(emit_end));
     }
 }
 
 void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
                     const BpePairTable& pair_table, const std::array<int, 256>& byte_to_intern_id,
-                    const std::vector<std::vector<int>>& intern_emit_ids) {
+                    const std::vector<int>& intern_emit_ids,
+                    const std::vector<std::size_t>& intern_emit_offsets) {
     if (text.empty()) { return; }
     if (!has_bpe_merges) {
         throw std::invalid_argument(
@@ -750,7 +763,8 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
         normalized         = normalized_storage;
     }
     for_each_qwen_word(normalized, [&](std::string_view word) {
-        append_bpe_word(ids, word, pair_table, byte_to_intern_id, intern_emit_ids);
+        append_bpe_word(ids, word, pair_table, byte_to_intern_id, intern_emit_ids,
+                        intern_emit_offsets);
     });
 }
 
@@ -761,6 +775,15 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         resources.generation_config_json.empty()) {
         throw std::invalid_argument("embedded tokenizer resources are empty");
     }
+    // JSON, vocab strings, and the hash map are freed as this function returns.
+    // malloc_trim releases the free space at the top of each glibc arena.
+    struct ReleaseLoadHeap {
+        ~ReleaseLoadHeap() noexcept {
+#if defined(__GLIBC__)
+            ::malloc_trim(0);
+#endif
+        }
+    } release_load_heap;
     constexpr std::string_view tokenizer_label        = "tokenizer.json";
     constexpr std::string_view tokenizer_config_label = "tokenizer_config.json";
     const Json root = read_json_asset(resources.tokenizer_json, tokenizer_label);
@@ -769,18 +792,18 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json& model = require_object_field(root, "model", tokenizer_label);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
-    id_to_token_                 = std::move(vocab_metadata.id_to_token);
-    vocab_token_to_id_           = std::move(vocab_metadata.token_to_id);
-    valid_token_ids_.resize(id_to_token_.size());
+    std::vector<std::string> id_to_token = std::move(vocab_metadata.id_to_token);
+    std::unordered_map<std::string, int> vocab_token_to_id = std::move(vocab_metadata.token_to_id);
+    valid_token_ids_.resize(id_to_token.size());
     for (const int id : vocab_metadata.occupied_ids) {
         valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
     }
-    added_tokens_ = load_added_tokens(root, tokenizer_label, id_to_token_,
-                                      vocab_metadata.occupied_ids, vocab_token_to_id_);
-    merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token_,
-                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
-    if (valid_token_ids_.size() < id_to_token_.size()) {
-        valid_token_ids_.resize(id_to_token_.size());
+    added_tokens_ = load_added_tokens(root, tokenizer_label, id_to_token,
+                                      vocab_metadata.occupied_ids, vocab_token_to_id);
+    merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token,
+                               vocab_metadata.occupied_ids, vocab_token_to_id, added_tokens_);
+    if (valid_token_ids_.size() < id_to_token.size()) {
+        valid_token_ids_.resize(id_to_token.size());
     }
     for (const AddedToken& token : added_tokens_) {
         valid_token_ids_.at(static_cast<std::size_t>(token.id)) = 1;
@@ -798,8 +821,8 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         if (existing != intern_ids.end()) { return existing->second; }
         const int intern_id = static_cast<int>(intern_str.size());
         intern_str.push_back(symbol);
-        const auto vocab = vocab_token_to_id_.find(symbol);
-        intern_to_vocab.push_back(vocab == vocab_token_to_id_.end() ? -1 : vocab->second);
+        const auto vocab = vocab_token_to_id.find(symbol);
+        intern_to_vocab.push_back(vocab == vocab_token_to_id.end() ? -1 : vocab->second);
         intern_ids.emplace(symbol, intern_id);
         return intern_id;
     };
@@ -823,32 +846,34 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
             intern_symbol(byte_encoder.at(static_cast<unsigned char>(byte)));
     }
 
-    intern_emit_ids_.resize(intern_str.size());
+    intern_emit_offsets_.reserve(intern_str.size() + 1);
+    intern_emit_offsets_.push_back(0);
     for (std::size_t intern_id = 0; intern_id < intern_str.size(); ++intern_id) {
+        const std::size_t emit_begin = intern_emit_ids_.size();
         if (intern_to_vocab[intern_id] >= 0) {
-            intern_emit_ids_[intern_id] = {intern_to_vocab[intern_id]};
-            continue;
-        }
-        const std::vector<uni::CodepointSpan> pieces =
-            uni::utf8_codepoints(intern_str[intern_id], "Tokenizer intern emit");
-        if (pieces.size() <= 1) { continue; }
-        intern_emit_ids_[intern_id].reserve(pieces.size());
-        bool ok = true;
-        for (const uni::CodepointSpan& piece : pieces) {
-            const auto vocab =
-                vocab_token_to_id_.find(intern_str[intern_id].substr(piece.offset, piece.length));
-            if (vocab == vocab_token_to_id_.end()) {
-                intern_emit_ids_[intern_id].clear();
-                ok = false;
-                break;
+            intern_emit_ids_.push_back(intern_to_vocab[intern_id]);
+        } else {
+            const std::vector<uni::CodepointSpan> pieces =
+                uni::utf8_codepoints(intern_str[intern_id], "Tokenizer intern emit");
+            if (pieces.size() > 1) {
+                bool ok = true;
+                for (const uni::CodepointSpan& piece : pieces) {
+                    const auto vocab = vocab_token_to_id.find(
+                        intern_str[intern_id].substr(piece.offset, piece.length));
+                    if (vocab == vocab_token_to_id.end()) {
+                        ok = false;
+                        break;
+                    }
+                    intern_emit_ids_.push_back(vocab->second);
+                }
+                if (!ok) { intern_emit_ids_.resize(emit_begin); }
             }
-            intern_emit_ids_[intern_id].push_back(vocab->second);
         }
-        (void)ok;
+        intern_emit_offsets_.push_back(intern_emit_ids_.size());
     }
 
-    special_token_ids_.assign(id_to_token_.size(), 0);
-    added_token_ids_.assign(id_to_token_.size(), 0);
+    special_token_ids_.assign(id_to_token.size(), 0);
+    added_token_ids_.assign(id_to_token.size(), 0);
     for (const AddedToken& token : added_tokens_) {
         const auto index = static_cast<std::size_t>(token.id);
         added_token_ids_.at(index) = 1;
@@ -877,27 +902,27 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     }
 
     const auto byte_decoder = build_byte_level_decoder();
-    id_to_decoded_bytes_.resize(id_to_token_.size());
-    for (std::size_t id = 0; id < id_to_token_.size(); ++id) {
+    decoded_bytes_.clear();
+    decoded_offsets_.assign(id_to_token.size() + 1, 0);
+    for (std::size_t id = 0; id < id_to_token.size(); ++id) {
+        decoded_offsets_[id] = decoded_bytes_.size();
         if (valid_token_ids_[id] == 0) { continue; }
         if (added_token_ids_[id] != 0) {
-            id_to_decoded_bytes_[id] = id_to_token_[id];
+            decoded_bytes_.append(id_to_token[id]);
             continue;
         }
-        std::string bytes;
         const std::vector<uni::CodepointSpan> codepoints =
-            uni::utf8_codepoints(id_to_token_[id], "Tokenizer decode table");
-        bytes.reserve(codepoints.size());
+            uni::utf8_codepoints(id_to_token[id], "Tokenizer decode table");
         for (const uni::CodepointSpan& codepoint : codepoints) {
             const auto byte = byte_decoder.find(static_cast<std::uint32_t>(codepoint.value));
             if (byte == byte_decoder.end()) {
                 throw std::invalid_argument(
                     "Tokenizer vocabulary contains a character outside the byte-level alphabet");
             }
-            bytes.push_back(byte->second);
+            decoded_bytes_.push_back(byte->second);
         }
-        id_to_decoded_bytes_[id] = std::move(bytes);
     }
+    decoded_offsets_.back() = decoded_bytes_.size();
 
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 }
@@ -967,7 +992,7 @@ EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> 
     mark_prefix(0);
     if (!options.parse_added_tokens) {
         append_bpe_ids(encoded.ids, text, has_bpe_merges_, bpe_pair_table_, byte_to_intern_id_,
-                       intern_emit_ids_);
+                       intern_emit_ids_, intern_emit_offsets_);
         mark_prefix(text.size());
         return encoded;
     }
@@ -977,7 +1002,7 @@ EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> 
         const auto match = find_leftmost_added(text, pos);
         if (!match) {
             append_bpe_ids(encoded.ids, text.substr(pos), has_bpe_merges_, bpe_pair_table_,
-                           byte_to_intern_id_, intern_emit_ids_);
+                           byte_to_intern_id_, intern_emit_ids_, intern_emit_offsets_);
             mark_prefix(text.size());
             break;
         }
@@ -986,7 +1011,8 @@ EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> 
         const AddedToken& match_token = added_tokens_[static_cast<std::size_t>(match_index)];
         if (match_pos > pos) {
             append_bpe_ids(encoded.ids, text.substr(pos, match_pos - pos), has_bpe_merges_,
-                           bpe_pair_table_, byte_to_intern_id_, intern_emit_ids_);
+                           bpe_pair_table_, byte_to_intern_id_, intern_emit_ids_,
+                           intern_emit_offsets_);
             mark_prefix(match_pos);
         }
 
@@ -1019,12 +1045,18 @@ std::string_view Tokenizer::decode_token_bytes(int id, bool skip_special_tokens)
                                     std::to_string(id));
     }
     const auto index = static_cast<std::size_t>(id);
-    if (index >= id_to_decoded_bytes_.size() || index >= valid_token_ids_.size() ||
+    if (index + 1 >= decoded_offsets_.size() || index >= valid_token_ids_.size() ||
         valid_token_ids_[index] == 0) {
         throw std::out_of_range("Tokenizer::decode token id " + std::to_string(id) +
                                 " is outside loaded vocabulary");
     }
-    return id_to_decoded_bytes_[index];
+    const std::size_t begin = decoded_offsets_[index];
+    const std::size_t end   = decoded_offsets_[index + 1];
+    if (begin > end || end > decoded_bytes_.size()) {
+        throw std::logic_error("Tokenizer decode table is corrupt");
+    }
+    if (begin == end) { return {}; }
+    return std::string_view(decoded_bytes_.data() + begin, end - begin);
 }
 
 bool Tokenizer::is_special_token(int id) const noexcept {

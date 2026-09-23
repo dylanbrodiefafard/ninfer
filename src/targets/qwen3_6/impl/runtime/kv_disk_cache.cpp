@@ -1038,16 +1038,6 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
     restore_window_bytes_ = restore_window_stride_ * static_cast<std::size_t>(slots);
     page_staging_stride_ = page_bytes;
     page_staging_bytes_ = page_staging_stride_ * static_cast<std::size_t>(slots);
-    std::size_t max_state_object_bytes = std::max<std::size_t>(config_.gdn_staging_bytes, 256);
-    max_state_object_bytes = std::max(
-        max_state_object_bytes,
-        static_cast<std::size_t>(config_.fingerprint.gdn_conv_bytes +
-                                  config_.fingerprint.gdn_recurrent_bytes));
-    max_state_object_bytes =
-        std::max(max_state_object_bytes,
-                 static_cast<std::size_t>(config_.fingerprint.cyclic_lane_bytes));
-    max_state_object_bytes =
-        std::max(max_state_object_bytes, static_cast<std::size_t>(config_.hidden_bytes));
     auto aligned_state_bytes = [](std::size_t bytes) {
         return (bytes + kDiskPageIoAlignment - 1) & ~(kDiskPageIoAlignment - 1);
     };
@@ -1062,9 +1052,6 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
                                       aligned_state_bytes(rec_bytes) +
                                       aligned_state_bytes(hidden_bytes) +
                                       aligned_state_bytes(cyclic_bytes));
-    spill_scratch_.resize(page_bytes + kDiskPageHeaderBytes);
-    spill_zstd_.resize(std::max<std::size_t>(max_state_object_bytes * 2, 4096));
-    decode_zstd_.resize(std::max<std::size_t>(max_state_object_bytes * 2, 4096));
     auto require_cuda = [](cudaError_t err, const char* what) {
         if (err != cudaSuccess) {
             throw std::runtime_error(std::string(what) + ": " + cudaGetErrorName(err));
