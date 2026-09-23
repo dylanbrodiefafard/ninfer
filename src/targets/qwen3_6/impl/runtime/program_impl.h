@@ -457,10 +457,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         if (backend_pool != nullptr) {
             page_bytes = std::max(page_bytes, paged_kv_logical_page_bytes(*backend_pool));
         }
-        std::size_t staging = decoder->linear_attention.conv_host_image_bytes() +
-                              decoder->linear_attention.recurrent_host_image_bytes();
-        staging = std::max(staging, tail_hidden_store.bytes());
-        if (dflash) { staging = std::max(staging, dflash->local.lane_host_bytes()); }
         const KvCacheStorage kv_cache = kv_dtype == DType::BF16  ? KvCacheStorage::BFloat16
                                         : kv_dtype == DType::U8 ? KvCacheStorage::Nvfp4
                                                                 : KvCacheStorage::Int8Group64;
@@ -477,7 +473,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         disk.text_pool           = &text_pool;
         disk.backend_pool        = backend_pool;
         disk.logical_page_bytes  = page_bytes;
-        disk.gdn_staging_bytes   = staging;
         disk.hidden_bytes        = sequences[0].tail_hidden.bytes();
         disk.restore_io_threads  = 16;
         kv_disk_cache_.emplace(std::move(disk));

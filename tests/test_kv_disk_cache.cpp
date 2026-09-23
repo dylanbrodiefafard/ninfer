@@ -500,15 +500,6 @@ disk_config(const fs::path& location, q36::detail::KVRamCache& ram, ninfer::Page
         cfg.logical_page_bytes =
             std::max(cfg.logical_page_bytes, ninfer::paged_kv_logical_page_bytes(*backend));
     }
-    cfg.gdn_staging_bytes = 256;
-    if (gdn != nullptr) {
-        cfg.gdn_staging_bytes =
-            std::max(cfg.gdn_staging_bytes,
-                     gdn->conv_host_image_bytes() + gdn->recurrent_host_image_bytes());
-    }
-    if (cyclic != nullptr) {
-        cfg.gdn_staging_bytes = std::max(cfg.gdn_staging_bytes, cyclic->lane_host_bytes());
-    }
     return cfg;
 }
 
