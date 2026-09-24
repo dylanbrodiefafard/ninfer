@@ -217,6 +217,13 @@ target_include_directories(ninfer_qwen3_8_27b_dflash_capacity_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_capacity_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_verify_score_real_test
+  SOURCES targets/qwen3_6_27b/test_verify_score_real.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_8_27b_verify_score_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_qwen3_8_27b_verify_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_mtp_nvfp4_real_test
   SOURCES targets/qwen3_6_27b/test_engine_mtp_nvfp4_real.cpp
   LIBRARIES ninfer_engine)
@@ -392,6 +399,7 @@ ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cp
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
+ninfer_add_linear_test(ninfer_linear_nvfp4_a8_test ops/linear/test_nvfp4_a8.cpp)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)

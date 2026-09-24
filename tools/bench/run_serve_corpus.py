@@ -34,6 +34,8 @@ SPECULATIVE_MODES = {
     "mtp3": ("mtp", 3, 0),
     "mtp4": ("mtp", 4, 0),
     "mtp5": ("mtp", 5, 0),
+    "dflash1": ("dflash", 1, 0),
+    "dflash2": ("dflash", 2, 0),
     "dflash3": ("dflash", 3, 0),
     "dflash4": ("dflash", 4, 0),
     "dflash4w6": ("dflash", 4, 6),

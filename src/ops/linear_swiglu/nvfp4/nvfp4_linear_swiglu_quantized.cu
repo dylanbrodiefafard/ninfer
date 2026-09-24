@@ -1,11 +1,14 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
+// A4/A8 routes share the paired gate/up epilogue and its private BF16 projection staging.
+
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include <cuda_bf16.h>
@@ -89,6 +92,17 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 }
 
 } // namespace
+
+void nvfp4_linear_swiglu_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                      WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope = workspace.scope();
+    const auto scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
+    launch_fp8_a8_quantize(x, weight, scratch, stream);
+    using Schedule = Nvfp4W4a4MmaSchedule<32, 64, 128, 1, 4, 2, 1>;
+    launch_nvfp4_w4a8_mma<Geometry, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
+        Nvfp4SwiGluRows<Schedule>, true>(weight, x.ne[1], scratch, Nvfp4IdentityEpilogue{},
+            Nvfp4SwiGluOutput{static_cast<__nv_bfloat16*>(out.data)}, stream);
+}
 
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      WorkspaceArena& workspace, cudaStream_t stream) {

@@ -330,11 +330,13 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
     int failures                       = 0;
     const bool a4                      = policy == ops::LinearPolicy::AllowA4 && tokens >= 4;
+    const bool a8 = policy == ops::LinearPolicy::AllowA8 && tokens >= 4;
+    constexpr ReductionCriterion a8_criterion{0.04, 1.0 / 256.0, 0.06};
     const ReductionCriterion& criterion =
-        a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
+        a8 ? a8_criterion : (a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance);
     const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
+        std::string(" NVFP4 ") + (a8 ? "A8" : (a4 ? "A4" : "A16")) + " T=" + std::to_string(tokens);
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens, criterion, sample_count);
     failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
@@ -477,6 +479,9 @@ int run_nvfp4_target() {
     }
     for (const std::int32_t tokens : {1, 4, 15, 36, 1024}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
+    }
+    for (const std::int32_t tokens : {4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24}) {
+        failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     for (const std::int32_t tokens : {2}) {
         failures += run_nvfp4_packed_column0(parent, tokens);

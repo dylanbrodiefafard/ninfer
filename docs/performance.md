@@ -18,6 +18,522 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash W4 A8 and residual-projection tuning (2026-09-24)
+
+The selected A8/A8 verification policy now covers **k=3/4/5 drafts (W4/W5/W6)**,
+including adaptive DFlash with maximum draft5. Request-local W2/W3 stays A16 regardless of
+concurrency. Prefill and ordinary decode retain their text policy. NVFP4 weights, FP32
+current GDN convolution input, BF16 saved history and FP32 recurrent state are preserved.
+
+### Diagnosis and selected schedules
+
+On RTX5090, SM120a, CUDA13.1, Nsight Compute found the original A8 MLP-down
+`[5120,17408]`, T5 kernel launched **80 CTAs for170 SMs**, with no spills and691.10GB/s
+DRAM throughput versus1674.5GB/s sustained read. The attention-output `[5120,6144]`
+kernel had the same80-CTA grid and35.79% DRAM throughput. The byte-floor classifier's
+DRAM label was not evidence that either launch saturated memory. The evidence-gated
+`grid_underfill` recipe admits output-row partitioning with the same K reduction and weight pass.
+
+Retained A8 schedule: M16 for T≤16, M32 otherwise, K256 and two stages. The two N=5120
+projections use **N16/two warps for M16 and N32/four warps for M32**. Other shapes retain
+N64/four warps. Independent oracles qualify both the generic N16 scale layout and contiguous
+N32 staging. Exact nibble expansion and per16 FP32 scale accumulation are unchanged.
+The MLP-down T5 kernel now launches320 CTAs; profiled DRAM utilization rose39.20%→54.84%,
+with no spills. Profiler duration fell72.70→51.97µs; profiler durations are not the public-Op medians.
+
+Cold-cache public Linear medians,30 samples/3 warmups, including quantization:
+
+| Projection | T | Before A8 µs | Selected A8 µs | A16 control µs |
+|---|---:|---:|---:|---:|
+| Attention output `[5120,6144]` | 5 | 32.384 | 26.624 | 22.528 |
+| Attention output `[5120,6144]` | 24 | 34.816 | 30.720 | 73.344 |
+| MLP down `[5120,17408]` | 5 | 65.536 | 57.376 | 47.104 |
+| MLP down `[5120,17408]` | 24 | 81.536 | 61.440 | 163.456 |
+
+This fixes part of the small-panel loss: **MLP-down is still slower than A16 at T4–6**.
+The N32/two-warp and transposed output-major small-panel candidates lost to the retained
+schedules and were removed. Broad tile/pipeline changes on the other shapes were not
+admitted by the byte-floor gate; no separate codec/scale arithmetic speedup is claimed.
+The remaining quantization, K16 instruction and scale-handling costs are included in the Op timings.
+
+At W4, complete GDN record cold graph medians improve49.152→40.448µs at C1 and
+116.736→40.960µs at C4 (A16→A8). Its caller-owned workspace grows from zero to184336
+and737344bytes respectively; interval planning includes the new W4 route.
+
+### Paired quality and Engine measurements
+
+Same actual-verifier methodology and corpora as below, now scored at **W4**, with matched
+before/after gold histories. WikiText has32739 scored tokens; six reset code-reference
+documents have8545. These compare W4 A8 against W4 A16, not against the earlier W5 scores.
+
+| Domain | W4 A16 PPL | W4 A8 PPL | Change |
+|---|---:|---:|---:|
+| WikiText | 5.163988 | 5.175765 | **+0.22808%** |
+| Code references | 1.933908 | 1.937614 | **+0.19164%** |
+
+Paired mean ΔNLL is0.00227816 /0.00191459nats, with conditional1024-token block-bootstrap
+95% intervals `[0.00076750,0.00367605]` / `[0.00053510,0.00316991]` (10000 draws).
+These are PPL diagnostics, not task-accuracy percentages or population-equivalence claims.
+W3/W4/W5/W6 C1/C4 score controls match exactly within each profile over256 unique tokens;
+before/after W3/W5/W6 are exact too. Six16-round actual-logit licensing cells at W4
+(greedy/p-less/stochastic, C1/C4) pass. W4 Linear and fused Ops pass independent mathematical
+oracles and codec-residual checks; GDN includes ragged/tree and every-prefix carried-history cases.
+
+Same RTX5090 DFlash2 artifact and `long_decode_aime26_15` fixture as below, p-lessT2/thinking,
+NVFP4 KV, graphs, optimized head, no prefix reuse,8192 completion tokens per request.
+Before is the selected A8/A8 implementation prior to W4 and row-partition changes.
+Steady full-batch aggregate decode throughput:
+
+| Mode | C | Before tok/s | After tok/s | Gain | Alternating paired waves |
+|---|---:|---:|---:|---:|---:|
+| Fixed k3 | 1 | 145.75 | 151.58 | **4.00%** | 2 |
+| Fixed k3 | 4 | 207.01 | 330.28 | **59.54%** | 2 |
+| Adaptive max5 | 1 | 149.68 | 154.41 | **3.16%** | 2 |
+| Adaptive max5 | 4 | 390.08 | 427.32 | **9.55%** | 2 |
+| Fixed k4, schedule-only diagnostic | 1 | 144.68 | 151.51 | 4.72% | 1 |
+| Fixed k4, schedule-only diagnostic | 4 | 391.62 | 424.58 | 8.42% | 1 |
+
+All20 cells/50 requests completed with zero recovery attempts/cycle exclusions. Both fixed-k4
+pairs have identical per-request response hashes. W4 arithmetic and adaptive choices can change
+trajectories in the other comparisons; their rates are measured Engine tradeoffs, not isolated
+kernel ratios. These workload-specific results do not imply adaptive always beats fixed draft widths.
+Whole-wave makespans are retained separately from steady throughput in the report.
+
+Local evidence: `profiles/bench/dflash-a8-w4/{before-ops.json,final-ops.json,quality-report.json,
+speed-report.json}`, paired scorer TSVs, command records and raw server logs.
+
+Final checks: `NINFER_DEV_CONTAINER=ninfer-builder-dylan NINFER_DEV_JOBS=12
+./scripts/run-unit-tests.sh` rebuilt the normal binaries and passed **105 tests, 2
+artifact-dependent skips, 0 failures** (482.54s test time). The explicit real DFlash Engine
+test passed fixed k1–5, adaptive max5, graph/eager/concurrent execution, Vision/MRoPE,
+terminal publication and RAM continuation; `disk_real --case dflash` passed disk restore
+and continuation. W4 scorer checks with commit limit2 passed at C1/C4. Classifier/recipe
+self-tests, Python compilation and whitespace checks passed. Read-only review found no
+implementation blocker; its W4 codec-criterion and stale-contract findings were corrected.
+
+## DFlash A8 and A16 GDN pairing qualification (2026-09-24)
+
+**Selected default: ordinary A8 / GDN A8 verification projections.** Following qualification,
+the user approved this measured PPL/throughput tradeoff. A8 operates over the
+same NVFP4 artifact: row-scaled E4M3 activations, exact E2M1-code expansion, FP8 K16 MMA and
+original per16 weight scales applied to FP32 partials before accumulation. It does not
+requantize or persistently repack the weights. GDN convolution consumes FP32 current
+projection; BF16 history/records and FP32 recurrent state are preserved.
+
+Hardware and artifact are the RTX5090/SM120a/CUDA13.1 and exact DFlash2 NVFP4 artifact
+identified in the A4 qualification below. Verification precision is selected from request-local
+width: this initial qualification kept W2–4 A16 across concurrency and changed eligible W5/W6 verification
+projections; prefill, ordinary decode and the existing attention Q codec stay common.
+
+### Paired verifier PPL
+
+Same actual-verifier gold-history scoring inputs and domain as the A4 study below: W5/C1,
+prefix8 plus one unscored anchor, raw temperature1 probabilities over248077 valid vocabulary
+rows, NVFP4 KV. Code consists of the same six independently reset reference files, not newly
+generated model output. Old A/B/C results are retained as paired controls.
+
+| Ordinary / GDN verification projections | WikiText,32739 tokens | Code references,8545 tokens |
+|---|---:|---:|
+| A16 / A16 (A) | 5.166109 | 1.931212 |
+| A4 / A16 (B) | 5.232096 | 1.953540 |
+| A4 / A4 (C) | 5.245608 | 1.959898 |
+| A8 / A8 | **5.178117** | **1.936304** |
+| A4 / A8 | 5.222942 | 1.954479 |
+| A8 / A16 | 5.178623 | 1.936100 |
+
+All-A8 raises PPL versus A by **0.23244% on WikiText and0.26368% on code**, compared with
+C's approximately1.54% and1.49%. Its paired mean ΔNLL is0.00232171 and0.00263334nats,
+respectively. Fixed-seed10000-draw/1024-token within-document block-bootstrap95% intervals
+are `[0.00096601,0.00368203]` and `[-0.00022994,0.00506721]`. These are conditional diagnostics
+on these corpora, not population guarantees or proofs of equivalence.
+
+With ordinary projections already A8, adding GDN A8 changes PPL by−0.00978% on WikiText
+and+0.01055% on code; both paired ΔNLL intervals include zero. With ordinary projections
+A4, GDN A8 versus GDN A16 changes PPL by−0.17495% /+0.04808%, also with intervals spanning
+zero. Most mean loss still comes from the ordinary A4 projections. These measurements do
+not establish an improvement in generated-task success rates.
+
+### Engine throughput
+
+Same `long_decode_aime26_15` decode-saturation fixture and fixed benchmark seeds as the earlier
+A/B/C controls: p-less temperature 2, thinking, optimized proposal head, CUDA Graphs, NVFP4 KV,
+no prefix reuse, context 32768, KV capacity 32768 at C1 or 65536 at C4. Every request produced
+8192 completion tokens (8191 decode tokens). All GPU runs were sequential.
+
+Fixed k4, mean aggregate **steady full-batch decode tokens/s**:
+
+| Ordinary / GDN projections | C1 | C4 | C4/C1 | New measurement waves |
+|---|---:|---:|---:|---:|
+| A8 / A8 | 144.60 | 392.61 | 2.72× | 3 |
+| A4 / A8 | 161.77 | 480.13 | **2.97×** | 3 |
+| A8 / A16 | 132.19 | 325.37 | 2.46× | 1 diagnostic wave |
+
+All-A8 C4 waves were 393.959, 391.904 and 391.966 tok/s; GDN-only A8 waves were
+480.494, 480.636 and 479.261 tok/s. Earlier same-workload controls below are A at
+138.28/198.73, B at 148.75/380.37 and C at 158.50/498.88 tok/s (C1/C4). Thus all-A8
+offers **4.6% higher C1 throughput and 97.6% higher C4 throughput** than A, with much smaller
+PPL change than C. GDN-only A8
+retains approximately 96% of C's C4 throughput while reaching approximately 3× C4/C1 scaling.
+The arithmetic-profile comparisons include different generated trajectories and speculative
+acceptance; they are measured Engine tradeoffs, not isolated kernel speedup ratios.
+
+The separate **A16 W6 pairing** comparison fixes k5 and ordinary A4/GDN A16. Three alternating
+old/new pairs measured **267.866→284.025 tok/s at C4 (+6.03%)**. Old waves were
+268.045/267.777/267.777 and new waves 284.019/284.170/283.886. Per-request response hashes
+match in every pair. Mean whole-wave makespan improves 122.478→115.317 s. These fixed-k5
+figures must not be compared as the same workload as the fixed-k4 table above.
+
+The new campaign has **20 completed cells /59 completed requests**, zero recovery attempts
+and zero cycle exclusions. Whole-wave makespan remains distinct from the steady rate:
+all-A8 C4 averages 84.783 s and GDN-only A8 C4 69.121 s. Commands, request accounting,
+intervals and source server logs are retained in `speed-commands.json` and `speed-report.json`
+under the local evidence directory below.
+
+### Public-Op latency and the separate A16 batching control
+
+Cold-cache medians,20 samples after3 warmups, complete public Op including activation
+quantization. Principal Linear points at aggregate T24:
+
+| Linear `[N,K]` | A16 µs | A4 µs | A8 µs |
+|---|---:|---:|---:|
+| Attention input `[14336,5120]` | 110.592 | 34.432 | 43.008 |
+| GDN input `[16384,5120]` | 153.600 | 38.912 | 45.056 |
+| MLP gate/up `[34816,5120]` | 260.128 | 69.632 | 86.016 |
+| Output `[5120,6144]` | 73.728 | 18.432 | 34.816 |
+| MLP down `[5120,17408]` | 163.840 | 40.960 | 81.920 |
+
+A8 is faster than A16 at these aggregate points, but slower than A4. It is not universally
+faster than A16 at C1: at T5 the residual/output examples are22.528→31.360µs and
+47.104→65.536µs. The complete GDN record Op costs40.960µs with A8 at W5/W6 C1 and
+49.152µs at C4, versus roughly38.912–40.960µs with A4.
+
+For the **A16-only GDN batching change**, full C4 register panels lost and were removed.
+The retained change pairs requests at W6/C2 and C4; W6/C3 stays request-indexed. In the
+public GDN record Op, W6/C2 improves118.784→100.352µs and W6/C4 improves215.040→172.032µs
+(about15.5% and20.0% lower latency). This does not change activation precision. Paired
+W6/C4 verifier scoring over8192 unique tokens finds **zero changed token NLLs**, with exact
+equality in all four replicated lanes; old/new PPL is6.00350. Replicated lanes do not count
+as additional independent quality samples.
+
+The initial A8 schedule used M16 through T16, otherwise M32, N64/K256, four warps and two
+stages. Earlier K128/M32-only qualification schedules were replaced after public-Op timing;
+their K16 partial accumulation order is unchanged. Final W4/W5/W6 C1/C4 score controls match
+exactly, supporting the retained long-run PPL evidence. Independent mathematical/codec checks
+cover all five Linear shapes, fused attention/add/SwiGLU and GDN record state transitions.
+The all-A8 real Engine graph/eager/concurrency/RAM and DFlash HostDisk routes also pass.
+
+After integration, `NINFER_DEV_CONTAINER=ninfer-builder-dylan NINFER_DEV_JOBS=12
+./scripts/run-unit-tests.sh` passes **105 tests, with 2 artifact-dependent skips and no failures**
+(392.61 s test time). The retained real-model activation fixture, using patterned weights,
+gives maximum GDN group relative-L2 canonical/codec/residual errors of
+0.036199/0.0359501/0.00254837 for A8, versus0.131225/0.131411/0.00269852 for A4. This is
+operator evidence, not a substitute for the real-checkpoint PPL above. Seven Python report
+tests, classifier/recipe self-checks and `git diff --check` also pass. These qualification checks
+preceded the final selection of A8/A8; preserved profile binaries remain local comparison artifacts.
+
+After selecting A8/A8, the same full unit command rebuilt the normal CLI/server and test binaries
+and again passed **105 tests, 2 artifact-dependent skips, 0 failures** (383.70 s test time).
+With `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` set to the artifact below, the rebuilt
+`ninfer_qwen3_8_27b_dflash_real_test` and `ninfer_qwen3_6_27b_disk_real_test --case dflash`
+both passed, covering graph/eager execution, fixed/adaptive concurrency, Vision/MRoPE,
+terminal publication, RAM restore and disk continuation under the selected default.
+
+Local evidence: `profiles/bench/dflash-a8-qualification/quality-report.json`,
+`op-report.json`, `op-final-report.json`, paired TSVs and real-Engine logs. The canonical
+oracle checks and codec-residual criteria establish numerical implementation correctness;
+they do not replace the paired PPL evidence or select an acceptable quality budget.
+
+## DFlash A4 verification qualification (2026-09-23)
+
+**Historical A/B/C comparison.** The numerical and performance evidence below distinguishes
+three arithmetic profiles. The subsequently qualified A8/A8 default is documented above.
+
+| Profile | Eligible ordinary verification projections | GDN input projection |
+|---|---|---|
+| A | A16 | A16, FP32 current projection |
+| B | A4 | A16, FP32 current projection |
+| C | A4 | A4, FP32 current projection |
+
+All preserve BF16 convolution history/records and FP32 recurrent state. C does not introduce
+the extra BF16 current-projection rounding used by the older 503.95 tok/s diagnostic below.
+Short request-local widths W2–4 retain A16; the measured A4 chain widths are W5/W6.
+These profiles describe target projections: the existing NVFP4 attention Q codec is common
+to all three, including A.
+
+### Matched Engine throughput
+
+RTX 5090, driver580.173.02, CUDA13.1, `sm_120a`, exact local artifact
+`/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`.
+P-less temperature2, thinking, optimized proposal head, CUDA Graphs, NVFP4 KV and no prefix
+reuse. Context32768; KV capacity32768 at C1 and65536 otherwise. Each request produced8192
+completion tokens (8191 decode tokens). Three main-fixture waves alternate C/B/A, A/B/C,
+C/B/A execution order with the benchmark's fixed seed set. All GPU work was sequential.
+
+Mean aggregate **steady full-batch decode tokens/s**, `long_decode_aime26_15`:
+
+| Policy | Profile | C1 | C2 | C3 | C4 | C4/C1 |
+|---|---|---:|---:|---:|---:|---:|
+| Fixed k4 | A | 138.28 | 184.70 | 200.23 | 198.73 | 1.44× |
+| Fixed k4 | B | 148.75 | 257.49 | 330.69 | 380.37 | 2.56× |
+| Fixed k4 | C | 158.50 | 288.01 | 405.75 | 498.88 | **3.15×** |
+| Adaptive max5 | A | 144.67 | 190.14 | 207.72 | 222.50 | 1.54× |
+| Adaptive max5 | B | 151.97 | 252.72 | 332.00 | 377.82 | 2.49× |
+| Adaptive max5 | C | 156.87 | 283.78 | 384.86 | 481.73 | **3.07×** |
+
+GDN A4's incremental C4 gain over B is **31.2% fixed /27.5% adaptive**; C1 gains are
+6.6% /3.2%. Fixed C4 C waves are499.30,498.58,498.77tok/s. Adaptive C4 C waves are
+474.60,495.44,475.15tok/s: a4.33% peak-to-trough spread relative to the mean, associated
+with both round duration and token yield/histogram changes. This is not evidence that
+adaptive universally beats fixed k4.
+
+One second-fixture wave, `long_decode_aime26_30`, checks workload dependence:
+
+| Policy | A C1/C4 | B C1/C4 | C C1/C4 |
+|---|---:|---:|---:|
+| Fixed k4 | 148.41 /211.39 | 163.93 /410.42 | 174.35 /508.85 |
+| Adaptive max5 | 147.40 /227.75 | 156.29 /401.77 | 168.34 /524.46 |
+
+There are84 complete cells and210 completed requests; recovery attempts and cycle exclusions
+are zero. Selected steady intervals span45–158s/cell and cover90.1–98.2% of decode tokens.
+Whole-wave makespan is a different metric: C fixed C4 on the main fixture averages67.75s,
+about484 completion tokens/s, versus498.88 steady decode tokens/s. Adaptive probe/switch
+work is included in observed rates/makespans but not separately timed. Memory records report
+startup allocations/graph allowance, not an independently sampled whole-run GPU peak.
+
+The command manifests, individual waves, makespans, round durations, yields, acceptance,
+width histograms and memory records are in
+`profiles/bench/dflash-a4-qualification/{phase-e-commands.json,phase-e-report.json,phase-e-wave*/}`.
+The local controls are `/build/apps/ninfer-serve-phase-e-{a,b,c}` in `ninfer-builder-dylan`;
+they were built from the same production source with explicit temporary arithmetic-policy
+edits, then preserved before reverting those edits. The benchmark used Python3.11.16 at
+`/opt/ninfer-python311/bin/python3.11` inside that builder. These are inference-level
+comparisons: generated trajectories can differ across profiles, so gains are not isolated
+kernel speedups at identical intermediate inputs. Read-only phase review reconciled every
+cell with its server log and approved the measurement scope.
+
+### Paired quality evidence
+
+Actual target Verify and production replay commit, raw temperature1 full-domain logits,
+identical reference tokens/commit boundaries, NVFP4 KV:
+
+| Material | Unique scored tokens | A PPL | B PPL | C PPL | C/B change |
+|---|---:|---:|---:|---:|---:|
+| WikiText stream | 32739 | 5.1661087 | 5.2320963 | 5.2456080 | +0.2583% |
+| Six local code-reference files | 8545 | 1.9312122 | 1.9535397 | 1.9598982 | +0.3255% |
+| Six AIME problem statements | 690 | 2.3395555 | 2.3592293 | 2.3673919 | +0.3460% |
+
+Conditional1024-token block-bootstrap95% intervals for **C−B mean NLL** are
+[−0.0003091,+0.0056656] on WikiText and[−0.0028405,+0.0091058] on code. These do not establish
+equivalence or broad-domain confidence. The original8192-token WikiText prefix showed
++1.0140% C/B PPL; it overlaps the extended sample. Code C−B p99 token delta is+0.8990 NLL
+and maximum absolute delta3.1994, so the mean does not eliminate individual-token tails.
+WikiText lacks retained original document boundaries; code files are independently reset,
+but human authorship/training-held-out provenance is unverified. AIME input-text NLL is
+**not worked-solution likelihood or solve accuracy**.
+
+### Behavioral evidence and decision limit
+
+Fixed k4, p-less temperature2, matched seeds/settings and the same artifact. With thinking
+and8192 output tokens, every profile solved the same2/6 selected AIME questions; four math
+cases and both code tasks exhausted their budgets without completing. They count as failures.
+
+To obtain executable-code evidence, the same two local tasks were also run with thinking
+disabled at seed12345. Its observed failures triggered a matched extension with seeds23456
+and34567 declared before that extension, applied to every profile. This is an outcome-triggered
+diagnostic extension, not a prospectively fixed independent benchmark. Initial failures were retained; code was
+neither repaired nor regenerated until passing. Existing seed/visible/hidden tests validated
+the reference solutions (94 LRU tests,100 limiter tests). Each generated solution passes only
+if all tests pass within60s under Python3.11.
+
+| Full code-task passes | A | B | C |
+|---|---:|---:|---:|
+| LRU cache, three seeds | 2/3 | 3/3 | 1/3 |
+| Fair weighted limiter, three seeds | 0/3 | 1/3 | 0/3 |
+| Combined | 2/6 | **4/6** | **1/6** |
+
+C emitted syntax errors on two LRU samples and timed out in two limiter test runs. This is
+a meaningful observed warning, but only two tasks/three seeds—not a population estimate or
+proof that GDN A4 generally reduces coding accuracy. B's better result than A also demonstrates
+the sensitivity of this small stochastic sample. Preserve both the thinking-budget failures
+and this separate non-thinking diagnostic when judging the tradeoff. Complete responses,
+answer keys, grading inputs and completed test logs are under
+`profiles/bench/dflash-a4-qualification/behavior/`.
+Timed-out jobs retain their tested modules and failure outcomes, but partial pytest output
+was not retained by the timeout handler; no timeout was rerun merely to obtain a log.
+
+Core qualification includes independent GDN/codec oracles, actual candidate-logit greedy and
+p-less/top-k/top-p licensing, matched-budget C1/C4 isolation, graphs/eager, RAM/HostDisk
+continuation and near-capacity width transitions. Cross-trajectory NLL and ordinary-A16
+greedy margins remain reported diagnostics, not invented quality thresholds. Both the
+additional average PPL cost and the small coding comparison must inform the user's final
+GDN A16/A4 decision; the throughput result alone does not select the default.
+
+## DFlash2 concurrent long-reasoning decode (2026-09-22)
+
+RTX 5090, driver 580.173.02, CUDA 13.1, `sm_120a`; artifact
+`/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`.
+The workload is the repository's `long_decode_aime26_15` fixture (335 prompt tokens), one
+concurrent wave of C requests with the benchmark's fixed per-request seeds, thinking enabled,
+and 8192 output tokens per request. Every request reached that output limit. Sampling is the
+serving default p-less at temperature 2.0, with NVFP4 KV, CUDA Graphs, the optimized proposal
+head, `--max-context 32768 --kv-capacity 65536`, and prefix reuse disabled.
+
+These are **aggregate committed decode tokens per wall-clock second** from complete steady
+one-second serving intervals at full occupancy, not sums of per-request GPU rates. Each cell
+is one long wave, not a repeated-sample mean; different draft widths and adaptive decisions
+can produce different continuations. The full-wave makespans were 83–164 seconds. There were
+no generation-recovery retries in these waves.
+
+| Configuration | C=2 tok/s | C=3 tok/s | C=4 tok/s |
+|---|---:|---:|---:|
+| Prior fixed DFlash k=4 | 186.15 | 200.58 | 198.93 |
+| Prior adaptive DFlash, captured k=3/4/5 | 182.69 | 207.03 | 199.66 |
+| Retained fixed DFlash k=2 | **197.91** | **209.93** | 217.74 |
+| Retained adaptive DFlash, captured k=1/2/3/4/5 | 191.47 | 204.28 | **221.94** |
+
+For this long AIME workload, fixed k=2 is the measured recommendation at C=2/3; adaptive
+with `--draft-tokens 5` was fastest at C=4. Relative to prior fixed k=4, those configurations
+improve throughput by 6.3%, 4.7%, and 11.6%. Adaptive alone is not a uniform win: its C=3
+result is 1.3% below the prior adaptive wave. This is not evidence of a universal 250 tok/s
+ceiling or a claim that every reasoning workload now exceeds it.
+
+### Attribution and retained fix
+
+All baseline steady intervals had average decode batch exactly C. A five-second C=4
+CUDA-Graph node trace attributed 33.3% of kernel time to target NVFP4 SwiGLU, 22.0% to
+MLP-down, 16.1% to GDN input, and 7.4% to attention/GDN output projections. GPU kernels
+occupied approximately 98% of the capture. Attention, p-less selection, and HTTP/host
+scheduling were not the dominant costs. A focused NCU check of the T=20 SwiGLU route found
+20.4% DRAM throughput, 63.0% SM throughput, and zero local-memory spill sectors: the wider
+A16/SIMT verification work is not saturating the card's DRAM bandwidth. At k=4 the long
+waves accepted only about 31–32% of drafts, yielding about 2.25–2.27 tokens per row-round
+while verifying five columns per request.
+
+The missing short-width aggregation made reducing k unnecessarily expensive: W=2/3 MLP
+and attention-input projections still launched separate request panels. The retained leaf
+uses the already-qualified aggregate A16 Ops at these widths; NVFP4 attention/GDN residual
+projections also aggregate W=2..4. It preserves the C=1 arithmetic policy and the existing
+BF16/FP8 panel boundaries. Adaptive DFlash now captures k=1/2 as well, so it can select these
+cheaper rounds. Fixed k=4 execution is unchanged.
+
+Matched 2048-token-per-lane AIME waves isolate the aggregation change at fixed widths:
+
+| Draft k | C=2 prior → retained | C=3 prior → retained | C=4 prior → retained |
+|---|---:|---:|---:|
+| 1 | 141.4 → 180.9 | 146.4 → 204.1 | 152.6 → 222.6 |
+| 2 | 163.7 → 200.6 | 165.2 → 210.9 | 171.1 → 222.4 |
+| 3 | 184.3 → 186.5 | 198.9 → 201.9 | 206.5 → 211.9 |
+
+All nine pairs preserved per-seed response hashes and exact speculative rounds, drafts,
+accepts, and fallback counts. Public SwiGLU at W=2 C=4 fell from 272.4 us for four panels
+to 104.4 us for one aggregate. Attempting to share GDN weights across all four requests
+instead of pairs regressed the public Op and was removed. The remaining scaling limit is
+primarily target projection execution; this change does not remove that cost.
+
+Validation: independent Op oracles for attention input, NVFP4 LinearAdd and SwiGLU;
+real-artifact greedy C=4 isolation at k=1..5; adaptive short-budget and RAM-restore
+continuations against cold recomputation; and automatic-capacity execution with a
+259744-token prompt and forced `1,2,3,4,5,4,5,3,2,1` transitions at every C=1..4.
+The full unit suite completed with 104 passes, two artifact-dependent skips, and no failures.
+The expanded adaptive set reserves 240 MiB of graph allowance at C=4, versus the previous
+144 MiB; automatic KV sizing accounts for the additional 96 MiB.
+
+Reproduce the retained fixed-k=2 measurement inside the GPU builder:
+
+```bash
+python3 -m tools.bench.run_serve_concurrency \
+  --serve /build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --mode dflash2 --sampling p-less --suite decode-saturation \
+  --concurrency 2 --concurrency 3 --concurrency 4 \
+  --decode-tokens 8192 --saturation-thinking \
+  --max-context 32768 --kv-capacity 65536 --kv-dtype nvfp4 \
+  --output /src/profiles/bench/dflash-concurrency-fixed2 --port 18082
+```
+
+For adaptive, replace `--mode dflash2` with `--mode dflash5 --adaptive-draft`. Explicit
+`--sampling p-less` matters: the benchmark's historical `stochastic` default selects the
+top-p/top-k sampler. Reports are under `profiles/bench/dflash-concurrency-20260922-` with
+suffixes `pless-baseline`, `adaptive-baseline`, `short-widths`, `short-aggregate`,
+`fixed2-final`, and `adaptive-aggregate`; the node trace is
+`profiles/nsys/dflash-concurrency-20260922-c4.nsys-rep`.
+
+### Scaling follow-up: verification arithmetic policy
+
+The preceding short-width fix does not explain or solve the dominant scaling loss. A matched
+C=1 measurement and two isolated arithmetic-route controls identify it as a fork-specific
+verification policy, rather than an unavoidable DFlash concurrency ceiling. The same artifact,
+8192-token AIME waves, p-less temperature 2, NVFP4 KV, graphs, and optimized proposal head
+were used. C=1 used a 32768-token KV capacity, within its one-request capacity ceiling;
+C>1 used 65536. Actual request contexts stay below 9000 tokens.
+Each point is one wave; generated continuations can differ across arithmetic profiles.
+
+For context, the source repository's [published Qwen3.8 NVFP4 MTP3 saturation results](https://github.com/Neroued/ninfer/blob/9e163eee/docs/performance/qwen3.8-27b.md#decode-saturation)
+are 143.8 / 267.6 / 461.1 tok/s at C=1/2/4, or 3.21x C=1 at C=4. These are historical
+stochastic MTP3 measurements, not a fresh same-sampler DFlash A/B. Current upstream code
+at `9e163eee` consumes the artifact's activation policy for the aggregate FFN, and permits
+materialized batched NVFP4 GDN projection. It does not impose this fork's blanket A16
+verification override.
+
+Fork commit `f41e4fc3` introduced that override in `text_policy()` for p-less stability.
+It selects A16 from the C=1 verify width even when the aggregate contains 10/15/20 columns,
+and applies regardless of the request's sampler. Subsequent changes restored many aggregate
+launches but retained scalar A16 arithmetic. Separately, `nvfp4_gdn_conv_resolve_plan()`
+forces packed widths through SmallT A16 even when its caller permits A4; the recurrent
+record path consumes an unmaterialized FP32 projection. These choices disproportionately
+increase the cost of C>1 verification.
+
+Public-Op medians, microseconds, for DFlash k=4 (W=5):
+
+| Op / arithmetic | T=5 (C=1) | T=10 (C=2) | T=15 (C=3) | T=20 (C=4) |
+|---|---:|---:|---:|---:|
+| SwiGLU A16 | 90.11 | 114.72 | 167.58 | 213.02 |
+| SwiGLU A4 | 71.68 | 71.68 | 71.68 | 71.68 |
+| MLP-down LinearAdd A16 | 49.15 | 65.54 | 83.97 | 145.41 |
+| MLP-down LinearAdd A4 | 40.96 | 40.96 | 40.96 | 40.96 |
+
+The A4 timings include the existing activation quantization and use warp tensor-core MMA.
+Increasing C quadruples useful columns without increasing their measured Op latency in this
+band. The A16 route remains scalar FP32 accumulation over decoded NVFP4 weights.
+
+Two diagnostic binaries isolate these policies on the current fork. The first permits A4 for
+NVFP4 target verification in `text_policy()` while leaving GDN records unchanged. The second
+also routes GDN records through the existing aggregate `gdn_input_proj()` and
+`compose_record()` path, with planner-accounted projection workspace. That second control
+introduces BF16 projection materialization before convolution as well as A4 activation
+quantization. Neither diagnostic is a qualified production replacement.
+
+| Fixed DFlash k=4 route | C=1 tok/s | C=2 tok/s | C=3 tok/s | C=4 tok/s | C4 / C1 |
+|---|---:|---:|---:|---:|---:|
+| Production A16 | 139.69 | 186.15 | 200.58 | 198.93 | 1.42x |
+| Diagnostic A4 projections, existing GDN | 149.65 | 257.78 | 330.62 | 379.70 | 2.54x |
+| Diagnostic A4 projections + composed GDN | 154.62 | — | — | 503.95 | 3.26x |
+
+The final control measured only C=1/4, sufficient to resolve the remaining scaling question.
+Complete steady batch-round times were respectively 16.28→45.44 ms, 15.04→23.41 ms, and
+14.07→17.97 ms from C=1 to C=4. Production yields stayed almost identical at 2.274 versus
+2.260 committed tokens per row-round, ruling out collapsing acceptance as the cause of its
+poor scaling. The final control yielded 2.175/2.264 tokens per row-round: its round-cost
+scaling alone supports about 3.13x throughput at equal yield. GPU scheduling and the DFlash
+proposer implementation were held fixed.
+
+Adaptive was tested with a maximum of **five** draft tokens. The qualified production path
+measured 146.08 / 191.47 / 204.28 / 221.94 tok/s at C=1/2/3/4, only 1.52x scaling. Selecting
+shorter widths reduces work but does not remove the arithmetic-route bottleneck.
+
+**Production correction:** qualify a consistent batched tensor-core verification profile,
+including GDN projection/convolution, against the independent numerical oracles and real
+p-less/recurrent-state behavior. The two controls establish the performance cause and
+available headroom; their acceptance rates and completed output budgets do not establish
+accuracy equivalence. A blind removal of the precision guard is not a validated fix.
+The diagnostic source edits were removed and the production server rebuilt. The earlier
+short-width aggregation and adaptive-set changes remain the qualified implementation.
+
+Reports: `profiles/bench/dflash-scaling-20260922-{c1-fixed4,c1-adaptive5,a4-projections,a4-gdn}`.
+The C=2..4 production points reuse the preceding long-wave reports. Diagnostic executables
+are `/build/apps/ninfer-serve-scaling-a4-projections` and
+`/build/apps/ninfer-serve-scaling-a4-gdn` in the measurement builder; they are not CLI modes.
+
 ## DFlash2 automatic KV capacity
 
 Qualified on RTX 5090, driver 580.173.02, CUDA 13.1, `sm_120a`, using
@@ -26,8 +542,10 @@ The server workload used `--max-context 260000 --kv-capacity auto --max-concurre
 --prefill-chunk 4096 --kv-dtype nvfp4 --spec dflash --draft-tokens 5 --adaptive-draft
 --lm-head-draft`, temperature 1.5, 32768 MiB RAM cache, and 100000 MiB disk cache.
 
-DFlash2 reserves 12 MiB per `(K, B, topology)` graph executable, or 144 MiB for this
-configuration, instead of inheriting the autoregressive DFlash allowance of 1152 MiB.
+DFlash2 reserves 12 MiB per `(K, B, topology)` graph executable, or 144 MiB for the
+three-width adaptive set used in this earlier qualification, instead of inheriting the
+autoregressive DFlash allowance of 1152 MiB. The current five-width set reserves 240 MiB
+at C=4; the capacity numbers below describe the earlier set.
 With the same reported 13.26 GiB free after weights, server startup resolved 558656 tokens,
 up from the reported 501312-token configuration: the 1008 MiB reduction buys exactly 896
 64-token pages (57344 tokens). Measured graph usage was 54 MiB and free memory after startup

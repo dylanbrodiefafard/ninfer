@@ -39,7 +39,7 @@ constexpr int kWarmup   = 5;
 constexpr int kTrials   = 7;
 constexpr double kDenseFp4TflopS = 1676.0;
 
-enum class Atom : int { Nvfp4, Bf16, Fp8, S8 };
+enum class Atom : int { Nvfp4, Bf16, Fp8, Fp8K16, S8 };
 
 struct Options {
     Atom atom      = Atom::Nvfp4;
@@ -104,6 +104,15 @@ __global__ void mma_issue_kernel(float* sink, int iters) {
         issue_bf16(iters, c0, c1, c2, c3);
     } else if constexpr (kAtom == Atom::Fp8) {
         issue_fp8(iters, c0, c1, c2, c3);
+    } else if constexpr (kAtom == Atom::Fp8K16) {
+        float d[4] = {};
+        for (int i = 0; i < iters; ++i) {
+#pragma unroll
+            for (int u = 0; u < kInner; ++u) {
+                ninfer::ops::mma_fp8_e4m3_k16(d, 0x38383838U, 0x38383838U, 0x38383838U);
+            }
+        }
+        c0 = d[0]; c1 = d[1]; c2 = d[2]; c3 = d[3];
     } else {
         issue_s8(iters, c0, c1, c2, c3);
     }
@@ -174,7 +183,7 @@ Result run_atom(const char* name, int m, int n, int k, const Options& opt, int s
 
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
-                 "usage: %s [--atom nvfp4|bf16|fp8|s8|all] [--iters N] [--warps W] "
+                 "usage: %s [--atom nvfp4|bf16|fp8|fp8_k16|s8|all] [--iters N] [--warps W] "
                  "[--blocks-per-sm B] [--json]\n",
                  argv0);
 }
@@ -201,6 +210,8 @@ Options parse(int argc, char** argv) {
                 opt.atom = Atom::S8;
             } else if (value == "fp8") {
                 opt.atom = Atom::Fp8;
+            } else if (value == "fp8_k16") {
+                opt.atom = Atom::Fp8K16;
             } else if (value == "all") {
                 opt.all = true;
             } else {
@@ -249,6 +260,7 @@ int main(int argc, char** argv) {
     }
     if (want(Atom::S8)) { results.push_back(run_atom<Atom::S8>("s8", 16, 8, 32, opt, sm_count)); }
     if (want(Atom::Fp8)) { results.push_back(run_atom<Atom::Fp8>("fp8", 16, 8, 32, opt, sm_count)); }
+    if (want(Atom::Fp8K16)) { results.push_back(run_atom<Atom::Fp8K16>("fp8_k16", 16, 8, 16, opt, sm_count)); }
 
     if (opt.json) {
         std::printf("{\n");

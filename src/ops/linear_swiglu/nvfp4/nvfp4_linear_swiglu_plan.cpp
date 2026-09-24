@@ -4,6 +4,7 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
 
 #include <algorithm>
@@ -17,6 +18,7 @@ enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
     FusedW4A4,
+    FusedW4A8,
     LinearW4A4Post,
     TmaFusedW4A4,
 };
@@ -30,6 +32,10 @@ bool is_tma_tokens(std::int32_t tokens) {
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
+    if (policy == LinearPolicy::AllowA8) {
+        if (tokens >= 4) { return Nvfp4LinearSwiGluRoute::FusedW4A8; }
+        return tokens == 1 ? Nvfp4LinearSwiGluRoute::DecodeFusedA16 : Nvfp4LinearSwiGluRoute::SmallTFusedA16;
+    }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_swiglu admits only A16 or A4");
     }
@@ -88,6 +94,9 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
+    if (policy == LinearPolicy::AllowA8) {
+        return max_tokens >= 4 ? fp8_a8_workspace_capacity_bytes(max_tokens, 5120) : 0;
+    }
     if (policy == LinearPolicy::A16Only || max_tokens < kNvfp4FirstW4a4MlpGateUp) { return 0; }
 
     std::size_t maximum = 0;
@@ -111,6 +120,9 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
     switch (resolve_route(policy, x.ne[1])) {
+    case Nvfp4LinearSwiGluRoute::FusedW4A8:
+        nvfp4_linear_swiglu_w4a8_launch(x, weight, out, workspace, stream);
+        return;
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
         nvfp4_linear_swiglu_decode_launch(x, weight, out, stream);
         return;

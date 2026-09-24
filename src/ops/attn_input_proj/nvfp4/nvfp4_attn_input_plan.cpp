@@ -13,11 +13,15 @@ namespace {
 enum class Nvfp4AttnInputRoute : std::uint8_t {
     A16,
     W4A4,
+    W4A8,
 };
 
 Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Nvfp4AttnInputRoute::A16; }
+    if (policy == LinearPolicy::AllowA8) {
+        return tokens >= 4 ? Nvfp4AttnInputRoute::W4A8 : Nvfp4AttnInputRoute::A16;
+    }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
     }
@@ -64,6 +68,9 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
+    if (resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A8) {
+        return fp8_a8_workspace_capacity_bytes(max_tokens, 5120);
+    }
     return resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows)
                : 0;
@@ -80,6 +87,11 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
         throw std::invalid_argument("nvfp4 W4A4 attn_input_proj requires caller workspace");
     }
     auto scope                       = workspace->scope();
+    if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::W4A8) {
+        const auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
+        nvfp4_attn_input_w4a8_launch(x, weight, q, gate, k, v, scratch, stream);
+        return;
+    }
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_attn_input_w4a4_launch(x, weight, q, gate, k, v, scratch, stream);
 }

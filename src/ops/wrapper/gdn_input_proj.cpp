@@ -640,8 +640,8 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
         const ConvGeometry geometry        = require_record_input(x, kHidden);
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-            throw std::invalid_argument("NVFP4 gdn_input_proj_conv_record admits only A16 or A4");
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("NVFP4 gdn_input_proj_conv_record admits A16, A4 or A8");
         }
         detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
         if (weight.n != kParentRows || weight.k != kHidden) {
@@ -664,43 +664,32 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace, parent_index);
         require_record_parent_index(parent_index, geometry);
 
-        // Packed T=2..16: B=1 W=4 uses one fused SmallT pass. B=1 W=5/6 and
-        // qualified B>1 W=2/5 shapes replay one grouped SmallT weight load (including
+        // AllowA4/AllowA8 W>=5 aggregate projection with FP32 convolution input.
+        // A16: B=1 W=4 uses one fused SmallT pass. B=1 W=5/6 and
+        // B>1 W=2/5 and B=2/4 W=6 replay a grouped SmallT weight load (including
         // a direct W=5 C=3 group), then consume the private FP32 projection without
         // adding a semantic BF16 boundary. Other B=1 widths retain fused T=1
         // GEMV+FP32 conv; other B>1 widths retain request-indexed CTAs.
         const bool tree = parent_index_active(parent_index);
-        const detail::Nvfp4GdnConvPlan plan =
-            detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
-        if (plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) {
-            const std::int32_t* parent_ptr =
-                tree ? static_cast<const std::int32_t*>(parent_index->data) : nullptr;
-            if (detail::nvfp4_gdn_record_uses_small_t(geometry.width, geometry.batch)) {
-                detail::nvfp4_gdn_record_small_t_launch(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
-                    conv_record, query, key, value, z, workspace, stream, parent_ptr);
-            } else {
-                detail::nvfp4_gdn_record_t1_fused_launch(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
-                    conv_record, query, key, value, z, stream, parent_ptr);
-            }
+        (void)detail::nvfp4_gdn_conv_resolve_plan(policy, geometry.width, geometry.batch);
+        if (detail::nvfp4_gdn_record_uses_quantized(policy, geometry.width)) {
+            detail::nvfp4_gdn_record_quantized_launch(
+                x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
+                conv_record, query, key, value, z, policy, workspace, stream,
+                tree ? static_cast<const std::int32_t*>(parent_index->data) : nullptr);
             return;
         }
-        if (tree) {
-            compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
-                           conv_record, query, key, value, z, geometry, workspace, stream,
-                           [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                               gdn_input_proj(x_flat, weight, record_flat, z_flat, policy,
-                                              workspace, stream);
-                           },
-                           parent_index);
-            return;
+        const std::int32_t* parent_ptr =
+            tree ? static_cast<const std::int32_t*>(parent_index->data) : nullptr;
+        if (detail::nvfp4_gdn_record_uses_small_t(geometry.width, geometry.batch)) {
+            detail::nvfp4_gdn_record_small_t_launch(
+                x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
+                conv_record, query, key, value, z, workspace, stream, parent_ptr);
+        } else {
+            detail::nvfp4_gdn_record_t1_fused_launch(
+                x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
+                conv_record, query, key, value, z, stream, parent_ptr);
         }
-
-        auto scope = workspace.scope();
-        gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream);
-        detail::nvfp4_gdn_record_post_launch(conv_record, conv_weight, conv_states, valid_columns,
-                                             initial_state_slots, query, key, value, stream);
         return;
     }
 
@@ -954,7 +943,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
         input_rows != detail::Nvfp4GdnInputGeometry::kInputRows ||
-        (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+        (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8)) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_record workspace: unsupported single-parent profile");
     }

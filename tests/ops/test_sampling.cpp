@@ -120,7 +120,8 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
             const double p = weights[static_cast<std::size_t>(token)] / total;
             collision += p * p;
         }
-        const double cut = ops::p_less_membership_cut(collision, config.temperature);
+        // Independent public formula, not the production membership helper.
+        const double cut = std::max(collision * std::exp(-0.125 / config.temperature), 1.0 / 1024.0);
         Distribution out;
         double kept = 0.0;
         for (int token = 0; token < token_domain; ++token) {

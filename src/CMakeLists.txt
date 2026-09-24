@@ -127,7 +127,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+  ops/attn_input_proj/nvfp4/nvfp4_attn_input_quantized.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
@@ -139,7 +139,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/w8/w8_attn_input_plan.cpp
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_quantized.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
   ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
   ops/gdn_input_proj/fp8/fp8_gdn_input_matrix.cu
@@ -171,6 +171,7 @@ add_library(ninfer_ops STATIC
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
   ops/linear/nvfp4/nvfp4_w4a4.cu
+  ops/linear/nvfp4/nvfp4_w4a8.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
@@ -191,7 +192,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/fp8/fp8_linear_add_a8.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+  ops/linear_add/nvfp4/nvfp4_linear_add_quantized.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
@@ -206,7 +207,7 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_quantized.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
   ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu

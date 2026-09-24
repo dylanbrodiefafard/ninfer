@@ -392,25 +392,34 @@ One propose block:
    row. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
 5. The 27B target verifies the chain (`W=k+1`) in one
    causal forward for the compact batch. Concurrent C>1 keeps that forward packed (`B=batch`)
-   so CUDA graphs capture one 27B verify rather than a serial host loop. Residual Linear and
-   GDN-control normally panel at the C=1 width (`packed_route_tokens`); the qualified W=5
-   C=2..4 residual Linear routes instead use one panel-bit-exact A16 T=10/15/20 launch; T=20
-   retains the T=5 panel reduction profile. Fused
-   NVFP4/BF16-control attention input and NVFP4 SwiGLU make the same qualified exception. SmallT
+   so CUDA graphs capture one 27B verify rather than a serial host loop. The leaf selects
+   precision from the request-local width through `packed_route_tokens`: W=2..3 retains A16,
+   while the selected policy permits A8 for ordinary and GDN verification projections at
+   W=4/5/6, independently of concurrency. Prefill and ordinary decode retain their text policy.
+   Qualified NVFP4 MLP, attention-input and residual projections aggregate through W=6;
+   BF16 residual and attention-input aggregation stays at
+   W=5. T=20 retains the T=5 panel reduction profile. GDN control uses its packed-sequence Op.
+   SmallT
    GQA uses one batched launch with request-indexed partial CTAs and a batched reduction, preserving
    each request's arithmetic without taking the generic `MultiBatch=true` route. ReplaySSM records
    are `layer(g, 0, B)`.
-   Packed GDN conv-record keeps the W-local reduction and BF16 history boundary: B=1 W=4 uses a
-   fused SmallT pass; B=1 W=5/6 and qualified W=2/5 B=2..4 shapes group weight replay while
-   materializing a private FP32 projection. Other B=1 widths use the fused T=1 GEMV+FP32 conv
-   route, and other B>1 widths use request-indexed SmallT CTAs. Packed GDN recurrence uses one
+   Packed NVFP4 GDN conv-record under A4 (W=5..16) or A8 (W=4..16) aggregates projections while
+   preserving FP32 current input to convolution and BF16 saved history. A8 uses E4M3 activations
+   and separately scaled K16 partials without requantizing the NVFP4 weights. Under A16,
+   B=1 W=4 uses a fused SmallT pass; B=1 W=5/6 and W=2/5 B=2..4 group weight replay with a
+   private FP32 projection. W=6 B=2/4 uses request pairs, while B=3 remains request-indexed.
+   Other B=1 widths use fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT
+   CTAs. The selected A8/A8 quality/performance tradeoff is recorded in the performance reference.
+   Packed GDN recurrence uses one
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
    accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less also uses Leviathan
    on every hop, with one-hot `q`, and samples the bonus from its column's p-less distribution.
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
-   recommendation is k=4 (W=5, one SmallT GQA tile). Maximum k=5 (W=6). `--adaptive-draft`
-   picks live k in `{3,4,5}` as in [§8.1](#81-adaptive-draft-length). Frozen
+   single-request recommendation is k=4 (W=5, one SmallT GQA tile); concurrent long-reasoning
+   settings are measured in [performance.md](../performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22).
+   Maximum k=5 (W=6). `--adaptive-draft` picks live k in `{1,2,3,4,5}` as in
+   [§8.1](#81-adaptive-draft-length). Frozen
    `--draft-tokens 4` stays `{4}`. CUDA graphs capture one graph per k; the next k is chosen
    after the round (lagged one round, no post-draft host seam).
 
@@ -426,7 +435,7 @@ the **next** round. “Lock” means: do not mix k as a bandit; take the current
 
 | State | Lifetime | Role |
 |---|---|---|
-| CUDA graphs for `{3,4,5}` | once per Engine launch | the three possible round shapes |
+| CUDA graphs for DFlash `{1,2,3,4,5}` or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed |
 | `T(k,C,L)` | Engine lifetime, one table per concurrency C | seconds for a k-round at this batch size and length |
 | hop chances `r_i` | one request | how far down the draft this prompt still matches |
 | `live_k` | chosen after each round, used next round | which graph to run |
@@ -442,8 +451,8 @@ sequence length L, so
 `T(k,C,L) = a_{C,k} + c_C L`
 
 by online least squares: shared slope in L, per-k intercept, one table per C. That table is
-**shared across requests** on this server. After a few rounds, `T(3)`, `T(4)`, and `T(5)` are
-known. An unmeasured k is tried **at most once**, smallest first, and only if an optimistic
+**shared across requests** on this server. After a few rounds, competitive captured widths have
+measured times. An unmeasured k is tried **at most once**, smallest first, and only if an optimistic
 bound (unseen hops treated as certain accept) still beats the best measured arm. Unmeasured
 `T(k)` is `max(T(k-1), 2 T(k-1) − T(k-2))`. Fallback rounds with draft extent 0 do not update
 T.
@@ -471,9 +480,11 @@ cannot afford the locked k.
 On a long-lived serve, T is known after the first requests. A later request still starts with
 empty hops (`live_k = 0` on C=1), so the first rounds mostly pick from known T until this
 prompt’s coins exist, then sit on one k. Host tests cover hop updates, dominance, one probe,
-and shared batch k. Greedy Engine A/Bs vs frozen `{3,4,5}` are the throughput check: C≥2 stays
-on the frozen winner after one k=5 probe; C=1 pays a short probe tax; high-accept Python can
-linger on k=5 because the product of hop means is optimistic.
+and shared batch k. DFlash includes k=1/2 because short verification batches can win at C>1
+when later-hop acceptance is low. Their NVFP4 MLP and attention-input projections aggregate
+requests into one weight pass; W=2..4 NVFP4 residual projections do likewise. W2/W3 retain
+A16; k=3 (W4) now uses the same A8 policy as k=4/5 (W5/W6). The picker can still prefer
+k=4/5 for high-acceptance workloads.
 
 ## 9. Speculative round semantics
 

@@ -14,6 +14,9 @@ int main() {
             1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 48, 49, 128, 1024, 2048, 4096,
         };
         int failures = 0;
+        failures += run_profile("LinearSwiGLU NVFP4_A8",
+            {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A8},
+            std::array<std::int32_t, 11>{4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24});
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);

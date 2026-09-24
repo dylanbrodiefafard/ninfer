@@ -1904,12 +1904,20 @@ int main(int argc, char** argv) {
                                std::string(argv[2]) == "metadata";
     const bool event_only = argc == 3 && std::string(argv[1]) == "--case" &&
                             std::string(argv[2]) == "event";
-    if (argc != 1 && !corrupt_only && !metadata_only && !event_only) {
-        return fail("usage: disk_real [--case corrupt|metadata|event]");
+    const bool dflash_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                             std::string(argv[2]) == "dflash";
+    if (argc != 1 && !corrupt_only && !metadata_only && !event_only && !dflash_only) {
+        return fail("usage: disk_real [--case corrupt|metadata|event|dflash]");
     }
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    if (dflash_only) {
+        if (dflash == nullptr || *dflash == '\0') { return 77; }
+        const int result = exercise_dflash_three_tier(dflash);
+        if (result == 0) { std::cout << "ok DFlash disk restore and continuation\n"; }
+        return result;
+    }
     if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
         (dflash == nullptr || *dflash == '\0')) {
         std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "

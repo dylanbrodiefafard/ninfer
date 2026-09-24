@@ -307,7 +307,7 @@ std::string usage_text(std::string_view program) {
          << "                              the artifact to contain dflash/ objects\n"
          << "  --draft-tokens <0..5>     speculative draft window: mtp [0,5] (0 = none),\n"
          << "                              dflash [1,5] (default: 0)\n"
-         << "  --adaptive-draft            pick live K in {3,4,5} by locking E[Y]/T(k,C,L); requires --spec mtp|dflash\n"
+         << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {1..5}, MTP {3..5}, within the captured set\n"
          << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
          << "                              default (dflash only)\n"
          << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens\n"

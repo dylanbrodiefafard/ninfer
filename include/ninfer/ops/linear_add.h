@@ -52,8 +52,10 @@ namespace ninfer::ops {
  *   staging, and workspace precision; those private choices are not semantic rounding boundaries.
  *
  * Compute policy:
- *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only and AllowA4; AllowA4 permits
+ *   Q5, W8, and BF16_CTRL admit only A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4 permits
  *   the private resolver to select a qualified A16 or A4 route at every positive T.
+ *   NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4 and A16 below that;
+ *   exact weight-code expansion and FP32 per16-scale accumulation preserve the stored weights.
  *   FP8 admits A16Only and AllowA8, with caller-owned A8 activation workspace.
  *
  * Effects:

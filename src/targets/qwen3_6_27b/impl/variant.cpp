@@ -45,6 +45,8 @@ void validate_token_interval(std::int32_t first, std::int32_t last) {
 }
 
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::AllowA4;
+constexpr ops::LinearPolicy kNvfp4VerifyPolicy = ops::LinearPolicy::AllowA8;
+constexpr ops::LinearPolicy kNvfp4GdnVerifyPolicy = ops::LinearPolicy::AllowA8;
 
 ops::LinearPolicy text_policy(const Weight& weight,
                               qwen3_6::TextPhase phase = qwen3_6::TextPhase::Prefill,
@@ -53,17 +55,15 @@ ops::LinearPolicy text_policy(const Weight& weight,
         return phase == qwen3_6::TextPhase::Prefill && aggregate_tokens > 1
                    ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
     }
-    // P-less is sensitive to small target-logit perturbations at its collision-probability
-    // boundary. Keep target verification on the same A16 matrix route as ordinary decode.
-    // Numerically sensitive fused projections remain per-request panels unless they have an
-    // Numerically qualified aggregate schedules pin W=4..6 projection shapes to A16. BF16
-    // attention input, W=6 C=3/4 attention input, and the attention/GDN residual projections stay
-    // panel-preserving outside W=5 because real recurrent activations expose differences there.
+    // Verification chooses precision from the request-local width. Short widths retain
+    // A16 across C; W>=4 permits the selected NVFP4 activation profile across C.
     if (phase == qwen3_6::TextPhase::Verify && aggregate_tokens > 0 &&
-        aggregate_tokens <= 16) {
+        aggregate_tokens <= 3) {
         return ops::LinearPolicy::A16Only;
     }
-    return weight.qtype == QType::NVFP4 ? kNvfp4TextPolicy : ops::LinearPolicy::A16Only;
+    return weight.qtype == QType::NVFP4
+        ? (phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy)
+        : ops::LinearPolicy::A16Only;
 }
 
 bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
@@ -74,25 +74,14 @@ bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
 
 bool aggregate_verify_extent(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                              std::int32_t aggregate_tokens) {
-    return split_verify_panels(phase, route_tokens, aggregate_tokens) && route_tokens >= 4 &&
+    return split_verify_panels(phase, route_tokens, aggregate_tokens) && route_tokens >= 2 &&
            route_tokens <= 6 && aggregate_tokens <= 24;
 }
 
-bool aggregate_verify_residuals(qwen3_6::TextPhase phase, std::int32_t route_tokens,
+bool aggregate_verify_residuals(QType qtype, qwen3_6::TextPhase phase, std::int32_t route_tokens,
                                 std::int32_t aggregate_tokens) {
-    return aggregate_verify_extent(phase, route_tokens, aggregate_tokens) && route_tokens == 5;
-}
-
-bool aggregate_verify_projection(qwen3_6::TextPhase phase, std::int32_t route_tokens,
-                                 std::int32_t aggregate_tokens) {
     return aggregate_verify_extent(phase, route_tokens, aggregate_tokens) &&
-           (route_tokens != 6 || aggregate_tokens == 12);
-}
-
-bool aggregate_verify_swiglu(qwen3_6::TextPhase phase, std::int32_t route_tokens,
-                             std::int32_t aggregate_tokens) {
-    return aggregate_verify_extent(phase, route_tokens, aggregate_tokens) &&
-           aggregate_tokens <= 20;
+           (route_tokens == 5 || qtype == QType::NVFP4);
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
@@ -101,7 +90,8 @@ bool aggregate_verify_swiglu(qwen3_6::TextPhase phase, std::int32_t route_tokens
 ops::LinearPolicy attn_input_packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
                                            std::int32_t route_tokens,
                                            std::int32_t aggregate_tokens) {
-    const ops::LinearPolicy policy = text_policy(weight, phase, aggregate_tokens);
+    const ops::LinearPolicy policy = text_policy(weight, phase,
+        route_tokens > 0 ? route_tokens : aggregate_tokens);
     if (route_tokens > 0 && route_tokens < 4 && weight.qtype == QType::NVFP4 &&
         policy == ops::LinearPolicy::AllowA4) {
         return ops::LinearPolicy::A16Only;
@@ -112,7 +102,8 @@ ops::LinearPolicy attn_input_packed_policy(const Weight& weight, qwen3_6::TextPh
 ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhase phase,
                                          std::int32_t route_tokens,
                                          std::int32_t aggregate_tokens) {
-    const ops::LinearPolicy policy = text_policy(weight, phase, aggregate_tokens);
+    const ops::LinearPolicy policy = text_policy(weight, phase,
+        route_tokens > 0 ? route_tokens : aggregate_tokens);
     if (route_tokens <= 0 || weight.qtype != QType::NVFP4 ||
         policy != ops::LinearPolicy::AllowA4) {
         return policy;
@@ -131,15 +122,15 @@ ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhas
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
-// NVFP4 packed verify B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B=2..4
-// W=2/5 shapes group requests per weight pass (including the direct W=5, B=3 group)
+// Under A16, NVFP4 packed verify B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B=2..4
+// W=2/5 and B=2/4 W=6 group requests per weight pass (W=5, B=3 uses one group)
 // and keep the projection in private FP32 workspace. Other B=1 widths retain the
 // fused T=1-reduction route; the other B>1 widths retain request-indexed CTAs.
 std::size_t nvfp4_gdn_record_leaf_bytes(std::int32_t batch, std::int32_t min_width,
                                         std::int32_t max_width) {
     return std::max(kMinimumLeafWorkspaceBytes,
                     ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                        QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch, min_width,
+                        QType::NVFP4, 16384, TextConfig::hidden, kNvfp4GdnVerifyPolicy, batch, min_width,
                         max_width));
 }
 
@@ -286,7 +277,7 @@ void Variant::attention_projection(const Tensor& hidden,
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
-    const bool aggregate = aggregate_verify_projection(phase, route_tokens, hidden.ne[1]) &&
+    const bool aggregate = aggregate_verify_extent(phase, route_tokens, hidden.ne[1]) &&
                            (fused.qtype == QType::NVFP4 ||
                             (fused.qtype == QType::BF16_CTRL && route_tokens == 5));
     if (split_verify_panels(phase, route_tokens, hidden.ne[1]) && !aggregate) {
@@ -314,7 +305,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           std::int32_t route_tokens) {
     if (split_verify_panels(phase, route_tokens, attention.ne[1]) &&
         (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
-         !aggregate_verify_residuals(phase, route_tokens, attention.ne[1]))) {
+         !aggregate_verify_residuals(weight.qtype, phase, route_tokens, attention.ne[1]))) {
         for (std::int32_t offset = 0; offset < attention.ne[1]; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
             ops::linear_add(attention.slice(1, offset, route_tokens), weight, residual_panel,
@@ -323,7 +314,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
         return;
     }
     ops::linear_add(attention, weight, residual,
-                    aggregate_verify_residuals(phase, route_tokens, attention.ne[1])
+                    aggregate_verify_residuals(weight.qtype, phase, route_tokens, attention.ne[1])
                         ? text_policy(weight, phase, route_tokens)
                         : residual_packed_policy(weight, phase, route_tokens, attention.ne[1]),
                     workspace, stream);
@@ -469,8 +460,9 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, valid_columns,
-                                    initial_slots, conv_record, query, key, value, output_gate_view,
-                                    text_policy(fused, phase, hidden.ne[1]), leaf_workspace, stream,
+                                     initial_slots, conv_record, query, key, value, output_gate_view,
+                                      fused.qtype == QType::NVFP4 && hidden.ne[1] >= 4
+                                         ? kNvfp4GdnVerifyPolicy : text_policy(fused, phase, hidden.ne[1]), leaf_workspace, stream,
                                     parent_index);
 }
 
@@ -479,7 +471,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     cudaStream_t stream, std::int32_t route_tokens) {
     if (split_verify_panels(phase, route_tokens, hidden.ne[1]) &&
         (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
-         !aggregate_verify_residuals(phase, route_tokens, hidden.ne[1]))) {
+         !aggregate_verify_residuals(weight.qtype, phase, route_tokens, hidden.ne[1]))) {
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
             ops::linear_add(hidden.slice(1, offset, route_tokens), weight, residual_panel,
@@ -488,7 +480,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
         return;
     }
     ops::linear_add(hidden, weight, residual,
-                    aggregate_verify_residuals(phase, route_tokens, hidden.ne[1])
+                    aggregate_verify_residuals(weight.qtype, phase, route_tokens, hidden.ne[1])
                         ? text_policy(weight, phase, route_tokens)
                         : residual_packed_policy(weight, phase, route_tokens, hidden.ne[1]),
                     workspace, stream);
@@ -522,7 +514,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         const bool aggregate_down = weights.down.qtype != QType::FP8_E4M3FN_ROW_BF16S &&
                                     aggregate_verify_extent(phase, route_tokens, hidden.ne[1]);
         const bool aggregate_swiglu = weights.gate_up.qtype == QType::NVFP4 &&
-                                      aggregate_verify_swiglu(phase, route_tokens, hidden.ne[1]);
+                                      aggregate_verify_extent(phase, route_tokens, hidden.ne[1]);
         if (aggregate_swiglu) {
             ops::linear_swiglu(hidden, weights.gate_up, activation,
                                text_policy(weights.gate_up, phase, route_tokens), workspace,
@@ -645,16 +637,16 @@ std::size_t Variant::mtp_attention_output_workspace_capacity_bytes(std::int32_t 
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                   qwen3_6::TextPhase,
+                                                                   qwen3_6::TextPhase phase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::SelectiveFp8Nvfp4:
         return std::max(attention_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
-                           qwen3_6::TextPhase::Prefill, first, last),
-                        attention_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
-                           qwen3_6::TextPhase::Prefill, first, last));
+                            phase, first, last),
+                         attention_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                            phase, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return 0;
@@ -664,20 +656,21 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
             ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+            QType::NVFP4, 14336, TextConfig::hidden,
+            phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile weights_profile, qwen3_6::TextPhase phase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::SelectiveFp8Nvfp4:
         return std::max(attention_output_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
-                           qwen3_6::TextPhase::Prefill, first, last),
-                        attention_output_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
-                           qwen3_6::TextPhase::Prefill, first, last));
+                            phase, first, last),
+                         attention_output_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                            phase, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -689,7 +682,8 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
             ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
-                                                        TextConfig::query_size, kNvfp4TextPolicy,
+                                                        TextConfig::query_size,
+                                                        phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy,
                                                         first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
@@ -778,16 +772,16 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                    qwen3_6::TextPhase,
+                                                                    qwen3_6::TextPhase phase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::SelectiveFp8Nvfp4:
         return std::max(gdn_output_projection_workspace_capacity_bytes(WeightsProfile::Nvfp4,
-                           qwen3_6::TextPhase::Prefill, first, last),
-                        gdn_output_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
-                           qwen3_6::TextPhase::Prefill, first, last));
+                            phase, first, last),
+                         gdn_output_projection_workspace_capacity_bytes(WeightsProfile::MixedFp8Nvfp4,
+                            phase, first, last));
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:
         return ops::linear_add_workspace_capacity_bytes(QType::Q5G64_F16S, TextConfig::hidden,
@@ -799,7 +793,8 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
             ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
+            QType::NVFP4, TextConfig::hidden, TextConfig::value_dim,
+            phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -811,7 +806,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                         qwen3_6::TextPhase, std::int32_t first,
+                                                         qwen3_6::TextPhase phase, std::int32_t first,
                                                          std::int32_t last) {
     validate_token_interval(first, last);
     QType gate_up_qtype;
@@ -837,12 +832,12 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
                 ops::LinearPolicy::AllowA8, first, last));
         (void)fp8.alloc_bytes(scratch);
         return std::max(fp8.peak_bytes(1), post_mixer_workspace_capacity_bytes(
-            WeightsProfile::Nvfp4, qwen3_6::TextPhase::Prefill, first, last));
+            WeightsProfile::Nvfp4, phase, first, last));
     }
     case WeightsProfile::Nvfp4:
         gate_up_qtype = QType::NVFP4;
         down_qtype    = QType::NVFP4;
-        policy        = kNvfp4TextPolicy;
+        policy        = phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy;
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");

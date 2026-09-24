@@ -143,12 +143,4 @@ void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_
            stream);
 }
 
-void nvfp4_gdn_record_post_launch(const Tensor& conv_record, const Tensor& conv_weight,
-                                  const Tensor& conv_states, const Tensor& valid_columns,
-                                  const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, cudaStream_t stream) {
-    launch(conv_record, conv_weight, conv_states, valid_columns, initial_slot, query, key, value,
-           NoHistoryPublish{}, stream);
-}
-
 } // namespace ninfer::ops::detail

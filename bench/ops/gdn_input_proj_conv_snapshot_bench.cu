@@ -215,7 +215,8 @@ std::vector<std::int32_t> parse_valid_columns(std::string_view text) {
 ops::LinearPolicy parse_nvfp4_policy(std::string_view value) {
     if (value == "a16") return ops::LinearPolicy::A16Only;
     if (value == "a4") return ops::LinearPolicy::AllowA4;
-    throw std::invalid_argument("--nvfp4-policy must be a16 or a4");
+    if (value == "a8") return ops::LinearPolicy::AllowA8;
+    throw std::invalid_argument("--nvfp4-policy must be a16, a4 or a8");
 }
 
 void usage(const char* argv0) {
@@ -224,7 +225,7 @@ void usage(const char* argv0) {
                  "Public workload:\n"
                  "  --format q4q5|nvfp4|w8|all   Default q4q5.\n"
                  "  --form snapshot|record|both  Default snapshot.\n"
-                 "  --nvfp4-policy a16|a4        Default a4.\n"
+                  "  --nvfp4-policy a16|a4|a8     Default a4; A8 is record-only.\n"
                  "  --tokens T                    Exact token extent.\n"
                  "  --sweep START:END[:STEP]      Token sweep (default 1:6).\n\n"
                  "  --batch B                     Snapshot [1,8], record [1,4] (default 1).\n"
@@ -367,7 +368,7 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 const char* policy_name(ops::LinearPolicy policy) {
-    return policy == ops::LinearPolicy::AllowA4 ? "a4" : "a16";
+    return policy == ops::LinearPolicy::AllowA8 ? "a8" : (policy == ops::LinearPolicy::AllowA4 ? "a4" : "a16");
 }
 
 class Q4Q5Fixture {
@@ -445,7 +446,7 @@ public:
     }
 
     [[nodiscard]] const char* profile() const noexcept {
-        return policy_ == ops::LinearPolicy::AllowA4 ? "nvfp4-a4" : "nvfp4-a16";
+        return policy_ == ops::LinearPolicy::AllowA8 ? "nvfp4-a8" : (policy_ == ops::LinearPolicy::AllowA4 ? "nvfp4-a4" : "nvfp4-a16");
     }
 
     [[nodiscard]] GdnGeometry geometry() const noexcept {

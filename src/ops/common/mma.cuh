@@ -4,6 +4,14 @@
 
 namespace ninfer::ops {
 
+__device__ __forceinline__ void mma_fp8_e4m3_k16(float (&d)[4], unsigned a0, unsigned a1,
+                                                unsigned b) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a0), "r"(a1), "r"(b));
+}
+
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)

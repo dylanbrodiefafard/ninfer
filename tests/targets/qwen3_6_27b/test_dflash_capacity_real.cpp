@@ -85,7 +85,10 @@ void exercise(const char* artifact) {
     require(startup.cuda_graph_observed_bytes > 0 &&
                 startup.cuda_graph_observed_bytes <= startup.cuda_graph_allowance_bytes,
             "DFlash graph allocation exceeded its allowance");
-    require(startup.cuda_graph_allowance_bytes - startup.cuda_graph_observed_bytes <= 128 * kMiB,
+    // Keep the prior three-width allowance-slack bound per captured shape. Short-width
+    // adaptation now captures five shapes at each batch size, rather than three.
+    require(startup.cuda_graph_allowance_bytes - startup.cuda_graph_observed_bytes <=
+                128 * kMiB * 5 / 3,
             "automatic capacity still strands an oversized DFlash graph allowance");
     require(startup_free >= 768 * kMiB, "startup consumed automatic headroom");
     std::cout << "startup tokens=" << resolution.resolved_tokens
@@ -137,7 +140,7 @@ void exercise(const char* artifact) {
     std::array<std::uint32_t, 6> widths_seen{};
     // Every exact B must change K in both directions on the same live state, including 4<->5.
     for (const std::size_t batch : {4U, 3U, 2U, 1U}) {
-        for (const std::uint32_t k : {3U, 4U, 5U, 4U, 5U, 3U}) {
+        for (const std::uint32_t k : {1U, 2U, 3U, 4U, 5U, 4U, 5U, 3U, 2U, 1U}) {
             for (std::size_t row = 0; row < batch; ++row) {
                 program.requests[lanes[row]].adaptive.live_k = k;
             }
@@ -162,7 +165,7 @@ void exercise(const char* artifact) {
                                           std::span(no_flags).first(batch));
             ++widths_seen[k];
         }
-        std::cout << "batch=" << batch << " widths=3,4,5,4,5,3 passed\n" << std::flush;
+        std::cout << "batch=" << batch << " widths=1,2,3,4,5,4,5,3,2,1 passed\n" << std::flush;
         // Cancel the retiring lane at the round boundary before shrinking the active batch.
         program.abort_lane(lanes[batch - 1]);
     }
@@ -174,7 +177,7 @@ void exercise(const char* artifact) {
     const auto final_free = free_bytes();
     require(final_free + 64 * kMiB >= startup_free,
             "prefill or adaptive graph switching allocated unexpected device memory");
-    for (const auto k : {3U, 4U, 5U}) {
+    for (const auto k : {1U, 2U, 3U, 4U, 5U}) {
         require(widths_seen[k] == 8, "adaptive width coverage is incomplete");
     }
     std::cout << "ok full_chunks=" << full_chunks

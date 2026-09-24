@@ -75,8 +75,8 @@ void test_capture_set() {
                        std::string_view msg) { expect(got == want, msg); };
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive {3,4,5}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, true), {3, 4, 5},
-       "DFlash N>=5 {3,4,5}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true), {1, 2, 3, 4, 5},
+       "DFlash includes short concurrent verification widths");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 4, true), {4}, "DFlash N=4 frozen {4}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, false), {7}, "frozen DFlash {N}");
 }
@@ -85,7 +85,7 @@ void test_seed_is_captured_min() {
     using ninfer::SpeculativeBackend;
     const auto df = q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true);
     const auto mt = q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true);
-    expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 3,
+    expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 1,
            "seed fallback is captured.front()");
     expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3, "MTP seed is also the smallest k");
     const std::uint32_t frozen[] = {7};

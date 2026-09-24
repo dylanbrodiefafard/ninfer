@@ -113,7 +113,7 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
                                 input_rows == detail::Nvfp4Residual6144Geometry::kInputRows) ||
                                (output_rows == detail::Nvfp4Residual17408Geometry::kOutputRows &&
                                 input_rows == detail::Nvfp4Residual17408Geometry::kInputRows);
-        if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+        if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
@@ -202,8 +202,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     if (w.qtype == QType::NVFP4) {
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-            throw std::invalid_argument("NVFP4 linear_add admits only A16 or A4");
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("NVFP4 linear_add admits A16, A4 or A8");
         }
         detail::validate_nvfp4_weight(w, "nvfp4 linear_add");
         const bool supported_shape = (w.n == detail::Nvfp4Residual6144Geometry::kOutputRows &&

@@ -4,6 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/nvfp4/nvfp4_w4a8_plan.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -15,6 +16,7 @@ namespace {
 enum class Nvfp4LinearRoute : std::uint8_t {
     A16,
     W4A4,
+    W4A8,
 };
 
 Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
@@ -23,6 +25,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
+    if (policy == LinearPolicy::AllowA8) {
+        const auto problem = resolve_nvfp4_problem(output_rows, input_rows);
+        return tokens >= 4 && (problem == Nvfp4Problem::AttnInput || problem == Nvfp4Problem::GdnInput ||
+            problem == Nvfp4Problem::MlpGateUp || problem == Nvfp4Problem::Residual6144 ||
+            problem == Nvfp4Problem::Residual17408) ? Nvfp4LinearRoute::W4A8 : Nvfp4LinearRoute::A16;
+    }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
     }
@@ -91,6 +99,9 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
         throw std::invalid_argument("nvfp4 linear workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+    if (resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearRoute::W4A8) {
+        return fp8_a8_workspace_capacity_bytes(max_tokens, input_rows);
+    }
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
@@ -105,6 +116,13 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
 
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearRoute::A16) {
         launch_a16(x, weight, out, stream);
+        return;
+    }
+    if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearRoute::W4A8) {
+        if (!workspace) { throw std::invalid_argument("NVFP4 A8 requires workspace"); }
+        auto scope = workspace->scope();
+        auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
+        launch_nvfp4_w4a8(x, weight, out, scratch, stream);
         return;
     }
     if (workspace == nullptr) {
