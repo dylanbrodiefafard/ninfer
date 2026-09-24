@@ -21,6 +21,18 @@ struct Nvfp4GdnConvPlan {
     Nvfp4GdnConvScheduleId schedule;
 };
 
+inline constexpr bool nvfp4_gdn_record_uses_quantized(LinearPolicy policy, std::int32_t width) noexcept {
+    return ((policy == LinearPolicy::AllowA4 && width >= 5) ||
+            (policy == LinearPolicy::AllowA8 && width >= 4)) && width <= 16;
+}
+
+void nvfp4_gdn_record_quantized_launch(const Tensor& x, const Weight& weight,
+                               const Tensor& conv_weight, const Tensor& conv_states,
+                               const Tensor& valid_columns, const Tensor& initial_slot,
+                               Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                               Tensor& z, LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                               const std::int32_t* parent_index);
+
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size);
 
@@ -73,14 +85,15 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                                      const std::int32_t* parent_index = nullptr);
 
-// Packed T=2..16 record: B=1 W=5/6 and qualified B>1 W=2/5 routes group requests per
+// Packed T=2..16 record: B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 group requests per
 // SmallT weight pass (including one W=5 C=3 group) and materialize only the private
 // FP32 projection. B=1 W=4 uses fused SmallT; other B=1 widths retain T=1 GEMV+FP32
 // conv, and other B>1 widths use request-indexed CTAs.
 inline constexpr bool nvfp4_gdn_record_uses_grouped_replay(std::int32_t width,
                                                             std::int32_t batch_size) noexcept {
     return (batch_size == 1 && (width == 5 || width == 6)) ||
-           (batch_size > 1 && (width == 2 || width == 5));
+           (batch_size > 1 && (width == 2 || width == 5 ||
+                               (width == 6 && (batch_size == 2 || batch_size == 4))));
 }
 
 inline constexpr bool nvfp4_gdn_record_uses_small_t(std::int32_t width,
@@ -101,11 +114,6 @@ void nvfp4_gdn_snapshot_post_launch(const Tensor& projected, const Tensor& conv_
                                     Tensor& conv_states, const Tensor& valid_columns,
                                     const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                                     Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream);
-
-void nvfp4_gdn_record_post_launch(const Tensor& conv_record, const Tensor& conv_weight,
-                                  const Tensor& conv_states, const Tensor& valid_columns,
-                                  const Tensor& initial_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, cudaStream_t stream);
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                  Tensor& conv_states, const Tensor& valid_columns,

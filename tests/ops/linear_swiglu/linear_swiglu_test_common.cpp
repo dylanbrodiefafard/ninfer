@@ -250,7 +250,7 @@ void validate_profile(const Profile& profile) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4) ||
+         profile.activation_compute != ActivationCompute::A4 && profile.activation_compute != ActivationCompute::A8) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8) ||
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {

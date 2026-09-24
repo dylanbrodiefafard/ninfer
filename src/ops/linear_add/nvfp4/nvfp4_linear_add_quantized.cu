@@ -1,8 +1,11 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
+// A4/A8 projection routes share LinearAdd's residual epilogue.
+
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
 
@@ -54,6 +57,19 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
 }
 
 } // namespace
+
+void nvfp4_linear_add_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                   Fp8A8Workspace workspace, cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    const Nvfp4AddResidualEpilogue epilogue{data, weight.n};
+    const Nvfp4ContiguousOutput out{data, weight.n};
+    if (weight.k == 6144) {
+        launch_nvfp4_w4a8_mma<Nvfp4Residual6144Geometry>(weight, x.ne[1], workspace, epilogue, out, stream);
+    } else {
+        launch_nvfp4_w4a8_mma<Nvfp4Residual17408Geometry>(weight, x.ne[1], workspace, epilogue, out, stream);
+    }
+}
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {

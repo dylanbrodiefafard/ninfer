@@ -440,6 +440,7 @@ public:
     std::uint64_t pending_disk_restore_ticket_ = 0;
 
 private:
+    friend struct VerificationQualification;
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void retain_committed_sequence(SequenceState& sequence, RequestControl& request);
     void ordered_reset(SequenceState& sequence);

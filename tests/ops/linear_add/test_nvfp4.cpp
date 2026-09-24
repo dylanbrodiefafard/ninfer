@@ -26,6 +26,7 @@ constexpr ReductionCriterion kA16Tolerance{
     2.0 * kBf16UnitRoundoff,
 };
 constexpr ReductionCriterion kA4Tolerance{0.16, kBf16UnitRoundoff, 0.16};
+constexpr ReductionCriterion kA8Tolerance{0.04, kBf16UnitRoundoff, 0.06};
 
 struct Invocation {
     std::int32_t tokens;
@@ -106,6 +107,17 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::array invocations{
+        Invocation{4, ops::LinearPolicy::AllowA8},
+        Invocation{8, ops::LinearPolicy::AllowA8},
+        Invocation{16, ops::LinearPolicy::AllowA8},
+        Invocation{5, ops::LinearPolicy::AllowA8},
+        Invocation{6, ops::LinearPolicy::AllowA8},
+        Invocation{10, ops::LinearPolicy::AllowA8},
+        Invocation{12, ops::LinearPolicy::AllowA8},
+        Invocation{15, ops::LinearPolicy::AllowA8},
+        Invocation{18, ops::LinearPolicy::AllowA8},
+        Invocation{20, ops::LinearPolicy::AllowA8},
+        Invocation{24, ops::LinearPolicy::AllowA8},
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
@@ -179,9 +191,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
         const bool a4 = invocation.policy == ops::LinearPolicy::AllowA4 &&
                         ((k == 6144 && invocation.tokens >= 5) ||
-                         (k == 17408 && invocation.tokens >= 3));
+                          (k == 17408 && invocation.tokens >= 3));
+        const bool a8 = invocation.policy == ops::LinearPolicy::AllowA8;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
-                                  std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
+                                  std::to_string(k) + "] " + (a8 ? "A8" : (a4 ? "A4" : "A16")) +
                                   " T=" + std::to_string(invocation.tokens);
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
@@ -213,7 +226,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : kA16Tolerance);
+        failures += verify_reduction(label, actual, expected, a8 ? kA8Tolerance : (a4 ? kA4Tolerance : kA16Tolerance));
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");

@@ -28,8 +28,12 @@ server must accept image or video input. Speculative residency is likewise froze
 `--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
 Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..5`; on RTX 5090,
-`--spec dflash --draft-tokens 4 --lm-head-draft` is the measured speed recommendation.
-`--adaptive-draft` picks live k in `{3,4,5}` after each round by locking
+`--spec dflash --draft-tokens 4 --lm-head-draft` is the measured single-request speed recommendation.
+For long concurrent AIME responses, the current [C=2–4 measurements](performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22)
+favor fixed `--draft-tokens 2` at C=2/3 and `--draft-tokens 5 --adaptive-draft` at C=4,
+with `--lm-head-draft` in both cases.
+With `--draft-tokens 5`, `--adaptive-draft` picks live DFlash k in `{1,2,3,4,5}`
+after each round by locking
 `argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time
 (shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when
 dominated; switching k costs 1 ms. That is a sticky policy, not a once-per-launch latch: see
@@ -666,7 +670,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..5` | unset |
-| `--adaptive-draft` | pick live draft K in `{3,4,5}` by locking `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). `--draft-tokens 4` stays `{4}` | off |
+| `--adaptive-draft` | pick live draft K by `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). DFlash with `--draft-tokens 5` captures `{1,2,3,4,5}`; DFlash `--draft-tokens 4` stays `{4}`. MTP captures `{3,4,5}` up to its configured limit | off |
 | `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 is chain `W=k+1` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |

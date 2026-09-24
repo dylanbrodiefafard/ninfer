@@ -1573,7 +1573,8 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
         const double p = weights[static_cast<std::size_t>(token)] / total;
         collision += p * p;
     }
-    const double cut = ops::p_less_membership_cut(collision, config.temperature);
+    // Independent public formula (epsilon=1/16, maximum effective support=1024).
+    const double cut = std::max(collision * std::exp(-0.125 / config.temperature), 1.0 / 1024.0);
     std::vector<int> support;
     for (int token = 0; token < token_domain; ++token) {
         if (p_less_token_suppressed(config, token) || !(total > 0.0)) { continue; }

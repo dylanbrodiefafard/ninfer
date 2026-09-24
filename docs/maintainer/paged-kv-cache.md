@@ -142,7 +142,7 @@ resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation 
 按 `M` 生成并核对 reservation curve。
 
 DFlash2 的 CUDA Graph allowance 按每个 `(K, B, topology)` executable 计 12 MiB，包含其
-reachable definitions；adaptive `K={3,4,5}`、`C=4` 的当前单 topology 共 144 MiB。
+reachable definitions；DFlash adaptive `K={1,2,3,4,5}`、`C=4` 的当前单 topology 共 240 MiB。
 不能套用 autoregressive DFlash 的 64/96 MiB unroll allowance。所有 definitions 和 executables
 在 startup 建立，实测 graph allocation 超过 allowance 时启动失败。4096-token prefill 和 adaptive
 K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV pool。

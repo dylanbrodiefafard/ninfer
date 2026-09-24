@@ -108,6 +108,9 @@ def _matching_roof(card: dict) -> str:
         atom = bound.fp8_compute_atom(problem["n"], problem["k"], problem["t"], problem["policy"])
         rate = card["useful_flops"] / (card["t_comp_us"] * 1e6)
         return f"measured {atom.upper()} MMA roof ({rate:.3f} TFLOP/s; padded issue count included)"
+    if card["problem"]["qtype"] == "nvfp4" and card["problem"]["policy"] == "a8" and card["mma_atom"]["k"] == 16:
+        rate = card["useful_flops"] / (card["t_comp_us"] * 1e6)
+        return f"measured FP8 K16 MMA roof ({rate:.3f} TFLOP/s; block-scale arithmetic excluded)"
     t_issue = card.get("t_issue_us")
     t_comp = card["t_comp_us"]
     if t_issue is not None and t_issue >= t_comp:
@@ -144,7 +147,9 @@ def _classified(card: dict) -> list[dict]:
     p = card["problem"]
     rows = []
     for name in bound.IDEAS:
-        rows.append(bound.classify_idea(name, card["bound"], p["t"], p["phase"]))
+        rows.append(bound.classify_idea(name, card["bound"], p["t"], p["phase"],
+            profiled_ctas=card.get("profiled_ctas"), profiled_dram_gbs=card.get("profiled_dram_gbs"),
+            measured_us=card.get("measured_us")))
     return rows
 
 
@@ -249,7 +254,11 @@ def render_filled(card: dict) -> str:
         )
     else:
         lines.append("5. SM120  ILLEGAL  " + "; ".join(card["sm120"]["reasons"]))
-    if card["bound"] == "DRAM":
+    if idea and idea["name"] == "quality_tradeoff":
+        lines.append("6. Family Requested precision candidate; preserve represented weights. Baseline atom/roof above does not model candidate arithmetic.")
+    elif idea and idea["name"] == "grid_underfill":
+        lines.append("6. Family Evidence-gated output-row partitioning only; preserve K reduction and one weight pass. " + idea["reason"])
+    elif card["bound"] == "DRAM":
         lines.append(
             "6. Family DRAM-bound. Do not fork a compute family. "
             "Attack extra bytes or raise T per weight pass."
@@ -263,7 +272,8 @@ def render_filled(card: dict) -> str:
     lines.append("          Oracle first, then this public Op at the exact point. Fast-but-wrong is invalid.")
     lines.append("          NCU is one named question, not an open report: " + "; ".join(_NCU_QUESTIONS) + ".")
     lines.append(f"          {layer2['ncu']}")
-    lines.append("          No Engine / ninfer_bench / serve A/B until this Op wins.")
+    lines.append("          Measure public-Op latency before paired model quality." if idea and idea["name"] == "quality_tradeoff"
+                 else "          No Engine / ninfer_bench / serve A/B until this Op wins.")
     lines.append("8. Lose   Delete the candidate. Do not leave a second path.")
     lines.append("")
     lines.extend(_group_lines(_classified(card)))

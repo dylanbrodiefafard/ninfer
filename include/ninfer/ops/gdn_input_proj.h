@@ -184,11 +184,12 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /**
- * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. Ordinary
+ * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. Under A16,
  * B=1 fused T=1-reduction, B=1 W=4 fused SmallT, and B=2..4 request-indexed SmallT routes require
- * no storage. B=1 W=5/6 and qualified B>1 W=2/5 grouped replay use a private FP32 projection.
- * AllowA4 otherwise returns only the activation-quantization workspace selected by the
- * corresponding projection route; conv_record is caller-owned.
+ * no storage. B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 grouped replay use a private FP32 projection.
+ * AllowA4 W=5..16 or AllowA8 W=4..16 uses aggregate quantized projection with private FP32 q/k/value storage plus
+ * activation codes/scales. AllowA4 W=2..4 and AllowA8 W=2..3 retain the A16 profile.
+ * conv_record is caller-owned.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -212,9 +213,14 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * [T,B] (or [T] when B=1) parent tensor used by gated_delta_net_replay_record: token 0 loads the
  * checkpoint history, every other valid token j loads the width-three history saved after its
  * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
- * NVFP4 B=1 W=4 uses one fused same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..4
+ * Under NVFP4 AllowA4 W=5..16 or AllowA8 W=4..16, the Op aggregates B requests in the respective A4/A8 MMA family and
+ * writes FP32 current projections for convolution, without a BF16 intermediate. The
+ * A8 uses row-scaled E4M3 activations and separately scaled K16 partials without requantizing
+ * weights. The A16 profile (including AllowA4 W=2..4 and AllowA8 W=2..3) uses the following routes:
+ * B=1 W=4 uses one fused same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..4
  * W=2/5 profiles use one grouped SmallT weight pass with a private FP32 projection, including one
- * direct W=5 C=3 group. Other B=1 widths use the fused T=1-reduction GEMV+FP32-convolution route;
+ * direct W=5 C=3 group. W=6 B=2/4 uses request pairs; W=6 B=3 remains request-indexed.
+ * Other B=1 widths use the fused T=1-reduction GEMV+FP32-convolution route;
  * other B>1 widths use same-reduction request-indexed CTAs. All routes round saved three-tap
  * history through BF16 at each valid column and avoid the BF16 projected compose-record route.
  *
@@ -231,7 +237,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
 
 /**
  * Single-parent record-producing form. Registered parents are W8G32_F16S [12288,2048], NVFP4
- * and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only and AllowA4.
+ * and FP8_E4M3FN_ROW_BF16S [16384,5120]. W8 admits A16Only. NVFP4 admits A16Only, AllowA4 and AllowA8.
  * FP8 admits A16Only/AllowA8 but uses qualified A16 arithmetic throughout W=2..16.
  * FP8 batches preserve the C=1 panel reduction and fused/materialized convolution profile.
  */

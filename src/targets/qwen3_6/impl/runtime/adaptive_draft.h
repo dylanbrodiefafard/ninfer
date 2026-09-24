@@ -2,7 +2,7 @@
 
 // Family host policy for adaptive draft length. No CUDA.
 //
-// Objective: match the best constant-k policy in {3,4,5}. Mixing k forks the
+// Objective: match the best captured constant-k policy. Mixing k forks the
 // greedy DFlash/MTP path, so this is not a mixing bandit.
 //
 // Y(k) = 1 + sum_{i<k} q_i with q_i = prod_{j<=i} r_j and
@@ -73,7 +73,7 @@ adaptive_draft_ks(SpeculativeBackend backend, std::uint32_t n, bool adaptive) {
         for (std::uint32_t k = 3; k <= 5 && k <= n; ++k) { out.push_back(k); }
         return out.empty() ? std::vector<std::uint32_t>{n} : out;
     }
-    if (n >= 5) { return {3, 4, 5}; }
+    if (n >= 5) { return {1, 2, 3, 4, 5}; }
     return {n};
 }
 

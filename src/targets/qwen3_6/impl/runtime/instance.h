@@ -85,7 +85,7 @@ dflash_captured_verify_width(std::uint32_t k, std::uint32_t storage_ceil) {
     return live <= storage_ceil ? live : storage_ceil;
 }
 
-// Storage / ReplaySSM / pending-features width. Adaptive `{3,4,5}` is chain W<=6.
+// Storage / ReplaySSM / pending-features width. Adaptive DFlash `{1,2,3,4,5}` is chain W<=6.
 // An explicit --dflash-verify-width still wins; chain-only packages require W=k+1.
 [[nodiscard]] inline std::uint32_t
 dflash_storage_verify_width(std::span<const std::uint32_t> captured_ks,

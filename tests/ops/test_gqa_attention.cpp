@@ -2,6 +2,7 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/op_tester.h"
+#include "ops/nvfp4_activation_ref.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -44,7 +45,11 @@ constexpr std::uint16_t kOutputCanary = 0x7fc1u;
 constexpr ReductionCriterion kAttentionBf16Criterion{
     /*relative_l2*/ 2.8e-3,
     /*gross_absolute*/ 1.0e-3,
-    /*gross_relative_to_max_reference*/ 2.7e-3,
+    // The tensor-wide gross bound must admit the observable BF16 output's unit
+    // roundoff. Captured y=-2.008041972987867 has nearest BF16 -2.015625 (error
+    // .007583), exceeding the old .007479 whole-case bound even for exact attention.
+    // This output-format allowance does not replace the canonical oracle/L2 check.
+    /*gross_relative_to_max_reference*/ 1.0 / 256.0,
 };
 
 constexpr ReductionCriterion kAttentionInt8Criterion{
@@ -3327,7 +3332,7 @@ int run_sage_skip_rejected(const Geometry& geometry) {
 }
 
 int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
-                MappingPattern mapping, bool sage = false) {
+                MappingPattern mapping, bool sage = false, const char* model_inputs = nullptr) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -3340,8 +3345,58 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
 
-    const HostCache cache_host =
+    HostCache cache_host =
         make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
+    if (model_inputs != nullptr) {
+        // Qualification capture: LE {absolute_position, plane, BF16 element_count}
+        // followed by represented values. Planes 0/1/2 are Q/K/V; plane 3 is ignored.
+        // The oracle below still evaluates the complete formula, not captured output.
+        if ((dtype != DType::BF16 && dtype != DType::U8) || sage || geometry.q_heads != 24 || geometry.kv_heads != 4) {
+            throw std::invalid_argument("model attention capture requires 27B BF16 or NVFP4 geometry");
+        }
+        std::ifstream input(model_inputs, std::ios::binary);
+        if (!input) { throw std::runtime_error("cannot read model attention capture"); }
+        std::vector<bool> found_q(test_case.tokens), found_k(total), found_v(total);
+        std::vector<float> captured_k(static_cast<std::size_t>(total) * kHeadDim * geometry.kv_heads);
+        std::vector<float> captured_v(captured_k.size());
+        std::uint32_t header[3];
+        while (input.read(reinterpret_cast<char*>(header), sizeof(header))) {
+            const auto position = header[0], plane = header[1], count = header[2];
+            if (plane > 3 || count != static_cast<std::uint32_t>(
+                    kHeadDim * ((plane == 0 || plane == 3) ? geometry.q_heads : geometry.kv_heads))) {
+                throw std::runtime_error("invalid model attention capture geometry");
+            }
+            std::vector<std::uint16_t> bits(count);
+            if (!input.read(reinterpret_cast<char*>(bits.data()), count * sizeof(bits[0]))) {
+                throw std::runtime_error("truncated model attention capture");
+            }
+            if (plane == 0 && position >= static_cast<unsigned>(test_case.base) &&
+                position < static_cast<unsigned>(total)) {
+                const auto token = position - test_case.base;
+                found_q[token] = true;
+                for (unsigned i = 0; i < count; ++i) { q[token * count + i] = bf16_to_f32(bits[i]); }
+            } else if ((plane == 1 || plane == 2) && position < static_cast<unsigned>(total)) {
+                (plane == 1 ? found_k : found_v)[position] = true;
+                auto& destination = plane == 1 ? captured_k : captured_v;
+                for (int head = 0; head < geometry.kv_heads; ++head) {
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        destination[kv_input_index(geometry, head, d, position)] =
+                            bf16_to_f32(bits[head * kHeadDim + d]);
+                    }
+                }
+            }
+        }
+        for (const auto* found : {&found_q, &found_k, &found_v}) {
+            if (!std::all_of(found->begin(), found->end(), [](bool present) { return present; })) {
+                throw std::runtime_error("model attention capture misses required represented inputs");
+            }
+        }
+        std::vector<std::int32_t> captured_positions(total);
+        for (int i = 0; i < total; ++i) { captured_positions[i] = i; }
+        // Independent registered-codec encoding; ideal_attention decodes the actual
+        // signed codes and stored scales rather than comparing to unquantized KV.
+        append_cache(cache_host, captured_k, captured_v, captured_positions);
+    }
     const bool strict_pv = s3_strict_pv() && test_case.tokens <= 6;
     const std::vector<double> reference =
         (sage && !strict_pv)
@@ -3386,10 +3441,33 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     const std::vector<double> actual = bf16_bits_to_double(output_bits);
-    int failures =
-        verify_attention(label, actual, reference, attention_criterion(dtype, sage, strict_pv));
+    int failures = 0;
+    if (model_inputs != nullptr && dtype == DType::U8) {
+        // The NVFP4 QK route also quantizes public BF16 Q. Real normalized queries
+        // have a different codec floor from the bounded uniform conformance inputs.
+        // Keep the canonical full formula; use an independent exact codec control
+        // to separate Q distortion from arithmetic error, as for W4A4 projections.
+        const auto query_codec = nvfp4_activation_reference(q, 1.0F);
+        const auto codec_reference = ideal_attention(query_codec.represented, cache_host, positions);
+        const auto codec = compute_reduction_stats(codec_reference.data(), reference.data(), reference.size());
+        const auto residual = compute_reduction_stats(actual.data(), codec_reference.data(), reference.size());
+        const auto canonical = compute_reduction_stats(actual.data(), reference.data(), reference.size());
+        ReductionCriterion criterion = kAttentionNvfp4Criterion;
+        criterion.relative_l2 = codec.relative_l2 + criterion.relative_l2 *
+            residual.reference_root_mean_square / std::max(codec.reference_root_mean_square, 1e-30);
+        criterion.gross_absolute += codec.maximum_absolute_error +
+            criterion.gross_relative_to_max_reference * residual.maximum_absolute_reference;
+        criterion.gross_relative_to_max_reference = 0;
+        failures += verify_attention(label + " canonical with explicit Q-codec floor", actual, reference, criterion);
+        failures += verify_attention(label + " Q-codec residual", actual, codec_reference, kAttentionNvfp4Criterion);
+        std::cout << label << " canonical_rel_l2=" << canonical.relative_l2
+                  << " query_codec_rel_l2=" << codec.relative_l2
+                  << " arithmetic_residual_rel_l2=" << residual.relative_l2 << '\n';
+    } else {
+        failures += verify_attention(label, actual, reference, attention_criterion(dtype, sage, strict_pv));
+    }
     if (sage) { sage_floor_report(label, actual, reference, q, cache_host, positions); }
-    if (dtype == DType::U8 && !sage) {
+    if (dtype == DType::U8 && !sage && model_inputs == nullptr) {
         failures += verify_nvfp4_kernel_inside_codec_gap(label, actual, reference, int8_reference,
                                                          bf16_reference);
     }
@@ -5368,6 +5446,19 @@ int s3_dump_case(const Geometry& geometry, const AttentionCase& test_case, const
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--model-inputs") == 0) {
+        if (cuda_unavailable()) { return 1; }
+        int failures = 0;
+        for (const auto dtype : {DType::BF16, DType::U8}) {
+            for (const int base : {8, 12, 31}) {
+                failures += run_a3_case(kGeometries[0], dtype,
+                    {5, base, static_cast<std::uint32_t>(base + 5), 0},
+                    MappingPattern::Fragmented, false, argv[2]);
+            }
+        }
+        std::cout << (failures == 0 ? "PASS" : "FAIL") << " BF16/NVFP4 captured-input attention\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--xattn-proof") == 0) {
         if (cuda_unavailable()) {
             std::cerr << "FAIL: no usable CUDA device\n";

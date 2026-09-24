@@ -1,8 +1,11 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
+// A4 and A8 share the semantic split-output policy; their MMA arithmetic remains separate.
+
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_w4a8_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
 #include <cuda_bf16.h>
@@ -81,6 +84,14 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
 }
 
 } // namespace
+
+void nvfp4_attn_input_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                  Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    launch_nvfp4_w4a8_mma<Geometry>(weight, x.ne[1], workspace, Nvfp4IdentityEpilogue{},
+        Nvfp4W4a4AttentionOutput{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)}, stream);
+}
 
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,

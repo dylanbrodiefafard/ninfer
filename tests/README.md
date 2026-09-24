@@ -61,6 +61,23 @@ presets.
 owns deterministic payload generation, device `Weight` views, row views, and independent logical
 weight decoding.
 
+`ninfer_linear_nvfp4_a8_test` checks NVFP4-storage/E4M3-activation execution at the five
+principal text geometries and verification extents (including W4 at C1–4), with CUDA Graph replay with changed
+inputs. The canonical FP64 dot-product oracle uses the original BF16 activations and decoded
+weights. Independent E4M3 activation encoding supplies a supplementary codec-distortion and
+arithmetic/storage-residual check; its distortion-derived bound is not a model-quality budget.
+The existing attention-input, LinearAdd and LinearSwiGLU suites also check their A8 routes
+directly against their complete mathematical oracles.
+
+`ninfer_gdn_input_proj_conv_record_test` qualifies both A4 and A8 projections against the
+independent projection/convolution/history oracle and reports each profile separately. It
+checks exact activation encoding, zero rows, outliers, chain/tree parents, valid-prefix tails
+and carried BF16 history, including every retained prefix at the A8 W4 boundary.
+A16 W6 request pairing at C2/C4 is additionally required to match
+the legacy T1 outputs exactly; C3 retains the request-indexed route. The optional existing
+`NINFER_GDN_REAL_ACTIVATIONS` input supplies represented real-model activations while the
+fixture weights remain patterned test weights.
+
 ## Build and run
 
 One command for the full C++ unit suite (GPU builder container, excluding opt-in
@@ -355,10 +372,37 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
 KV capacity at context 260000, concurrency 4, NVFP4 KV, and prefill chunk 4096. It checks that
 the graph allowance fits the measured allocation without stranding more than 128 MiB, executes
 full prefill chunks and partial tails up to 259744 tokens, then drives the production Program
-through `K=3,4,5,4,5,3` at every batch size 1–4. The test sets the host adaptive selection at
+through `K=1,2,3,4,5,4,5,3,2,1` at every batch size 1–4. The test sets the host adaptive selection at
 round boundaries to make width transitions deterministic; it checks actual executed K, token
 counts, workspace bounds, and device-memory stability. Adaptive policy selection itself is
 covered by `ninfer_qwen3_6_adaptive_draft_test`.
+
+`ninfer_qwen3_8_27b_verify_score_real_test` is the actual-Verify qualification seam described
+in [tools/ppl](../tools/ppl/README.md). With `NINFER_VERIFY_DECODE_CHECK=greedy`, `p-less`, or
+`stochastic`, it instead runs 16 production draft/Verify/sample/commit rounds and checks
+licensed tokens against the candidate's represented logits. Greedy checks the exact argmax
+and tie rule; p-less and top-k/top-p check independent support formulas, accepted draft
+prefixes, and commit frontiers. Distribution probabilities, rejection/correction and RNG
+semantics additionally use the independent sampling/speculative Op tests. This real-data
+check is not a statistical distribution test.
+
+Concurrent generation controls use identical output budgets: a shorter request's ordinary
+final-token fallback can differ from a longer A4-verification continuation. Equality with a
+prefix of a differently budgeted request is not the same-profile isolation contract.
+Ordinary-scorer margins and scores of independently generated stochastic histories are
+diagnostics, not correctness thresholds for a changed target distribution or paired PPL.
+
+`ninfer_qwen3_6_27b_disk_real_test --case dflash` selects the existing real DFlash three-tier
+restart/HostDisk/continuation check using `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`.
+
+`ninfer_gqa_attention_test --model-inputs <capture.attn>` checks captured 27B represented
+Q/K/V with the existing independent attention oracle at the short-context partition
+regression shapes. The capture is a sequence of little-endian u32
+`{absolute_position, plane, element_count}` headers and BF16 elements, with Q/K/V planes
+0/1/2; captured output plane3 is ignored by the oracle. BF16 comparison uses a tensor-wide
+gross bound admitting BF16 unit roundoff. NVFP4 checks explicitly separate the existing
+private Q-codec distortion from arithmetic residual using the independent activation-codec
+reference; the canonical oracle still uses the original BF16 Q and exact stored KV codes/scales.
 
 ```bash
 NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS=/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \

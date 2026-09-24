@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -24,6 +25,12 @@ void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tenso
 
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream);
+
+void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, Nvfp4W4a4Workspace workspace, cudaStream_t stream);
+
+void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                      Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream);
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);

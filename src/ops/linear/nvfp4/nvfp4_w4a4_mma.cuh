@@ -175,8 +175,8 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
         }
     }
 
-    if constexpr (RowPolicy::kContiguous) {
-        static_assert((Schedule::kBlockN % 64) == 0);
+    if constexpr (RowPolicy::kContiguous && Schedule::kBlockN >= 32) {
+        static_assert((Schedule::kBlockN % 32) == 0);
         constexpr int kScaleRowTiles     = Schedule::kBlockN >= 128 ? Schedule::kBlockN / 128 : 1;
         constexpr int kQuartilesPerTile  = Schedule::kBlockN >= 128 ? 4 : Schedule::kBlockN / 32;
         constexpr int kScaleBytesPerTask = kQuartilesPerTile * 4;
@@ -353,6 +353,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
 
     const int accumulator_row   = lane >> 2;
     const int accumulator_col   = 2 * (lane & 3);
+    // Fused GDN convolution consumes FP32 projection accumulators. Its output policy
+    // bypasses the BF16 shared epilogue; all existing BF16 policies retain that path.
+    constexpr bool kFp32Output = requires { output.store_fp32(0, 0, 0.0F); };
+    static_assert(!kFp32Output || !PairRows);
     constexpr int kOutputStride = Schedule::kBlockN + 8;
     static_assert(sizeof(Nvfp4W4a4SharedStorage<Schedule>) >=
                   Schedule::kBlockM * kOutputStride * sizeof(__nv_bfloat16));
@@ -382,28 +386,41 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 value10 = epilogue.apply(parent_row0, token1, value10);
                 value11 = epilogue.apply(parent_row1, token1, value11);
             }
-            *destination0 = __floats2bfloat162_rn(value00, value01);
-            *destination1 = __floats2bfloat162_rn(value10, value11);
+            if constexpr (kFp32Output) {
+                if (token0 < tokens) {
+                    output.store_fp32(parent_row0, token0, value00);
+                    output.store_fp32(parent_row1, token0, value01);
+                }
+                if (token1 < tokens) {
+                    output.store_fp32(parent_row0, token1, value10);
+                    output.store_fp32(parent_row1, token1, value11);
+                }
+            } else {
+                *destination0 = __floats2bfloat162_rn(value00, value01);
+                *destination1 = __floats2bfloat162_rn(value10, value11);
+            }
         }
     }
-    __syncthreads();
-    constexpr int kStoredRows    = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
-    constexpr int kVectorsPerRow = kStoredRows / 8;
-    constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
-    for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors;
-         task += Schedule::kThreads) {
-        const int token_local = task / kVectorsPerRow;
-        const int row_vector  = task - token_local * kVectorsPerRow;
-        const int token       = token_begin + token_local;
-        if (token < tokens) {
-            const uint4 values =
-                load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
-            if constexpr (PairRows) {
-                const uint4 paired = load_vec<uint4>(shared_output + token_local * kOutputStride +
-                                                     kStoredRows + row_vector * 8);
-                output.store_pair_vector(row_begin + row_vector * 8, token, values, paired);
-            } else {
-                output.store_vector(row_begin + row_vector * 8, token, values);
+    if constexpr (!kFp32Output) {
+        __syncthreads();
+        constexpr int kStoredRows    = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
+        constexpr int kVectorsPerRow = kStoredRows / 8;
+        constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
+        for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors;
+             task += Schedule::kThreads) {
+            const int token_local = task / kVectorsPerRow;
+            const int row_vector  = task - token_local * kVectorsPerRow;
+            const int token       = token_begin + token_local;
+            if (token < tokens) {
+                const uint4 values =
+                    load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
+                if constexpr (PairRows) {
+                    const uint4 paired = load_vec<uint4>(shared_output + token_local * kOutputStride +
+                                                         kStoredRows + row_vector * 8);
+                    output.store_pair_vector(row_begin + row_vector * 8, token, values, paired);
+                } else {
+                    output.store_vector(row_begin + row_vector * 8, token, values);
+                }
             }
         }
     }

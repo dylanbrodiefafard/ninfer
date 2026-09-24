@@ -724,10 +724,11 @@ their single-parent BF16 weights through `attn_input_proj` for the six early
 `query_key_gate_value` parents and through `linear_add` for attention output layers 3 and 7 and GDN
 output layer 4.
 
-All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Every Text
-phase passes `AllowA4` for NVFP4 weights and `A16Only` for all other formats. Each semantic Op then
-resolves its qualified route from the exact geometry and T; Prefill, ordinary decode, and
-speculative target verify do not create separate activation-policy variants. MTP and Vision use
+All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Prefill and
+ordinary decode pass `AllowA4` for NVFP4 weights. Speculative target verification selects from
+request-local width: W2–3 retains A16; eligible W≥4 ordinary and GDN projections use `AllowA8`.
+The BF16 exceptions retain `A16Only`. Each semantic Op resolves its qualified route from the
+exact geometry and T. MTP and Vision use
 their registered storage and execution paths. With all startup features enabled, 1054 tensors and six
 resources are materialized; the 247 site-level `d_x` scalars are consumed and validated but receive
 no device allocation.

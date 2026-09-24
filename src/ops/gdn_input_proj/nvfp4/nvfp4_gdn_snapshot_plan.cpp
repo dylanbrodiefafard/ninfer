@@ -34,11 +34,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (tokens <= 0 || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
     }
-    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
-        throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8) {
+        throw std::invalid_argument("nvfp4 gdn conv: unsupported compute policy");
     }
     // Width selects the fused family. Snapshot T=2..16 is SmallT GEMM+FP32 conv. Record
-    // B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B>1 W=2/5 shapes group requests
+    // B=1 W=4 uses fused SmallT. B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 group requests
     // while retaining the W-local reduction and FP32 conv input. Other B=1 widths retain
     // fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT CTAs. Do not
     // flatten to B*W W4A4 compose.
@@ -76,41 +76,39 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
 std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
                                                       std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
-    if (min_tokens <= 0 || max_tokens < min_tokens || batch_size <= 0 || batch_size > 4) {
+    if (min_tokens < 2 || max_tokens < min_tokens || max_tokens > 16 ||
+        batch_size <= 0 || batch_size > 4) {
         throw std::invalid_argument("nvfp4 gdn record workspace: invalid B/T domain");
     }
-    const Nvfp4GdnConvPlan minimum_plan =
-        nvfp4_gdn_conv_resolve_plan(policy, min_tokens, batch_size);
-    const Nvfp4GdnConvPlan maximum_plan =
-        nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
-    if (minimum_plan.schedule == Nvfp4GdnConvScheduleId::DecodeFusedA16) {
-        throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
-    }
-    if (maximum_plan.schedule == Nvfp4GdnConvScheduleId::SmallTFusedA16) {
-        std::int32_t maximum_grouped_width = 0;
-        if (min_tokens <= 2 && max_tokens >= 2 &&
-            nvfp4_gdn_record_uses_grouped_replay(2, batch_size)) {
-            maximum_grouped_width = 2;
-        }
-        if (min_tokens <= 5 && max_tokens >= 5 &&
-            nvfp4_gdn_record_uses_grouped_replay(5, batch_size)) {
-            maximum_grouped_width = 5;
-        }
-        if (min_tokens <= 6 && max_tokens >= 6 &&
-            nvfp4_gdn_record_uses_grouped_replay(6, batch_size)) {
-            maximum_grouped_width = 6;
-        }
-        if (maximum_grouped_width == 0) { return 0; }
+    (void)nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
+    if (nvfp4_gdn_record_uses_quantized(policy, max_tokens)) {
         WorkspaceLayoutBuilder layout;
-        (void)layout.alloc(DType::FP32,
-                           {kNvfp4RecordChannels, maximum_grouped_width, batch_size}, 256);
+        (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
+        if (policy == LinearPolicy::AllowA8) {
+            (void)allocate_fp8_a8_workspace(layout, max_tokens * batch_size, 5120);
+        } else {
+            (void)allocate_nvfp4_w4a4_workspace(layout, max_tokens * batch_size, 5120);
+        }
         return layout.peak_bytes(1);
     }
-    if (batch_size > 1) {
-        throw std::logic_error("batched NVFP4 conv-record has no Materialized route");
+    std::int32_t maximum_grouped_width = 0;
+    if (min_tokens <= 2 && max_tokens >= 2 &&
+        nvfp4_gdn_record_uses_grouped_replay(2, batch_size)) {
+        maximum_grouped_width = 2;
     }
-    return nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, std::max(min_tokens, 4),
-                                                    max_tokens);
+    if (min_tokens <= 5 && max_tokens >= 5 &&
+        nvfp4_gdn_record_uses_grouped_replay(5, batch_size)) {
+        maximum_grouped_width = 5;
+    }
+    if (min_tokens <= 6 && max_tokens >= 6 &&
+        nvfp4_gdn_record_uses_grouped_replay(6, batch_size)) {
+        maximum_grouped_width = 6;
+    }
+    if (maximum_grouped_width == 0) { return 0; }
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::FP32,
+                       {kNvfp4RecordChannels, maximum_grouped_width, batch_size}, 256);
+    return layout.peak_bytes(1);
 }
 
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,

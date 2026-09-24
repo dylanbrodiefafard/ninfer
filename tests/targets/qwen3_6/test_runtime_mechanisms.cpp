@@ -1150,9 +1150,8 @@ void test_adaptive_capture_and_topology() {
     };
     same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
     same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive set");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, true), {3, 4, 5}, "DFlash {3,4,5}");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 6, true), {3, 4, 5},
-         "DFlash N=6 still {3,4,5}");
+    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true), {1, 2, 3, 4, 5},
+         "DFlash includes short concurrent verification widths");
     const std::uint32_t c        = 3;
     const std::uint32_t planned  = 0;
     const std::uint32_t k_stride = q36::adaptive_k_stride(c, planned);

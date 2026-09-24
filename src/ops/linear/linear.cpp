@@ -168,7 +168,7 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return 0;
     case QType::NVFP4:
         if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,

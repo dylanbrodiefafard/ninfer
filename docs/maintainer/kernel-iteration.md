@@ -48,6 +48,22 @@ The classifier uses the public Linear model-byte floor, 1674.5 GB/s sustained re
 
 If `verdict=refuse` or `sm120=ILLEGAL`, stop. Do not write CUDA.
 
+The byte roof is a lower bound, not proof that the current launch saturates memory.
+`--idea grid_underfill --profiled-ctas N --profiled-dram-gbs R` admits output-row
+partitioning inside the existing family only after same-kernel NCU evidence shows fewer
+than 170 CTAs and DRAM below 80% of the sustained read ceiling. Preserve one weight pass
+and the K reduction; this does not admit split-K or speculative occupancy/pipeline tuning.
+Require a measured public-Op baseline and independent correctness before candidate timing.
+
+An explicitly requested arithmetic-quality comparison uses `--idea quality_tradeoff` rather
+than the speed-only `new_family` classification. This admission requires a measured current
+public-Op baseline, a legal candidate instruction path, unchanged represented weight values,
+and independent numerical qualification followed by paired quality and latency measurements.
+The existing format's roof is not a candidate-arithmetic performance prediction. This exception
+admits the requested NVFP4-storage/A8 qualification even if the compressed-byte floor is DRAM;
+it does not admit an unsolicited new family to chase a theoretical compute roof. Candidate
+cleanup and the public-Op-first sequence remain required.
+
 ## Layer 1 — SM120 legality and MMA issue roof
 
 RTX 5090 is not B200. Legal: warp `mma.sync` (including `kind::mxf4nvf4`), single-CTA TMA,
@@ -70,6 +86,13 @@ benchmark supports both. FP8 bound cards require a matching measured `fp8` or
 FP4 datasheet roof. Their weight floor is `N*K + 2*N` bytes. The instruction
 probe excludes operand conversion, activation quantization, loads and epilogues;
 public-Op timings must include those costs.
+
+For NVFP4-storage/A8 use `--qtype nvfp4 --policy a8`. At the five admitted text geometries
+and T>=4, its roof uses the separately measured `fp8_k16` atom from `kdev mma`, while
+retaining the packed NVFP4 weight-byte floor. Missing K16 calibration is an error; neither
+the NVFP4 K64 nor FP8 K32 issue rate is interchangeable. This is still a lower bound:
+exact nibble expansion and per16 FP32 scale accumulation are included in public-Op timing,
+not in the register-only MMA probe.
 
 ## Layer 2 — parameter sweep on the GPU
 
