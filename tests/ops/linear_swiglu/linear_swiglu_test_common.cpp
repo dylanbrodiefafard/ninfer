@@ -5,8 +5,11 @@
 #include "core/decode_graph.h"
 #include <optional>
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rmsnorm_linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/fp8_activation_ref.h"
 
 #include <cuda_runtime.h>
 
@@ -22,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -129,17 +133,20 @@ struct ActiveValue {
     double value;
 };
 
+template <class Scalar>
 std::vector<std::vector<ActiveValue>>
-index_nonzero_activations(const std::vector<std::uint16_t>& activation, std::int32_t input_rows,
+index_nonzero_activations(const std::vector<Scalar>& activation, std::int32_t input_rows,
                           std::int32_t tokens) {
     std::vector<std::vector<ActiveValue>> by_column(static_cast<std::size_t>(input_rows));
     for (std::int32_t token = 0; token < tokens; ++token) {
         for (std::int32_t column = 0; column < input_rows; ++column) {
-            const std::uint16_t bits =
-                activation[static_cast<std::size_t>(token) * input_rows + column];
-            if ((bits & 0x7fffU) == 0U) { continue; }
-            by_column[static_cast<std::size_t>(column)].push_back(
-                {token, static_cast<double>(test::bf16_to_f32(bits))});
+            const auto input = activation[static_cast<std::size_t>(token) * input_rows + column];
+            const double value = [&] {
+                if constexpr (std::is_same_v<Scalar, std::uint16_t>) { return static_cast<double>(test::bf16_to_f32(input)); }
+                else { return static_cast<double>(input); }
+            }();
+            if (value == 0) { continue; }
+            by_column[static_cast<std::size_t>(column)].push_back({token, value});
         }
     }
     return by_column;
@@ -151,12 +158,15 @@ double silu_fp64(double value) {
     return value * exponential / (1.0 + exponential);
 }
 
+template <class Scalar>
 std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                                               const quantized_weight::PackedWeight& weight,
-                                              const std::vector<std::uint16_t>& activation,
-                                              std::int32_t tokens) {
+                                              const std::vector<Scalar>& activation,
+                                              std::int32_t tokens,
+                                              std::vector<double>* precision_bound = nullptr) {
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
+    if (precision_bound) { precision_bound->resize(output.size()); }
 
     const unsigned hardware_threads = std::max(1U, std::thread::hardware_concurrency());
     const std::int32_t thread_count =
@@ -171,9 +181,12 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
         workers.emplace_back([&, row_begin, row_end] {
             std::vector<double> gate(static_cast<std::size_t>(tokens));
             std::vector<double> up(static_cast<std::size_t>(tokens));
+            std::vector<double> gate_abs(tokens), up_abs(tokens);
             for (std::int32_t row = row_begin; row < row_end; ++row) {
                 std::fill(gate.begin(), gate.end(), 0.0);
                 std::fill(up.begin(), up.end(), 0.0);
+                std::fill(gate_abs.begin(), gate_abs.end(), 0.0);
+                std::fill(up_abs.begin(), up_abs.end(), 0.0);
                 const std::int32_t up_row = profile.output_rows + row;
                 for (std::int32_t column = 0; column < profile.input_rows; ++column) {
                     const double gate_weight =
@@ -184,12 +197,32 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                          active_by_column[static_cast<std::size_t>(column)]) {
                         gate[static_cast<std::size_t>(active.token)] += gate_weight * active.value;
                         up[static_cast<std::size_t>(active.token)] += up_weight * active.value;
+                        if (precision_bound) {
+                            gate_abs[active.token] += std::abs(gate_weight * active.value);
+                            up_abs[active.token] += std::abs(up_weight * active.value);
+                        }
                     }
                 }
                 for (std::int32_t token = 0; token < tokens; ++token) {
                     const double fused = silu_fp64(gate[static_cast<std::size_t>(token)]) *
                                          up[static_cast<std::size_t>(token)];
                     output[static_cast<std::size_t>(token) * profile.output_rows + row] = fused;
+                    if (precision_bound) {
+                        // Qualification profile: FP32 K16 partials and their scaled sum,
+                        // followed by BF16 gate/up materialization and BF16 final output.
+                        // Bound rounding from magnitudes, not rounded oracle intermediates.
+                        constexpr double u32 = 0x1p-24, ub = 1.0 / 256.0;
+                        const double steps = profile.input_rows / 16 + 20;
+                        const double gamma = steps * u32 / (1.0 - steps * u32);
+                        const double eg = gamma * gate_abs[token] * (1 + ub) + ub * std::abs(gate[token]);
+                        const double eu = gamma * up_abs[token] * (1 + ub) + ub * std::abs(up[token]);
+                        // |SiLU'| < 1.1 globally, including its negative non-monotonic region.
+                        const double product_error = 1.1 * eg * (std::abs(up[token]) + eu) +
+                            std::abs(silu_fp64(gate[token])) * eu;
+                        (*precision_bound)[static_cast<std::size_t>(token) * profile.output_rows + row] =
+                            product_error * (1 + ub) + ub * std::abs(fused) +
+                            32 * u32 * (std::abs(fused) + 1.0);
+                    }
                 }
             }
         });
@@ -289,9 +322,49 @@ int run_profile(std::string_view label, const Profile& profile,
     }
     quantized_weight::PackedWeight host_weight = quantized_weight::make_patterned_weight(
         profile.qtype, profile.gate_up_rows, profile.input_rows, profile.seed, weight_options);
-    const std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
+    std::vector<std::uint16_t> host_activation = make_activation(profile, maximum_tokens);
+    std::vector<std::uint16_t> norm_weights(profile.input_rows);
+    for (int i = 0; i < profile.input_rows; ++i) {
+        norm_weights[i] = test::f32_to_bf16(static_cast<float>(i % 23 - 11) / 8.0F);
+    }
+    if (profile.input_rmsnorm) {
+        std::fill(host_activation.end() - profile.input_rows, host_activation.end(), 0);
+    }
+    const auto represented_normalization = [&](const std::vector<std::uint16_t>& input) {
+        if (!profile.input_rmsnorm) { return input; }
+        std::vector<std::uint16_t> result(input.size());
+        for (int t = 0; t < maximum_tokens; ++t) {
+            double square_sum = 0;
+            for (int i = 0; i < profile.input_rows; ++i) {
+                const double x = test::bf16_to_f32(input[t * profile.input_rows + i]);
+                square_sum += x * x;
+            }
+            const double inv = 1.0 / std::sqrt(square_sum / profile.input_rows + static_cast<double>(1e-6F));
+            for (int i = 0; i < profile.input_rows; ++i) {
+                const auto index = t * profile.input_rows + i;
+                result[index] = test::f32_to_bf16(static_cast<float>(test::bf16_to_f32(input[index]) * inv *
+                    (1.0 + test::bf16_to_f32(norm_weights[i]))));
+            }
+        }
+        return result;
+    };
     const std::vector<double> reference =
-        linear_swiglu_oracle_fp64(profile, host_weight, host_activation, maximum_tokens);
+        linear_swiglu_oracle_fp64(profile, host_weight, represented_normalization(host_activation), maximum_tokens);
+    const auto codec_oracle = [&](const std::vector<std::uint16_t>& input, std::vector<double>& bound) {
+        const auto normalized = represented_normalization(input);
+        std::vector<float> values(normalized.size());
+        for (std::size_t i = 0; i < values.size(); ++i) { values[i] = test::bf16_to_f32(normalized[i]); }
+        const auto codec = test::fp8_activation_reference(values, profile.input_rows);
+        std::vector<double> decoded(values.size());
+        for (std::size_t i = 0; i < decoded.size(); ++i) {
+            decoded[i] = quantized_weight::detail::decode_e4m3fn(codec.codes[i]) *
+                         static_cast<double>(codec.scales[i / profile.input_rows]);
+        }
+        return linear_swiglu_oracle_fp64(profile, host_weight, decoded, maximum_tokens, &bound);
+    };
+    std::vector<double> codec_bound, negative_codec_bound;
+    const auto codec_reference = profile.input_rmsnorm ? codec_oracle(host_activation, codec_bound) : std::vector<double>{};
+    std::vector<double> negative_codec_reference;
     std::vector<std::uint16_t> negative_activation;
     std::vector<double> negative_reference;
     std::optional<DeviceContext> graph_context;
@@ -299,13 +372,17 @@ int run_profile(std::string_view label, const Profile& profile,
         negative_activation = host_activation;
         for (auto& bits : negative_activation) bits ^= 0x8000;
         negative_reference =
-            linear_swiglu_oracle_fp64(profile, host_weight, negative_activation, maximum_tokens);
+            linear_swiglu_oracle_fp64(profile, host_weight, represented_normalization(negative_activation), maximum_tokens);
+        if (profile.input_rmsnorm) { negative_codec_reference = codec_oracle(negative_activation, negative_codec_bound); }
         graph_context.emplace();
     }
 
     test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
     const Weight weight = host_weight.device_weight(device_weight.data());
+    test::GuardedDeviceBuffer device_norm(norm_weights.size() * sizeof(std::uint16_t));
+    device_norm.copy_from_host(norm_weights.data(), device_norm.bytes());
+    const Tensor norm(device_norm.data(), DType::BF16, {profile.input_rows});
 
     test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(host_activation.data(),
@@ -316,8 +393,10 @@ int run_profile(std::string_view label, const Profile& profile,
             ? ops::LinearPolicy::AllowA4
             : (profile.activation_compute == ActivationCompute::A8 ? ops::LinearPolicy::AllowA8
                                                                    : ops::LinearPolicy::A16Only);
-    const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
+    const std::size_t workspace_bytes = profile.input_rmsnorm
+        ? ops::rmsnorm_linear_swiglu_workspace_capacity_bytes(maximum_tokens)
+        : ops::linear_swiglu_workspace_capacity_bytes(
+            profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
 
     int failures        = 0;
@@ -330,7 +409,11 @@ int run_profile(std::string_view label, const Profile& profile,
         workspace.reset_peak();
         const cudaStream_t stream = replay ? graph_context->stream : nullptr;
         const auto launch         = [&] {
-            ops::linear_swiglu(x, weight, destination, policy, workspace, stream);
+            if (profile.input_rmsnorm) {
+                ops::rmsnorm_linear_swiglu(x, norm, 1e-6F, weight, destination, workspace, stream);
+            } else {
+                ops::linear_swiglu(x, weight, destination, policy, workspace, stream);
+            }
         };
         const std::string label_case =
             std::string(label) + " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
@@ -355,9 +438,10 @@ int run_profile(std::string_view label, const Profile& profile,
                 else
                     launch();
                 test::cuda_check(cudaStreamSynchronize(stream), "synchronize LinearSwiGLU");
-                const auto exact = ops::linear_swiglu_workspace_capacity_bytes(
-                    profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens,
-                    tokens);
+                const auto exact = profile.input_rmsnorm
+                    ? ops::rmsnorm_linear_swiglu_workspace_capacity_bytes(tokens)
+                    : ops::linear_swiglu_workspace_capacity_bytes(
+                        profile.qtype, profile.gate_up_rows, profile.input_rows, policy, tokens, tokens);
                 if (workspace.used() != 0 || workspace.peak_used() != exact) {
                     std::cerr << label_case << ": exact workspace query/execution mismatch\n";
                     ++failures;
@@ -366,6 +450,34 @@ int run_profile(std::string_view label, const Profile& profile,
                 const auto actual = read_bf16_output(output, elements);
                 failures +=
                     compare_output(label_case, actual, expected.data(), profile.activation_compute);
+                if (profile.input_rmsnorm) {
+                    const auto& codec = phase ? negative_codec_reference : codec_reference;
+                    const auto distortion = compute_reduction_stats(codec.data(), expected.data(), elements);
+                    const auto residual = compute_reduction_stats(actual.data(), codec.data(), elements);
+                    std::cout << label_case << " codec_rel_l2=" << distortion.relative_l2
+                              << " residual_rel_l2=" << residual.relative_l2 << '\n';
+                    const auto& bound = phase ? negative_codec_bound : codec_bound;
+                    for (std::size_t i = 0; i < elements; ++i) {
+                        if (!std::isfinite(actual[i]) || std::abs(actual[i] - codec[i]) > bound[i]) {
+                            std::cerr << label_case << ": independent codec residual exceeds precision bound at "
+                                      << i << " error=" << std::abs(actual[i] - codec[i]) << " bound=" << bound[i] << '\n';
+                            ++failures;
+                            break;
+                        }
+                    }
+                    if (tokens < 4) { continue; } // The separate LinearSwiGLU selects A16 here.
+                    test::GuardedDeviceBuffer normalized(static_cast<std::size_t>(profile.input_rows) * tokens * 2);
+                    test::GuardedDeviceBuffer composed(elements * 2);
+                    Tensor h(normalized.data(), DType::BF16, {profile.input_rows, tokens});
+                    Tensor control(composed.data(), DType::BF16, {profile.output_rows, tokens});
+                    ops::rmsnorm(x, norm, 1e-6F, true, h, stream);
+                    ops::linear_swiglu(h, weight, control, policy, workspace, stream);
+                    test::cuda_check(cudaStreamSynchronize(stream), "synchronize composed normalization control");
+                    if (actual != read_bf16_output(composed, elements)) {
+                        std::cerr << label_case << ": fused/composed normalization differs\n";
+                        ++failures;
+                    }
+                }
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                  input_bits.data(),
@@ -387,6 +499,11 @@ int run_profile(std::string_view label, const Profile& profile,
     const auto& final_input = graph_cases.empty() ? host_activation : negative_activation;
     failures += device_activation.verify_guards(std::string(label) + " activation");
     failures += device_weight.verify_guards(std::string(label) + " weight");
+    if (profile.input_rmsnorm) {
+        failures += device_norm.verify_guards(std::string(label) + " norm");
+        failures += verify_unchanged(std::string(label) + " norm", device_norm,
+                                    norm_weights.data(), device_norm.bytes());
+    }
     failures += verify_unchanged(std::string(label) + " activation", device_activation,
                                  final_input.data(), final_input.size() * sizeof(std::uint16_t));
     failures += verify_unchanged(std::string(label) + " weight", device_weight,

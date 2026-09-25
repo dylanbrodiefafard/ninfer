@@ -18,6 +18,111 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash A8 fusion qualification (2026-09-24)
+
+Two measured fusions are retained over the preceding W4-enabled A8/A8 implementation:
+
+- **GDN record, W4–6/C1–4:** A8 projection feeds convolution/record publication through a
+  CTA-local FP32 tile. The tile aliases weight staging only after the final K-loop barrier;
+  convolution reads it after a further CTA barrier. FP32 current projections and BF16 saved
+  history are preserved. A4 and wider A8 record widths retain their existing global staging.
+- **Verification post-mixer:** `rmsnorm_linear_swiglu` combines unit-offset RMSNorm and row-wise
+  A8 quantization before the existing gate/up/SwiGLU kernel. The normalized input still rounds
+  to BF16 in registers. The down projection remains separate. Family planning owns normalized
+  scratch; the execution leaf selects the fused Op or the ordinary normalization composition.
+
+### Attribution and public-Op results
+
+RTX5090/SM120a, CUDA13.1, driver580.173.02. Nsight Systems traces of Engine `tg128`, fixed k4,
+NVFP4 KV at C1/C4 put the separate GDN convolution kernel at0.7%/0.6% of GPU kernel time.
+The 5120-channel quantizer alone accounts for1.1%/0.9%; wide RMSNorm is another2.7%/2.1%,
+including uses beyond the selected post-mixer fusion. These traces support modest opportunity,
+not a large theoretical Engine multiplier.
+
+The GDN fusion removes an FP32 write/read of `2*T*10240*4` bytes and one launch. A first
+candidate used a separate shared-memory tile and regressed W5/C4 to53.25µs: NCU showed
+52KiB of static shared memory, restricting residency to one CTA/SM.
+Reusing the completed weight staging removed that extra shared-memory allocation and retained
+the winner. No weight re-encoding or K-reduction change was introduced.
+
+Cold-cache public-Op medians,3 warmups/50 samples:
+
+| Complete operation | W/C or T | Before µs | Fused µs |
+|---|---|---:|---:|
+| GDN projection + convolution/record | W5/C1 | 40.960 | 38.912 |
+| GDN projection + convolution/record | W5/C4 | 49.152 | 43.008 |
+| GDN projection + convolution/record | W6/C4 | 47.104 | 43.008 |
+| RMSNorm + A8 gate/up/SwiGLU | T5 | 79.872 | 77.024 |
+| RMSNorm + A8 gate/up/SwiGLU | T20 | 92.160 | 88.064 |
+| RMSNorm + A8 gate/up/SwiGLU | T24 | 92.160 | 89.344 |
+
+GDN timings use captured full-Op graph replay; normalized SwiGLU uses its public composed/fused
+sequence benchmark. W5/C1 GDN transient capacity falls230420→25620bytes, and W5/C4
+921680→102480bytes. The adaptive C4 `[2,6]` capacity remains327680bytes because W2's A16
+route needs more than fused W6's122976bytes; `[3,6]` excludes that high-water mark.
+These are Op scratch sizes, not total Engine memory savings.
+
+### Numerical preservation
+
+The GDN independent projection/convolution/history oracle passes chain/tree, ragged inputs,
+every-prefix continuation and interval-capacity execution. The normalized SwiGLU check evaluates
+FP64 normalization, the explicit normalized BF16 cast, decoded signed weights and full SwiGLU
+formula. Its canonical A8 criterion remains unchanged. Independent FP8 encoding/dequantization
+additionally separates codec distortion from arithmetic residual. The residual criterion uses
+per-output conditioning/rounding bounds for the implementation's FP32 partials, BF16 gate/up
+materialization and BF16 result; it does not round private intermediates in the oracle. Reusing
+the old empirical A16 relative-L2 limit was inappropriate for these normalized fixtures: some
+legal compound BF16 rounding residuals exceed0.0033. The supplementary bound explicitly
+accounts for those stages and the global SiLU derivative bound1.1.
+
+Fused/composed normalized outputs match exactly in tested T4–32 fixtures, including changed-input
+graph replay. The standalone Op also passes its independent oracle at T1/T3, where the separate
+LinearSwiGLU's A16 fallback is not a same-profile equality control. Production short verification
+widths remain unchanged.
+
+All18 before/GDN-only/both × W4/W5/W6 × C1/C4 score controls match exactly over256 unique
+tokens. More importantly, **all32739 WikiText and8545 code-reference token NLLs are exactly
+unchanged** between the previous implementation and both fusions. PPL remains5.1781168165 /
+1.9363044071. These are zero-change fusion comparisons against A8/A8, not new A16-relative
+quality measurements or generated-task accuracy claims.
+
+### Engine speed
+
+Same `long_decode_aime26_15` fixture,8192 completion tokens/request, fixed seeds, p-lessT2,
+thinking enabled, optimized proposal head, graphs, NVFP4 KV and prefix reuse off. Context32768,
+KV32768 at C1 and65536 at C4. Rates are steady full-batch aggregate decode tok/s.
+
+| Mode / candidate | C | Before | After | Gain | Paired waves |
+|---|---:|---:|---:|---:|---:|
+| Fixed k4 / GDN alone | 1 | 151.75 | 152.41 | +0.44% | 3 |
+| Fixed k4 / both | 1 | 151.75 | 153.66 | **+1.26%** | 3 |
+| Fixed k4 / GDN alone | 4 | 424.72 | 428.69 | +0.94% | 3 |
+| Fixed k4 / both | 4 | 424.72 | 430.44 | **+1.35%** | 3 |
+| Adaptive max5 / both | 1 | 154.25 | 156.82 | **+1.67%** | 2 |
+| Adaptive max5 / both | 4 | 426.97 | 433.36 | **+1.50%** | 2 |
+
+All26 cells/65 requests completed with zero recovery attempts/cycle exclusions. Fixed-k4 response
+hashes match across all profiles and waves. Adaptive C1 hashes match; adaptive C4 hashes differ,
+so that comparison includes the timed adaptive policy's trajectory and is not a fixed-trajectory
+kernel ratio. GDN-only C1 is a small effect: per-wave gains are0.03%,0.66%,0.62%. Both-fusion
+fixed-k4 gains are positive in all waves (C1:0.71–1.77%; C4:1.28–1.44%). Whole-wave means
+for both improve53.801→53.133s at fixed-k4/C1 and78.478→77.443s at fixed-k4/C4, separately
+from the steady-rate metric. These are workload-specific measurements, not population estimates.
+
+Local evidence: `profiles/bench/dflash-a8-fusion/` contains paired per-token scores,
+`quality-report.json`, `speed-report.json`, command records and raw server logs;
+`profiles/nsys/a8-fusion-before-c{1,4}` holds the scoped attribution traces.
+
+Final validation: `NINFER_DEV_CONTAINER=ninfer-builder-dylan NINFER_DEV_JOBS=12
+./scripts/run-unit-tests.sh` passed **105 tests, 2 artifact-dependent skips, 0 failures**
+(400.03s test time). The real DFlash Engine test passed fixed/adaptive graph/eager concurrency,
+Vision/MRoPE, terminal delivery and RAM continuation; the DFlash disk restore/continuation
+case passed. The reported server configuration—context260000, automatic KV, C4, adaptive
+max5, NVFP4 KV, optimized head, RAM32768MiB/disk100000MiB—also reached listening locally
+with both fusions (KV553152tokens, graph usage94MiB/240MiB allowance), using a separate test
+disk-cache directory. Read-only review closed with no remaining material findings after the
+codec-residual and non-monotonic workspace-interval checks were added. Whitespace checks pass.
+
 ## DFlash W4 A8 and residual-projection tuning (2026-09-24)
 
 The selected A8/A8 verification policy now covers **k=3/4/5 drafts (W4/W5/W6)**,

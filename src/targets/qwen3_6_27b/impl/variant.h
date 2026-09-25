@@ -97,7 +97,9 @@ struct Variant {
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace, cudaStream_t stream,
                                             std::int32_t route_tokens = 0);
-    static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+    // Normalize the raw residual for the post-mixer; hidden is caller-owned scratch.
+    static void post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
+                           const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

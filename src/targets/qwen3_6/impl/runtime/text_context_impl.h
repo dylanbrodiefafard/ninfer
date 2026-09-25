@@ -1047,9 +1047,7 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
-    ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
-
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s,
+    Variant::post_mixer(*post_norm, kCfg.rms_eps, h, *m.payload, x, ph, work_, s,
                         packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 }
 

@@ -22,6 +22,9 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                       WorkspaceArena& workspace, cudaStream_t stream);
 void nvfp4_linear_swiglu_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                       WorkspaceArena& workspace, cudaStream_t stream);
+void nvfp4_rmsnorm_linear_swiglu_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                      const Weight& weight, Tensor& out,
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,

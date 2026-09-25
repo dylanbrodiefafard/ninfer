@@ -410,6 +410,13 @@ One propose block:
    private FP32 projection. W=6 B=2/4 uses request pairs, while B=3 remains request-indexed.
    Other B=1 widths use fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT
    CTAs. The selected A8/A8 quality/performance tradeoff is recorded in the performance reference.
+   A8 W4–6 fuses projection and convolution/record publication using a CTA-local FP32 tile;
+   the tile reuses completed weight staging after the final K-loop barrier. Wider public record
+   widths retain global FP32 staging. Workspace intervals containing W2 retain its larger A16 scratch.
+   The family passes post-normalization parameters and caller-owned normalized scratch to the
+   post-mixer leaf. Eligible NVFP4/A8 verification uses `rmsnorm_linear_swiglu`: RMSNorm's BF16
+   rounding is preserved in registers before FP8 quantization and the gate/up projection.
+   The down projection remains separate. Other profiles materialize the ordinary RMSNorm result.
    Packed GDN recurrence uses one
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
    accepts the matching prefix.

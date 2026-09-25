@@ -7,6 +7,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rmsnorm_linear_swiglu.h"
 #include "ninfer/ops/mtp_fc.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
@@ -502,11 +503,27 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
     }
 }
 
-void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
+                         const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
                          std::int32_t route_tokens) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    const int width = route_tokens > 0 ? route_tokens : hidden.ne[1];
+    const bool fused_norm = weights.gate_up.qtype == QType::NVFP4 && hidden.ne[1] <= 24 &&
+        text_policy(weights.gate_up, phase, width) == ops::LinearPolicy::AllowA8 && width >= 4 &&
+        (!split_verify_panels(phase, route_tokens, hidden.ne[1]) ||
+         aggregate_verify_extent(phase, route_tokens, hidden.ne[1]));
+    if (!fused_norm) { ops::rmsnorm(residual, norm_weight, norm_eps, true, hidden, stream); }
+    const auto swiglu = [&](const Tensor& normalized, Tensor& out, int local_width) {
+        if (fused_norm) {
+            ops::rmsnorm_linear_swiglu(residual, norm_weight, norm_eps, weights.gate_up,
+                                      out, workspace, stream);
+        } else {
+            ops::linear_swiglu(normalized, weights.gate_up, out,
+                                text_policy(weights.gate_up, phase, local_width), workspace, stream);
+        }
+    };
     if (split_verify_panels(phase, route_tokens, hidden.ne[1])) {
         // The aggregate residual schedules were qualified for the existing
         // formats, not FP8. Keep FP8 at the C=1 panel width to preserve its
@@ -516,9 +533,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         const bool aggregate_swiglu = weights.gate_up.qtype == QType::NVFP4 &&
                                       aggregate_verify_extent(phase, route_tokens, hidden.ne[1]);
         if (aggregate_swiglu) {
-            ops::linear_swiglu(hidden, weights.gate_up, activation,
-                               text_policy(weights.gate_up, phase, route_tokens), workspace,
-                               stream);
+            swiglu(hidden, activation, route_tokens);
             if (aggregate_down) {
                 ops::linear_add(activation, weights.down, residual,
                                 text_policy(weights.down, phase, route_tokens), workspace, stream);
@@ -536,9 +551,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         }
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor activation_panel = activation.slice(1, offset, route_tokens);
-            ops::linear_swiglu(hidden.slice(1, offset, route_tokens), weights.gate_up,
-                               activation_panel, text_policy(weights.gate_up, phase, route_tokens),
-                               workspace, stream);
+            swiglu(hidden.slice(1, offset, route_tokens), activation_panel, route_tokens);
             if (!aggregate_down) {
                 Tensor residual_panel = residual.slice(1, offset, route_tokens);
                 ops::linear_add(activation_panel, weights.down, residual_panel,
@@ -551,8 +564,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         }
         return;
     }
-    ops::linear_swiglu(hidden, weights.gate_up, activation,
-                       text_policy(weights.gate_up, phase, hidden.ne[1]), workspace, stream);
+    swiglu(hidden, activation, hidden.ne[1]);
     ops::linear_add(activation, weights.down, residual,
                     residual_packed_policy(weights.down, phase, route_tokens, hidden.ne[1]),
                     workspace, stream);

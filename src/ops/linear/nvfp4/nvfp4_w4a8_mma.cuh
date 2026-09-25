@@ -24,9 +24,23 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
     constexpr int KT = Geometry::kInputRows / BK;
     constexpr int OS = BN + 8;
-    __shared__ Nvfp4W4a4SharedStorage<Schedule> weights;
+    constexpr bool fp32_tile = requires(Output o, float* tile) {
+        o.template store_tile<Schedule>(tile, 0, 0);
+    };
+    // Projection staging is dead after the final K-loop barrier. Reuse it for
+    // the FP32 convolution tile instead of reducing residency with another tile.
+    union Staging {
+        Nvfp4W4a4SharedStorage<Schedule> weights;
+        float tile[BM * OS];
+    };
+    __shared__ Staging staging;
+    auto& weights = staging.weights;
     __shared__ __align__(16) std::uint8_t inputs[S][BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 result[BM * OS];
+    __shared__ __align__(16) __nv_bfloat16 bf16_result[BM * OS];
+    auto* result = [&] {
+        if constexpr (fp32_tile) { return staging.tile; }
+        else { return bf16_result; }
+    }();
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / Schedule::kWarpsN, wn = warp % Schedule::kWarpsN;
     const int token_begin = blockIdx.y * BM;
@@ -113,7 +127,9 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
                 if (token < tokens) {
                     value = epilogue.apply(parent_row, token, accum[m][n][j] * (activation.scales[token] * inverse_weight_scale));
                 }
-                if constexpr (fp32) {
+                if constexpr (fp32_tile) {
+                    result[local_token * OS + local_row] = value;
+                } else if constexpr (fp32) {
                     if (token < tokens) { output.store_fp32(parent_row, token, value); }
                 } else {
                     result[local_token * OS + local_row] = __float2bfloat16_rn(value);
@@ -121,7 +137,10 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
             }
         }
     }
-    if constexpr (!fp32) {
+    if constexpr (fp32_tile) {
+        __syncthreads();
+        output.template store_tile<Schedule>(result, row_begin, tokens);
+    } else if constexpr (!fp32) {
         __syncthreads();
         constexpr int stored_rows = PairRows ? BN / 2 : BN;
         for (int task = tid; task < BM * stored_rows / 8; task += Schedule::kThreads) {

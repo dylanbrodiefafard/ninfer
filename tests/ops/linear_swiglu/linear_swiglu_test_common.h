@@ -21,6 +21,7 @@ struct Profile {
     std::int32_t output_rows;
     std::uint32_t seed;
     ActivationCompute activation_compute;
+    bool input_rmsnorm = false;
 };
 
 int run_profile(std::string_view label, const Profile& profile,

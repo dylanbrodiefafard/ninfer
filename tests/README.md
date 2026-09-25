@@ -78,6 +78,15 @@ the legacy T1 outputs exactly; C3 retains the request-indexed route. The optiona
 `NINFER_GDN_REAL_ACTIVATIONS` input supplies represented real-model activations while the
 fixture weights remain patterned test weights.
 
+`rmsnorm_linear_swiglu` is qualified in the NVFP4 SwiGLU executable against an independent
+FP64 normalization/projection/nonlinearity oracle, retaining the explicit normalized BF16
+boundary. Its canonical A8 criterion is supplemented by independently encoded/decoded FP8
+inputs and a per-output arithmetic bound: FP32 accumulation, BF16 gate/up materialization,
+SiLU conditioning and final BF16 rounding. The oracle itself does not round private projection
+intermediates. Fused/composed output equality is supplementary, including changed-input graph
+replay and zero rows. GDN record cases execute the A8 C4 `[2,6]` and `[3,6]` workspace intervals
+to protect the W2 high-water mark after W4–6 projection/convolution fusion.
+
 ## Build and run
 
 One command for the full C++ unit suite (GPU builder container, excluding opt-in

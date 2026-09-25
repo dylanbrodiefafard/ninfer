@@ -82,6 +82,14 @@ std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::
     }
     (void)nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
     if (nvfp4_gdn_record_uses_quantized(policy, max_tokens)) {
+        if (policy == LinearPolicy::AllowA8 && max_tokens <= 6) {
+            const auto quantized = fp8_a8_workspace_capacity_bytes(max_tokens * batch_size, 5120);
+            WorkspaceLayoutBuilder short_a16;
+            if (min_tokens <= 2 && nvfp4_gdn_record_uses_grouped_replay(2, batch_size)) {
+                (void)short_a16.alloc(DType::FP32, {kNvfp4RecordChannels, 2, batch_size}, 256);
+            }
+            return std::max(quantized, short_a16.peak_bytes(1));
+        }
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
         if (policy == LinearPolicy::AllowA8) {
