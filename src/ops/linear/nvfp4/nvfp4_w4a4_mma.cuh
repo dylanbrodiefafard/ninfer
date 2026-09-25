@@ -132,10 +132,12 @@ stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
     }
 }
 
-template <class Geometry, class Schedule, class RowPolicy, Cache WeightCache = Cache::cg>
+// Storage supplies b_codes/b_scales with the Nvfp4W4a4SharedStorage weight layout.
+template <class Geometry, class Schedule, class RowPolicy, Cache WeightCache = Cache::cg,
+          class Storage>
 __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __restrict__ codes,
                                                         const std::uint8_t* __restrict__ scales,
-                                                        Nvfp4W4a4SharedStorage<Schedule>& shared,
+                                                        Storage& shared,
                                                         int stage, int k_tile, int row_begin,
                                                         RowPolicy row_policy) {
     constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
