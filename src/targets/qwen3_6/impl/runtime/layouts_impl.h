@@ -314,7 +314,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                std::int32_t batch_size, std::int32_t min_width,
-                               std::int32_t max_width) {
+                               std::int32_t max_width, bool tree_verify) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
@@ -333,10 +333,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::ReplayRecord) {
             // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.
-            // Chain and tree reserve one T=1 overlay scratch pool; the fused overlay also
-            // publishes replay records.
-            scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
-                                TextConfig::gdn_value_heads, batch_size, max_width));
+            // Tree verify reserves the T=1 overlay scratch pool that holds every column state;
+            // chain verify carries the state in registers and needs no scratch.
+            if (tree_verify) {
+                scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
+                                    TextConfig::gdn_value_heads, batch_size, max_width));
+            }
             if (plan.adaptive_draft) {
                 (void)layout.alloc(DType::BF16,
                                    {TextConfig::convolution_dim, max_width, batch_size});
@@ -372,7 +374,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  bool tree_verify = false) {
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope,
                         tree_verify);
-        gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
+        gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width, tree_verify);
         post_mixer_stage(layout, first, last, phase);
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {

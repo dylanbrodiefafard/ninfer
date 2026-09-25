@@ -224,13 +224,14 @@ template <class Geometry, class Epilogue, class Output,
 void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Fp8A8Workspace workspace,
                            Epilogue epilogue, Output output, cudaStream_t stream, RowPolicy rows = {}) {
     // N=5120 with N64 launches only 80 CTAs on 170 SMs. Partition output rows without splitting
-    // K or replaying weights, and deepen the pipeline instead: M16 N=5120 streams K512 over three
-    // stages, other M16 and M32 N=5120 schedules stream K256 over three. Wider projections place
-    // weight rows on MMA M (SwapAB); M32 keeps two stages. Every schedule keeps ascending K16 FMAs.
+    // K or replaying weights, and deepen the pipeline instead: N=5120 streams K512 over three
+    // stages (M16 on N16, M32 on N32); other M16 schedules stream K256 over three. Wider
+    // projections place weight rows on MMA M (SwapAB); M32 keeps two stages. Every schedule keeps
+    // ascending K16 FMAs.
     const auto launch = [&]<int BM>() {
         constexpr bool narrow = Geometry::kOutputRows == 5120;
         constexpr int BN = narrow ? (BM == 16 ? 16 : 32) : 64;
-        constexpr int BK = narrow && BM == 16 ? 512 : 256;
+        constexpr int BK = narrow ? 512 : 256;
         constexpr int S  = narrow || BM == 16 ? 3 : 2;
         using Schedule = Nvfp4W4a4MmaSchedule<BM, BN, BK, 1, BN == 16 ? 2 : 4, S, 1>;
         const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, (tokens + BM - 1) / BM);
