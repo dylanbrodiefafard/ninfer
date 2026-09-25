@@ -429,6 +429,18 @@ cmake --build build --parallel --target ninfer_prepare_masked_block_bench
 
 Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32 output writes.
 
+## NVFP4 normalized LinearSwiGLU Op benchmark
+
+`ninfer_nvfp4_linear_swiglu_bench` accepts `--policy a16|a4|a8`.
+`--rmsnorm` times the composed RMSNorm→LinearSwiGLU sequence; `--rmsnorm-fused`
+times the `rmsnorm_linear_swiglu` public Op and requires `--policy a8` without panel splitting.
+Both include normalization, quantization and projection in the timed region:
+
+```bash
+./build/bench/ninfer_nvfp4_linear_swiglu_bench --policy a8 --rmsnorm --t-sweep 4,5,6,16,20,24
+./build/bench/ninfer_nvfp4_linear_swiglu_bench --policy a8 --rmsnorm-fused --t-sweep 4,5,6,16,20,24
+```
+
 ## W8 LinearSwiGLU Op benchmark
 
 `ninfer_w8_linear_swiglu_bench` measures the registered W8 `[12288,2048] -> [6144,T]`

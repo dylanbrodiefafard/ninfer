@@ -1,6 +1,8 @@
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rmsnorm_linear_swiglu.h"
 
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -8,6 +10,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
 #include <cstdint>
+#include <cmath>
 #include <stdexcept>
 
 namespace ninfer::ops {
@@ -143,6 +146,27 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream) {
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
+}
+
+std::size_t rmsnorm_linear_swiglu_workspace_capacity_bytes(std::int32_t tokens) {
+    return detail::fp8_a8_workspace_capacity_bytes(tokens, 5120);
+}
+
+void rmsnorm_linear_swiglu(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& gate_up, Tensor& out, WorkspaceArena& workspace,
+                          cudaStream_t stream) {
+    (void)rmsnorm_linear_swiglu_workspace_capacity_bytes(x.ne[1]);
+    if (x.dtype != DType::BF16 || norm_weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
+        x.ne[0] != 5120 || x.ne[2] != 1 || x.ne[3] != 1 || norm_weight.ne[0] != 5120 ||
+        norm_weight.numel() != 5120 || out.ne[0] != 17408 || out.ne[1] != x.ne[1] ||
+        out.ne[2] != 1 || out.ne[3] != 1 || !x.is_contiguous() || !norm_weight.is_contiguous() ||
+        !out.is_contiguous() || !aligned_to(x.data, 16) || !aligned_to(out.data, 16) ||
+        !aligned_to(norm_weight.data, 4) || gate_up.qtype != QType::NVFP4 ||
+        gate_up.n != 34816 || gate_up.k != 5120 || !(eps > 0) || !std::isfinite(eps)) {
+        throw std::invalid_argument("rmsnorm_linear_swiglu: invalid normalized NVFP4/A8 geometry");
+    }
+    (void)detail::validate_nvfp4_weight(gate_up, "rmsnorm_linear_swiglu");
+    detail::nvfp4_rmsnorm_linear_swiglu_launch(x, norm_weight, eps, gate_up, out, workspace, stream);
 }
 
 } // namespace ninfer::ops

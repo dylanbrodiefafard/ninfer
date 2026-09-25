@@ -244,9 +244,11 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               weights.dt_bias, workspace, hidden, g, beta, stream);
 }
 
-void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
+                         const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream,
-                         std::int32_t) {
+                          std::int32_t) {
+    ops::rmsnorm(residual, norm_weight, norm_eps, true, hidden, stream);
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 

@@ -6,6 +6,7 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
@@ -123,11 +124,12 @@ __launch_bounds__(Block) __global__
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool QuantizeFp8 = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                   std::int64_t rows, float eps) {
+                                   std::int64_t rows, float eps,
+                                   std::uint8_t* codes = nullptr, float* scales = nullptr) {
     static_assert(Block % kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
@@ -165,10 +167,42 @@ __launch_bounds__(Block) __global__
             if constexpr (Epilogue == RmsEpilogue::Gated) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
-            out[row_base + pair] =
+            const auto normalized =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+            if constexpr (QuantizeFp8) { values[k] = normalized; }
+            else { out[row_base + pair] = normalized; }
         }
+    }
+    if constexpr (QuantizeFp8) {
+        float maximum = 0.0F;
+#pragma unroll
+        for (int k = 0; k < MaxPairsPerThread; ++k) {
+            if (k < pairs_per_thread) {
+                const float2 value = __bfloat1622float2(values[k]);
+                maximum = fmaxf(maximum, fmaxf(fabsf(value.x), fabsf(value.y)));
+            }
+        }
+        maximum = warp_max(maximum);
+        const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
+        if (lane == 0) { warp_sums[warp] = maximum; }
+        __syncthreads();
+        if (warp == 0) {
+            maximum = warp_max(lane < Block / 32 ? warp_sums[lane] : 0.0F);
+            if (lane == 0) { inv_shared = maximum > 0.0F ? maximum / 448.0F : 0.0F; }
+        }
+        __syncthreads();
+        const float scale = inv_shared, inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+#pragma unroll
+        for (int k = 0; k < MaxPairsPerThread; ++k) {
+            if (k < pairs_per_thread) {
+                const float2 value = __bfloat1622float2(values[k]);
+                reinterpret_cast<std::uint16_t*>(codes)[row_base + threadIdx.x + k * Block] =
+                    __nv_cvt_float2_to_fp8x2(make_float2(value.x * inverse, value.y * inverse),
+                                            __NV_SATFINITE, __NV_E4M3);
+            }
+        }
+        if (threadIdx.x == 0) { scales[row] = scale; }
     }
 }
 

@@ -187,8 +187,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. Under A16,
  * B=1 fused T=1-reduction, B=1 W=4 fused SmallT, and B=2..4 request-indexed SmallT routes require
  * no storage. B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 grouped replay use a private FP32 projection.
- * AllowA4 W=5..16 or AllowA8 W=4..16 uses aggregate quantized projection with private FP32 q/k/value storage plus
- * activation codes/scales. AllowA4 W=2..4 and AllowA8 W=2..3 retain the A16 profile.
+ * AllowA8 W=4..6 fuses projection/convolution through a CTA-local FP32 tile and needs only
+ * caller-owned activation codes/scales. AllowA4 W=5..16 and AllowA8 W=7..16 also need private
+ * FP32 q/k/value storage. AllowA4 W=2..4 and AllowA8 W=2..3 retain the A16 profile.
+ * An interval containing W=2 includes its A16 scratch even when its A8 endpoint uses less.
  * conv_record is caller-owned.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -214,8 +216,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * checkpoint history, every other valid token j loads the width-three history saved after its
  * parent, and the kernel saves the post-convolution history for j so siblings can share a parent.
  * Under NVFP4 AllowA4 W=5..16 or AllowA8 W=4..16, the Op aggregates B requests in the respective A4/A8 MMA family and
- * writes FP32 current projections for convolution, without a BF16 intermediate. The
- * A8 uses row-scaled E4M3 activations and separately scaled K16 partials without requantizing
+ * supplies FP32 current projections to convolution, without a BF16 intermediate. A8 W=4..6
+ * keeps those projections in a CTA-local tile and fuses convolution/record publication;
+ * other quantized widths use private FP32 storage. A8 uses row-scaled E4M3 activations and
+ * separately scaled K16 partials without requantizing
  * weights. The A16 profile (including AllowA4 W=2..4 and AllowA8 W=2..3) uses the following routes:
  * B=1 W=4 uses one fused same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..4
  * W=2/5 profiles use one grouped SmallT weight pass with a private FP32 projection, including one

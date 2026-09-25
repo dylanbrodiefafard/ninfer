@@ -285,6 +285,10 @@ without introducing a BF16 current-projection intermediate. Convolution consumes
 projection and BF16 three-tap history; saved records/history remain BF16. A8 uses row-scaled
 E4M3 activations, exact expansion of the stored E2M1 codes and separately scaled K16 partials.
 It neither changes the artifact nor requantizes its weights.
+A8 W4–6 fuses projection with convolution and record publication through a CTA-local FP32
+tile; it needs only activation-quantization workspace. Wider A8 and A4 record widths retain
+the global FP32 intermediate. Capacity queries over an interval include W2's A16 scratch
+when present, even if the upper fused width requires less storage.
 Under A16, B=1 W=4 uses one fused SmallT pass; B=1 W=5/6 uses a grouped pass and separate
 FP32 convolution. B=2..4 W=2/5 groups requests, including one W5/C3 group. W6/C2 and C4 use
 pairs; W6/C3 stays request-indexed. Other B=1 widths use fused T1 GEMV+FP32 conv, and other
@@ -305,6 +309,8 @@ Qualified NVFP4 attention-input, residual and MLP routes aggregate through W6; B
 attention-input/residual aggregation stays at W5. Precision is pinned by request-local width,
 not by aggregate T: W2–3 stays A16, and the selected default uses A8 for both ordinary and
 GDN verification projections at W4/W5/W6. Prefill and ordinary decode retain their text policy.
+The eligible verification post-mixer fuses RMSNorm and A8 quantization before gate/up/SwiGLU,
+preserving the BF16 normalized-input rounding boundary. The down projection stays separate.
 The quality/default decision is recorded in the performance reference. A16 residual T20
 retains the T5 panel reduction profile.
 Target GQA stays `[D, heads, W, B]`. SmallT uses one batched launch with request-indexed partial
