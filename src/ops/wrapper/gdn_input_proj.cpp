@@ -664,7 +664,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                   conv_record, query, key, value, z, workspace, parent_index);
         require_record_parent_index(parent_index, geometry);
 
-        // AllowA4/AllowA8 W>=5 aggregate projection with FP32 convolution input.
+        // AllowA4 W>=5 and AllowA8 W>=2 aggregate projection with FP32 convolution input.
         // A16: B=1 W=4 uses one fused SmallT pass. B=1 W=5/6 and
         // B>1 W=2/5 and B=2/4 W=6 replay a grouped SmallT weight load (including
         // a direct W=5 C=3 group), then consume the private FP32 projection without

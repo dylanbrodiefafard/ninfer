@@ -725,8 +725,8 @@ their single-parent BF16 weights through `attn_input_proj` for the six early
 output layer 4.
 
 All NVFP4 Text parents and BF16 exceptions described above are bound and executable. Prefill and
-ordinary decode pass `AllowA4` for NVFP4 weights. Speculative target verification selects from
-request-local width: W2–3 retains A16; eligible W≥4 ordinary and GDN projections use `AllowA8`.
+ordinary decode pass `AllowA4` for NVFP4 weights. Speculative target verification passes `AllowA8`
+to eligible ordinary and GDN projections at every verification width.
 The BF16 exceptions retain `A16Only`. Each semantic Op resolves its qualified route from the
 exact geometry and T. MTP and Vision use
 their registered storage and execution paths. With all startup features enabled, 1054 tensors and six

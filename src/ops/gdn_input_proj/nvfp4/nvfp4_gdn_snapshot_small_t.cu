@@ -335,7 +335,7 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
 
 template <int Width, bool Tree>
 struct A8RecordOutput {
-    static_assert(Width >= 4 && Width <= 6);
+    static_assert(Width >= kNvfp4FirstA8 && Width <= 6);
     // C<=4 and W<=6 fit the launcher's single M16/M32 tile. Every request's
     // temporal columns are present here; wider public widths retain global staging.
     Nvfp4GdnConvOutput<Width, RecordColumnPublish, Tree> output;
@@ -394,14 +394,20 @@ void launch_quantized_record_exact(const Tensor& x, const Weight& weight, const 
     CUDA_CHECK(cudaGetLastError());
 }
 
+constexpr int kFirstA4RecordWidth = 5;
+constexpr int kLastQuantizedRecordWidth = 16;
+constexpr std::size_t kA4RecordWidths = kLastQuantizedRecordWidth - kFirstA4RecordWidth + 1;
+constexpr std::size_t kA8RecordWidths = kLastQuantizedRecordWidth - kNvfp4FirstA8 + 1;
+
 template <bool A8, std::size_t... Offsets>
 constexpr auto make_quantized_record_launchers(std::index_sequence<Offsets...>) {
+    constexpr int first = A8 ? kNvfp4FirstA8 : kFirstA4RecordWidth;
     return std::array<RecordLaunch, sizeof...(Offsets) * 2>{
-        &launch_quantized_record_exact<(A8 ? 4 : 5) + static_cast<int>(Offsets), false, A8>...,
-        &launch_quantized_record_exact<(A8 ? 4 : 5) + static_cast<int>(Offsets), true, A8>...};
+        &launch_quantized_record_exact<first + static_cast<int>(Offsets), false, A8>...,
+        &launch_quantized_record_exact<first + static_cast<int>(Offsets), true, A8>...};
 }
-constexpr auto kA4RecordLaunchers = make_quantized_record_launchers<false>(std::make_index_sequence<12>{});
-constexpr auto kA8RecordLaunchers = make_quantized_record_launchers<true>(std::make_index_sequence<13>{});
+constexpr auto kA4RecordLaunchers = make_quantized_record_launchers<false>(std::make_index_sequence<kA4RecordWidths>{});
+constexpr auto kA8RecordLaunchers = make_quantized_record_launchers<true>(std::make_index_sequence<kA8RecordWidths>{});
 
 template <std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
@@ -428,8 +434,8 @@ void nvfp4_gdn_record_quantized_launch(const Tensor& x, const Weight& weight,
                                Tensor& z, LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
                                const std::int32_t* parent_index) {
     const auto launch = policy == LinearPolicy::AllowA8
-        ? kA8RecordLaunchers[static_cast<std::size_t>(x.ne[1] - 4 + (parent_index ? 13 : 0))]
-        : kA4RecordLaunchers[static_cast<std::size_t>(x.ne[1] - 5 + (parent_index ? 12 : 0))];
+        ? kA8RecordLaunchers[static_cast<std::size_t>(x.ne[1] - kNvfp4FirstA8) + (parent_index ? kA8RecordWidths : 0)]
+        : kA4RecordLaunchers[static_cast<std::size_t>(x.ne[1] - kFirstA4RecordWidth) + (parent_index ? kA4RecordWidths : 0)];
     launch(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                               conv_record, query, key, value, z, workspace, parent_index, stream);
 }

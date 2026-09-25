@@ -410,9 +410,9 @@ One propose block:
    private FP32 projection. W=6 B=2/4 uses request pairs, while B=3 remains request-indexed.
    Other B=1 widths use fused T=1 GEMV+FP32 conv; other B>1 widths use request-indexed SmallT
    CTAs. The selected A8/A8 quality/performance tradeoff is recorded in the performance reference.
-   A8 W4–6 fuses projection and convolution/record publication using a CTA-local FP32 tile;
+   A8 W2–6 fuses projection and convolution/record publication using a CTA-local FP32 tile;
    the tile reuses completed weight staging after the final K-loop barrier. Wider public record
-   widths retain global FP32 staging. Workspace intervals containing W2 retain its larger A16 scratch.
+   widths retain global FP32 staging.
    The family passes post-normalization parameters and caller-owned normalized scratch to the
    post-mixer leaf. Eligible NVFP4/A8 verification uses `rmsnorm_linear_swiglu`: RMSNorm's BF16
    rounding is preserved in registers before FP8 quantization and the gate/up projection.
@@ -489,8 +489,8 @@ empty hops (`live_k = 0` on C=1), so the first rounds mostly pick from known T u
 prompt’s coins exist, then sit on one k. Host tests cover hop updates, dominance, one probe,
 and shared batch k. DFlash includes k=1/2 because short verification batches can win at C>1
 when later-hop acceptance is low. Their NVFP4 MLP and attention-input projections aggregate
-requests into one weight pass; W=2..4 NVFP4 residual projections do likewise. W2/W3 retain
-A16; k=3 (W4) now uses the same A8 policy as k=4/5 (W5/W6). The picker can still prefer
+requests into one weight pass; W=2..4 NVFP4 residual projections do likewise. Every
+verification width, including k=1/2 (W2/W3), uses the same A8 policy as k=3..5 (W4–W6). The picker can still prefer
 k=4/5 for high-acceptance workloads.
 
 ## 9. Speculative round semantics

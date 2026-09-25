@@ -84,8 +84,8 @@ boundary. Its canonical A8 criterion is supplemented by independently encoded/de
 inputs and a per-output arithmetic bound: FP32 accumulation, BF16 gate/up materialization,
 SiLU conditioning and final BF16 rounding. The oracle itself does not round private projection
 intermediates. Fused/composed output equality is supplementary, including changed-input graph
-replay and zero rows. GDN record cases execute the A8 C4 `[2,6]` and `[3,6]` workspace intervals
-to protect the W2 high-water mark after W4–6 projection/convolution fusion.
+replay and zero rows. GDN record cases execute the A8 C4 `[2,6]` workspace interval at its fused W6
+high-water mark.
 
 ## Build and run
 

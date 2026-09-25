@@ -18,6 +18,44 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash A8 at every verification width (2026-09-25)
+
+Verification now uses the selected A8/A8 profile at W2 and W3 as well as W4–W6
+(`kNvfp4FirstA8 = 2`), so a request's arithmetic no longer depends on its draft width. Ordinary
+decode (T=1) and prefill keep their text policy. MTP target verification at k=1/2 follows the same
+rule. A8 W2/W3 GDN records use the fused projection/convolution tile.
+
+Paired actual-verifier scoring against `fda2972d` (W2/W3 A16), same corpora and method as the W4
+study (C1, prefix 8, raw T1 probabilities, NVFP4 KV; 1024-token block bootstrap, 10000 draws):
+
+| Width | Corpus | A16 PPL | A8 PPL | Change | Mean ΔNLL 95% interval |
+|---|---|---:|---:|---:|---|
+| W2 | WikiText, 32739 tokens | 5.164707 | 5.176074 | +0.220% | [0.00082, 0.00353] |
+| W2 | Code references, 8545 tokens | 1.933908 | 1.937614 | +0.192% | [0.00049, 0.00317] |
+| W3 | WikiText | 5.164409 | 5.176229 | +0.229% | [0.00085, 0.00358] |
+| W3 | Code references | 1.933003 | 1.938109 | +0.264% | [0.00026, 0.00509] |
+
+These match the approved W4 cost (+0.228% / +0.192%). W2/W3 C1/C4 score controls are exactly equal
+on all four lanes over 256 tokens, and the greedy, p-less and stochastic 16-round licensing cells
+pass at C1/C4 for both widths.
+
+Engine, same fixture and flags as the section below, single waves, steady decode tok/s:
+
+| Mode | C | `fda2972d` | A8 all widths |
+|---|---:|---:|---:|
+| Fixed k2 | 1 | 134.33 | 135.60 |
+| Fixed k2 | 4 | 219.47 | **317.06** |
+| Fixed k4 | 1 / 4 | 160.05 / 450.92 | 159.29 / 449.07 |
+| Adaptive max5 | 1 | 163.62 | 156.99 |
+| Adaptive max5 | 4 | 452.86 | 452.30 |
+
+Fixed k4 hashes are unchanged (W5 is unaffected). Adaptive rarely selects k=1/2 on this workload
+(3 of ~3450 rounds at C1, ~270 of ~14400 at C4); at C1 those few rounds change the seed-0
+trajectory, and its acceptance (27.5→25.6%) accounts for the whole C1 difference: tokens per round
+fall 3.9%, width choices and round cost are unchanged. Adaptive C4 acceptance is 32.1% vs 31.9%.
+Fixed k2 accepts slightly less (C4 50.0→47.3%) yet is 44% faster at C4.
+Evidence: `profiles/bench/dflash-a8-w23/`, `profiles/bench/dflash-a8-followups/{final,w23a8}-*`.
+
 ## DFlash A8 kernel schedule and GDN gating (2026-09-25)
 
 Three bit-exact changes over `c1da30a8`; every fixed-k4 per-request response hash is unchanged.

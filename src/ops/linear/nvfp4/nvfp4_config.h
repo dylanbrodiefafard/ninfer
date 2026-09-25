@@ -241,7 +241,11 @@ inline constexpr std::int32_t kNvfp4FirstW4a4MlpGateUp     = 2;
 inline constexpr std::int32_t kNvfp4FirstW4a4Residual6144  = 5;
 inline constexpr std::int32_t kNvfp4FirstW4a4Residual17408 = 3;
 inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
-// Tree/chain verify is W<=16. Packed GDN conv-record uses fused SmallT for B=1 W=4,
+// AllowA8 is the verification policy: every verify width (W>=2) and aggregate uses W4A8, so a
+// request's arithmetic does not depend on its draft width or batch. T=1 stays on the A16 GEMV.
+inline constexpr std::int32_t kNvfp4FirstA8 = 2;
+// Tree/chain verify is W<=16. AllowA8 conv-record is W4A8 at every width; under A16, packed
+// GDN conv-record uses fused SmallT for B=1 W=4,
 // grouped SmallT replay for B=1 W=5/6 and B=2..4 W=2/5, fused T=1-reduction
 // GEMV+FP32 conv for other B=1 widths, and one same-reduction request-indexed SmallT
 // grid for other B>1 widths. Snapshot T=2..16 stays fused SmallT. W4A4 Materialized

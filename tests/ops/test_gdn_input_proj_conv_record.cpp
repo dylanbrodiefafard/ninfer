@@ -1020,7 +1020,8 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                                 std::vector<std::uint16_t>* carried_state = nullptr,
                                 std::vector<std::uint16_t>* reference_state = nullptr) {
         const std::int32_t aggregate = width * batch;
-        const bool a8 = qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA8 && width >= 4;
+        const bool a8 = qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA8 &&
+                        width >= ops::detail::kNvfp4FirstA8;
         const bool quantized = a8 || (qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA4 && width >= 5);
         const std::int32_t slots     = aggregate + batch + 1;
         const bool dense             = valid_columns.empty();
@@ -1120,13 +1121,11 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
         Tensor lz(legacy_z.data(), DType::BF16, {kZRows, width, batch});
         Tensor lr(legacy_record.data(), DType::BF16, {kChannels, width, batch});
 
-        // Exercise the adaptive high-water mark: W2 grouped A16 requires more
-        // scratch than fused A8 W4..6. Excluding W2 must also permit the small arena.
+        // Exercise the adaptive interval: every A8 width is fused, so [2,6] is sized by W6.
         const bool interval = qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA8 &&
-                              batch == 4 && (width == 2 || width == 6);
+                              batch == 4 && width == 6;
         const std::size_t rec_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            qtype, kRows, kHidden, policy, batch, interval ? (width == 2 ? 2 : 3) : width,
-            interval ? 6 : width);
+            qtype, kRows, kHidden, policy, batch, interval ? 2 : width, width);
         WorkspaceArena batched_ws(std::max<std::size_t>(256, rec_bytes));
         ops::gdn_input_proj_conv_record(x, parent.view(), conv, batched_state_view, valid, initial,
                                         br, bq, bk, bv, bz, policy, batched_ws,
