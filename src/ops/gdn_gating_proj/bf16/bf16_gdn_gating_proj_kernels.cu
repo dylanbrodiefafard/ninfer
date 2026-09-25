@@ -23,8 +23,7 @@ constexpr int kK                  = 5120;
 constexpr int kThreads            = 256;
 constexpr int kLogicalRows        = 2 * kN;
 constexpr int kSmallTMax          = 8;
-constexpr int kGemvPackedMax      = 16;
-constexpr int kGemvPackedExtendedMax = 20;
+constexpr int kGemvPackedMax      = 20;
 constexpr int kSmallTKSlice       = 512;
 constexpr int kSmallTSplits       = kK / kSmallTKSlice;
 constexpr int kSmallTRowsPerBlock = 4;
@@ -143,62 +142,64 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
     beta[out_index]              = sigmoid(acc_b);
 }
 
-template <int PackedMax, int FixedTokens = 0>
+// One logical row per CTA x, up to kGemvTokenTile tokens per CTA y. Every output keeps the T=1
+// GEMV reduction: thread p accumulates pairs p, p+256, ... in order, then the same warp shuffle
+// tree and eight-lane warp-sum tree as block_reduce_sum. Tokens split across CTAs and reduce under
+// one barrier, so packed outputs stay bit-identical to T=1 decode at every T and batch.
+constexpr int kGemvTokenTile = 4;
+static_assert(kGemvTokenTile <= kThreads / kWarpSize);
+
 __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
                                                  const __nv_bfloat16* a_weight,
                                                  const __nv_bfloat16* b_weight, const float* A_log,
                                                  const float* dt_bias, float* g, float* beta,
                                                  std::int32_t t) {
-    static_assert(PackedMax == kGemvPackedMax || PackedMax == kGemvPackedExtendedMax);
-    static_assert(FixedTokens == 0 || FixedTokens == 5 || FixedTokens == 6);
-    static_assert(FixedTokens <= PackedMax);
+    constexpr int kWarps = kThreads / kWarpSize;
     const int global_row = static_cast<int>(blockIdx.x);
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
     const auto* weight   = is_b ? b_weight : a_weight;
-    __shared__ float warp_sums[kThreads / kWarpSize];
+    const int token0     = static_cast<int>(blockIdx.y) * kGemvTokenTile;
+    const int ncols      = min(kGemvTokenTile, t - token0);
+    __shared__ float warp_sums[kGemvTokenTile][kWarps];
 
-    constexpr int kAccumulators = FixedTokens == 0 ? PackedMax : FixedTokens;
-    float acc[kAccumulators];
+    float acc[kGemvTokenTile];
 #pragma unroll
-    for (int tt = 0; tt < kAccumulators; ++tt) { acc[tt] = 0.0f; }
+    for (int tt = 0; tt < kGemvTokenTile; ++tt) { acc[tt] = 0.0f; }
 
-    constexpr int kPairs        = kK / 2;
-    const std::int64_t row_base = static_cast<std::int64_t>(row) * kK;
-    const auto* w2 =
-        reinterpret_cast<const __nv_bfloat162*>(weight + static_cast<std::int64_t>(row_base));
-    for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += static_cast<int>(blockDim.x)) {
+    constexpr int kPairs = kK / 2;
+    const auto* w2 = reinterpret_cast<const __nv_bfloat162*>(weight + static_cast<std::int64_t>(row) * kK);
+    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x + static_cast<std::int64_t>(token0) * kK);
+    for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += kThreads) {
         const float2 wf = bf16x2_to_float2(w2[p]);
 #pragma unroll
-        for (int tt = 0; tt < kAccumulators; ++tt) {
-            if constexpr (FixedTokens != 0) {
-                const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
-                    x + static_cast<std::int64_t>(tt) * kK);
-                const float2 xf = bf16x2_to_float2(x2[p]);
-                acc[tt]         = fmaf(wf.x, xf.x, acc[tt]);
-                acc[tt]         = fmaf(wf.y, xf.y, acc[tt]);
-            } else if (tt < t) {
-                const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(
-                    x + static_cast<std::int64_t>(tt) * kK);
-                const float2 xf = bf16x2_to_float2(x2[p]);
+        for (int tt = 0; tt < kGemvTokenTile; ++tt) {
+            if (tt < ncols) {
+                const float2 xf = bf16x2_to_float2(x2[tt * kPairs + p]);
                 acc[tt]         = fmaf(wf.x, xf.x, acc[tt]);
                 acc[tt]         = fmaf(wf.y, xf.y, acc[tt]);
             }
         }
     }
 
-    // Same pair-wise K FMA order as T=1 GEMV. block_reduce_sum barriers between tokens so
-    // packed T=2..16 reuses this launch without a T=1 host loop.
-    for (int tt = 0; tt < (FixedTokens == 0 ? t : FixedTokens); ++tt) {
-        const float reduced = block_reduce_sum<kThreads>(acc[tt], warp_sums);
-        if (threadIdx.x == 0) {
-            const std::int64_t out = static_cast<std::int64_t>(tt) * kN + row;
-            if (is_b) {
-                beta[out] = sigmoid(reduced);
-            } else {
-                const float sp = softplus(reduced + dt_bias[row]);
-                g[out]         = -expf(A_log[row]) * sp;
-            }
+    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+#pragma unroll
+    for (int tt = 0; tt < kGemvTokenTile; ++tt) {
+        const float sum = warp_reduce_sum(acc[tt]);
+        if (lane == 0) { warp_sums[tt][warp] = sum; }
+    }
+    __syncthreads();
+    if (warp >= ncols) { return; }
+    float reduced = lane < kWarps ? warp_sums[warp][lane] : 0.0f;
+    reduced       = warp_reduce_sum<kWarps>(reduced);
+    if (lane == 0) {
+        const std::int64_t out = static_cast<std::int64_t>(token0 + warp) * kN + row;
+        if (is_b) {
+            beta[out] = sigmoid(reduced);
+        } else {
+            const float sp = softplus(reduced + dt_bias[row]);
+            g[out]         = -expf(A_log[row]) * sp;
         }
     }
 }
@@ -365,27 +366,16 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
     const std::int32_t t = x.ne[1];
-    if (t < 1 || t > kGemvPackedExtendedMax) {
+    if (t < 1 || t > kGemvPackedMax) {
         throw std::invalid_argument("gdn_gating_proj: GEMV/small-T fused admits T=1..20");
     }
-    const auto launch = [&]<int PackedMax, int FixedTokens = 0>() {
-        bf16_gdn_gating_proj_gemv_kernel<PackedMax, FixedTokens>
-            <<<2 * kN, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(a_weight.qdata),
-            static_cast<const __nv_bfloat16*>(b_weight.qdata),
-            static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
-            static_cast<float*>(g.data), static_cast<float*>(beta.data), t);
-    };
-    if (t == 5) {
-        launch.template operator()<kGemvPackedMax, 5>();
-    } else if (t == 6) {
-        launch.template operator()<kGemvPackedMax, 6>();
-    } else if (t <= kGemvPackedMax) {
-        launch.template operator()<kGemvPackedMax>();
-    } else {
-        launch.template operator()<kGemvPackedExtendedMax>();
-    }
+    const dim3 grid(2 * kN, static_cast<unsigned>(div_up(t, kGemvTokenTile)));
+    bf16_gdn_gating_proj_gemv_kernel<<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata),
+        static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+        static_cast<float*>(g.data), static_cast<float*>(beta.data), t);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -431,10 +421,10 @@ void bf16_gdn_gating_proj_small_t_fused_launch(const Tensor& x, const Weight& a_
                                                Tensor& beta, cudaStream_t stream) {
     (void)workspace;
     (void)workspace_bytes;
-    if (x.ne[1] < 2 || x.ne[1] > kGemvPackedExtendedMax) {
+    if (x.ne[1] < 2 || x.ne[1] > kGemvPackedMax) {
         throw std::invalid_argument("gdn_gating_proj: small-T fused admits T=2..20");
     }
-    // Same 96-CTA GEMV reduction as T=1, one launch, weights streamed once. Column 0 is
+    // Same per-output GEMV reduction as T=1 in one launch; token tiles spread across CTAs. Column 0 is
     // bit-identical to ordinary decode GEMV; split-K SmallT and MMA split-8 were not.
     bf16_gdn_gating_proj_gemv_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
 }

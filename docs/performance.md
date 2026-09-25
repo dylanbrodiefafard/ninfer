@@ -18,6 +18,37 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash A8 kernel schedule and GDN gating (2026-09-25)
+
+Three bit-exact changes over `c1da30a8`; every fixed-k4 per-request response hash is unchanged.
+
+- **GDN gating a/b projection:** tokens split across `grid.y` in tiles of four, reduced under one
+  barrier with the T=1 thread-to-K mapping and shuffle tree. Engine C4 trace: 16.5→6.7 µs per
+  T20 call; C1 6.3→5.0 µs.
+- **A8 pipeline depth:** A8 stages only NVFP4 weights and FP8 activations (the W4A4 activation
+  buffers are gone). N=5120 uses K512×3 at M16 and K256×3 at M32, other M16 schedules K256×3, and
+  M32 N64 keeps K256×2. The smaller footprint alone slowed M16 gate/up (more CTAs per SM); three
+  stages recover it. Public Linear including quantization: MLP-down T5 57.3→41.0 µs, T20
+  63.1→53.2; residual-out T5 26.6→20.5, T20 30.7→24.6.
+- **SwapAB for N≥14336 A8 projections:** weight rows on MMA M and eight-token panels on N, skipping
+  panels past the valid tokens; per-output K16 FMA order is unchanged. Engine C4: gate/up
+  79.9→75.6 µs, GDN input 39.0→37.0 µs.
+
+RTX 5090/SM120a, CUDA 13.1, same DFlash2 artifact, `long_decode_aime26_15`, 8192 completion tokens,
+p-less T2, thinking, NVFP4 KV, graphs, optimized head, no prefix reuse; KV 32768 at C1 and 65536
+at C4. Single waves, steady full-batch aggregate decode tok/s:
+
+| Build | Fixed k4 C1 | Fixed k4 C4 | Adaptive max5 C1 | Adaptive max5 C4 |
+|---|---:|---:|---:|---:|
+| `c1da30a8` | 154.13 | 431.31 | 156.76 | 433.09 |
+| + gating, A8 stages | 158.59 | 438.97 | 162.77 | 440.29 |
+| + SwapAB | **160.05** | **450.92** | **163.72** | **451.60** |
+
+Total: fixed k4 +3.8% / +4.5%, adaptive +4.4% / +4.3% (C1 / C4). Adaptive C4 hashes differ because
+timed width selection changes trajectories. Measured non-wins (drafter A8, PDL, in-CTA K split)
+and open items are in the [DFlash A8 follow-up plan](maintainer/dflash-a8-followups.md).
+Evidence: `profiles/bench/dflash-a8-followups/`, `profiles/nsys/a8-followups-{base,sched,swap}-c{1,4}`.
+
 ## DFlash A8 fusion qualification (2026-09-24)
 
 Two measured fusions are retained over the preceding W4-enabled A8/A8 implementation:
