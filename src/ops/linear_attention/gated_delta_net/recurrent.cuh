@@ -388,7 +388,7 @@ struct SnapshotAccess {
     }
 };
 
-template <bool Masked, bool ParentIndexed>
+template <bool Masked>
 struct OverlayAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -430,10 +430,6 @@ struct OverlayAccess {
     __device__ __forceinline__ std::int32_t column_slot(std::int32_t token,
                                                         std::int32_t batch) const {
         return token * batch_size + batch;
-    }
-
-    __device__ __forceinline__ std::int32_t work_slot(std::int32_t batch) const {
-        return width * batch_size + batch;
     }
 
     __device__ __forceinline__ const float* live_head(const RecurrentCoordinates& coord) const {
@@ -967,9 +963,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                                                   access.active_columns(coord));
 }
 
-template <bool Masked, bool ParentIndexed>
+template <bool Masked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_overlay_kernel(OverlayAccess<Masked, ParentIndexed> access) {
+    recurrent_overlay_kernel(OverlayAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
     const std::int32_t width         = access.width;
@@ -984,19 +980,12 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
             continue;
         }
 
-        if constexpr (ParentIndexed) {
-            const std::int32_t parent = access.parent_index[access.column(coord, token)];
-            if (parent < 0) {
-                access.load_tile(access.live_head(coord), coord, state);
-            } else {
-                access.load_tile(access.overlay_head(access.column_slot(parent, coord.batch), coord),
-                                 coord, state);
-            }
-        } else if (token == 0) {
+        const std::int32_t parent = access.parent_index[access.column(coord, token)];
+        if (parent < 0) {
             access.load_tile(access.live_head(coord), coord, state);
         } else {
-            access.load_tile(access.overlay_head(access.work_slot(coord.batch), coord), coord,
-                             state);
+            access.load_tile(access.overlay_head(access.column_slot(parent, coord.batch), coord),
+                             coord, state);
         }
 
         RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, token), coord.dqk_base);
@@ -1012,13 +1001,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                 access.output_ptr(coord, token), coord.dqk_base, coord.dv_base,
                                 coord.lane, access.scale);
 
-        if constexpr (ParentIndexed) {
-            access.store_tile(access.overlay_head(access.column_slot(token, coord.batch), coord),
-                              coord, state);
-        } else {
-            access.store_tile(access.overlay_head(access.work_slot(coord.batch), coord), coord,
-                              state);
-        }
+        access.store_tile(access.overlay_head(access.column_slot(token, coord.batch), coord),
+                          coord, state);
         __syncthreads();
     }
 }

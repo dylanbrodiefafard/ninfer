@@ -34,12 +34,13 @@ GPU idle between kernels: 3.6% (C1) / 3.2% (C4); about 1085 kernels per C1 round
 | # | Candidate | Numerics | Status |
 |---|---|---|---|
 | 1 | GDN gating projection: parallelize tokens across the grid, same per-output K order | bit-exact | kept |
-| 2 | N=5120 A8 projections: deeper pipeline and/or deterministic split-K | stages: exact; split-K: FP32 association changes | stages kept; in-CTA K split lost; cross-CTA split-K open |
+| 2 | N=5120 A8 projections: deeper pipeline and/or deterministic split-K | stages: exact; split-K: FP32 association changes | stages kept (M32 K512×3 added); in-CTA K split and M32 N16 grid lost; cross-CTA split-K not admitted |
 | 3 | Swap-AB A8 MMA (weights on M=16, tokens on N=8) for T≤24 | per-output K16 order unchanged; exact if FMA order kept | kept for wide shapes |
 | 4 | Drafter projections A16 → A8 | acceptance only; target distribution unchanged | not kept; acceptance unresolved |
 | 5 | Remove standalone quantize launches (pre-mixer RMSNorm+A8 fusion, consumer-side quantize) and PDL weight prefetch on A8 kernels | exact if the same row scale/codes are produced | PDL lost; quantize fusion open (bounded ≤~1% per site) |
 | 6 | Verification W2/W3 → A8 across C (keeps precision independent of C) | new PPL qualification required | done: A8 at every verify width (performance.md) |
-| 7 | Defer GDN fold into the next round's overlay (one fewer state pass) | FP32 state transition must stay identical | not started; larger state-transaction change |
+| 7 | Defer GDN fold into the next round's overlay (one fewer state pass) | FP32 state transition must stay identical | closed: ≤~1.2% at C4 after 8, large state-transaction change |
+| 8 | Chain GDN verify: register-resident record kernel instead of the scratch T=1 overlay | bit-exact (FP32 store/load identity, same transition) | kept |
 
 Details:
 
@@ -83,6 +84,9 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
 | Baseline (`c1da30a8`) | 154.13 | 431.31 | 156.76 | 433.09 |
 | + gating token split, A8 stage schedule | 158.59 | 438.97 | 162.77 | 440.29 |
 | + SwapAB for wide A8 projections | 160.05 | 450.92 | 163.72 | 451.60 |
+| `fccf6613` (A8 at every width) | 159.29 | 449.07 | 156.99 | 452.30 |
+| + chain GDN record kernel (8) | 161.03 | 461.17 | 158.43 | 463.03 |
+| + M32 N=5120 K512×3 (2) | 161.22 | 471.25 | 158.73 | 473.84 |
 
 - **1, gating (kept):** C4 trace 58.5→26.2 ms of kernel time (16.5→6.7 µs per T20 call), C1
   6.3→5.0 µs. Bit-exact.
@@ -130,12 +134,27 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
 
   A8 wins broadly at the C2–C4 aggregates of W2/W3 and roughly ties at C1.
 
+- **2c, M32 N=5120 (kept K512×3):** NCU counters are admin-only on this host
+  (`RmProfilingAdminOnly=1`); the launch shape is 160 CTAs × 4 warps and the public Op ran at 52%
+  of sustained read. Public Linear A8 (incl. quantize), MLP-down / residual-out at T17–24:
+  baseline 52.8 / 24.0 µs; N16 grid K512 83.3 / 34.1; N16 grid K256 55.3 / 25.9; N32 K512 44.6 /
+  19.7 (kept). T≤16 unchanged. Grid underfill is therefore not the limiter; deeper per-stage K
+  is. Cross-CTA split-K is `split_k` under a DRAM bound, which `tools.kdev` admits only if it cuts
+  model bytes; it does not, and cluster>1 is outside the kdev legality envelope, so it is not
+  pursued.
+- **8, chain GDN record (kept):** the C4 swap trace showed `recurrent_overlay_kernel` at 22.5 µs
+  per layer (1.08 ms per round, 5.8%) against 8.2 µs at C1. For chain verify the overlay stored
+  and reloaded each row's head state in scratch after every column. The register-resident record
+  kernel runs the same width-one transition; `ninfer_gated_delta_net_replay_record_test` already
+  requires its `out` to equal the snapshot kernel bit for bit. The overlay is now tree-only.
+  Engine hashes unchanged.
+- **7, fold deferral (closed):** with chain verify reading state once, deferral would remove at
+  most one state read per round (about a third of the 714 µs C4 fold, ~1.2%), add sequential
+  steps to every record kernel, and move the committed-state frontier across rounds.
+
 ## Remaining follow-ups
 
-- Cross-CTA split-K (cluster reduction, fixed order, identical at M16/M32) for N=5120 at C4:
-  M32 MLP-down is still 46 µs against a 28 µs floor; residual-out 17.5 against 10.
 - Drafter A8 with a proper acceptance study (candidate 4).
 - Standalone-quantize removal (candidate 5 remainder).
-- GDN fold deferral (candidate 7): C4 fold 713 µs per round at its bandwidth floor.
 - BF16 target attention layers (`bf16_small_t_inner` 14336×5120, ~92–108 µs, 6 per round) and the
   W8 verify LM head (~800 µs per round) are at their bandwidth floors; only format changes help.

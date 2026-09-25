@@ -273,7 +273,7 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
     }
 }
 
-template <bool Masked, bool ParentIndexed>
+template <bool Masked>
 void launch_recurrent_overlay_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& g, const Tensor& beta, float scale,
                                     const Tensor& ssm_states, const Tensor& valid_columns,
@@ -289,7 +289,7 @@ void launch_recurrent_overlay_fixed(const Tensor& q, const Tensor& k, const Tens
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
     const std::int64_t overlay_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * v.ne[1];
-    const OverlayAccess<Masked, ParentIndexed> access{
+    const OverlayAccess<Masked> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -311,7 +311,7 @@ void launch_recurrent_overlay_fixed(const Tensor& q, const Tensor& k, const Tens
         overlay_slot_stride,
         scale,
     };
-    recurrent_overlay_kernel<Masked, ParentIndexed><<<grid, block, 0, stream>>>(access);
+    recurrent_overlay_kernel<Masked><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -321,31 +321,16 @@ void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v,
                               Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                               Tensor& out, float* overlay_states,
                               const std::int32_t* parent_index, cudaStream_t stream) {
-    const bool masked = valid_columns.data != nullptr;
-    if (parent_index == nullptr) {
-        if (!masked) {
-            launch_recurrent_overlay_fixed<false, false>(q, k, v, g, beta, scale, ssm_states,
-                                                         valid_columns, initial_state_slots,
-                                                         key_record, value_record, gate_record, out,
-                                                         overlay_states, parent_index, stream);
-        } else {
-            launch_recurrent_overlay_fixed<true, false>(q, k, v, g, beta, scale, ssm_states,
-                                                        valid_columns, initial_state_slots,
-                                                        key_record, value_record, gate_record, out,
-                                                        overlay_states, parent_index, stream);
-        }
-        return;
-    }
-    if (!masked) {
-        launch_recurrent_overlay_fixed<false, true>(q, k, v, g, beta, scale, ssm_states,
-                                                    valid_columns, initial_state_slots, key_record,
-                                                    value_record, gate_record, out, overlay_states,
-                                                    parent_index, stream);
+    if (valid_columns.data == nullptr) {
+        launch_recurrent_overlay_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                                              initial_state_slots, key_record, value_record,
+                                              gate_record, out, overlay_states, parent_index,
+                                              stream);
     } else {
-        launch_recurrent_overlay_fixed<true, true>(q, k, v, g, beta, scale, ssm_states,
-                                                   valid_columns, initial_state_slots, key_record,
-                                                   value_record, gate_record, out, overlay_states,
-                                                   parent_index, stream);
+        launch_recurrent_overlay_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                                             initial_state_slots, key_record, value_record,
+                                             gate_record, out, overlay_states, parent_index,
+                                             stream);
     }
 }
 

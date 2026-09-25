@@ -273,8 +273,8 @@ o  = (S @ q) * (1/sqrt(128))
 The CUDA recurrence uses an algebraically equivalent ordering appropriate to the kernel. Prefill
 uses chunked parallel state passing for large T and recurrent/small-T paths where appropriate;
 ordinary decode uses the width-one in-place path, while MTP verification records T=W transitions
-for Fold and overlays T=1 snapshot arithmetic on scratch SSM for packed `out`, so each verify
-column matches ordinary decode. Fold applies the same finite-precision recurrent transition.
+for Fold and carries each row's state in registers through the width-one transition for packed
+`out`, so each verify column matches ordinary decode. Fold applies the same finite-precision recurrent transition.
 
 The per-head output is normalized and gated before projection:
 
@@ -507,8 +507,8 @@ target tokens. Under p-less, DFlash2 chain accept uses the same one-hot `q` conv
 p-less distribution, and the bonus samples its own column's distribution. Cycle-exit exclusion
 affects the root only; later hops are not silently changed to greedy sampling. DFlash2
 differs by producing the whole candidate chain in one masked-block forward. Packed GDN conv-record uses a T=1-reduction, BF16-history SmallT launch at B=2..4; packed
-GDN recurrent overlays ordinary T=1 snapshot arithmetic on scratch SSM so those packed logits
-match width-one decode. Fold still consumes the T=W records.
+GDN recurrent applies the width-one transition to register-resident state per column, so those
+packed logits match width-one decode. Fold still consumes the T=W records.
 
 Target verification writes candidate KV into provisioned but unpublished extents. After the final
 per-row output prefix is known, one all-layer Fold commits the accepted sequential prefix into the

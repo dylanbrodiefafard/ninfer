@@ -295,7 +295,7 @@ B>1 widths use request-indexed CTAs. Independent record tests cover dense/ragged
 carried history and every valid prefix; the A16 pairing change additionally matches legacy
 T1 outputs exactly. Quantized projection checks use their own mathematical oracle, not A16
 bit parity or the superseded BF16-compose record route.
-Packed GDN recurrent then overlays T=1 snapshot `out` on scratch SSM. DFlash C>1
+Packed GDN recurrent then carries register-resident state through the width-one transition for `out`. DFlash C>1
 propose isolates each compact row as a C=1-shaped forward (`T=width`, `B=1`) so draft
 Linears, SWA, and the draft head use sequential kernels. Eager propose resolves SWA's
 direct/split route from the row frontier rather than the batch maximum; graph replay keeps

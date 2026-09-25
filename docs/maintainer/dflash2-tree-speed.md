@@ -25,8 +25,8 @@ evidence from the chain/tree speed investigation.
 
 The historical tree experiment used 4-warp parent tiles in HBM when the ReplaySSM workspace was
 sized for it; tests without that workspace kept the 1-warp shared-memory tile. The current chain
-route instead publishes replay records in the T=1 overlay kernel and reserves no parent-tile
-buffer. Path/tree select scans the
+route instead publishes replay records from the register-resident record kernel and reserves no
+overlay or parent-tile scratch. Path/tree select scans the
 shortlist with 32-way column splits, then scores each (parent, candidate) pair with the serial
 rank-256 FMA (32 pairs in parallel for the tree walk). The 4-warp tree record kept a 16 KiB
 2-slot smem cache of the last two written parent tiles.
@@ -151,7 +151,7 @@ The tree A/B used one graph-stable work-arena buffer of `Hv × B × W × 128 × 
 Post-opt: 26.1 ms / 1536 calls / **17.0 µs** vs 27.3 µs 1-warp (−0.50 ms/round). Still slower
 than sequential record (8.9 µs) because each column reloads parent state. Remaining GDN tax
 is ~0.4 ms/round. This packed-tree route is no longer a product route; current chain replay
-fuses record publication into the T=1 overlay kernel.
+publishes records from the register-resident record kernel.
 
 ### 3. Skip KV/feature compact when `fold_path` is identity `0..m-1` (kept)
 

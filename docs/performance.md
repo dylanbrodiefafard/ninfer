@@ -18,6 +18,29 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash GDN chain record and M32 A8 schedule (2026-09-25)
+
+Two bit-exact changes, `qwen3.8-27b/nvfp4` DFlash2 on RTX 5090, NVFP4 KV:
+
+- Chain verification publishes GDN replay records from the register-resident record kernel. The
+  T=1 overlay kernel it replaces stored and reloaded each row's 64 KiB FP32 head state in scratch
+  after every column, with a block barrier. FP32 store/load is exact and the per-column transition
+  is the same width-one arithmetic. The overlay is now tree-only and chain verify reserves no
+  overlay scratch. Overlay at C4 was 22.5 µs per layer, 1.08 ms per round.
+- N=5120 A8 at M32 (T17–32) streams K512 over three stages instead of K256. Public Linear A8
+  T20, including quantization: MLP-down 52.9→44.6 µs, residual-out 24.0→19.7 µs. M32 on the
+  N16 grid (320 CTAs) was worse (83.3 µs), so grid underfill is not the limiter.
+
+Engine, same fixture and flags as the section below, single waves, steady decode tok/s. Fixed-k4
+and adaptive C1 response hashes match the previous build:
+
+| Mode | C | `fccf6613` | Chain record | + M32 K512 |
+|---|---:|---:|---:|---:|
+| Fixed k4 | 1 | 159.29 | 161.03 | 161.22 |
+| Fixed k4 | 4 | 449.07 | 461.17 | **471.25** |
+| Adaptive max5 | 1 | 156.99 | 158.43 | 158.73 |
+| Adaptive max5 | 4 | 452.30 | 463.03 | **473.84** |
+
 ## DFlash A8 at every verification width (2026-09-25)
 
 Verification now uses the selected A8/A8 profile at W2 and W3 as well as W4–W6
