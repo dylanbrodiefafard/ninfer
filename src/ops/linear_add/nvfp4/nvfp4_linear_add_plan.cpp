@@ -22,7 +22,7 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     }
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearAddRoute::A16; }
     if (policy == LinearPolicy::AllowA8) {
-        return tokens >= 4 ? Nvfp4LinearAddRoute::W4A8 : Nvfp4LinearAddRoute::A16;
+        return tokens >= kNvfp4FirstA8 ? Nvfp4LinearAddRoute::W4A8 : Nvfp4LinearAddRoute::A16;
     }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported policy");

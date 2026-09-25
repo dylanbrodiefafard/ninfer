@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/linear/nvfp4/nvfp4_config.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
@@ -23,7 +24,7 @@ struct Nvfp4GdnConvPlan {
 
 inline constexpr bool nvfp4_gdn_record_uses_quantized(LinearPolicy policy, std::int32_t width) noexcept {
     return ((policy == LinearPolicy::AllowA4 && width >= 5) ||
-            (policy == LinearPolicy::AllowA8 && width >= 4)) && width <= 16;
+            (policy == LinearPolicy::AllowA8 && width >= kNvfp4FirstA8)) && width <= 16;
 }
 
 void nvfp4_gdn_record_quantized_launch(const Tensor& x, const Weight& weight,

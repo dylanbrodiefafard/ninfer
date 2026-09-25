@@ -56,12 +56,7 @@ ops::LinearPolicy text_policy(const Weight& weight,
         return phase == qwen3_6::TextPhase::Prefill && aggregate_tokens > 1
                    ? ops::LinearPolicy::AllowA8 : ops::LinearPolicy::A16Only;
     }
-    // Verification chooses precision from the request-local width. Short widths retain
-    // A16 across C; W>=4 permits the selected NVFP4 activation profile across C.
-    if (phase == qwen3_6::TextPhase::Verify && aggregate_tokens > 0 &&
-        aggregate_tokens <= 3) {
-        return ops::LinearPolicy::A16Only;
-    }
+    // Every NVFP4 verification width uses the selected A8 profile, independent of batch.
     return weight.qtype == QType::NVFP4
         ? (phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy)
         : ops::LinearPolicy::A16Only;
@@ -462,8 +457,9 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, valid_columns,
                                      initial_slots, conv_record, query, key, value, output_gate_view,
-                                      fused.qtype == QType::NVFP4 && hidden.ne[1] >= 4
-                                         ? kNvfp4GdnVerifyPolicy : text_policy(fused, phase, hidden.ne[1]), leaf_workspace, stream,
+                                     fused.qtype == QType::NVFP4 ? kNvfp4GdnVerifyPolicy
+                                                                 : text_policy(fused, phase, hidden.ne[1]),
+                                     leaf_workspace, stream,
                                     parent_index);
 }
 
@@ -511,7 +507,7 @@ void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidd
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     const int width = route_tokens > 0 ? route_tokens : hidden.ne[1];
     const bool fused_norm = weights.gate_up.qtype == QType::NVFP4 && hidden.ne[1] <= 24 &&
-        text_policy(weights.gate_up, phase, width) == ops::LinearPolicy::AllowA8 && width >= 4 &&
+        text_policy(weights.gate_up, phase, width) == ops::LinearPolicy::AllowA8 &&
         (!split_verify_panels(phase, route_tokens, hidden.ne[1]) ||
          aggregate_verify_extent(phase, route_tokens, hidden.ne[1]));
     if (!fused_norm) { ops::rmsnorm(residual, norm_weight, norm_eps, true, hidden, stream); }

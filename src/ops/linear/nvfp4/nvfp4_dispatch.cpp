@@ -27,7 +27,7 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
     if (policy == LinearPolicy::AllowA8) {
         const auto problem = resolve_nvfp4_problem(output_rows, input_rows);
-        return tokens >= 4 && (problem == Nvfp4Problem::AttnInput || problem == Nvfp4Problem::GdnInput ||
+        return tokens >= kNvfp4FirstA8 && (problem == Nvfp4Problem::AttnInput || problem == Nvfp4Problem::GdnInput ||
             problem == Nvfp4Problem::MlpGateUp || problem == Nvfp4Problem::Residual6144 ||
             problem == Nvfp4Problem::Residual17408) ? Nvfp4LinearRoute::W4A8 : Nvfp4LinearRoute::A16;
     }

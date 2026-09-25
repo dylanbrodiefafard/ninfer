@@ -33,7 +33,7 @@ bool is_tma_tokens(std::int32_t tokens) {
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
     if (policy == LinearPolicy::AllowA8) {
-        if (tokens >= 4) { return Nvfp4LinearSwiGluRoute::FusedW4A8; }
+        if (tokens >= kNvfp4FirstA8) { return Nvfp4LinearSwiGluRoute::FusedW4A8; }
         return tokens == 1 ? Nvfp4LinearSwiGluRoute::DecodeFusedA16 : Nvfp4LinearSwiGluRoute::SmallTFusedA16;
     }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
@@ -95,7 +95,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
     if (policy == LinearPolicy::AllowA8) {
-        return max_tokens >= 4 ? fp8_a8_workspace_capacity_bytes(max_tokens, 5120) : 0;
+        return max_tokens >= kNvfp4FirstA8 ? fp8_a8_workspace_capacity_bytes(max_tokens, 5120) : 0;
     }
     if (policy == LinearPolicy::A16Only || max_tokens < kNvfp4FirstW4a4MlpGateUp) { return 0; }
 

@@ -38,7 +38,7 @@ GPU idle between kernels: 3.6% (C1) / 3.2% (C4); about 1085 kernels per C1 round
 | 3 | Swap-AB A8 MMA (weights on M=16, tokens on N=8) for T≤24 | per-output K16 order unchanged; exact if FMA order kept | kept for wide shapes |
 | 4 | Drafter projections A16 → A8 | acceptance only; target distribution unchanged | not kept; acceptance unresolved |
 | 5 | Remove standalone quantize launches (pre-mixer RMSNorm+A8 fusion, consumer-side quantize) and PDL weight prefetch on A8 kernels | exact if the same row scale/codes are produced | PDL lost; quantize fusion open (bounded ≤~1% per site) |
-| 6 | Verification W2/W3 → A8 across C (keeps precision independent of C) | new PPL qualification required | awaiting user decision; Op data below |
+| 6 | Verification W2/W3 → A8 across C (keeps precision independent of C) | new PPL qualification required | done: A8 at every verify width (performance.md) |
 | 7 | Defer GDN fold into the next round's overlay (one fewer state pass) | FP32 state transition must stay identical | not started; larger state-transaction change |
 
 Details:
@@ -116,7 +116,8 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
   (T-independent association) and reduce in rank order. Public Linear for N=5120 was worse at
   every width: MLP-down ×2 45–61 µs versus 41–55; ×4 61–63 µs at T≤16. M32 N=5120 is therefore
   not limited by warps per SM. Cross-CTA split-K (cluster DSMEM) is untested.
-- **6, W2/W3 A8 (decision pending):** Public Linear, A16 → A8 including quantization, with the
+- **6, W2/W3 A8 (done):** selected and qualified; see performance.md "DFlash A8 at every
+  verification width". Original Op data: Public Linear, A16 → A8 including quantization, with the
   A8 T≥4 gate lifted temporarily:
 
   | Shape | T2 | T3 | T8 | T12 |
@@ -127,16 +128,12 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
   | MLP-down `[5120,17408]` | 36.9→40.4 | 41.0→40.6 | 59.4→41.0 | 69.6→43.0 |
   | residual-out `[5120,6144]` | 18.4→20.5 | 18.4→20.5 | 28.7→20.5 | 32.4→20.5 |
 
-  A8 wins broadly at the C2–C4 aggregates of W2/W3 and roughly ties at C1. On the measured AIME
-  workload adaptive chose k1/k2 in 0.1% (C1) and 1.8% (C4) of rounds, so its Engine effect there
-  is small; fixed k1/k2 and short-width-heavy workloads would benefit. Needs W2/W3 PPL/score
-  controls and a user decision on the precision tradeoff, like the W4–W6 selection.
+  A8 wins broadly at the C2–C4 aggregates of W2/W3 and roughly ties at C1.
 
 ## Remaining follow-ups
 
 - Cross-CTA split-K (cluster reduction, fixed order, identical at M16/M32) for N=5120 at C4:
   M32 MLP-down is still 46 µs against a 28 µs floor; residual-out 17.5 against 10.
-- W2/W3 A8 qualification (candidate 6), if the tradeoff is wanted.
 - Drafter A8 with a proper acceptance study (candidate 4).
 - Standalone-quantize removal (candidate 5 remainder).
 - GDN fold deferral (candidate 7): C4 fold 713 µs per round at its bandwidth floor.
