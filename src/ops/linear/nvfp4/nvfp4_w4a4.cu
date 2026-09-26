@@ -21,7 +21,6 @@ using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 
 using M64N128S3                   = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
 using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-constexpr std::int32_t kTmaBlockM = 256;
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace,
@@ -57,7 +56,7 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
                     std::int32_t tokens, cudaStream_t stream) {
     constexpr bool kResidualGeometry = std::is_same_v<Geometry, Nvfp4Residual6144Geometry> ||
                                        std::is_same_v<Geometry, Nvfp4Residual17408Geometry>;
-    if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+    if (tokens >= 1024) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear(
             resolve_nvfp4_problem(Geometry::kOutputRows, Geometry::kInputRows), workspace.codes,

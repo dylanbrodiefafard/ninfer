@@ -60,7 +60,6 @@ using M64N64                      = Nvfp4W4a4MmaSchedule<64, 64, 256, 4, 2, 2, 1
 using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-constexpr std::int32_t kTmaBlockM = 256;
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
@@ -98,7 +97,7 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                   cudaStream_t stream) {
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
-    if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+    if (tokens >= 1024) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_attention(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),

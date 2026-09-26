@@ -222,7 +222,8 @@ template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
     const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
-    const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
+    const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
+    int token_count) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(Schedule::kStages >= 2, "activation-scale slots reuse the stage buffers");
@@ -396,8 +397,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 shared_output + token1 * kOutputStride + parent_row);
             const int global_row0   = row_begin + parent_row;
             const int global_row1   = global_row0 + 1;
-            const int global_token0 = token_begin + token0;
-            const int global_token1 = token_begin + token1;
+            // The last M tile may be partial. The activation code and scale descriptors carry the
+            // real token count as their row extent, so TMA zero-fills the rows past the end and a
+            // padded lane accumulates exactly zero. It only has to stay off other memory: clamp the
+            // token the epilogue reads with, and drop its store below.
+            const int global_token0 = min(token_begin + token0, token_count - 1);
+            const int global_token1 = min(token_begin + token1, token_count - 1);
             const float value00 =
                 epilogue.apply(global_row0, global_token0, accumulators[mma_m][mma_n][0] * alpha);
             const float value01 =
@@ -418,6 +423,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         const int token_local = task / kVectorsPerRow;
         const int row_vector  = task - token_local * kVectorsPerRow;
         const int token       = token_begin + token_local;
+        if (token >= token_count) { continue; }
         const uint4 values =
             load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
         output.store_vector(row_begin + row_vector * 8, token, values);

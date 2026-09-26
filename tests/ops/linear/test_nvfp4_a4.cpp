@@ -28,6 +28,8 @@ int run_nvfp4_a4() {
         Invocation{24, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{36, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA4},
+        Invocation{1500, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{2048, CallForm::Policy, ops::LinearPolicy::AllowA4},
         Invocation{4096, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
