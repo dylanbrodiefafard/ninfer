@@ -78,6 +78,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
+    std::size_t vision_text_gaps = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
     bool force_cold_prefill = false;
@@ -315,6 +316,14 @@ public:
                                std::span<const std::uint8_t> rejected = {});
     void abort_lane(std::uint32_t lane) noexcept;
     void retain_lane(std::uint32_t lane);
+    // Active sequences are retained in place. An already retained lane stays.
+    // False leaves the caller to drop the lane; this does not clear it.
+    [[nodiscard]] bool retain_reusable_lane(std::uint32_t lane);
+    // Copies the prompt prefix of a live or retained lane. `rewrite_frontier` is 0
+    // when that lane has no rewrite checkpoint inside the prompt.
+    [[nodiscard]] bool copy_reusable_prompt(std::uint32_t lane, std::uint32_t prompt_tokens,
+                                            std::vector<TokenId>& tokens,
+                                            std::uint32_t& rewrite_frontier) const;
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t lane);
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;

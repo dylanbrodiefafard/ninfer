@@ -118,6 +118,13 @@ ninfer_add_test(ninfer_qwen3_6_generation_recovery_test
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_qwen3_6_generation_recovery_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_recovery_executor_test
+  SOURCES targets/qwen3_6/test_recovery_executor.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_recovery_executor_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_tool_grammar_test
   SOURCES targets/qwen3_6/test_tool_grammar.cpp
   LIBRARIES ninfer_engine ninfer_tool_grammar)
@@ -162,6 +169,14 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_recovery_kv_real_test
+  SOURCES targets/qwen3_6_27b/test_recovery_kv_real.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+target_include_directories(ninfer_qwen3_6_27b_recovery_kv_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_qwen3_6_27b_recovery_kv_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
   SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)

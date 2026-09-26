@@ -252,11 +252,14 @@ repetition-evidence threshold, not a 4,096-token reasoning limit. The occurrence
 have a fixed separation,
 so changing words elsewhere in a multi-paragraph loop does not hide the repeated passage.
 Hashes locate candidates; exact token comparison confirms them. Two copies alone do not
-trigger a retry. Long reasoning without that repetition is not limited. The failed
-generated reasoning and closed historical reasoning are omitted from
-the internal retry context; original user content and actual tool results are preserved,
-and an explicitly labeled engine system notice asks for concrete progress. No call or
-tool result is invented. Reasoning and duplicate-tool recovery share the two-retry budget.
+trigger a retry. Long reasoning without that repetition is not limited. The retry keeps
+the cached prompt, including historical reasoning. It closes the open think turn and
+appends the notice or rejected-call feedback. Only the failed generation is omitted. A
+later retry appends another notice after the same close; the earlier notice stays. A
+ready checkpoint that is a prefix is trimmed and the suffix is prefilled. Original user
+content and actual tool results stay in that prompt, and an explicitly labeled engine
+system notice asks for concrete progress. No call or tool result is invented. Reasoning
+and duplicate-tool recovery share the two-retry budget.
 Raw output and media inputs do not use these internal retries. See the serving reference
 for the detector's conservative scope and recovery usage fields.
 

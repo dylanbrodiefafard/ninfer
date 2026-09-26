@@ -361,15 +361,19 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string replacement = placeholder(item);
-        if (rendered.rewrite_checkpoint) {
-            const std::size_t boundary = rendered.rewrite_checkpoint->offset;
-            const std::size_t end      = position + needle.size();
+        const auto shift_boundary     = [&](std::size_t boundary) {
+            const std::size_t end = position + needle.size();
             if (position < boundary && boundary < end) {
                 throw std::logic_error("rewrite checkpoint intersects a media placeholder");
             }
-            if (end <= boundary) {
-                rendered.rewrite_checkpoint->offset = boundary - needle.size() + replacement.size();
-            }
+            if (end <= boundary) { return boundary - needle.size() + replacement.size(); }
+            return boundary;
+        };
+        if (rendered.rewrite_checkpoint) {
+            rendered.rewrite_checkpoint->offset = shift_boundary(rendered.rewrite_checkpoint->offset);
+        }
+        for (std::size_t& offset : rendered.turn_closure_offsets) {
+            offset = shift_boundary(offset);
         }
         rendered.text.replace(position, needle.size(), replacement);
         search = position + replacement.size();
@@ -498,6 +502,35 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
     }
 }
 
+void append_turn_closure_frontiers(EncodedChat& encoded, const Tokenizer& tokenizer,
+                                   const RenderedChat& rendered) {
+    encoded.turn_closure_frontiers.reserve(rendered.turn_closure_offsets.size());
+    for (const std::size_t offset : rendered.turn_closure_offsets) {
+        if (rendered.rewrite_checkpoint && encoded.rewrite_checkpoint &&
+            offset == rendered.rewrite_checkpoint->offset) {
+            encoded.turn_closure_frontiers.push_back(encoded.rewrite_checkpoint->frontier);
+            continue;
+        }
+        if (offset > rendered.text.size()) {
+            throw std::logic_error("turn closure byte offset exceeds rendered chat");
+        }
+        if (offset == 0) { continue; }
+        const std::vector<int> prefix =
+            tokenizer.encode(std::string_view(rendered.text).substr(0, offset));
+        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
+            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+            throw std::logic_error("turn closure is not an exact token prefix");
+        }
+        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("turn closure token frontier exceeds uint32");
+        }
+        const auto frontier = static_cast<std::uint32_t>(prefix.size());
+        if (frontier < encoded.input_ids.size()) {
+            encoded.turn_closure_frontiers.push_back(frontier);
+        }
+    }
+}
+
 } // namespace
 
 std::string PreprocessStats::summary() const {
@@ -520,6 +553,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     EncodedChat encoded;
     if (!rendered.rewrite_checkpoint) {
         encoded.input_ids = tokenizer.encode(rendered.text);
+        append_turn_closure_frontiers(encoded, tokenizer, rendered);
         return encoded;
     }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
@@ -547,6 +581,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         .kind     = rendered.rewrite_checkpoint->kind,
         .frontier = frontier,
     };
+    append_turn_closure_frontiers(encoded, tokenizer, rendered);
     return encoded;
 }
 
@@ -615,8 +650,9 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
 
     rendered                  = expand_placeholders(std::move(rendered), items);
     EncodedChat encoded       = encode_rendered_chat(tokenizer_, rendered);
-    output.input_ids          = std::move(encoded.input_ids);
-    output.rewrite_checkpoint = encoded.rewrite_checkpoint;
+    output.input_ids               = std::move(encoded.input_ids);
+    output.rewrite_checkpoint      = encoded.rewrite_checkpoint;
+    output.turn_closure_frontiers  = std::move(encoded.turn_closure_frontiers);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

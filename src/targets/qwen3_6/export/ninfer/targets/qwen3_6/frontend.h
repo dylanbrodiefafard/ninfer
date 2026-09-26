@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -129,6 +130,12 @@ public:
     ~Frontend();
 
     [[nodiscard]] PreparedPrompt prepare(PromptInput input) const;
+    // Resident prompt prefix plus the empty-think close, the insert fragment, and a
+    // copy of the thinking prologue. Empty when that suffix does not round-trip.
+    [[nodiscard]] std::optional<PreparedPrompt>
+    splice_recovery_prompt(std::vector<TokenId> prefix, const PromptInput& source,
+                           std::span<const ChatMessage> insert,
+                           std::shared_ptr<const GenerationRecoveryContext> recovery) const;
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;

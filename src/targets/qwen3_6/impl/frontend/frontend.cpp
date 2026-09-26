@@ -331,6 +331,7 @@ std::unique_ptr<PreparedPromptData> make_text_prompt_data(fi::EncodedChat encode
     PreparedPromptData& result = *prepared;
     result.token_ids.assign(encoded.input_ids.begin(), encoded.input_ids.end());
     result.identity.rewrite_checkpoint = std::move(encoded.rewrite_checkpoint);
+    result.turn_closure_frontiers      = std::move(encoded.turn_closure_frontiers);
     assign_text_positions(result);
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
@@ -363,6 +364,7 @@ std::unique_ptr<PreparedPromptData> make_media_prompt_data(fi::ProcessedInput pr
     result.prepare.attention_pairs     = processed.stats.attention_pairs;
     result.prepare.patch_bytes         = processed.stats.patch_bytes;
     result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+    result.turn_closure_frontiers      = std::move(processed.turn_closure_frontiers);
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
@@ -1270,6 +1272,99 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     result.identity.reusable = allow_prefix_identity;
     result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
+}
+
+namespace {
+
+std::optional<std::vector<TokenId>> encode_round_trip(const fi::Tokenizer& tokenizer,
+                                                      std::string_view text, std::string& decoded) {
+    decoded.clear();
+    if (text.empty()) { return std::nullopt; }
+    const std::vector<int> encoded = tokenizer.encode(text);
+    if (encoded.empty()) { return std::nullopt; }
+    std::vector<TokenId> ids;
+    ids.reserve(encoded.size());
+    for (const int id : encoded) {
+        if (!tokenizer.is_valid_token(id)) { return std::nullopt; }
+        decoded += tokenizer.decode_token_bytes(id);
+        ids.push_back(static_cast<TokenId>(id));
+    }
+    if (decoded != text) { return std::nullopt; }
+    return ids;
+}
+
+bool insert_enables_tool_output(const PromptInput& source, std::span<const ChatMessage> insert) {
+    if (enables_tool_output(source)) { return true; }
+    return std::any_of(insert.begin(), insert.end(), [](const ChatMessage& message) {
+        return message.role == ChatRole::Tool ||
+               (message.role == ChatRole::Assistant && !message.tool_calls.empty());
+    });
+}
+
+} // namespace
+
+std::optional<PreparedPrompt> Frontend::splice_recovery_prompt(
+    std::vector<TokenId> prefix, const PromptInput& source, std::span<const ChatMessage> insert,
+    std::shared_ptr<const GenerationRecoveryContext> recovery) const {
+    if (impl_ == nullptr || prefix.empty() || insert.empty()) { return std::nullopt; }
+    try {
+        std::string prologue_decoded;
+        std::string close_decoded;
+        std::string fragment_decoded;
+        const auto prologue_ids =
+            encode_round_trip(*impl_->tokenizer, kRecoveryThinkingPrologue, prologue_decoded);
+        const auto close_ids =
+            encode_round_trip(*impl_->tokenizer, kRecoveryTurnClose, close_decoded);
+        if (!prologue_ids || !close_ids) { return std::nullopt; }
+
+        std::vector<ChatMessage> owned(insert.begin(), insert.end());
+        const fi::ChatRenderOptions fragment_options{
+            .add_generation_prompt = false,
+            .enable_thinking       = source.options.enable_thinking,
+            .reasoning_effort      = source.options.reasoning_effort,
+            .preserve_thinking     = source.options.preserve_thinking,
+            .add_vision_id         = false,
+            .tool_jsons            = {},
+        };
+        const std::string fragment = impl_->chat_template.render_fragment(
+            convert_messages(std::move(owned)), fragment_options);
+        const auto fragment_ids = encode_round_trip(*impl_->tokenizer, fragment, fragment_decoded);
+        if (!fragment_ids ||
+            !recovery_suffix_tokens_ok(prefix, *prologue_ids, *close_ids, *fragment_ids,
+                                       kRecoveryThinkingPrologue, prologue_decoded,
+                                       kRecoveryTurnClose, close_decoded, fragment,
+                                       fragment_decoded)) {
+            return std::nullopt;
+        }
+
+        prefix.reserve(prefix.size() + close_ids->size() + fragment_ids->size() +
+                       prologue_ids->size());
+        prefix.insert(prefix.end(), close_ids->begin(), close_ids->end());
+        prefix.insert(prefix.end(), fragment_ids->begin(), fragment_ids->end());
+        prefix.insert(prefix.end(), prologue_ids->begin(), prologue_ids->end());
+
+        const auto start = Clock::now();
+        auto data        = std::make_unique<PreparedPromptData>();
+        data->token_ids  = std::move(prefix);
+        assign_text_positions(*data);
+        (void)checked_token_count(data->token_ids.size());
+        data->identity.reusable = true;
+        data->identity.rewrite_checkpoint = RewriteCheckpointSpec{
+            .kind     = RewriteCheckpointKind::ResponseReplay,
+            .frontier = static_cast<std::uint32_t>(data->token_ids.size()),
+        };
+        data->starts_in_reasoning = true;
+        data->tool_output_enabled = insert_enables_tool_output(source, insert);
+        data->tool_grammar        = impl_->tool_grammar.compile(source.options.tool_jsons,
+                                                                source.options.enable_thinking);
+        data->generation_recovery = std::move(recovery);
+        data->prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
+        return PreparedPrompt(std::move(data));
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    } catch (const std::out_of_range&) {
+        return std::nullopt;
+    }
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,

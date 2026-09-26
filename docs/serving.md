@@ -409,12 +409,16 @@ reasoning as well. Different results, changed arguments, an intervening user tur
 media, or ordinary short polling do not meet that evidence. This conservative detector
 does not recognize every multi-tool cycle or infer arbitrary external state changes.
 
-Recovery preserves real conversation content/results, removes closed assistant reasoning
-from the internal retry prompt, and adds feedback explicitly stating that the rejected
-proposal was not executed. It permits at most two retries within the original completion
-token budget and resource reservation. It neither executes tools nor forces EOS. Already
-streamed reasoning/prose remains visible; rejected calls are never published. A novel valid
-call is not a guarantee that the model has made useful progress.
+Recovery keeps the cached prompt, including historical reasoning. It closes the open
+think turn and appends feedback stating that the rejected proposal was not executed.
+Only the failed generation is omitted. A later retry appends another notice after the
+same close; the earlier notice stays in the prompt. A ready checkpoint that is a prefix
+of the spliced prompt is trimmed and the suffix is prefilled. When no complete checkpoint
+matches that prefix, the spliced prompt is prefilled from an empty KV image. It permits
+at most two retries within the original completion token budget and resource reservation.
+It neither executes tools nor forces EOS. Already streamed reasoning/prose remains
+visible; rejected calls are never published. A novel valid call is not a guarantee that
+the model has made useful progress.
 
 Text-only p-less thinking requests can also retry persistent generated reasoning before
 a tool call exists. Three non-overlapping occurrences of an identical 256-token reasoning
@@ -422,15 +426,19 @@ passage must appear within the current generated attempt. Their separation may d
 this catches multi-paragraph loops whose periods change after a one-token intervention.
 In addition, repeated passages must cover at least 4,096 distinct redundant tokens;
 overlapping windows cannot count the same tokens twice. This conservative threshold
-allows shorter loops to escape naturally without an expensive full-context retry.
+allows shorter loops to escape naturally without a recovery retry.
 It does not cap reasoning at 4,096 tokens.
 Hashes only locate candidates; exact generated-token comparison proves the match. Prompt
 tokens and previous attempts cannot supply occurrences. Two copies alone do not trigger
 a retry. It is not a reasoning-length
-timeout. The retry discards the failed attempt's reasoning from its internal context,
-removes closed historical reasoning, preserves the original task and completed tool results,
-and appends an explicitly labeled engine system notice. It creates no assistant tool call,
-tool result, or user message. Already streamed reasoning remains visible, separated from
+timeout. The retry keeps the cached prompt, including historical reasoning. It closes the
+open think turn and appends an explicitly labeled engine system notice. Only the failed
+generation is omitted. A later retry appends another notice after the same close; the
+earlier notice stays. It creates no assistant tool call, tool result, or user message.
+A ready checkpoint that is a prefix of the spliced prompt is trimmed and the suffix is
+prefilled. When no complete checkpoint matches that prefix, the spliced prompt is
+prefilled from an empty KV image. The failed attempt's generated tokens are not part of
+the retry prompt. Already streamed reasoning remains visible, separated from
 the retry by a blank line, and charged to
 completion usage. Both recovery causes share the same maximum of two retries. Requests
 with media, raw output, disabled thinking, or non-p-less sampling do not use reasoning retries.
@@ -463,7 +471,7 @@ that object reports discarded-generation retries, whereas cycle exclusions are l
 
 The server emits live `[req N] recovery` console records for streaming and non-streaming
 requests on all three HTTP surfaces. `retry_triggered` identifies `repeated_reasoning` or
-`duplicate_tool_call`; `retry_started` marks the cold-context rebuild, and
+`duplicate_tool_call`; `retry_started` marks the retry prefill, and
 `retry_prefill_complete` marks its completion. `exhausted` is a warning before the request
 error. `finished` reports the terminal outcome (including cancellation or output limits),
 not a claim that the task succeeded. Records include started attempt count,
@@ -874,7 +882,7 @@ Runtime cache capacity or optional capture-allocation failures skip the capture 
 generation. Optional cache-lookup allocation failure leaves normal cold admission available.
 If a disk cache read or optional RAM/disk restore metadata or CUDA-event allocation fails before
 prefill, the Engine drains the partial restore,
-excludes that entry from reuse, and recomputes the prompt without prefix reuse. The same request
+excludes that entry from reuse, and recomputes the prompt from an empty KV image. The same request
 returns through normal capacity admission; its original queue deadline does not expire this
 already-admitted recovery. This cache fallback does not produce `service_unavailable`.
 Disk format v6 fingerprints canonical logical KV pages rather than the current GPU pool capacity,

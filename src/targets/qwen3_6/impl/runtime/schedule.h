@@ -188,6 +188,10 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
 
+[[nodiscard]] PrefillChunkResult prefill_mrope_text_chunk(
+    PrefillContext& state, const qwen3_6::PreparedPromptData& prompt, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
+
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
                          VisionPrefillSession& vision, std::uint32_t nominal_length,
