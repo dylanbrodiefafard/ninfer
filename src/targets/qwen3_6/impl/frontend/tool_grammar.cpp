@@ -22,6 +22,53 @@ bool annotation(std::string_view key) {
            key == "readOnly" || key == "writeOnly" || key == "$comment";
 }
 
+// Rewrites a client schema into one the grammar compiler enforces, accepting a superset of the
+// client's instances so a valid call is never masked out; the client still validates the
+// arguments it receives. `format` and the content keywords are annotations in JSON Schema 2020-12.
+// Assertions that only narrow the instance set are dropped, `oneOf` widens to `anyOf`, and a
+// single-branch `allOf` with annotation-only siblings is inlined. Keywords that grant instances
+// (`patternProperties`, a multi-branch `allOf`) stay and are rejected by check_schema.
+void relax_schema(Json& schema) {
+    if (!schema.is_object()) { return; }
+    // Inline first so the inlined keywords are relaxed below.
+    if (schema.contains("allOf") && schema["allOf"].is_array() && schema["allOf"].size() == 1 &&
+        schema["allOf"][0].is_object()) {
+        const bool annotation_siblings =
+            std::all_of(schema.items().begin(), schema.items().end(), [](const auto& item) {
+                return item.key() == "allOf" || annotation(item.key());
+            });
+        if (annotation_siblings) {
+            Json inner = std::move(schema["allOf"][0]);
+            schema.erase("allOf");
+            for (auto it = inner.begin(); it != inner.end(); ++it) { schema[it.key()] = it.value(); }
+        }
+    }
+    for (const char* key :
+         {"format", "contentEncoding", "contentMediaType", "contentSchema", "uniqueItems",
+          "multipleOf", "propertyNames", "not", "contains", "minContains", "maxContains",
+          "dependentRequired", "dependentSchemas", "if", "then", "else", "unevaluatedProperties",
+          "unevaluatedItems"}) {
+        schema.erase(key);
+    }
+    if (schema.contains("oneOf") && !schema.contains("anyOf")) {
+        schema["anyOf"] = std::move(schema["oneOf"]);
+        schema.erase("oneOf");
+    }
+    for (const char* map : {"properties", "$defs", "definitions"}) {
+        if (schema.contains(map) && schema[map].is_object()) {
+            for (auto& child : schema[map]) { relax_schema(child); }
+        }
+    }
+    for (const char* child : {"items", "additionalProperties"}) {
+        if (schema.contains(child)) { relax_schema(schema[child]); }
+    }
+    for (const char* list : {"prefixItems", "anyOf", "allOf"}) {
+        if (schema.contains(list) && schema[list].is_array()) {
+            for (auto& child : schema[list]) { relax_schema(child); }
+        }
+    }
+}
+
 void check_schema(const Json& schema) {
     if (schema.is_boolean()) { return; }
     if (!schema.is_object()) { throw std::invalid_argument("tool schema must be an object or boolean"); }
@@ -243,6 +290,7 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
                 throw std::invalid_argument("invalid or duplicate tool name: " + name);
             }
             Json schema = function.value("parameters", Json{{"type", "object"}});
+            relax_schema(schema);
             check_schema(schema);
             name_required_properties(schema);
             definitions.push_back({name, schema, std::nullopt});

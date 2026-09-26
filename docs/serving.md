@@ -360,10 +360,17 @@ warning; it does not invent a structured tool call. Each completed output has a 
 `function_call_output` Item in a later request. NInfer does not execute functions. Its schema
 subset supports scalar/container types, properties/required/additionalProperties, array bounds,
 numeric bounds, string patterns/length bounds, enums/constants, local references, and supported
-`anyOf` forms. A string `pattern` combined with `minLength` or `maxLength` is not
-supported: the compiler would otherwise ignore the length bound. Unsupported assertions
-or assertion combinations are rejected during preparation
-rather than silently ignored, with HTTP 400, `code: invalid_tool_schema`, and
+`anyOf` forms. Keywords the grammar cannot enforce are relaxed so the grammar accepts a superset
+of the schema's instances, and the client remains the validator for them: `format` and the
+`content*` keywords are annotations; `oneOf` is constrained as `anyOf`; a single-branch `allOf`
+with annotation-only siblings is inlined; and the narrowing-only assertions `not`,
+`propertyNames`, `uniqueItems`, `multipleOf`, `contains`/`minContains`/`maxContains`,
+`dependentRequired`/`dependentSchemas`, `if`/`then`/`else`, and
+`unevaluatedProperties`/`unevaluatedItems` are not enforced. The prompt still shows the model the
+original schema. A string `pattern` combined with `minLength` or `maxLength` is not
+supported: the compiler would otherwise ignore the length bound. Other unsupported assertions
+(for example `patternProperties` or a multi-branch `allOf`) or assertion combinations are
+rejected during preparation, with HTTP 400, `code: invalid_tool_schema`, and
 `param: tools` on the OpenAI error surface. Malformed schemas, patterns and unresolved
 references use the same classification and retain the compiler diagnostic.
 This is not full JSON Schema or OpenAI strict-tool parity:
