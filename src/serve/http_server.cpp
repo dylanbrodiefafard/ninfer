@@ -878,6 +878,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 };
                 output.on_content = [&](const std::string& text) {
                     if (thinking_open) {
+                        write_stream_item(sink, *stream,
+                                          make_content_block_delta_signature(thinking_index, id));
                         write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
                         thinking_open = false;
                     }
@@ -900,6 +902,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const std::string_view remaining = unstreamed_content(outcome);
 
                 if (thinking_open) {
+                    write_stream_item(sink, *stream,
+                                      make_content_block_delta_signature(thinking_index, id));
                     write_stream_item(sink, *stream, make_content_block_stop(thinking_index));
                     thinking_open = false;
                 }

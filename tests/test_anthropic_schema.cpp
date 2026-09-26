@@ -638,8 +638,9 @@ int test_response_serialization() {
     const Json& content = resp.at("content");
     failures += check(content.size() == 3, "thinking + text + tool_use blocks");
     failures += check(content.at(0).at("type") == "thinking" &&
-                          content.at(0).at("thinking") == "the reasoning",
-                      "thinking block");
+                          content.at(0).at("thinking") == "the reasoning" &&
+                          content.at(0).at("signature") == "msg_1",
+                      "thinking block carries a non-empty signature");
     failures +=
         check(content.at(1).at("type") == "text" && content.at(1).at("text") == "the answer",
               "text block");
@@ -691,6 +692,12 @@ int test_streaming_events() {
     failures += check(thdelta.at("delta").at("type") == "thinking_delta" &&
                           thdelta.at("delta").at("thinking") == "hmm",
                       "thinking_delta");
+
+    const Json sigdelta = parse_sse(make_content_block_delta_signature(0, "msg_1"), &type);
+    failures += check(type == "content_block_delta" && sigdelta.at("index") == 0 &&
+                          sigdelta.at("delta").at("type") == "signature_delta" &&
+                          sigdelta.at("delta").at("signature") == "msg_1",
+                      "signature_delta");
 
     const ToolCall call{"toolu_2", "get_weather", R"({"city":"Paris"})"};
     const Json tustart = parse_sse(make_content_block_start_tool_use(2, call), &type);
