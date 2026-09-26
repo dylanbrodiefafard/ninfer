@@ -246,8 +246,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if len(args.concurrency) != len(set(args.concurrency)):
         raise corpus.CampaignError("duplicate --concurrency value")
     for concurrency in args.concurrency:
-        if concurrency < 1 or concurrency > 4:
-            raise corpus.CampaignError("--concurrency must be in [1, 4]")
+        if concurrency < 1 or concurrency > 6:
+            raise corpus.CampaignError("--concurrency must be in [1, 6]")
     if len(args.suite) != len(set(args.suite)):
         raise corpus.CampaignError("duplicate --suite value")
 

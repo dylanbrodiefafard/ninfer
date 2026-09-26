@@ -11,7 +11,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 ## 1. Requirements
 
-- `max_concurrency=1..4` 的 active requests 共享各类 growing KV capacity；
+- `max_concurrency=1..6` 的 active requests 共享各类 growing KV capacity；
 - 单个 request 可以使用 main KV pool 的大部分容量，不按 slot 平均切分；
 - 不同 request 的物理 KV 不要求连续；
 - active、retained 和 speculative provisional KV 使用同一套 reservation accounting；

@@ -31,12 +31,14 @@ Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..5
 `--spec dflash --draft-tokens 4 --lm-head-draft` is the measured single-request speed recommendation.
 For long concurrent AIME responses, the current [C=2–4 measurements](performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22)
 favor fixed `--draft-tokens 2` at C=2/3 and `--draft-tokens 5 --adaptive-draft` at C=4,
-with `--lm-head-draft` in both cases.
+with `--lm-head-draft` in both cases. At [C=5/6](performance.md#concurrency-c56-2026-09-25),
+`--draft-tokens 5 --adaptive-draft --lm-head-draft` reaches 550/626 aggregate tok/s.
 With `--draft-tokens 5`, `--adaptive-draft` picks live DFlash k in `{1,2,3,4,5}`
 after each round by locking
 `argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` and online least-squares round time
-(shared slope, per-k intercept). An unmeasured k is probed at most once and dropped when
-dominated; switching k costs 1 ms. That is a sticky policy, not a once-per-launch latch: see
+(shared slope, per-k intercept). Every captured k is measured once per batch size before the
+argmax applies, because round time need not grow smoothly with k;
+switching k costs 1 ms. That is a sticky policy, not a once-per-launch latch: see
 [adaptive draft length](maintainer/qwen3.6-27b-model.md#81-adaptive-draft-length). Frozen `--draft-tokens 4` stays `{4}`.
 A later request cannot enable a capability omitted at startup.
 
@@ -657,7 +659,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
-| `--max-concurrency N` | maximum admitted requests; valid range `1..4` | `1` |
+| `--max-concurrency N` | maximum admitted requests; valid range `1..6` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `4096` |
@@ -832,7 +834,7 @@ raw values.
 
 ## Execution behavior
 
-The server owns one resident Engine with a startup-fixed capacity of `1..4` active generation
+The server owns one resident Engine with a startup-fixed capacity of `1..6` active generation
 requests. At each decode boundary, every decode-ready request is compacted into one batch and
 processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay. A
 request joins that batch only after its single-request prefill finishes; when it completes or is

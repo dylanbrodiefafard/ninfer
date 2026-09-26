@@ -84,7 +84,8 @@ bool is_nvfp4_dflash_w5_aggregate_problem(std::int32_t output_rows, std::int32_t
                                           LinearPolicy policy) noexcept {
     if (!is_nvfp4_linear_problem(output_rows, input_rows)) { return false; }
     const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
-    if (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut) {
+    if (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
+        problem == Nvfp4Problem::DflashFeature) {
         return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA4;
     }
     if (problem == Nvfp4Problem::DflashConvProj) { return policy == LinearPolicy::A16Only; }

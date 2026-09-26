@@ -72,9 +72,9 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
 
 // Residual verify is [rows, T] with T=width*batch when a caller packs sequences. NVFP4 W4A4
 // and SmallT/Q4-head routes key off that T, so packed_route_tokens preserves the C=1-width
-// reduction profile: qualified shapes aggregate B=2..4 and other shapes panel per request.
+// reduction profile: qualified shapes aggregate B=2..6 and other shapes panel per request.
 // GQA remains request-indexed. NVFP4 GDN conv-record uses fused SmallT at B=1 W=4,
-// grouped W=5/6 weight replay at B=1, qualified W=2/5 grouped replay at B=2..4, and
+// grouped W=5/6 weight replay at B=1, qualified W=2/5 grouped replay at B=2..6, and
 // request-indexed SmallT for the other B>1 widths.
 // DFlash proposal still isolates compact rows so SWA envelopes follow each sequence's frontier.
 std::int32_t packed_route_tokens(std::int32_t batch, std::int32_t width) {
@@ -661,7 +661,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
-        throw std::invalid_argument("ordinary decode batch size must be in [1,4]");
+        throw std::invalid_argument("ordinary decode batch size must be in [1,6]");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");

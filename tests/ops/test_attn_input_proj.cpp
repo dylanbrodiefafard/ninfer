@@ -291,10 +291,10 @@ int run_bf16_target() {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
-    for (const std::int32_t tokens : {1, 2, 10, 15, 20, 22, 23, 128}) {
+    for (const std::int32_t tokens : {1, 2, 10, 15, 20, 22, 23, 25, 30, 128}) {
         failures += run_bf16_target_case(parent, tokens);
     }
-    for (const std::int32_t tokens : {10, 15, 20}) {
+    for (const std::int32_t tokens : {10, 15, 20, 25, 30}) {
         failures += run_bf16_w5_panels(parent, tokens);
     }
     return failures;
@@ -350,7 +350,8 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
     return failures;
 }
 
-int run_nvfp4_panels(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t panel) {
+int run_nvfp4_panels(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t panel,
+                     ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -366,15 +367,16 @@ int run_nvfp4_panels(DevicePackedWeight& parent, std::int32_t tokens, std::int32
     Tensor pq = packed_q.tensor(), pg = packed_gate.tensor(), pk = packed_k.tensor();
     Tensor pv = packed_value.tensor(), cq = panel_q.tensor(), cg = panel_gate.tensor();
     Tensor ck = panel_k.tensor(), cv = panel_value.tensor();
-    DeviceArena workspace(256);
-    ops::attn_input_proj(x, parent.view(), pq, pg, pk, pv, ops::LinearPolicy::A16Only, workspace,
-                         nullptr);
+    DeviceArena workspace(std::max<std::size_t>(
+        256, ops::attn_input_proj_workspace_capacity_bytes(QType::NVFP4, 14336, kHidden, policy,
+                                                           1, tokens)));
+    ops::attn_input_proj(x, parent.view(), pq, pg, pk, pv, policy, workspace, nullptr);
     for (std::int32_t offset = 0; offset < tokens; offset += panel) {
         Tensor panel_x = x.slice(1, offset, panel);
         Tensor out_q = cq.slice(1, offset, panel), out_g = cg.slice(1, offset, panel);
         Tensor out_k = ck.slice(1, offset, panel), out_v = cv.slice(1, offset, panel);
-        ops::attn_input_proj(panel_x, parent.view(), out_q, out_g, out_k, out_v,
-                             ops::LinearPolicy::A16Only, workspace, nullptr);
+        ops::attn_input_proj(panel_x, parent.view(), out_q, out_g, out_k, out_v, policy,
+                             workspace, nullptr);
     }
     cuda_synchronize();
 
@@ -382,7 +384,8 @@ int run_nvfp4_panels(DevicePackedWeight& parent, std::int32_t tokens, std::int32
     const auto exact = [&](std::string_view name, const GuardedBf16Tensor& packed,
                            const GuardedBf16Tensor& panels) {
         if (packed.bits() == panels.bits()) { return; }
-        std::cerr << "attn " << name << " NVFP4 A16 W" << panel << " panels T=" << tokens
+        std::cerr << "attn " << name << " NVFP4 policy=" << static_cast<int>(policy) << " W"
+                  << panel << " panels T=" << tokens
                   << ": packed output differs from panels\n";
         ++failures;
     };
@@ -477,10 +480,16 @@ int run_nvfp4_target() {
             failures += run_nvfp4_panels(parent, panel * batch, panel);
         }
     }
+    // Every verify width uses A8; aggregates across C<=6 equal their W-panels.
+    for (const std::int32_t panel : {2, 3, 4, 5, 6}) {
+        for (std::int32_t batch = 2; batch <= 6; ++batch) {
+            failures += run_nvfp4_panels(parent, panel * batch, panel, ops::LinearPolicy::AllowA8);
+        }
+    }
     for (const std::int32_t tokens : {1, 4, 15, 36, 1024}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
-    for (const std::int32_t tokens : {4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24}) {
+    for (const std::int32_t tokens : {4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24, 25, 30, 33, 36}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     for (const std::int32_t tokens : {2}) {

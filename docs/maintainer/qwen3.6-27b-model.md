@@ -480,13 +480,16 @@ coin-flip lead does not thrash graphs. Ties keep the smaller k. At C≥2 the bat
 hops are observed per row; the next k is one number written onto every row.
 
 A mixing bandit would keep sampling 3, 4, and 5. Mixing k forks the greedy CUDA-graph path
-and, at C≥2, makes every row wait on the same k. After T is measured the policy always takes
-the current argmax. That is sticky; it may still move if hops really change, or if budget
+and, at C≥2, makes every row wait on the same k. T is engine-global per batch size, and each
+captured k is measured once per batch size before exploitation: shorter arms bound nothing,
+because verify routes and tiles change with T=W×C. With A16 W2/W3 verification a C=6 k=1 round
+(~36 ms) cost more than k=4 (~24 ms), and extrapolating 2T(k−1)−T(k−2) from k=1/2 hid k=3..5
+and locked C=6 at k=1. After T is measured the policy always takes the current argmax. That is sticky; it may still move if hops really change, or if budget
 cannot afford the locked k.
 
 On a long-lived serve, T is known after the first requests. A later request still starts with
 empty hops (`live_k = 0` on C=1), so the first rounds mostly pick from known T until this
-prompt’s coins exist, then sit on one k. Host tests cover hop updates, dominance, one probe,
+prompt’s coins exist, then sit on one k. Host tests cover hop updates, dominance, one measurement per arm,
 and shared batch k. DFlash includes k=1/2 because short verification batches can win at C>1
 when later-hop acceptance is low. Their NVFP4 MLP and attention-input projections aggregate
 requests into one weight pass; W=2..4 NVFP4 residual projections do likewise. Every

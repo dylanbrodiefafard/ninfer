@@ -246,7 +246,7 @@ inline constexpr std::int32_t kNvfp4FirstW4a4MtpFc         = 8;
 inline constexpr std::int32_t kNvfp4FirstA8 = 2;
 // Tree/chain verify is W<=16. AllowA8 conv-record is W4A8 at every width; under A16, packed
 // GDN conv-record uses fused SmallT for B=1 W=4,
-// grouped SmallT replay for B=1 W=5/6 and B=2..4 W=2/5, fused T=1-reduction
+// grouped SmallT replay for B=1 W=5/6 and B=2..6 W=2/5, fused T=1-reduction
 // GEMV+FP32 conv for other B=1 widths, and one same-reduction request-indexed SmallT
 // grid for other B>1 widths. Snapshot T=2..16 stays fused SmallT. W4A4 Materialized
 // compose is prefill.

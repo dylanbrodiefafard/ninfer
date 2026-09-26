@@ -170,10 +170,14 @@ int test_cli_contract() {
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "2"})
             .concurrency,
         2, "concurrency 2");
+    failures += expect_u32(
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "6"})
+            .concurrency,
+        6, "concurrency 6");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "5"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "7"});
         },
         "unsupported concurrency");
     return failures;

@@ -160,13 +160,12 @@ void gdn_norm_gating_proj_packed_sequences(
 
     const std::int32_t tokens = x.ne[1];
     const std::int32_t batch = tokens / sequence_width;
-    if (batch <= 0 || batch > 4) {
+    if (batch <= 0 || batch > detail::kBf16GdnGatingPackedMaxBatch) {
         throw std::invalid_argument(
-            "gdn_norm_gating_proj_packed_sequences: batch must be in 1..4");
+            "gdn_norm_gating_proj_packed_sequences: batch must be in 1..6");
     }
-    const bool aggregate_w5 = sequence_width == 5 && batch >= 2;
-    if (aggregate_w5) {
-        detail::bf16_gdn_norm_gating_packed_w5_dispatch(
+    if (detail::bf16_gdn_gating_packed_aggregates(sequence_width, batch)) {
+        detail::bf16_gdn_norm_gating_packed_dispatch(
             x, norm_weight, eps, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
         return;
     }

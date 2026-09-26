@@ -77,7 +77,7 @@ std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::
                                                       std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
     if (min_tokens < 2 || max_tokens < min_tokens || max_tokens > 16 ||
-        batch_size <= 0 || batch_size > 4) {
+        batch_size <= 0 || batch_size > 6) {
         throw std::invalid_argument("nvfp4 gdn record workspace: invalid B/T domain");
     }
     (void)nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
