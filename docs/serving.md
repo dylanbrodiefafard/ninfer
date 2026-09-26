@@ -120,6 +120,11 @@ both `system` and `developer` to system-class ChatML blocks at their original po
 move later instructions to the beginning of the conversation. A leading instruction keeps the
 artifact template's existing tool/reasoning-instruction composition.
 
+Only chat-template markup encodes as control tokens. Client-supplied text (message content,
+reasoning history, tool-call names and arguments, tool results, and tool definitions) is literal:
+a file or tool result that spells `<|im_end|>`, `<tool_call>`, `<think>`, or a vision placeholder
+encodes as ordinary text and cannot open or close a turn, a tool call, or a media slot.
+
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,

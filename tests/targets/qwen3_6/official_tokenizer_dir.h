@@ -13,6 +13,7 @@ inline const std::optional<std::string>& official_tokenizer_dir() {
         const char* env = std::getenv("NINFER_OFFICIAL_TOKENIZER_DIR");
         const char* candidates[] = {
             env,
+            "/models/qwen3.8-27b-bf16",
         };
         for (const char* path : candidates) {
             if (path == nullptr || path[0] == '\0') { continue; }

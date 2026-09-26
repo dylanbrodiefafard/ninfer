@@ -1,5 +1,7 @@
 #pragma once
 
+#include "targets/qwen3_6/impl/frontend/tokenizer.h"
+
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/types.h>
 
@@ -56,6 +58,13 @@ struct ChatPart {
     }
 };
 
+// Rendered text plus the byte spans that came from the client (message text, tool calls, tool
+// definitions). Template markup outside those spans is structural and encodes with added tokens.
+struct RenderedFragment {
+    std::string text;
+    std::vector<ByteSpan> literal_spans;
+};
+
 struct ChatMessage {
     ChatRole role = ChatRole::User;
     std::vector<ChatPart> parts;
@@ -64,9 +73,9 @@ struct ChatMessage {
     std::string tool_call_id;
 
     [[nodiscard]] bool has_media() const noexcept;
-    [[nodiscard]] std::string rendered_content(bool add_vision_id = false,
-                                               int* image_count   = nullptr,
-                                               int* video_count   = nullptr) const;
+    [[nodiscard]] RenderedFragment rendered_content(bool add_vision_id = false,
+                                                    int* image_count   = nullptr,
+                                                    int* video_count   = nullptr) const;
 };
 
 struct ChatRenderOptions {
@@ -85,6 +94,7 @@ struct RewriteCheckpointByteSpec {
 
 struct RenderedChat {
     std::string text;
+    std::vector<ByteSpan> literal_spans;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
 };
 

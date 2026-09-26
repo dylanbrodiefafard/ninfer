@@ -386,11 +386,12 @@ int check_splice_matches_cold(const fi::Tokenizer& tokenizer, const fi::Rendered
     if (failures != 0) { return failures; }
     const std::size_t n = committed.text.size();
     failures +=
-        check(tokenizer.is_encode_loop_pos(full.text, n),
+        check(tokenizer.is_encode_loop_pos(full.text, n, {}, full.literal_spans),
               (std::string(message) + ": committed size is not a loop-pos of full").c_str());
-    const std::vector<int> committed_ids = tokenizer.encode(committed.text);
+    const std::vector<int> committed_ids =
+        tokenizer.encode(committed.text, {}, committed.literal_spans);
     const auto spliced = fi::try_splice_encoded_chat(tokenizer, committed_ids, full.text, n,
-                                                     full.rewrite_checkpoint);
+                                                     full.rewrite_checkpoint, full.literal_spans);
     const fi::EncodedChat cold = fi::encode_rendered_chat(tokenizer, full);
     failures += check(spliced.has_value(), (std::string(message) + ": splice refused").c_str());
     if (!spliced) { return failures; }
@@ -1064,7 +1065,8 @@ int test_concurrency_and_copy_out() {
                                             planted_full.rewrite_checkpoint
                                                 ? std::optional<std::size_t>{
                                                       planted_full.rewrite_checkpoint->offset}
-                                                : std::nullopt);
+                                                : std::nullopt,
+                                            planted_full.literal_spans);
     failures += check(copied.has_value(), "C3 did not copy the planted prefix");
     for (int i = 0; i < 16; ++i) {
         const std::string text = "evict-" + std::to_string(i) + std::string(32, 'x');
@@ -1286,7 +1288,7 @@ int test_coverage_gaps() {
     video_message.parts.push_back(std::move(video));
     fi::EncodedHistoryCache media_cache;
     (void)cached_prepare(toy, media_cache,
-                         product_input({product_message(ninfer::ChatRole::User, "AB")}));
+                         product_input({product_message(ninfer::ChatRole::User, "x")}));
     const std::size_t after_text = media_cache.size();
     auto video_call = cached_prepare(toy, media_cache, product_input({video_message}));
     failures += check(!video_call.observation.cache_hit && media_cache.size() == after_text &&

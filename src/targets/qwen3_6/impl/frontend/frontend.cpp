@@ -1259,7 +1259,8 @@ std::uint32_t Frontend::count_tokens(PromptInput input) const {
     if (!has_media) {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options));
-        return checked_token_count(impl_->tokenizer->encode(rendered.text).size());
+        return checked_token_count(
+            impl_->tokenizer->encode(rendered.text, {}, rendered.literal_spans).size());
     }
 
     fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor);
