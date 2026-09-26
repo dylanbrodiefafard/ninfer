@@ -141,9 +141,11 @@ persistent 部分直接来自生产 `LayoutBuilder`，workspace 来自生产 sch
 resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation probing。最终 plan 再由同一 builder
 按 `M` 生成并核对 reservation curve。
 
-DFlash2 的 CUDA Graph allowance 按每个 `(K, B, topology)` executable 计 12 MiB，包含其
-reachable definitions；DFlash adaptive `K={1,2,3,4,5}`、`C=4` 的当前单 topology 共 240 MiB。
-不能套用 autoregressive DFlash 的 64/96 MiB unroll allowance。所有 definitions 和 executables
+单 schedule graph families（ordinary、MTP、DFlash2）的 CUDA Graph allowance 按 `(K, B, topology)`
+executable 数 `n` 计 `min(12n, 24+6n)` MiB，包含其 reachable definitions：实测总量是固定 warm-up 部分加
+每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。DFlash adaptive
+`K={1,2,3,4,5}`、`C=4` 的 20 个 executable 共 144 MiB。不能套用 autoregressive DFlash 的 64/96 MiB
+unroll allowance。所有 definitions 和 executables
 在 startup 建立，实测 graph allocation 超过 allowance 时启动失败。4096-token prefill 和 adaptive
 K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV pool。
 
@@ -805,12 +807,12 @@ Incoming prompt 的复用路径为：
   frontier、恢复 checkpoint，再 prefill suffix；
 - prompt 匹配一条 ladder head 于 `F` 时，走 `restore_context_checkpoint`：把该 head 的 GDN 装入
   current、hidden 装入 `tail_hidden`（不写 rewrite hidden），trim KV 到 `F`，保留 `frontier<=F`
-  的 heads（含 `F` 本身），丢掉 `frontier>F` 的 heads 以及 `rewrite.frontier>F` 的 VRAM rewrite；
+  的 heads（含 `F` 本身），丢掉 `frontier>F` 的 heads 以及 `rewrite.frontier>F` 的 resident rewrite；
   DFlash 同时从该 head 恢复 cyclic 并设 `dflash_context_frontier=F`；
 - prompt 匹配 turn-rollback head 于上一完成 `E` 时，走 `restore_turn_rollback`：同一套完整
   checkpoint 配方（GDN→current，hidden→`tail_hidden`，MTP `mtp_kv_valid=E-1`，DFlash cyclic 与
-  `dflash_context_frontier=E`）。VRAM D2D `2C→current`
-  仅当 staging identity 仍是该 head；否则 unpack host。Ladder freeze 借 `2C` 后必须装回 rollback；
+  `dflash_context_frontier=E`）。VRAM D2D `C→current`（staging slot）
+  仅当 staging identity 仍是该 head；否则 unpack host。Ladder freeze 借 staging slot 后必须装回 rollback；
 - common prefix 结束在没有完整 checkpoint 的任意其他位置时，cache miss。
 
 Planner 先试 current frontier；否则在 rewrite 与该 bundle 上的 ladder / turn-rollback heads 中取最长完整

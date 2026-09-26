@@ -68,28 +68,25 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-template <class ProfileAllowance>
-std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
-                                     ProfileAllowance&& profile_allowance, const char* label) {
-    std::vector<std::pair<std::uint32_t, std::size_t>> classes;
+std::size_t graph_topology_count(const std::vector<GraphExecutionProfile>& profiles) {
+    std::vector<std::uint32_t> classes;
     for (const GraphExecutionProfile profile : profiles) {
-        const std::size_t allowance = profile_allowance(profile);
-        const auto existing = std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-            return entry.first == profile.topology_class;
-        });
-        if (existing == classes.end()) {
-            classes.emplace_back(profile.topology_class, allowance);
-        } else {
-            existing->second = std::max(existing->second, allowance);
+        if (std::find(classes.begin(), classes.end(), profile.topology_class) == classes.end()) {
+            classes.push_back(profile.topology_class);
         }
     }
+    return classes.size();
+}
 
-    std::size_t total = 0;
-    for (const auto& [topology_class, allowance] : classes) {
-        (void)topology_class;
-        total = checked_add(total, allowance, label);
-    }
-    return total;
+// Startup graph memory for single-schedule executables, charged against Automatic KV capacity.
+// prepare_graphs' measured total is a fixed warm-up part plus about 4 MiB per executable
+// (RTX 5090 serve benches: at most 46 MiB for 4 executables and 146 MiB for 30). Keep 12 MiB
+// per executable through four and 24 MiB + 6 MiB per executable beyond.
+std::size_t graph_executables_allowance(std::size_t executables, const char* label) {
+    const std::size_t linear = checked_mul(12ULL * kMiB, executables, label);
+    const std::size_t affine =
+        checked_add(24ULL * kMiB, checked_mul(6ULL * kMiB, executables, label), label);
+    return std::min(linear, affine);
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -165,10 +162,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                                 DFlashConfig::local_capacity,
                                                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                                                 static_cast<std::int32_t>(plan.max_concurrency));
-            dflash.rewrite_checkpoint_local = plan_cyclic_kv_cache(
-                builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
-                DFlashConfig::kv_heads, DFlashConfig::head_dim,
-                static_cast<std::int32_t>(plan.max_concurrency));
             dflash.staging_local = plan_cyclic_kv_cache(
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim, 1);
@@ -1016,11 +1009,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             schedule::VisionContext::output_transient_bytes(merged);
     }
     if (impl->use_cuda_graph) {
-        // Allowance is per instantiated executable. K and B are folded into topology_class here
-        // (LLD Topology class) so graph_topology_allowance is not multiplied by C again.
+        // Allowance follows the instantiated executable count. K and B are folded into
+        // topology_class here (LLD Topology class), so each class is one executable.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
+            impl->graph_allowance_bytes = graph_executables_allowance(
+                impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             std::uint32_t max_planned = 0;
             for (const std::uint32_t k : impl->captured_ks) {
@@ -1046,9 +1039,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     }
                 }
             }
-            impl->graph_allowance_bytes = graph_topology_allowance(
-                expanded, [&](GraphExecutionProfile) { return 12ULL * kMiB; },
-                "MTP graph allowance");
+            impl->graph_allowance_bytes = graph_executables_allowance(
+                graph_topology_count(expanded), "MTP graph allowance");
         } else {
             std::uint32_t max_planned = 0;
             for (const std::uint32_t k : impl->captured_ks) {
@@ -1084,34 +1076,34 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     }
                 }
             }
-            std::vector<std::pair<std::uint32_t, std::size_t>> classes;
-            for (std::size_t i = 0; i < expanded.size(); ++i) {
-                const std::uint64_t final_visible = std::min<std::uint64_t>(
-                    impl->capacity,
-                    static_cast<std::uint64_t>(expanded[i].max) + expanded_w[i]);
+            if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
                 // DFlash2 captures one parallel proposal/verify schedule, not the
-                // autoregressive DFlash unroll. Its definitions share one executable
-                // per (K, B, topology), just like the other graph families. Budget
-                // 12 MiB for that executable and its definitions; prepare_graphs
-                // checks the complete measured allocation against this allowance.
-                const std::size_t allowance =
-                    (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2
-                         ? 12ULL
-                         : (final_visible <= 4096 ? 64ULL : 96ULL)) * kMiB;
-                const auto existing =
-                    std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-                        return entry.first == expanded[i].topology_class;
-                    });
-                if (existing == classes.end()) {
-                    classes.emplace_back(expanded[i].topology_class, allowance);
-                } else {
-                    existing->second = std::max(existing->second, allowance);
+                // autoregressive DFlash unroll. Its definitions share one executable per
+                // (K, B, topology), just like the other graph families.
+                impl->graph_allowance_bytes = graph_executables_allowance(
+                    graph_topology_count(expanded), "DFlash exact-b graph allowance");
+            } else {
+                std::vector<std::pair<std::uint32_t, std::size_t>> classes;
+                for (std::size_t i = 0; i < expanded.size(); ++i) {
+                    const std::uint64_t final_visible = std::min<std::uint64_t>(
+                        impl->capacity,
+                        static_cast<std::uint64_t>(expanded[i].max) + expanded_w[i]);
+                    const std::size_t allowance = (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                    const auto existing =
+                        std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
+                            return entry.first == expanded[i].topology_class;
+                        });
+                    if (existing == classes.end()) {
+                        classes.emplace_back(expanded[i].topology_class, allowance);
+                    } else {
+                        existing->second = std::max(existing->second, allowance);
+                    }
                 }
-            }
-            for (const auto& [topology_class, allowance] : classes) {
-                (void)topology_class;
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, allowance, "DFlash exact-b graph allowance");
+                for (const auto& [topology_class, allowance] : classes) {
+                    (void)topology_class;
+                    impl->graph_allowance_bytes = checked_add(
+                        impl->graph_allowance_bytes, allowance, "DFlash exact-b graph allowance");
+                }
             }
         }
     }

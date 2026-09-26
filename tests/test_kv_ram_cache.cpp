@@ -1,4 +1,5 @@
 #include "cuda_stream_gate.h"
+#include "rewrite_state_host_image.h"
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
@@ -2009,11 +2010,12 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     source.backend_pool       = &backend_pool;
     source.gdn                = &gdn;
     source.gdn_current_slot   = 0;
-    source.gdn_checkpoint_slot = 1;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 1, &dflash_ckpt, 0, ctx.stream);
+    source.rewrite_state      = source_rewrite.source();
     source.tail_hidden        = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.dflash_local       = &dflash_local;
-    source.dflash_checkpoint  = &dflash_ckpt;
     source.dflash_lane        = 0;
     source.stream             = ctx.copy_stream;
     q36::detail::KVRamCache cache(16ULL << 20);
@@ -2040,17 +2042,18 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     target.backend_dst_pages       = 1;
     target.gdn                     = &gdn;
     target.gdn_current_slot        = 2;
-    target.gdn_checkpoint_slot     = 3;
+    auto target_rewrite = ninfer::test::RewriteStateHostImage::sized(gdn, &dflash_ckpt);
+    target.rewrite_state           = target_rewrite.target();
     target.tail_hidden             = &hidden_out;
     target.rewrite_checkpoint_hidden = &rewrite_out;
     target.dflash_local            = &dflash_local;
-    target.dflash_checkpoint       = &dflash_ckpt;
     target.dflash_lane             = 1;
     target.stream                  = ctx.copy_stream;
     cache.claim(match->entry_id);
     const q36::detail::RamRestoredHost host = cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
     ctx.synchronize_all();
+    target_rewrite.unpack(gdn, 3, &dflash_ckpt, 1, ctx.stream);
 
     int failures = 0;
     if (host.rope_delta != 7 || host.mtp_kv_valid != 3 || !host.backend_image_present ||
@@ -2232,7 +2235,8 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
     source.text_pool          = &text_pool;
     source.gdn                = &gdn;
     source.gdn_current_slot   = 0;
-    source.gdn_checkpoint_slot = 1;
+    const auto source_rewrite = ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state      = source_rewrite.source();
     source.tail_hidden        = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.ladder_heads       = {head_at(2, conv_f2.data(), rec_f2.data(), hid_f2.data()),
@@ -2291,7 +2295,9 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
     target.text_dst_pages          = ninfer::pages_for_tokens(match->reuse_base);
     target.gdn                     = &gdn;
     target.gdn_current_slot        = 2;
-    target.gdn_checkpoint_slot     = 3;
+    auto target_rewrite            = ninfer::test::RewriteStateHostImage::sized(gdn);
+    target_rewrite.fill(0xee);
+    target.rewrite_state           = target_rewrite.target();
     target.tail_hidden             = &hidden_out;
     target.rewrite_checkpoint_hidden = &rewrite_out;
     target.reuse                   = match->reuse;
@@ -2300,6 +2306,7 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
     cache.claim(match->entry_id);
     const q36::detail::RamRestoredHost host = cache.unpack_device(match->entry_id, target);
     ctx.synchronize_all();
+    target_rewrite.unpack(gdn, 3, nullptr, 0, ctx.stream);
 
     int failures = 0;
     if (host.ladders.size() != 3) {
@@ -2358,10 +2365,12 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
             CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 3).data, 0xee,
                                   gdn.recurrent_slot(layer, 3).bytes()));
         }
+        target_rewrite.fill(0xee);
         target.reuse_base     = frontier;
         target.text_dst_pages = ninfer::pages_for_tokens(frontier);
         (void)cache.unpack_device(match->entry_id, target);
         ctx.synchronize_all();
+        target_rewrite.unpack(gdn, 3, nullptr, 0, ctx.stream);
         gdn.pack_slot_to_host(2, conv_packed.data(), rec_packed.data(), ctx.copy_stream);
         ctx.synchronize_all();
         if (conv_packed != conv_expect || rec_packed != rec_expect) {
@@ -3254,7 +3263,8 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
     source.text_pool          = &text_pool;
     source.gdn                = &gdn;
     source.gdn_current_slot   = 0;
-    source.gdn_checkpoint_slot = 1;
+    const auto source_rewrite = ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state = source_rewrite.source();
     source.tail_hidden        = &hidden;
     source.ladder_heads       = {rollback};
     source.stream             = ctx.copy_stream;
@@ -3297,7 +3307,8 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
     target.text_dst_pages   = ninfer::pages_for_tokens(match->reuse_base);
     target.gdn              = &gdn;
     target.gdn_current_slot = 2;
-    target.gdn_checkpoint_slot = 3;
+    auto target_rewrite = ninfer::test::RewriteStateHostImage::sized(gdn);
+    target.rewrite_state = target_rewrite.target();
     target.tail_hidden      = &hidden_out;
     target.reuse            = match->reuse;
     target.reuse_base       = match->reuse_base;
@@ -3428,7 +3439,8 @@ int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
     source.text_pool               = &text_pool;
     source.gdn                     = &gdn;
     source.gdn_current_slot        = 0;
-    source.gdn_checkpoint_slot     = 1;
+    const auto source_rewrite = ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state = source_rewrite.source();
     source.tail_hidden             = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.ladder_heads            = {rollback, ladder};
@@ -3504,7 +3516,8 @@ int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
     target.text_dst_pages      = ninfer::pages_for_tokens(4);
     target.gdn                 = &gdn;
     target.gdn_current_slot    = 2;
-    target.gdn_checkpoint_slot = 3;
+    auto target_rewrite = ninfer::test::RewriteStateHostImage::sized(gdn);
+    target.rewrite_state = target_rewrite.target();
     target.tail_hidden         = &hidden_out;
     target.reuse               = ninfer::PrefixReusePath::RestoreTurnRollback;
     target.reuse_base          = 4;
@@ -3513,14 +3526,15 @@ int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
     (void)cache.unpack_device(match4->entry_id, target);
     ctx.synchronize_all();
     auto [conv_now, rec_now] = packed_slot(2);
-    auto [conv_ckpt, rec_ckpt] = packed_slot(3);
+    const auto& conv_ckpt    = target_rewrite.conv;
+    const auto& rec_ckpt     = target_rewrite.recurrent;
     auto [conv_left, rec_left] = packed_slot(0);
     if (conv_now != conv_rb || rec_now != rec_rb) {
         std::cerr << "rollback unpack installed current/rewrite/ladder GDN into current\n";
         ++failures;
     }
     if (conv_left != conv_poison || rec_left != rec_poison) {
-        std::cerr << "rollback unpack clobbered leftover current/2C GDN\n";
+        std::cerr << "rollback unpack clobbered leftover current/staging GDN\n";
         ++failures;
     }
     if (conv_ckpt != conv_rw || rec_ckpt != rec_rw) {
@@ -3579,7 +3593,7 @@ int test_mixed_checkpoint_gdn_isolation(ninfer::DeviceContext& ctx) {
         ++failures;
     }
     if (conv_left_e != conv_poison || rec_left_e != rec_poison) {
-        std::cerr << "AppendAtFrontier clobbered leftover current/2C GDN\n";
+        std::cerr << "AppendAtFrontier clobbered leftover current/staging GDN\n";
         ++failures;
     }
     CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
@@ -3932,7 +3946,8 @@ int test_rollback_skips_ahead_rewrite_gdn(ninfer::DeviceContext& ctx) {
     source.text_pool                 = &text_pool;
     source.gdn                       = &gdn;
     source.gdn_current_slot          = 0;
-    source.gdn_checkpoint_slot       = 1;
+    const auto source_rewrite = ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state = source_rewrite.source();
     source.tail_hidden               = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.ladder_heads              = {rollback};
@@ -3967,7 +3982,8 @@ int test_rollback_skips_ahead_rewrite_gdn(ninfer::DeviceContext& ctx) {
     target.text_dst_pages      = ninfer::pages_for_tokens(4);
     target.gdn                 = &gdn;
     target.gdn_current_slot    = 2;
-    target.gdn_checkpoint_slot = 3;
+    auto target_rewrite = ninfer::test::RewriteStateHostImage::sized(gdn);
+    target.rewrite_state = target_rewrite.target();
     target.tail_hidden         = &hidden_out;
     target.reuse               = ninfer::PrefixReusePath::RestoreTurnRollback;
     target.reuse_base          = 4;
@@ -4094,7 +4110,8 @@ int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
     source.text_pool                 = &text_pool;
     source.gdn                       = &gdn;
     source.gdn_current_slot          = 0;
-    source.gdn_checkpoint_slot       = 1;
+    const auto source_rewrite = ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state = source_rewrite.source();
     source.tail_hidden               = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.ladder_heads              = {rollback};
@@ -4130,7 +4147,8 @@ int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
     target.text_dst_pages      = ninfer::pages_for_tokens(4);
     target.gdn                 = &gdn;
     target.gdn_current_slot    = 1;
-    target.gdn_checkpoint_slot = 3;
+    auto target_rewrite = ninfer::test::RewriteStateHostImage::sized(gdn);
+    target.rewrite_state = target_rewrite.target();
     target.tail_hidden         = &hidden_out;
     target.reuse               = ninfer::PrefixReusePath::RestoreTurnRollback;
     target.reuse_base          = 4;
@@ -4150,14 +4168,20 @@ int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
     auto [conv_l0, rec_l0] = packed_slot(0);
     auto [conv_l1, rec_l1] = packed_slot(1);
     auto [conv_r0, rec_r0] = packed_slot(2);
-    auto [conv_r1, rec_r1] = packed_slot(3);
+    auto [conv_s3, rec_s3] = packed_slot(3);
     auto [conv_st, rec_st] = packed_slot(4);
+    const auto& conv_r1 = target_rewrite.conv;
+    const auto& rec_r1  = target_rewrite.recurrent;
     if (conv_l1 != conv_rb || rec_l1 != rec_rb) {
         std::cerr << "C=2 lane-1 rollback did not land in slot 1\n";
         ++failures;
     }
     if (conv_r1 != conv_rw || rec_r1 != rec_rw) {
-        std::cerr << "C=2 lane-1 rollback dropped rewrite GDN at F<=E from slot C+1\n";
+        std::cerr << "C=2 lane-1 rollback dropped rewrite GDN at F<=E from its host image\n";
+        ++failures;
+    }
+    if (conv_s3 != conv_p2 || rec_s3 != rec_p2) {
+        std::cerr << "C=2 lane-1 rollback wrote a device slot outside lane 1\n";
         ++failures;
     }
     if (conv_l0 != conv_p0 || rec_l0 != rec_p0) {
@@ -4165,11 +4189,11 @@ int test_c2_lane1_rollback_slot_isolation(ninfer::DeviceContext& ctx) {
         ++failures;
     }
     if (conv_r0 != conv_p2 || rec_r0 != rec_p2) {
-        std::cerr << "C=2 lane-1 rollback clobbered lane 0 rewrite GDN\n";
+        std::cerr << "C=2 lane-1 rollback clobbered slot 2\n";
         ++failures;
     }
     if (conv_st != conv_p4 || rec_st != rec_p4) {
-        std::cerr << "C=2 lane-1 rollback clobbered staging slot 2C\n";
+        std::cerr << "C=2 lane-1 rollback clobbered the staging slot\n";
         ++failures;
     }
     cache.consume(match4->entry_id);

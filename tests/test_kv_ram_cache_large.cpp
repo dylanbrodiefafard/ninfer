@@ -1,4 +1,5 @@
 #include "cuda_stream_gate.h"
+#include "rewrite_state_host_image.h"
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -173,7 +174,8 @@ int expect_page_sentinels(ninfer::PagedKVPool& pool, const ninfer::PagedKVAlloca
 
 int capture_bundle(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::PagedKVPool& pool,
                    ninfer::PagedKVAllocation& alloc, ninfer::LinearAttentionStatePool& gdn,
-                   const ninfer::Tensor& hidden, const ninfer::Tensor& rewrite, cudaStream_t stream) {
+                   const ninfer::Tensor& hidden, const ninfer::Tensor& rewrite,
+                   const ninfer::test::RewriteStateHostImage& rewrite_state, cudaStream_t stream) {
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
     ninfer::targets::qwen3_6::PreparedPromptData retained = prompt;
     retained.token_ids.push_back(0);
@@ -206,7 +208,7 @@ int capture_bundle(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::
     source.text_pool            = &pool;
     source.gdn                  = &gdn;
     source.gdn_current_slot     = 0;
-    source.gdn_checkpoint_slot  = 1;
+    source.rewrite_state        = rewrite_state.source();
     source.tail_hidden          = &hidden;
     source.rewrite_checkpoint_hidden = &rewrite;
     source.stream               = stream;
@@ -465,6 +467,8 @@ int main() {
     fill_slot(gdn, 0, 0x44, ctx.stream);
     fill_slot(gdn, 1, 0x45, ctx.stream);
     ctx.synchronize_all();
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
     ninfer::DeviceBuffer hidden_buf(10240);
     hidden_buf.fill(0xa1);
     ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::U8, {10240});
@@ -477,7 +481,8 @@ int main() {
     ninfer::targets::qwen3_6::detail::KVRamCache cache(1024ULL * 1024ULL * 1024ULL);
     StreamCopyGate capture_gate;
     capture_gate.launch(ctx.copy_stream);
-    if (capture_bundle(cache, kv_pool, contiguous, gdn, hidden, rewrite, ctx.copy_stream) != 0) {
+    if (capture_bundle(cache, kv_pool, contiguous, gdn, hidden, rewrite, source_rewrite,
+                       ctx.copy_stream) != 0) {
         return fail("large SequenceState capture failed");
     }
     const auto prompt = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
@@ -530,7 +535,8 @@ int main() {
     target.text_dst_pages            = kKvPages;
     target.gdn                       = &gdn;
     target.gdn_current_slot          = 0;
-    target.gdn_checkpoint_slot       = 1;
+    auto target_rewrite              = ninfer::test::RewriteStateHostImage::sized(gdn);
+    target.rewrite_state             = target_rewrite.target();
     target.tail_hidden               = &hidden_out;
     target.rewrite_checkpoint_hidden = &rewrite_out;
     target.stream                    = ctx.copy_stream;
@@ -552,9 +558,11 @@ int main() {
     CUDA_CHECK(cudaEventSynchronize(stop));
     ctx.synchronize_all();
     cache.consume(match->entry_id);
+    target_rewrite.unpack(gdn, 1, nullptr, 0, ctx.stream);
+    // The rewrite checkpoint restores into its host image; only the current slot is H2D.
     const double restore_ms   = elapsed_ms(start, stop);
-    const std::size_t payload = kv_bytes + 2 * gdn_slot_bytes;
-    std::cerr << "kv_ram_large restore_two_gdn_slots_plus_kv=" << gbs(payload, restore_ms, 1)
+    const std::size_t payload = kv_bytes + gdn_slot_bytes;
+    std::cerr << "kv_ram_large restore_gdn_slot_plus_kv=" << gbs(payload, restore_ms, 1)
               << " GB/s (" << restore_ms << " ms) payload_bytes=" << payload << '\n';
     if (expect_page_sentinels(kv_pool, dest, 42, "large restore KV") != 0) { return 1; }
     if (expect_slot(gdn, 0, 0x44, "large restore GDN current") != 0) { return 1; }

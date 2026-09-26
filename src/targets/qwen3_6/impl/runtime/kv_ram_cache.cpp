@@ -1012,9 +1012,16 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
                      ? source.rewrite_checkpoint_hidden->bytes()
                      : 0;
     lengths[10] = source.dflash_local ? source.dflash_local->lane_host_bytes() : 0;
-    lengths[11] = source.dflash_checkpoint && source.rewrite_valid
-                      ? source.dflash_checkpoint->lane_host_bytes()
+    lengths[11] = source.dflash_local && source.rewrite_valid
+                      ? source.dflash_local->lane_host_bytes()
                       : 0;
+    if ((lengths[5] != 0 || lengths[7] != 0) &&
+        (source.rewrite_state.conv == nullptr || source.rewrite_state.recurrent == nullptr)) {
+        throw std::invalid_argument("RAM capture rewrite checkpoint has no GDN host image");
+    }
+    if (lengths[11] != 0 && source.rewrite_state.dflash == nullptr) {
+        throw std::invalid_argument("RAM capture rewrite checkpoint has no DFlash host image");
+    }
     aligns[0] = kHostAlign;
     aligns[1] = kHostAlign;
     for (std::size_t i = 2; i < kSectionCount; ++i) { aligns[i] = kDeviceAlign; }
@@ -1155,11 +1162,11 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
                                               raw + header.offset[6], source.stream);
                 copies_launched = true;
             }
-            if (source.rewrite_valid && (lengths[5] != 0 || lengths[7] != 0)) {
-                start_device_copies();
-                source.gdn->pack_slot_to_host(source.gdn_checkpoint_slot, raw + header.offset[5],
-                                              raw + header.offset[7], source.stream);
-                copies_launched = true;
+            if (lengths[5] != 0) {
+                std::memcpy(raw + header.offset[5], source.rewrite_state.conv, lengths[5]);
+            }
+            if (lengths[7] != 0) {
+                std::memcpy(raw + header.offset[7], source.rewrite_state.recurrent, lengths[7]);
             }
         }
         if (source.tail_hidden != nullptr && lengths[8] != 0) {
@@ -1181,11 +1188,8 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
                                                    source.stream);
             copies_launched = true;
         }
-        if (source.dflash_checkpoint != nullptr && lengths[11] != 0) {
-            start_device_copies();
-            source.dflash_checkpoint->copy_lane_to_host(source.dflash_lane, raw + header.offset[11],
-                                                        source.stream);
-            copies_launched = true;
+        if (lengths[11] != 0) {
+            std::memcpy(raw + header.offset[11], source.rewrite_state.dflash, lengths[11]);
         }
         for (std::size_t i = 0; i < source.ladder_heads.size(); ++i) {
             const RamLadderHead& head  = source.ladder_heads[i];
@@ -1307,11 +1311,9 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
                 throw std::logic_error("RAM restore is missing DFlash cyclic state");
             }
             verify_cyclic(header, *target.dflash_local);
-            if (header.length[11] != 0) {
-                if (target.dflash_checkpoint == nullptr) {
-                    throw std::logic_error("RAM restore is missing DFlash checkpoint cyclic state");
-                }
-                verify_cyclic(header, *target.dflash_checkpoint);
+            if (header.length[11] != 0 &&
+                header.length[11] != target.dflash_local->lane_host_bytes()) {
+                throw std::logic_error("RAM entry DFlash rewrite-checkpoint geometry mismatch");
             }
         }
         if (header.has_gdn) {
@@ -1417,8 +1419,13 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         !context_head || header.rewrite_frontier <= target.reuse_base;
     if (unpack_rewrite && target.gdn != nullptr &&
         (header.length[5] != 0 || header.length[7] != 0)) {
-        target.gdn->unpack_slot_from_host(target.gdn_checkpoint_slot, raw + header.offset[5],
-                                          raw + header.offset[7], target.stream);
+        if (target.rewrite_state.conv == nullptr || target.rewrite_state.recurrent == nullptr) {
+            throw std::logic_error("RAM restore is missing the rewrite-checkpoint GDN image");
+        }
+        std::memcpy(target.rewrite_state.conv, raw + header.offset[5],
+                    static_cast<std::size_t>(header.length[5]));
+        std::memcpy(target.rewrite_state.recurrent, raw + header.offset[7],
+                    static_cast<std::size_t>(header.length[7]));
     }
     if (!context_head && target.tail_hidden != nullptr && header.length[8] != 0) {
         CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, raw + header.offset[8],
@@ -1434,9 +1441,12 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
         target.dflash_local->copy_lane_from_host(raw + header.offset[10], target.dflash_lane,
                                                  target.stream);
     }
-    if (unpack_rewrite && target.dflash_checkpoint != nullptr && header.length[11] != 0) {
-        target.dflash_checkpoint->copy_lane_from_host(raw + header.offset[11], target.dflash_lane,
-                                                      target.stream);
+    if (unpack_rewrite && target.dflash_local != nullptr && header.length[11] != 0) {
+        if (target.rewrite_state.dflash == nullptr) {
+            throw std::logic_error("RAM restore is missing the rewrite-checkpoint DFlash image");
+        }
+        std::memcpy(target.rewrite_state.dflash, raw + header.offset[11],
+                    static_cast<std::size_t>(header.length[11]));
     }
     {
         std::lock_guard lock(io_mutex_);

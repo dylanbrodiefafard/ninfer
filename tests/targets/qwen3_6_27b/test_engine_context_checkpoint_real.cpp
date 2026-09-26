@@ -519,7 +519,7 @@ int exercise_catch_up(const char* artifact, ninfer::SpeculativeBackend spec) {
     const ninfer::GenerationResult rollback =
         engine.generate(engine.prepare_tokens(rollback_edit), greedy(kPastFreezeOutputs, true));
     if (const int rc = expect_rollback(rollback, ninfer::PrefixReuseSource::VramResident, e1,
-                                       "catch-up rollback D2D after ladder freeze borrowed 2C");
+                                       "catch-up rollback D2D after ladder freeze borrowed staging");
         rc != 0) {
         return rc;
     }
@@ -1820,7 +1820,7 @@ int exercise_turn_rollback(const char* artifact,
         const ninfer::GenerationResult freeze_r =
             c2.generate(c2.prepare_tokens(freeze_p), greedy(kPastFreezeOutputs, true));
         if (const int rc =
-                expect_captured(freeze_r, kMark, "C=2 freeze while rollback occupies 2C");
+                expect_captured(freeze_r, kMark, "C=2 freeze while rollback occupies staging");
             rc != 0) {
             return rc;
         }
