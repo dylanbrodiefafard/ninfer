@@ -241,6 +241,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.tool_sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "tool grammar target sampling config");
+    out.tool_nodes = add_tensor(
+        builder, DType::I32, {tool_width, static_cast<std::int32_t>(plan.max_concurrency), 2},
+        "tool grammar verification node staging");
     out.tail_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");
