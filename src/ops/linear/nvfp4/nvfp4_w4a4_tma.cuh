@@ -193,6 +193,31 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "memory");
 }
 
+// One 16-byte activation-scale box covers the K-tile pair p = k_tile / 2. Its slot is read by
+// tiles 2p and 2p+1 and rewritten by tile 2p + 2 * kSlots, whose producer first waits for the
+// consumers to release tile 2p + 2 * kSlots - kStages; that must be at least 2p + 1, so
+// kSlots = (kStages + 2) / 2 (2 slots for 2 or 3 stages, 3 for 4). kSlots <= kStages, so the
+// per-stage scale buffers hold them.
+template <class Schedule>
+__device__ __forceinline__ int nvfp4_tma_scale_slot(int k_tile) {
+    constexpr int kSlots = (Schedule::kStages + 2) / 2;
+    static_assert(kSlots <= Schedule::kStages);
+    return (k_tile / 2) % kSlots;
+}
+
+// The work distributor issues CTAs in linear order with blockIdx.x fastest. Launched as
+// grid(weight-row tiles, token tiles), every co-resident CTA would hold a different weight tile
+// and the weight matrix would stream from memory once per token tile. Deriving both tile indices
+// from the linear CTA id with the token tile fastest keeps the CTAs that share a weight tile
+// together, so the matrix is read once.
+__device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block_y) {
+    const int rows = static_cast<int>(gridDim.y);
+    const int linear =
+        static_cast<int>(blockIdx.y) * static_cast<int>(gridDim.x) + static_cast<int>(blockIdx.x);
+    block_y = linear % rows;
+    block_x = linear / rows;
+}
+
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
@@ -200,11 +225,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
+    static_assert(Schedule::kStages >= 2, "activation-scale slots reuse the stage buffers");
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
-    auto& shared          = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);
-    const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
-    const int row_begin   = static_cast<int>(blockIdx.x) * Schedule::kBlockN;
+    auto& shared = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);
+    int block_x  = 0;
+    int block_y  = 0;
+    nvfp4_tma_raster_blocks(block_x, block_y);
+    const int token_begin = block_y * Schedule::kBlockM;
+    const int row_begin   = block_x * Schedule::kBlockN;
 
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -229,12 +258,19 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 const int stage                 = k_tile % Schedule::kStages;
                 const std::uint32_t empty_phase = 1U ^ ((k_tile / Schedule::kStages) & 1U);
                 nvfp4_mbarrier_wait(&shared.empty[stage], empty_phase);
+                constexpr std::uint32_t kScaleBytes =
+                    Schedule::kBlockM * Schedule::kScaleWordsPerRow * 4;
                 constexpr std::uint32_t kTransactionBytes =
                     Schedule::kBlockM * Schedule::kCodeRowBytes +
-                    Schedule::kBlockN * Schedule::kCodeRowBytes +
-                    Schedule::kBlockM * Schedule::kScaleWordsPerRow * 4 +
+                    Schedule::kBlockN * Schedule::kCodeRowBytes + kScaleBytes +
                     Schedule::kBlockN * Schedule::kK64PerStage * 4;
-                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
+                // TMA's innermost box cannot be narrower than 16 bytes, and 16 bytes of activation
+                // scales cover two K tiles: fetch the box on the even tile into a scale slot
+                // and let the odd tile expect that many bytes fewer.
+                const bool load_scales = (k_tile & 1) == 0;
+                nvfp4_mbarrier_arrive_expect_tx(
+                    &shared.full[stage],
+                    load_scales ? kTransactionBytes : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
@@ -242,8 +278,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                                   &shared.full[stage]);
                 nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, (k_tile / 2) * 16,
-                                  token_begin, &shared.full[stage]);
+                if (load_scales) {
+                    nvfp4_tma_load_2d(tensors.a_scale4[nvfp4_tma_scale_slot<Schedule>(k_tile)],
+                                      &descriptors.a_scales, (k_tile / 2) * 16, token_begin,
+                                      &shared.full[stage]);
+                }
                 const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
                                          k_tile * Schedule::kK64PerStage) *
                                         32;
@@ -299,8 +338,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                             a_fragments[mma_m][3], smem_addr(address));
                 const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
                 a_scales[mma_m] =
-                    tensors.a_scale4[stage][scale_row * Schedule::kScaleWordsPerRow +
-                                            (k_tile & 1) * Schedule::kK64PerStage + local_k64];
+                    tensors.a_scale4[nvfp4_tma_scale_slot<Schedule>(k_tile)]
+                                    [scale_row * Schedule::kScaleWordsPerRow +
+                                     (k_tile & 1) * Schedule::kK64PerStage + local_k64];
             }
 
 #pragma unroll
