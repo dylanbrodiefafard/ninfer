@@ -155,6 +155,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{24, ops::LinearPolicy::AllowA4},
         Invocation{36, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
+        Invocation{1025, ops::LinearPolicy::AllowA4},
+        Invocation{1279, ops::LinearPolicy::AllowA4},
         Invocation{2048, ops::LinearPolicy::AllowA4},
         Invocation{4096, ops::LinearPolicy::AllowA4},
     };

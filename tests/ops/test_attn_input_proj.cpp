@@ -486,7 +486,7 @@ int run_nvfp4_target() {
             failures += run_nvfp4_panels(parent, panel * batch, panel, ops::LinearPolicy::AllowA8);
         }
     }
-    for (const std::int32_t tokens : {1, 4, 15, 36, 1024}) {
+    for (const std::int32_t tokens : {1, 4, 15, 36, 1024, 1025, 1500}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
     for (const std::int32_t tokens : {4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24, 25, 30, 33, 36}) {

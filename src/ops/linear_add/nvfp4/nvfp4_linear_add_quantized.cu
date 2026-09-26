@@ -19,7 +19,6 @@ using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 
 using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-constexpr std::int32_t kTmaBlockM = 256;
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
@@ -76,7 +75,7 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens  = x.ne[1];
     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
-    if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+    if (tokens >= 1024) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear_add(problem, workspace.codes, workspace.scales,
                                          static_cast<const std::uint8_t*>(weight.qdata),

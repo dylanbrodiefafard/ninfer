@@ -82,9 +82,10 @@ void run_once(const Ctx& c) {
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            static_cast<int>(kShared)) == cudaSuccess;
   (void)configured;
-  dim3 grid(Geom::kOutputRows / Schedule::kBlockN, c.tokens / Schedule::kBlockM);
-  kernel<<<grid, Schedule::kThreads, kShared, c.stream>>>(descriptors, c.alpha, Epi{},
-                                                          Out{c.out, Geom::kOutputRows});
+  dim3 grid(Geom::kOutputRows / Schedule::kBlockN,
+            (c.tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
+  kernel<<<grid, Schedule::kThreads, kShared, c.stream>>>(
+      descriptors, c.alpha, Epi{}, Out{c.out, Geom::kOutputRows}, c.tokens);
   CUDA_CHECK(cudaGetLastError());  // a silently-failed launch (e.g. too many threads) would otherwise leave stale output -> false maxdiff=0
 }
 

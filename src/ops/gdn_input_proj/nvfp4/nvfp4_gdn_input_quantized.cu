@@ -20,7 +20,6 @@ using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 
 using M64N128S3                   = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
 using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-constexpr std::int32_t kTmaBlockM = 256;
 
 struct GdnFp32ProjectionOutput {
     float* qkv;
@@ -83,7 +82,7 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& 
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
-    if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+    if (tokens >= 1024) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_gdn(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
