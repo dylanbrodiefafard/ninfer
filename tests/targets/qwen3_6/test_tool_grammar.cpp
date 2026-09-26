@@ -576,14 +576,44 @@ int main(int argc, char** argv) {
         ignored_stop.preview(std::vector<ninfer::TokenId>{1, 2, 3, 4, 5, 6, 7});
         ignored_stop.commit_preview();
     }
+    // Keywords the grammar cannot enforce are relaxed to a superset of the client's instances;
+    // keywords that grant instances the grammar cannot express are still rejected.
     auto unsupported = Json::parse(tools[0]);
-    unsupported["function"]["parameters"]["not"] = Json{{"required", {"filePath"}}};
+    unsupported["function"]["parameters"]["patternProperties"] =
+        Json{{"^x-", Json{{"type", "string"}}}};
     bool rejected = false;
     try { (void)compiler.compile(std::vector<std::string>{unsupported.dump()}, false); }
     catch (const ninfer::RequestError& error) {
         rejected = error.kind() == ninfer::RequestErrorKind::InvalidToolSchema;
     }
-    check(rejected, "unsupported assertion was silently ignored");
+    check(rejected, "an instance-granting keyword was silently ignored");
+    {
+        std::string valid_call;
+        for (int i = 0; i < 6; ++i) { valid_call += pieces[i]; }
+        auto relaxed    = Json::parse(tools[0]);
+        auto& params    = relaxed["function"]["parameters"];
+        auto& file_path = params["properties"]["filePath"];
+        params["not"]            = Json{{"required", {"missing"}}};
+        params["propertyNames"]  = Json{{"maxLength", 32}};
+        file_path["format"]      = "uri-reference";
+        file_path                = Json{{"oneOf", {file_path, Json{{"type", "integer"}}}}};
+        params["properties"]["limit"] =
+            Json{{"allOf", {Json{{"type", "integer"}, {"multipleOf", 2}}}}, {"description", "n"}};
+        const auto relaxed_grammar =
+            compiler.compile(std::vector<std::string>{relaxed.dump()}, false);
+        xgrammar::GrammarMatcher relaxed_matcher(relaxed_grammar->compiled);
+        check(relaxed_matcher.AcceptString(valid_call),
+              "relaxed not/propertyNames/format/oneOf/allOf schema rejected a valid call");
+        auto multi_all_of = Json::parse(tools[0]);
+        multi_all_of["function"]["parameters"]["properties"]["limit"] =
+            Json{{"allOf", {Json{{"type", "integer"}}, Json{{"minimum", 0}}}}};
+        rejected = false;
+        try { (void)compiler.compile(std::vector<std::string>{multi_all_of.dump()}, false); }
+        catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::InvalidToolSchema;
+        }
+        check(rejected, "a multi-branch allOf was silently dropped");
+    }
     for (const std::string malformed : {"{", R"({"type":"function","function":{"name":7}})"}) {
         bool input_error = false;
         try { (void)compiler.compile(std::vector<std::string>{malformed}, false); }
