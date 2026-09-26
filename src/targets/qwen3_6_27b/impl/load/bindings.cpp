@@ -447,8 +447,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    // The embedding is only row-gathered (a few KiB per token), so it lives in pinned host
+    // memory and its VRAM goes to the KV pool.
+    out.token_embedding = WeightPlan{
+        .object = artifact::bind_tensor(binder, "text/token_embedding", vocabulary_format,
+                                        {248320, 5120}, artifact::TensorPlacement::MappedHost),
+        .format = vocabulary_format};
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
     case WeightsProfile::GroupwiseIntW8Endpoints:

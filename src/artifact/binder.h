@@ -12,6 +12,8 @@ namespace ninfer::artifact {
 
 enum class TensorPlacement : std::uint8_t {
     Device,
+    // Pinned host memory read directly by kernels through its unified device address.
+    MappedHost,
     ValidateOnly,
 };
 
@@ -31,9 +33,12 @@ struct HostMaterialization {
 };
 
 struct MaterializationPlan {
-    std::size_t object_count            = 0;
-    std::uint64_t device_capacity_bytes = 0;
+    std::size_t object_count                 = 0;
+    std::uint64_t device_capacity_bytes      = 0;
+    std::uint64_t mapped_host_capacity_bytes = 0;
     std::vector<DeviceMaterialization> device_objects;
+    // Offsets are into the one pinned host backing; tensors keep their device alignment.
+    std::vector<DeviceMaterialization> mapped_host_objects;
     std::vector<HostMaterialization> host_objects;
 };
 
@@ -50,12 +55,15 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
+    void materialize_on_mapped_host(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();
 
 private:
     ObjectHandle find_unconsumed(std::string_view name);
+    void plan_tensor(ObjectHandle handle, std::uint64_t& capacity_bytes,
+                     std::vector<DeviceMaterialization>& objects);
 
     const Reader& reader_;
     std::vector<bool> consumed_;

@@ -154,6 +154,8 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
     if (placement == TensorPlacement::Device) {
         binder.materialize_on_device(handle);
+    } else if (placement == TensorPlacement::MappedHost) {
+        binder.materialize_on_mapped_host(handle);
     } else {
         binder.validate_only(handle);
     }
