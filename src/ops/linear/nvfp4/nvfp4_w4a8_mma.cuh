@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <type_traits>
+
 #include "core/device.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
@@ -14,6 +17,32 @@ __device__ __forceinline__ unsigned nvfp4_codes_to_fp8(unsigned codes) {
            ((codes & 0x0800U) << 12) | ((codes & 0x8000U) << 16);
 }
 
+// Exact E2M1-code expansion to BF16 with the stored E4M3 block scale folded in: every product of
+// an E2M1 value and an E4M3 scale has at most six significant bits, so the BF16 multiply is exact.
+// Nibbles 0..3 (K 4t..4t+3) return as {K 4t, 4t+1} and {K 4t+2, 4t+3} BF16 pairs.
+__device__ __forceinline__ void nvfp4_codes_to_bf16x2(unsigned codes, __nv_bfloat162 scale,
+                                                      unsigned& low, unsigned& high) {
+    const unsigned magnitude = codes & 0x7777U;
+    const unsigned lo = __byte_perm(0xC0800000U, 0xC0804000U, magnitude);
+    const unsigned hi = __byte_perm(0x3F3F3F00U, 0x40404040U, magnitude);
+    unsigned pair0 = __byte_perm(lo, hi, 0x5140) | ((codes & 0x0008U) << 12) | ((codes & 0x0080U) << 24);
+    unsigned pair1 = __byte_perm(lo, hi, 0x7362) | ((codes & 0x0800U) << 4) | ((codes & 0x8000U) << 16);
+    const __nv_bfloat162 scaled0 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&pair0), scale);
+    const __nv_bfloat162 scaled1 = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&pair1), scale);
+    low = *reinterpret_cast<const unsigned*>(&scaled0);
+    high = *reinterpret_cast<const unsigned*>(&scaled1);
+}
+
+__device__ __forceinline__ __nv_bfloat162 nvfp4_scale_bf16x2(std::uint8_t storage) {
+    return __float2bfloat162_rn(decode_nvfp4_e4m3(storage));
+}
+
+// BF16 activations (A16) for the same weight-streaming schedules: the scaled weights feed BF16
+// m16n8k16 MMAs that accumulate in FP32 across K, with no activation quantization.
+struct Nvfp4Bf16Activation {
+    const __nv_bfloat16* data = nullptr;
+};
+
 // A8 stages only the weight half of the W4A4 layout; FP8 activations use their own buffer.
 template <class Schedule>
 struct Nvfp4W4a8WeightStorage {
@@ -21,31 +50,46 @@ struct Nvfp4W4a8WeightStorage {
     alignas(16) std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
 };
 
-// SwapAB places sixteen weight rows on MMA M and eight-token panels on N. Token panels past the
-// CTA's valid tokens are skipped, and each weight code and scale is expanded once per 16 rows.
+// Dynamic shared memory: BF16 activation stages exceed the 48 KiB static limit (N<=6144 M32 is
+// about 64 KiB). Projection staging is dead after the final K-loop barrier; the FP32 convolution
+// tile reuses it.
+template <class Schedule, int ActivationBytes = 1>
+struct Nvfp4W4a8SharedStorage {
+    static constexpr int kResultStride = Schedule::kBlockN + 8;
+    union Staging {
+        Nvfp4W4a8WeightStorage<Schedule> weights;
+        float tile[Schedule::kBlockM * kResultStride];
+    } staging;
+    alignas(16) std::uint8_t inputs[Schedule::kStages][Schedule::kBlockM * Schedule::kBlockK * ActivationBytes];
+    alignas(16) __nv_bfloat16 bf16_result[Schedule::kBlockM * kResultStride];
+};
+
+// SwapPanels > 0 places sixteen weight rows on MMA M and that many eight-token panels on N; each
+// weight code and scale is expanded once per 16 rows. The launch compiles ceil(T/8) panels: a
+// predicated QMMA still occupies the tensor pipe, so the runtime guard below only covers the last
+// token tile when T exceeds one tile (it also keeps the full-tile panel loads hoisted).
 template <class Geometry, class Schedule, class Epilogue, class Output,
-          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false, bool SwapAB = false>
+          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false, int SwapPanels = 0,
+          class Activation = Fp8A8Workspace>
 __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
-    Fp8A8Workspace activation, const std::uint8_t* weight_codes,
+    Activation activation, const std::uint8_t* weight_codes,
     const std::uint8_t* weight_scales, int tokens, float inverse_weight_scale,
     Epilogue epilogue, Output output, RowPolicy rows = {}) {
     constexpr int BM = Schedule::kBlockM, BN = Schedule::kBlockN;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
     constexpr int KT = Geometry::kInputRows / BK;
     constexpr int OS = BN + 8;
+    constexpr bool kBf16 = std::is_same_v<Activation, Nvfp4Bf16Activation>;
+    constexpr int kRowBytes = BK * (kBf16 ? 2 : 1);
     constexpr bool fp32_tile = requires(Output o, float* tile) {
         o.template store_tile<Schedule>(tile, 0, 0);
     };
-    // Projection staging is dead after the final K-loop barrier. Reuse it for
-    // the FP32 convolution tile instead of reducing residency with another tile.
-    union Staging {
-        Nvfp4W4a8WeightStorage<Schedule> weights;
-        float tile[BM * OS];
-    };
-    __shared__ Staging staging;
+    extern __shared__ __align__(16) std::uint8_t nvfp4_w4a8_shared[];
+    auto& shared = *reinterpret_cast<Nvfp4W4a8SharedStorage<Schedule, kBf16 ? 2 : 1>*>(nvfp4_w4a8_shared);
+    auto& staging = shared.staging;
     auto& weights = staging.weights;
-    __shared__ __align__(16) std::uint8_t inputs[S][BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 bf16_result[BM * OS];
+    auto& inputs = shared.inputs;
+    auto& bf16_result = shared.bf16_result;
     auto* result = [&] {
         if constexpr (fp32_tile) { return staging.tile; }
         else { return bf16_result; }
@@ -55,15 +99,20 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
     const int token_begin = blockIdx.y * BM;
     const int row_begin = blockIdx.x * (PairRows ? BN / 2 : BN);
     const auto input_byte = [](int row, int column) {
-        return row * BK + (column ^ ((row & (BK / 16 - 1)) * 16));
+        return row * kRowBytes + (column ^ ((row & (kRowBytes / 16 - 1)) * 16));
     };
+    const auto* activation_bytes = [&] {
+        if constexpr (kBf16) { return reinterpret_cast<const std::uint8_t*>(activation.data); }
+        else { return static_cast<const std::uint8_t*>(activation.codes); }
+    }();
     const auto stage_inputs = [&](int stage, int tile) {
-        for (int task = tid; task < BM * BK / 16; task += Schedule::kThreads) {
-            const int row = task / (BK / 16), column = (task % (BK / 16)) * 16;
+        for (int task = tid; task < BM * kRowBytes / 16; task += Schedule::kThreads) {
+            const int row = task / (kRowBytes / 16), column = (task % (kRowBytes / 16)) * 16;
             const int token = token_begin + row;
             const bool valid = token < tokens;
             cp_async_zfill<16, Cache::cg>(inputs[stage] + input_byte(row, column),
-                activation.codes + static_cast<std::int64_t>(valid ? token : 0) * Geometry::kInputRows + tile * BK + column,
+                activation_bytes + static_cast<std::int64_t>(valid ? token : 0) * Geometry::kInputRows * (kBf16 ? 2 : 1) +
+                    tile * kRowBytes + column,
                 valid ? 16 : 0);
         }
         stage_nvfp4_w4a4_weight<Geometry, Schedule, RowPolicy>(
@@ -80,10 +129,11 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
             return (sr * Schedule::kK64PerStage + group / 4) * 4 + group % 4;
         }
     };
-    static_assert(!SwapAB || (Schedule::kWarpsM == 1 && Schedule::kWarpN % 16 == 0));
-    constexpr int kSwapRows = Schedule::kWarpN / 16, kSwapPanels = BM / 8;
+    constexpr bool SwapAB = SwapPanels > 0;
+    static_assert(!SwapAB || (Schedule::kWarpsM == 1 && Schedule::kWarpN % 16 == 0 && SwapPanels * 8 <= BM));
+    constexpr int kSwapRows = Schedule::kWarpN / 16, kSwapPanels = SwapAB ? SwapPanels : 1;
     float accum[Schedule::kMmaM][Schedule::kMmaN][4] = {};
-    float swap_accum[SwapAB ? kSwapRows : 1][SwapAB ? kSwapPanels : 1][4] = {};
+    float swap_accum[SwapAB ? kSwapRows : 1][kSwapPanels][4] = {};
     const int valid_panels = min(kSwapPanels, (tokens - token_begin + 7) / 8);
     for (int tile = 0; tile < KT; ++tile) {
         const int stage = tile % S;
@@ -91,7 +141,34 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
         __syncthreads();
 #pragma unroll
         for (int group = 0; group < BK / 16; ++group) {
-            if constexpr (SwapAB) {
+            if constexpr (SwapAB && kBf16) {
+                uint2 b[kSwapPanels];
+#pragma unroll
+                for (int p = 0; p < kSwapPanels; ++p) {
+                    if (p < valid_panels) {
+                        b[p] = load_vec<uint2>(inputs[stage] + input_byte(p * 8 + lane / 4, group * 32 + (lane & 3) * 8));
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < kSwapRows; ++r) {
+                    const int row = wn * Schedule::kWarpN + r * 16 + lane / 4;
+                    const int column = group * 8 + (lane & 3) * 2;
+                    unsigned a0, a1, a2, a3;
+                    nvfp4_codes_to_bf16x2(load_vec<std::uint16_t>(weights.b_codes[stage] + row * Schedule::kCodeRowBytes +
+                        nvfp4_w4a4_swizzled_byte<Schedule>(row, column)),
+                        nvfp4_scale_bf16x2(weights.b_scales[stage][scale_offset(row, group)]), a0, a2);
+                    nvfp4_codes_to_bf16x2(load_vec<std::uint16_t>(weights.b_codes[stage] + (row + 8) * Schedule::kCodeRowBytes +
+                        nvfp4_w4a4_swizzled_byte<Schedule>(row + 8, column)),
+                        nvfp4_scale_bf16x2(weights.b_scales[stage][scale_offset(row + 8, group)]), a1, a3);
+#pragma unroll
+                    for (int p = 0; p < kSwapPanels; ++p) {
+                        if (p < valid_panels) {
+                            mma_bf16(swap_accum[r][p][0], swap_accum[r][p][1], swap_accum[r][p][2], swap_accum[r][p][3],
+                                     a0, a1, a2, a3, b[p].x, b[p].y);
+                        }
+                    }
+                }
+            } else if constexpr (SwapAB) {
                 unsigned b[kSwapPanels];
 #pragma unroll
                 for (int p = 0; p < kSwapPanels; ++p) {
@@ -119,6 +196,29 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
                             swap_accum[r][p][2] = fmaf(partial[2], scale1, swap_accum[r][p][2]);
                             swap_accum[r][p][3] = fmaf(partial[3], scale1, swap_accum[r][p][3]);
                         }
+                    }
+                }
+            } else if constexpr (kBf16) {
+                uint2 a[Schedule::kMmaM][2];
+#pragma unroll
+                for (int m = 0; m < Schedule::kMmaM; ++m) {
+                    const int row = wm * Schedule::kWarpM + m * 16 + lane / 4;
+                    const int column = group * 32 + (lane & 3) * 8;
+                    a[m][0] = load_vec<uint2>(inputs[stage] + input_byte(row, column));
+                    a[m][1] = load_vec<uint2>(inputs[stage] + input_byte(row + 8, column));
+                }
+#pragma unroll
+                for (int n = 0; n < Schedule::kMmaN; ++n) {
+                    const int row = wn * Schedule::kWarpN + n * 8 + lane / 4;
+                    const int column = group * 8 + (lane & 3) * 2;
+                    unsigned b0, b1;
+                    nvfp4_codes_to_bf16x2(load_vec<std::uint16_t>(weights.b_codes[stage] + row * Schedule::kCodeRowBytes +
+                        nvfp4_w4a4_swizzled_byte<Schedule>(row, column)),
+                        nvfp4_scale_bf16x2(weights.b_scales[stage][scale_offset(row, group)]), b0, b1);
+#pragma unroll
+                    for (int m = 0; m < Schedule::kMmaM; ++m) {
+                        mma_bf16(accum[m][n][0], accum[m][n][1], accum[m][n][2], accum[m][n][3],
+                                 a[m][0].x, a[m][1].x, a[m][0].y, a[m][1].y, b0, b1);
                     }
                 }
             } else {
@@ -164,7 +264,11 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
         const int parent_row = rows.weight_row(row_begin, local_row);
         float value = 0;
         if (token < tokens) {
-            value = epilogue.apply(parent_row, token, accumulated * (activation.scales[token] * inverse_weight_scale));
+            if constexpr (kBf16) {
+                value = epilogue.apply(parent_row, token, accumulated * inverse_weight_scale);
+            } else {
+                value = epilogue.apply(parent_row, token, accumulated * (activation.scales[token] * inverse_weight_scale));
+            }
         }
         if constexpr (fp32_tile) {
             result[local_token * OS + local_row] = value;
@@ -220,31 +324,51 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
 }
 
 template <class Geometry, class Epilogue, class Output,
-          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false>
-void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Fp8A8Workspace workspace,
-                           Epilogue epilogue, Output output, cudaStream_t stream, RowPolicy rows = {}) {
-    // N=5120 with N64 launches only 80 CTAs on 170 SMs. Partition output rows without splitting
-    // K or replaying weights, and deepen the pipeline instead: N=5120 streams K512 over three
-    // stages (M16 on N16, M32 on N32); other M16 schedules stream K256 over three. Wider
-    // projections place weight rows on MMA M (SwapAB); M32 keeps two stages. T=33..48 (C=5/6
-    // verify) uses one M48 tile so every weight byte is read once; its stages fit 48 KiB of static
-    // shared memory (N=5120 K256x2, wide K128x3). Every schedule keeps ascending K16 FMAs, so the
-    // tile height never changes an output.
-    const auto launch = [&]<int BM>() {
-        constexpr bool narrow = Geometry::kOutputRows == 5120;
+          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false, class Activation = Fp8A8Workspace>
+void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspace,
+                           Epilogue epilogue, Output output, cudaStream_t stream) {
+    constexpr bool kBf16 = std::is_same_v<Activation, Nvfp4Bf16Activation>;
+    constexpr int kActivationBytes = kBf16 ? 2 : 1;
+    // Output rows are partitioned without splitting K or replaying weights. N<=6144 places tokens on
+    // MMA M (N16 tiles for T<=16, N32 above) and streams K512 of FP8 over three stages; wider
+    // projections place sixteen weight rows on MMA M (SwapAB) and compile the exact eight-token
+    // panel count, streaming K256 over three stages (M16) or two (M32). T=33..48 (C=5/6 verify)
+    // uses one M48 tile so every weight byte is read once. BF16 activations halve BK to keep the
+    // same staged bytes. Every schedule keeps each output's ascending K order, so neither tile
+    // height nor panel count changes an output.
+    const auto launch = [&]<int BM, int Panels>() {
+        constexpr bool narrow = Geometry::kOutputRows <= 6144;
         constexpr int BN = narrow ? (BM == 16 ? 16 : 32) : 64;
-        constexpr int BK = BM == 48 ? (narrow ? 256 : 128) : (narrow ? 512 : 256);
+        constexpr int BK = (BM == 48 ? (narrow ? 256 : 128) : (narrow ? 512 : 256)) / kActivationBytes;
         constexpr int S  = BM == 48 ? (narrow ? 2 : 3) : (narrow || BM == 16 ? 3 : 2);
         using Schedule = Nvfp4W4a4MmaSchedule<BM, BN, BK, 1, BN == 16 ? 2 : 4, S, 1>;
+        constexpr auto kernel =
+            nvfp4_w4a8_mma_kernel<Geometry, Schedule, Epilogue, Output, RowPolicy, PairRows, narrow ? 0 : Panels, Activation>;
+        constexpr int smem = sizeof(Nvfp4W4a8SharedStorage<Schedule, kActivationBytes>);
+        static const bool configured = [] {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+            return true;
+        }();
+        (void)configured;
         const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, (tokens + BM - 1) / BM);
-        nvfp4_w4a8_mma_kernel<Geometry, Schedule, Epilogue, Output, RowPolicy, PairRows, !narrow>
-            <<<grid, Schedule::kThreads, 0, stream>>>(workspace,
-                static_cast<const std::uint8_t*>(weight.qdata), static_cast<const std::uint8_t*>(weight.scales),
-                tokens, 1.0F / weight.weight_scale_divisor, epilogue, output, rows);
+        kernel<<<grid, Schedule::kThreads, smem, stream>>>(workspace,
+            static_cast<const std::uint8_t*>(weight.qdata), static_cast<const std::uint8_t*>(weight.scales),
+            tokens, 1.0F / weight.weight_scale_divisor, epilogue, output, RowPolicy{});
     };
-    if (tokens <= 16) { launch.template operator()<16>(); }
-    else if (tokens <= 32) { launch.template operator()<32>(); }
-    else { launch.template operator()<48>(); }
+    if constexpr (Geometry::kOutputRows <= 6144) {
+        if (tokens <= 16) { launch.template operator()<16, 0>(); }
+        else if (tokens <= 32) { launch.template operator()<32, 0>(); }
+        else { launch.template operator()<48, 0>(); }
+    } else {
+        switch (std::min((tokens + 7) / 8, 6)) {
+        case 1: launch.template operator()<16, 1>(); break;
+        case 2: launch.template operator()<16, 2>(); break;
+        case 3: launch.template operator()<32, 3>(); break;
+        case 4: launch.template operator()<32, 4>(); break;
+        case 5: launch.template operator()<48, 5>(); break;
+        default: launch.template operator()<48, 6>(); break;
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

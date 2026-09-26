@@ -60,7 +60,18 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
 
+// DFlash qkv, attention-output and feature projections run BF16 activations on tensor cores for
+// T>=2; T=1 keeps the GEMV decode kernel.
+bool a16_uses_mma(Nvfp4Problem problem, std::int32_t tokens) {
+    return tokens >= 2 && (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
+                           problem == Nvfp4Problem::DflashFeature);
+}
+
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (a16_uses_mma(resolve_nvfp4_problem(weight.n, weight.k), x.ne[1])) {
+        launch_nvfp4_a16_mma(x, weight, out, stream);
+        return;
+    }
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
@@ -80,14 +91,19 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 } // namespace
 
+bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                           LinearPolicy policy) noexcept {
+    if (!is_nvfp4_linear_problem(output_rows, input_rows) ||
+        (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
+        return false;
+    }
+    return a16_uses_mma(resolve_nvfp4_problem(output_rows, input_rows), 2);
+}
+
 bool is_nvfp4_dflash_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
                                           LinearPolicy policy) noexcept {
     if (!is_nvfp4_linear_problem(output_rows, input_rows)) { return false; }
     const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
-    if (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
-        problem == Nvfp4Problem::DflashFeature) {
-        return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA4;
-    }
     if (problem == Nvfp4Problem::DflashConvProj) { return policy == LinearPolicy::A16Only; }
     return policy == LinearPolicy::AllowA4 && (problem == Nvfp4Problem::MlpGateUp ||
                                                problem == Nvfp4Problem::Residual17408);

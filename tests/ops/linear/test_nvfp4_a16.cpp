@@ -56,17 +56,20 @@ int run_nvfp4_a16() {
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, 5,
-        dflash_batches);
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 729U, 5,
-        dflash_batches);
+    // Tensor-core DFlash projections aggregate every draft width in one weight pass.
+    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+        failures += run_packed_sequences_matches_panels(
+            "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, width,
+            dflash_batches);
+        failures += run_packed_sequences_matches_panels(
+            "NVFP4_A16 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 729U, width,
+            dflash_batches);
+        failures += run_packed_sequences_matches_panels(
+            "NVFP4_A16 DFlash feature packed", make_nvfp4_weight, 5120, 25600, 739U, width,
+            dflash_batches, ops::LinearPolicy::AllowA4);
+    }
     failures += run_packed_sequences_matches_panels(
         "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5,
-        dflash_batches);
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash feature packed", make_nvfp4_weight, 5120, 25600, 739U, 5,
         dflash_batches);
     return failures;
 }
