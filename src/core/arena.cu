@@ -182,6 +182,13 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
     }
+    // A pageable H2D cudaMemcpy may return before the device write lands. Settle it before
+    // callers submit consumers on non-blocking streams.
+    const cudaError_t settled = cudaStreamSynchronize(nullptr);
+    if (settled != cudaSuccess) {
+        throw std::runtime_error(
+            cuda_error_message("host-to-device copy synchronization failed", settled));
+    }
 }
 
 void DeviceBuffer::copy_to_host(void* destination, std::size_t count,
