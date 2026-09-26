@@ -99,8 +99,8 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 RAM 第二层的 D2H/H2D 走独立的 copy engine（`DeviceContext::copy_stream`），不是 GPU scheduling
 unit，也不占用 compute owner。Copy 可以与**另一条** lane 的合法 compute unit 重叠；当前
 PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 destination。MTP/DFlash prefill
-context-checkpoint 冻结是例外：staging GDN（slot `2C`，与 lane current 不相交）、staging hidden，
-以及 DFlash staging cyclic state 的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `2C` 从 turn-rollback occupant
+context-checkpoint 冻结是例外：staging GDN（slot `C`，与 lane current 不相交）、staging hidden，
+以及 DFlash staging cyclic state 的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `C` 从 turn-rollback occupant
 借出，pack 后 H2D 把 rollback 装回；`occupied=false` 必须发生在 clobber D2D 之前。`device.stream`
 上的 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images 使用 Program-owned
 high-water pinned pool；head 离队后回池，后续相同 layout 的 freeze 复用 allocation 与 completion event，
@@ -336,11 +336,17 @@ capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request
 state 始终重新创建。
 
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
-`[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 rewrite-checkpoint
-state；MTP 或 DFlash 引擎额外保留 slot `2C` 作为 Engine-wide GDN：默认热 occupant 是 turn-rollback（append
-occupy 在 suffix prefill 之前把 current+`tail_hidden` 钉在上一完成 `E`），ladder freeze 借走后再
-装回。它不是 rewrite slot。一份 slot 同时选择全部 GDN layers 的 convolution history
-和 recurrent state。Decode round
+`[0,C)` 作为各 lane 的 current committed state；MTP 或 DFlash 引擎额外保留 slot `C` 作为 Engine-wide
+GDN：默认热 occupant 是 turn-rollback（append occupy 在 suffix prefill 之前把 current+`tail_hidden` 钉在
+上一完成 `E`），ladder freeze 借走后再装回。一份 slot 同时选择全部 GDN layers 的 convolution history
+和 recurrent state。
+
+Rewrite checkpoint 不占 device slot：每条 lane 拥有一份 pinned host image（GDN slot 与 DFlash cyclic local
+lane 的 host-image layout），首次 capture 或 tier restore 时分配，之后随 lane 复用。Prefill chunk 恰好结束在
+checkpoint frontier 时，在 compute stream 上把 current D2H 进该 image（stream-ordered，先于下一 chunk
+更新 current）；rewrite restore 从该 image H2D 回 current。RAM/SSD tier 与该 image 之间只做 host copy。
+Checkpoint hidden `[hidden,1]` 仍在 device。因此 per-lane device fixed state 只剩 current GDN 与 DFlash
+current local，不随 rewrite checkpoint 翻倍。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
 
 ### 4.4 Batch row
@@ -841,7 +847,7 @@ does not change GPU pool capacity, active-set
 accounting, or CUDA Graph addresses, and it does not move an in-flight request off the GPU.
 
 MTP 或 DFlash prefill may freeze current GDN into an Engine-wide staging slot during an in-flight prefill
-(after the Program prefill step compute-syncs that chunk). That freeze borrows slot `2C` from the
+(after the Program prefill step compute-syncs that chunk). That freeze borrows slot `C` from the
 turn-rollback occupant: `occupied=false` before the clobber D2D, pack the ladder head, then H2D
 rollback GDN and hidden back. DFlash also D2Ds that lane's cyclic local into a 1-lane Engine-wide
 staging window before the same `d2d_done` fence; host-pack D2H reads that frozen window, not live

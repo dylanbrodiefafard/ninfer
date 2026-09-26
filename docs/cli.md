@@ -289,10 +289,14 @@ unallocated. It does not probe allocations or resize the pool at request time. T
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 The startup log's `slack` includes the automatic `headroom`; they are not separate deductions.
-`graphs` reports measured GPU usage / planned allowance. DFlash2 budgets 12 MiB per
-`(draft length, batch size, topology)` executable (240 MiB for adaptive lengths 1/2/3/4/5 and
-four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
+`graphs` reports measured GPU usage / planned allowance. Ordinary, MTP, and DFlash2 budget
+`min(12n, 24+6n)` MiB for `n` `(draft length, batch size, topology)` executables (144 MiB for
+adaptive lengths 1/2/3/4/5 and four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
 processing a full prefill chunk uses the already reserved runtime storage.
+Each lane's turn (rewrite) checkpoint lives in pinned host memory rather than the GPU pool: one
+image per lane of the GDN state (146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V),
+allocated at startup outside `--kv-ram-capacity` and outside the startup memory report. Capturing
+it costs one D2H at the prefill chunk that ends on the checkpoint, and restoring it one H2D.
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.

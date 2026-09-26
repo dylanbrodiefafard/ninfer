@@ -125,7 +125,7 @@ struct DiskRestoreTarget {
 
     LinearAttentionStatePool* gdn    = nullptr;
     std::int32_t gdn_current_slot    = -1;
-    std::int32_t gdn_checkpoint_slot = -1;
+    RewriteStateHostTarget rewrite_state;
 
     Tensor* tail_hidden               = nullptr;
     Tensor* rewrite_checkpoint_hidden = nullptr;
@@ -133,9 +133,8 @@ struct DiskRestoreTarget {
     PrefixReusePath reuse    = PrefixReusePath::FullReset;
     std::uint32_t reuse_base = 0;
 
-    CyclicKVCache* dflash_local      = nullptr;
-    CyclicKVCache* dflash_checkpoint = nullptr;
-    std::int32_t dflash_lane         = 0;
+    CyclicKVCache* dflash_local = nullptr;
+    std::int32_t dflash_lane    = 0;
 
     cudaStream_t stream = nullptr;
 };

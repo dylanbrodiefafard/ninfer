@@ -6891,6 +6891,14 @@ void KVDiskCache::start_restore_state_h2d_locked(cudaStream_t stream) {
                                    state_h2d_stream_));
         copied_state = true;
     };
+    // Rewrite checkpoints are lane-owned pinned host images; the loaded slices copy on the host.
+    auto host_from_arena = [&](void* dst, const auto& src, const char* label) {
+        if (!live() || src.empty()) { return; }
+        if (dst == nullptr) {
+            throw std::logic_error(std::string("KV disk restore is missing the ") + label);
+        }
+        std::memcpy(dst, src.data(), src.size());
+    };
     auto cyclic_from_arena = [&](CyclicKVCache* cache, const auto& src) {
         if (!live() || cache == nullptr || src.empty()) { return; }
         state_arena_h2d_pending_ = true;
@@ -6910,10 +6918,11 @@ void KVDiskCache::start_restore_state_h2d_locked(cudaStream_t stream) {
         gdn_from_arena(restore_target_->gdn_current_slot, restore_state_slices_.gdn_conv,
                        restore_state_slices_.gdn_rec);
     }
-    if (restore_unpack_rewrite_) {
-        gdn_from_arena(restore_target_->gdn_checkpoint_slot,
-                       restore_state_slices_.rewrite_gdn_conv,
-                       restore_state_slices_.rewrite_gdn_rec);
+    if (restore_unpack_rewrite_ && restore_target_->gdn != nullptr) {
+        host_from_arena(restore_target_->rewrite_state.conv,
+                        restore_state_slices_.rewrite_gdn_conv, "rewrite-checkpoint GDN image");
+        host_from_arena(restore_target_->rewrite_state.recurrent,
+                        restore_state_slices_.rewrite_gdn_rec, "rewrite-checkpoint GDN image");
     }
     if (!restore_use_context_head_ && !skip_frontier_current) {
         hidden_from_arena(restore_target_->tail_hidden, restore_state_slices_.hidden);
@@ -6925,9 +6934,9 @@ void KVDiskCache::start_restore_state_h2d_locked(cudaStream_t stream) {
     if (!restore_use_context_head_ && !skip_frontier_current) {
         cyclic_from_arena(restore_target_->dflash_local, restore_state_slices_.cyclic);
     }
-    if (restore_unpack_rewrite_) {
-        cyclic_from_arena(restore_target_->dflash_checkpoint,
-                          restore_state_slices_.rewrite_cyclic);
+    if (restore_unpack_rewrite_ && restore_target_->dflash_local != nullptr) {
+        host_from_arena(restore_target_->rewrite_state.dflash,
+                        restore_state_slices_.rewrite_cyclic, "rewrite-checkpoint DFlash image");
     }
     if (fail_after_state_h2d_enqueue_.exchange(false, std::memory_order_acq_rel)) {
         throw std::runtime_error("injected failure after KV disk state H2D enqueue");

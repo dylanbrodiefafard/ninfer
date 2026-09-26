@@ -935,19 +935,21 @@ The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_rollback`. Both
 rewrite checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
-rewritten suffix; matching KV tokens alone never authorize a partial hit. MTP or DFlash prefill may also
+rewritten suffix; matching KV tokens alone never authorize a partial hit. Their recurrent and DFlash
+local state live in one lane-owned pinned host image per lane (outside `--kv-ram-capacity`), so they
+do not reduce GPU KV capacity. MTP or DFlash prefill may also
 freeze current GDN at committed chunk ends that have reached a context mark (default 24576, 36864,
 53248, 77824, 102400, 151552, or `--context-checkpoints a,b,c`); a later prompt that matches that prefix restores GDN into current and hidden into
 `tail_hidden` as `restore_context_checkpoint`. DFlash2 also restores that lane's cyclic local K/V
-and `dflash_context_frontier`. Slot `2C` is the Engine-wide GDN image for that
+and `dflash_context_frontier`. GDN staging slot `C` is the Engine-wide GDN image for that
 freeze and for the turn-rollback pin: on `append_frontier` occupy with `E>0` and a
-real suffix (`prompt_tokens > E`), current GDN and `tail_hidden` are copied to `2C` before suffix
+real suffix (`prompt_tokens > E`), current GDN and `tail_hidden` are copied to that slot before suffix
 prefill so a later edit of the last user turn can restore that completed `E` as
 `restore_turn_rollback`. The same slot is written on an exact-hit / decode-only request
 (`prompt_tokens == E`) when `ninfer.capture_context_checkpoint` is true, unless a context-checkpoint
 head already sits at that `E` (skip, `captured_tokens = 0`; the rollback slot stays empty until a
 later `true` at a new `E`). A later exact-hit `true` replaces the one rollback pin and leaves
-ladder heads. Ladder freeze borrows `2C` and reloads the rollback image afterward.
+ladder heads. Ladder freeze borrows that slot and reloads the rollback image afterward.
 Same last user regenerate still hits rewrite (`TurnClosure` is longer than rollback `E`). With stable
 `preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
 response's complete deterministic generation prologue. For thinking generation this includes

@@ -27,7 +27,11 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
             if (rewrite_checkpoint) {
-                state.dflash->save_rewrite_checkpoint(state.dflash_host_ingress->lanes[0],
+                if (state.rewrite_checkpoint_state.dflash == nullptr) {
+                    throw std::logic_error("DFlash rewrite checkpoint has no host image");
+                }
+                state.dflash->local.copy_lane_to_host(state.dflash_host_ingress->lanes[0],
+                                                      state.rewrite_checkpoint_state.dflash,
                                                       state.execution.device.stream);
             }
         });
@@ -37,10 +41,9 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
-                         std::int32_t rewrite_checkpoint_state_slot,
                          std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
-    card.set_linear_state_slots(current_state_slot, rewrite_checkpoint_state_slot);
+    card.set_linear_state_slot(current_state_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     card.set_prefill_skip(execution.keep_frac, execution.xattn_tau, execution.xattn_min_len);
@@ -62,8 +65,10 @@ PrefillChunkResult prefill_text_chunk(
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card.set_rewrite_checkpoint_state_output(state.rewrite_checkpoint_state.conv,
+                                             state.rewrite_checkpoint_state.recurrent);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
@@ -87,8 +92,10 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
-                        state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+                        state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card.set_rewrite_checkpoint_state_output(state.rewrite_checkpoint_state.conv,
+                                             state.rewrite_checkpoint_state.recurrent);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)

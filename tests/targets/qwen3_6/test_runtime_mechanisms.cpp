@@ -870,20 +870,17 @@ void test_prefill_context_marks() {
            "response rewrite also wins a same-F ladder tie");
 
     using Slots = q36::detail::mechanism_slots::LinearStateSlots;
-    expect(Slots::state_slot_count(1, true) == 3, "C=1 MTP/DFlash GDN pool is 2C+1");
-    expect(Slots::staging_state_slot(1) == 2, "C=1 staging is slot 2C");
+    expect(Slots::state_slot_count(1, true) == 2, "C=1 MTP/DFlash GDN pool is C+1");
+    expect(Slots::staging_state_slot(1) == 1, "C=1 staging is slot C");
     expect(Slots::current_state_slot(0, 1) == 0, "C=1 current is slot 0");
-    expect(Slots::rewrite_checkpoint_state_slot(0, 1) == 1, "C=1 rewrite is slot C");
-    expect(Slots::state_slot_count(1, false) == 2, "ordinary GDN pool is 2C, no staging");
-    expect(Slots::state_slot_count(2, true) == 5, "C=2 MTP/DFlash GDN pool is 2C+1");
-    expect(Slots::staging_state_slot(2) == 4, "C=2 staging is slot 2C");
+    expect(Slots::state_slot_count(1, false) == 1, "ordinary GDN pool is C, no staging");
+    expect(Slots::state_slot_count(2, true) == 3, "C=2 MTP/DFlash GDN pool is C+1");
+    expect(Slots::staging_state_slot(2) == 2, "C=2 staging is slot C");
     expect(Slots::current_state_slot(1, 2) == 1, "C=2 lane 1 current is slot 1");
-    expect(Slots::rewrite_checkpoint_state_slot(1, 2) == 3, "C=2 lane 1 rewrite is slot C+1");
-    expect(Slots::state_slot_count(8, true) == 17, "C=8 MTP/DFlash GDN pool is 2C+1");
-    expect(Slots::staging_state_slot(8) == 16, "C=8 staging is slot 2C");
+    expect(Slots::state_slot_count(8, true) == 9, "C=8 MTP/DFlash GDN pool is C+1");
+    expect(Slots::staging_state_slot(8) == 8, "C=8 staging is slot C");
     expect(Slots::current_state_slot(7, 8) == 7, "C=8 last-lane current is slot 7");
-    expect(Slots::rewrite_checkpoint_state_slot(7, 8) == 15, "C=8 last-lane rewrite is slot C+7");
-    expect(Slots::staging_state_slot(3) == 6, "C=3 staging is slot 2C");
+    expect(Slots::staging_state_slot(3) == 3, "C=3 staging is slot C");
 }
 
 } // namespace

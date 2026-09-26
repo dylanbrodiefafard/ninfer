@@ -5,6 +5,7 @@
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "cuda_stream_gate.h"
+#include "rewrite_state_host_image.h"
 #include "targets/qwen3_6/impl/runtime/kv_disk_cache.h"
 #include "targets/qwen3_6/impl/runtime/kv_ram_cache.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -7810,7 +7811,9 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     auto source                   = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
     source.gdn                    = &gdn;
     source.gdn_current_slot      = 0;
-    source.gdn_checkpoint_slot  = 1;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
+    source.rewrite_state         = source_rewrite.source();
     source.rewrite_valid       = true;
     source.rewrite_kind         = q36::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier     = 2;
@@ -7853,7 +7856,11 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
         target.text_dst_pages     = 1;
         target.gdn                 = &gdn;
         target.gdn_current_slot   = current_slot;
-        target.gdn_checkpoint_slot = checkpoint_slot;
+        // Seed the host rewrite image from the checkpoint slot so an untouched image leaves the
+        // device-side comparison unchanged.
+        auto target_rewrite = ninfer::test::RewriteStateHostImage::packed(
+            gdn, checkpoint_slot, nullptr, 0, ctx.stream);
+        target.rewrite_state       = target_rewrite.target();
         target.reuse               = reuse;
         target.reuse_base         = reuse_base;
         target.stream              = ctx.copy_stream;
@@ -7870,6 +7877,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
             std::cerr << hung << " threw: " << e.what() << '\n';
             return 1;
         }
+        target_rewrite.unpack(gdn, checkpoint_slot, nullptr, 0, ctx.stream);
         disk.cancel_restore();
         disk.release(restore_match.entry_id);
         dest.release();
@@ -7934,7 +7942,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
                                        ctx.copy_stream, 4);
     response_source.gdn = &gdn;
     response_source.gdn_current_slot = 0;
-    response_source.gdn_checkpoint_slot = 1;
+    response_source.rewrite_state = source_rewrite.source();
     response_source.rewrite_valid = true;
     response_source.rewrite_kind = q36::RewriteCheckpointKind::ResponseReplay;
     response_source.rewrite_frontier = 2;
@@ -8048,7 +8056,9 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     auto source                       = make_source(retained, identity, alloc, pool, ctx.copy_stream, 4);
     source.gdn                        = &gdn;
     source.gdn_current_slot         = 0;
-    source.gdn_checkpoint_slot       = 1;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 1, &rewrite_cyclic, 0, ctx.stream);
+    source.rewrite_state             = source_rewrite.source();
     source.tail_hidden                = &hidden;
     source.rewrite_checkpoint_hidden = &hidden_rw;
     source.rewrite_valid             = true;
@@ -8058,7 +8068,6 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     source.hash_c                     = q36::detail::prefix_hash_at(retained.token_ids, identity, 2);
     source.dflash_local               = &cyclic;
     source.dflash_lane                = 0;
-    source.dflash_checkpoint            = &rewrite_cyclic;
     ctx.synchronize_all();
     auto id = capture_or_evict(ram, source);
     if (!id) {
@@ -8106,11 +8115,11 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
     target.text_dst_pages            = 1;
     target.gdn                        = &gdn;
     target.gdn_current_slot          = 2;
-    target.gdn_checkpoint_slot      = 3;
+    auto target_rewrite = ninfer::test::RewriteStateHostImage::sized(gdn, &rewrite_cyclic);
+    target.rewrite_state             = target_rewrite.target();
     target.tail_hidden                = &hidden_out;
     target.rewrite_checkpoint_hidden = &hidden_out_rw;
     target.dflash_local               = &cyclic;
-    target.dflash_checkpoint           = &rewrite_cyclic;
     target.dflash_lane                = 0;
     target.reuse                      = ninfer::PrefixReusePath::AppendAtFrontier;
     target.reuse_base                = 4;
@@ -8131,6 +8140,7 @@ int test_pinned_state_h2d_matches_heap(ninfer::DeviceContext& ctx, ninfer::Paged
         return 1;
     }
     ctx.synchronize_all();
+    target_rewrite.unpack(gdn, 3, &rewrite_cyclic, 0, ctx.stream);
     std::vector<unsigned char> conv_got(frontier_conv.size());
     std::vector<unsigned char> rec_got(frontier_rec.size());
     gdn.pack_slot_to_host(2, conv_got.data(), rec_got.data(), ctx.stream);
@@ -13347,7 +13357,9 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
     auto source                  = make_source(retained, identity, alloc, pool, ctx.copy_stream, 8);
     source.gdn                   = &gdn;
     source.gdn_current_slot     = 0;
-    source.gdn_checkpoint_slot  = 0;
+    const auto source_rewrite =
+        ninfer::test::RewriteStateHostImage::packed(gdn, 0, nullptr, 0, ctx.stream);
+    source.rewrite_state        = source_rewrite.source();
     source.rewrite_valid        = true;
     source.rewrite_kind         = q36::RewriteCheckpointKind::TurnClosure;
     source.rewrite_frontier      = 4;
@@ -13470,7 +13482,8 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
         target.text_dst_pages    = 1;
         target.gdn               = &gdn;
         target.gdn_current_slot = 1;
-        target.gdn_checkpoint_slot = 2;
+        auto target_rewrite      = ninfer::test::RewriteStateHostImage::sized(gdn);
+        target.rewrite_state     = target_rewrite.target();
         target.stream            = ctx.copy_stream;
         disk.restore_device(match->entry_id, target);
         try {
@@ -13504,7 +13517,7 @@ int test_zero_hidden_bytes_preserves_heads(ninfer::DeviceContext& ctx, ninfer::P
         rb_target.text_dst_pages    = 1;
         rb_target.gdn               = &gdn;
         rb_target.gdn_current_slot = 1;
-        rb_target.gdn_checkpoint_slot = 2;
+        rb_target.rewrite_state    = target_rewrite.target();
         rb_target.reuse            = ninfer::PrefixReusePath::RestoreTurnRollback;
         rb_target.reuse_base       = 3;
         rb_target.stream            = ctx.copy_stream;

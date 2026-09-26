@@ -780,10 +780,11 @@ The server workload used `--max-context 260000 --kv-capacity auto --max-concurre
 --prefill-chunk 4096 --kv-dtype nvfp4 --spec dflash --draft-tokens 5 --adaptive-draft
 --lm-head-draft`, temperature 1.5, 32768 MiB RAM cache, and 100000 MiB disk cache.
 
-DFlash2 reserves 12 MiB per `(K, B, topology)` graph executable, or 144 MiB for the
-three-width adaptive set used in this earlier qualification, instead of inheriting the
-autoregressive DFlash allowance of 1152 MiB. The current five-width set reserves 240 MiB
-at C=4; the capacity numbers below describe the earlier set.
+This qualification reserved 12 MiB per DFlash2 `(K, B, topology)` graph executable, or 144 MiB
+for the three-width adaptive set used then, instead of inheriting the
+autoregressive DFlash allowance of 1152 MiB. The current five-width set reserves 144 MiB
+at C=4 (`min(12n, 24+6n)` MiB for `n` executables); the capacity numbers below describe the
+earlier set.
 With the same reported 13.26 GiB free after weights, server startup resolved 558656 tokens,
 up from the reported 501312-token configuration: the 1008 MiB reduction buys exactly 896
 64-token pages (57344 tokens). Measured graph usage was 54 MiB and free memory after startup

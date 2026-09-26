@@ -185,9 +185,16 @@ public:
         rewrite_checkpoint_hidden_output_ = output;
     }
 
+    // Pinned host image receiving the current GDN slot when prefill crosses the rewrite
+    // checkpoint frontier (LinearAttentionStatePool::pack_slot_to_host layout).
+    void set_rewrite_checkpoint_state_output(void* conv, void* recurrent) noexcept {
+        rewrite_checkpoint_conv_output_      = conv;
+        rewrite_checkpoint_recurrent_output_ = recurrent;
+    }
+
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
-    void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
+    void set_linear_state_slot(std::int32_t current_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
     void set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
                          const Tensor* prefix_lengths);
@@ -324,11 +331,12 @@ private:
     std::int32_t active_sequence_row_                     = 0;
     std::int32_t rope_delta_                              = 0;
     std::int32_t linear_state_current_slot_               = 0;
-    std::int32_t linear_state_rewrite_checkpoint_slot_    = 0;
     GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_               = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
+    void* rewrite_checkpoint_conv_output_                 = nullptr;
+    void* rewrite_checkpoint_recurrent_output_            = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
     // Prefill tile-skip: keep_frac (Sparge) and xattn_tau (XAttention). Decode/SmallT
     // ignore these (forced dense). Defaults are exact attention.

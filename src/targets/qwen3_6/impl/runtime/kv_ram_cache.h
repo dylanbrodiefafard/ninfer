@@ -40,6 +40,20 @@ struct RamLadderHead {
     std::size_t dflash_bytes    = 0;
 };
 
+// Lane-owned pinned rewrite-checkpoint images, in the LinearAttentionStatePool slot host-image
+// and CyclicKVCache lane host-image layouts. DFlash is null for non-DFlash engines.
+struct RewriteStateHostSource {
+    const void* conv      = nullptr;
+    const void* recurrent = nullptr;
+    const void* dflash    = nullptr;
+};
+
+struct RewriteStateHostTarget {
+    void* conv      = nullptr;
+    void* recurrent = nullptr;
+    void* dflash    = nullptr;
+};
+
 struct RamLadderIndex {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
@@ -85,7 +99,7 @@ struct RamCaptureSource {
 
     const LinearAttentionStatePool* gdn = nullptr;
     std::int32_t gdn_current_slot       = -1;
-    std::int32_t gdn_checkpoint_slot    = -1;
+    RewriteStateHostSource rewrite_state;
 
     const Tensor* tail_hidden                = nullptr;
     const Tensor* rewrite_checkpoint_hidden  = nullptr;
@@ -94,9 +108,8 @@ struct RamCaptureSource {
 
     std::uint64_t disk_entry_id = 0;
 
-    const CyclicKVCache* dflash_local      = nullptr;
-    const CyclicKVCache* dflash_checkpoint = nullptr;
-    std::int32_t dflash_lane               = 0;
+    const CyclicKVCache* dflash_local = nullptr;
+    std::int32_t dflash_lane          = 0;
 
     cudaStream_t stream = nullptr;
 };
@@ -111,7 +124,7 @@ struct RamRestoreTarget {
 
     LinearAttentionStatePool* gdn     = nullptr;
     std::int32_t gdn_current_slot     = -1;
-    std::int32_t gdn_checkpoint_slot  = -1;
+    RewriteStateHostTarget rewrite_state;
 
     Tensor* tail_hidden               = nullptr;
     Tensor* rewrite_checkpoint_hidden = nullptr;
@@ -119,9 +132,8 @@ struct RamRestoreTarget {
     PrefixReusePath reuse    = PrefixReusePath::FullReset;
     std::uint32_t reuse_base = 0;
 
-    CyclicKVCache* dflash_local      = nullptr;
-    CyclicKVCache* dflash_checkpoint = nullptr;
-    std::int32_t dflash_lane         = 0;
+    CyclicKVCache* dflash_local = nullptr;
+    std::int32_t dflash_lane    = 0;
 
     cudaStream_t stream = nullptr;
 };

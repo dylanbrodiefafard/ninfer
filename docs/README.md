@@ -64,6 +64,9 @@ Pending plans:
 - [DFlash A8 verification follow-ups](maintainer/dflash-a8-followups.md) lists measured
   attribution and candidate speedups after the A8/A8 default, with per-candidate outcomes.
 
+- [Elastic concurrency lanes](maintainer/elastic-concurrency.md) records the measured per-lane
+  memory cost and candidate designs for trading idle lanes back to the KV pool.
+
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
   implementation map.

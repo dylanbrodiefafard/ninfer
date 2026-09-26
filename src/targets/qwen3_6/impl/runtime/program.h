@@ -208,6 +208,10 @@ struct SequenceState {
     std::uint64_t use_tick        = 0;
     std::uint64_t disk_entry_id   = 0;
     RewriteCheckpoint rewrite_checkpoint;
+    // Lane-owned pinned image of the rewrite checkpoint's GDN slot and DFlash cyclic lane,
+    // allocated with the Program; rewrite_checkpoint says whether its contents are valid. Its
+    // fence covers every asynchronous copy that reads or writes it.
+    ContextCheckpointHead rewrite_image;
     std::vector<ContextCheckpointHead> context_checkpoints;
     std::uint32_t next_context_mark = 0;
     // Set by HostDisk staged restore after the matching head is unpacked into current.
@@ -519,6 +523,10 @@ private:
                                      std::uint32_t base, std::uint32_t prompt_tokens,
                                      bool capture_enabled, bool request_pin);
     void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);
+    void allocate_rewrite_image(SequenceState& sequence);
+    void restore_rewrite_checkpoint_state(SequenceState& sequence);
+    [[nodiscard]] qwen3_6::detail::RewriteStateHostTarget
+    rewrite_state_host_target(SequenceState& sequence);
     void restore_dflash_cyclic_from_head(SequenceState& sequence, const ContextCheckpointHead& head);
     void snapshot_dflash_cyclic_to_staging(std::int32_t lane);
     void pack_dflash_cyclic_to_head(ContextCheckpointHead& head);
