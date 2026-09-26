@@ -9,6 +9,7 @@
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/generation_recovery.h"
+#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/prepared_prompt.h"
 #include "runtime/contract/reasoning_recovery.h"
 
 #include <algorithm>
@@ -33,6 +34,14 @@
 namespace ninfer::runtime {
 
 template <class Instance>
+class ConcurrentExecutor;
+
+// Plants one queued retry and lets the worker run start_generation_recovery for
+// the script selected on the probe program. Production has no other caller.
+template <class ProbeInstance>
+int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor);
+
+template <class Instance>
 class ConcurrentExecutor {
     struct Request;
 
@@ -49,6 +58,7 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()),
+          context_capacity_(options.max_context),
           load_progress_(options.load_progress), generation_recovery_(options.generation_recovery) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -397,6 +407,7 @@ private:
                 bool generation_recovery)
             : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
               output(std::move(output_session)), prompt_summary(summary),
+              resident_prompt_tokens(summary.prompt_tokens),
               prepare_seconds(frontend_seconds), options(std::move(request_options)),
               delivery(output_delivery), deadline(limit), submitted(submit_time),
               pending_since(submit_time),
@@ -412,6 +423,9 @@ private:
         targets::qwen3_6::PreparedPrompt prompt;
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
+        // Length of the prompt prefix the next recovery splice copies. The admitted
+        // prompt_summary.prompt_tokens value stays unchanged for usage reporting.
+        std::uint32_t resident_prompt_tokens = 0;
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
         OutputDelivery delivery = OutputDelivery::TerminalOnly;
@@ -773,9 +787,145 @@ private:
         add(total.rounds_per_draft, part.rounds_per_draft);
     }
 
+    void release_recovery_lane(std::uint32_t lane) noexcept {
+        instance_.program->abort_lane(lane);
+        if (prefill_lane_ && *prefill_lane_ == lane) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+    }
+
+    void begin_recovery_prefill(const std::shared_ptr<Request>& request, std::uint32_t lane,
+                                Plan plan) {
+        const RequestPlanSummary summary = plan.summary();
+        instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
+        prefill_lane_ = lane;
+        const auto prefill_started = Clock::now();
+        const PrefillStepResult first = instance_.program->start_prefill_lane(
+            lane, std::move(request->prompt), std::move(plan), instance_.request_memory.region(),
+            &request->output);
+        request->recovery.prefill_seconds +=
+            std::chrono::duration<double>(Clock::now() - prefill_started).count();
+        (void)resolve_prefill_step(request, first,
+                                   request->cancelled.load(std::memory_order_acquire));
+        publish_runtime_stats();
+    }
+
+    // Blocking host restore on this lane. Returns false when the caller should
+    // cold-prefill the same lane. Does not requeue, clear the output budget, or
+    // stick force_cold_prefill / cache_fallback.
+    [[nodiscard]] bool prefill_recovery_from_host(const std::shared_ptr<Request>& request,
+                                                  std::uint32_t lane, bool ram, Plan host_plan) {
+        const RequestPlanSummary summary = host_plan.summary();
+        const std::uint64_t ram_entry_id  = summary.ram_entry_id;
+        const std::uint64_t disk_entry_id = summary.disk_entry_id;
+        bool ram_claimed                  = false;
+        bool disk_claimed                 = false;
+        bool ram_owned                    = false;
+        bool disk_owned                   = false;
+        bool consumed                     = false;
+        auto release_claim = [&]() noexcept {
+            if (consumed) { return; }
+            if (ram_claimed) {
+                try {
+                    instance_.program->release_ram_entry(ram_entry_id);
+                } catch (...) {}
+                ram_claimed = false;
+            }
+            if (disk_claimed) {
+                try {
+                    instance_.program->release_disk_entry(disk_entry_id);
+                } catch (...) {}
+                disk_claimed = false;
+            }
+        };
+        try {
+            if (ram) {
+                instance_.program->claim_ram_entry(ram_entry_id);
+                ram_claimed = true;
+                ram_owned   = true;
+                instance_.program->restore_ram_entry(lane, ram_entry_id, host_plan);
+            } else {
+                if (!instance_.program->claim_disk_entry(
+                        disk_entry_id, summary.disk_execution_frontier, summary.disk_hash_f_lo,
+                        summary.disk_hash_f_hi, summary.reusable_prompt_tokens,
+                        summary.disk_reuse_path, summary.disk_committed_generation)) {
+                    return false;
+                }
+                disk_claimed = true;
+                disk_owned   = true;
+                instance_.program->prefetch_disk_plan(disk_entry_id, host_plan);
+                instance_.program->restore_disk_entry(lane, disk_entry_id, host_plan);
+            }
+            instance_.program->pump_disk_restore();
+            if (instance_.program->kv_disk_restore_failed()) {
+                instance_.program->wait_kv_disk_copies();
+            }
+            if (!instance_.program->kv_copies_ready()) {
+                instance_.program->wait_kv_ram_copies();
+                instance_.program->wait_kv_disk_copies();
+            } else {
+                instance_.program->wait_kv_disk_copies();
+            }
+            instance_.program->wait_kv_ram_copies_on_compute();
+            if (instance_.program->kv_disk_restore_failed()) {
+                throw CacheRestoreFailure("disk cache restore failed");
+            }
+            begin_recovery_prefill(request, lane, std::move(host_plan));
+            const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
+            request->kv_ram_save_seconds += copies.save;
+            request->kv_ram_load_seconds += copies.load;
+            const auto disk_copies = instance_.program->harvest_kv_disk_copy_seconds();
+            request->kv_disk_save_seconds += disk_copies.save;
+            request->kv_disk_load_seconds += disk_copies.load;
+            request->kv_disk_h2d_seconds += disk_copies.h2d;
+            cumulative_stats_.kv_disk_h2d_seconds += disk_copies.h2d;
+            if (ram) {
+                instance_.program->consume_ram_entry(ram_entry_id);
+                ram_claimed = false;
+            } else {
+                instance_.program->consume_disk_entry(disk_entry_id);
+                disk_claimed = false;
+            }
+            consumed = true;
+            return true;
+        } catch (const CacheRestoreFailure&) {
+            try {
+                instance_.program->cancel_disk_restore();
+            } catch (...) {}
+            try {
+                instance_.program->synchronize_all();
+            } catch (...) {}
+            release_claim();
+            if (ram_owned) {
+                try {
+                    instance_.program->discard_ram_capture(ram_entry_id);
+                } catch (...) {}
+            }
+            if (disk_owned) {
+                try {
+                    instance_.program->invalidate_disk_entry(disk_entry_id);
+                } catch (...) {}
+            }
+            release_recovery_lane(lane);
+            if (!request->prompt) { throw; }
+            return false;
+        } catch (...) {
+            try {
+                instance_.program->cancel_disk_restore();
+            } catch (...) {}
+            try {
+                instance_.program->synchronize_all();
+            } catch (...) {}
+            release_claim();
+            release_recovery_lane(lane);
+            throw;
+        }
+    }
+
     // Recovery starts only after the generated round is committed. Tool calls
     // remain unpublished; reasoning retries pause an otherwise active lane.
-    // Re-prefill owns the same admitted resource/service commitment.
+    // The retry keeps this lane and splices onto the resident prompt.
     [[nodiscard]] bool start_generation_recovery() {
         while (!recovery_queue_.empty()) {
             auto request = std::move(recovery_queue_.front());
@@ -785,36 +935,136 @@ private:
             }
             const auto lane = *request->lane;
             const auto attempt = request->recovery.attempts + 1;
-            const auto started = Clock::now();
-            auto repaired = instance_.loaded->frontend.prepare(
-                request->recovery_context->repair(request->output.tool_calls(), attempt));
-            request->recovery.prepare_seconds +=
-                std::chrono::duration<double>(Clock::now() - started).count();
-            if (repaired.summary().prompt_tokens >
-                request->prompt_summary.prompt_tokens + request->generated.size()) {
-                recovery_exhausted(request, "repaired context would exceed the original reservation");
-                return true;
-            }
-            auto output = instance_.loaded->frontend.make_output_session(
-                repaired, request->options.stop, request->options.output);
             auto execution = request->options.execution;
             execution.requested_output_tokens = request->budget->remaining();
-            execution.allow_prefix_reuse = false;
+            // Keep the request's reuse setting. capture stays off so a retry does not
+            // pin its frontier as a turn rollback.
             execution.capture_context_checkpoint = false;
             execution.suppressed_token_count = 0;
-            if (!output.model_stop_tokens_allowed()) {
+
+            const bool reuse_enabled =
+                execution.allow_prefix_reuse && !execution.force_cold_prefill;
+            const bool lane_retained =
+                reuse_enabled && instance_.program->retain_reusable_lane(lane);
+            invalidate_lane_plans(lane);
+            release_planning_state(request);
+
+            const auto started = Clock::now();
+            std::vector<TokenId> prefix;
+            std::uint32_t ignored_frontier = 0;
+            const bool copied = instance_.program->copy_reusable_prompt(
+                lane, request->resident_prompt_tokens, prefix, ignored_frontier);
+            (void)ignored_frontier;
+            std::vector<TokenId> original_prefix;
+            if (!copied) {
+                auto rebuilt =
+                    instance_.loaded->frontend.prepare(request->recovery_context->input());
+                request->resident_prompt_tokens = rebuilt.summary().prompt_tokens;
+                auto taken = targets::qwen3_6::PreparedPromptAccess::take(std::move(rebuilt));
+                original_prefix = std::move(taken.token_ids);
+            }
+            const auto selected = targets::qwen3_6::recovery_splice_prefix(
+                copied ? std::span<const TokenId>(prefix) : std::span<const TokenId>{},
+                original_prefix);
+            if (selected.data() != prefix.data()) { prefix = std::move(original_prefix); }
+            const auto insert = request->recovery_context->recovery_insert(
+                request->output.tool_calls(), attempt);
+            auto spliced = instance_.loaded->frontend.splice_recovery_prompt(
+                std::move(prefix), request->recovery_context->input(), insert,
+                request->recovery_context);
+            request->recovery.prepare_seconds +=
+                std::chrono::duration<double>(Clock::now() - started).count();
+
+            const auto route_of = [&](bool splice_accepted, bool budget_ok, bool pages_ok,
+                                      std::uint32_t resident, bool can_admit, std::uint32_t ram,
+                                      std::uint32_t disk, bool restore_failed) {
+                return targets::qwen3_6::route_recovery_prefill(targets::qwen3_6::RecoveryPrefillInput{
+                    .splice_accepted           = splice_accepted,
+                    .allow_prefix_reuse        = execution.allow_prefix_reuse,
+                    .force_cold_prefill        = execution.force_cold_prefill,
+                    .lane_retained             = lane_retained,
+                    .resident_reusable_tokens  = resident,
+                    .can_admit_lane            = can_admit,
+                    .output_budget_preserved   = budget_ok,
+                    .pages_fit                 = pages_ok,
+                    .ram_reusable_tokens       = ram,
+                    .disk_reusable_tokens      = disk,
+                    .host_restore_failed       = restore_failed,
+                });
+            };
+            if (!spliced) {
+                const auto decision = route_of(false, true, true, 0, true, 0, 0, false);
+                recovery_exhausted(request, std::string(decision.detail));
+                return true;
+            }
+
+            const std::uint32_t spliced_tokens = spliced->summary().prompt_tokens;
+            const bool budget_ok = targets::qwen3_6::recovery_output_budget_preserved(
+                spliced_tokens, context_capacity_, request->budget->remaining());
+            if (!budget_ok) {
+                const auto decision = route_of(true, false, true, 0, true, 0, 0, false);
+                recovery_exhausted(request, std::string(decision.detail));
+                return true;
+            }
+
+            auto session = instance_.loaded->frontend.make_output_session(
+                *spliced, request->options.stop, request->options.output);
+            if (!session.model_stop_tokens_allowed()) {
                 const auto& stops = instance_.loaded->frontend.default_stop_policy().token_ids;
                 execution.suppressed_token_count = static_cast<std::uint32_t>(stops.size());
                 std::copy(stops.begin(), stops.end(), execution.suppressed_token_ids.begin());
             }
-            auto base = instance_.program->plan_request_base(repaired, execution);
-            if (!admission_resources_fit(base.summary().admission, request->admission_resources) ||
-                base.summary().effective_output_tokens != request->budget->remaining()) {
-                recovery_exhausted(request, "repaired request cannot preserve its admitted output budget");
+            auto base = instance_.program->plan_request_base(*spliced, execution);
+            const bool pages_ok =
+                admission_resources_fit(base.summary().admission, request->admission_resources) &&
+                base.summary().effective_output_tokens == request->budget->remaining();
+            if (!pages_ok) {
+                const auto decision = route_of(true, true, false, 0, true, 0, 0, false);
+                recovery_exhausted(request, std::string(decision.detail));
+                return true;
+            }
+
+            std::uint32_t resident = 0;
+            bool can_admit         = true;
+            std::optional<Plan> lane_plan;
+            if (lane_retained) {
+                lane_plan = instance_.program->plan_request_for_lane(lane, *spliced, base);
+                resident  = lane_plan->summary().reusable_prompt_tokens;
+                can_admit = instance_.program->can_admit_lane(lane, *lane_plan);
+            }
+            auto decision = route_of(true, true, true, resident, can_admit, 0, 0, false);
+            std::optional<Plan> ram_plan;
+            std::optional<Plan> disk_plan;
+            if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Cold && reuse_enabled) {
+                try {
+                    ram_plan.emplace(instance_.program->plan_ram_reuse(*spliced, base));
+                } catch (const std::bad_alloc&) {}
+                try {
+                    disk_plan.emplace(instance_.program->plan_disk_reuse(*spliced, base));
+                } catch (const std::bad_alloc&) {}
+                const auto host_tokens = [](const std::optional<Plan>& plan, PrefixReuseSource source,
+                                            bool ram_source) -> std::uint32_t {
+                    if (!plan) { return 0; }
+                    const RequestPlanSummary& summary = plan->summary();
+                    if (summary.reusable_prompt_tokens == 0 || summary.reuse_source != source) {
+                        return 0;
+                    }
+                    if ((ram_source ? summary.ram_entry_id : summary.disk_entry_id) == 0) {
+                        return 0;
+                    }
+                    return summary.reusable_prompt_tokens;
+                };
+                decision = route_of(
+                    true, true, true, resident, can_admit,
+                    host_tokens(ram_plan, PrefixReuseSource::HostRam, true),
+                    host_tokens(disk_plan, PrefixReuseSource::HostDisk, false), false);
+            }
+            if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Exhaust) {
+                recovery_exhausted(request, std::string(decision.detail));
                 return true;
             }
             if (request->cancelled.load(std::memory_order_acquire)) {
-                instance_.program->abort_lane(lane);
+                release_recovery_lane(lane);
                 complete_cancelled(request);
                 return true;
             }
@@ -822,21 +1072,14 @@ private:
             const auto previous = instance_.program->generation_timings_lane(lane);
             if (request->recovery.attempts == 0) { request->initial_timings = previous; }
             request->previous_decode_seconds += previous.decode_seconds;
-            add_speculative(request->previous_speculative, instance_.program->speculative_stats_lane(lane));
+            add_speculative(request->previous_speculative,
+                            instance_.program->speculative_stats_lane(lane));
             request->previous_reasoning_tokens += request->output.reasoning_tokens();
-            instance_.program->abort_lane(lane);
-            invalidate_lane_plans(lane);
-            release_planning_state(request);
-            auto plan = instance_.program->plan_request_for_lane(lane, repaired, base);
-            if (!instance_.program->can_admit_lane(lane, plan)) {
-                recovery_exhausted(request, "reserved lane cannot be rebuilt safely");
-                return true;
-            }
-            const auto summary = plan.summary();
-            request->prompt = std::move(repaired);
-            request->output = std::move(output);
-            request->recovery.attempts = attempt;
-            request->recovery_pending = false;
+            request->prompt                  = std::move(*spliced);
+            request->output                  = std::move(session);
+            request->resident_prompt_tokens  = spliced_tokens;
+            request->recovery.attempts       = attempt;
+            request->recovery_pending        = false;
             publish_recovery(request, RecoveryEventKind::RetryStarted, request->recovery_cause);
             // The failed attempt may end mid-word. Keep it visible, but do not
             // concatenate the new attempt onto that unfinished word in SSE/JSON.
@@ -847,19 +1090,40 @@ private:
             }
             request->recovery_reasoning_begin = request->reasoning.size();
             request->recovery_generated_begin = request->generated.size();
-            request->reasoning_cycle = {};
-            request->stop_suppression_active = execution.suppressed_token_count != 0;
-            instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
-            prefill_lane_ = lane;
-            const auto prefill_started = Clock::now();
-            const auto first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(plan), instance_.request_memory.region(),
-                &request->output);
-            request->recovery.prefill_seconds +=
-                std::chrono::duration<double>(Clock::now() - prefill_started).count();
-            (void)resolve_prefill_step(request, first, request->cancelled.load(std::memory_order_acquire));
-            publish_runtime_stats();
-            return true;
+            request->reasoning_cycle          = {};
+            request->stop_suppression_active  = execution.suppressed_token_count != 0;
+
+            auto cold_prefill = [&] {
+                release_recovery_lane(lane);
+                begin_recovery_prefill(
+                    request, lane,
+                    instance_.program->plan_request_for_lane(lane, request->prompt, base));
+            };
+            using Route = targets::qwen3_6::RecoveryPrefillRoute;
+            switch (decision.route) {
+            case Route::ResidentSuffix:
+                begin_recovery_prefill(request, lane, std::move(*lane_plan));
+                return true;
+            case Route::HostRam:
+            case Route::HostDisk: {
+                release_recovery_lane(lane);
+                const bool ram = decision.route == Route::HostRam;
+                if (!prefill_recovery_from_host(request, lane, ram,
+                                                ram ? std::move(*ram_plan) : std::move(*disk_plan))) {
+                    const auto failed = route_of(true, true, true, 0, true, 0, 0, true);
+                    if (failed.route != Route::Cold) {
+                        throw std::logic_error("recovery host restore failure must cold-prefill");
+                    }
+                    cold_prefill();
+                }
+                return true;
+            }
+            case Route::Cold:
+                cold_prefill();
+                return true;
+            case Route::Exhaust:
+                throw std::logic_error("recovery exhaust must stop before prefill");
+            }
         }
         return false;
     }
@@ -2309,6 +2573,7 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
+    const std::uint32_t context_capacity_;
     LoadProgress load_progress_;
     const bool generation_recovery_;
 
@@ -2340,6 +2605,8 @@ private:
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;
+
+    friend int drive_scripted_recovery<Instance>(ConcurrentExecutor& executor);
 };
 
 } // namespace ninfer::runtime

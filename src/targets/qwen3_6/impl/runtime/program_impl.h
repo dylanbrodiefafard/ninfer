@@ -1326,6 +1326,40 @@ void ProgramImplCore::retain_lane(std::uint32_t lane) {
     retain_committed_sequence(sequence, request);
 }
 
+bool ProgramImplCore::retain_reusable_lane(std::uint32_t lane) {
+    if (lane >= max_concurrency) { return false; }
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Active) {
+        if (!sequence.kv) { return false; }
+        retain_committed_sequence(sequence, request);
+        return true;
+    }
+    return sequence.retained && sequence.kv && request.lifecycle == Lifecycle::Complete;
+}
+
+bool ProgramImplCore::copy_reusable_prompt(std::uint32_t lane, std::uint32_t prompt_tokens,
+                                           std::vector<TokenId>& tokens,
+                                           std::uint32_t& rewrite_frontier) const {
+    tokens.clear();
+    rewrite_frontier = 0;
+    if (lane >= max_concurrency || prompt_tokens == 0) { return false; }
+    const SequenceState& sequence = sequences[lane];
+    const RequestControl& request = requests[lane];
+    const bool held =
+        sequence.kv && sequence.ledger.size() >= prompt_tokens &&
+        (request.lifecycle == Lifecycle::Active ||
+         (sequence.retained && request.lifecycle == Lifecycle::Complete));
+    if (!held) { return false; }
+    tokens.assign(sequence.ledger.begin(),
+                  sequence.ledger.begin() + static_cast<std::ptrdiff_t>(prompt_tokens));
+    if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
+        sequence.rewrite_checkpoint.frontier <= prompt_tokens) {
+        rewrite_frontier = sequence.rewrite_checkpoint.frontier;
+    }
+    return true;
+}
+
 bool ProgramImplCore::revert_cancelled_prefill_lane(std::uint32_t lane) {
     if (lane >= max_concurrency) { return false; }
     SequenceState& sequence = sequences[lane];
@@ -3442,11 +3476,18 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.rewrite_checkpoint_capture
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
                     : std::nullopt;
+            // A vision-free suffix of a multimodal prompt still has 3-axis positions. The text
+            // prefill path would continue with 1-D RoPE and a zero delta, so a later cold prefill
+            // of the same tokens would not match the checkpoint this suffix captures.
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
                     schedule_state, staged.prompt, *staged.vision, nominal,
                     rewrite_checkpoint_capture_frontier, final_candidate);
+            } else if (staged.prompt.has_media()) {
+                result = schedule::prefill_mrope_text_chunk(
+                    schedule_state, staged.prompt, nominal, rewrite_checkpoint_capture_frontier,
+                    final_candidate);
             } else {
                 result = schedule::prefill_text_chunk(
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,

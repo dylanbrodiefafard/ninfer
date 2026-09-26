@@ -498,6 +498,21 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (use.end <= begin) { continue; }
         if (use.begin >= end) { break; }
         if (active == nullptr) {
+            if (use.item_index >= plan_.control->items.size()) {
+                throw std::logic_error("Vision prefill item index is out of range");
+            }
+            const auto& upcoming = plan_.control->items[use.item_index];
+            const std::uint32_t image_at =
+                upcoming.scatter_indices.empty()
+                    ? use.begin
+                    : static_cast<std::uint32_t>(upcoming.scatter_indices.front());
+            // Ordinary tokens before the first image column, including the MTP bridge
+            // token, stay on the text path. A prefix that ends on that column then
+            // continues with the same visual chunk a cold prefill uses.
+            if (image_at > begin) {
+                end = std::min(end, image_at);
+                break;
+            }
             active = &use;
         } else {
             end = std::min(end, use.begin);

@@ -1130,9 +1130,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
             throw std::invalid_argument("multimodal positions must have shape [3,T]");
         }
-        if (multimodal->vision == nullptr) {
-            throw std::invalid_argument("multimodal prefill requires a Vision session");
-        }
         rope_delta_ = multimodal->rope_delta;
     } else if (text_kv_base_ == 0) {
         rope_delta_ = 0;
@@ -1169,14 +1166,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (checkpoint_rel > 0 && t0 < checkpoint_rel && t0 + len > checkpoint_rel) {
             len = checkpoint_rel - t0;
         }
+        const std::uint32_t chunk_abs = base + static_cast<std::uint32_t>(t0);
+        for (const std::uint32_t frontier : prefill_split_frontiers_) {
+            if (frontier <= chunk_abs) { continue; }
+            const std::uint32_t room = frontier - chunk_abs;
+            if (room < static_cast<std::uint32_t>(len)) { len = static_cast<int>(room); }
+        }
         work_.reset();
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
-        if (multimodal != nullptr) {
-            if (multimodal->vision == nullptr) {
-                throw std::logic_error("multimodal prefill has no Vision session");
-            }
+        if (multimodal != nullptr && multimodal->vision != nullptr) {
             vision_chunk =
                 multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
             len = vision_chunk.length;
@@ -1426,6 +1426,7 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
+    set_prefill_split_frontiers(input.turn_closure_frontiers);
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     NullTap tap;
@@ -1441,8 +1442,40 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData&
         nominal_length > input.token_ids.size() - begin) {
         throw std::invalid_argument("multimodal prefill chunk is outside the prompt");
     }
+    set_prefill_split_frontiers(input.turn_closure_frontiers);
     const std::span<const int> tokens(input.token_ids);
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
+    return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
+                        finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_mrope_chunk(const qwen3_6::PreparedPromptData& input,
+                                                    std::uint32_t begin,
+                                                    std::uint32_t nominal_length,
+                                                    bool finalize_at_end) {
+    if (begin >= input.token_ids.size() || nominal_length == 0 ||
+        nominal_length > input.token_ids.size() - begin) {
+        throw std::invalid_argument("mrope prefill chunk is outside the prompt");
+    }
+    set_prefill_split_frontiers(input.turn_closure_frontiers);
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, nullptr, begin, input.rope_delta};
+    NullTap tap;
+    return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, tap,
+                        finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_mrope_chunk(const qwen3_6::PreparedPromptData& input,
+                                                    std::uint32_t begin,
+                                                    std::uint32_t nominal_length,
+                                                    bool finalize_at_end, DFlashFeatureSink& sink) {
+    if (begin >= input.token_ids.size() || nominal_length == 0 ||
+        nominal_length > input.token_ids.size() - begin) {
+        throw std::invalid_argument("mrope prefill chunk is outside the prompt");
+    }
+    set_prefill_split_frontiers(input.turn_closure_frontiers);
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, nullptr, begin, input.rope_delta};
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
                         finalize_at_end);
 }

@@ -162,6 +162,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         auto control =
             std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
         std::uint32_t previous_end = 0;
+        std::size_t text_gaps      = 0;
         for (const qwen3_6::VisionItemControl& item : control->items) {
             if (item.scatter_indices.empty()) {
                 throw std::invalid_argument("vision item has no Text consumer columns");
@@ -180,8 +181,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
+            if (begin > previous_end) { ++text_gaps; }
             previous_end = end;
         }
+        base->vision_text_gaps = text_gaps;
         base->vision_control = std::move(control);
     }
 
@@ -195,6 +198,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
+        base->vision_text_gaps +
         (base->rewrite_checkpoint &&
                  base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
              ? 1ULL
@@ -341,8 +345,14 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         }
     }
 
+    std::size_t text_gaps = 0;
+    if (plan.vision) {
+        for (const VisionUseSpan& use : plan.vision->uses) {
+            if (use.begin > plan.reuse_base) { ++text_gaps; }
+        }
+    }
     const std::size_t prefill_splits =
-        (plan.vision ? plan.vision->uses.size() : 0ULL) +
+        (plan.vision ? plan.vision->uses.size() : 0ULL) + text_gaps +
         (plan.rewrite_checkpoint_capture &&
                  plan.rewrite_checkpoint_capture->frontier < plan.summary.prompt_tokens
              ? 1ULL

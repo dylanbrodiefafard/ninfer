@@ -36,9 +36,15 @@ benchmark-report, and external protocol behavior. Repository verification princi
   typed calls, and transactional publication preserving XML-valued arguments. The optional
   real-tokenizer probe compares masks with direct byte acceptance over the represented
   vocabulary at free-text and call-closing boundaries;
-- `targets/qwen3_6/test_generation_recovery.cpp` — contextual duplicate detection, truthful
-  reasoning-only retry notices, preservation of real messages/results, and legitimate
-  changed reads/results and polling;
+- `targets/qwen3_6/test_generation_recovery.cpp` — contextual duplicate detection, a
+  checkpoint-prefix retry that closes the open think turn, keeps historical reasoning,
+  and prefers a held ledger to the original prompt, preservation of real messages/results,
+  and legitimate changed reads/results and polling;
+- `targets/qwen3_6/test_recovery_executor.cpp` — executor cache policy: a resident prefix
+  is prefilled in place, the longer host checkpoint wins, a failed admission restore is
+  discarded and the requeued request is computed cold, and a failed recovery restore
+  cold-prefills the same lane without sticking that fallback. The live retain, copy,
+  abort, and RAM restore sequence is `targets/qwen3_6_27b/test_recovery_kv_real.cpp`;
 - `test_typical_cycle.cpp` — suffix-square boundaries, exact repeated-passage evidence,
   non-overlapping coverage, changing/large periods, and productive-length negative controls;
 - `test_serve_metrics.cpp`, `test_request_log.cpp`, and `test_http_error_handler.cpp` — Prometheus
@@ -374,6 +380,19 @@ NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS=/ssdpool2nvme/local_llm/models/qwen3.8-nvfp
   ctest --test-dir build -R ninfer_qwen3_8_27b_mtp_nvfp4_real_test --output-on-failure
 NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_ram_real_test --output-on-failure
+```
+
+`ninfer_qwen3_6_27b_recovery_kv_real_test` loads one 27B artifact (NVFP4, otherwise the
+groupwise checkpoint, otherwise DFlash) and drives the production Program. It prefills a
+thinking prompt, retains the lane, copies the prompt without its sampled token, and prefills
+only the recovery suffix from that resident checkpoint. It then captures the stacked prompt,
+aborts the lane three times, restores the RAM image onto the empty lane, and prefills again
+without recomputing the restored prefix. Disk restore uses the same empty-lane contract; its
+bytes stay in the disk cache tests.
+
+```bash
+NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
+  ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_6_27b_recovery_kv_real_test$'
 ```
 
 `ninfer_qwen3_8_27b_dflash_capacity_real_test` uses the DFlash artifact named by

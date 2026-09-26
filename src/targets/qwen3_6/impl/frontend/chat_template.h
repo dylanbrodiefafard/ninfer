@@ -86,6 +86,10 @@ struct RewriteCheckpointByteSpec {
 struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    // Byte offsets immediately after each `<|im_start|>assistant\n` when thinking is not
+    // preserved. Each one is a turn-closure frontier: history omits the empty think wrapper,
+    // so a later cold prefill has to stop there to match the checkpoint that turn captured.
+    std::vector<std::size_t> turn_closure_offsets;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {
@@ -100,6 +104,11 @@ public:
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options = {}) const;
+    // Per-message turns only: no tools preamble, no reasoning-instruction block,
+    // and no generation prompt. Assistants are rendered as a suffix after the
+    // conversation's last user query.
+    [[nodiscard]] std::string render_fragment(const std::vector<ChatMessage>& messages,
+                                              ChatRenderOptions options = {}) const;
 
 private:
     explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept

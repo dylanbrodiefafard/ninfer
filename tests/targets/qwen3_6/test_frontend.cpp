@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <ninfer/targets/qwen3_6/generation_recovery.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
@@ -116,7 +117,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(16, "<tool_"), added(17, "call>"), added(18, "<function=f>"),
          added(19, "</function>"), added(20, "</tool_call>"), added(21, "<tool_call>"),
          added(22, "preface"), added(23, "call"), added(24, "a <"),
-         added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
+         added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"), added(33, "system\n"),
          added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
          added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
@@ -332,16 +333,27 @@ int test_official_chat_template() {
 
     fi::ChatRenderOptions no_thinking;
     no_thinking.enable_thinking = false;
-    failures +=
-        check(render_chat_text({chat_message(ninfer::ChatRole::User, "q1"),
-                                chat_message(ninfer::ChatRole::Assistant,
-                                             "<think>\nold thought\n</think>\n\nold answer"),
-                                chat_message(ninfer::ChatRole::User, "q2")},
-                               no_thinking) == "<|im_start|>user\nq1<|im_end|>\n"
-                                               "<|im_start|>assistant\nold answer<|im_end|>\n"
-                                               "<|im_start|>user\nq2<|im_end|>\n"
-                                               "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-              "thinking history differs from the official template");
+    const fi::RenderedChat no_thinking_chat =
+        render_chat({chat_message(ninfer::ChatRole::User, "q1"),
+                     chat_message(ninfer::ChatRole::Assistant,
+                                  "<think>\nold thought\n</think>\n\nold answer"),
+                     chat_message(ninfer::ChatRole::User, "q2")},
+                    no_thinking);
+    const std::string no_thinking_text =
+        "<|im_start|>user\nq1<|im_end|>\n"
+        "<|im_start|>assistant\nold answer<|im_end|>\n"
+        "<|im_start|>user\nq2<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    const std::string assistant_turn = "<|im_start|>assistant\n";
+    std::vector<std::size_t> assistant_frontiers;
+    for (std::size_t at = 0; (at = no_thinking_text.find(assistant_turn, at)) != std::string::npos;
+         at += assistant_turn.size()) {
+        assistant_frontiers.push_back(at + assistant_turn.size());
+    }
+    failures += check(no_thinking_chat.text == no_thinking_text &&
+                          no_thinking_chat.turn_closure_offsets == assistant_frontiers &&
+                          assistant_frontiers.size() == 2,
+                      "thinking history differs from the official template");
 
     fi::ChatMessage lookup = chat_message(ninfer::ChatRole::Assistant, "");
     lookup.tool_calls.push_back(
@@ -1755,6 +1767,238 @@ int test_declared_tool_publication() {
     return failures;
 }
 
+int test_recovery_fragment(const fi::CompiledChatTemplate& chat, bool effort) {
+    fi::ChatRenderOptions closed;
+    closed.add_generation_prompt = false;
+    const std::vector<fi::ChatMessage> history = {chat_message(ninfer::ChatRole::User, "task")};
+    const std::string base                     = chat.render(history, closed).text;
+    auto equals_fragment = [&](const std::vector<fi::ChatMessage>& insert, const char* label) {
+        auto combined = history;
+        combined.insert(combined.end(), insert.begin(), insert.end());
+        const std::string full     = chat.render(combined, closed).text;
+        const std::string fragment = chat.render_fragment(insert, closed);
+        return check(full == base + fragment, label);
+    };
+
+    int failures = equals_fragment({chat_message(ninfer::ChatRole::System, "NInfer notice")},
+                                   "system notice fragment was not the closed-history suffix");
+
+    fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "");
+    assistant.tool_calls.push_back(
+        {.id = "ninfer_rejected_1_0", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
+    fi::ChatMessage sunny = chat_message(ninfer::ChatRole::Tool, "sunny");
+    sunny.tool_call_id    = "ninfer_rejected_1_0";
+    failures += equals_fragment({assistant, sunny},
+                                "one rejected call was not the closed-history suffix");
+
+    fi::ChatMessage cooler = chat_message(ninfer::ChatRole::Tool, "20C");
+    cooler.tool_call_id    = "ninfer_rejected_1_1";
+    failures += equals_fragment({assistant, sunny, cooler},
+                                "two tool results were not the closed-history suffix");
+    const std::string two = chat.render_fragment({assistant, sunny, cooler}, closed);
+    const std::string user_group = "<|im_start|>user";
+    const std::size_t first_user = two.find(user_group);
+    failures += check(first_user != std::string::npos &&
+                          two.find(user_group, first_user + user_group.size()) == std::string::npos &&
+                          two.find("</tool_response><|im_end|>\n") != std::string::npos &&
+                          two.find("</tool_response>\n<|im_end|>") == std::string::npos,
+                      "two tool results were not one user group closed against </tool_response>");
+
+    failures += check(chat.render_fragment(
+                          {chat_message(ninfer::ChatRole::System, "  current diagnostics  ")},
+                          closed) == "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
+                      "a trimmed system fragment did not use the system branch");
+
+    const std::string call = chat.render_fragment({assistant}, closed);
+    if (effort) {
+        failures += check(call.find("<tool_call>") != std::string::npos &&
+                              call.find("<think>") == std::string::npos,
+                          "an effort assistant fragment wrapped empty reasoning");
+    } else {
+        failures += check(call.find("<think>\n\n</think>\n\n") != std::string::npos &&
+                              call.find("<tool_call>") != std::string::npos,
+                          "a thinking-toggle assistant fragment omitted the empty think wrapper");
+    }
+    return failures;
+}
+
+int test_recovery_prompt_splice(const Frontend& frontend) {
+    const FrontendResources owned = resources();
+    const fi::Tokenizer tokenizer({.tokenizer_json         = owned.tokenizer_json,
+                                   .tokenizer_config_json  = owned.tokenizer_config_json,
+                                   .generation_config_json = owned.generation_config_json});
+    const std::vector<ninfer::TokenId> prefix{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
+    ninfer::PromptInput source;
+    source.options.enable_thinking = true;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    source.messages.push_back(std::move(user));
+    const auto recovery = ninfer::targets::qwen3_6::GenerationRecoveryContext::analyze(source);
+    ninfer::ChatMessage notice;
+    notice.role = ninfer::ChatRole::System;
+    notice.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    const std::span<const ninfer::ChatMessage> insert(&notice, 1);
+    const auto spliced =
+        frontend.splice_recovery_prompt(prefix, source, insert, recovery);
+    int failures = check(spliced.has_value(), "a prologue-terminated prefix was not spliced");
+    if (!spliced) { return failures; }
+
+    const auto& data = FrontendFactory::inspect(*spliced);
+    fi::ChatRenderOptions closed;
+    closed.add_generation_prompt = false;
+    const std::string fragment =
+        thinking_toggle_template().render_fragment({chat_message(ninfer::ChatRole::System, "x")},
+                                                   closed);
+    const std::string tail_text =
+        std::string(ninfer::targets::qwen3_6::kRecoveryTurnClose) + fragment +
+        std::string(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
+    auto encode = [&](std::string_view text) {
+        std::vector<ninfer::TokenId> ids;
+        for (const int id : tokenizer.encode(text)) { ids.push_back(static_cast<ninfer::TokenId>(id)); }
+        return ids;
+    };
+    const auto prologue_ids = encode(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
+    const auto close_ids    = encode(ninfer::targets::qwen3_6::kRecoveryTurnClose);
+    const auto fragment_ids = encode(fragment);
+    std::vector<ninfer::TokenId> tail = close_ids;
+    tail.insert(tail.end(), fragment_ids.begin(), fragment_ids.end());
+    tail.insert(tail.end(), prologue_ids.begin(), prologue_ids.end());
+    failures += check(data.token_ids.size() == prefix.size() + tail.size() &&
+                          std::equal(prefix.begin(), prefix.end(), data.token_ids.begin()) &&
+                          std::equal(tail.begin(), tail.end(), data.token_ids.begin() + prefix.size()),
+                      "the splice did not append close, fragment, and a copy of the prologue ids");
+    std::vector<int> tail_ids(data.token_ids.begin() + static_cast<std::ptrdiff_t>(prefix.size()),
+                              data.token_ids.end());
+    failures += check(tokenizer.decode(tail_ids) == tail_text,
+                      "the spliced tail did not decode to close, fragment, then prologue");
+    failures += check(!prologue_ids.empty() && prefix.size() >= prologue_ids.size() &&
+                          std::equal(prologue_ids.begin(), prologue_ids.end(),
+                                     prefix.end() - static_cast<std::ptrdiff_t>(prologue_ids.size())),
+                      "the resident prefix did not end with the encoded prologue");
+    bool positions = data.rope_delta == 0 && data.vision_items.empty() && data.token_types.size() ==
+                                                                               data.token_ids.size();
+    for (std::size_t i = 0; positions && i < data.token_ids.size(); ++i) {
+        positions = data.token_types[i] == 0 && data.position_axis(0)[static_cast<std::ptrdiff_t>(i)] ==
+                                                     static_cast<std::int32_t>(i) &&
+                    data.position_axis(1)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i) &&
+                    data.position_axis(2)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i);
+    }
+    failures += check(positions && data.starts_in_reasoning && data.identity.reusable &&
+                          !data.tool_grammar && data.identity.rewrite_checkpoint &&
+                          data.identity.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          data.identity.rewrite_checkpoint->frontier == data.token_ids.size(),
+                      "the spliced prompt did not record a reusable response replay");
+
+    auto bad = prefix;
+    bad.back() = 0;
+    failures += check(!frontend.splice_recovery_prompt(std::move(bad), source, insert, recovery),
+                      "a prefix that does not end with the prologue was spliced");
+
+    const auto first_ids = data.token_ids;
+    const auto stacked =
+        frontend.splice_recovery_prompt(first_ids, source, insert, recovery);
+    failures += check(stacked.has_value(), "attempt 2 did not splice onto the previous prompt");
+    if (stacked) {
+        const auto& again = FrontendFactory::inspect(*stacked);
+        failures += check(again.token_ids.size() > first_ids.size() &&
+                              std::equal(prefix.begin(), prefix.end(), again.token_ids.begin()) &&
+                              std::equal(first_ids.begin(), first_ids.end(), again.token_ids.begin()) &&
+                              again.identity.rewrite_checkpoint &&
+                              again.identity.rewrite_checkpoint->frontier == again.token_ids.size(),
+                          "attempt 2 did not keep the previous prompt and move the rewrite frontier");
+    }
+
+    ninfer::PromptInput tools = source;
+    tools.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
+    const auto with_tools = frontend.splice_recovery_prompt(prefix, tools, insert, recovery);
+    failures += check(with_tools && FrontendFactory::inspect(*with_tools).tool_grammar != nullptr,
+                      "declared tools did not compile a grammar onto the spliced prompt");
+    return failures;
+}
+
+int test_official_recovery_splice() {
+    if (skip_without_official_tokenizer("test_official_recovery_splice")) { return 0; }
+    const auto& tokenizer_dir = official_tokenizer_dir();
+    FrontendResources owned    = resources(reasoning_effort_template_source());
+    owned.tokenizer_json       = read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
+    nlohmann::json config      = nlohmann::json::parse(
+        read_file((tokenizer_dir.value() + "/tokenizer_config.json").c_str()));
+    config["chat_template"]       = owned.chat_template_jinja;
+    owned.tokenizer_config_json   = config.dump();
+    owned.generation_config_json  =
+        read_file((tokenizer_dir.value() + "/generation_config.json").c_str());
+    const Frontend frontend = FrontendFactory::create_component(owned, false);
+    const fi::Tokenizer tokenizer({.tokenizer_json         = owned.tokenizer_json,
+                                   .tokenizer_config_json  = owned.tokenizer_config_json,
+                                   .generation_config_json = owned.generation_config_json});
+
+    ninfer::PromptInput input;
+    input.options.enable_thinking   = true;
+    input.options.preserve_thinking = true;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "keep the task", .media = {}});
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = "historical reasoning stays";
+    assistant.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "answer", .media = {}});
+    input.messages.push_back(std::move(user));
+    input.messages.push_back(std::move(assistant));
+    const auto recovery = ninfer::targets::qwen3_6::GenerationRecoveryContext::analyze(input);
+    const auto prepared = frontend.prepare(recovery->input());
+    const auto& prepared_data = FrontendFactory::inspect(prepared);
+    const auto prologue_ids   = tokenizer.encode(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
+    int failures              = check(recovery && !prologue_ids.empty() &&
+                                 prepared_data.token_ids.size() >= prologue_ids.size() &&
+                                 std::equal(prologue_ids.begin(), prologue_ids.end(),
+                                            prepared_data.token_ids.end() -
+                                                static_cast<std::ptrdiff_t>(prologue_ids.size())),
+                             "the prepared thinking prompt did not end with the recovery prologue");
+    std::vector<int> prepared_ids(prepared_data.token_ids.begin(), prepared_data.token_ids.end());
+    failures += check(tokenizer.decode(prepared_ids).find("historical reasoning stays") !=
+                          std::string::npos,
+                      "historical reasoning was absent from the prepared prompt");
+
+    auto accept = [&](std::span<const ninfer::ChatMessage> insert, const char* label) {
+        const auto spliced = frontend.splice_recovery_prompt(
+            prepared_data.token_ids, recovery->input(), insert, recovery);
+        if (!spliced) {
+            std::cerr << label << '\n';
+            return 1;
+        }
+        const auto& data = FrontendFactory::inspect(*spliced);
+        const bool prefix =
+            data.token_ids.size() > prepared_data.token_ids.size() &&
+            std::equal(prepared_data.token_ids.begin(), prepared_data.token_ids.end(),
+                       data.token_ids.begin());
+        const bool frontier = data.identity.rewrite_checkpoint &&
+                              data.identity.rewrite_checkpoint->kind ==
+                                  ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                              data.identity.rewrite_checkpoint->frontier == data.token_ids.size() &&
+                              data.starts_in_reasoning;
+        if (!prefix || !frontier) {
+            std::cerr << label << '\n';
+            return 1;
+        }
+        return 0;
+    };
+    const auto notice = recovery->recovery_insert({}, 1);
+    failures += accept(notice, "official recovery notice did not splice onto the prepared prompt");
+    ninfer::ToolCall call;
+    call.name           = "read";
+    call.arguments_json = R"({"path":"a.cpp"})";
+    const auto rejected = recovery->recovery_insert(std::span<const ninfer::ToolCall>(&call, 1), 1);
+    failures += accept(rejected, "official rejected call did not splice onto the prepared prompt");
+    return failures;
+}
+
 int main() {
     if (std::getenv("NINFER_BENCH_ENCODE") != nullptr) { return run_encode_bench(); }
     const FrontendResources owned = resources();
@@ -1767,6 +2011,10 @@ int main() {
     failures += test_reasoning_effort_empty_history_think();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
+    failures += test_recovery_fragment(thinking_toggle_template(), false);
+    failures += test_recovery_fragment(reasoning_effort_template(), true);
+    failures += test_recovery_prompt_splice(frontend);
+    failures += test_official_recovery_splice();
     failures += test_text_and_image_prepare(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);

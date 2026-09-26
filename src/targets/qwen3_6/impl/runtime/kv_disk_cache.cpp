@@ -6329,11 +6329,16 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         }
         ++drops_;
     }
+    // prepare_spill returns false when the note is already durable. A spill can
+    // commit in the window after the check above, and that is success: the
+    // caller only needed the image on disk before evicting it from RAM.
+    const auto committed = ram_notes_.find(ram_id);
+    const bool durable = committed != ram_notes_.end() && committed->second.durable;
     if (idle_cancel_ram_ == ram_id) { idle_cancel_ram_ = 0; }
     if (!prepared) {
         lock.unlock();
         unpin_extra();
-        return false;
+        return durable;
     }
     return wait_done(lock);
 }

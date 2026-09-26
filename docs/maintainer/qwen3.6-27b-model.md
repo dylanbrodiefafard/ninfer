@@ -533,7 +533,7 @@ region separately excludes `<tool_call>`; closing reasoning normally licenses th
 call grammar, rather than promoting reasoning text into calls. Per-node masks use the actual
 verification parent relation, not chain depth. Draft proposals never advance grammar state;
 only the accepted output transaction does. The runtime owns bounded repeated-reasoning/duplicate-call recovery
-and full-state re-prefill, as specified in the concurrent inference architecture. Neither
+and restores a checkpoint prefix before prefilling the recovery suffix, as specified in the concurrent inference architecture. Neither
 grammar constraints nor loop recovery authorize execution of a generated tool.
 
 ## 10. Vision preprocessing

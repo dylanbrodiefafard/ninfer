@@ -957,6 +957,92 @@ void test_cancelled_dflash_exact_prefix_reuse() {
            "valid DFlash exact prefix still appends ahead of its checkpoint");
 }
 
+q36::PreparedPromptData text_ids(std::vector<ninfer::TokenId> ids) {
+    q36::PreparedPromptData prompt;
+    const auto tokens = static_cast<std::uint32_t>(ids.size());
+    prompt.token_ids   = std::move(ids);
+    prompt.token_types.assign(tokens, 0);
+    std::vector<std::int32_t> positions;
+    positions.reserve(3 * static_cast<std::size_t>(tokens));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::uint32_t i = 0; i < tokens; ++i) {
+            positions.push_back(static_cast<std::int32_t>(i));
+        }
+    }
+    prompt.positions = std::move(positions);
+    return prompt;
+}
+
+// Recovery splice: the ledger still holds the failed generation after the prompt
+// prefix, and the candidate replaces that tail with a different suffix.
+void test_recovery_prefix_reuse() {
+    using Path    = ninfer::PrefixReusePath;
+    using Kind    = q36::RewriteCheckpointKind;
+    using Backend = ninfer::SpeculativeBackend;
+    constexpr std::uint32_t P = 16;
+    const auto prefix         = text_prompt(P);
+    std::vector<ninfer::TokenId> ledger = prefix.token_ids;
+    ledger.insert(ledger.end(), {9001, 9002, 9003, 9004});
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(prefix);
+    identity.append_generated(4, 0);
+    auto candidate_ids = prefix.token_ids;
+    candidate_ids.insert(candidate_ids.end(), {42, 43, 44});
+    const auto prompt = text_ids(candidate_ids);
+    q36::detail::ResidentReuseState state{&ledger, &identity, P + 4, true, Kind::ResponseReplay, P,
+                                          0, 0, true, false, {}};
+
+    {
+        const auto sel = decide(state, prompt, Backend::None);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == P,
+               "response replay at the prompt prefix restores that checkpoint");
+    }
+    {
+        auto turn            = state;
+        turn.rewrite_kind     = Kind::TurnClosure;
+        turn.rewrite_frontier = P - 3;
+        const auto sel        = decide(turn, prompt, Backend::None);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == P - 3,
+               "a turn checkpoint before the prompt end restores that frontier");
+    }
+    {
+        auto missed = prompt;
+        missed.token_ids[3] = 1;
+        const auto sel      = decide(state, missed, Backend::None);
+        expect(sel.path == Path::FullReset && sel.frontier == 0,
+               "one changed prompt token misses the advertised rewrite checkpoint");
+    }
+    {
+        auto mtp          = state;
+        mtp.mtp_kv_valid  = 8;
+        mtp.context_checkpoints.push_back(
+            {8, q36::detail::prefix_hash_at(ledger, identity, 8),
+             q36::detail::ContextCheckpointKind::Ladder});
+        const auto sel = decide(mtp, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 8,
+               "an unready rewrite falls through to an earlier ready ladder");
+    }
+    {
+        constexpr std::uint32_t S1 = 24;
+        std::vector<ninfer::TokenId> stacked = prefix.token_ids;
+        for (std::uint32_t i = 0; i < S1 - P; ++i) { stacked.push_back(5000 + i); }
+        std::vector<ninfer::TokenId> long_ledger = stacked;
+        long_ledger.insert(long_ledger.end(), {9001, 9002, 9003, 9004});
+        q36::detail::ResidentPrefixIdentity stacked_identity;
+        stacked_identity.assign(prefix);
+        stacked_identity.append_generated(long_ledger.size() - P, 0);
+        stacked.push_back(77);
+        stacked.push_back(78);
+        const auto candidate = text_ids(std::move(stacked));
+        q36::detail::ResidentReuseState stacked_state{
+            &long_ledger, &stacked_identity, static_cast<std::uint32_t>(long_ledger.size()), true,
+            Kind::ResponseReplay, S1, 0, 0, true, false, {}};
+        const auto sel = decide(stacked_state, candidate, Backend::None);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == S1,
+               "a second recovery suffix restores the previous spliced prompt");
+    }
+}
+
 void test_resident_reuse_decision() {
     using Path    = ninfer::PrefixReusePath;
     using Kind    = q36::RewriteCheckpointKind;
@@ -1252,6 +1338,7 @@ int main() {
     test_prefix_hash_and_dflash_gate();
     test_prefill_context_marks();
     test_resident_reuse_decision();
+    test_recovery_prefix_reuse();
     test_cancelled_dflash_exact_prefix_reuse();
     test_dflash_chain_verify_kv_headroom();
     test_adaptive_capture_and_topology();

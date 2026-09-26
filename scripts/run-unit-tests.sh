@@ -105,13 +105,13 @@ weight_filenames() {
 weight_tests() {
   case "$1" in
     NINFER_QWEN3_6_27B_NVFP4_WEIGHTS)
-      echo "prefix, ram, checkpoint, serve-prepend"
+      echo "prefix, ram, recovery-kv, checkpoint, serve-prepend"
       ;;
     NINFER_QWEN3_6_27B_WEIGHTS)
-      echo "prefix, ram, checkpoint, serve-prepend, load-plan"
+      echo "prefix, ram, recovery-kv, checkpoint, serve-prepend, load-plan"
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
-      echo "ninfer_qwen3_8_27b_dflash_real_test"
+      echo "ninfer_qwen3_8_27b_dflash_real_test, recovery-kv"
       ;;
     NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS)
       echo "ninfer_qwen3_8_27b_mtp_nvfp4_real_test"
