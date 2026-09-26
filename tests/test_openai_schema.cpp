@@ -507,6 +507,26 @@ int test_parse_tool_history_messages() {
     failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
                       "tool history preserves special tokens in Engine output");
 
+    Json text_parts                 = body;
+    text_parts["messages"][2]["content"] = Json::array(
+        {Json{{"type", "text"}, {"text", "part one "}}, Json{{"type", "text"}, {"text", "two"}}});
+    const GenerationRequest parts_req = parse_chat_completion_request(text_parts, default_limits());
+    failures += check(parts_req.messages[2].content.size() == 2 &&
+                          parts_req.messages[2].content[0].text == "part one " &&
+                          parts_req.messages[2].content[1].text == "two",
+                      "tool text-part content parsed in order");
+    Json image_part                 = body;
+    image_part["messages"][2]["content"] = Json::array(
+        {Json{{"type", "image_url"}, {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}});
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(image_part, default_limits()); }),
+        "non-text tool content part rejected");
+    Json null_content                    = body;
+    null_content["messages"][2]["content"] = nullptr;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(null_content, default_limits()); }),
+        "null tool content rejected");
+
     Json bad_args                                                     = body;
     bad_args["messages"][1]["tool_calls"][0]["function"]["arguments"] = R"(["Paris"])";
     failures +=

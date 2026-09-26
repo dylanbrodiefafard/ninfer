@@ -78,7 +78,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 The endpoint supports:
 
 - `system`, `developer`, `user`, `assistant`, and `tool` history;
-- string content and ordered text, `image_url`, and `video_url` parts;
+- string content and ordered text, `image_url`, and `video_url` parts; tool messages accept a
+  string or text parts only;
 - `max_completion_tokens` and the legacy `max_tokens` spelling;
 - `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`
   (top-p/top-k/penalties are ignored by default p-less; `--no-p-less-sampling` opts out);
