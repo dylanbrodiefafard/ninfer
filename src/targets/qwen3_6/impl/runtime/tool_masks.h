@@ -12,11 +12,12 @@
 namespace ninfer::targets::qwen3_6 {
 
 // Program-owned, startup-sized exchange. Its address and pinned/device buffers
-// remain stable for every captured graph. The executor changes bindings only at
+// remain stable for every captured graph. Host copies are fixed-size 1D copies of
+// device staging: drivers may refuse to update 2D graph copies that touch host memory. The executor changes bindings only at
 // synchronized round boundaries; the CUDA host node makes no CUDA API calls.
 class ToolMaskExchange {
 public:
-    ToolMaskExchange(Tensor masks, Tensor sampling);
+    ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes);
     void bind(std::span<const OutputSession* const> outputs,
               std::span<const ops::SamplingConfig> sampling);
     // Ordinary/prefill root sampling; called at a synchronized CPU boundary.
@@ -37,6 +38,7 @@ private:
 
     Tensor masks_;
     Tensor sampling_;
+    Tensor nodes_;
     const std::size_t width_;
     const std::size_t capacity_;
     PinnedHostBuffer host_masks_;

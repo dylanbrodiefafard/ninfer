@@ -393,7 +393,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
     tool_masks = std::make_unique<qwen3_6::ToolMaskExchange>(
         plan.persistent.tool_token_masks.bind(backing),
-        plan.persistent.tool_sampling_config.bind(backing));
+        plan.persistent.tool_sampling_config.bind(backing),
+        plan.persistent.tool_nodes.bind(backing));
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
     if (plan.persistent.staging_hidden) {

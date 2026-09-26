@@ -10,15 +10,18 @@ namespace {
 constexpr std::size_t kWords = (kTokenDomain + 31) / 32;
 }
 
-ToolMaskExchange::ToolMaskExchange(Tensor masks, Tensor sampling)
-    : masks_(masks), sampling_(sampling), width_(masks.ne[1]), capacity_(masks.ne[2]),
+ToolMaskExchange::ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes)
+    : masks_(masks), sampling_(sampling), nodes_(nodes), width_(masks.ne[1]), capacity_(masks.ne[2]),
       host_masks_(masks.bytes()), host_sampling_(sampling.bytes()),
       host_ids_(width_ * capacity_ * sizeof(TokenId)),
       host_parents_(width_ * capacity_ * sizeof(std::int32_t)),
       host_counts_(capacity_ * sizeof(std::int32_t)) {
     if (masks.dtype != DType::I32 || masks.ne[0] != kWords ||
         !masks.is_contiguous() || width_ == 0 || capacity_ == 0 ||
-        sampling.bytes() < capacity_ * sizeof(ops::SamplingConfig)) {
+        sampling.bytes() < capacity_ * sizeof(ops::SamplingConfig) ||
+        nodes.dtype != DType::I32 || nodes.ne[0] != static_cast<std::int64_t>(width_) ||
+        nodes.ne[1] != static_cast<std::int64_t>(capacity_) || nodes.ne[2] != 2 ||
+        !nodes.is_contiguous()) {
         throw std::invalid_argument("invalid tool mask exchange storage");
     }
     outputs_.resize(capacity_, nullptr);
@@ -69,13 +72,19 @@ const ops::SamplingConfig* ToolMaskExchange::enqueue(
         throw std::invalid_argument("invalid speculative tool mask inputs");
     }
     // Captured graphs must not store per-launch stack addresses. Shape-specific
-    // copies use the fixed max-width pitch; counts delimit valid nodes at replay.
-    CUDA_CHECK(cudaMemcpy2DAsync(host_ids_.data(), width_ * sizeof(TokenId), ids.data, ids.nb[1],
-                                width * sizeof(TokenId), batch, cudaMemcpyDeviceToHost, stream));
+    // copies pack into device staging at the fixed max-width pitch; counts delimit
+    // valid nodes at replay. Only fixed-size 1D copies cross to host memory.
+    const std::size_t plane = width_ * capacity_ * sizeof(std::int32_t);
+    auto* staged_ids        = static_cast<std::uint8_t*>(nodes_.data);
+    CUDA_CHECK(cudaMemcpy2DAsync(staged_ids, width_ * sizeof(TokenId), ids.data, ids.nb[1],
+                                width * sizeof(TokenId), batch, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_ids_.data(), staged_ids, plane, cudaMemcpyDeviceToHost, stream));
     if (parents) {
-        CUDA_CHECK(cudaMemcpy2DAsync(host_parents_.data(), width_ * sizeof(std::int32_t),
+        CUDA_CHECK(cudaMemcpy2DAsync(staged_ids + plane, width_ * sizeof(std::int32_t),
                                     parents->data, parents->nb[1], width * sizeof(std::int32_t),
-                                    batch, cudaMemcpyDeviceToHost, stream));
+                                    batch, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_parents_.data(), staged_ids + plane, plane,
+                                   cudaMemcpyDeviceToHost, stream));
     }
     // tree_ is engine-wide for a graph family, but cannot be assigned at capture
     // and assumed to change at replay. Encode it into the callback identity.
