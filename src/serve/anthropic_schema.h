@@ -47,6 +47,8 @@ std::string make_content_block_start_tool_use(int index, const ToolCall& call);
 std::string make_content_block_delta_text(int index, const std::string& delta_text);
 std::string make_content_block_delta_thinking(int index, const std::string& delta_text);
 std::string make_content_block_delta_tool_json(int index, const std::string& partial_json);
+// Closes a thinking block's opaque signature; streamed once, just before its content_block_stop.
+std::string make_content_block_delta_signature(int index, const std::string& signature);
 std::string make_content_block_stop(int index);
 std::string make_message_delta(const char* stop_reason, int output_tokens);
 std::string make_message_stop();

@@ -573,7 +573,10 @@ std::string make_messages_response(const std::string& id, const std::string& mod
                                    const CompletionUsage& usage) {
     Json blocks = Json::array();
     if (!reasoning.empty()) {
-        blocks.push_back(Json{{"type", "thinking"}, {"thinking", reasoning}, {"signature", ""}});
+        // Claude clients expect a non-empty opaque signature and echo it back with the block.
+        // NInfer lowers returned thinking text directly into history, so the message id serves
+        // as the value without adding signing state.
+        blocks.push_back(Json{{"type", "thinking"}, {"thinking", reasoning}, {"signature", id}});
     }
     if (!content.empty()) { blocks.push_back(Json{{"type", "text"}, {"text", content}}); }
     for (const ToolCall& call : tool_calls) {
@@ -644,6 +647,13 @@ std::string make_content_block_delta_thinking(int index, const std::string& delt
                Json{{"type", "content_block_delta"},
                     {"index", index},
                     {"delta", Json{{"type", "thinking_delta"}, {"thinking", delta_text}}}});
+}
+
+std::string make_content_block_delta_signature(int index, const std::string& signature) {
+    return sse("content_block_delta",
+               Json{{"type", "content_block_delta"},
+                    {"index", index},
+                    {"delta", Json{{"type", "signature_delta"}, {"signature", signature}}}});
 }
 
 std::string make_content_block_delta_tool_json(int index, const std::string& partial_json) {
