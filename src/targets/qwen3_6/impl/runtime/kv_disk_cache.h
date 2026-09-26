@@ -923,6 +923,9 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::condition_variable idle_cv_;
+    // CUDA device of the constructing thread; I/O and restore threads bind it before issuing
+    // copies or event operations.
+    int cuda_device_ = 0;
     std::thread io_thread_;
     std::vector<std::thread> restore_threads_{};
     std::uint32_t restore_io_threads_ = 1;

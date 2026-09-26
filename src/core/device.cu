@@ -176,6 +176,17 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     return *this;
 }
 
+void DeviceContext::bind_to_current_thread() const {
+    const cudaError_t err = cudaSetDevice(device);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaSetDevice failed", err));
+    }
+}
+
+void DeviceContext::bind_to_current_thread_noexcept() const noexcept {
+    log_cuda_error("cudaSetDevice", cudaSetDevice(device));
+}
+
 int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; }
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }

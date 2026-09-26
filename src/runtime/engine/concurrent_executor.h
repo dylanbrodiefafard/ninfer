@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/device.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -43,7 +45,8 @@ public:
     using Plan     = typename Package::RequestPlan;
     using Clock    = std::chrono::steady_clock;
 
-    ConcurrentExecutor(Instance& instance, const EngineOptions& options)
+    ConcurrentExecutor(Instance& instance, const DeviceContext& device,
+                       const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
@@ -58,7 +61,26 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        // The worker issues all model CUDA work; bind it to the Engine device before the first
+        // request so a non-zero --device never falls back to the thread-default device 0.
+        std::promise<void> startup;
+        std::future<void> started = startup.get_future();
+        worker_ = std::thread([this, &device, startup = std::move(startup)]() mutable {
+            try {
+                device.bind_to_current_thread();
+                startup.set_value();
+            } catch (...) {
+                startup.set_exception(std::current_exception());
+                return;
+            }
+            worker_loop();
+        });
+        try {
+            started.get();
+        } catch (...) {
+            worker_.join();
+            throw;
+        }
     }
 
     ~ConcurrentExecutor() noexcept {
