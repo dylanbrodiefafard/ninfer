@@ -1084,6 +1084,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     }
 
     const auto tail_started = Clock::now();
+    // The fold, compaction and hidden correction are ordered before the next round's work on the
+    // compute stream, so the host prepares that round while they run. A context append's ingress
+    // copy still reads the pinned staging the next round rewrites.
+    bool ingress_copy_pending = false;
     try {
         ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
                              std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
@@ -1186,6 +1190,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 }
             }
             if (append_size != 0) {
+                ingress_copy_pending = true;
                 enqueue_dflash_context_append(
                     std::span<const std::uint32_t>(append_lanes.data(), append_size),
                     std::span<const std::uint32_t>(append_starts.data(), append_size),
@@ -1193,7 +1198,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
         }
 
-        device.synchronize();
+        if (ingress_copy_pending) { device.synchronize(); }
         work.reset();
     } catch (...) {
         try {
