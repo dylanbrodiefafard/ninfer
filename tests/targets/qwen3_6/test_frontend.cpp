@@ -6,6 +6,7 @@
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "targets/qwen3_6/official_tokenizer_dir.h"
+#include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
 
@@ -106,6 +107,36 @@ nlohmann::json decoder_added(std::string content, bool special = false) {
     return value;
 }
 
+constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
+
+// Single-byte vocabulary entries for generated-UTF-8 recovery cases.
+constexpr ninfer::TokenId kByte80Token = 40;
+constexpr ninfer::TokenId kByteE0Token = 41;
+constexpr ninfer::TokenId kByteEDToken = 42;
+constexpr ninfer::TokenId kByteA0Token = 43;
+constexpr ninfer::TokenId kByteF4Token = 44;
+constexpr ninfer::TokenId kByte90Token = 45;
+constexpr ninfer::TokenId kByteF5Token = 46;
+constexpr ninfer::TokenId kByteF0Token = 47;
+constexpr ninfer::TokenId kByte9FToken = 48;
+constexpr ninfer::TokenId kByte98Token = 49;
+constexpr ninfer::TokenId kByteC2Token = 50;
+constexpr ninfer::TokenId kByteA2Token = 51;
+
+std::string byte_level_symbol(std::uint8_t target) {
+    std::uint32_t next = 256;
+    for (int value = 0; value <= 255; ++value) {
+        const bool visible = (value >= 33 && value <= 126) || (value >= 161 && value <= 172) ||
+                             (value >= 174 && value <= 255);
+        const std::uint32_t codepoint = visible ? static_cast<std::uint32_t>(value) : next++;
+        if (value == target) {
+            return ninfer::text::unicode_internal::codepoint_to_utf8(
+                static_cast<std::int32_t>(codepoint));
+        }
+    }
+    throw std::logic_error("byte-level test symbol is outside one byte");
+}
+
 FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
@@ -121,11 +152,22 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
          added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
          added(248068, "<think>"), added(248069, "</think>")});
-    result.tokenizer_json = nlohmann::json{
+    nlohmann::json vocab           = {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}};
+    vocab[byte_level_symbol(0x80)] = kByte80Token;
+    vocab[byte_level_symbol(0xe0)] = kByteE0Token;
+    vocab[byte_level_symbol(0xed)] = kByteEDToken;
+    vocab[byte_level_symbol(0xa0)] = kByteA0Token;
+    vocab[byte_level_symbol(0xf4)] = kByteF4Token;
+    vocab[byte_level_symbol(0x90)] = kByte90Token;
+    vocab[byte_level_symbol(0xf5)] = kByteF5Token;
+    vocab[byte_level_symbol(0xf0)] = kByteF0Token;
+    vocab[byte_level_symbol(0x9f)] = kByte9FToken;
+    vocab[byte_level_symbol(0x98)] = kByte98Token;
+    vocab[byte_level_symbol(0xc2)] = kByteC2Token;
+    vocab[byte_level_symbol(0xa2)] = kByteA2Token;
+    result.tokenizer_json          = nlohmann::json{
         {"model",
-         {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
-          {"merges", nlohmann::json::array()}}},
+         {{"type", "BPE"}, {"vocab", std::move(vocab)}, {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
 
@@ -1432,6 +1474,71 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     const auto complete = session.commit_preview();
     failures += check(channel_text(complete, ninfer::OutputChannel::Content) == "中",
                       "UTF-8 codepoint was not published when complete");
+
+    const auto decode_generated = [&](const std::vector<ninfer::TokenId>& tokens,
+                                      bool one_token_per_round) {
+        auto generated_prompt  = frontend.prepare_tokens({0});
+        auto generated_session = frontend.make_output_session(generated_prompt, {});
+        std::string text;
+        std::uint32_t budget = static_cast<std::uint32_t>(tokens.size());
+        if (one_token_per_round) {
+            for (const ninfer::TokenId token : tokens) {
+                const auto decision = generated_session.preview(
+                    std::array<ninfer::TokenId, 1>{token}, budget, ninfer::FinishReason::OutputLimit);
+                budget -= decision.accepted_tokens;
+                text += channel_text(generated_session.commit_preview(),
+                                     ninfer::OutputChannel::Content);
+            }
+        } else {
+            (void)generated_session.preview(tokens, budget, ninfer::FinishReason::OutputLimit);
+            text = channel_text(generated_session.commit_preview(), ninfer::OutputChannel::Content);
+        }
+        return text;
+    };
+
+    struct Utf8Case {
+        std::vector<ninfer::TokenId> tokens;
+        std::string expected;
+        const char* label;
+    };
+    const std::string replacement(kUtf8Replacement);
+    const std::vector<Utf8Case> utf8_cases = {
+        {{10, 1}, replacement + "helloST", "invalid continuation after leading byte"},
+        {{10, 11, 1}, replacement + "helloST", "maximal incomplete subpart"},
+        {{11, 1}, replacement + "helloST", "isolated continuation byte"},
+        {{10, 11}, replacement, "terminal incomplete suffix"},
+        {{kByteE0Token, kByte80Token, kByte80Token},
+         replacement + replacement + replacement,
+         "overlong codepoint"},
+        {{kByteEDToken, kByteA0Token, kByte80Token},
+         replacement + replacement + replacement,
+         "surrogate codepoint"},
+        {{kByteF4Token, kByte90Token, kByte80Token, kByte80Token},
+         replacement + replacement + replacement + replacement,
+         "out-of-range codepoint"},
+        {{kByteF5Token, 1}, replacement + "helloST", "invalid leading byte"},
+        {{kByteC2Token, kByteA2Token}, "¢", "valid two-byte codepoint"},
+        {{kByteF0Token, kByte9FToken, kByte98Token, kByte80Token}, "😀",
+         "valid four-byte codepoint"},
+    };
+    for (const Utf8Case& test : utf8_cases) {
+        const std::string batched = decode_generated(test.tokens, false);
+        const std::string split   = decode_generated(test.tokens, true);
+        failures += check(batched == test.expected, test.label);
+        failures += check(split == test.expected, test.label);
+    }
+
+    auto repaired_stop_prompt = frontend.prepare_tokens({0});
+    ninfer::StopPolicy repaired_stop;
+    repaired_stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    auto repaired_stop_session = frontend.make_output_session(repaired_stop_prompt, repaired_stop);
+    const auto repaired_stop_decision = repaired_stop_session.preview(
+        std::array<ninfer::TokenId, 3>{10, 1, 2}, 3, ninfer::FinishReason::OutputLimit);
+    failures += check(repaired_stop_decision.finish_reason == ninfer::FinishReason::StopString,
+                      "UTF-8 recovery hid a following stop string");
+    failures += check(channel_text(repaired_stop_session.commit_preview(),
+                                   ninfer::OutputChannel::Content) == replacement + "hello",
+                      "UTF-8 recovery changed stop-string publication");
 
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});
