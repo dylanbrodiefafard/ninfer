@@ -289,7 +289,8 @@ unallocated. It does not probe allocations or resize the pool at request time. T
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 The startup log's `slack` includes the automatic `headroom`; they are not separate deductions.
-`graphs` reports measured GPU usage / planned allowance. Ordinary, MTP, and DFlash2 budget
+`graphs` reports measured GPU usage / planned allowance; the measurement is a device-wide free-memory
+delta, so other processes on the GPU can move it, and it does not fail startup. Ordinary, MTP, and DFlash2 budget
 `min(12n, 24+6n)` MiB for `n` `(draft length, batch size, topology)` executables (144 MiB for
 adaptive lengths 1/2/3/4/5 and four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
 processing a full prefill chunk uses the already reserved runtime storage.

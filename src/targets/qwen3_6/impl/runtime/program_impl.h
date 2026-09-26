@@ -3169,15 +3169,11 @@ void ProgramImplCore::prepare_graphs() {
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
 
+    // Device-wide free memory also moves with other processes' allocations, so the delta is an
+    // observation reported against the allowance, not a startup gate.
     std::size_t free_after = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
-    const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
-    graph_observed_bytes       = consumed;
-    if (consumed > graph_allowance_bytes) {
-        throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
-                                 " bytes, exceeding the planned allowance of " +
-                                 std::to_string(graph_allowance_bytes) + " bytes");
-    }
+    graph_observed_bytes = free_before > free_after ? free_before - free_after : 0;
     for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }
     dflash_capture_allocations.clear();
     for (PagedKVAllocation& allocation : mtp_capture_allocations) { allocation.unbind_row(); }

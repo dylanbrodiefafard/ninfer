@@ -146,7 +146,9 @@ executable 数 `n` 计 `min(12n, 24+6n)` MiB，包含其 reachable definitions�
 每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。DFlash adaptive
 `K={1,2,3,4,5}`、`C=4` 的 20 个 executable 共 144 MiB。不能套用 autoregressive DFlash 的 64/96 MiB
 unroll allowance。所有 definitions 和 executables
-在 startup 建立，实测 graph allocation 超过 allowance 时启动失败。4096-token prefill 和 adaptive
+在 startup 建立。实测值是 preparation 前后的 device-wide free-memory 差，会计入同一 GPU 上其他进程的
+分配/释放，因此只作为 observed/allowance 报告，不作为启动失败条件；allowance 校准由 real-artifact
+capacity test 在独占 GPU 上检查。4096-token prefill 和 adaptive
 K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV pool。
 
 `R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
