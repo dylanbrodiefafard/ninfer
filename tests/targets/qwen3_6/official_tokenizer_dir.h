@@ -15,6 +15,7 @@ inline const std::optional<std::string>& official_tokenizer_dir() {
             env,
             "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
             "/ssdpool2nvme/local_llm/ninfer-dylan2/profiles/bench/official-tokenizer",
+            "/models/qwen3.8-27b-bf16",
         };
         for (const char* path : candidates) {
             if (path == nullptr || path[0] == '\0') { continue; }

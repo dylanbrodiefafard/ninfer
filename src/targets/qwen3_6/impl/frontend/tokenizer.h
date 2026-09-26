@@ -16,6 +16,17 @@ struct EncodeOptions {
     bool parse_added_tokens = true;
 };
 
+// Half-open byte range [begin, end) of text that is literal content. Added tokens never match
+// inside or across a literal span, so client-supplied text containing control markers such as
+// `<tool_call>` or `<|im_end|>` encodes as ordinary byte-level BPE. Spans passed to the encoder
+// are sorted, disjoint, nonempty and in range.
+struct ByteSpan {
+    std::size_t begin = 0;
+    std::size_t end   = 0;
+
+    friend bool operator==(const ByteSpan&, const ByteSpan&) = default;
+};
+
 struct DecodeOptions {
     bool skip_special_tokens = false;
     std::vector<int> stop_token_ids;
@@ -64,14 +75,17 @@ class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
 
-    std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
+    std::vector<int> encode(std::string_view text, EncodeOptions options = {},
+                            std::span<const ByteSpan> literal_spans = {}) const;
     EncodedText encode(std::string_view text, std::optional<std::size_t> prefix_byte_end,
-                       EncodeOptions options = {}) const;
+                       EncodeOptions options                   = {},
+                       std::span<const ByteSpan> literal_spans = {}) const;
     // True iff `n` is a mark_prefix site of encode(text): 0, each added-token
     // match_pos, each post-match pos (advanced by content.size(), not best_len),
     // or text.size() after leftover BPE. Interior gap/special cuts are false.
     [[nodiscard]] bool is_encode_loop_pos(std::string_view text, std::size_t n,
-                                          EncodeOptions options = {}) const;
+                                          EncodeOptions options                   = {},
+                                          std::span<const ByteSpan> literal_spans = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
     std::string_view decode_token_bytes(int id, bool skip_special_tokens = false) const;
 
@@ -85,7 +99,8 @@ public:
 
 private:
     [[nodiscard]] std::optional<std::pair<std::size_t, int>>
-    find_leftmost_added(std::string_view text, std::size_t pos) const;
+    find_leftmost_added(std::string_view text, std::size_t pos,
+                        std::span<const ByteSpan> literal_spans) const;
 
     // One byte blob and one id blob. Per-token strings and the vocab hash
     // exist only while the constructor is building these tables.

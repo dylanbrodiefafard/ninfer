@@ -349,13 +349,28 @@ std::string placeholder(const VisionItem& item) {
     return out;
 }
 
+// First occurrence of template markup at or after `from`; client text that merely spells a
+// placeholder is literal and never binds media.
+std::size_t find_markup(const RenderedChat& rendered, std::string_view needle, std::size_t from) {
+    std::size_t position = rendered.text.find(needle, from);
+    while (position != std::string::npos) {
+        const std::size_t end = position + needle.size();
+        const auto overlapping =
+            std::find_if(rendered.literal_spans.begin(), rendered.literal_spans.end(),
+                         [&](const ByteSpan& span) { return span.begin < end && position < span.end; });
+        if (overlapping == rendered.literal_spans.end()) { return position; }
+        position = rendered.text.find(needle, overlapping->end);
+    }
+    return std::string::npos;
+}
+
 RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
     std::size_t search = 0;
     for (const VisionItem& item : items) {
         const std::string_view needle    = item.modality == Modality::Image ? kImagePad : kVideoPad;
-        const std::size_t position       = rendered.text.find(needle, search);
+        const std::size_t position       = find_markup(rendered, needle, search);
         const std::string_view other     = item.modality == Modality::Image ? kVideoPad : kImagePad;
-        const std::size_t other_position = rendered.text.find(other, search);
+        const std::size_t other_position = find_markup(rendered, other, search);
         if (position == std::string::npos ||
             (other_position != std::string::npos && other_position < position)) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
@@ -372,10 +387,16 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             }
         }
         rendered.text.replace(position, needle.size(), replacement);
+        for (ByteSpan& span : rendered.literal_spans) {
+            if (span.begin >= position + needle.size()) {
+                span.begin = span.begin - needle.size() + replacement.size();
+                span.end   = span.end - needle.size() + replacement.size();
+            }
+        }
         search = position + replacement.size();
     }
-    if (rendered.text.find(kImagePad, search) != std::string::npos ||
-        rendered.text.find(kVideoPad, search) != std::string::npos) {
+    if (find_markup(rendered, kImagePad, search) != std::string::npos ||
+        find_markup(rendered, kVideoPad, search) != std::string::npos) {
         throw std::invalid_argument("rendered chat has unbound vision placeholders");
     }
     return rendered;
@@ -519,21 +540,28 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     if (!rendered.rewrite_checkpoint) {
-        encoded.input_ids = tokenizer.encode(rendered.text);
+        encoded.input_ids = tokenizer.encode(rendered.text, {}, rendered.literal_spans);
         return encoded;
     }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
     }
-    EncodedText tokens = tokenizer.encode(rendered.text, rendered.rewrite_checkpoint->offset);
+    EncodedText tokens = tokenizer.encode(rendered.text, rendered.rewrite_checkpoint->offset, {},
+                                          rendered.literal_spans);
     encoded.input_ids  = std::move(tokens.ids);
     std::uint32_t frontier = 0;
     if (tokens.prefix_tokens && *tokens.prefix_tokens != 0 &&
         *tokens.prefix_tokens <= encoded.input_ids.size()) {
         frontier = *tokens.prefix_tokens;
     } else {
+        const std::size_t offset = rendered.rewrite_checkpoint->offset;
+        std::vector<ByteSpan> prefix_spans;
+        for (const ByteSpan span : rendered.literal_spans) {
+            if (span.begin >= offset) { break; }
+            prefix_spans.push_back(ByteSpan{.begin = span.begin, .end = std::min(span.end, offset)});
+        }
         const std::vector<int> prefix = tokenizer.encode(
-            std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset));
+            std::string_view(rendered.text).substr(0, offset), {}, prefix_spans);
         if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
             !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
             throw std::logic_error("rewrite checkpoint is not an exact token prefix");

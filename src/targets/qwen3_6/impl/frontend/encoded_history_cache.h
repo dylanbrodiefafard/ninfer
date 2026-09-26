@@ -43,9 +43,13 @@ class EncodedHistoryCache {
 public:
     [[nodiscard]] std::optional<CopiedCommitted>
     copy_longest_prefix(std::string_view full, const Tokenizer& tokenizer,
-                        std::optional<std::size_t> checkpoint_offset);
+                        std::optional<std::size_t> checkpoint_offset,
+                        std::span<const ByteSpan> full_literal_spans = {});
 
-    void insert_committed(std::string bytes, std::vector<int> ids);
+    // Entries are keyed by bytes and literal spans together: the same bytes encode differently
+    // when a control marker is template markup in one history and client text in another.
+    void insert_committed(std::string bytes, std::vector<int> ids,
+                          std::vector<ByteSpan> literal_spans = {});
     void drop_committed(std::string_view bytes);
     void poison_committed_ids(std::string_view bytes);
     void scramble_committed_bytes(std::string_view bytes);
@@ -55,6 +59,7 @@ public:
 private:
     struct Entry {
         std::string bytes;
+        std::vector<ByteSpan> literal_spans;
         std::vector<int> ids;
         std::uint64_t stamp = 0;
     };
@@ -67,7 +72,8 @@ private:
 [[nodiscard]] std::optional<EncodedChat>
 try_splice_encoded_chat(const Tokenizer& tokenizer, std::span<const int> committed_ids,
                         std::string_view full, std::size_t n,
-                        const std::optional<RewriteCheckpointByteSpec>& checkpoint);
+                        const std::optional<RewriteCheckpointByteSpec>& checkpoint,
+                        std::span<const ByteSpan> full_literal_spans = {});
 
 [[nodiscard]] EncodedChat encode_chat_with_cache(const Tokenizer& tokenizer,
                                                  const CompiledChatTemplate& chat_template,

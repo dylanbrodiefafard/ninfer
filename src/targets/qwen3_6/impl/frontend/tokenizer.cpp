@@ -928,13 +928,28 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
 }
 
 std::optional<std::pair<std::size_t, int>>
-Tokenizer::find_leftmost_added(std::string_view text, std::size_t pos) const {
+Tokenizer::find_leftmost_added(std::string_view text, std::size_t pos,
+                               std::span<const ByteSpan> literal_spans) const {
+    std::size_t literal = static_cast<std::size_t>(
+        std::partition_point(literal_spans.begin(), literal_spans.end(),
+                             [pos](const ByteSpan& span) { return span.end <= pos; }) -
+        literal_spans.begin());
     for (std::size_t i = pos; i < text.size(); ++i) {
         if (added_start_bytes_[static_cast<unsigned char>(text[i])] == 0) { continue; }
+        while (literal < literal_spans.size() && literal_spans[literal].end <= i) { ++literal; }
+        // A match may neither start inside a literal span nor extend into the next one.
+        std::size_t limit = text.size();
+        if (literal < literal_spans.size()) {
+            if (literal_spans[literal].begin <= i) {
+                i = literal_spans[literal].end - 1;
+                continue;
+            }
+            limit = literal_spans[literal].begin;
+        }
         int node             = 0;
         int best             = -1;
         std::size_t best_len = 0;
-        for (std::size_t j = i; j < text.size(); ++j) {
+        for (std::size_t j = i; j < limit; ++j) {
             const int child =
                 added_trie_[static_cast<std::size_t>(node)].next[static_cast<unsigned char>(
                     text[j])];
@@ -954,18 +969,35 @@ Tokenizer::find_leftmost_added(std::string_view text, std::size_t pos) const {
     return std::nullopt;
 }
 
-std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
-    return encode(text, std::nullopt, options).ids;
+namespace {
+
+void validate_literal_spans(std::string_view text, std::span<const ByteSpan> literal_spans) {
+    std::size_t previous_end = 0;
+    for (const ByteSpan span : literal_spans) {
+        if (span.begin >= span.end || span.end > text.size() || span.begin < previous_end) {
+            throw std::invalid_argument(
+                "Tokenizer literal byte spans must be ordered, disjoint, nonempty, and in range");
+        }
+        previous_end = span.end;
+    }
 }
 
-bool Tokenizer::is_encode_loop_pos(std::string_view text, std::size_t n,
-                                   EncodeOptions options) const {
+} // namespace
+
+std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options,
+                                   std::span<const ByteSpan> literal_spans) const {
+    return encode(text, std::nullopt, options, literal_spans).ids;
+}
+
+bool Tokenizer::is_encode_loop_pos(std::string_view text, std::size_t n, EncodeOptions options,
+                                   std::span<const ByteSpan> literal_spans) const {
     if (n == 0 || n == text.size()) { return true; }
     if (n > text.size()) { return false; }
     if (!options.parse_added_tokens) { return false; }
     std::size_t pos = 0;
+    validate_literal_spans(text, literal_spans);
     while (pos < text.size()) {
-        const auto match = find_leftmost_added(text, pos);
+        const auto match = find_leftmost_added(text, pos, literal_spans);
         if (!match) { return false; }
         const std::size_t match_pos = match->first;
         const int match_index       = match->second;
@@ -981,7 +1013,8 @@ bool Tokenizer::is_encode_loop_pos(std::string_view text, std::size_t n,
 }
 
 EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> prefix_byte_end,
-                              EncodeOptions options) const {
+                              EncodeOptions options,
+                              std::span<const ByteSpan> literal_spans) const {
     EncodedText encoded;
     if (text.empty()) { return encoded; }
     auto mark_prefix = [&](std::size_t byte_pos) {
@@ -997,9 +1030,10 @@ EncodedText Tokenizer::encode(std::string_view text, std::optional<std::size_t> 
         return encoded;
     }
 
+    validate_literal_spans(text, literal_spans);
     std::size_t pos = 0;
     while (pos < text.size()) {
-        const auto match = find_leftmost_added(text, pos);
+        const auto match = find_leftmost_added(text, pos, literal_spans);
         if (!match) {
             append_bpe_ids(encoded.ids, text.substr(pos), has_bpe_merges_, bpe_pair_table_,
                            byte_to_intern_id_, intern_emit_ids_, intern_emit_offsets_);
