@@ -303,7 +303,9 @@ its fixed profile envelope. Target verify stays packed `B=batch` so graphs captu
 forward; ReplaySSM records are `layer(g, 0, B)` and the feature sink covers the compact
 lanes. Packed Linear/GDN-control sites normally launch at the C=1 width via
 `linear_packed_sequences` / `packed_route_tokens` so C>1 does not select a different
-T-specialized kernel (NVFP4 SmallT warp count, Q4 draft-head SmallT vs MMA, or A16↔W4A4).
+T-specialized kernel (NVFP4 SmallT warp count or A16↔W4A4). The DFlash qkv, attention-output
+and feature projections (BF16 activations on tensor cores) and the Q4 draft head reduce every
+column in one T-independent order, so they aggregate packed drafts of any width in one pass.
 Qualified NVFP4 attention-input, residual and MLP routes aggregate through W6; BF16-control
 attention-input/residual aggregation stays at W5. The selected default uses A8
 for both ordinary and GDN verification projections at every verification width (W2–W6), so a

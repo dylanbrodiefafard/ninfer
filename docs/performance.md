@@ -18,6 +18,54 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash drafter tensor cores and A8 panel count (2026-09-26)
+
+Three changes on `qwen3.8-27b/nvfp4` DFlash2, RTX 5090, NVFP4 KV:
+
+- **A8 SwapAB panel count.** Wide A8 projections (attention/GDN input, MLP gate/up) compile the
+  exact eight-token panel count, ceil(T/8). The runtime `valid_panels` guard had predicated the
+  padded panels' QMMAs, and predicated QMMAs still occupy the tensor pipe: NCU showed identical
+  tensor work at T20 and T32 (82% tensor-pipe busy). Public Op, NCU at application clocks, cold:
+  T17–24 −6% (gate/up) to −14% (attention input), T33–40 −11% to −16%; T<=16 and full 4-panel
+  tiles unchanged. Bit-exact; fixed-k4 response hashes match.
+- **DFlash drafter projections on tensor cores.** The qkv `[6144,5120]`, attention-output
+  `[5120,4096]` and feature `[5120,25600]` projections keep BF16 activations but run the A8
+  kernel's NVFP4 weight path: each E2M1 code times its E4M3 block scale is exact in BF16, so the
+  scaled weights feed BF16 m16n8k16 MMAs that accumulate in FP32. CUDA-core A16 at T30 was
+  62/50/274 µs, the tensor-core route 35/15/80 µs. Every output keeps one ascending-K order at any
+  T, so packed drafts of every width (W=2..6, previously W=5 only, with T=20 split in two) run in
+  one pass and still match their per-request panels exactly.
+- **Q4 proposal head.** 128 weight rows per CTA share one staged activation tile (the K-split
+  16-row CTAs restaged all T columns, ~2.5 GB of L2 reads at T30). Public Op: T5 246→218 µs,
+  T20 486→247 µs, T30 684→331 µs (~213 µs byte floor). One T-independent reduction order.
+
+The drafter and head reductions change FP32 association, so drafts differ from `6ab11dfa` in the
+last bits; `ninfer_qwen3_8_27b_dflash_real_test` still matches six overlapping requests to their
+C=1 streams for k=1..5. Acceptance moved within run-to-run variance (adaptive C4 0.318→0.320,
+C6 0.321→0.322).
+
+Same fixture and flags as the C=5/6 section below; single waves, steady aggregate decode tok/s,
+`6ab11dfa` and this build measured back to back:
+
+| Build / mode | C1 | C2 | C3 | C4 | C5 | C6 |
+|---|---:|---:|---:|---:|---:|---:|
+| `6ab11dfa`, adaptive max5 | 164.2 | 291.7 | 400.0 | 474.2 | 549.8 | 623.7 |
+| This build, adaptive max5 | 157.1 | 302.1 | 416.3 | 500.0 | 576.5 | 657.0 |
+| `6ab11dfa`, fixed k4 | 160.5 | — | — | 471.4 | — | 619.6 |
+| This build, fixed k4 | 164.4 | — | — | 517.7 | — | 664.8 |
+
+Adaptive C1 locks k=5 in both builds with the same 14.4 ms round (C1 kernels are unchanged
+within 0.2%); this single trajectory accepts 0.252 instead of 0.273 per drafted token, and three
+repeats of each build reproduce their own streams (157.3/156.8/157.3 vs 164.5/164.6/164.3). The
+same drafter binary produced a different C1 stream at 167.0 tok/s in another session, so C1
+adaptive throughput on one seed is an acceptance draw, not a kernel measurement. Fixed-k4 C4
+also includes a favorable draw (0.31→0.34); paired adaptive runs at unchanged acceptance put
+the round-time gain at 2–4%. Not kept (measured):
+row-owned W8 LM head (2–4% slower at T<=20, where the K-split kernel is at its byte floor) and
+BF16 attention input (adaptive C2 −6% through k selection); BN32 wide A8, deeper M48 pipelines,
+narrow two-M-warp A8, and a 32 B BF16 swizzle. Evidence: `profiles/ncu/{a8,a16,a16v,q4c,w8,bf16}`,
+`profiles/bench/{a8-logs,dm-*,qh-*,fin-*}`, traces `profiles/nsys/wb-k4-c{4,6}`.
+
 ## Concurrency C=5/6 (2026-09-25)
 
 `max_concurrency` admits 1–6. The C=5/6 verify aggregates (T=W×C up to 36) keep every

@@ -95,6 +95,9 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
         group > 0) {
         return group;
     }
+    if (w.qtype == QType::NVFP4 && detail::is_nvfp4_dflash_mma_aggregate_problem(w.n, w.k, policy)) {
+        return x.ne[1];
+    }
     if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 &&
         detail::is_nvfp4_dflash_w5_aggregate_problem(w.n, w.k, policy)) {
         // A16 SmallT uses eight values per lane only at T=17..20, so direct T=20 differs by a
@@ -105,7 +108,7 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
         if (x.ne[1] == 20 && a16_only) { return 2 * sequence_width; }
         return x.ne[1];
     }
-    // The Q4 27B draft head keeps every column's SmallT reduction through T=32.
+    // The Q4 27B draft head reduces every column in the same order; one pass holds 32 columns.
     if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width >= 2 &&
         x.ne[1] > sequence_width && detail::is_q4_27b_draft_head_problem(w.n, w.k)) {
         constexpr std::int32_t kSameReductionTokens = 32;

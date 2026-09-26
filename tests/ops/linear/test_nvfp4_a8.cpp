@@ -25,6 +25,7 @@ int main() {
         Invocation{33, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{36, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{36, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
+        Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
     int failures = 0;
     for (const auto& shape : {

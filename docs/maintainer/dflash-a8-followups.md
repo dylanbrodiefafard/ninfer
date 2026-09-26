@@ -41,6 +41,12 @@ GPU idle between kernels: 3.6% (C1) / 3.2% (C4); about 1085 kernels per C1 round
 | 6 | Verification W2/W3 → A8 across C (keeps precision independent of C) | new PPL qualification required | done: A8 at every verify width (performance.md) |
 | 7 | Defer GDN fold into the next round's overlay (one fewer state pass) | FP32 state transition must stay identical | closed: ≤~1.2% at C4 after 8, large state-transaction change |
 | 8 | Chain GDN verify: register-resident record kernel instead of the scratch T=1 overlay | bit-exact (FP32 store/load identity, same transition) | kept |
+| 9 | SwapAB panel count compiled from ceil(T/8) (a predicated QMMA still occupies the tensor pipe) | bit-exact | kept |
+| 10 | Drafter NVFP4 A16 on tensor cores (BF16 activations, scale folded exactly into BF16 weights), one pass at any draft width | FP32 association changes vs CUDA-core A16; T-invariant | kept |
+| 11 | Q4 proposal head: 128 rows per CTA sharing one activation tile | FP32 association changes; T-invariant | kept |
+| 12 | W8 verify LM head and BF16 attention input: row-owned tensor-core kernels (T-invariant, any-width aggregation) | FP32 association changes | not kept (C1–C4 cost) |
+| 13 | A8 grid/tile variants: BN32 wide, M48 deep pipeline (dynamic smem), narrow WarpsM=2, BF16 32 B swizzle | exact | lost |
+| 14 | Target verify A16 on tensor cores instead of A8 | quality gain; new PPL qualification | open: ties/beats A8 at T<=16, 4–22% behind at T>=20 |
 
 Details:
 
@@ -152,9 +158,30 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
   most one state read per round (about a third of the 714 µs C4 fold, ~1.2%), add sequential
   steps to every record kernel, and move the committed-state frontier across rounds.
 
+- **9–13 (2026-09-26):** NCU on the wide A8 projections showed identical tensor work at T20 and
+  T32 (and at T5 and T16): every QMMA was predicated on `valid_panels`, and predicated QMMAs still
+  occupy the pipe. Compiling the panel count cuts T17–24 and T33–40 time 6–16% (public Op, NCU at
+  application clocks); four-panel tiles keep the runtime guard so their schedule is unchanged.
+  At T>=20 A8 remains tensor-issue bound: NVFP4's per-16 E4M3 scale forces K16 FP8 MMAs (64 G/s,
+  the same instruction rate as BF16 K16). The drafter's CUDA-core A16 projections (5x their byte
+  floor at T30) now use the A8 kernel's weight path with BF16 activations: E2M1×E4M3 products
+  are exact in BF16, so the scaled weights feed BF16 m16n8k16 MMAs directly; per-output K order is
+  T-invariant, so W=2..6 drafts aggregate in one pass. The Q4 head and W8 LM head were
+  activation-L2-bound (16-row CTAs restage all T columns: ~2.5–4.8 GB of L2 reads at T30); 128-row
+  CTAs remove that. The W8 variant is 2–4% slower than the K-split kernel at T<=20 (which sits at
+  its byte floor) and was not kept; the BF16 attention-input variant regressed adaptive C2 by 6%
+  through k selection and was not kept. Numbers: performance.md "DFlash drafter tensor cores".
+- **14:** with A8's BK and two stages, A16-on-tensor-cores beats A8+quantize at T<=16 (gate/up
+  65.3 vs 66.9 µs, GDN-in 32.4 vs 34.9, attn-in 30.2 vs 32.1) but its M32 tile needs ~55 KiB of
+  shared memory (one CTA per SM) and trails A8 by 4–22% at T20–30. Mixing A16/A8 by T would make
+  verification precision depend on C, so this needs M32 parity first.
+
 ## Remaining follow-ups
 
-- Drafter A8 with a proper acceptance study (candidate 4).
-- Standalone-quantize removal (candidate 5 remainder).
-- BF16 target attention layers (`bf16_small_t_inner` 14336×5120, ~92–108 µs, 6 per round) and the
-  W8 verify LM head (~800 µs per round) are at their bandwidth floors; only format changes help.
+- Target verify A16 on tensor cores (candidate 14): an M32 BF16 schedule with two CTAs per SM,
+  then fused-op wiring (SwiGLU, residual add, GDN record, attention input) and PPL qualification.
+- Standalone-quantize removal (candidate 5 remainder); moot if 14 lands.
+- W8 LM head at C5/C6 (T25–36: 974 µs and a second pass at T36) and BF16 attention input at
+  T>=20: row-owned kernels win there but must also match the K-split kernels at T<=20.
+- GDN record (~2x its FP32 state-read floor at C6) is latency-bound on warp-shuffle dot products;
+  a change must keep record/fold/snapshot/overlay transitions identical.
