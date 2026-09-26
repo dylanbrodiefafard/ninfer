@@ -55,7 +55,7 @@ int run_nvfp4_a16() {
                           {256, 5120, 721U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
-    constexpr std::array<std::int32_t, 3> dflash_batches{2, 3, 4};
+    constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
     failures += run_packed_sequences_matches_panels(
         "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, 5,
         dflash_batches);
@@ -64,6 +64,9 @@ int run_nvfp4_a16() {
         dflash_batches);
     failures += run_packed_sequences_matches_panels(
         "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5,
+        dflash_batches);
+    failures += run_packed_sequences_matches_panels(
+        "NVFP4_A16 DFlash feature packed", make_nvfp4_weight, 5120, 25600, 739U, 5,
         dflash_batches);
     return failures;
 }

@@ -1364,6 +1364,23 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     failures += run_shape(5, 4, {5, 4, 3, 2},
                            {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2, -1, 0, 1, 2, 3},
                            2081U);
+    // C=5/6 verify covers every chain width, plus ragged tree rows at the widest aggregates
+    // (A8 W=6 B=6 is the 36-token single-tile boundary).
+    for (int batch : {5, 6}) {
+        for (int width : {2, 3, 4, 5, 6}) {
+            failures += run_shape(width, batch, {}, {}, 2700U + width * 8 + batch);
+        }
+        for (int width : {5, 6}) {
+            std::vector<int> valid(batch), parents(batch * width);
+            for (int b = 0; b < batch; ++b) {
+                valid[b] = width - b % width;
+                for (int t = 0; t < width; ++t) {
+                    parents[b * width + t] = t == 0 ? -1 : (t - 1) / 2;
+                }
+            }
+            failures += run_shape(width, batch, valid, parents, 2760U + width * 8 + batch);
+        }
+    }
     if (qtype == QType::NVFP4 && policy == ops::LinearPolicy::A16Only) {
         for (int batch : {2, 3, 4}) {
             failures += run_shape(6, batch, {}, {}, 2600U + batch);

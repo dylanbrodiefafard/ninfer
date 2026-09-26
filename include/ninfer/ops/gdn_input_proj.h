@@ -15,7 +15,7 @@ namespace ninfer::ops {
 
 // FP8 single-parent domain: FP8_E4M3FN_ROW_BF16S RowScale [16384,5120], ordered
 // [Q(2048),K(2048),V(6144),Z(6144)], exact BF16 row multipliers. Projection admits
-// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..4, record
+// A16Only/AllowA8 at every positive T. Snapshot and record admit B=1..6, record
 // W=2..16, snapshot W>=1 (B>1 requires W<=16). Both retain A16 for W<=16;
 // long B=1 AllowA8 snapshot may quantize activations privately. Record preserves
 // the optional tree-parent operand in fused and materialized routes. Complete
@@ -175,7 +175,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Returns the transient capacity for the registered Q4/Q5 or W8 record-producing profile.
- * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..4,
+ * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..6,
  * T=2..16 execution domain. These profiles require no transient storage because materialized
  * projection writes directly to caller-owned conv_record.
  */
@@ -185,7 +185,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Returns the transient capacity for the [16384,5120] NVFP4 record-producing profile. Under A16,
- * B=1 fused T=1-reduction, B=1 W=4 fused SmallT, and B=2..4 request-indexed SmallT routes require
+ * B=1 fused T=1-reduction, B=1 W=4 fused SmallT, and B=2..6 request-indexed SmallT routes require
  * no storage. B=1 W=5/6, B>1 W=2/5, and B=2/4 W=6 grouped replay use a private FP32 projection.
  * AllowA8 W=4..6 fuses projection/convolution through a CTA-local FP32 tile and needs only
  * caller-owned activation codes/scales. AllowA4 W=5..16 and AllowA8 W=7..16 also need private
@@ -206,7 +206,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * representation to conv_record [C,T,B] for subsequent history/replay. Query, key, and value are
  * zero in each row's invalid tail; z is projected for every physical column.
  *
- * The execution domain is B=1..4 and T=2..16. valid_columns is empty for dense input or device
+ * The execution domain is B=1..6 and T=2..16. valid_columns is empty for dense input or device
  * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
  * modified. Only the valid prefix of conv_record is semantically defined.
@@ -221,7 +221,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * other quantized widths use private FP32 storage. A8 uses row-scaled E4M3 activations and
  * separately scaled K16 partials without requantizing
  * weights. The A16 profile (including AllowA4 W=2..4 and AllowA8 W=2..3) uses the following routes:
- * B=1 W=4 uses one fused same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..4
+ * B=1 W=4 uses one fused same-reduction SmallT weight pass. B=1 W=5/6 and qualified B=2..6
  * W=2/5 profiles use one grouped SmallT weight pass with a private FP32 projection, including one
  * direct W=5 C=3 group. W=6 B=2/4 uses request pairs; W=6 B=3 remains request-indexed.
  * Other B=1 widths use the fused T=1-reduction GEMV+FP32-convolution route;

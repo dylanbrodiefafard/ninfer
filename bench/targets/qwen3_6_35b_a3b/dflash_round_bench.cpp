@@ -45,7 +45,7 @@ void print_usage(const char* executable) {
     std::cout << "usage: " << executable
               << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..15>]"
-                 " [--batch <1..4>]"
+                 " [--batch <1..6>]"
                  " [--proposal-head full|optimized] [--no-cuda-graph]\n";
 }
 
@@ -112,7 +112,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
     if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
-        throw std::invalid_argument("--batch must be in [1,4]");
+        throw std::invalid_argument("--batch must be in [1,6]");
     }
     return options;
 }

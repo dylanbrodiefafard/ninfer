@@ -18,6 +18,47 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Concurrency C=5/6 (2026-09-25)
+
+`max_concurrency` admits 1–6. The C=5/6 verify aggregates (T=W×C up to 36) keep every
+request's C=1 arithmetic, so C=1–4 kernels and outputs are unchanged:
+
+- A8 MMA uses one M48 tile for T=33–48 (N=5120 K256×2 stages, wide K128×3), so W=6 C=6 reads
+  weights once. The fused A8 GDN conv-record epilogue requires that single tile.
+- Aggregate verify extent, fused RMSNorm+SwiGLU, GDN replay/record rows, and GDN gating extend to
+  C=6. Gating aggregates every W=2..16 packed verify through T=36 on the T=1-reduction GEMV.
+- The W8 verify LM head and the Q4 proposal head aggregate W=2..6 in passes of at most 32
+  columns (both keep one K-split reduction per column through T=32). BF16 attention routes the
+  W=5 C=5/6 aggregates (T=25/30) to SmallT, which keeps the T=5 panel reduction; the generic
+  crossover sends T>22 to MMA. DFlash W=5 drafter projections, now including the feature
+  projection, run one pass at C=5/6; only A16 T=20 keeps two T=10 groups.
+- Adaptive draft measures every captured k once per batch size. Extrapolating an unmeasured
+  arm's T from shorter arms is not a bound: before A8 covered W2/W3, a C=6 k=1 round (36 ms)
+  cost more than k=4 (24 ms), k=3..5 were never probed, and C=6 locked k=1 (266 tok/s).
+
+Every aggregate is bit-identical to its per-request panels in the Op tests (B=2..6, W=2..6), and
+`ninfer_qwen3_8_27b_dflash_real_test` matches six overlapping greedy requests to their C=1
+DFlash streams for k=1..5.
+
+RTX 5090, CUDA 13.1, DFlash2 artifact, `long_decode_aime26_15`, 8192 completion tokens per
+request, p-less T2, thinking, NVFP4 KV, max context 16384, KV capacity 16384×C, graphs,
+optimized head. Single waves, steady full-batch aggregate decode tok/s:
+
+| Build / mode | C1 | C2 | C3 | C4 | C5 | C6 |
+|---|---:|---:|---:|---:|---:|---:|
+| Before (`79033d70`), adaptive max5 | 159.1 | 291.9 | 399.5 | 474.3 | — | — |
+| C≤6, adaptive max5 | 164.7 | 292.2 | 400.8 | 475.2 | **550.4** | **625.8** |
+| Before (`79033d70`), fixed k4 | 160.8 | — | — | 471.1 | — | — |
+| C≤6, fixed k4 | 160.6 | — | — | 472.5 | **556.0** | **619.9** |
+
+Adaptive C2–C6 lock k=4 after one round per arm (C1 locks k=5). Aggregate throughput rises
++15.8% from C4 to C5 and +13.7% from C5 to C6; per-request decode is ~104 tok/s at C6. Fixed-k4
+kernel time per round is 18.69/20.10/21.34 ms at C4/C5/C6: each added request costs ~1.3 ms
+(GDN fold/record, attention, heads). Before the head/drafter/attention single-pass fixes, the
+fifth request cost 2.80 ms because those three leaves split into extra weight passes at C=5.
+Evidence: `profiles/bench/c6-{base2,fix}-*`, traces `profiles/nsys/c5{why,fix}-k4-c{4,5,6}`
+and `profiles/nsys/c6-{k1-c4,k1-c6,k4-c6}` (pre-merge build, A16 W2/W3).
+
 ## DFlash GDN chain record and M32 A8 schedule (2026-09-25)
 
 Two bit-exact changes, `qwen3.8-27b/nvfp4` DFlash2 on RTX 5090, NVFP4 KV:

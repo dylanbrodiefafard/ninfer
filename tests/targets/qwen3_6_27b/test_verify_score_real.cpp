@@ -477,8 +477,8 @@ int main(int argc, char** argv) {
         const unsigned width = argc > 2 ? std::stoul(argv[2]) : 5;
         const unsigned prefix = argc > 3 ? std::stoul(argv[3]) : 8;
         const unsigned limit = argc > 4 ? std::stoul(argv[4]) : 31;
-        require(batch >= 1 && batch <= 4 && width >= 2 && width <= 6 && prefix > 0 && limit > 0,
-                "usage: verify_score [C=1..4 W=2..6 prefix scored_tokens [file [--ids]]]");
+        require(batch >= 1 && batch <= 6 && width >= 2 && width <= 6 && prefix > 0 && limit > 0,
+                "usage: verify_score [C=1..6 W=2..6 prefix scored_tokens [file [--ids]]]");
         ninfer::DeviceContext device;
         ninfer::EngineOptions options;
         options.artifact_path = artifact;

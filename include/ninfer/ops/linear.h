@@ -137,8 +137,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * SmallT, Q4 draft-head, and W8/Q4 SIMT/MMA routes are specialized by exact T, so launching once
  * at `T=width*B` can select a different kernel than sequential C=1 (`T=width`). This entry
  * launches one Linear per sequence by default. Qualified exceptions aggregate the A16 W8
- * vocabulary W=5 profile across B=2..4 and aggregate selected NVFP4 DFlash and Q4 27B draft-head
- * profiles. `T` must be a positive multiple of `sequence_width`. Tensor, weight, aliasing,
+ * vocabulary W=2..6 profile in passes of at most 32 same-reduction columns and aggregate selected
+ * NVFP4 DFlash and Q4 27B draft-head profiles. `T` must be a positive multiple of `sequence_width`. Tensor, weight, aliasing,
  * policy, and workspace
  * requirements match `linear`.
  *

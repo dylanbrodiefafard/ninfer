@@ -31,7 +31,7 @@ namespace {
 
 constexpr std::int32_t kStateDim       = 128;
 constexpr std::int32_t kQkHeads        = 16;
-constexpr std::int32_t kRecordCapacity = 4;
+constexpr std::int32_t kRecordCapacity = 6;
 constexpr std::size_t kGuardBytes      = 256;
 
 std::uint32_t mix(std::uint32_t value) {
@@ -1123,6 +1123,8 @@ int main() {
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 4, {6, 4, 1, 5}, 1821U);
+    failures += run_case({48, 48, 10240}, 5, 5, {5, 0, 3, 1, 4}, 1823U);
+    failures += run_case({48, 48, 10240}, 6, 6, {6, 4, 1, 5, 0, 2}, 1827U);
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);

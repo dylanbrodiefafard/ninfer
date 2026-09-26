@@ -76,30 +76,40 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
-bool aggregate_w8_vocabulary_sequences(const Tensor& x, const Weight& w,
+// The W8 vocabulary SmallT route keeps one eight-K-warp reduction for every T<=32, so verify
+// requests (W=2..6) share weight passes of at most 32 columns; T=33 changes the K split.
+std::int32_t w8_vocabulary_group_width(const Tensor& x, const Weight& w,
                                        std::int32_t sequence_width, LinearPolicy policy) {
-    return policy == LinearPolicy::A16Only && w.qtype == QType::W8G32_F16S &&
-           detail::is_w8_vocabulary_problem(w.n, w.k) && sequence_width == 5 && x.ne[1] >= 10 &&
-           x.ne[1] <= 20;
+    constexpr std::int32_t kSameReductionTokens = 32;
+    if (policy != LinearPolicy::A16Only || w.qtype != QType::W8G32_F16S ||
+        !detail::is_w8_vocabulary_problem(w.n, w.k) || sequence_width < 2 ||
+        sequence_width > 6 || x.ne[1] <= sequence_width) {
+        return 0;
+    }
+    return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
 }
 
 std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
                                          std::int32_t sequence_width, LinearPolicy policy) {
-    if (aggregate_w8_vocabulary_sequences(x, w, sequence_width, policy)) { return x.ne[1]; }
-    if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 && x.ne[1] <= 20 &&
+    if (const std::int32_t group = w8_vocabulary_group_width(x, w, sequence_width, policy);
+        group > 0) {
+        return group;
+    }
+    if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 &&
         detail::is_nvfp4_dflash_w5_aggregate_problem(w.n, w.k, policy)) {
-        // Direct T=20 A16 differs by a few BF16 ulps on real recurrent activations despite
-        // passing random conformance inputs. Two T=10 groups preserve the qualified C=2 route
-        // exactly while still halving C=4 weight reads. W4A4 gate/down is exact at T=20.
-        if (x.ne[1] == 20 && detail::is_nvfp4_a16_only_problem(
-                                 detail::resolve_nvfp4_problem(w.n, w.k))) {
-            return 2 * sequence_width;
-        }
+        // A16 SmallT uses eight values per lane only at T=17..20, so direct T=20 differs by a
+        // few BF16 ulps on real recurrent activations; two T=10 groups keep the C=2 route.
+        // T=10/15/25/30 keep the T=5 association, and W4A4 is one M32 tile through T=32.
+        const bool a16_only =
+            detail::is_nvfp4_a16_only_problem(detail::resolve_nvfp4_problem(w.n, w.k));
+        if (x.ne[1] == 20 && a16_only) { return 2 * sequence_width; }
         return x.ne[1];
     }
-    if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width == 4 &&
-        x.ne[1] >= 8 && x.ne[1] <= 16 && detail::is_q4_27b_draft_head_problem(w.n, w.k)) {
-        return x.ne[1];
+    // The Q4 27B draft head keeps every column's SmallT reduction through T=32.
+    if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width >= 2 &&
+        x.ne[1] > sequence_width && detail::is_q4_27b_draft_head_problem(w.n, w.k)) {
+        constexpr std::int32_t kSameReductionTokens = 32;
+        return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
     }
     return sequence_width;
 }

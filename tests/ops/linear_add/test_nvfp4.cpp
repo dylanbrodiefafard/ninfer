@@ -292,9 +292,9 @@ int run_packed_column0(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 }
 
 int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t seed,
-                                 std::int32_t width) {
-    constexpr std::int32_t kMaxBatch = 4;
-    const std::int32_t kMaxT          = width * kMaxBatch;
+                                 std::int32_t width, ops::LinearPolicy policy,
+                                 std::int32_t max_batch) {
+    const std::int32_t kMaxT = width * max_batch;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;
@@ -311,7 +311,7 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
     const Weight weight = host_weight.device_weight(device_weight.data());
 
     int failures = 0;
-    for (std::int32_t batch = 2; batch <= kMaxBatch; ++batch) {
+    for (std::int32_t batch = 2; batch <= max_batch; ++batch) {
         const std::int32_t tokens       = width * batch;
         const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
         const std::size_t output_bytes = output_words * sizeof(std::uint16_t);
@@ -319,12 +319,12 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
         GuardedDeviceBuffer panels(output_bytes);
         aggregate.copy_from_host(initial_residual.data(), output_bytes);
         panels.copy_from_host(initial_residual.data(), output_bytes);
-        WorkspaceArena workspace(256);
+        WorkspaceArena workspace(std::max<std::size_t>(
+            256, ops::linear_add_workspace_capacity_bytes(QType::NVFP4, n, k, policy, 1, tokens)));
 
         Tensor aggregate_x(device_activation.data(), DType::BF16, {k, tokens});
         Tensor aggregate_y(aggregate.data(), DType::BF16, {n, tokens});
-        ops::linear_add(aggregate_x, weight, aggregate_y, ops::LinearPolicy::A16Only, workspace,
-                        nullptr);
+        ops::linear_add(aggregate_x, weight, aggregate_y, policy, workspace, nullptr);
         for (std::int32_t row = 0; row < batch; ++row) {
             auto* input = static_cast<std::uint8_t*>(device_activation.data()) +
                           static_cast<std::int64_t>(row) * width * k * sizeof(std::uint16_t);
@@ -332,8 +332,7 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
                            static_cast<std::int64_t>(row) * width * n * sizeof(std::uint16_t);
             Tensor panel_x(input, DType::BF16, {k, width});
             Tensor panel_y(output, DType::BF16, {n, width});
-            ops::linear_add(panel_x, weight, panel_y, ops::LinearPolicy::A16Only, workspace,
-                            nullptr);
+            ops::linear_add(panel_x, weight, panel_y, policy, workspace, nullptr);
         }
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 aggregate parity");
 
@@ -341,7 +340,8 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
         std::vector<std::uint16_t> panel_bits(output_words);
         aggregate.copy_to_host(aggregate_bits.data(), output_bytes);
         panels.copy_to_host(panel_bits.data(), output_bytes);
-        const std::string label = "NVFP4 linear_add W" + std::to_string(width) +
+        const std::string label = "NVFP4 linear_add W" + std::to_string(width) + " policy=" +
+                                  std::to_string(static_cast<int>(policy)) +
                                   " aggregate parity [" +
                                   std::to_string(n) + "," + std::to_string(k) + "] C=" +
                                   std::to_string(batch);
@@ -372,9 +372,12 @@ int main() {
     failures += run_shape(5120, 17408, 821U);
     failures += run_packed_column0(5120, 6144, 811U);
     failures += run_packed_column0(5120, 17408, 821U);
-    for (const std::int32_t width : {4, 5, 6}) {
-        failures += run_aggregate_matches_panels(5120, 6144, 831U + width, width);
-        failures += run_aggregate_matches_panels(5120, 17408, 841U + width, width);
+    // Every verify width uses A8; aggregates across C<=6 equal their W-panels.
+    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+        failures += run_aggregate_matches_panels(5120, 6144, 831U + width, width,
+                                                 ops::LinearPolicy::AllowA8, 6);
+        failures += run_aggregate_matches_panels(5120, 17408, 841U + width, width,
+                                                 ops::LinearPolicy::AllowA8, 6);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;

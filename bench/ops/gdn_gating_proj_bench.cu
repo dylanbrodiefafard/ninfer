@@ -238,14 +238,15 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const Weight wb     = bf16_row_view(parent, heads, heads);
     if (opt.packed_width != 0 &&
         (tokens % opt.packed_width != 0 || tokens / opt.packed_width < 1 ||
-         tokens / opt.packed_width > 4)) {
-        throw std::invalid_argument("packed T must be W times B=1..4");
+         tokens / opt.packed_width > ops::detail::kBf16GdnGatingPackedMaxBatch)) {
+        throw std::invalid_argument("packed T must be W times B=1..6");
     }
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
     const auto plan = [&] {
-        if (opt.packed_width == 5 && tokens / opt.packed_width >= 2) {
-            return ops::detail::bf16_gdn_gating_resolve_packed_w5_plan(problem);
+        if (ops::detail::bf16_gdn_gating_packed_aggregates(opt.packed_width,
+                                                           tokens / opt.packed_width)) {
+            return ops::detail::bf16_gdn_gating_resolve_packed_plan(problem);
         }
         if (opt.packed_width != 0) {
             return ops::detail::bf16_gdn_gating_resolve_plan(

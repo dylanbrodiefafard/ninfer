@@ -37,7 +37,7 @@ is enabled and the matrix contains decode work, one ordinary public generation r
 decode graph before warmups and measured repetitions. `--concurrency N` also primes the N-lane
 decode graph.
 
-`--concurrency N` (1–4) sizes the Engine for N active lanes. Pure-prefill throughput is aggregate
+`--concurrency N` (1–6) sizes the Engine for N active lanes. Pure-prefill throughput is aggregate
 `N * P / wave_seconds`; because the Engine permits one prefill owner, it measures a serialized
 request wave rather than N simultaneous prefill kernels. Decode throughput is aggregate:
 `N * G / max(decode_seconds)` across lanes. For `pp+tg` at `N>1`, each lane first completes a
@@ -55,7 +55,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..4>]
+          [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..6>]
            [--spec <mtp|dflash>] [--draft-tokens <0..5>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
@@ -191,7 +191,7 @@ selects the 35B contiguous-parent form. `--candidate auto` uses production dispa
 selected route and transient workspace after a 256 MiB L2 flush.
 
 For the 27B norm/control profile, `--packed-width W` measures the public packed-independent-
-sequence entry with each listed `T` interpreted as `W*B` for B=1..4. It is valid only with
+sequence entry with each listed `T` interpreted as `W*B` for B=1..6. It is valid only with
 `--norm-control --candidate auto`; private candidate bit-exact screening remains a separate mode.
 
 ```bash
@@ -277,7 +277,7 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 
 `ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6 Q4/Q5, NVFP4, and W8
 `gdn_input_proj_conv_snapshot` forms for exact `B=1..8` and record-producing forms for the product
-domain `B=1..4`. The timed body is exactly one complete public Op call; the benchmark does not
+domain `B=1..6`. The timed body is exactly one complete public Op call; the benchmark does not
 include private launchers, candidate selection, duplicated compositions, or route labels. Its
 default `T=1..6` sweep is the production MTP verification interval. NVFP4 accepts
 the public `a16` and `a4` policies; the reported profile names the caller policy, not a private

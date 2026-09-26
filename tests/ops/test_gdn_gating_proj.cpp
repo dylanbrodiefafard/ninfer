@@ -743,7 +743,7 @@ int verify_packed_workspace_rejections() {
     expect_invalid(0, 1, 1);
     expect_invalid(5, 0, 1);
     expect_invalid(5, 3, 2);
-    expect_invalid(5, 1, 5);
+    expect_invalid(5, 1, 7);
     return failures;
 }
 
@@ -779,6 +779,14 @@ int main() {
     failures += run_norm_packed_columns_match_decode(kQwen27, 10, 0x610au);
     failures += run_norm_packed_columns_match_decode(kQwen27, 15, 0x610fu);
     failures += run_norm_packed_columns_match_decode(kQwen27, 20, 0x6114u);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 25, 0x6119u);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 30, 0x611eu);
+    // Every verify width aggregates across C=2..6 with each column equal to its W-panel.
+    failures += run_norm_packed_columns_match_decode(kQwen27, 12, 0x620cu, 2);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 18, 0x6212u, 3);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 24, 0x6218u, 4);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 12, 0x620du, 6);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 36, 0x6224u, 6);
     failures += run_norm_packed_columns_match_decode(kQwen27, 24, 0x6118u, 12);
     failures += run_norm_packed_columns_match_decode(kQwen27, 34, 0x6122u, 17);
     // Every registered 35B projection route and its contiguous-parent storage contract.
@@ -794,6 +802,8 @@ int main() {
     failures += run_norm_projection_case(kQwen27, 15, 0x300fu, 5);
     failures += run_norm_projection_case(kQwen27, 20, 0x3014u, 5);
     failures += run_norm_projection_case(kQwen27, 24, 0x3018u, 12);
+    failures += run_norm_projection_case(kQwen27, 30, 0x301eu, 5);
+    failures += run_norm_projection_case(kQwen27, 36, 0x3024u, 6);
     failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
     failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u);

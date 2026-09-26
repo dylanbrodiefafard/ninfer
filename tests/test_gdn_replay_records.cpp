@@ -128,38 +128,38 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(0, 5); }, "excess active rows");
 
     failures += expect_size(record_bytes({.layers          = 48,
-                                          .record_capacity = 4,
+                                          .record_capacity = 6,
                                           .width           = 6,
                                           .conv_channels   = 10240,
                                           .qk_heads        = 16,
                                           .value_heads     = 48,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            42909696, "48-layer T6 capacity");
+                            64364544, "48-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
-                                          .record_capacity = 4,
+                                          .record_capacity = 6,
                                           .width           = 6,
                                           .conv_channels   = 8192,
                                           .qk_heads        = 16,
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            20828160, "30-layer T6 capacity");
+                            31242240, "30-layer T6 capacity");
     failures += expect_size(record_bytes({.layers          = 30,
-                                          .record_capacity = 4,
+                                          .record_capacity = 6,
                                           .width           = 16,
                                           .conv_channels   = 8192,
                                           .qk_heads        = 16,
                                           .value_heads     = 32,
                                           .key_dim         = 128,
                                           .value_dim       = 128}),
-                            55541760, "30-layer T16 capacity");
+                            83312640, "30-layer T16 capacity");
 
     failures += expect_throw(
         [&] {
             ninfer::LayoutBuilder invalid;
             (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 5,
+                                                            .record_capacity = 7,
                                                             .width           = 2,
                                                             .conv_channels   = 1,
                                                             .qk_heads        = 1,
@@ -167,7 +167,7 @@ int main() {
                                                             .key_dim         = 1,
                                                             .value_dim       = 1});
         },
-        "record capacity above four");
+        "record capacity above six");
 
     ninfer::LayoutBuilder state_builder;
     const auto state_layout = ninfer::plan_linear_attention_state_pool(

@@ -72,7 +72,7 @@ int bf16_w5_aggregate_matches_panels() {
     constexpr std::int32_t kN        = 5120;
     constexpr std::int32_t kK        = 6144;
     constexpr std::int32_t kWidth    = 5;
-    constexpr std::int32_t kMaxBatch = 4;
+    constexpr std::int32_t kMaxBatch = 6;
     constexpr std::int32_t kMaxT     = kWidth * kMaxBatch;
     ninfer::test::direct_bf16_weight::DeviceWeight weight(
         ninfer::test::direct_bf16_weight::make_patterned(kN, kK, 449U));

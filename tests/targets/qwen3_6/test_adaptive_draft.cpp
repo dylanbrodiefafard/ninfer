@@ -115,9 +115,6 @@ void test_unseen_r_not_added_to_mean_y() {
     const float y3 = q36::detail::expected_tokens(state, 3);
     expect_near(q36::detail::expected_tokens(state, 5), y3, 1e-5f,
                 "unseen r3,r4 do not add tokens to E[Y]");
-    const float q2 = 0.80f * 0.625f * 0.60f;
-    expect_near(q36::detail::expected_tokens_optimistic(state, 5), y3 + 2.0f * q2, 0.02f,
-                "optimistic bound fills unseen r_i with 1");
 }
 
 void test_r_updates_only_when_prefix_reached() {
@@ -159,16 +156,6 @@ void test_t_ols_shared_slope() {
     expect_near(t5 - 0.040f, 0.010f, 2e-3f, "shared c ≈ 0.010 / 1000 tokens");
 }
 
-void test_unmeasured_t5_extrapolates_and_is_at_least_t4() {
-    q36::AdaptiveRoundTimeState st;
-    plant_t(st, 3, 0.056f, 512);
-    plant_t(st, 4, 0.049f, 512);
-    expect(q36::adaptive_t_measured(st, 4), "T(4) is measured");
-    expect(!q36::adaptive_t_measured(st, 5), "T(5) is not measured");
-    const float t5 = q36::adaptive_t_hat(st, 5, 512);
-    expect(t5 >= 0.049f - 1e-6f, "T(5) >= T(4) even when 2 T(4)-T(3) is smaller");
-}
-
 void test_cold_start_runs_smallest_k() {
     q36::AdaptiveDraftState state;
     q36::seed_adaptive_draft_state(state, 0);
@@ -203,7 +190,26 @@ void test_unmeasured_k5_is_probed_at_most_once_then_dropped() {
     expect(pick(cfg, state, 5, 5) == 4, "after T(5) is measured the arm is dominated");
 }
 
-void test_small_q_extrapolation_skips_k5_probe() {
+void test_unmeasured_arm_is_probed_despite_slower_short_arms() {
+    // Observed C=6 DFlash round times: k=1/2 rounds cost more than k=3..5. Measured short arms
+    // must not hide the unmeasured, faster arms.
+    q36::AdaptiveDraftState state;
+    plant_r(state, 2, {0.61f, 0.40f});
+    q36::AdaptiveRoundTimeState t;
+    plant_t(t, 1, 0.036f);
+    plant_t(t, 2, 0.041f);
+    const std::uint32_t ks[] = {1, 2, 3, 4, 5};
+    auto cfg                 = cfg_of(ks, t);
+    expect(pick(cfg, state, 5, 1) == 3, "first unmeasured arm is probed");
+    plant_t(t, 3, 0.022f);
+    expect(pick(cfg, state, 5, 3) == 4, "each unmeasured arm is measured once");
+    plant_t(t, 4, 0.024f);
+    plant_t(t, 5, 0.027f);
+    plant_r(state, 5, {0.61f, 0.40f, 0.40f, 0.40f, 0.40f});
+    expect(pick(cfg, state, 5, 5) == 3, "then argmax E[Y]/T over measured arms");
+}
+
+void test_dominated_arm_is_measured_once_then_dropped() {
     q36::AdaptiveDraftState state;
     plant_r(state, 4, {0.80f, 0.70f, 0.60f, 0.0f});
     q36::AdaptiveRoundTimeState t;
@@ -211,8 +217,9 @@ void test_small_q_extrapolation_skips_k5_probe() {
     plant_t(t, 4, 0.024f);
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
-    expect(pick(cfg, state, 5, 4) == 3,
-           "dead last hop and rising T: lock 3; unmeasured k=5 stays dominated");
+    expect(pick(cfg, state, 5, 4) == 5, "an unmeasured arm has no T bound: probe k=5 once");
+    plant_t(t, 5, 0.028f);
+    expect(pick(cfg, state, 5, 5) == 3, "dead last hop and rising T: lock 3 after measuring");
 }
 
 void test_unmeasured_k4_probed_at_most_once() {
@@ -224,7 +231,9 @@ void test_unmeasured_k4_probed_at_most_once() {
     auto cfg                 = cfg_of(ks, t);
     expect(pick(cfg, state, 5, 3) == 4, "T(3) known, equal-T extra hop probes k=4 once");
     plant_t(t, 4, 0.040f);
-    expect(pick(cfg, state, 5, 4) == 3, "after expensive T(4) the arm is dominated");
+    expect(pick(cfg, state, 5, 4) == 5, "k=5 is still measured once");
+    plant_t(t, 5, 0.060f);
+    expect(pick(cfg, state, 5, 5) == 3, "after expensive T(4)/T(5) both arms are dominated");
 }
 
 void test_argmin_t_when_hops_unseen() {
@@ -379,13 +388,6 @@ void test_t_survives_request_seed() {
            "T is server-global; hop posterior is per-request");
 }
 
-void test_optimistic_cold_start_does_not_invent_all_success() {
-    q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
-    expect_near(q36::detail::expected_tokens_optimistic(state, 5), 1.0f, 1e-6f,
-                "no r_i seen → optimistic E[Y] stays 1");
-}
-
 } // namespace
 
 int main() {
@@ -397,11 +399,11 @@ int main() {
     test_r_updates_only_when_prefix_reached();
     test_pcur_zero_skips_update();
     test_t_ols_shared_slope();
-    test_unmeasured_t5_extrapolates_and_is_at_least_t4();
     test_cold_start_runs_smallest_k();
     test_measured_expensive_k5_is_dominated();
     test_unmeasured_k5_is_probed_at_most_once_then_dropped();
-    test_small_q_extrapolation_skips_k5_probe();
+    test_unmeasured_arm_is_probed_despite_slower_short_arms();
+    test_dominated_arm_is_measured_once_then_dropped();
     test_unmeasured_k4_probed_at_most_once();
     test_argmin_t_when_hops_unseen();
     test_ties_keep_smaller_k();
@@ -412,7 +414,6 @@ int main() {
     test_batch_next_writes_executed_k();
     test_budget_clamp();
     test_t_survives_request_seed();
-    test_optimistic_cold_start_does_not_invent_all_success();
     if (failures != 0) {
         std::cerr << failures << " adaptive draft host checks failed\n";
         return 1;

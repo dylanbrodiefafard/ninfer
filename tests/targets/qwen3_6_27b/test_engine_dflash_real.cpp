@@ -19,6 +19,10 @@
 
 namespace {
 
+constexpr std::size_t kIsolationRequests = ninfer::kMaximumConcurrency;
+using IsolationTokens = std::array<std::vector<ninfer::TokenId>, kIsolationRequests>;
+
+
 ninfer::EngineOptions base_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path  = artifact;
@@ -375,9 +379,9 @@ int check_tokens(const char* label, const ninfer::GenerationResult& result,
 // Actual candidate-logit licensing is checked by test_verify_score_real's decode
 // qualification; exact same-profile C=1/C>1 isolation remains enforced here.
 int check_target_margins(const char* artifact,
-                         const std::array<std::vector<ninfer::TokenId>, 4>& prompts,
-                         const std::array<std::vector<ninfer::TokenId>, 4>& generated,
-                         const std::array<std::vector<ninfer::TokenId>, 4>& ordinary,
+                         const IsolationTokens& prompts,
+                         const IsolationTokens& generated,
+                         const IsolationTokens& ordinary,
                          const char* label) {
     bool needs_score = false;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
@@ -1792,20 +1796,19 @@ std::vector<ninfer::TokenId> token_prefix(const std::vector<ninfer::TokenId>& to
     return std::vector<ninfer::TokenId>(tokens.begin(), tokens.begin() + length);
 }
 
-int run_overlapping_c4(ninfer::Engine& engine,
-                       const std::array<std::vector<ninfer::TokenId>, 4>& prompts,
-                       const std::array<std::vector<ninfer::TokenId>, 4>& dflash_oracles,
-                       const std::array<std::vector<ninfer::TokenId>, 4>& target_oracles,
-                       const char* label) {
+int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prompts,
+                             const IsolationTokens& dflash_oracles,
+                             const IsolationTokens& target_oracles, const char* label) {
     // Per-row isolation requires identical request budgets as well as k. A shorter
     // request can enter its ordinary final-token fallback while a longer control
     // still uses A4 verification. Its longer prefix is therefore not a C=1 oracle.
     // Target-only remains a separate cross-schedule diagnostic.
     // Request A crosses the known packed/T=1 tie at generated token 21. Its strict
-    // comparison is against sequential packed DFlash, so this exercises the actual C=4
-    // isolation contract through and beyond the diagnostic target-only flip.
-    constexpr std::array<std::uint32_t, 4> lengths{24, 13, 7, 17};
-    std::array<std::vector<ninfer::TokenId>, 4> same_budget_oracles;
+    // comparison is against sequential packed DFlash, so this exercises the actual C=6
+    // isolation contract through and beyond the diagnostic target-only flip. Staggered
+    // budgets retire requests one at a time, so the batch also passes through C=5..1.
+    constexpr std::array<std::uint32_t, kIsolationRequests> lengths{24, 13, 7, 17, 20, 11};
+    IsolationTokens same_budget_oracles;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         if (lengths[i] == dflash_oracles[i].size()) {
             same_budget_oracles[i] = dflash_oracles[i];
@@ -1817,18 +1820,21 @@ int run_overlapping_c4(ninfer::Engine& engine,
             same_budget_oracles[i] = result.generated_token_ids;
         }
     }
-    auto a = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(lengths[0]));
-    auto b = engine.submit(engine.prepare_tokens(prompts[1]), greedy_options(lengths[1]));
-    auto c = engine.submit(engine.prepare_tokens(prompts[2]), greedy_options(lengths[2]));
-    auto d = engine.submit(engine.prepare_tokens(prompts[3]), greedy_options(lengths[3]));
-    std::array<ninfer::GenerationResult, 4> results;
+    std::vector<decltype(engine.submit(engine.prepare_tokens(prompts[0]),
+                                       greedy_options(lengths[0])))>
+        handles;
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        handles.push_back(
+            engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(lengths[i])));
+    }
+    std::array<ninfer::GenerationResult, kIsolationRequests> results;
     try {
-        results = {a.wait(), b.wait(), c.wait(), d.wait()};
+        for (std::size_t i = 0; i < handles.size(); ++i) { results[i] = handles[i].wait(); }
     } catch (const std::exception& error) {
         std::cerr << label << " concurrent speculative verify threw: " << error.what() << '\n';
         return 1;
     }
-    const char* names[] = {"A", "B", "C", "D"};
+    const char* names[] = {"A", "B", "C", "D", "E", "F"};
     int failed          = 0;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         const std::string request = std::string(label) + " request " + names[i];
@@ -1896,8 +1902,8 @@ int main() {
     // Packed verify is T=W (SmallT GQA at T<=6; Prompt GQA at T>6 on 24 heads). Ordinary
     // decode stays T=1 GEMV. The separately qualified floating-point schedules can flip a
     // later greedy boundary (k=1 and k=4, prompt 0, token 21). C>1 must still match saved C=1
-    // DFlash of the same k exactly (row isolation), and the C=4 run below crosses that point.
-    const std::array<std::vector<ninfer::TokenId>, 4> prompts{
+    // DFlash of the same k exactly (row isolation), and the C=6 run below crosses that point.
+    const IsolationTokens prompts{
         std::vector<ninfer::TokenId>{
             248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
             1710,   248046, 198, 248045, 74455, 198,   248068, 198,
@@ -1912,6 +1918,14 @@ int main() {
         },
         std::vector<ninfer::TokenId>{
             248045, 846,    198, 109266, 7000,  96220, 117443, 97913,
+            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+        },
+        std::vector<ninfer::TokenId>{
+            248045, 846,    198, 109266, 8100,  96220, 117443, 97913,
+            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+        },
+        std::vector<ninfer::TokenId>{
+            248045, 846,    198, 109266, 9300,  96220, 117443, 97913,
             1710,   248046, 198, 248045, 74455, 198,   248068, 198,
         },
     };
@@ -1973,8 +1987,8 @@ int main() {
     }
 
     auto run_k = [&](std::uint32_t draft_tokens, const char* label) -> int {
-        std::array<std::vector<ninfer::TokenId>, 4> target_oracles;
-        std::array<std::vector<ninfer::TokenId>, 4> dflash_oracles;
+        IsolationTokens target_oracles;
+        IsolationTokens dflash_oracles;
         const char* only_prompt = std::getenv("NINFER_DFLASH_TEST_ONLY_PROMPT");
         {
             // A DFlash self-comparison can miss a verifier that consistently commits the
@@ -1995,7 +2009,8 @@ int main() {
         }
 
         ninfer::EngineOptions dflash_options = speculative_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens, 4);
+            artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens,
+            static_cast<std::uint32_t>(kIsolationRequests));
         if (std::getenv("NINFER_DFLASH_TEST_MAX1") != nullptr) {
             dflash_options.max_concurrency = 1;
         }
@@ -2049,8 +2064,9 @@ int main() {
                     }
                 }
             }
-            if (only_prompt == nullptr && dflash_options.max_concurrency >= 4 &&
-                run_overlapping_c4(engine, prompts, dflash_oracles, target_oracles, label) != 0) {
+            if (only_prompt == nullptr && dflash_options.max_concurrency >= kIsolationRequests &&
+                run_overlapping_requests(engine, prompts, dflash_oracles, target_oracles, label) !=
+                    0) {
                 failed = 1;
             }
             if (draft_tokens == 4 && dflash_options.speculative.dflash_verify_width == 0 &&
@@ -2076,19 +2092,19 @@ int main() {
 
     const char* only_k = std::getenv("NINFER_DFLASH_TEST_ONLY_K");
     if (only_k == nullptr || std::string(only_k) == "1") {
-        if (const int result = run_k(1, "DFlash2 k=1 chain C=4"); result != 0) { return result; }
+        if (const int result = run_k(1, "DFlash2 k=1 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "2") {
-        if (const int result = run_k(2, "DFlash2 k=2 chain C=4"); result != 0) { return result; }
+        if (const int result = run_k(2, "DFlash2 k=2 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "3") {
-        if (const int result = run_k(3, "DFlash2 k=3 chain C=4"); result != 0) { return result; }
+        if (const int result = run_k(3, "DFlash2 k=3 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "4" || std::string(only_k) == "7") {
-        if (const int result = run_k(4, "DFlash2 k=4 chain C=4"); result != 0) { return result; }
+        if (const int result = run_k(4, "DFlash2 k=4 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "5") {
-        if (const int result = run_k(5, "DFlash2 k=5 chain C=4"); result != 0) { return result; }
+        if (const int result = run_k(5, "DFlash2 k=5 chain C=6"); result != 0) { return result; }
     }
 
     {

@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include "core/device.h" // CUDA_CHECK
 
@@ -23,7 +24,7 @@ constexpr int kK                  = 5120;
 constexpr int kThreads            = 256;
 constexpr int kLogicalRows        = 2 * kN;
 constexpr int kSmallTMax          = 8;
-constexpr int kGemvPackedMax      = 20;
+constexpr int kGemvPackedMax      = kBf16GdnGatingPackedMaxCols;
 constexpr int kSmallTKSlice       = 512;
 constexpr int kSmallTSplits       = kK / kSmallTKSlice;
 constexpr int kSmallTRowsPerBlock = 4;
@@ -367,7 +368,7 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
     require_shape(b_weight, "b_weight");
     const std::int32_t t = x.ne[1];
     if (t < 1 || t > kGemvPackedMax) {
-        throw std::invalid_argument("gdn_gating_proj: GEMV/small-T fused admits T=1..20");
+        throw std::invalid_argument("gdn_gating_proj: GEMV/small-T fused admits T=1..36");
     }
     const dim3 grid(2 * kN, static_cast<unsigned>(div_up(t, kGemvTokenTile)));
     bf16_gdn_gating_proj_gemv_kernel<<<grid, kThreads, 0, stream>>>(
@@ -422,7 +423,7 @@ void bf16_gdn_gating_proj_small_t_fused_launch(const Tensor& x, const Weight& a_
     (void)workspace;
     (void)workspace_bytes;
     if (x.ne[1] < 2 || x.ne[1] > kGemvPackedMax) {
-        throw std::invalid_argument("gdn_gating_proj: small-T fused admits T=2..20");
+        throw std::invalid_argument("gdn_gating_proj: small-T fused admits T=2..36");
     }
     // Same per-output GEMV reduction as T=1 in one launch; token tiles spread across CTAs. Column 0 is
     // bit-identical to ordinary decode GEMV; split-K SmallT and MMA split-8 were not.

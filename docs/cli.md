@@ -138,7 +138,8 @@ For 35B-A3B DFlash v1:
 For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Verify is
 chain `W=k+1` for `k` in `1..5`. On RTX 5090, `k=4` (block length five) is the measured
 single-request speed recommendation. See the [concurrent long-reasoning measurements](performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22)
-for C=2–4 settings. With `--draft-tokens 5`, `--adaptive-draft` picks live DFlash k in
+for C=2–4 settings and the [C=5/6 measurements](performance.md#concurrency-c56-2026-09-25).
+With `--draft-tokens 5`, `--adaptive-draft` picks live DFlash k in
 `{1,2,3,4,5}` after each round by
 `argmax E[Y(k)] / T(k,C,L)` (nested hop-survival `r_i`, online least-squares round time). That
 is a sticky policy, not a once-per-launch latch: see
@@ -176,7 +177,7 @@ the product) is in [dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
 | `--kv-dtype bf16\|int8\|nvfp4` | KV-cache storage | `nvfp4` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..5` | unset |
-| `--adaptive-draft` | pick live draft K by `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; at most one probe of an unmeasured k; 1 ms switch cost). DFlash with `--draft-tokens 5` captures `{1,2,3,4,5}`; DFlash `--draft-tokens 4` stays `{4}`. MTP captures `{3,4,5}` up to its configured limit | off |
+| `--adaptive-draft` | pick live draft K by `E[Y]/T(k,C,L)` (nested `r_i`; least-squares T; each captured k measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens 5` captures `{1,2,3,4,5}`; DFlash `--draft-tokens 4` stays `{4}`. MTP captures `{3,4,5}` up to its configured limit | off |
 | `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 is chain `W=k+1` | auto |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |

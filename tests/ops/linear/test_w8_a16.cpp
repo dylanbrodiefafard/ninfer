@@ -3,6 +3,7 @@
 #include <array>
 #include <exception>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -21,10 +22,14 @@ int w8_a16_conformance() {
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});
-    constexpr std::array kVocabularyBatches{2, 3, 4};
-    failures += run_packed_sequences_matches_panels(
-        "W8_A16 vocabulary packed", make_w8g32_f16s_weight, 248320, 5120, 199U, 5,
-        kVocabularyBatches);
+    // Verify LM head: every chain width across C=2..6, including W=6 C=6 (30+6 columns).
+    constexpr std::array kVocabularyBatches{2, 3, 4, 5, 6};
+    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+        failures += run_packed_sequences_matches_panels(
+            "W8_A16 vocabulary packed W" + std::to_string(width), make_w8g32_f16s_weight,
+            248320, 5120,
+            199U + static_cast<std::uint32_t>(width), width, kVocabularyBatches);
+    }
 
     constexpr std::array kN5120K10240{
         a16(1),  a16(4),  a16(5),  a16(8),  a16(9),  a16(16), a16(17), a16(24),

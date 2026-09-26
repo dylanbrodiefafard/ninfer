@@ -54,8 +54,18 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
-Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_w5_plan(
-    const Bf16GdnGatingProblem& problem);
+// Packed verify sequences run the T=1 GEMV reduction with tokens spread across CTAs, so every
+// output column matches its per-request W-column panel. Aggregation covers C<=6, W<=6.
+inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 36;
+inline constexpr std::int32_t kBf16GdnGatingPackedMaxBatch = 6;
+
+[[nodiscard]] constexpr bool bf16_gdn_gating_packed_aggregates(std::int32_t sequence_width,
+                                                               std::int32_t batch) noexcept {
+    return batch >= 2 && sequence_width >= 2 && sequence_width <= 16 &&
+           sequence_width * batch <= kBf16GdnGatingPackedMaxCols;
+}
+
+Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_plan(const Bf16GdnGatingProblem& problem);
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_cols, std::int32_t max_cols);
@@ -84,7 +94,7 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                                    Tensor& g, Tensor& beta, cudaStream_t stream);
-void bf16_gdn_norm_gating_packed_w5_dispatch(
+void bf16_gdn_norm_gating_packed_dispatch(
     const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h, const Weight& a_weight,
     const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
     Tensor& g, Tensor& beta, cudaStream_t stream);

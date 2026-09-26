@@ -602,7 +602,7 @@ int run_packed_matches_panels(std::string_view label, const Profile& profile,
                               std::int32_t panel_width,
                               std::span<const std::int32_t> packed_widths) {
     validate_profile(profile);
-    if (profile.activation_compute != ActivationCompute::A16 || panel_width <= 0 ||
+    if (profile.activation_compute == ActivationCompute::A4 || panel_width <= 0 ||
         packed_widths.empty()) {
         throw std::invalid_argument("linear_swiglu test: invalid packed-panel comparison");
     }
@@ -632,10 +632,31 @@ int run_packed_matches_panels(std::string_view label, const Profile& profile,
     device_activation.copy_from_host(host_activation.data(),
                                      host_activation.size() * sizeof(std::uint16_t));
 
-    const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
-        profile.qtype, profile.gate_up_rows, profile.input_rows, ops::LinearPolicy::A16Only, 1,
-        maximum_tokens);
+    std::vector<std::uint16_t> norm_weights(profile.input_rows);
+    for (int i = 0; i < profile.input_rows; ++i) {
+        norm_weights[i] = test::f32_to_bf16(static_cast<float>(i % 23 - 11) / 8.0F);
+    }
+    test::GuardedDeviceBuffer device_norm(norm_weights.size() * sizeof(std::uint16_t));
+    device_norm.copy_from_host(norm_weights.data(), device_norm.bytes());
+    const Tensor norm(device_norm.data(), DType::BF16, {profile.input_rows});
+
+    const ops::LinearPolicy policy = profile.activation_compute == ActivationCompute::A8
+                                         ? ops::LinearPolicy::AllowA8
+                                         : ops::LinearPolicy::A16Only;
+    const std::size_t workspace_bytes = profile.input_rmsnorm
+        ? ops::rmsnorm_linear_swiglu_workspace_capacity_bytes(maximum_tokens)
+        : ops::linear_swiglu_workspace_capacity_bytes(profile.qtype, profile.gate_up_rows,
+                                                      profile.input_rows, policy, 1,
+                                                      maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
+    const auto launch = [&](const Tensor& input, Tensor& output) {
+        workspace.reset();
+        if (profile.input_rmsnorm) {
+            ops::rmsnorm_linear_swiglu(input, norm, 1e-6F, weight, output, workspace, nullptr);
+        } else {
+            ops::linear_swiglu(input, weight, output, policy, workspace, nullptr);
+        }
+    };
     int failures = 0;
     for (const std::int32_t tokens : packed_widths) {
         const std::size_t output_elements =
@@ -648,14 +669,10 @@ int run_packed_matches_panels(std::string_view label, const Profile& profile,
         Tensor packed(packed_output.data(), DType::BF16, {profile.output_rows, tokens});
         Tensor panels(panel_output.data(), DType::BF16, {profile.output_rows, tokens});
 
-        workspace.reset();
-        ops::linear_swiglu(x, weight, packed, ops::LinearPolicy::A16Only, workspace, nullptr);
+        launch(x, packed);
         for (std::int32_t offset = 0; offset < tokens; offset += panel_width) {
-            workspace.reset();
-            Tensor panel_x = x.slice(1, offset, panel_width);
             Tensor panel_y = panels.slice(1, offset, panel_width);
-            ops::linear_swiglu(panel_x, weight, panel_y, ops::LinearPolicy::A16Only, workspace,
-                               nullptr);
+            launch(x.slice(1, offset, panel_width), panel_y);
         }
         test::cuda_check(cudaDeviceSynchronize(), "synchronize LinearSwiGLU packed panels");
 

@@ -68,10 +68,14 @@ bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
            route_tokens < aggregate_tokens;
 }
 
+// Chain verify W=2..6 across C<=kMaximumConcurrency requests.
+constexpr std::int32_t kMaximumAggregateVerifyTokens =
+    6 * static_cast<std::int32_t>(kMaximumConcurrency);
+
 bool aggregate_verify_extent(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                              std::int32_t aggregate_tokens) {
     return split_verify_panels(phase, route_tokens, aggregate_tokens) && route_tokens >= 2 &&
-           route_tokens <= 6 && aggregate_tokens <= 24;
+           route_tokens <= 6 && aggregate_tokens <= kMaximumAggregateVerifyTokens;
 }
 
 bool aggregate_verify_residuals(QType qtype, qwen3_6::TextPhase phase, std::int32_t route_tokens,
@@ -118,7 +122,7 @@ ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhas
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
-// Under A16, NVFP4 packed verify B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B=2..4
+// Under A16, NVFP4 packed verify B=1 W=4 uses fused SmallT. B=1 W=5/6 and qualified B=2..6
 // W=2/5 and B=2/4 W=6 group requests per weight pass (W=5, B=3 uses one group)
 // and keep the projection in private FP32 workspace. Other B=1 widths retain the
 // fused T=1-reduction route; the other B>1 widths retain request-indexed CTAs.
@@ -288,11 +292,10 @@ void Variant::attention_projection(const Tensor& hidden,
         }
         return;
     }
-    ops::attn_input_proj(
-        hidden, fused, query, gate, key, value,
+    const ops::LinearPolicy policy =
         aggregate ? text_policy(fused, phase, route_tokens)
-                  : attn_input_packed_policy(fused, phase, route_tokens, hidden.ne[1]),
-        workspace, stream);
+                  : attn_input_packed_policy(fused, phase, route_tokens, hidden.ne[1]);
+    ops::attn_input_proj(hidden, fused, query, gate, key, value, policy, workspace, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
@@ -506,7 +509,8 @@ void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidd
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     const int width = route_tokens > 0 ? route_tokens : hidden.ne[1];
-    const bool fused_norm = weights.gate_up.qtype == QType::NVFP4 && hidden.ne[1] <= 24 &&
+    const bool fused_norm = weights.gate_up.qtype == QType::NVFP4 &&
+        hidden.ne[1] <= kMaximumAggregateVerifyTokens &&
         text_policy(weights.gate_up, phase, width) == ops::LinearPolicy::AllowA8 &&
         (!split_verify_panels(phase, route_tokens, hidden.ne[1]) ||
          aggregate_verify_extent(phase, route_tokens, hidden.ne[1]));

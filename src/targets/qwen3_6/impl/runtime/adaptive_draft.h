@@ -176,25 +176,6 @@ namespace detail {
     return e;
 }
 
-// Unseen r_i after an identified prefix are 1 (q_extra = last q). No data at
-// hop 0 stays E[Y]=1 so a cold start does not invent a chain of successes.
-[[nodiscard]] inline float expected_tokens_optimistic(const AdaptiveDraftState& state,
-                                                      std::uint32_t k) {
-    float e               = 1.0f;
-    float run             = 1.0f;
-    const std::uint32_t n = std::min(k, 5U);
-    for (std::uint32_t i = 0; i < n; ++i) {
-        if (!r_seen_at(state, i)) {
-            if (i == 0) { return 1.0f; }
-            e += run * static_cast<float>(n - i);
-            return e;
-        }
-        run *= r_mean(state, i);
-        e += run;
-    }
-    return e;
-}
-
 [[nodiscard]] inline float pooled_slope(const AdaptiveRoundTimeState& st) {
     float sxx = 0.0f;
     float sxy = 0.0f;
@@ -212,27 +193,11 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
                      bool& measured) {
     t        = 0.0f;
     measured = false;
-    if (st == nullptr || k >= kAdaptiveTBins) { return; }
-    const float Lf = static_cast<float>(L);
-    const float c  = pooled_slope(*st);
-    if (st->n[k] > 0.0f) {
-        t = st->mean_T[k] + c * (Lf - st->mean_L[k]);
-        if (!(t > 0.0f)) { t = st->mean_T[k]; }
-        measured = t > 0.0f;
-        return;
-    }
-    if (k == 0) { return; }
-    float t_prev = 0.0f;
-    bool m_prev  = false;
-    t_lookup(st, k - 1U, L, t_prev, m_prev);
-    if (!(t_prev > 0.0f)) { return; }
-    t = t_prev;
-    if (k >= 2) {
-        float t_prev2 = 0.0f;
-        bool m2       = false;
-        t_lookup(st, k - 2U, L, t_prev2, m2);
-        if (t_prev2 > 0.0f) { t = std::max(t_prev, 2.0f * t_prev - t_prev2); }
-    }
+    if (st == nullptr || k >= kAdaptiveTBins || !(st->n[k] > 0.0f)) { return; }
+    const float c = pooled_slope(*st);
+    t             = st->mean_T[k] + c * (static_cast<float>(L) - st->mean_L[k]);
+    if (!(t > 0.0f)) { t = st->mean_T[k]; }
+    measured = t > 0.0f;
 }
 
 [[nodiscard]] inline std::uint32_t clamp_to_budget(std::span<const std::uint32_t> captured,
@@ -249,15 +214,14 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
 }
 
 [[nodiscard]] inline float row_sum_e(std::span<const AdaptiveDraftState* const> states,
-                                     std::span<const std::uint32_t> row_cap, std::uint32_t k,
-                                     bool optimistic) {
+                                     std::span<const std::uint32_t> row_cap, std::uint32_t k) {
     float sum_e = 0.0f;
     for (std::size_t r = 0; r < states.size(); ++r) {
         const AdaptiveDraftState* st = states[r];
         if (st == nullptr) { continue; }
         const std::uint32_t kr = r < row_cap.size() ? std::min(k, row_cap[r]) : k;
         if (kr == 0) { continue; }
-        sum_e += optimistic ? expected_tokens_optimistic(*st, kr) : expected_tokens(*st, kr);
+        sum_e += expected_tokens(*st, kr);
     }
     return sum_e;
 }
@@ -309,12 +273,23 @@ inline void adaptive_assign_live_k(std::span<AdaptiveDraftState*> states, std::u
     }
 }
 
+// Round time need not grow smoothly with k: verify routes and tiles change with T=W*C, and a
+// k=1/2 round has cost more than k=4 at C=6. Shorter arms therefore bound nothing about an
+// unmeasured arm. Each captured k within the cap is measured once per batch size (T is
+// engine-global), then the policy takes argmax E[Y]/T.
 [[nodiscard]] inline std::uint32_t
 adaptive_select_k(const AdaptiveDraftConfig& cfg,
                   std::span<const AdaptiveDraftState* const> states,
                   std::span<const std::uint32_t> row_cap, std::uint32_t cap_k,
                   std::uint32_t live_k) {
     if (cfg.captured_ks.empty() || states.empty()) { return cap_k; }
+
+    for (std::uint32_t k : cfg.captured_ks) {
+        if (k <= cap_k &&
+            (cfg.round_time == nullptr || !adaptive_t_measured(*cfg.round_time, k))) {
+            return k;
+        }
+    }
 
     std::uint32_t best = 0;
     float best_s       = -1.0f;
@@ -323,52 +298,17 @@ adaptive_select_k(const AdaptiveDraftConfig& cfg,
         float t       = 0.0f;
         bool measured = false;
         detail::t_lookup(cfg.round_time, k, cfg.length_tokens, t, measured);
-        if (!measured || !(t > 0.0f)) { continue; }
-        const float e = detail::row_sum_e(states, row_cap, k, false);
+        if (!measured) { continue; }
+        const float e = detail::row_sum_e(states, row_cap, k);
         if (!(e > 0.0f)) { continue; }
-        const float t_eff =
-            t + ((live_k != 0 && k != live_k) ? cfg.switch_seconds : 0.0f);
-        if (!(t_eff > 0.0f)) { continue; }
-        const float sc = e / t_eff;
+        const float t_eff = t + ((live_k != 0 && k != live_k) ? cfg.switch_seconds : 0.0f);
+        const float sc    = e / t_eff;
         if (sc > best_s) {
             best_s = sc;
             best   = k;
         }
     }
-
-    std::uint32_t probe = 0;
-    for (std::uint32_t k : cfg.captured_ks) {
-        if (k > cap_k) { continue; }
-        float t       = 0.0f;
-        bool measured = false;
-        detail::t_lookup(cfg.round_time, k, cfg.length_tokens, t, measured);
-        if (!measured) {
-            probe = k;
-            break;
-        }
-    }
-    if (probe == 0) {
-        return best != 0 ? best : cfg.captured_ks.front();
-    }
-
-    float t_lb       = 0.0f;
-    bool probe_meas  = false;
-    detail::t_lookup(cfg.round_time, probe, cfg.length_tokens, t_lb, probe_meas);
-    if (!(t_lb > 0.0f) && best != 0) {
-        bool dummy = false;
-        detail::t_lookup(cfg.round_time, best, cfg.length_tokens, t_lb, dummy);
-    }
-    if (!(t_lb > 0.0f)) { return probe; }
-
-    const float e_opt = detail::row_sum_e(states, row_cap, probe, true);
-    const float t_eff =
-        t_lb + ((live_k != 0 && probe != live_k) ? cfg.switch_seconds : 0.0f);
-    if (!(e_opt > 0.0f) || !(t_eff > 0.0f)) {
-        return best != 0 ? best : probe;
-    }
-    const float sc_opt = e_opt / t_eff;
-    if (best == 0 || sc_opt > best_s) { return probe; }
-    return best;
+    return best != 0 ? best : cfg.captured_ks.front();
 }
 
 [[nodiscard]] inline std::uint32_t
