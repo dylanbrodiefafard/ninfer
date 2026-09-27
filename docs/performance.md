@@ -18,6 +18,30 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Upstream W4A4 TMA ports and DFlash2 sampler check (2026-09-26)
+
+RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4.ninfer` (Ostfralla NVFP4 + MTP), `ninfer_bench -p ...
+-r 3 --warmup 1 --kv-dtype nvfp4`, prefill chunk 4096, two interleaved passes per arm. Prefill
+tok/s (mean of passes):
+
+| Prompt | `45bef20a` | + TMA raster/scale box, partial M tile (`9b8fcce1`) | + tiled scales, SwiGLU TMA from 256, split-conv T>8 (`724de290`) |
+|---:|---:|---:|---:|
+| 1,500 | 11,977 | 14,796 | 15,908 |
+| 4,096 | 14,193 | 15,945 | 16,570 |
+| 6,000 | 13,161 | 15,064 | 15,819 |
+| 8,192 | 13,612 | 15,198 | 15,842 |
+
+The two intermediate columns come from separate A/B runs whose bases were remeasured in each run
+(`9b8fcce1`-equivalent: 14,840/16,008/15,097/15,324), so the last column is compared with that
+remeasured base. Net over `45bef20a`: +33% at 1,500, +17% at 4,096, +20% at 6,000, +16% at 8,192. Decode is unaffected (A4 routes start
+at T=1024 for projections and T=256 for SwiGLU). Op-level numbers are in the commit messages.
+
+DFlash2 acceptance vs sampler, same build, `long_decode_aime26_15`, C=1, fixed k=5, NVFP4
+drafter, 4,096 tokens, one request each: fork default p-less T2 — 22.8% acceptance, 2.14
+tokens/round, 149.1 decode tok/s; upstream's T0.6/top-p 0.95/top-k 20/presence 1.0 — 39.1%,
+2.95 tokens/round, 207.9 tok/s. Upstream's published 35.2%/183.4 tok/s (k=7, W8 drafter) is
+therefore a sampler difference, not a drafter-precision one.
+
 ## DFlash drafter tensor cores and A8 panel count (2026-09-26)
 
 Three changes on `qwen3.8-27b/nvfp4` DFlash2, RTX 5090, NVFP4 KV:
