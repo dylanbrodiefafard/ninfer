@@ -36,6 +36,11 @@ The two intermediate columns come from separate A/B runs whose bases were remeas
 remeasured base. Net over `45bef20a`: +33% at 1,500, +17% at 4,096, +20% at 6,000, +16% at 8,192. Decode is unaffected (A4 routes start
 at T=1024 for projections and T=256 for SwiGLU). Op-level numbers are in the commit messages.
 
+Long-context prefill, same method (2 reps x 2 interleaved passes), `45bef20a` vs `c40469f3`
+(all W4A4 TMA ports): 16,384 tokens 12,697 -> 14,519 tok/s (+14.4%); 32,768 11,129 -> 12,512
+(+12.4%); 65,536 8,934 -> 9,805 (+9.7%). The gain falls with context because the ported kernels
+speed up per-token projection work while prefill attention grows with the prefix.
+
 DFlash2 acceptance vs sampler, same build, `long_decode_aime26_15`, C=1, fixed k=5, NVFP4
 drafter, 4,096 tokens, one request each: fork default p-less T2 — 22.8% acceptance, 2.14
 tokens/round, 149.1 decode tok/s; upstream's T0.6/top-p 0.95/top-k 20/presence 1.0 — 39.1%,
