@@ -252,7 +252,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     int token_count) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
-    static_assert(Schedule::kStages >= 2, "activation-scale slots reuse the stage buffers");
+    static_assert(Schedule::kStages >= 2 && Schedule::kStages <= 4,
+                  "the scale-slot reuse bound (Stages+2)/2 is proven for 2..4 stages");
+    static_assert(((Geometry::kInputRows / Schedule::kBlockK) % 2) == 0,
+                  "a scale box covers a K-tile pair, so the K-tile count must be even");
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4W4a4TmaSharedStorage<Schedule>*>(shared_bytes);
@@ -425,10 +428,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 shared_output + token1 * kOutputStride + parent_row);
             const int global_row0   = row_begin + parent_row;
             const int global_row1   = global_row0 + 1;
-            // The last M tile may be partial. The activation code and scale descriptors carry the
-            // real token count as their row extent, so TMA zero-fills the rows past the end and a
-            // padded lane accumulates exactly zero. It only has to stay off other memory: clamp the
-            // token the epilogue reads with, and drop its store below.
+            // The last M tile may be partial. The code descriptor's row extent is the real token
+            // count, so TMA zero-fills code rows past it, and the quantizer wrote zero scales for
+            // the tiled plane's padding: a padded lane accumulates exactly zero. It only has to
+            // stay off other memory: clamp the token the epilogue reads with, and drop its store.
             const int global_token0 = min(token_begin + token0, token_count - 1);
             const int global_token1 = min(token_begin + token1, token_count - 1);
             const float value00 =

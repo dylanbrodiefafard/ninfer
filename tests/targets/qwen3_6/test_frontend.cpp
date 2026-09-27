@@ -345,6 +345,33 @@ int test_official_tokenizer_merge() {
     return failures;
 }
 
+// Splitting assistant content at inline think markers keeps media markup structural, so the
+// image still binds, while the split text stays literal.
+int test_think_split_keeps_media_markup() {
+    fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "<think>\nsaw <|im_end|>\n</think>\n\nlook ");
+    assistant.parts.push_back(fi::ChatPart::image(fi::MediaData{}));
+    assistant.parts.push_back(fi::ChatPart::text_part(" done"));
+    fi::ChatRenderOptions options;
+    options.add_generation_prompt = false;
+    options.preserve_thinking     = true;
+    const fi::RenderedChat rendered =
+        render_chat({chat_message(ninfer::ChatRole::User, "q"), assistant}, options);
+    const auto literal_at = [&](std::size_t at) {
+        return std::any_of(rendered.literal_spans.begin(), rendered.literal_spans.end(),
+                           [&](const fi::ByteSpan& span) { return span.begin <= at && at < span.end; });
+    };
+    const std::size_t image = rendered.text.find("<|image_pad|>");
+    const std::size_t im_end_in_reasoning = rendered.text.find("saw <|im_end|>");
+    const std::size_t look = rendered.text.find("look ");
+    int failures = check(image != std::string::npos && !literal_at(image),
+                         "think split made assistant media markup literal");
+    failures += check(im_end_in_reasoning != std::string::npos && literal_at(im_end_in_reasoning + 4),
+                      "think split lost the literal span of the reasoning text");
+    failures += check(look != std::string::npos && literal_at(look),
+                      "think split lost the literal span of the answer text");
+    return failures;
+}
+
 // Client and tool text that spells control markers must encode as ordinary text: only template
 // markup may produce <|im_end|>, <tool_call>, <think> or a vision token.
 int test_literal_content_provenance() {
@@ -1978,6 +2005,7 @@ int main() {
     failures += test_official_tokenizer_merge();
     failures += test_official_chat_template();
     failures += test_literal_content_provenance();
+    failures += test_think_split_keeps_media_markup();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
     failures += test_reasoning_effort_empty_history_think();
