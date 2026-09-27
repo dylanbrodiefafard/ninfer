@@ -118,6 +118,7 @@ class Fixture:
     max_new: int
     suite: str
     category: str | None = None
+    tools: list[dict[str, Any]] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -469,7 +470,7 @@ def build_specs(
 
 
 def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "model": model_id,
         "messages": fixture.messages,
         "max_completion_tokens": fixture.max_new,
@@ -477,6 +478,9 @@ def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any
         "stream": False,
         "enable_thinking": fixture.thinking,
     }
+    if fixture.tools:
+        payload["tools"] = fixture.tools
+    return payload
 
 
 def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> None:

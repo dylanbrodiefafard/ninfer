@@ -67,8 +67,8 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. Null
  *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
  *   residual excludes d. Greedy mode ignores q. When configs[b].p_less is set, p is the p-less
- *   distribution from sampling.h rather than the top-k/top-p/min-p truncation, and selector q is
- *   ignored (one-hot at the realized drafted token, same as MTP). Every hop applies that
+ *   distribution from sampling.h rather than the top-k/top-p/min-p truncation; selector q is
+ *   still the recorded proposal law (one-hot for greedy drafts). Every hop applies that
  *   Leviathan test to its own target p-less distribution, and the bonus samples its own column.
  *   Only hop 0 applies the cycle-exit restriction p' of sampling.h (V without a typical exclude,
  *   or Dirac on the runner-up when V is that singleton); typical_exclude is cleared for later

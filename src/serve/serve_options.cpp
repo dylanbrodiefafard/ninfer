@@ -117,7 +117,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F] "
            "[--spec mtp|dflash --draft-tokens N] "
            "[--adaptive-draft] "
-           "[--dflash-verify-width N] "
+           "[--dflash-verify-width N] [--dflash-p-less-draft-temperature T] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--context-checkpoints off|a,b,c] "
@@ -284,6 +284,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.dflash_verify_width = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--dflash-verify-width"),
                                       "dflash-verify-width"));
+        } else if (arg == "--dflash-p-less-draft-temperature") {
+            options.speculative.dflash_p_less_draft_temperature =
+                parse_float_in(require_value("--dflash-p-less-draft-temperature"),
+                               "dflash-p-less-draft-temperature", 0.0f, 2.0f);
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");

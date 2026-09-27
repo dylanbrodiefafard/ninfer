@@ -62,6 +62,14 @@ int main() {
     failures += check(!production.sampling.p_less && production.sampling.top_p == 0.5F,
                       "--no-p-less-sampling did not opt into the production sampler");
 
+    failures += check(defaults.speculative.dflash_p_less_draft_temperature == 0.4F,
+                      "CLI p-less draft temperature default is not 0.4");
+    const ninfer::cli::Options greedy_drafts =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "dflash", "--draft-tokens",
+               "5", "--dflash-p-less-draft-temperature", "0"});
+    failures += check(greedy_drafts.speculative.dflash_p_less_draft_temperature == 0.0F,
+                      "--dflash-p-less-draft-temperature did not set SpeculativeOptions");
+
     const ninfer::cli::Options dflash_vision =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "dflash",
                "--draft-tokens", "3", "--vision"});

@@ -136,6 +136,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=0.6,
         help="stochastic temperature override (default: 0.6, published method)",
     )
+    parser.add_argument(
+        "--p-less-draft-temperature",
+        type=float,
+        default=None,
+        help="DFlash2 p-less draft temperature passed to ninfer-serve (default: the server's own)",
+    )
+    parser.add_argument(
+        "--p-less-temperature",
+        type=float,
+        default=None,
+        help="p-less sampling temperature passed to ninfer-serve (default: the server's own)",
+    )
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--min-p", type=float, default=0.0)
@@ -297,11 +309,18 @@ def saturation_job_fixtures(
     if args.saturation_messages is not None:
         path = args.saturation_messages.expanduser().resolve()
         try:
-            messages = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise corpus.CampaignError(f"failed to read --saturation-messages: {exc}") from exc
+        # A plain message list, or a captured request object {"messages": [...], "tools": [...]}.
+        tools = None
+        messages = loaded
+        if isinstance(loaded, dict):
+            messages = loaded.get("messages")
+            tools = loaded.get("tools") or None
         if not isinstance(messages, list) or not messages:
-            raise corpus.CampaignError("--saturation-messages must be a non-empty JSON list")
+            raise corpus.CampaignError(
+                "--saturation-messages must be a non-empty message list or {messages, tools}")
         one = corpus.Fixture(
             name=path.stem,
             messages=messages,
@@ -309,6 +328,7 @@ def saturation_job_fixtures(
             max_new=args.decode_tokens,
             suite="long_niah",
             category=None,
+            tools=tools,
         )
         return [one] * concurrency
     resolved: list[corpus.Fixture] = []
@@ -442,6 +462,10 @@ def server_command(
             command.append("--lm-head-draft")
         if getattr(args, "adaptive_draft", False):
             command.append("--adaptive-draft")
+    if point.sampling_mode == "p-less" and getattr(args, "p_less_temperature", None) is not None:
+        command.extend(["--temperature", str(args.p_less_temperature)])
+    if getattr(args, "p_less_draft_temperature", None) is not None:
+        command.extend(["--dflash-p-less-draft-temperature", str(args.p_less_draft_temperature)])
     if point.sampling_mode == "greedy":
         command.extend(["--greedy", "--no-p-less-sampling"])
     elif point.sampling_mode == "stochastic":

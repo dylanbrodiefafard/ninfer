@@ -55,9 +55,9 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *   Then prev[t,b] = path[t,b]. Candidate order does not affect the selected token.
  *   An internal force_greedy call may override temperature for an intermediate refinement pass.
  *   When selector_ids / selector_q are non-null they receive the 16 candidate token ids and
- *   the proposal distribution q: one-hot at the greedy/p-less pick, else the 16-way softmax.
- *   Truncated-sampling Leviathan accept uses this q. Under p-less, chain accept ignores any
- *   recorded selector q and uses one-hot at the drafted token (same as MTP / null selectors).
+ *   the proposal distribution q: one-hot at a greedy pick, else the 16-way softmax the draft was
+ *   drawn from. Rows sample at temperature, or at draft_temperature under active p-less (<= 0
+ *   greedy). Chain accept uses this q for truncated sampling and p-less alike.
  *   Null selectors leave q implicit one-hot at path[t,b].
  *
  * Logical shapes:

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1453,46 +1454,6 @@ int residual_p_minus_q_prefers_uncovered_mass() {
                                config, token_counts, expected, &ids, &q);
 }
 
-int p_less_ignores_selector_q_when_u_exceeds_p(int physical_rows, int token_domain, int uncovered,
-                                               const char* label) {
-    // Adaptive DFlash may still present a T=2 16-way softmax q (hot-patch missed the
-    // path-select object, or a stale graph buffer). P-less Leviathan must use one-hot q
-    // like MTP: u > p' rejects even when p'/q_16way > 1.
-    constexpr int k     = 1;
-    constexpr int draft = 7;
-    const std::vector<std::int32_t> drafts{draft};
-    const std::vector<std::int32_t> targets{3, 11};
-    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
-    logits[draft]                                              = 20.0f;
-    logits[uncovered]                                          = 20.0f;
-    logits[static_cast<std::int64_t>(physical_rows) + uncovered] = 20.0f;
-    if (physical_rows > token_domain) {
-        logits[token_domain]                                     = 100.0f;
-        logits[physical_rows - 1]                                = 200.0f;
-        logits[static_cast<std::int64_t>(physical_rows) + token_domain]      = 100.0f;
-        logits[static_cast<std::int64_t>(physical_rows) + physical_rows - 1] = 200.0f;
-    }
-    round_to_bf16(logits);
-    std::vector<std::uint16_t> logits_bits(logits.size());
-    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
-
-    constexpr std::int32_t initial_length = 40;
-    const auto expected = accept_state_oracle(drafts, 0, uncovered, initial_length);
-    std::vector<std::int32_t> token_counts(token_domain, 0);
-    ops::SamplingConfig config{};
-    config.temperature = 2.0f;
-    config.p_less      = 1;
-    config.seed        = seed_with_uniform_in(initial_length + 1, ops::kSamplePurposeSpeculativeAccept,
-                                              0.51f, 0.99f);
-    constexpr int cap  = 16;
-    std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k, 0);
-    std::vector<float> q(static_cast<std::size_t>(cap) * k, 1.0f / static_cast<float>(cap));
-    ids[0] = draft;
-    for (int c = 1; c < cap; ++c) { ids[static_cast<std::size_t>(c)] = 2000 + c; }
-    return execute_accept_case(label, targets, logits_bits, physical_rows, drafts, initial_length,
-                               token_domain, config, token_counts, expected, &ids, &q);
-}
-
 int p_less_fractional_q_residual_does_not_reemit_draft(int physical_rows, int token_domain,
                                                        int uncovered, const char* label) {
     // Adaptive DFlash chain writes a 16-way q. P-less V={draft, uncovered} with q(draft)
@@ -1623,6 +1584,152 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
     }
     return support;
 }
+
+// Exactness of speculative sampling with sampled (non-greedy) drafts under p-less: draw the
+// draft from a fixed non-uniform 16-way q, run the accept kernel, and compare the committed
+// first token's distribution with the independent p-less oracle p' (chi-square over the support,
+// plus zero mass outside it). Holds for any q; greedy drafts are the one-hot special case.
+int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int token_domain,
+                                                        float draft_temperature_tag) {
+    constexpr int active        = 64;  // tokens with live logits; the rest sit far below p-less
+    constexpr int k             = 1;
+    constexpr int cap           = 16;
+    constexpr int trials        = 40000;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
+    for (int t = 0; t < active; ++t) {
+        const float v = 2.5f * std::sin(0.7f * static_cast<float>(t)) + 0.04f * static_cast<float>(t);
+        logits[static_cast<std::size_t>(t)]                                             = v;
+        logits[static_cast<std::size_t>(physical_rows) + static_cast<std::size_t>(t)] = v;
+    }
+    // Padding rows past the public domain must never be sampled.
+    for (int t = token_domain; t < physical_rows; ++t) {
+        logits[static_cast<std::size_t>(t)]                                             = 100.0f;
+        logits[static_cast<std::size_t>(physical_rows) + static_cast<std::size_t>(t)] = 100.0f;
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature = 1.5f;
+    config.p_less      = 1;
+    const std::vector<int> support = p_less_support_oracle(logits, physical_rows, 0, token_domain, config);
+    std::vector<double> target(token_domain, 0.0);
+    {
+        double max_scaled = -1e30;
+        for (int t = 0; t < token_domain; ++t) {
+            max_scaled = std::max(max_scaled, static_cast<double>(logits[static_cast<std::size_t>(t)]) / 1.5);
+        }
+        double z = 0.0;
+        for (const int t : support) { z += std::exp(logits[static_cast<std::size_t>(t)] / 1.5 - max_scaled); }
+        for (const int t : support) {
+            target[static_cast<std::size_t>(t)] =
+                std::exp(logits[static_cast<std::size_t>(t)] / 1.5 - max_scaled) / z;
+        }
+    }
+
+    // q: 16 candidates, softmax at a different temperature over a shifted pattern, so it
+    // overlaps the support only partly and puts mass on tokens outside it.
+    std::vector<std::int32_t> ids(cap);
+    std::vector<float> q(cap);
+    double qsum = 0.0;
+    for (int c = 0; c < cap; ++c) {
+        ids[static_cast<std::size_t>(c)] = (c * 5 + 3) % active;
+        const double w = std::exp(logits[static_cast<std::size_t>(ids[static_cast<std::size_t>(c)])] /
+                                  (1.0 + draft_temperature_tag) + 0.3 * std::cos(static_cast<double>(c)));
+        q[static_cast<std::size_t>(c)] = static_cast<float>(w);
+        qsum += w;
+    }
+    for (float& value : q) { value = static_cast<float>(value / qsum); }
+
+    std::vector<std::int32_t> counts_init(token_domain, 0);
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>{0, 0});
+    DeviceBuffer d_logits  = to_device(logits_bits);
+    DeviceBuffer d_drafts  = to_device(std::vector<std::int32_t>{0});
+    DeviceBuffer d_counts  = to_device(counts_init);
+    DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+    DeviceBuffer d_sel_ids = to_device(ids);
+    DeviceBuffer d_sel_q   = to_device(q);
+    config.token_counts    = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config  = device_config(config);
+    GuardedDeviceBuffer d_length(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_token(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_num(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, k + 1});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor length(d_length.data(), DType::I32, {1});
+    Tensor token(d_token.data(), DType::I32, {1});
+    Tensor sampled(d_sampled.data(), DType::I32, {k + 1});
+    Tensor num_sampled(d_num.data(), DType::I32, {1});
+    Tensor accepted(d_accepted.data(), DType::I32, {1});
+    Tensor sel_ids_t(d_sel_ids.p, DType::I32, {cap, k});
+    Tensor sel_q_t(d_sel_q.p, DType::FP32, {cap, k});
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1)));
+
+    std::mt19937_64 rng(0x5eedULL);
+    std::discrete_distribution<int> draw(q.begin(), q.end());
+    std::vector<std::int64_t> observed(token_domain, 0);
+    int accepted_total = 0;
+    for (int trial = 0; trial < trials; ++trial) {
+        const std::int32_t draft = ids[static_cast<std::size_t>(draw(rng))];
+        cuda_check(cudaMemcpy(d_drafts.p, &draft, sizeof(draft), cudaMemcpyHostToDevice), "draft");
+        config.seed = 0x9e3779b97f4a7c15ULL * static_cast<unsigned long long>(trial + 1);
+        cuda_check(cudaMemcpy(d_config.p, &config, sizeof(config), cudaMemcpyHostToDevice), "config");
+        initialize(d_length, std::vector<std::int32_t>{40});
+        workspace.reset();
+        ops::speculative_accept_greedy_drafts(
+            targets, logits_t, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
+            token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
+            &sel_ids_t, &sel_q_t);
+        const auto first = read<std::int32_t>(d_sampled, 1);
+        const auto acc   = read<std::int32_t>(d_accepted, 1);
+        accepted_total += acc[0];
+        if (first[0] < 0 || first[0] >= token_domain) {
+            std::cerr << "p-less sampled draft: committed token out of range\n";
+            return 1;
+        }
+        ++observed[static_cast<std::size_t>(first[0])];
+    }
+    double chi2 = 0.0;
+    int outside  = 0;
+    for (int t = 0; t < token_domain; ++t) {
+        const double expected = target[static_cast<std::size_t>(t)] * trials;
+        if (expected <= 0.0) {
+            outside += observed[static_cast<std::size_t>(t)] != 0;
+            continue;
+        }
+        const double diff = static_cast<double>(observed[static_cast<std::size_t>(t)]) - expected;
+        chi2 += diff * diff / expected;
+    }
+    const double dof   = std::max(1.0, static_cast<double>(support.size()) - 1.0);
+    const double limit = dof + 6.0 * std::sqrt(2.0 * dof);
+    // Distribution exactness holds for any q, even one treated as one-hot. The acceptance rate
+    // separates the contracts: sum_d min(p'(d), q(d)) when the accept path uses the real q,
+    // sum_d q(d) p'(d) when it treats the draft as a point mass.
+    double expected_acceptance = 0.0;
+    for (int c = 0; c < cap; ++c) {
+        expected_acceptance += std::min(target[static_cast<std::size_t>(ids[static_cast<std::size_t>(c)])],
+                                        static_cast<double>(q[static_cast<std::size_t>(c)]));
+    }
+    const double acceptance = static_cast<double>(accepted_total) / trials;
+    const double acceptance_tolerance =
+        6.0 * std::sqrt(expected_acceptance * (1.0 - expected_acceptance) / trials) + 1e-3;
+    std::cout << "p-less sampled draft V=" << token_domain << ": support=" << support.size() << " chi2=" << chi2
+              << " (limit " << limit << ") acceptance=" << acceptance << " (expected "
+              << expected_acceptance << ") outside=" << outside << "\n";
+    if (outside == 0 && chi2 < limit &&
+        std::abs(acceptance - expected_acceptance) < acceptance_tolerance) {
+        return 0;
+    }
+    std::cerr << "p-less speculative sampling with a sampled draft changed the target distribution\n";
+    return 1;
+}
+
 
 bool p_less_support_contains(const std::vector<int>& support, int token) {
     return std::find(support.begin(), support.end(), token) != support.end();
@@ -1807,11 +1914,15 @@ std::vector<float> peaked_p_less_per_column_logits(int physical_rows, int token_
 }
 
 std::pair<std::vector<std::int32_t>, std::vector<float>>
-uniform_selector_q(const std::vector<std::int32_t>& drafts, int cap = 16) {
+greedy_selector_q(const std::vector<std::int32_t>& drafts, int cap = 16) {
+    // The 16-way shortlist a greedy DFlash2 path select writes: one-hot q at the draft. The
+    // accept path consumes selector q under p-less, so it must be the real draft distribution.
     const int k = static_cast<int>(drafts.size());
     std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k), 0);
-    std::vector<float> q(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k),
-                         1.0f / static_cast<float>(cap));
+    std::vector<float> q(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k), 0.0f);
+    for (int hop = 0; hop < k; ++hop) {
+        q[static_cast<std::size_t>(hop) * static_cast<std::size_t>(cap)] = 1.0f;
+    }
     for (int hop = 0; hop < k; ++hop) {
         ids[static_cast<std::size_t>(hop) * static_cast<std::size_t>(cap)] =
             drafts[static_cast<std::size_t>(hop)];
@@ -1824,7 +1935,7 @@ uniform_selector_q(const std::vector<std::int32_t>& drafts, int cap = 16) {
 }
 
 int p_less_chain_token_invariants_case(int physical_rows, int token_domain, int k,
-                                       bool stale_selector_q, unsigned long long seeds,
+                                       bool with_selector_q, unsigned long long seeds,
                                        const char* label) {
     const std::vector<int> survivors{7, 11, 19};
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), 7);
@@ -1844,8 +1955,8 @@ int p_less_chain_token_invariants_case(int physical_rows, int token_domain, int 
     std::vector<float> q;
     const std::vector<std::int32_t>* ids_arg = nullptr;
     const std::vector<float>* q_arg          = nullptr;
-    if (stale_selector_q) {
-        auto sel = uniform_selector_q(drafts);
+    if (with_selector_q) {
+        auto sel = greedy_selector_q(drafts);
         ids      = std::move(sel.first);
         q        = std::move(sel.second);
         ids_arg  = &ids;
@@ -1921,7 +2032,7 @@ int p_less_out_of_domain_draft_never_licensed_case(int physical_rows, int token_
     ops::SamplingConfig config{};
     config.temperature = 2.0f;
     config.p_less      = 1;
-    auto sel           = uniform_selector_q(drafts);
+    auto sel           = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -1952,7 +2063,7 @@ int p_less_two_token_rejection_emits_other_survivor(int physical_rows, int token
     ops::SamplingConfig config{};
     config.temperature = 2.0f;
     config.p_less      = 1;
-    auto sel           = uniform_selector_q(drafts);
+    auto sel           = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     int rejections                        = 0;
@@ -2001,7 +2112,7 @@ int p_less_typical_exclude_singleton_never_accepts_cycle(int physical_rows, int 
     config.temperature     = 2.0f;
     config.p_less          = 1;
     config.typical_exclude = cycle;
-    auto sel               = uniform_selector_q(drafts);
+    auto sel               = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -2038,7 +2149,7 @@ int p_less_typical_exclude_multi_never_emits_continuation(int physical_rows, int
     config.temperature     = 2.0f;
     config.p_less          = 1;
     config.typical_exclude = cycle;
-    auto sel               = uniform_selector_q(drafts);
+    auto sel               = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -2087,7 +2198,7 @@ int p_less_typical_exclude_later_hops_keep_argmax(int physical_rows, int token_d
     config.temperature     = 2.0f;
     config.p_less          = 1;
     config.typical_exclude = later;
-    auto sel               = uniform_selector_q(drafts);
+    auto sel               = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     int hop1_seen                         = 0;
@@ -3020,21 +3131,20 @@ int main() {
     failures += fractional_q_accepts_when_p_covers_q();
     failures += fractional_q_rejects_when_p_is_zero();
     failures += residual_p_minus_q_prefers_uncovered_mass();
+    failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 0.0f);
+    failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 1.0f);
+    failures += p_less_sampled_draft_preserves_target_distribution(248320, 248077, 0.0f);
     failures += p_less_fractional_q_residual_does_not_reemit_draft(
         64, 64, 11, "p-less fractional q residual does not re-emit draft V=64");
     failures += p_less_fractional_q_residual_does_not_reemit_draft(
         248320, 248077, 600, "DFlash2 p-less fractional q residual does not re-emit draft");
-    failures += p_less_ignores_selector_q_when_u_exceeds_p(
-        64, 64, 11, "p-less ignores 16-way q when u > p V=64");
-    failures += p_less_ignores_selector_q_when_u_exceeds_p(
-        248320, 248077, 600, "DFlash2 p-less ignores 16-way q when u > p");
     failures += p_less_chain_token_invariants_case(
-        64, 64, 5, true, 48ull, "p-less adaptive-DFlash k=5 16-way q token invariants V=64");
+        64, 64, 5, true, 48ull, "p-less adaptive-DFlash k=5 selector q token invariants V=64");
     failures += p_less_chain_token_invariants_case(
         64, 64, 5, false, 32ull, "p-less adaptive-DFlash k=5 one-hot q token invariants V=64");
     failures += p_less_chain_token_invariants_case(
         248320, 248077, 5, true, 8ull,
-        "DFlash2 p-less adaptive k=5 16-way q token invariants");
+        "DFlash2 p-less adaptive k=5 selector q token invariants");
     failures += p_less_out_of_domain_draft_never_licensed_case(
         64, 64, 16ull, "p-less out-of-domain draft is never licensed V=64");
     failures += p_less_out_of_domain_draft_never_licensed_case(

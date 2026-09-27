@@ -70,17 +70,14 @@ __device__ __forceinline__ void speculative_chain_hop_q(const std::int32_t* sele
     hop_q          = selector_q + base;
 }
 
-// The p-less route uses a deterministic draft selector, so its actual proposal
-// q is a point mass, as in MTP. A softmax shortlist is not the proposal law for
-// that deterministic choice and would invalidate accept/correction probabilities.
-// Target p-less temperature still applies independently at every verified hop.
+// The selector q is the proposal law the DFlash2 path select drew each hop's draft from:
+// one-hot for greedy drafts, the shortlist softmax for sampled ones. Accept/correction use it
+// under every target sampler, p-less included (MTP and DFlash1 pass null ids, the one-hot
+// convention).
 __device__ __forceinline__ void
-speculative_chain_hop_q_for_target(const SamplingConfig& cfg, const std::int32_t* selector_ids,
-                                   const float* selector_q, int selector_k, int hop, int row, int k,
-                                   const int*& hop_ids, const float*& hop_q) {
-    hop_ids = nullptr;
-    hop_q   = nullptr;
-    if (sampling_p_less_active(cfg)) { return; }
+speculative_chain_hop_q_for_target(const std::int32_t* selector_ids, const float* selector_q,
+                                   int selector_k, int hop, int row, int k, const int*& hop_ids,
+                                   const float*& hop_q) {
     speculative_chain_hop_q(selector_ids, selector_q, selector_k, hop, row, k, hop_ids, hop_q);
 }
 
@@ -271,7 +268,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                             row_logits, base, d, token_domain, cfg, gate, admitted);
                         const int* hop_ids = nullptr;
                         const float* hop_q = nullptr;
-                        speculative_chain_hop_q_for_target(cfg, selector_ids, selector_q,
+                        speculative_chain_hop_q_for_target(selector_ids, selector_q,
                                                            selector_k, i, row, k, hop_ids,
                                                            hop_q);
                         const float qd = sampling_selector_q(
@@ -295,7 +292,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 const int d        = row_drafts[i];
                 const int* hop_ids = nullptr;
                 const float* hop_q = nullptr;
-                speculative_chain_hop_q_for_target(cfg, selector_ids, selector_q, selector_k, i,
+                speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i,
                                                    row, k, hop_ids, hop_q);
                 const float ur = sampling_uniform(cfg.seed, L_sh + i + 1,
                                                   kSamplePurposeSpeculativeCorrection, 0u);
@@ -346,7 +343,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 }
                 const int* hop_ids  = nullptr;
                 const float* hop_q  = nullptr;
-                speculative_chain_hop_q_for_target(cfg, selector_ids, selector_q, selector_k, i,
+                speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i,
                                                    row, k, hop_ids, hop_q);
                 const float qd =
                     sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
@@ -708,7 +705,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     }
                     const int* hop_ids = nullptr;
                     const float* hop_q = nullptr;
-                    speculative_chain_hop_q_for_target(cfg, selector_ids, selector_q, selector_k, i,
+                    speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i,
                                                        row, k, hop_ids, hop_q);
                     const float qd =
                         sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
@@ -1027,7 +1024,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
         const int* hop_ids = nullptr;
         const float* hop_q = nullptr;
         if (i < extent) {
-            speculative_chain_hop_q_for_target(cfg, selector_ids, selector_q, selector_k, i, row,
+            speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i, row,
                                                k, hop_ids, hop_q);
         }
         if (threadIdx.x == 0) {

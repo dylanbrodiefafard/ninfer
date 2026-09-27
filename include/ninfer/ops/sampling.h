@@ -60,6 +60,9 @@ struct SamplingConfig {
     float presence_penalty     = 0.0f;
     float frequency_penalty    = 0.0f;
     std::int32_t p_less        = 0; // != 0 => p-less; ignore top_k/top_p/min_p/penalties
+    // DFlash2 path-select temperature for p-less rows (<= 0 => greedy drafts). Verification uses
+    // the recorded proposal q, so any value keeps the target distribution exact.
+    float draft_temperature    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     std::int32_t suppressed_token_count = 0;
