@@ -88,7 +88,7 @@ void causal_conv1d_split_launch(const Tensor& x, const Tensor& weight, Tensor& c
     const std::int32_t k        = key.ne[0];
     const std::int32_t v        = value.ne[0];
 
-    if (T <= kCausalConvSequenceMaxTokens) {
+    if (T <= kCausalConvSplitSequenceMaxTokens) {
         const int block = T == 1 ? 256 : 32;
         causal_conv1d_split_sequence_kernel<<<grid_for(C, block, "split sequence"), block, 0,
                                                stream>>>(

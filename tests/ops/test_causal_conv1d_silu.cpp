@@ -557,7 +557,7 @@ int main() {
 
     // The production Qwen3.8 GDN partition qualifies both direct-store launch families against
     // the same complete FP64 oracle as the ordinary output form.
-    for (const std::int32_t T : {1, 7, 65, 257}) {
+    for (const std::int32_t T : {1, 7, 8, 9, 16, 64, 65, 257}) {
         failures += split_case(T, 3000U + static_cast<std::uint32_t>(T));
     }
 
