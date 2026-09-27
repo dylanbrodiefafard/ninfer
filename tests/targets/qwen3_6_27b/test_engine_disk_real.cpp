@@ -263,7 +263,14 @@ int land_on_disk(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& kee
     if (const int rc = capture_to_ram(engine, keep, evictor, generated, label); rc != 0) {
         return rc;
     }
-    if (engine.runtime_stats().kv_disk_captures >= captures_before + 1) { return 0; }
+    // Idle spill publishes a disk copy and leaves the RAM image in place. A
+    // capture delta alone does not mean `keep` left RAM; equal-length RAM
+    // would still win the later lookup. Only skip the RAM eviction when the
+    // arena no longer holds an image.
+    const auto landed = engine.runtime_stats();
+    if (landed.kv_disk_captures >= captures_before + 1 && landed.kv_ram_entry_count == 0) {
+        return 0;
+    }
     const ninfer::GenerationResult extra =
         engine.generate(engine.prepare_tokens(force), greedy(8, false));
     if (extra.generated_token_ids.size() != 8 ||
@@ -1906,8 +1913,11 @@ int main(int argc, char** argv) {
                             std::string(argv[2]) == "event";
     const bool dflash_only = argc == 3 && std::string(argv[1]) == "--case" &&
                              std::string(argv[2]) == "dflash";
-    if (argc != 1 && !corrupt_only && !metadata_only && !event_only && !dflash_only) {
-        return fail("usage: disk_real [--case corrupt|metadata|event|dflash]");
+    const bool suffix_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                             std::string(argv[2]) == "suffix";
+    if (argc != 1 && !corrupt_only && !metadata_only && !event_only && !dflash_only &&
+        !suffix_only) {
+        return fail("usage: disk_real [--case corrupt|metadata|event|dflash|suffix]");
     }
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
@@ -1926,16 +1936,16 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = (event_only ? exercise_corrupt_restore_falls_back(groupwise, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(groupwise) : corrupt_only ? exercise_corrupt_restore_falls_back(groupwise) : exercise_artifact(groupwise)); result != 0) { return result; }
+        if (const int result = (suffix_only ? exercise_suffix_prefill(groupwise) : event_only ? exercise_corrupt_restore_falls_back(groupwise, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(groupwise) : corrupt_only ? exercise_corrupt_restore_falls_back(groupwise) : exercise_artifact(groupwise)); result != 0) { return result; }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = (event_only ? exercise_corrupt_restore_falls_back(nvfp4, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(nvfp4) : corrupt_only ? exercise_corrupt_restore_falls_back(nvfp4) : exercise_artifact(nvfp4)); result != 0) { return result; }
+        if (const int result = (suffix_only ? exercise_suffix_prefill(nvfp4) : event_only ? exercise_corrupt_restore_falls_back(nvfp4, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(nvfp4) : corrupt_only ? exercise_corrupt_restore_falls_back(nvfp4) : exercise_artifact(nvfp4)); result != 0) { return result; }
     }
     if (dflash != nullptr && *dflash != '\0' &&
         (nvfp4 == nullptr || *nvfp4 == '\0' || std::string(dflash) != nvfp4)) {
-        if (const int result = (event_only ? exercise_corrupt_restore_falls_back(dflash, true, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(dflash, true) : corrupt_only ? exercise_corrupt_restore_falls_back(dflash, true) : exercise_artifact(dflash)); result != 0) { return result; }
+        if (const int result = (suffix_only ? exercise_suffix_prefill(dflash) : event_only ? exercise_corrupt_restore_falls_back(dflash, true, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(dflash, true) : corrupt_only ? exercise_corrupt_restore_falls_back(dflash, true) : exercise_artifact(dflash)); result != 0) { return result; }
     }
-    if (!corrupt_only && !metadata_only && !event_only && dflash != nullptr && *dflash != '\0') {
+    if (!corrupt_only && !metadata_only && !event_only && !suffix_only && dflash != nullptr && *dflash != '\0') {
         if (const int result = exercise_corrupt_restore_falls_back(dflash, true); result != 0) { return result; }
     }
     std::cout << "ok\n";

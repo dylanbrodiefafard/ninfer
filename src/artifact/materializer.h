@@ -22,6 +22,7 @@ struct MaterializationStats {
     std::uint64_t file_bytes              = 0;
     std::uint64_t h2d_bytes               = 0;
     std::uint64_t device_capacity_bytes   = 0;
+    std::uint64_t mapped_host_bytes       = 0;
     std::uint64_t retained_resource_bytes = 0;
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
@@ -56,6 +57,7 @@ private:
     };
 
     std::unique_ptr<DeviceArena> device_arena_;
+    std::unique_ptr<PinnedHostBuffer> mapped_host_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

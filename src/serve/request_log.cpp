@@ -561,6 +561,7 @@ std::string format_server_start_json(
                               {"weights_id", load.weights_id},
                               {"bytes_read", load.artifact_bytes_read},
                               {"host_to_device_bytes", load.host_to_device_bytes},
+                              {"mapped_host_bytes", load.mapped_host_bytes},
                               {"peak_staging_bytes", load.peak_staging_bytes},
                               {"tensor_count", load.tensor_count},
                               {"resource_count", load.resource_count},

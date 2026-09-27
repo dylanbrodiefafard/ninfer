@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -175,6 +176,34 @@ struct ReadChunk {
     std::uint64_t required = 0;
 };
 
+// Pinned host tensors are copied from the mapped artifact on a worker thread while device
+// tensors stream through the staging slots. cudaMallocHost memory is device-addressable at
+// the same pointer under unified addressing.
+std::future<void> materialize_mapped_host(const Reader& reader, const MaterializationPlan& plan,
+                                          PinnedHostBuffer& backing,
+                                          std::vector<void*>& destinations) {
+    destinations.resize(plan.mapped_host_objects.size());
+    std::vector<std::pair<std::span<const std::byte>, std::byte*>> copies;
+    copies.reserve(plan.mapped_host_objects.size());
+    auto* base = static_cast<std::byte*>(backing.data());
+    for (std::size_t i = 0; i < plan.mapped_host_objects.size(); ++i) {
+        const DeviceMaterialization& placement = plan.mapped_host_objects[i];
+        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        if (payload.data.size() != placement.bytes ||
+            placement.offset > backing.size() - placement.bytes ||
+            placement.offset % placement.alignment != 0) {
+            throw ArtifactError("mapped host materialization plan does not match artifact payload");
+        }
+        destinations[i] = base + placement.offset;
+        copies.emplace_back(payload.data, base + placement.offset);
+    }
+    return std::async(std::launch::async, [copies = std::move(copies)] {
+        for (const auto& [source, destination] : copies) {
+            std::memcpy(destination, source.data(), source.size());
+        }
+    });
+}
+
 } // namespace
 
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
@@ -217,6 +246,22 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     out.stats_.device_capacity_bytes = capacity;
     out.stats_.tensor_count          = plan.device_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
+
+    std::future<void> mapped_host_copy;
+    if (plan.mapped_host_capacity_bytes != 0) {
+        if (plan.mapped_host_capacity_bytes > static_cast<std::uint64_t>(SIZE_MAX)) {
+            throw ArtifactError("artifact mapped host backing size is invalid");
+        }
+        out.mapped_host_ = std::make_unique<PinnedHostBuffer>(
+            static_cast<std::size_t>(plan.mapped_host_capacity_bytes), 4096);
+        std::vector<void*> destinations;
+        mapped_host_copy = materialize_mapped_host(reader, plan, *out.mapped_host_, destinations);
+        for (std::size_t i = 0; i < plan.mapped_host_objects.size(); ++i) {
+            out.objects_.at(plan.mapped_host_objects[i].object.index).device = destinations[i];
+            out.stats_.mapped_host_bytes += plan.mapped_host_objects[i].bytes;
+        }
+        out.stats_.tensor_count += plan.mapped_host_objects.size();
+    }
 
     for (const HostMaterialization& placement : plan.host_objects) {
         auto& resource            = out.objects_.at(placement.object.index).resource;
@@ -374,6 +419,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
     if (copied != total || next_range != ranges.size()) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
+    }
+    if (mapped_host_copy.valid()) {
+        mapped_host_copy.get();
+        out.stats_.file_bytes = checked_add(out.stats_.file_bytes, out.stats_.mapped_host_bytes,
+                                            "artifact read bytes overflow u64");
     }
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =

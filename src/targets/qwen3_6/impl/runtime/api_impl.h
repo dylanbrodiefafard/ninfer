@@ -7,6 +7,7 @@
 
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -230,6 +231,18 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 template <>
 void Program<Variant>::retain_lane(std::uint32_t lane) {
     impl_->retain_lane(lane);
+}
+
+template <>
+bool Program<Variant>::retain_reusable_lane(std::uint32_t lane) {
+    return impl_->retain_reusable_lane(lane);
+}
+
+template <>
+bool Program<Variant>::copy_reusable_prompt(std::uint32_t lane, std::uint32_t prompt_tokens,
+                                            std::vector<TokenId>& tokens,
+                                            std::uint32_t& rewrite_frontier) const {
+    return impl_->copy_reusable_prompt(lane, prompt_tokens, tokens, rewrite_frontier);
 }
 
 template <>

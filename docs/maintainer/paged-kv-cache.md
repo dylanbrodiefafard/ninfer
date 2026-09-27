@@ -153,7 +153,10 @@ K 切换使用已规划的共享 workspace，不增加 graph family 或扩展 KV
 
 `R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
 等同于 arena payload；因此 Instance 与 Graph 完整建立并同步后再次查询实际 free memory，并与 policy、
-planned slack 一起报告。默认 1 GiB 同时吸收这部分差值，并为同一 GPU 上后续的小额占用留下实际余量。
+planned slack 一起报告。Engine 在 startup 之后不再分配 device memory（C=6、6 个约 158k-token 请求的
+serve 实测 per-process 占用恒定），所以默认 `R` 为 64 MiB，只覆盖 driver 侧增长（lazy per-kernel local
+memory，最大 kernel stack 1128 B/thread）；与桌面或其他进程共享 GPU 时用 `--kv-capacity-headroom`
+增大。Automatic 模式下的 startup 失败信息会提示该选项。
 
 Engine 对外同时报告 configured `max_context` 和 resolved `kv_capacity=M*P_main`。最后一个 physical page
 的 rounding tail 只属于 storage padding，不能让 sequence frontier 超过 `S`。Admission 以 page-group

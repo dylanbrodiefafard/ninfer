@@ -256,14 +256,25 @@ void exercise_c2_admission(const char* artifact) {
             Tokens history = source;
             history.insert(history.end(), first.generated_token_ids.begin(),
                            first.generated_token_ids.end() - 1);
-            // C2 takes its empty lane first. Four distinct replacements then
-            // occupy both retained lanes and move the target out of the single
-            // RAM slot into disk. No idle wait is inserted between admissions.
+            // C2 takes its empty lane first. Four distinct replacements move
+            // the target out of the single RAM slot into disk. The following
+            // cold fillers reoccupy both lanes after the last of those
+            // admissions may have cleared its sibling.
             deadline.phase = "fill both retained lanes and exhaust RAM";
             for (ninfer::TokenId token : {9906, 728, 2047, 5830}) {
                 Tokens occupant = other;
                 occupant[3] = token;
                 (void)engine->generate(engine->prepare_tokens(occupant), greedy(8, false));
+            }
+            // The last pressure admission can evict its sibling and leave one
+            // lane empty. A disk restore onto that free lane does not capture.
+            // Two cold replacements reoccupy both lanes so this admission is
+            // the one that must snapshot a retained victim.
+            deadline.phase = "reoccupy both retained lanes";
+            for (ninfer::TokenId token : {111, 222}) {
+                Tokens filler = other;
+                filler[3] = token;
+                (void)engine->generate(engine->prepare_tokens(filler), greedy(8, false));
             }
             const auto before = engine->runtime_stats();
             if (before.kv_ram_used_bytes == 0 ||
@@ -277,7 +288,20 @@ void exercise_c2_admission(const char* artifact) {
                 after.kv_ram_captures <= before.kv_ram_captures ||
                 after.kv_ram_evictions <= before.kv_ram_evictions) {
                 throw std::runtime_error(
-                    "C2 disk admission did not capture a retained victim under full RAM pressure");
+                    "C2 disk admission did not capture a retained victim under full RAM pressure"
+                    " source=" +
+                    std::to_string(static_cast<int>(restored.prefix_reuse_source)) +
+                    " reused=" + std::to_string(restored.reused_prompt_tokens) +
+                    " ram_captures=" + std::to_string(before.kv_ram_captures) + "->" +
+                    std::to_string(after.kv_ram_captures) +
+                    " ram_evictions=" + std::to_string(before.kv_ram_evictions) + "->" +
+                    std::to_string(after.kv_ram_evictions) +
+                    " ram_drops=" + std::to_string(before.kv_ram_drops) + "->" +
+                    std::to_string(after.kv_ram_drops) +
+                    " ram_entries=" + std::to_string(before.kv_ram_entry_count) + "->" +
+                    std::to_string(after.kv_ram_entry_count) +
+                    " ram_used=" + std::to_string(before.kv_ram_used_bytes) + "->" +
+                    std::to_string(after.kv_ram_used_bytes));
             }
             deadline.phase = "full-RAM disk continuation oracle";
             const auto oracle = engine->generate(engine->prepare_tokens(history), greedy(1, false));

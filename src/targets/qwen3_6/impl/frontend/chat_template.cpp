@@ -647,6 +647,93 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
     throw std::invalid_argument("invalid reasoning effort");
 }
 
+void append_rendered_messages(RenderBuffer& rendered, const std::vector<ChatMessage>& messages,
+                              std::size_t begin, const ChatRenderOptions& options,
+                              bool effort_template, bool preserve_thinking, long last_query_index,
+                              int& image_count, int& video_count,
+                              std::optional<RewriteCheckpointByteSpec>* rewrite_checkpoint,
+                              std::vector<std::size_t>* turn_closure_offsets) {
+    for (std::size_t i = begin; i < messages.size(); ++i) {
+        const ChatMessage& message = messages[i];
+        if (is_instruction_role(message.role)) { validate_instruction_message(message); }
+        const RenderedFragment content = trim_ascii_whitespace(
+            message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (is_instruction_role(message.role)) {
+            rendered.markup("<|im_start|>system\n");
+            rendered.append(content);
+            rendered.markup("<|im_end|>\n");
+            continue;
+        }
+        if (message.role == ChatRole::User) {
+            rendered.markup("<|im_start|>user\n");
+            rendered.append(content);
+            rendered.markup("<|im_end|>\n");
+            continue;
+        }
+        if (message.role == ChatRole::Tool) {
+            const bool opens_group = i > 0 && messages[i - 1].role != ChatRole::Tool;
+            const bool closes_group =
+                i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
+            if (opens_group) { rendered.markup("<|im_start|>user"); }
+            rendered.markup("\n<tool_response>\n");
+            rendered.append(content);
+            rendered.markup("\n</tool_response>");
+            if (closes_group) { rendered.markup("<|im_end|>\n"); }
+            continue;
+        }
+
+        if (message.role != ChatRole::Assistant) {
+            throw std::invalid_argument("unsupported chat role value");
+        }
+
+        // assistant
+        RenderedFragment reasoning;
+        RenderedFragment body = content;
+        if (!message.reasoning_content.empty()) {
+            reasoning.text = message.reasoning_content;
+            reasoning.literal_spans.push_back(
+                ByteSpan{.begin = 0, .end = message.reasoning_content.size()});
+        } else if (!effort_template) {
+            const ThinkSplit split = derive_think_split(content.text);
+            reasoning = slice_fragment(content, split.reasoning_begin, split.reasoning_end);
+            body      = slice_fragment(content, split.content_begin, content.text.size());
+        }
+        reasoning = trim_ascii_whitespace(reasoning);
+
+        const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
+        rendered.markup("<|im_start|>assistant\n");
+        if (!preserve_thinking && turn_closure_offsets != nullptr) {
+            turn_closure_offsets->push_back(rendered.size());
+        }
+        if (rewrite_checkpoint != nullptr && !preserve_thinking && !rewrite_checkpoint->has_value() &&
+            static_cast<long>(i) > last_query_index) {
+            *rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+        }
+        // Official Qwen3.8 Jinja still wraps whenever keep_thinking. The C++ clone
+        // omits an empty reasoning wrapper so history does not inject the
+        // no-thinking cue `<think>\n\n</think>\n\n`.
+        if (keep_thinking && !(effort_template && reasoning.text.empty())) {
+            rendered.markup("<think>\n");
+            rendered.append(reasoning);
+            rendered.markup("\n</think>\n\n");
+        }
+        rendered.append(body);
+        if (!message.tool_calls.empty()) {
+            const bool body_has_text = !trim_ascii_whitespace(body.text).empty();
+            for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
+                if (call_index == 0) {
+                    if (body_has_text) { rendered.markup("\n\n"); }
+                } else {
+                    rendered.markup("\n");
+                }
+                render_tool_call(rendered, message.tool_calls[call_index], effort_template);
+            }
+        }
+        rendered.markup("<|im_end|>\n");
+    }
+}
+
 } // namespace
 
 bool ChatMessage::has_media() const noexcept {
@@ -748,88 +835,17 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::vector<std::size_t> turn_closure_offsets;
 
     int image_count = 0;
     int video_count = 0;
-    for (std::size_t i = 0; i < messages.size(); ++i) {
-        const ChatMessage& message = messages[i];
-        if (i < message_begin) { continue; }
-        if (is_instruction_role(message.role)) { validate_instruction_message(message); }
-        const RenderedFragment content = trim_ascii_whitespace(
-            message.rendered_content(options.add_vision_id, &image_count, &video_count));
-        if (is_instruction_role(message.role)) {
-            rendered.markup("<|im_start|>system\n");
-            rendered.append(content);
-            rendered.markup("<|im_end|>\n");
-            continue;
-        }
-        if (message.role == ChatRole::User) {
-            rendered.markup("<|im_start|>user\n");
-            rendered.append(content);
-            rendered.markup("<|im_end|>\n");
-            continue;
-        }
-        if (message.role == ChatRole::Tool) {
-            const bool opens_group = i > 0 && messages[i - 1].role != ChatRole::Tool;
-            const bool closes_group =
-                i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
-            if (opens_group) { rendered.markup("<|im_start|>user"); }
-            rendered.markup("\n<tool_response>\n");
-            rendered.append(content);
-            rendered.markup("\n</tool_response>");
-            if (closes_group) { rendered.markup("<|im_end|>\n"); }
-            continue;
-        }
-
-        if (message.role != ChatRole::Assistant) {
-            throw std::invalid_argument("unsupported chat role value");
-        }
-
-        // assistant
-        RenderedFragment reasoning;
-        RenderedFragment body = content;
-        if (!message.reasoning_content.empty()) {
-            reasoning.text = message.reasoning_content;
-            reasoning.literal_spans.push_back(
-                ByteSpan{.begin = 0, .end = message.reasoning_content.size()});
-        } else if (!effort_template) {
-            const ThinkSplit split = derive_think_split(content.text);
-            reasoning = slice_fragment(content, split.reasoning_begin, split.reasoning_end);
-            body      = slice_fragment(content, split.content_begin, content.text.size());
-        }
-        reasoning = trim_ascii_whitespace(reasoning);
-
-        const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
-        rendered.markup("<|im_start|>assistant\n");
-        if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
-        }
-        // Official Qwen3.8 Jinja still wraps whenever keep_thinking. The C++ clone
-        // omits an empty reasoning wrapper so history does not inject the
-        // no-thinking cue `<think>\n\n</think>\n\n`.
-        if (keep_thinking && !(effort_template && reasoning.text.empty())) {
-            rendered.markup("<think>\n");
-            rendered.append(reasoning);
-            rendered.markup("\n</think>\n\n");
-        }
-        rendered.append(body);
-        if (!message.tool_calls.empty()) {
-            const bool body_has_text = !trim_ascii_whitespace(body.text).empty();
-            for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
-                if (call_index == 0) {
-                    if (body_has_text) { rendered.markup("\n\n"); }
-                } else {
-                    rendered.markup("\n");
-                }
-                render_tool_call(rendered, message.tool_calls[call_index], effort_template);
-            }
-        }
-        rendered.markup("<|im_end|>\n");
-    }
+    append_rendered_messages(rendered, messages, message_begin, options, effort_template,
+                             preserve_thinking, last_query_index, image_count, video_count,
+                             &rewrite_checkpoint, preserve_thinking ? nullptr : &turn_closure_offsets);
 
     if (options.add_generation_prompt) {
         rendered.markup("<|im_start|>assistant\n");
+        if (!preserve_thinking) { turn_closure_offsets.push_back(rendered.size()); }
         if (!preserve_thinking && !rewrite_checkpoint) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
@@ -848,9 +864,25 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     RenderedFragment fragment = std::move(rendered).take();
-    return RenderedChat{.text               = std::move(fragment.text),
-                        .literal_spans      = std::move(fragment.literal_spans),
-                        .rewrite_checkpoint = rewrite_checkpoint};
+    return RenderedChat{.text                 = std::move(fragment.text),
+                        .literal_spans        = std::move(fragment.literal_spans),
+                        .rewrite_checkpoint   = rewrite_checkpoint,
+                        .turn_closure_offsets = std::move(turn_closure_offsets)};
+}
+
+RenderedFragment CompiledChatTemplate::render_fragment(const std::vector<ChatMessage>& messages,
+                                                       ChatRenderOptions options) const {
+    if (messages.empty()) { return {}; }
+    const bool effort_template   = semantics_ == ChatTemplateSemantics::ReasoningEffort;
+    const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
+    RenderBuffer rendered;
+    int image_count = 0;
+    int video_count = 0;
+    // A fragment is appended after the closed conversation, so each assistant
+    // sits past the last user query. last_query_index -1 is that suffix.
+    append_rendered_messages(rendered, messages, 0, options, effort_template, preserve_thinking,
+                             -1, image_count, video_count, nullptr, nullptr);
+    return std::move(rendered).take();
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

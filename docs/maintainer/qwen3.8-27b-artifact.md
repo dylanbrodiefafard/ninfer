@@ -267,6 +267,11 @@ are not dispatch inputs. MTP matrices on that identity bind as W8 or NVFP4. The 
 `Program`, and reports `qwen3_8_27b/qwen3.8-27b/groupwise-int` or
 `qwen3_8_27b/qwen3.8-27b/nvfp4` in the load summary.
 
+Every 27B profile materializes `text/token_embedding` (1.26 GiB as W8) in pinned host memory
+(`TensorPlacement::MappedHost`) rather than VRAM: the embedding is only row-gathered, and the gather
+kernels read it through its unified device address. The load summary reports it as
+`mapped_host_bytes`; the freed VRAM goes to the automatic KV pool. `text/output_head` stays in VRAM.
+
 The opt-in 27B live Engine tests (`ninfer_qwen3_6_27b_prefix_real_test`,
 `ninfer_qwen3_6_27b_ram_real_test`) load these identities when
 `NINFER_QWEN3_6_27B_WEIGHTS` or `NINFER_QWEN3_6_27B_NVFP4_WEIGHTS` points at the Qwen3.8

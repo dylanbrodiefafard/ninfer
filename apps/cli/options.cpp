@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -116,8 +117,9 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--kv-ram-capacity off|N] [--kv-disk-capacity off|N]\n"
-           "       [--kv-disk-location PATH] [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--kv-capacity-headroom MiB]\n"
+           "       [--kv-ram-capacity off|N] [--kv-disk-capacity off|N] [--kv-disk-location PATH]\n"
+           "       [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F]\n"
            "       [--spec mtp|dflash --draft-tokens N]\n"
@@ -135,9 +137,10 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--kv-capacity auto leaves " +
+           "--kv-capacity auto sizes the KV pool from all free GPU memory except\n"
+           "--kv-capacity-headroom MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           "); raise it when other processes, such as a desktop, share the GPU.\n"
            "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
            "--kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB (default off).\n"
            "--kv-disk-location is required iff --kv-disk-capacity is enabled.\n"
@@ -160,6 +163,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    std::optional<std::uint64_t> kv_capacity_headroom_mib;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -179,6 +183,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--kv-capacity-headroom") {
+            kv_capacity_headroom_mib = parse_u64(value(arg), "kv-capacity-headroom");
         } else if (arg == "--kv-ram-capacity") {
             options.kv_ram_capacity_bytes = parse_kv_ram_capacity_bytes(value(arg));
         } else if (arg == "--kv-disk-capacity") {
@@ -272,6 +278,17 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (kv_capacity_headroom_mib) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--kv-capacity-headroom requires --kv-capacity auto");
+        }
+        constexpr std::uint64_t mib = 1024ULL * 1024ULL;
+        if (*kv_capacity_headroom_mib > std::numeric_limits<std::size_t>::max() / mib) {
+            throw std::invalid_argument("--kv-capacity-headroom is too large");
+        }
+        options.kv_capacity.automatic_headroom_bytes =
+            static_cast<std::size_t>(*kv_capacity_headroom_mib * mib);
     }
 
     const bool has_prompt   = !options.prompt.empty();

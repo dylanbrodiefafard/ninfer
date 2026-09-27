@@ -184,6 +184,40 @@ int main() {
                     materialized.device_arena().used() == plan.device_capacity_bytes,
                 "materialized tensor does not own the planned device backing");
 
+        // Mapped host placement: excluded from the device backing, pinned, device-addressable.
+        ninfer::artifact::Binder mapped_binder(reader);
+        mapped_binder.retain_on_host(mapped_binder.require_resource(
+            "frontend/test.json", ninfer::artifact::ResourceEncoding::RawBytesV1));
+        const auto mapped =
+            mapped_binder.require_tensor("weights/test", ninfer::artifact::NumericFormat::BF16,
+                                         ninfer::artifact::StorageLayout::ContiguousLeV1,
+                                         tensor_shape);
+        mapped_binder.materialize_on_mapped_host(mapped);
+        const auto mapped_device =
+            mapped_binder.require_tensor("weights/second", ninfer::artifact::NumericFormat::BF16,
+                                         ninfer::artifact::StorageLayout::ContiguousLeV1,
+                                         second_shape);
+        mapped_binder.materialize_on_device(mapped_device);
+        const auto mapped_plan = mapped_binder.finish();
+        require(mapped_plan.device_capacity_bytes == kSecondTensor.size() &&
+                    mapped_plan.mapped_host_capacity_bytes == kTensor.size() &&
+                    mapped_plan.mapped_host_objects.size() == 1,
+                "mapped host tensor was charged to the device backing");
+        auto mapped_materialized = ninfer::artifact::materialize(reader, mapped_plan, device);
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, mapped_materialized.device_data(mapped)));
+        require(attributes.type == cudaMemoryTypeHost && attributes.devicePointer ==
+                                                             mapped_materialized.device_data(mapped),
+                "mapped host tensor is not pinned at its unified device address");
+        std::array<std::byte, kTensor.size()> mapped_copied{};
+        CUDA_CHECK(cudaMemcpy(mapped_copied.data(), mapped_materialized.device_data(mapped),
+                              mapped_copied.size(), cudaMemcpyDefault));
+        require(mapped_copied == kTensor, "mapped host tensor payload differs from the artifact");
+        const auto& mapped_stats = mapped_materialized.stats();
+        require(mapped_stats.tensor_count == 2 && mapped_stats.mapped_host_bytes == kTensor.size() &&
+                    mapped_stats.h2d_bytes == kSecondTensor.size(),
+                "mapped host materialization statistics are incomplete");
+
         auto parallel_fixture = write_parallel_fixture();
         ninfer::artifact::Reader parallel_reader(parallel_fixture.path);
         ninfer::artifact::Binder parallel_binder(parallel_reader);
