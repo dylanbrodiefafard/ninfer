@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/panel_copy.h"
+#include "targets/qwen3_6/impl/runtime/prefill_schedule.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -1166,12 +1167,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if (checkpoint_rel > 0 && t0 < checkpoint_rel && t0 + len > checkpoint_rel) {
             len = checkpoint_rel - t0;
         }
-        const std::uint32_t chunk_abs = base + static_cast<std::uint32_t>(t0);
-        for (const std::uint32_t frontier : prefill_split_frontiers_) {
-            if (frontier <= chunk_abs) { continue; }
-            const std::uint32_t room = frontier - chunk_abs;
-            if (room < static_cast<std::uint32_t>(len)) { len = static_cast<int>(room); }
-        }
+        len = static_cast<int>(qwen3_6::detail::cap_prefill_at_frontiers(
+            base + static_cast<std::uint32_t>(t0), static_cast<std::uint32_t>(len),
+            prefill_split_frontiers_));
         work_.reset();
 
         VisionChunk vision_chunk;

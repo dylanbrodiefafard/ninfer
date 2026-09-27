@@ -8,6 +8,7 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -40,6 +41,43 @@ struct PrefillRun {
     std::uint32_t processed = 0;
 };
 
+struct CommittedState {
+    std::vector<std::byte> conv;
+    std::vector<std::byte> recurrent;
+    std::vector<std::byte> hidden;
+
+    bool operator==(const CommittedState&) const = default;
+};
+
+CommittedState committed_state(execution::ProgramImplCore& program) {
+    const auto& state = program.decoder->linear_attention;
+    const auto& hidden = program.sequences[0].tail_hidden;
+    CommittedState result{std::vector<std::byte>(state.conv_host_image_bytes()),
+                          std::vector<std::byte>(state.recurrent_host_image_bytes()),
+                          std::vector<std::byte>(hidden.bytes())};
+    state.pack_slot_to_host(0, result.conv.data(), result.recurrent.data(), program.device.stream);
+    CUDA_CHECK(cudaMemcpyAsync(result.hidden.data(), hidden.data, hidden.bytes(),
+                               cudaMemcpyDeviceToHost, program.device.stream));
+    program.device.synchronize();
+    return result;
+}
+
+std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, int rounds) {
+    const std::array<std::uint32_t, 1> lanes{0};
+    const std::array<ninfer::runtime::RoundBudget, 1> budgets{{{16}}};
+    const std::array<std::uint8_t, 1> flags{0};
+    std::vector<ninfer::TokenId> tokens;
+    for (int i = 0; i < rounds; ++i) {
+        const auto round = program.decode_batch(lanes, budgets);
+        require(round.row_counts[0] > 0, "decode did not produce a committed candidate");
+        const std::array<std::uint32_t, 1> accepted{
+            static_cast<std::uint32_t>(round.row_counts[0])};
+        tokens.insert(tokens.end(), round.tokens.begin(), round.tokens.begin() + accepted[0]);
+        program.resolve_pending_batch(lanes, accepted, flags, flags);
+    }
+    return tokens;
+}
+
 PrefillRun finish_prefill(execution::ProgramImplCore& program, family::PreparedPromptData prompt,
                           execution::RequestPlan plan) {
     PrefillRun run;
@@ -59,6 +97,65 @@ bool prefix_equals(const std::vector<ninfer::TokenId>& tokens,
                    const std::vector<ninfer::TokenId>& prefix) {
     return tokens.size() >= prefix.size() &&
            std::equal(prefix.begin(), prefix.end(), tokens.begin());
+}
+
+void exercise_decoded_retries(execution::ProgramImplCore& program, family::Frontend& frontend,
+                               const ninfer::PromptInput& input,
+                               ninfer::runtime::ResolvedExecutionOptions options) {
+    options.requested_output_tokens = 32;
+    auto prompt = family::PreparedPromptAccess::take(frontend.prepare(input));
+    const auto recovery = family::GenerationRecoveryContext::analyze(input);
+    for (std::uint32_t attempt = 1; attempt <= 2; ++attempt) {
+        const auto prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
+        const auto insert = recovery->recovery_insert({}, attempt);
+        auto prepared_retry = frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery);
+        require(prepared_retry.has_value(), "decoded retry splice was rejected");
+        auto retry = family::PreparedPromptAccess::take(std::move(*prepared_retry));
+
+        // The control run appends the exact same suffix to an unmodified prompt
+        // state. Both routes execute identical prefill chunks; the only difference
+        // is restoring the saved state after speculative decode has overwritten it.
+        CommittedState expected;
+        std::vector<ninfer::TokenId> expected_continuation;
+        for (const bool failed_decode : {false, true}) {
+            program.abort_lane(0);
+            auto base = program.plan_request_base(prompt, options);
+            auto plan = program.plan_request_for_lane(0, prompt, base);
+            (void)finish_prefill(program, family::PreparedPromptData(prompt), std::move(plan));
+            if (failed_decode) {
+                (void)decode_rounds(program, 4);
+                require(program.sequences[0].text_kv_valid > prompt_tokens,
+                        "failed decode did not advance beyond the recovery checkpoint");
+            }
+            require(program.retain_reusable_lane(0), "decoded lane could not be retained");
+            auto retry_base = program.plan_request_base(retry, options);
+            auto retry_plan = program.plan_request_for_lane(0, retry, retry_base);
+            require(retry_plan.summary().reusable_prompt_tokens == prompt_tokens,
+                    "decoded retry lost its prompt checkpoint: " + plan_text(retry_plan));
+            require(failed_decode
+                        ? execution::is_complete_checkpoint_restore(retry_plan.impl_->reuse)
+                        : retry_plan.impl_->reuse == execution::ReusePath::AppendAtFrontier,
+                    "fixture did not exercise append and checkpoint restore separately");
+            const auto run = finish_prefill(program, family::PreparedPromptData(retry),
+                                            std::move(retry_plan));
+            require(run.processed == retry.token_ids.size() - prompt_tokens,
+                    "decoded retry recomputed tokens before its checkpoint");
+            const auto actual = committed_state(program);
+            auto continuation = decode_rounds(program, 2);
+            if (!failed_decode) {
+                expected = actual;
+                expected_continuation = std::move(continuation);
+            } else {
+                require(actual == expected,
+                        "checkpoint retry changed the committed GDN or hidden state");
+                require(continuation == expected_continuation,
+                        "checkpoint retry changed greedy speculative continuation");
+            }
+        }
+        prompt = std::move(retry);
+        std::cout << "decoded retry attempt=" << attempt
+                  << " restored=" << prompt_tokens << " state and continuation matched\n";
+    }
 }
 
 void require_empty_lane(const execution::ProgramImplCore& program, const char* when) {
@@ -92,7 +189,9 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     options.speculative.backend        = backend;
     options.speculative.draft_tokens   = 3;
     options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
-    options.speculative.adaptive_draft = true;
+    // Fixed draft width keeps the restoration control independent of round-time
+    // estimates learned during the deliberately discarded decode.
+    options.speculative.adaptive_draft = false;
 
     ninfer::artifact::Reader reader(artifact);
     ninfer::artifact::Binder binder(reader);
@@ -120,6 +219,7 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
         .kind = ninfer::MessagePartKind::Text, .text = "Say hello in one sentence.", .media = {}});
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = true;
+    input.options.preserve_thinking = true;
 
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens       = 8;
@@ -251,6 +351,7 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     program.consume_ram_entry(entry_id);
     std::cout << "restored hit reused=" << restored.summary.reused_prompt_tokens
               << " suffix=" << restored.processed << '\n';
+    exercise_decoded_retries(program, frontend, input, execution);
 }
 
 } // namespace
@@ -259,9 +360,12 @@ int main() {
     const char* nvfp4  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* group  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    const char* mtp = std::getenv("NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS");
     const char* artifact = nullptr;
     ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::Mtp;
-    if (nvfp4 != nullptr && *nvfp4 != '\0') {
+    if (mtp != nullptr && *mtp != '\0') {
+        artifact = mtp;
+    } else if (nvfp4 != nullptr && *nvfp4 != '\0') {
         artifact = nvfp4;
     } else if (group != nullptr && *group != '\0') {
         artifact = group;
@@ -271,7 +375,8 @@ int main() {
     } else {
         std::cout << "skip: set NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, "
                      "NINFER_QWEN3_6_27B_WEIGHTS, or "
-                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
+                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS or "
+                     "NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS\n";
         return 77;
     }
     try {

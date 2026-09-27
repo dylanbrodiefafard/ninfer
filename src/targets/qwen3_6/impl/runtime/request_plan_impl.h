@@ -63,12 +63,14 @@ std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
 }
 
 std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
+                                     const PreparedPromptData& prompt,
                                      std::uint32_t reuse_base, std::uint32_t prefill_chunk,
-                                     std::size_t prefill_splits) noexcept {
-    const std::uint32_t suffix = summary.prompt_tokens - reuse_base;
+                                     std::span<const VisionUseSpan> vision_uses,
+                                     const std::optional<RewriteCheckpointSpec>& rewrite) noexcept {
     const std::uint64_t prefill_units =
-        suffix == 0 ? 1ULL
-                    : schedule::prefill_chunk_count(suffix, prefill_chunk) + prefill_splits;
+        qwen3_6::detail::projected_prefill_work(
+            prompt, reuse_base, prefill_chunk, vision_uses,
+            rewrite ? std::optional<std::uint32_t>(rewrite->frontier) : std::nullopt);
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
     return prefill_units + decode_units;
@@ -158,11 +160,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         .main_kv_pages    = base->text_kv_page_entitlement,
         .backend_kv_pages = base->backend_kv_page_entitlement,
     };
+    std::vector<VisionUseSpan> cold_vision_uses;
     if (prompt.has_media()) {
         auto control =
             std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
         std::uint32_t previous_end = 0;
-        std::size_t text_gaps      = 0;
+        cold_vision_uses.reserve(control->items.size());
         for (const qwen3_6::VisionItemControl& item : control->items) {
             if (item.scatter_indices.empty()) {
                 throw std::invalid_argument("vision item has no Text consumer columns");
@@ -181,10 +184,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
-            if (begin > previous_end) { ++text_gaps; }
+            cold_vision_uses.push_back(VisionUseSpan{begin, first, end});
             previous_end = end;
         }
-        base->vision_text_gaps = text_gaps;
         base->vision_control = std::move(control);
     }
 
@@ -196,15 +198,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
-    const std::size_t cold_prefill_splits =
-        (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
-        base->vision_text_gaps +
-        (base->rewrite_checkpoint &&
-                 base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
-             ? 1ULL
-             : 0ULL);
     base->summary.service_work_quanta =
-        projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
+        projected_service_work(base->summary, prompt, 0, prefill_chunk, cold_vision_uses,
+                               base->rewrite_checkpoint);
     if (prompt.generation_recovery && base->sampling.p_less) {
         base->summary.service_work_quanta += qwen3_6::GenerationRecoveryContext::maximum_attempts *
             (schedule::prefill_chunk_count(reserved_context_tokens, prefill_chunk) + 2ULL);
@@ -330,7 +326,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
             const std::uint32_t begin = plan.prepare_mtp && first != 0 ? first - 1 : first;
             const std::uint32_t end   = last + 1;
             if (end <= plan.reuse_base) { continue; }
-            vision.uses.push_back(VisionUseSpan{begin, end, static_cast<std::uint32_t>(index),
+            vision.uses.push_back(VisionUseSpan{begin, first, end, static_cast<std::uint32_t>(index),
                                                 total_merged});
             if (item.merged_count > std::numeric_limits<std::size_t>::max() - total_merged) {
                 throw std::overflow_error("Vision output extent overflows size_t");
@@ -345,20 +341,11 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         }
     }
 
-    std::size_t text_gaps = 0;
-    if (plan.vision) {
-        for (const VisionUseSpan& use : plan.vision->uses) {
-            if (use.begin > plan.reuse_base) { ++text_gaps; }
-        }
-    }
-    const std::size_t prefill_splits =
-        (plan.vision ? plan.vision->uses.size() : 0ULL) + text_gaps +
-        (plan.rewrite_checkpoint_capture &&
-                 plan.rewrite_checkpoint_capture->frontier < plan.summary.prompt_tokens
-             ? 1ULL
-             : 0ULL);
-    plan.summary.service_work_quanta =
-        projected_service_work(plan.summary, plan.reuse_base, prefill_chunk, prefill_splits);
+    plan.summary.service_work_quanta = projected_service_work(
+        plan.summary, prompt, plan.reuse_base, prefill_chunk,
+        plan.vision ? std::span<const VisionUseSpan>(plan.vision->uses)
+                    : std::span<const VisionUseSpan>{},
+        plan.rewrite_checkpoint_capture);
     if (prompt.generation_recovery && plan.sampling.p_less) {
         plan.summary.service_work_quanta += qwen3_6::GenerationRecoveryContext::maximum_attempts *
             (schedule::prefill_chunk_count(plan.summary.prompt_tokens +

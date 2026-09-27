@@ -633,6 +633,9 @@ int test_gdn_abort_host_unpack_ignores_stale_staging(ninfer::DeviceContext& ctx)
 
     fill_gdn_slot(pool, 1, kStale, ctx.stream);
     fill_gdn_slot(pool, 0, 0x00, ctx.stream);
+    // The restore must follow the simulated abort's writes to the same slot.
+    CUDA_CHECK(cudaEventRecord(d2d_done, ctx.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.copy_stream, d2d_done, 0));
     pool.unpack_slot_from_host(0, host_conv.data(), host_rec.data(), ctx.copy_stream);
     ctx.synchronize_all();
     CUDA_CHECK(cudaEventDestroy(d2d_done));

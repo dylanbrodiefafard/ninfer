@@ -8,6 +8,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <fstream>
@@ -75,7 +77,7 @@ std::string read_template() {
 
 // The toy vocabulary cannot piece the recovery notice back together. One added
 // token holds the whole system fragment so the splice round-trips.
-std::string recovery_fragment() {
+std::string recovery_fragment(std::uint32_t attempt = 1) {
     ninfer::PromptInput input;
     input.options.enable_thinking       = true;
     input.options.add_generation_prompt = true;
@@ -86,7 +88,7 @@ std::string recovery_fragment() {
     input.messages.push_back(std::move(user));
     const auto recovery = ninfer::targets::qwen3_6::GenerationRecoveryContext::analyze(input);
     if (!recovery) { throw std::runtime_error("probe input is not eligible for recovery"); }
-    const auto insert = recovery->recovery_insert({}, 1);
+    const auto insert = recovery->recovery_insert({}, attempt);
     if (insert.size() != 1 || insert[0].parts.size() != 1 ||
         insert[0].parts[0].kind != ninfer::MessagePartKind::Text) {
         throw std::runtime_error("probe recovery insert was not one system notice");
@@ -108,7 +110,7 @@ FrontendResources resources() {
          added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
          added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
          added(248068, "<think>"), added(248069, "</think>"),
-         added(500, recovery_fragment())});
+         added(500, recovery_fragment()), added(501, recovery_fragment(2))});
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
@@ -268,6 +270,10 @@ public:
     std::uint64_t claimed_disk_entry = 0;
     bool prefill_terminal            = false;
     bool saw_force_cold              = false;
+    bool cancel_on_restore           = false;
+    std::atomic<bool>* request_cancellation = nullptr;
+    bool lifecycle_retries           = false;
+    std::vector<std::vector<TokenId>> prefilled_prompts;
 
     void note(const char* event) {
         std::lock_guard lock(trace_mu_);
@@ -321,16 +327,28 @@ public:
     [[nodiscard]] bool copy_reusable_prompt(std::uint32_t, std::uint32_t prompt_tokens,
                                             std::vector<TokenId>& tokens, std::uint32_t&) {
         copied_tokens = prompt_tokens;
+        if (lifecycle_retries) {
+            if (prefilled_prompts.empty() || prefilled_prompts.back().size() != prompt_tokens) {
+                return false;
+            }
+            tokens = prefilled_prompts.back();
+            return true;
+        }
         if (prompt_tokens != kResidentTokens) { return false; }
         note("copy");
         tokens.assign(std::begin(kResidentPrefix), std::end(kResidentPrefix));
         return true;
     }
 
-    [[nodiscard]] ProbePlan plan_request_base(const PreparedPrompt&,
+    [[nodiscard]] ProbePlan plan_request_base(const PreparedPrompt& prompt,
                                               const ninfer::runtime::ResolvedExecutionOptions& options) {
         note("plan_base");
         ProbePlan plan     = fitted_plan();
+        if (lifecycle_retries) {
+            plan.fields.prompt_tokens = prompt.summary().prompt_tokens;
+            plan.fields.effective_output_tokens = options.requested_output_tokens;
+            plan.fields.service_work_quanta = options.requested_output_tokens + 8;
+        }
         plan.force_cold    = options.force_cold_prefill;
         plan.allow_reuse   = options.allow_prefix_reuse;
         saw_force_cold     = saw_force_cold || options.force_cold_prefill;
@@ -340,12 +358,16 @@ public:
     [[nodiscard]] ProbePlan plan_request_for_lane(std::uint32_t, const PreparedPrompt&,
                                                   const ProbePlan& base) {
         note("plan_cold");
-        ProbePlan plan   = fitted_plan();
+        ProbePlan plan   = lifecycle_retries ? base : fitted_plan();
         plan.force_cold  = base.force_cold;
         plan.allow_reuse = base.allow_reuse;
         if (script == CacheCase::RecoveryResidentHit && !base.force_cold && base.allow_reuse) {
-            plan.fields.reusable_prompt_tokens = kResidentTokens;
-            plan.fields.reuse_source           = PrefixReuseSource::VramResident;
+            plan.fields.reusable_prompt_tokens = lifecycle_retries
+                ? (prefilled_prompts.empty() ? 0 : prefilled_prompts.back().size())
+                : kResidentTokens;
+            if (plan.fields.reusable_prompt_tokens != 0) {
+                plan.fields.reuse_source = PrefixReuseSource::VramResident;
+            }
         }
         return plan;
     }
@@ -420,6 +442,7 @@ public:
             (script == CacheCase::AdmitRamRestoreThenCold && restore_ram_count == 1)) {
             throw CacheRestoreFailure("probe host restore failed");
         }
+        ram_timings_pending_ = true;
     }
 
     void release_ram_entry(std::uint64_t) { note("release_ram"); }
@@ -442,6 +465,12 @@ public:
         prefill_source    = plan.summary().reuse_source;
         prefill_ram_entry = plan.summary().ram_entry_id;
         prefill_disk_entry = plan.summary().disk_entry_id;
+        if (lifecycle_retries) {
+            auto data = ninfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(prompt));
+            prefilled_prompts.push_back(std::move(data.token_ids));
+            // Two failed reasoning attempts, then a caller stop on the second retry.
+            licensed_ = prefill_count < 3 ? 0 : 15;
+        }
         PrefillStepResult step;
         step.complete                = true;
         step.processed_prompt_tokens = 1;
@@ -466,8 +495,14 @@ public:
     [[nodiscard]] RamSnapshot kv_ram_snapshot() const noexcept { return {}; }
     [[nodiscard]] DiskSnapshot kv_disk_snapshot() const noexcept { return {}; }
     [[nodiscard]] GpuSnapshot kv_gpu_snapshot() const noexcept { return {}; }
-    [[nodiscard]] RamCopySeconds harvest_kv_ram_copy_seconds() { return {}; }
-    [[nodiscard]] DiskCopySeconds harvest_kv_disk_copy_seconds() { return {}; }
+    [[nodiscard]] RamCopySeconds harvest_kv_ram_copy_seconds() {
+        if (!std::exchange(ram_timings_pending_, false)) { return {}; }
+        return {.save = 0.125, .load = 0.25};
+    }
+    [[nodiscard]] DiskCopySeconds harvest_kv_disk_copy_seconds() {
+        if (!std::exchange(disk_timings_pending_, false)) { return {}; }
+        return {.save = 0.5, .load = 1.0, .h2d = 2.0};
+    }
     [[nodiscard]] bool kv_ram_copies_ready() const { return true; }
     [[nodiscard]] bool kv_disk_restore_failed() const { return false; }
     // A request starts at index version zero. Zero here would skip the host lookup.
@@ -491,6 +526,11 @@ public:
     }
     [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
                                                      std::span<const RoundBudget>) {
+        if (lifecycle_retries && prefill_count < 3) {
+            return {.tokens = repeated_tokens_,
+                    .row_counts = std::span<const std::int32_t>(&repeated_count_, 1),
+                    .row_stride = 64};
+        }
         throw std::logic_error("recovery entered decode after the cold prefill");
     }
 
@@ -515,10 +555,15 @@ public:
         if (script == CacheCase::RecoveryDiskRestoreFails) {
             throw CacheRestoreFailure("probe disk restore failed");
         }
+        disk_timings_pending_ = true;
     }
     void wait_kv_ram_copies() {}
     void wait_kv_disk_copies() {}
-    void wait_kv_ram_copies_on_compute() {}
+    void wait_kv_ram_copies_on_compute() {
+        if (cancel_on_restore && request_cancellation != nullptr) {
+            request_cancellation->store(true, std::memory_order_release);
+        }
+    }
     void evict_retained_lane(std::uint32_t) noexcept {}
     void retain_lane(std::uint32_t) {}
     void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId>) {}
@@ -529,6 +574,10 @@ public:
                                std::span<const std::uint8_t>) {}
 
 private:
+    bool ram_timings_pending_ = false;
+    bool disk_timings_pending_ = false;
+    std::array<TokenId, 64> repeated_tokens_{};
+    std::int32_t repeated_count_ = 64;
     TokenId licensed_ = kCallerStop;
     std::mutex trace_mu_;
 };
@@ -568,6 +617,8 @@ const char* kExpectedTrace[] = {
 };
 
 struct RecoveryOutcome {
+    ninfer::GenerationResult result;
+    double runtime_disk_h2d_seconds = 0;
     bool finished                  = false;
     std::string error;
     std::uint32_t attempts         = 0;
@@ -612,10 +663,22 @@ int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& 
     int failures = 0;
     failures += fail_case(program, outcome.finished && outcome.error.empty(),
                           outcome.error.empty() ? "the retry did not finish" : outcome.error.c_str());
+    const bool cancelled = program.cancel_on_restore;
     failures += fail_case(program, outcome.attempts == 1 && outcome.has_budget &&
-                                       outcome.budget_remaining == kOutputBudget - 1 &&
-                                       outcome.finish == FinishReason::StopToken,
+                                       outcome.budget_remaining == kOutputBudget - (cancelled ? 0 : 1) &&
+                                       outcome.finish == (cancelled ? FinishReason::Cancelled
+                                                                    : FinishReason::StopToken),
                           "the retry did not keep its output budget and finish");
+    const bool ram_hit = program.script == CacheCase::RecoveryRamHit;
+    const bool disk_hit = program.script == CacheCase::RecoveryDiskHit;
+    failures += fail_case(program,
+                          outcome.result.kv_ram_save_seconds == (ram_hit ? 0.125 : 0.0) &&
+                              outcome.result.kv_ram_load_seconds == (ram_hit ? 0.25 : 0.0) &&
+                              outcome.result.kv_disk_save_seconds == (disk_hit ? 0.5 : 0.0) &&
+                              outcome.result.kv_disk_load_seconds == (disk_hit ? 1.0 : 0.0) &&
+                              outcome.result.kv_disk_h2d_seconds == (disk_hit ? 2.0 : 0.0) &&
+                              outcome.runtime_disk_h2d_seconds == (disk_hit ? 2.0 : 0.0),
+                          "first-step completion lost restored-cache timings");
     failures += fail_case(program, outcome.pending_empty && outcome.recovery_empty &&
                                        outcome.slot_empty && !outcome.executor_failed,
                           "the retry left a queue, lane, or failed executor behind");
@@ -766,6 +829,7 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     request->admission_resources     = AdmissionResources{1, 1, 0};
     request->remaining_service_work  = 4;
     request->recovery_cause          = "repeated_reasoning";
+    executor.instance_.program->request_cancellation = &request->cancelled;
 
     {
         std::scoped_lock locks(executor.execution_mutex_, executor.queue_mutex_);
@@ -800,21 +864,25 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     outcome.cache_fallback   = request->cache_fallback;
     outcome.force_cold       = request->options.execution.force_cold_prefill;
     outcome.finish           = request->result.finish_reason;
+    outcome.result           = request->result;
     {
         std::scoped_lock locks(executor.execution_mutex_, executor.queue_mutex_);
         outcome.pending_empty   = executor.pending_.empty();
         outcome.recovery_empty  = executor.recovery_queue_.empty();
         outcome.slot_empty      = executor.slots_[0] == nullptr;
         outcome.executor_failed = executor.failed_;
+        outcome.runtime_disk_h2d_seconds = executor.runtime_stats().kv_disk_h2d_seconds;
+        executor.instance_.program->request_cancellation = nullptr;
     }
     return failures + check_scripted_recovery(*executor.instance_.program, outcome);
 }
 
 } // namespace ninfer::runtime
 
-int run_recovery(Frontend& frontend, CacheCase script) {
+int run_recovery(Frontend& frontend, CacheCase script, bool cancel_on_restore = false) {
     ProbeProgram program;
     program.script = script;
+    program.cancel_on_restore = cancel_on_restore;
     ProbeLoaded loaded{frontend};
     RecoveryProbe instance;
     instance.program = &program;
@@ -903,6 +971,62 @@ int run_admission(Frontend& frontend, CacheCase script) {
     }
 }
 
+int run_retry_lifecycle(Frontend& frontend) {
+    ProbeProgram program;
+    program.script = CacheCase::RecoveryResidentHit;
+    program.lifecycle_retries = true;
+    ProbeLoaded loaded{frontend};
+    RecoveryProbe instance;
+    instance.program = &program;
+    instance.loaded = &loaded;
+    auto engine = engine_options();
+    engine.max_context = 32768;
+    ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+
+    auto prepared = frontend.prepare(thinking_input());
+    const auto original_summary = prepared.summary();
+    ninfer::runtime::ResolvedRequestOptions options;
+    options.execution.sampling.p_less = true;
+    options.execution.sampling.temperature = 1.0F;
+    options.execution.allow_prefix_reuse = true;
+    options.execution.requested_output_tokens = 20000;
+    options.stop.token_ids = {15};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ninfer::CancellationView cancel([deadline] {
+        return std::chrono::steady_clock::now() >= deadline;
+    });
+    auto submission = executor.submit(std::move(prepared), original_summary, 0.0, std::move(options),
+                                      ninfer::OutputDelivery::TerminalOnly);
+    const auto result = submission.wait(nullptr, cancel);
+    int failures = 0;
+    failures += check(result.finish_reason == FinishReason::StopToken &&
+                          result.recovery.attempts == 2 && result.recovery.prefill_samples == 2 &&
+                          result.recovery.discarded_reasoning_tokens >= 8192,
+                      "committed reasoning did not trigger and finish both bounded retries");
+    failures += check(result.prompt.prompt_tokens == original_summary.prompt_tokens &&
+                          result.generated_token_ids.size() > 8192 &&
+                          result.generated_token_ids.size() < 20000 &&
+                          result.generated_token_ids.size() ==
+                              executor.runtime_stats().committed_decode_tokens + 3,
+                      "retry lifecycle lost original prompt usage or generated-token accounting");
+    failures += check(program.prefilled_prompts.size() == 3 && program.abort_count == 0,
+                      "retry lifecycle did not preserve the resident lane twice");
+    if (program.prefilled_prompts.size() == 3) {
+        const auto& original = program.prefilled_prompts[0];
+        const auto& first = program.prefilled_prompts[1];
+        const auto& second = program.prefilled_prompts[2];
+        failures += check(first.size() > original.size() && second.size() > first.size() &&
+                              std::equal(original.begin(), original.end(), first.begin()) &&
+                              std::equal(first.begin(), first.end(), second.begin()) &&
+                              std::count(first.begin(), first.end(), 500) == 1 &&
+                              std::count(second.begin(), second.end(), 500) == 1 &&
+                              std::count(second.begin(), second.end(), 501) == 1 &&
+                              second.size() < original.size() + 128,
+                          "second retry lost the first notice or included failed generation");
+    }
+    return failures;
+}
+
 int main() {
     try {
         Frontend frontend = FrontendTestAccess::create_component(resources(), false);
@@ -918,7 +1042,10 @@ int main() {
         };
         int failures = 0;
         for (const CacheCase script : recovery_cases) { failures += run_recovery(frontend, script); }
+        failures += run_recovery(frontend, CacheCase::RecoveryRamHit, true);
+        failures += run_recovery(frontend, CacheCase::RecoveryDiskHit, true);
         for (const CacheCase script : admission_cases) { failures += run_admission(frontend, script); }
+        failures += run_retry_lifecycle(frontend);
         std::cout << "recovery executor failures=" << failures << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

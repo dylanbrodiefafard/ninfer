@@ -17,6 +17,8 @@
 #undef NINFER_QWEN36_RUNTIME_NS
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
+#include "targets/qwen3_6/impl/runtime/prefill_schedule.h"
+#include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <ninfer/types.h>
 
@@ -29,6 +31,7 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -195,6 +198,135 @@ void test_mtp_alignment() {
     expect(final_visual.source_begin == 2 &&
                final_visual.destination_columns == std::vector<std::int32_t>({2}),
            "final shifted visual overlap excludes generated-token column");
+}
+
+void check_vision_prefill_shifted_inputs(
+    const std::array<std::vector<std::int32_t>, 2>& scatter) {
+    constexpr std::uint32_t tokens = 18;
+    std::vector<int> composed(tokens + 1);
+    for (std::uint32_t i = 0; i <= tokens; ++i) { composed[i] = static_cast<int>(i); }
+    for (std::size_t item = 0; item < scatter.size(); ++item) {
+        for (const auto column : scatter[item]) {
+            composed[column] = 1000 + static_cast<int>(item * 100) + column;
+        }
+    }
+    for (const bool mtp : {false, true}) {
+        std::array<q36::detail::VisionUseSpan, 2> uses;
+        for (std::size_t item = 0; item < scatter.size(); ++item) {
+            const auto first = static_cast<std::uint32_t>(scatter[item].front());
+            const auto end = static_cast<std::uint32_t>(scatter[item].back()) + 1;
+            uses[item] = {mtp && first != 0 ? first - 1 : first, first, end,
+                          static_cast<std::uint32_t>(item), 0};
+        }
+        for (const std::uint32_t base : {0U, 3U, 4U, 5U, 7U, 10U, 11U, 14U}) {
+            for (const std::uint32_t maximum : {1U, 4U, 128U}) {
+                std::uint32_t begin = base;
+                while (begin < tokens) {
+                    const auto chunk = q36::detail::select_vision_prefill_chunk(
+                        uses, begin, std::min(maximum, tokens - begin));
+                    expect(chunk.length != 0, "Vision chunk always advances");
+                    if (chunk.length == 0) { break; }
+                    // Independent exact oracle: Text consumes e[t], MTP consumes e[t+1].
+                    std::vector<int> text(chunk.length);
+                    std::vector<int> shifted(chunk.length);
+                    for (std::uint32_t j = 0; j < chunk.length; ++j) {
+                        text[j] = static_cast<int>(begin + j);
+                        shifted[j] = static_cast<int>(begin + j + 1);
+                    }
+                    if (chunk.use_index) {
+                        const auto item = uses[*chunk.use_index].item_index;
+                        for (const auto column : scatter[item]) {
+                            if (column >= static_cast<int>(begin) &&
+                                column < static_cast<int>(begin + chunk.length)) {
+                                text[column - begin] = composed[column];
+                            }
+                        }
+                        if (mtp) {
+                            const auto overlap = q36::shifted_visual_overlap(
+                                scatter[item], tokens,
+                                q36::plan_mtp_alignment_window(tokens, begin, chunk.length));
+                            for (std::size_t j = 0; j < overlap.size(); ++j) {
+                                shifted[overlap.destination_columns[j]] =
+                                    composed[scatter[item][overlap.source_begin + j]];
+                            }
+                        }
+                    }
+                    for (std::uint32_t j = 0; j < chunk.length; ++j) {
+                        expect(text[j] == composed[begin + j],
+                               "Vision chunk preserves every Text visual embedding");
+                        if (mtp) {
+                            expect(shifted[j] == composed[begin + j + 1],
+                                   "Vision chunk preserves MTP's shifted visual embedding");
+                        }
+                    }
+                    begin += chunk.length;
+                }
+            }
+        }
+    }
+}
+
+void test_vision_prefill_shifted_inputs() {
+    // A normal text gap before a noncontiguous video, minimum separation between
+    // image consumer spans, and a visual item starting at the first token.
+    check_vision_prefill_shifted_inputs({{{4, 5, 6}, {11, 13}}});
+    check_vision_prefill_shifted_inputs({{{4, 5, 6}, {8, 9}}});
+    check_vision_prefill_shifted_inputs({{{0, 1}, {3, 5}}});
+
+    const std::array<q36::detail::VisionUseSpan, 2> uses{{
+        {3, 4, 7, 0, 0}, {10, 11, 14, 1, 3}}};
+    const auto cold = q36::detail::select_vision_prefill_chunk(uses, 0, 18);
+    expect(cold.length == 4 && cold.use_index == 0,
+           "cold Text matches a four-token reused prefix while MTP sees the first image");
+    const auto prefix = q36::detail::select_vision_prefill_chunk(uses, 0, 3);
+    expect(prefix.length == 3 && !prefix.use_index,
+           "text before the shifted visual consumer needs no Vision embeddings");
+    const auto visual = q36::detail::select_vision_prefill_chunk(uses, 4, 14);
+    expect(visual.length == 6 && visual.use_index == 0,
+           "active image stops before the next item's shifted visual consumer");
+    const auto next_bridge = q36::detail::select_vision_prefill_chunk(uses, 10, 8);
+    expect(next_bridge.length == 1 && next_bridge.use_index == 1,
+           "next item's bridge-only chunk receives its shifted visual embedding");
+}
+
+void test_multimodal_prefill_service_projection() {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids.resize(800);
+    prompt.vision_items.resize(1);
+    prompt.turn_closure_frontiers = {100, 160, 220, 280, 340, 400, 460, 520, 580, 640, 700, 760};
+    constexpr std::uint32_t rewrite = 770;
+    const std::array<q36::detail::VisionUseSpan, 1> uses{{{3, 4, 67, 0, 0}}};
+    // Cold: one text/image boundary, twelve historical headers, the rewrite
+    // frontier, then the tail. Reused suffixes omit the boundaries behind them.
+    const std::array<std::pair<std::uint32_t, std::uint64_t>, 5> cases{{
+        {0, 15}, {67, 14}, {400, 8}, {760, 2}, {800, 1}}};
+    for (const auto& [base, expected] : cases) {
+        for (const std::uint32_t maximum : {128U, 1024U, 8192U}) {
+            const auto reserved =
+                q36::detail::projected_prefill_work(prompt, base, maximum, uses, rewrite);
+            expect(reserved == expected,
+                   "one-token image request reserves all historical turn prefill steps");
+        }
+    }
+    prompt.vision_items.clear();
+    expect(q36::detail::projected_prefill_work(prompt, 0, 1024, {}, rewrite) == 2,
+           "text-only projection does not reserve unused historical turn splits");
+    prompt.token_ids.resize(8192);
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, {}, 100) == 3,
+           "rewrite split of aligned 8192 tokens reserves both irregular tail steps");
+    prompt.vision_items.resize(1);
+    prompt.turn_closure_frontiers = {100};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, {}, std::nullopt) == 3,
+           "historical turn split reserves both irregular tail steps");
+    prompt.turn_closure_frontiers.clear();
+    const std::array<q36::detail::VisionUseSpan, 1> tail_image{{{100, 100, 164, 0, 0}}};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, tail_image, std::nullopt) == 3,
+           "Vision split reserves both irregular tail steps");
+    prompt.token_ids.resize(18);
+    const std::array<q36::detail::VisionUseSpan, 2> two_images{{
+        {3, 4, 7, 0, 0}, {10, 11, 14, 1, 3}}};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 128, two_images, std::nullopt) == 4,
+           "MTP image request reserves text-prefix, first image, next bridge, and next image");
 }
 
 void test_vision_control() {
@@ -1333,6 +1465,8 @@ int main() {
     test_decoder_layout();
     test_round_layout();
     test_mtp_alignment();
+    test_vision_prefill_shifted_inputs();
+    test_multimodal_prefill_service_projection();
     test_vision_control();
     test_prefix_identity();
     test_prefix_hash_and_dflash_gate();
