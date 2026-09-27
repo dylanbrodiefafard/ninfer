@@ -64,7 +64,7 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
                     std::int32_t tokens, cudaStream_t stream) {
     constexpr bool kResidualGeometry = std::is_same_v<Geometry, Nvfp4Residual6144Geometry> ||
                                        std::is_same_v<Geometry, Nvfp4Residual17408Geometry>;
-    if (nvfp4_w4a4_tma_route(tokens)) {
+    if (nvfp4_w4a4_tma_route(Geometry::kOutputRows, Geometry::kInputRows, tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear(
             resolve_nvfp4_problem(Geometry::kOutputRows, Geometry::kInputRows), workspace.codes,
@@ -140,8 +140,9 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_projection_scale_layout(tokens),
-                               stream);
+    launch_nvfp4_w4a4_quantize(
+        x, weight, workspace, nvfp4_w4a4_projection_scale_layout(weight.n, weight.k, tokens),
+        stream);
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::AttnInput:
         launch_problem<Nvfp4AttnInputGeometry>(weight, out, workspace, tokens, stream);

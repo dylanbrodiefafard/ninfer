@@ -81,9 +81,13 @@ void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Ten
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_projection_scale_layout(tokens),
-                               stream);
-    if (nvfp4_w4a4_tma_route(tokens)) {
+    launch_nvfp4_w4a4_quantize(
+        x, weight, workspace,
+        nvfp4_w4a4_projection_scale_layout(Nvfp4GdnInputGeometry::kOutputRows,
+                                           Nvfp4GdnInputGeometry::kInputRows, tokens),
+        stream);
+    if (nvfp4_w4a4_tma_route(Nvfp4GdnInputGeometry::kOutputRows,
+                             Nvfp4GdnInputGeometry::kInputRows, tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_gdn(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),

@@ -11,8 +11,8 @@ namespace ninfer::ops::detail {
 // selects its layout.
 inline constexpr std::int32_t kNvfp4TmaBlockM       = 256;
 inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
-// Every registered W4A4 projection (linear, linear_add, attention and GDN input) takes the TMA
-// route from this width; the fused SwiGLU TMA route has its own whole-tile predicate.
+// Widths from which a W4A4 projection with an unmeasured shape takes the TMA route; the fused
+// SwiGLU TMA route has its own predicate.
 inline constexpr std::int32_t kNvfp4W4a4TmaMinTokens = 1024;
 
 enum class Nvfp4ScaleLayout : std::uint8_t {
@@ -20,13 +20,31 @@ enum class Nvfp4ScaleLayout : std::uint8_t {
     Tiled,
 };
 
-[[nodiscard]] constexpr bool nvfp4_w4a4_tma_route(std::int32_t tokens) noexcept {
+// Per-shape W4A4 route: TMA or the tuned MMA schedules. RTX 5090 op medians, MMA -> TMA:
+// - 34816x5120 (gate/up) and 16384x5120 (GDN input): TMA wins or ties from T=256
+//   (e.g. T768 366->198 and 135->117 us).
+// - 14336x5120 (attention input): TMA wins at T=256 and above 384, but the resident MMA
+//   schedule is faster through T=384 (T384 63 vs 84 us).
+// - 5120x6144 and 5120x17408 (residual linear_add): MMA is within a few percent at T=256..384
+//   and faster at T=512 (45 vs 57, 111 vs 133 us); TMA wins above 512 (T768 70->63, 174->143).
+// Unmeasured shapes keep kNvfp4W4a4TmaMinTokens.
+[[nodiscard]] constexpr bool nvfp4_w4a4_tma_route(std::int32_t output_rows,
+                                                  std::int32_t input_rows,
+                                                  std::int32_t tokens) noexcept {
+    if (input_rows == 5120 && (output_rows == 34816 || output_rows == 16384)) {
+        return tokens >= 256;
+    }
+    if (input_rows == 5120 && output_rows == 14336) { return tokens == 256 || tokens > 384; }
+    if (output_rows == 5120 && (input_rows == 6144 || input_rows == 17408)) {
+        return tokens > 512;
+    }
     return tokens >= kNvfp4W4a4TmaMinTokens;
 }
 
 [[nodiscard]] constexpr Nvfp4ScaleLayout nvfp4_w4a4_projection_scale_layout(
-    std::int32_t tokens) noexcept {
-    return nvfp4_w4a4_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled : Nvfp4ScaleLayout::RowMajor;
+    std::int32_t output_rows, std::int32_t input_rows, std::int32_t tokens) noexcept {
+    return nvfp4_w4a4_tma_route(output_rows, input_rows, tokens) ? Nvfp4ScaleLayout::Tiled
+                                                                  : Nvfp4ScaleLayout::RowMajor;
 }
 
 // Token extent of the tiled plane: whole tiles, padding zero-filled by the quantizer.
