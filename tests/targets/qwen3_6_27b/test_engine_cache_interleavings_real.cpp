@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -187,14 +188,32 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
         }
         const auto stats = engine.runtime_stats();
         if (stats.running_requests != 0 || stats.waiting_requests != 0 || stats.kv_ram_drops != 0) {
-            throw std::runtime_error("cancellation matrix leaked a request or dropped its cache fixture");
+            throw std::runtime_error(
+                "cancellation matrix leaked a request or dropped its cache fixture: running=" +
+                std::to_string(stats.running_requests) +
+                " waiting=" + std::to_string(stats.waiting_requests) +
+                " ram_drops=" + std::to_string(stats.kv_ram_drops) +
+                " disk_drops=" + std::to_string(stats.kv_disk_drops) +
+                " disk_captures=" + std::to_string(stats.kv_disk_captures));
         }
         std::cerr << "cache interleavings " << (disk_enabled ? "RAM+disk" : "RAM")
                   << " C=" << concurrency << " early=" << early_cancel
                   << " cancellation mask=" << mask << " passed\n";
     }
-    if (disk_enabled && engine.runtime_stats().kv_disk_captures == 0) {
-        throw std::runtime_error("combined cache matrix did not execute any disk spill");
+    if (disk_enabled) {
+        // Idle spill is background work that admissions no longer wait for, so the first
+        // durable capture can land after the last request returns. The idle Engine must still
+        // persist one within a bounded time.
+        const auto started = std::chrono::steady_clock::now();
+        while (engine.runtime_stats().kv_disk_captures == 0) {
+            if (std::chrono::steady_clock::now() - started > std::chrono::seconds(120)) {
+                throw std::runtime_error("combined cache matrix did not execute any disk spill");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::cerr << "cache interleavings first disk capture after "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+                  << " s idle\n";
     }
 }
 

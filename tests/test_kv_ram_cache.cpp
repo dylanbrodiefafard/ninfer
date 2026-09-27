@@ -136,6 +136,7 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
             }
         }
         CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
 
@@ -1945,12 +1946,14 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gdn.conv_slot(0, 1).data, conv_ckpt.data(), conv_ckpt.size(),
                            cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     std::vector<unsigned char> rec_cur(gdn.recurrent_slot(0, 0).bytes(), 0x21);
     std::vector<unsigned char> rec_ckpt(gdn.recurrent_slot(0, 1).bytes(), 0x22);
     CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(1, 0).data, rec_cur.data(), rec_cur.size(),
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(1, 1).data, rec_ckpt.data(), rec_ckpt.size(),
                            cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
 
     ninfer::CyclicKVCacheLayerView local_view = dflash_local.layer_view(0);
     std::vector<unsigned char> k_local(local_view.k.slice(3, 0, 1).bytes(), 0x3c);
@@ -1959,6 +1962,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(local_view.v.slice(3, 0, 1).data, v_local.data(), v_local.size(),
                            cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     ninfer::CyclicKVCacheLayerView ckpt_view = dflash_ckpt.layer_view(0);
     std::vector<unsigned char> k_ckpt(ckpt_view.k.slice(3, 0, 1).bytes(), 0x4c);
     std::vector<unsigned char> v_ckpt(ckpt_view.v.slice(3, 0, 1).bytes(), 0x4d);
@@ -1966,6 +1970,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ckpt_view.v.slice(3, 0, 1).data, v_ckpt.data(), v_ckpt.size(),
                            cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
 
     ninfer::DeviceBuffer hidden_buf(128);
     hidden_buf.fill(0xa1);
@@ -2168,6 +2173,7 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
                                gdn.conv_slot_bytes(), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 1).data, rec_rewrite.data(),
                                gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 
     ninfer::DeviceBuffer hidden_buf(128);
@@ -2282,11 +2288,14 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
     ninfer::Tensor rewrite_out(rewrite_out_buf.p, ninfer::DType::U8, {128});
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
         CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         CUDA_CHECK(
             cudaMemset(gdn.recurrent_slot(layer, 2).data, 0, gdn.recurrent_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 3).data, 0xee, gdn.conv_slot(layer, 3).bytes()));
         CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 3).data, 0xee,
                               gdn.recurrent_slot(layer, 3).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 
     q36::detail::RamRestoreTarget target;
@@ -2356,14 +2365,18 @@ int test_context_checkpoint_middle_head(ninfer::DeviceContext& ctx) {
                            const std::vector<unsigned char>& hid_expect, bool expect_rewrite) {
         CUDA_CHECK(cudaMemset(hidden_out.data, 0, hidden_out.bytes()));
         CUDA_CHECK(cudaMemset(rewrite_out.data, 0xee, rewrite_out.bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
             CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
             CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 2).data, 0,
                                   gdn.recurrent_slot(layer, 2).bytes()));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
             CUDA_CHECK(
                 cudaMemset(gdn.conv_slot(layer, 3).data, 0xee, gdn.conv_slot(layer, 3).bytes()));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
             CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 3).data, 0xee,
                                   gdn.recurrent_slot(layer, 3).bytes()));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         }
         target_rewrite.fill(0xee);
         target.reuse_base     = frontier;
@@ -2569,8 +2582,10 @@ int test_context_checkpoint_two_ram_entries(ninfer::DeviceContext& ctx) {
             CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
             CUDA_CHECK(cudaMemset(gdn.recurrent_slot(layer, 2).data, 0,
                                   gdn.recurrent_slot(layer, 2).bytes()));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         }
         CUDA_CHECK(cudaMemset(hidden_out.data, 0, hidden_out.bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         q36::detail::RamRestoreTarget target;
         target.text             = &text_dest;
         target.text_pool        = &text_pool;
@@ -3066,6 +3081,7 @@ int test_context_checkpoint_catch_up_frontier(ninfer::DeviceContext& ctx) {
                                cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 0).data, rec_live.data(),
                                gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 
     ninfer::DeviceBuffer hidden_buf(32);
@@ -3137,8 +3153,10 @@ int test_context_checkpoint_catch_up_frontier(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {32});
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
         CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         CUDA_CHECK(
             cudaMemset(gdn.recurrent_slot(layer, 2).data, 0, gdn.recurrent_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
     q36::detail::RamRestoreTarget target;
     target.text           = &text_dest;
@@ -3213,6 +3231,7 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
                                cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(gdn.recurrent_slot(layer, 0).data, rec_exec.data(),
                                gdn.recurrent_slot_bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
     ninfer::DeviceBuffer hidden_buf(128);
     hidden_buf.fill(0xaa);
@@ -3298,8 +3317,10 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {128});
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
         CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0xee, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         CUDA_CHECK(
             cudaMemset(gdn.recurrent_slot(layer, 2).data, 0xee, gdn.recurrent_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
     q36::detail::RamRestoreTarget target;
     target.text             = &text_dest;
@@ -3656,6 +3677,7 @@ int test_context_checkpoint_dflash_cyclic_isolation(ninfer::DeviceContext& ctx) 
                            cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(local_view.v.slice(3, 0, 1).data, v_evict.data(), v_evict.size(),
                            cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     std::vector<unsigned char> cyclic_head(dflash_local.lane_host_bytes(), 0xa5);
 
     ninfer::DeviceBuffer hidden_buf(128);
@@ -3735,6 +3757,7 @@ int test_context_checkpoint_dflash_cyclic_isolation(ninfer::DeviceContext& ctx) 
                            k_poison.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dflash_local.layer_view(0).v.slice(3, 1, 1).data, v_poison.data(),
                            v_poison.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     ctx.synchronize_all();
 
     q36::detail::RamRestoreTarget target;
@@ -4454,8 +4477,10 @@ int test_context_checkpoint_same_f_fifo_first_wins(ninfer::DeviceContext& ctx) {
     ninfer::Tensor hidden_out(hidden_out_buf.p, ninfer::DType::U8, {32});
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
         CUDA_CHECK(cudaMemset(gdn.conv_slot(layer, 2).data, 0, gdn.conv_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         CUDA_CHECK(
             cudaMemset(gdn.recurrent_slot(layer, 2).data, 0, gdn.recurrent_slot(layer, 2).bytes()));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
     q36::detail::RamRestoreTarget target;
     target.text             = &text_dest;
@@ -5590,10 +5615,12 @@ int main(int argc, char** argv) {
             pattern[i] = static_cast<unsigned char>(i * 3 + 1);
         }
         CUDA_CHECK(cudaMemcpy(conv.data, pattern.data(), pattern.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         const ninfer::Tensor rec = gdn.recurrent_slot(1, 0);
         std::vector<unsigned char> rec_pattern(rec.bytes(), 0xab);
         CUDA_CHECK(
             cudaMemcpy(rec.data, rec_pattern.data(), rec_pattern.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         std::vector<unsigned char> conv_host(gdn.conv_host_image_bytes());
         std::vector<unsigned char> rec_host(gdn.recurrent_host_image_bytes());
         gdn.pack_slot_to_host(0, conv_host.data(), rec_host.data(), ctx.stream);
@@ -5626,9 +5653,11 @@ int main(int argc, char** argv) {
         std::vector<unsigned char> k_pattern(layer.k.slice(3, 0, 1).bytes(), 0x3c);
         CUDA_CHECK(cudaMemcpy(layer.k.slice(3, 0, 1).data, k_pattern.data(), k_pattern.size(),
                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         std::vector<unsigned char> v_pattern(layer.v.slice(3, 0, 1).bytes(), 0x4d);
         CUDA_CHECK(cudaMemcpy(layer.v.slice(3, 0, 1).data, v_pattern.data(), v_pattern.size(),
                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         std::vector<unsigned char> host(cyclic.lane_host_bytes());
         cyclic.copy_lane_to_host(0, host.data(), ctx.stream);
         ctx.synchronize_all();

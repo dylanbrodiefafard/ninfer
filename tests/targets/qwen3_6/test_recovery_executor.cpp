@@ -19,6 +19,7 @@
 #include <iostream>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -234,6 +235,7 @@ struct DiskSnapshot {
     std::uint64_t drops        = 0;
     double save_seconds        = 0;
     double load_seconds        = 0;
+    std::uint64_t sequence     = 0;
 };
 
 struct GpuPoolSnapshot {
@@ -515,6 +517,9 @@ public:
     void shutdown_kv_tiers(ninfer::LoadProgress = {}) {}
     [[nodiscard]] RamSnapshot kv_ram_snapshot() const noexcept { return {}; }
     [[nodiscard]] DiskSnapshot kv_disk_snapshot() const noexcept { return {}; }
+    [[nodiscard]] std::optional<DiskSnapshot> try_kv_disk_snapshot() const noexcept {
+        return DiskSnapshot{};
+    }
     [[nodiscard]] GpuSnapshot kv_gpu_snapshot() const noexcept { return {}; }
     [[nodiscard]] RamCopySeconds harvest_kv_ram_copy_seconds() {
         if (!std::exchange(ram_timings_pending_, false)) { return {}; }

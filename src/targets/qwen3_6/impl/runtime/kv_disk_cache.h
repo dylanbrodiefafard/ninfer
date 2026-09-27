@@ -242,6 +242,9 @@ public:
     void release_restore_ticket(std::uint64_t epoch);
     KvDiskCopySeconds harvest_copy_seconds();
     [[nodiscard]] KvDiskSnapshot snapshot() const noexcept;
+    // Non-blocking read for stats observers: empty while compaction or a tombstone fsync holds
+    // the index lock, so a scrape never waits behind disk I/O.
+    [[nodiscard]] std::optional<KvDiskSnapshot> try_snapshot() const noexcept;
     [[nodiscard]] std::uint64_t index_version() const noexcept {
         return index_version_.load(std::memory_order_relaxed);
     }
@@ -593,6 +596,8 @@ private:
     void enqueue(Job job, std::unique_lock<std::mutex>* lock = nullptr);
     [[nodiscard]] std::optional<Job> take_job(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] std::optional<Job> take_restore_job(std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] KvDiskSnapshot snapshot_locked() const noexcept;
+    [[nodiscard]] bool compaction_blocked_locked() const noexcept;
     [[nodiscard]] bool prefetch_readable_locked() const noexcept;
     [[nodiscard]] bool restore_readers_busy_locked() const noexcept;
     [[nodiscard]] bool restore_or_prefetch_busy_locked() const noexcept;
@@ -921,6 +926,7 @@ private:
     mutable std::atomic<DiskFaultPoint> test_next_fault_point_{DiskFaultPoint::None};
 
     mutable std::mutex mutex_;
+    mutable std::uint64_t snapshot_sequence_ = 0; // guarded by mutex_
     std::condition_variable cv_;
     std::condition_variable idle_cv_;
     // CUDA device of the constructing thread; I/O and restore threads bind it before issuing

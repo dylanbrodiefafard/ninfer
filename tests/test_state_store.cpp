@@ -671,6 +671,7 @@ int main() {
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
     ninfer::DeviceArena state_arena(state_plan.bytes);
     CUDA_CHECK(cudaMemset(state_arena.base(), 0x4a, state_arena.capacity()));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     ninfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
                                            state_plan.layout);
 

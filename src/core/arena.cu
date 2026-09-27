@@ -168,7 +168,10 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
 
 void DeviceBuffer::fill(int byte_value) {
     if (bytes == 0) { return; }
-    const cudaError_t err = cudaMemset(p, byte_value, bytes);
+    // cudaMemset and pageable cudaMemcpy may return before the device write lands; these
+    // helpers are synchronous, so wait on the legacy stream they use.
+    cudaError_t err = cudaMemset(p, byte_value, bytes);
+    if (err == cudaSuccess) { err = cudaStreamSynchronize(cudaStreamLegacy); }
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
     }
@@ -178,7 +181,8 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
     void* destination     = static_cast<std::uint8_t*>(p) + byte_offset;
-    const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
+    cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) { err = cudaStreamSynchronize(cudaStreamLegacy); }
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
     }

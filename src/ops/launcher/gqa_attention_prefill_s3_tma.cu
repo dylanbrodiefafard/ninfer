@@ -11,9 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <map>
 #include <mutex>
 #include <thread>
-#include <unordered_map>
+#include <tuple>
 
 namespace ninfer::ops::detail {
 
@@ -106,20 +107,25 @@ inline int gqa_s3_tma_stages() {
     return stages;
 }
 
+// The descriptor bakes in every pool base and the page count, so all of them identify it: a
+// later KV pool allocated at a recycled K address must not reuse a stale descriptor.
+using GqaS3TmaDescKey = std::tuple<const void*, const void*, const void*, std::int32_t>;
+
 struct GqaS3TmaDescCache {
     std::mutex* mutex                                     = nullptr;
-    std::unordered_map<const void*, void*>* entries       = nullptr;
+    std::map<GqaS3TmaDescKey, void*>* entries             = nullptr;
 };
 
 __host__ inline GqaS3TmaDescCache& gqa_s3_tma_desc_cache() {
     static GqaS3TmaDescCache cache = [] {
-        return GqaS3TmaDescCache{new std::mutex, new std::unordered_map<const void*, void*>};
+        return GqaS3TmaDescCache{new std::mutex, new std::map<GqaS3TmaDescKey, void*>};
     }();
     return cache;
 }
 
 template <typename Geometry, typename CacheView>
-__host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache) {
+__host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache,
+                                                         cudaStream_t stream) {
     const Tensor& cache_k           = cache.k_pages;
     const std::int64_t per_page     = static_cast<std::int64_t>(kGqaNvfp4CodeWidth) *
                                   kPagedKVPageSize * Geometry::KVHeads;
@@ -131,7 +137,7 @@ __host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache) 
 
     GqaS3TmaDescCache& cache_store = gqa_s3_tma_desc_cache();
     std::lock_guard<std::mutex> lock(*cache_store.mutex);
-    const void* key = cache_k.data;
+    const GqaS3TmaDescKey key{cache_k.data, cache.v_pages.data, cache.k_scale_pages.data, pages};
     {
         const auto found = cache_store.entries->find(key);
         if (found != cache_store.entries->end()) {
@@ -147,7 +153,10 @@ __host__ const GqaNvfp4s3TmaDesc* gqa_s3_tma_descriptor(const CacheView& cache) 
     }
     void* device = nullptr;
     if (cudaMalloc(&device, sizeof(GqaNvfp4s3TmaDesc)) != cudaSuccess ||
-        cudaMemcpy(device, &desc, sizeof(desc), cudaMemcpyHostToDevice) != cudaSuccess) {
+        // Ordered before the launch on the same stream; a synchronous pageable cudaMemcpy may
+        // return before its DMA lands.
+        cudaMemcpyAsync(device, &desc, sizeof(desc), cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess) {
         if (device != nullptr) { cudaFree(device); }
         return nullptr;
     }
@@ -163,7 +172,7 @@ bool gqa_s3_prefill_tma_try_launch(const Tensor& q, const Tensor& positions, flo
                                    cudaStream_t stream, float keep_frac, GqaS3PrefillDump* dump,
                                    std::uint32_t* dbg_regs, std::uint8_t* dbg_q) {
     if (!gqa_s3_tma_enabled() || keep_frac != 1.0f) { return false; }
-    const GqaNvfp4s3TmaDesc* desc_dev = gqa_s3_tma_descriptor<Geometry, CacheView>(cache);
+    const GqaNvfp4s3TmaDesc* desc_dev = gqa_s3_tma_descriptor<Geometry, CacheView>(cache, stream);
     if (desc_dev == nullptr) { return false; }
 
     const Tensor& cache_v_scale = cache.v_scale_pages;

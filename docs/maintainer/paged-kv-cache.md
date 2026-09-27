@@ -979,7 +979,10 @@ new page required when an exact-hit bridge extends validity after cancelled pref
 Compaction copies live extents into a new generation, publishes its complete base map, and then
 atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
 durable and all reader leases have drained. Admission requires the copy-on-write reserve before
-the first compaction or spill byte is written. Eviction uses durable tombstones so an uncertain
+the first compaction or spill byte is written. Compaction does not start while a restore, reader
+claim, or payload I/O still uses the current generation; an emergency spill then appends past
+the garbage threshold inside that reserve, and an idle spill defers without marking its entry
+failed, so compaction runs at the next quiescent admission. Eviction uses durable tombstones so an uncertain
 metadata publication cannot make a referenced object reusable. Before capacity eviction, admission
 checks that the incoming incremental bytes plus unique extents protected by claims or I/O pins
 (including a spill's parent) fit the budget. Known capacity shortfalls are rejected without
