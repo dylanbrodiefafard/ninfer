@@ -505,26 +505,40 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
 void append_turn_closure_frontiers(EncodedChat& encoded, const Tokenizer& tokenizer,
                                    const RenderedChat& rendered) {
     encoded.turn_closure_frontiers.reserve(rendered.turn_closure_offsets.size());
+    std::size_t byte_begin  = 0;
+    std::size_t token_begin = 0;
     for (const std::size_t offset : rendered.turn_closure_offsets) {
+        if (offset < byte_begin || offset > rendered.text.size()) {
+            throw std::logic_error("turn closure byte offsets are outside the ordered chat");
+        }
         if (rendered.rewrite_checkpoint && encoded.rewrite_checkpoint &&
             offset == rendered.rewrite_checkpoint->offset) {
             encoded.turn_closure_frontiers.push_back(encoded.rewrite_checkpoint->frontier);
+            byte_begin  = offset;
+            token_begin = encoded.rewrite_checkpoint->frontier;
             continue;
         }
-        if (offset > rendered.text.size()) {
-            throw std::logic_error("turn closure byte offset exceeds rendered chat");
-        }
         if (offset == 0) { continue; }
-        const std::vector<int> prefix =
-            tokenizer.encode(std::string_view(rendered.text).substr(0, offset));
-        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
-            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+        // Each boundary ends the assistant header's newline, a Qwen tokenization
+        // boundary. Encode disjoint intervals, including NFC normalization, and
+        // check them against the full encoding instead of re-encoding history for
+        // every assistant turn.
+        const std::vector<int> interval =
+            tokenizer.encode(std::string_view(rendered.text).substr(byte_begin, offset - byte_begin));
+        if (interval.size() > encoded.input_ids.size() - token_begin ||
+            !std::equal(interval.begin(), interval.end(),
+                        encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_begin))) {
             throw std::logic_error("turn closure is not an exact token prefix");
         }
-        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+        byte_begin = offset;
+        token_begin += interval.size();
+        if (token_begin == 0) {
+            throw std::logic_error("turn closure is not an exact token prefix");
+        }
+        if (token_begin > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("turn closure token frontier exceeds uint32");
         }
-        const auto frontier = static_cast<std::uint32_t>(prefix.size());
+        const auto frontier = static_cast<std::uint32_t>(token_begin);
         if (frontier < encoded.input_ids.size()) {
             encoded.turn_closure_frontiers.push_back(frontier);
         }

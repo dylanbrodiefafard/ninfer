@@ -490,39 +490,15 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     }
     const std::uint64_t nominal_end64 =
         static_cast<std::uint64_t>(begin) + static_cast<std::uint64_t>(nominal_length);
-    std::uint32_t end = static_cast<std::uint32_t>(
+    const std::uint32_t end = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
-
-    const VisionUseSpan* active = nullptr;
-    for (const VisionUseSpan& use : plan_.uses) {
-        if (use.end <= begin) { continue; }
-        if (use.begin >= end) { break; }
-        if (active == nullptr) {
-            if (use.item_index >= plan_.control->items.size()) {
-                throw std::logic_error("Vision prefill item index is out of range");
-            }
-            const auto& upcoming = plan_.control->items[use.item_index];
-            const std::uint32_t image_at =
-                upcoming.scatter_indices.empty()
-                    ? use.begin
-                    : static_cast<std::uint32_t>(upcoming.scatter_indices.front());
-            // Ordinary tokens before the first image column, including the MTP bridge
-            // token, stay on the text path. A prefix that ends on that column then
-            // continues with the same visual chunk a cold prefill uses.
-            if (image_at > begin) {
-                end = std::min(end, image_at);
-                break;
-            }
-            active = &use;
-        } else {
-            end = std::min(end, use.begin);
-            break;
-        }
+    const VisionChunkSelection selected =
+        select_vision_prefill_chunk(plan_.uses, begin, end - begin);
+    if (selected.length == 0) { throw std::logic_error("Vision chunk cap made no forward progress"); }
+    if (!selected.use_index) {
+        return VisionChunk{static_cast<std::int32_t>(selected.length), nullptr, {}};
     }
-    if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
-    if (active == nullptr) {
-        return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
-    }
+    const VisionUseSpan* active = &plan_.uses[*selected.use_index];
     if (active->item_index >= plan_.control->items.size() ||
         active->item_index >= prompt_.vision_items.size()) {
         throw std::logic_error("Vision prefill item index is out of range");
@@ -576,7 +552,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         }
         active_item_ = active->item_index;
     }
-    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+    return VisionChunk{static_cast<std::int32_t>(selected.length), &control, output};
 }
 
 bool VisionPrefillSession::release_consumed_media_payload() noexcept {

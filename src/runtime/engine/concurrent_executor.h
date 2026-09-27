@@ -795,8 +795,8 @@ private:
         }
     }
 
-    void begin_recovery_prefill(const std::shared_ptr<Request>& request, std::uint32_t lane,
-                                Plan plan) {
+    [[nodiscard]] PrefillStepResult begin_recovery_prefill(
+        const std::shared_ptr<Request>& request, std::uint32_t lane, Plan plan) {
         const RequestPlanSummary summary = plan.summary();
         instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
         prefill_lane_ = lane;
@@ -806,6 +806,11 @@ private:
             &request->output);
         request->recovery.prefill_seconds +=
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
+        return first;
+    }
+
+    void resolve_recovery_prefill(const std::shared_ptr<Request>& request,
+                                  const PrefillStepResult& first) {
         (void)resolve_prefill_step(request, first,
                                    request->cancelled.load(std::memory_order_acquire));
         publish_runtime_stats();
@@ -871,7 +876,7 @@ private:
             if (instance_.program->kv_disk_restore_failed()) {
                 throw CacheRestoreFailure("disk cache restore failed");
             }
-            begin_recovery_prefill(request, lane, std::move(host_plan));
+            const auto first = begin_recovery_prefill(request, lane, std::move(host_plan));
             const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
             request->kv_ram_save_seconds += copies.save;
             request->kv_ram_load_seconds += copies.load;
@@ -888,6 +893,9 @@ private:
                 disk_claimed = false;
             }
             consumed = true;
+            // A first-step stop or cancellation publishes the terminal result here.
+            // Account for the restore and finish its claim before publication.
+            resolve_recovery_prefill(request, first);
             return true;
         } catch (const CacheRestoreFailure&) {
             try {
@@ -1095,15 +1103,18 @@ private:
 
             auto cold_prefill = [&] {
                 release_recovery_lane(lane);
-                begin_recovery_prefill(
+                const auto first = begin_recovery_prefill(
                     request, lane,
                     instance_.program->plan_request_for_lane(lane, request->prompt, base));
+                resolve_recovery_prefill(request, first);
             };
             using Route = targets::qwen3_6::RecoveryPrefillRoute;
             switch (decision.route) {
-            case Route::ResidentSuffix:
-                begin_recovery_prefill(request, lane, std::move(*lane_plan));
+            case Route::ResidentSuffix: {
+                const auto first = begin_recovery_prefill(request, lane, std::move(*lane_plan));
+                resolve_recovery_prefill(request, first);
                 return true;
+            }
             case Route::HostRam:
             case Route::HostDisk: {
                 release_recovery_lane(lane);

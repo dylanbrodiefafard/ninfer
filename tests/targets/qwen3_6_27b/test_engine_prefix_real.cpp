@@ -830,6 +830,32 @@ int exercise_vision(ninfer::Engine& engine) {
         std::cerr << "visual MTP bridge changed greedy output relative to full prefill\n";
         return 1;
     }
+
+    // Historical turn boundaries create real prefill steps even when the entire
+    // prompt fits in one ordinary chunk. A one-token budget leaves no spare decode
+    // work that could hide an underestimated service reservation.
+    auto history = first_input(image_bytes);
+    history.options.preserve_thinking = false;
+    for (int turn = 0; turn < 12; ++turn) {
+        ninfer::ChatMessage assistant;
+        assistant.role = ninfer::ChatRole::Assistant;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "A colorful gradient.", .media = {}});
+        history.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Describe another detail.", .media = {}});
+        history.messages.push_back(std::move(user));
+    }
+    auto one_token = options(false);
+    one_token.execution.requested_output_tokens = 1;
+    const auto historical = engine.generate(engine.prepare(history), one_token);
+    if (historical.generated_token_ids.size() != 1 ||
+        historical.finish_reason != ninfer::FinishReason::OutputLimit) {
+        std::cerr << "multimodal history exhausted its prefill service reservation\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -898,7 +924,13 @@ int exercise_artifact(const char* artifact) {
     return vision_rc;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const bool vision_only = argc == 3 && std::string(argv[1]) == "--case" &&
+                             std::string(argv[2]) == "vision";
+    if (argc != 1 && !vision_only) {
+        std::cerr << "usage: prefix_real [--case vision]\n";
+        return 1;
+    }
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
@@ -909,13 +941,24 @@ int main() {
                      "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
         return 77;
     }
+    if (vision_only && (groupwise == nullptr || *groupwise == '\0') &&
+        (nvfp4 == nullptr || *nvfp4 == '\0')) {
+        std::cerr << "vision case requires the MTP artifact\n";
+        return 1;
+    }
     if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
+        if (vision_only) {
+            ninfer::Engine engine(engine_options(groupwise));
+            if (const int result = exercise_vision(engine); result != 0) { return result; }
+        } else if (const int result = exercise_artifact(groupwise); result != 0) { return result; }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
+        if (vision_only) {
+            ninfer::Engine engine(engine_options(nvfp4));
+            if (const int result = exercise_vision(engine); result != 0) { return result; }
+        } else if (const int result = exercise_artifact(nvfp4); result != 0) { return result; }
     }
-    if (dflash != nullptr && *dflash != '\0') {
+    if (!vision_only && dflash != nullptr && *dflash != '\0') {
         ninfer::Engine engine(dflash_engine_options(dflash));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         std::cerr << "dflash cancel retain\n";

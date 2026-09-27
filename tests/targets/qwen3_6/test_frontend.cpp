@@ -917,6 +917,71 @@ int test_official_resource_guards() {
     return failures;
 }
 
+int test_turn_closure_token_frontiers() {
+    const auto verify = [](const fi::Tokenizer& tokenizer, const fi::CompiledChatTemplate& chat,
+                           const std::vector<fi::ChatMessage>& messages,
+                           fi::ChatRenderOptions options) {
+        int failures = 0;
+        options.preserve_thinking = false;
+        for (const bool generation : {false, true}) {
+            options.add_generation_prompt = generation;
+            const auto rendered = chat.render(messages, options);
+            const auto encoded  = fi::encode_rendered_chat(tokenizer, rendered);
+            failures += check(encoded.input_ids == tokenizer.encode(rendered.text),
+                              "historical turn boundaries changed the complete prompt tokens");
+            std::vector<std::uint32_t> expected;
+            for (const std::size_t offset : rendered.turn_closure_offsets) {
+                const auto prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, offset));
+                failures += check(prefix.size() <= encoded.input_ids.size() &&
+                                      std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin()),
+                                  "independent turn prefix is not a prefix of the complete encoding");
+                if (prefix.size() < encoded.input_ids.size()) {
+                    expected.push_back(static_cast<std::uint32_t>(prefix.size()));
+                }
+            }
+            failures += check(encoded.turn_closure_frontiers == expected && expected.size() >= 24,
+                              "historical assistant frontiers differ from independent prefix encodings");
+            if (rendered.rewrite_checkpoint) {
+                const auto prefix = tokenizer.encode(std::string_view(rendered.text).substr(
+                    0, rendered.rewrite_checkpoint->offset));
+                failures += check(encoded.rewrite_checkpoint &&
+                                      encoded.rewrite_checkpoint->frontier == prefix.size(),
+                                  "historical turn encoding changed the rewrite checkpoint");
+            }
+        }
+        return failures;
+    };
+
+    std::vector<fi::ChatMessage> messages;
+    for (int i = 0; i < 24; ++i) {
+        messages.push_back(chat_message(ninfer::ChatRole::User, "x"));
+        messages.push_back(chat_message(ninfer::ChatRole::Assistant, "x"));
+    }
+    messages.push_back(chat_message(ninfer::ChatRole::User, "x"));
+    const auto owned = resources();
+    const fi::Tokenizer synthetic({.tokenizer_json         = owned.tokenizer_json,
+                                    .tokenizer_config_json  = owned.tokenizer_config_json,
+                                    .generation_config_json = owned.generation_config_json});
+    int failures = verify(synthetic, thinking_toggle_template(), messages, {});
+    if (skip_without_official_tokenizer("test_turn_closure_token_frontiers official")) {
+        return failures;
+    }
+    for (auto& message : messages) {
+        message.parts.front().text = message.role == ninfer::ChatRole::User
+            ? "Resume cafe\u0301 investigation. 中文 context."
+            : "### Result\nUnicode cafe\u0301, punctuation, and <think>literal markers</think>.";
+    }
+    failures += verify(official_tokenizer(), thinking_toggle_template(), messages, {});
+    fi::ChatRenderOptions effort;
+    effort.reasoning_effort = ninfer::ReasoningEffort::Medium;
+    failures += verify(official_tokenizer(), reasoning_effort_template(), messages, effort);
+    // A trailing tool turn puts the rewrite checkpoint among the historical
+    // frontiers rather than at the final generation header.
+    messages.back().role = ninfer::ChatRole::Tool;
+    failures += verify(official_tokenizer(), reasoning_effort_template(), messages, effort);
+    return failures;
+}
+
 int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::ChatMessage text_message;
     text_message.role = ninfer::ChatRole::User;
@@ -2010,6 +2075,7 @@ int main() {
     failures += test_reasoning_effort_chat_template();
     failures += test_reasoning_effort_empty_history_think();
     failures += test_rewrite_checkpoint_trace();
+    failures += test_turn_closure_token_frontiers();
     failures += test_official_resource_guards();
     failures += test_recovery_fragment(thinking_toggle_template(), false);
     failures += test_recovery_fragment(reasoning_effort_template(), true);
