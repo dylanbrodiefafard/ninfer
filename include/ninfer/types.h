@@ -116,6 +116,11 @@ struct SpeculativeOptions {
     std::uint32_t dflash_verify_width = 0;
     // Startup-only: capture extra draft-K graphs and lock live K at argmax E[Y]/T(k,C,L).
     bool adaptive_draft = false;
+    // DFlash2 draft temperature for p-less requests: drafts are drawn from the 16-candidate
+    // path-select softmax at this temperature and verified against their true proposal q, which
+    // keeps the target distribution exact. <= 0 drafts greedily (argmax). 0.4 measured best at
+    // p-less T=1.5 (C=1 and C=4/6, docs/performance.md).
+    float dflash_p_less_draft_temperature = 0.4f;
 };
 
 struct LoadProgress {

@@ -122,6 +122,21 @@ int main() {
     failures += check(adaptive_without_spec_rejected,
                       "--adaptive-draft was accepted without --spec");
 
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.dflash_p_less_draft_temperature ==
+                          0.4f,
+                      "p-less draft temperature default is not 0.4");
+    const ServeOptions draft_temperature =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "5",
+               "--dflash-p-less-draft-temperature", "0.6"});
+    failures += check(draft_temperature.speculative.dflash_p_less_draft_temperature == 0.6f,
+                      "--dflash-p-less-draft-temperature did not set SpeculativeOptions");
+    bool negative_draft_temperature_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--dflash-p-less-draft-temperature", "-1"});
+    } catch (const std::invalid_argument&) { negative_draft_temperature_rejected = true; }
+    failures += check(negative_draft_temperature_rejected,
+                      "a negative --dflash-p-less-draft-temperature was accepted");
+
     const ServeOptions configured = parse(
         {"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency", "4",
          "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context", "4096",

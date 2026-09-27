@@ -387,11 +387,11 @@ One propose block:
    frontier rather than the batch maximum; graph replay retains the fixed profile envelope.
 4. Path selector (`dflash2_path_select`): unsorted top-16 of those logits, then the Markov score
    `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum.
-   Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`,
-   except under p-less: p-less temperature is a target-distribution parameter, so the selector
-   stays greedy / one-hot `q` (same chain convention as MTP). Chain accept also ignores any
-   recorded 16-way `q` under p-less and uses that one-hot convention, so a stale or temperature-2
-   softmax shortlist cannot inflate `p/q` and lock onto copied n-grams.
+   Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`.
+   Under p-less the target temperature is not reused for drafting: the selector draws at
+   `--dflash-p-less-draft-temperature` (default 0.4; 0 is greedy, one-hot `q`), and chain accept
+   uses the recorded `q`, which is exact for any proposal law. Drafting at the p-less target
+   temperature itself accepts less than greedy; 0.4 accepts more (docs/performance.md).
    Selector RNG is keyed by request seed and absolute token position, independent of compact batch
    row. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
 5. The 27B target verifies the chain (`W=k+1`) in one
@@ -425,7 +425,8 @@ One propose block:
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
    accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less also uses Leviathan
-   on every hop, with one-hot `q`, and samples the bonus from its column's p-less distribution.
+   on every hop with the recorded selector `q`, and samples the bonus from its column's p-less
+   distribution.
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    single-request recommendation is k=4 (W=5, one SmallT GQA tile); concurrent long-reasoning
    settings are measured in [performance.md](../performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22).
@@ -508,9 +509,10 @@ and accepts only the prefix licensed by the target distribution.
 In greedy mode, MTP and DFlash2 accept the longest draft prefix matching the target argmax. In
 sampling mode both use chain rejection sampling against the represented target distribution. A bad
 draft therefore reduces acceptance and throughput; it must not change the distribution of emitted
-target tokens. Under p-less, DFlash2 chain accept uses the same one-hot `q` convention as MTP
-(ignore any 16-way selector `q`) at every hop: p-less temperature is not a draft softmax, so
-`p/q` from a 16-way shortlist would over-accept copied n-grams. Each hop uses its own represented
+target tokens. Under p-less, DFlash2 drafts are drawn at `--dflash-p-less-draft-temperature` and
+chain accept uses their recorded proposal `q` at every hop (one-hot for greedy drafts, as for MTP);
+speculative rejection sampling is exact for any proposal law, so the draft temperature changes
+only acceptance. Each hop uses its own represented
 p-less distribution, and the bonus samples its own column's distribution. Cycle-exit exclusion
 affects the root only; later hops are not silently changed to greedy sampling. DFlash2
 differs by producing the whole candidate chain in one masked-block forward. Packed GDN conv-record uses a T=1-reduction, BF16-history SmallT launch at B=2..4; packed

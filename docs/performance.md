@@ -156,6 +156,35 @@ for c in 1 4; do
 done
 ```
 
+## DFlash2 sampled p-less drafts (2026-09-27)
+
+P-less requests used greedy DFlash2 drafts and verified them as point masses. Verification now uses
+the recorded proposal q (accept `min(1,p'/q)`, correct from `max(0,p'-q)`), which is exact for any
+proposal law (Monte Carlo op test at V=64 and V=248077: chi-square within bound, acceptance equal to
+`sum min(p',q)`), and p-less drafts are drawn from the path-select softmax at
+`--dflash-p-less-draft-temperature` (default 0.4). Drafting at the p-less target temperature itself
+(1.5) accepts less than greedy; a low draft temperature accepts more.
+
+RTX 5090, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, p-less T=1.5, fixed k=5, optimized head, NVFP4
+KV. C=1: 9 prompts (AIME 15/30 at 4,096 tokens; Python/CUDA code, English/Chinese story, zh-en
+translation, CSV at 2,048; a 95k-token opencode capture with 20 tools at 2,048) x 4 seeds, one
+server per draft temperature after a warmup request:
+
+| Draft T | Decode tok/s | Tokens/round | Acceptance |
+|---:|---:|---:|---:|
+| 0 (greedy) | 196.9 | 3.06 | 41.1% |
+| 0.2 | 204.7 | 3.18 | 43.5% |
+| 0.3 | 206.4 | 3.20 | 44.0% |
+| **0.4** | **208.2 (+5.7%)** | **3.23** | 44.5% |
+| 0.5 | 203.9 | 3.17 | 43.3% |
+| 0.6 | 203.2 | 3.16 | 43.1% |
+| 0.8 | 199.9 | 3.11 | 42.2% |
+
+At 0.4 no prompt was slower than greedy (AIME 30 +14%, CUDA +7%, agentic 95k +5%, story/translation
+/CSV flat). Mixed-prompt waves, steady aggregate decode: C=4 469.6 -> 534.7 tok/s (+13.9%), C=6
+546.8 -> 631.8 (+15.5%). With `--adaptive-draft` and no warmup before the first measured request,
+the one-shot k probe locked k=1 for most requests in one campaign; the table uses fixed k=5.
+
 ## Upstream W4A4 TMA ports and DFlash2 sampler check (2026-09-26)
 
 RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4.ninfer` (Ostfralla NVFP4 + MTP), `ninfer_bench -p ...
