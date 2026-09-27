@@ -26,17 +26,14 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-constexpr std::array<RouteSpec, 6> k27Routes{{
-    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    // Product DFlash2 verify is T=12 at C=1. MMA split-8 at T>=17 is a different reduction
-    // than SmallT GEMV and flips greedy/p-less tokens. Packed execution therefore preserves
-    // the C=1 reduction profile: packed W>=2 verify aggregates B=2..6 through T=36 in SmallT;
-    // wider packed shapes execute one W-column panel per request.
-    {{2, 16}, Bf16GdnGatingScheduleId::SmallTFusedCooperative},
+constexpr std::array<RouteSpec, 5> k27Routes{{
+    // A fixed split-40 reduction covers decode and compact verify batches. The narrow token
+    // tiles share identical arithmetic, including packed C=1..6 execution through T=36.
+    {{1, 36}, Bf16GdnGatingScheduleId::MmaCooperativeSplit40},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also
     // removes the cooperative-residency constraint.
-    {{17, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{37, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
@@ -75,6 +72,7 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
 
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
@@ -82,9 +80,6 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
     case Bf16GdnGatingScheduleId::MmaUnsplit:
         return true;
-    case Bf16GdnGatingScheduleId::GemvPairedRows:
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
         return false;
@@ -98,11 +93,8 @@ std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     switch (schedule) {
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-        return 10;
-    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
-        // Packed GEMV: same K-reduction as T=1, no split-K partials.
-        return 1;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        return 40;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         return 32;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
@@ -113,7 +105,6 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
         return 4;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
         return 2;
-    case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
     case Bf16GdnGatingScheduleId::MmaUnsplit:
@@ -153,12 +144,10 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     if (!bf16_gdn_gating_admits(problem)) { return false; }
     if (is_27(problem)) {
         switch (schedule) {
-        case Bf16GdnGatingScheduleId::GemvPairedRows:
-            return problem.cols == 1;
-        case Bf16GdnGatingScheduleId::SmallTSplit10:
-            return problem.cols >= 2 && problem.cols <= 8;
-        case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
-            return problem.cols >= 2 && problem.cols <= 16;
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+            // 120 CTAs, at most six warps and 20 KiB shared per CTA: one CTA/SM suffices
+            // on the 170-SM RTX 5090, independently of the token-tile specialization.
+            return problem.cols <= 36;
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
@@ -186,9 +175,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
         return cooperative_35_grid_is_resident(schedule, problem.cols);
-    case Bf16GdnGatingScheduleId::GemvPairedRows:
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
         return false;
     }
     return false;
@@ -211,11 +198,13 @@ std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std:
 
 Bf16GdnGatingPlan make_plan(Bf16GdnGatingScheduleId schedule,
                             const Bf16GdnGatingProblem& problem) {
-    const bool mma                           = schedule_uses_mma(schedule);
-    const Bf16GdnGatingTokenVariant variant = !mma ? Bf16GdnGatingTokenVariant::None
-                                                    : ((problem.cols % mma_tile_cols(problem)) == 0
-                                                           ? Bf16GdnGatingTokenVariant::Full
-                                                           : Bf16GdnGatingTokenVariant::Predicated);
+    Bf16GdnGatingTokenVariant variant = Bf16GdnGatingTokenVariant::None;
+    if (schedule_uses_mma(schedule)) {
+        variant = schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit40 ||
+                          problem.cols % mma_tile_cols(problem) != 0
+                      ? Bf16GdnGatingTokenVariant::Predicated
+                      : Bf16GdnGatingTokenVariant::Full;
+    }
     const std::int32_t split_k = schedule_split_k(schedule);
     const std::size_t workspace =
         split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
@@ -231,16 +220,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
 
     switch (plan.schedule) {
-    case Bf16GdnGatingScheduleId::GemvPairedRows:
-        bf16_gdn_gating_proj_gemv_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
-        return;
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-        bf16_gdn_gating_proj_small_t_split10_launch(x, a_weight, b_weight, A_log, dt_bias,
-                                                    scratch.data, scratch.bytes, g, beta, stream);
-        return;
-    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
-        bf16_gdn_gating_proj_small_t_fused_launch(x, a_weight, b_weight, A_log, dt_bias,
-                                                  scratch.data, scratch.bytes, g, beta, stream);
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        bf16_gdn_gating_proj_mma_split40_launch(x, a_weight, b_weight, A_log, dt_bias,
+                                               scratch.data, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
@@ -319,12 +301,8 @@ std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16Gdn
 
 const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
-    case Bf16GdnGatingScheduleId::GemvPairedRows:
-        return "gdn_gating_proj.bf16.gemv.paired_rows";
-    case Bf16GdnGatingScheduleId::SmallTSplit10:
-        return "gdn_gating_proj.bf16.small_t.split10";
-    case Bf16GdnGatingScheduleId::SmallTFusedCooperative:
-        return "gdn_gating_proj.bf16.small_t.fused_cooperative";
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        return "gdn_gating_proj.bf16.mma.cooperative_split40";
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return "gdn_gating_proj.bf16.simt.warp_row.c4";
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
@@ -372,7 +350,7 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_plan(const Bf16GdnGatingProblem
     if (!is_27(problem) || problem.cols < 2 || problem.cols > kBf16GdnGatingPackedMaxCols) {
         throw std::invalid_argument("BF16 GDN gating: packed plan requires 27B T=2..36");
     }
-    return make_plan(Bf16GdnGatingScheduleId::SmallTFusedCooperative, problem);
+    return make_plan(Bf16GdnGatingScheduleId::MmaCooperativeSplit40, problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {

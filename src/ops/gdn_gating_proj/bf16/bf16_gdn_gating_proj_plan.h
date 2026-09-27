@@ -12,9 +12,7 @@
 namespace ninfer::ops::detail {
 
 enum class Bf16GdnGatingScheduleId {
-    GemvPairedRows,
-    SmallTSplit10,
-    SmallTFusedCooperative,
+    MmaCooperativeSplit40,
     SimtWarpRowC4,
     SimtWarpRowC8,
     MmaCooperativeSplit32,
@@ -54,8 +52,8 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
-// Packed verify sequences run the T=1 GEMV reduction with tokens spread across CTAs, so every
-// output column matches its per-request W-column panel. Aggregation covers C<=6, W<=6.
+// Small 27B panels and packed verify use the same split-40 MMA reduction through T=36.
+// Token tiling changes neither the K partition nor the order of the final reduction.
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 36;
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxBatch = 6;
 

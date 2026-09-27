@@ -17,7 +17,7 @@ namespace ninfer::ops::detail {
                                                                 std::int32_t max_tokens);
 
 // DFlash projections whose A16 route is the tensor-core kernel: every output keeps one ascending
-// K order at any T, so packed requests of any width share one weight pass.
+// K order at any T, so packed requests of width >=2 share one weight pass.
 bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
                                            LinearPolicy policy) noexcept;
 

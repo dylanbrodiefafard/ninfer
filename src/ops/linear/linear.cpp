@@ -95,7 +95,8 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
         group > 0) {
         return group;
     }
-    if (w.qtype == QType::NVFP4 && detail::is_nvfp4_dflash_mma_aggregate_problem(w.n, w.k, policy)) {
+    if (w.qtype == QType::NVFP4 && sequence_width >= 2 &&
+        detail::is_nvfp4_dflash_mma_aggregate_problem(w.n, w.k, policy)) {
         return x.ne[1];
     }
     if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 &&

@@ -25,7 +25,8 @@ namespace ninfer::ops {
                                                                         std::int32_t max_tokens);
 
 // Transient capacity for the 27B packed-sequence form below. Batch is restricted to 1..6;
-// fallback panels reuse one workspace allocation.
+// fallback panels reuse one workspace allocation. Packed capacity must be queried here:
+// its per-sequence reduction can require more storage than an ordinary call at T=W*B.
 [[nodiscard]] std::size_t gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
     std::int32_t sequence_width, std::int32_t min_batch, std::int32_t max_batch);
 
