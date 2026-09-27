@@ -66,7 +66,10 @@ __global__ __launch_bounds__(
 
     extern __shared__ __align__(128) unsigned char shared_bytes[];
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);
-    static_assert(Schedule::kStages >= 2, "activation-scale slots reuse the stage buffers");
+    static_assert(Schedule::kStages >= 2 && Schedule::kStages <= 4,
+                  "the scale-slot reuse bound (Stages+2)/2 is proven for 2..4 stages");
+    static_assert(((Geometry::kInputRows / Schedule::kBlockK) % 2) == 0,
+                  "a scale box covers a K-tile pair, so the K-tile count must be even");
     int block_x = 0;
     int block_y = 0;
     nvfp4_tma_raster_blocks(block_x, block_y);
@@ -268,8 +271,9 @@ __global__ __launch_bounds__(
         const int token_local = task / kVectorsPerRow;
         const int row_vector  = task - token_local * kVectorsPerRow;
         const int token       = token_begin + token_local;
-        // The last M tile may be partial: TMA zero-filled its rows past token_count, and the
-        // epilogue reads nothing else, so only the stores need bounding.
+        // The last M tile may be partial: TMA zero-filled code rows past token_count and the
+        // quantizer zeroed the padded scales; the epilogue reads nothing else, so only the stores
+        // need bounding.
         if (token >= token_count) { continue; }
         const uint4 values =
             load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);

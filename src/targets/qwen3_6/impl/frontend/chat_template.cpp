@@ -143,46 +143,50 @@ long last_real_user_query(const std::vector<ChatMessage>& messages) {
     throw std::invalid_argument("no user query found in chat messages");
 }
 
-std::string lstrip_newlines(std::string text) {
-    std::size_t begin = 0;
-    while (begin < text.size() && text[begin] == '\n') { ++begin; }
-    return text.substr(begin);
-}
-
-std::string rstrip_newlines(std::string text) {
-    std::size_t end = text.size();
-    while (end > 0 && text[end - 1] == '\n') { --end; }
-    return text.substr(0, end);
-}
-
 // Split an assistant turn into (reasoning, content) exactly as the Qwen3.6 jinja
 // does when reasoning_content is not provided: reasoning is the text between the
 // last <think> and the first </think>; content is everything after the last
 // </think>. When there is no </think> the whole thing is content and reasoning is
-// empty.
-struct ThinkParts {
-    std::string reasoning;
-    std::string content;
+// empty. The parts are byte ranges of the input so its literal spans (and any
+// media markup) carry over to each part.
+struct ThinkSplit {
+    std::size_t reasoning_begin = 0;
+    std::size_t reasoning_end   = 0;
+    std::size_t content_begin   = 0;
 };
 
-ThinkParts derive_think_parts(const std::string& content) {
-    ThinkParts parts;
-    const std::size_t first_close = content.find("</think>");
-    if (first_close == std::string::npos) {
-        parts.content = content;
-        return parts;
-    }
+ThinkSplit derive_think_split(const std::string& content) {
+    constexpr std::string_view kOpen  = "<think>";
+    constexpr std::string_view kClose = "</think>";
+    const std::size_t first_close     = content.find(kClose);
+    if (first_close == std::string::npos) { return {}; }
     // reasoning = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
-    std::string before          = rstrip_newlines(content.substr(0, first_close));
-    const std::size_t last_open = before.rfind("<think>");
-    std::string reasoning       = (last_open == std::string::npos)
-                                      ? before
-                                      : before.substr(last_open + std::string("<think>").size());
-    parts.reasoning             = lstrip_newlines(std::move(reasoning));
+    std::size_t reasoning_end = first_close;
+    while (reasoning_end > 0 && content[reasoning_end - 1] == '\n') { --reasoning_end; }
+    const std::size_t last_open =
+        std::string_view(content).substr(0, reasoning_end).rfind(kOpen);
+    std::size_t reasoning_begin = last_open == std::string::npos ? 0 : last_open + kOpen.size();
+    while (reasoning_begin < reasoning_end && content[reasoning_begin] == '\n') {
+        ++reasoning_begin;
+    }
     // content = content.split('</think>')[-1].lstrip('\n')
-    const std::size_t last_close = content.rfind("</think>");
-    parts.content = lstrip_newlines(content.substr(last_close + std::string("</think>").size()));
-    return parts;
+    std::size_t content_begin = content.rfind(kClose) + kClose.size();
+    while (content_begin < content.size() && content[content_begin] == '\n') { ++content_begin; }
+    return {reasoning_begin, reasoning_end, content_begin};
+}
+
+RenderedFragment slice_fragment(const RenderedFragment& fragment, std::size_t begin,
+                                std::size_t end) {
+    RenderedFragment out{.text = fragment.text.substr(begin, end - begin), .literal_spans = {}};
+    for (const ByteSpan span : fragment.literal_spans) {
+        const std::size_t clipped_begin = std::max(span.begin, begin);
+        const std::size_t clipped_end   = std::min(span.end, end);
+        if (clipped_begin < clipped_end) {
+            out.literal_spans.push_back(
+                ByteSpan{.begin = clipped_begin - begin, .end = clipped_end - begin});
+        }
+    }
+    return out;
 }
 
 constexpr std::string_view kToolInstructions =
@@ -782,21 +786,16 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
 
         // assistant
-        std::string reasoning;
+        RenderedFragment reasoning;
         RenderedFragment body = content;
         if (!message.reasoning_content.empty()) {
-            reasoning = message.reasoning_content;
+            reasoning.text = message.reasoning_content;
+            reasoning.literal_spans.push_back(
+                ByteSpan{.begin = 0, .end = message.reasoning_content.size()});
         } else if (!effort_template) {
-            ThinkParts parts = derive_think_parts(content.text);
-            reasoning        = std::move(parts.reasoning);
-            if (parts.content.size() != content.text.size()) {
-                // The split cut the content at its think markers; both halves are client text.
-                body.text          = std::move(parts.content);
-                body.literal_spans = {};
-                if (!body.text.empty()) {
-                    body.literal_spans.push_back(ByteSpan{.begin = 0, .end = body.text.size()});
-                }
-            }
+            const ThinkSplit split = derive_think_split(content.text);
+            reasoning = slice_fragment(content, split.reasoning_begin, split.reasoning_end);
+            body      = slice_fragment(content, split.content_begin, content.text.size());
         }
         reasoning = trim_ascii_whitespace(reasoning);
 
@@ -809,9 +808,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         // Official Qwen3.8 Jinja still wraps whenever keep_thinking. The C++ clone
         // omits an empty reasoning wrapper so history does not inject the
         // no-thinking cue `<think>\n\n</think>\n\n`.
-        if (keep_thinking && !(effort_template && reasoning.empty())) {
+        if (keep_thinking && !(effort_template && reasoning.text.empty())) {
             rendered.markup("<think>\n");
-            rendered.literal(reasoning);
+            rendered.append(reasoning);
             rendered.markup("\n</think>\n\n");
         }
         rendered.append(body);
