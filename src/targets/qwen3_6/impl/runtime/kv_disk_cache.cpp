@@ -1209,6 +1209,10 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
 KVDiskCache::~KVDiskCache() noexcept {
     try {
         stop_io_threads();
+        if (compaction_) {
+            discard_compaction_files(*compaction_);
+            compaction_.reset();
+        }
         try {
             queue_tombstone_object_unlinks();
             flush_queued_unlinks();
@@ -2043,18 +2047,55 @@ bool KVDiskCache::packs_need_compaction() const {
     return allocated != 0 && retained < allocated && allocated - retained >= allocated / 4;
 }
 
-// Generation descriptor replacement is safe only between restore epochs: a reader
-// must never race deletion of its source generation.
-bool KVDiskCache::compaction_blocked_locked() const noexcept {
-    return spill_ || restore_active_ || restore_target_ || payload_io_inflight_ != 0 ||
-           window_inflight_ != 0 || restore_state_inflight_ != 0 || !restore_q_.empty() ||
-           !reader_claims_.empty();
+// Publication switches object locations to the new generation. Readers copy a
+// location, including its generation lease, under the mutex for every read, and
+// claimed entries keep their objects referenced, so restores may continue across
+// the switch and the source generation is reaped only after those reads drain. Only an object writer
+// (a spill session or its payload I/O) could land bytes the new map omits.
+bool KVDiskCache::compaction_publish_blocked_locked() const noexcept {
+    return spill_ || payload_io_inflight_ != 0;
 }
 
-bool KVDiskCache::compact_packs(std::unique_lock<std::mutex>& lock,
-                                std::uint64_t additional_bytes) {
-    if (!packs_need_compaction()) { return true; }
-    if (compaction_blocked_locked()) { return false; }
+namespace {
+
+// One worker slice of compaction copy; the cache mutex is released for it.
+constexpr std::uint64_t kCompactionSliceBytes = 64ULL << 20;
+
+} // namespace
+
+void KVDiskCache::CompactionRun::close_outputs() noexcept {
+    for (int& fd : output) {
+        if (fd >= 0) {
+            (void)::close(fd);
+            fd = -1;
+        }
+    }
+}
+
+void KVDiskCache::request_compaction_locked() noexcept {
+    if (compaction_ || compaction_failed_generation_ == durable_generation_) { return; }
+    compaction_requested_ = true;
+    cv_.notify_all();
+}
+
+bool KVDiskCache::compaction_pending_locked() const {
+    if (compaction_ || compaction_requested_) { return true; }
+    return compaction_failed_generation_ != durable_generation_ &&
+           retired_generations_.empty() && packs_need_compaction();
+}
+
+bool KVDiskCache::compaction_runnable_locked() const noexcept {
+    if (stopping_) { return false; }
+    if (!compaction_) { return compaction_requested_; }
+    if (compaction_->next < compaction_->pending.size() || !compaction_->synced) { return true; }
+    return !compaction_publish_blocked_locked();
+}
+
+bool KVDiskCache::begin_compaction_locked() {
+    // A retired generation still leased by a reader is not reclaimable by
+    // another rewrite; compacting again would only copy the live set twice.
+    if (!retired_generations_.empty() || !packs_need_compaction()) { return true; }
+    if (!active_generation_) { return false; }
     const auto available_bytes = [&]() -> std::optional<std::uint64_t> {
         if (test_free_bytes_override_) { return *test_free_bytes_override_; }
         struct statvfs fs {};
@@ -2066,9 +2107,8 @@ bool KVDiskCache::compact_packs(std::unique_lock<std::mutex>& lock,
     }();
     const std::uint64_t retained = packed_retained_bytes();
     constexpr std::uint64_t kSegmentSlack = 1ULL << 30;
-    if (!available_bytes || retained > std::numeric_limits<std::uint64_t>::max() - additional_bytes ||
-        retained + additional_bytes > std::numeric_limits<std::uint64_t>::max() - kSegmentSlack ||
-        *available_bytes < retained + additional_bytes + kSegmentSlack) {
+    if (!available_bytes || retained > std::numeric_limits<std::uint64_t>::max() - kSegmentSlack ||
+        *available_bytes < retained + kSegmentSlack) {
         return false;
     }
     const std::uint64_t old_generation = pack_generation_;
@@ -2083,292 +2123,422 @@ bool KVDiskCache::compact_packs(std::unique_lock<std::mutex>& lock,
         ++new_generation;
     }
     if (generation_ec) { return false; }
-    struct Move { std::uint64_t id; ObjectRef::Location location; };
-    std::vector<Move> moves;
-    moves.reserve(objects_.size());
-    std::array<std::uint32_t, 5> segment{};
-    std::array<std::uint64_t, 5> tail{};
-    std::array<int, 5> output{};
-    output.fill(-1);
-    auto close_outputs = [&] {
-        for (int& fd : output) { if (fd >= 0) { (void)::close(fd); fd = -1; } }
+    auto run            = std::make_unique<CompactionRun>();
+    run->new_generation = new_generation;
+    run->source         = active_generation_;
+    run->root           = config_.location / "packs" / std::to_string(new_generation);
+    run->target         = std::make_shared<PackGeneration>();
+    run->target->number = new_generation;
+    run->target->root   = run->root;
+    run->pending.reserve(objects_.size());
+    for (const auto& [id, ref] : objects_) {
+        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) { continue; }
+        run->pending.push_back({id, ref});
+    }
+    std::sort(run->pending.begin(), run->pending.end(),
+              [](const auto& a, const auto& b) { return a.id < b.id; });
+    run->copied.reserve(run->pending.size());
+    run->moves.reserve(run->pending.size());
+    compaction_ = std::move(run);
+    return true;
+}
+
+KVDiskCache::CompactionRun::Move KVDiskCache::copy_compaction_object(
+    CompactionRun& run, const CompactionRun::Source& source) {
+    const auto read_fully = [](int fd, void* data, std::size_t bytes, off_t offset) {
+        auto* out = static_cast<std::uint8_t*>(data);
+        std::size_t done = 0;
+        while (done < bytes) {
+            const ssize_t n = ::pread(fd, out + done, bytes - done,
+                                      offset + static_cast<off_t>(done));
+            if (n < 0 && errno == EINTR) { continue; }
+            if (n <= 0) { return false; }
+            done += static_cast<std::size_t>(n);
+        }
+        return true;
     };
-    const auto new_root = config_.location / "packs" / std::to_string(new_generation);
-    auto new_active = std::make_shared<PackGeneration>();
-    new_active->number = new_generation;
-    new_active->root = new_root;
-    bool published = false;
-    try {
-        for (DiskObjectKind kind : {DiskObjectKind::Main, DiskObjectKind::Backend,
-                                    DiskObjectKind::State, DiskObjectKind::Ledger,
-                                    DiskObjectKind::Identity}) {
-            std::filesystem::create_directories(new_root / kind_dir(kind));
+    const auto write_fully = [](int fd, const void* data, std::size_t bytes, off_t offset) {
+        const auto* in = static_cast<const std::uint8_t*>(data);
+        std::size_t done = 0;
+        while (done < bytes) {
+            const ssize_t n = ::pwrite(fd, in + done, bytes - done,
+                                       offset + static_cast<off_t>(done));
+            if (n < 0 && errno == EINTR) { continue; }
+            if (n <= 0) { return false; }
+            done += static_cast<std::size_t>(n);
         }
-        std::vector<std::uint64_t> ids;
-        ids.reserve(objects_.size());
-        for (const auto& [id, ref] : objects_) {
-            if (ref.live_refs != 0 || ref.skip_refs != 0 || ref.hold_refs != 0) { ids.push_back(id); }
+        return true;
+    };
+    compaction_copy_entered_.store(true, std::memory_order_release);
+    if (const int ms = compaction_copy_stall_ms_.load(std::memory_order_acquire); ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+    if (run.buffer.empty()) { run.buffer.resize(1U << 20); }
+    std::vector<std::uint8_t>& buffer = run.buffer;
+    auto& segment = run.segment;
+    auto& tail    = run.tail;
+    auto& output  = run.output;
+    const std::uint64_t id = source.id;
+    const ObjectRef& ref = source.ref;
+    const std::size_t index = kind_index(ref.kind);
+    if (!ref.location.generation || ref.location.stored_bytes == 0 ||
+        ref.location.stored_bytes > ref.bytes || ref.location.logical_bytes == 0) {
+        throw std::runtime_error("invalid KV pack source metadata during compaction id=" +
+                                 std::to_string(id) + " kind=" +
+                                 std::to_string(static_cast<unsigned>(ref.kind)) +
+                                 " extent=" + std::to_string(ref.bytes) +
+                                 " stored=" + std::to_string(ref.location.stored_bytes) +
+                                 " logical=" + std::to_string(ref.location.logical_bytes));
+    }
+    if (tail[index] != 0 && tail[index] + ref.bytes > kPackSegmentBytes) {
+        ++segment[index]; tail[index] = 0;
+        if (output[index] >= 0) {
+            const int fd = output[index];
+            output[index] = -1;
+            if (::fdatasync(fd) != 0) {
+                (void)::close(fd);
+                throw std::runtime_error("failed to sync rolled compacted KV pack");
+            }
+            if (::close(fd) != 0) {
+                throw std::runtime_error("failed to close rolled compacted KV pack");
+            }
         }
-        std::sort(ids.begin(), ids.end());
-        std::vector<std::uint8_t> buffer(1U << 20);
-        const auto read_fully = [](int fd, void* data, std::size_t bytes, off_t offset) {
-            auto* out = static_cast<std::uint8_t*>(data);
-            std::size_t done = 0;
-            while (done < bytes) {
-                const ssize_t n = ::pread(fd, out + done, bytes - done,
-                                          offset + static_cast<off_t>(done));
-                if (n < 0 && errno == EINTR) { continue; }
-                if (n <= 0) { return false; }
-                done += static_cast<std::size_t>(n);
-            }
-            return true;
-        };
-        const auto write_fully = [](int fd, const void* data, std::size_t bytes, off_t offset) {
-            const auto* in = static_cast<const std::uint8_t*>(data);
-            std::size_t done = 0;
-            while (done < bytes) {
-                const ssize_t n = ::pwrite(fd, in + done, bytes - done,
-                                           offset + static_cast<off_t>(done));
-                if (n < 0 && errno == EINTR) { continue; }
-                if (n <= 0) { return false; }
-                done += static_cast<std::size_t>(n);
-            }
-            return true;
-        };
-        for (std::uint64_t id : ids) {
-            const ObjectRef& ref = objects_.at(id);
-            const std::size_t index = kind_index(ref.kind);
-            if (!ref.location.generation || ref.location.stored_bytes == 0 ||
-                ref.location.stored_bytes > ref.bytes || ref.location.logical_bytes == 0) {
-                throw std::runtime_error("invalid KV pack source metadata during compaction id=" +
-                                         std::to_string(id) + " kind=" +
-                                         std::to_string(static_cast<unsigned>(ref.kind)) +
-                                         " extent=" + std::to_string(ref.bytes) +
-                                         " stored=" + std::to_string(ref.location.stored_bytes) +
-                                         " logical=" + std::to_string(ref.location.logical_bytes));
-            }
-            if (tail[index] != 0 && tail[index] + ref.bytes > kPackSegmentBytes) {
-                ++segment[index]; tail[index] = 0;
-                if (output[index] >= 0) {
-                    const int fd = output[index];
-                    output[index] = -1;
-                    if (::fdatasync(fd) != 0) {
-                        (void)::close(fd);
-                        throw std::runtime_error("failed to sync rolled compacted KV pack");
-                    }
-                    if (::close(fd) != 0) {
-                        throw std::runtime_error("failed to close rolled compacted KV pack");
-                    }
-                }
-            }
-            const auto out_path = new_root / kind_dir(ref.kind) / ([&] {
-                char name[32]{}; std::snprintf(name, sizeof(name), "%08u.pack", segment[index]);
-                return std::string(name);
-            })();
-            if (output[index] < 0) {
-                std::filesystem::create_directories(out_path.parent_path());
-                output[index] = ::open(out_path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
-                if (output[index] < 0) { throw std::runtime_error("failed to create compacted KV pack"); }
-            }
-            const auto input = acquire_pack_descriptor(ref.location.generation, ref.kind,
-                                                       ref.location.segment, false);
-            struct stat input_stat {};
-            if (::fstat(input->buffered, &input_stat) != 0 ||
-                static_cast<std::uint64_t>(input_stat.st_size) <
-                    ref.location.offset + ref.bytes) {
-                throw std::runtime_error("short KV pack source during compaction");
-            }
-            std::uint8_t header[kDiskStatePayloadOffset]{};
-            const std::size_t header_bytes = ref.kind == DiskObjectKind::State
-                                                 ? kDiskCodecHeaderBytes
-                                                 : (ref.kind == DiskObjectKind::Main ||
-                                                    ref.kind == DiskObjectKind::Backend
-                                                        ? kDiskPageHeaderBytes
-                                                        : 0);
-            if (header_bytes != 0 &&
-                !read_fully(input->buffered, header, header_bytes,
-                            static_cast<off_t>(ref.location.offset))) {
-                throw std::runtime_error("failed to read KV pack source header");
-            }
-            std::uint32_t record_crc = ~0U;
-            std::uint32_t payload_crc = ~0U;
-            std::uint64_t copied = 0;
-            while (copied < ref.bytes) {
-                const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(
-                    buffer.size(), ref.bytes - copied));
-                if (!read_fully(input->buffered, buffer.data(), chunk,
-                                static_cast<off_t>(ref.location.offset + copied)) ||
-                    !write_fully(output[index], buffer.data(), chunk,
-                                 static_cast<off_t>(tail[index] + copied))) {
-                    throw std::runtime_error("failed to copy KV pack extent");
-                }
-                const std::uint64_t stored_begin = copied;
-                const std::uint64_t stored_end = std::min<std::uint64_t>(
-                    copied + chunk, ref.location.stored_bytes);
-                if (stored_begin < stored_end) {
-                    const auto stored = std::span<const std::uint8_t>(
-                        buffer.data(), static_cast<std::size_t>(stored_end - stored_begin));
-                    record_crc = crc32c_update(record_crc, stored);
-                    const std::uint64_t payload_begin =
-                        ref.kind == DiskObjectKind::State ? kDiskStatePayloadOffset
-                        : (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend
-                               ? kDiskPageHeaderBytes
-                               : 0);
-                    if (stored_begin < ref.location.stored_bytes &&
-                        payload_begin < ref.location.stored_bytes) {
-                        const std::uint64_t begin = std::max(stored_begin, payload_begin);
-                        const std::uint64_t end = stored_end;
-                        if (begin < end) {
-                            payload_crc = crc32c_update(
-                                payload_crc,
-                                std::span<const std::uint8_t>(
-                                    buffer.data() + static_cast<std::size_t>(begin - copied),
-                                    static_cast<std::size_t>(end - begin)));
-                        }
-                    }
-                }
-                copied += chunk;
-            }
-            if (~record_crc != ref.location.record_crc32c) {
-                throw std::runtime_error("KV pack record CRC mismatch during compaction");
-            }
-            if (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend) {
-                std::uint32_t version = 0;
-                std::uint32_t expected = 0;
-                std::memcpy(&version, header + 8, sizeof(version));
-                std::memcpy(&expected, header + 12, sizeof(expected));
-                if (std::memcmp(header, kDiskPageMagic, 8) != 0 ||
-                    version != kDiskFormatVersion || ref.location.stored_bytes !=
-                        kDiskPageHeaderBytes + ref.location.logical_bytes ||
-                    ref.bytes != aligned_page_file_bytes(ref.location.logical_bytes) ||
-                    expected != ~payload_crc) {
-                    throw std::runtime_error("invalid KV page record during compaction");
-                }
-            } else if (ref.kind == DiskObjectKind::State) {
-                const auto codec = static_cast<DiskCodec>(header[0]);
-                const auto state_kind = static_cast<DiskStateKind>(header[1]);
-                std::uint64_t unc = 0;
-                std::uint64_t cmp = 0;
-                std::uint32_t expected = 0;
-                std::memcpy(&unc, header + 4, sizeof(unc));
-                std::memcpy(&cmp, header + 12, sizeof(cmp));
-                std::memcpy(&expected, header + 20, sizeof(expected));
-                if (!valid_state_kind(static_cast<std::uint8_t>(state_kind)) ||
-                    !codec_payload_ok(codec, unc, cmp, ref.location.logical_bytes) ||
-                    unc != ref.location.logical_bytes ||
-                    cmp != ref.location.stored_bytes - kDiskStatePayloadOffset ||
-                    expected != ~payload_crc) {
-                    throw std::runtime_error("invalid KV state record during compaction");
-                }
-            } else if (ref.location.logical_bytes != ref.location.stored_bytes) {
-                throw std::runtime_error("invalid KV raw record during compaction");
-            }
-            moves.push_back(Move{id, ObjectRef::Location{nullptr, segment[index], tail[index], ref.bytes,
-                                                          ref.location.stored_bytes,
-                                                          ref.location.logical_bytes,
-                                                          ref.location.record_crc32c}});
-            tail[index] += ref.bytes;
+    }
+    const auto out_path = run.root / kind_dir(ref.kind) / ([&] {
+        char name[32]{}; std::snprintf(name, sizeof(name), "%08u.pack", segment[index]);
+        return std::string(name);
+    })();
+    if (output[index] < 0) {
+        std::filesystem::create_directories(out_path.parent_path());
+        // A publication attempt may already have created this segment empty.
+        output[index] = ::open(out_path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (output[index] < 0) { throw std::runtime_error("failed to create compacted KV pack"); }
+    }
+    const auto input = acquire_pack_descriptor(ref.location.generation, ref.kind,
+                                               ref.location.segment, false);
+    struct stat input_stat {};
+    if (::fstat(input->buffered, &input_stat) != 0 ||
+        static_cast<std::uint64_t>(input_stat.st_size) <
+            ref.location.offset + ref.bytes) {
+        throw std::runtime_error("short KV pack source during compaction");
+    }
+    std::uint8_t header[kDiskStatePayloadOffset]{};
+    const std::size_t header_bytes = ref.kind == DiskObjectKind::State
+                                         ? kDiskCodecHeaderBytes
+                                         : (ref.kind == DiskObjectKind::Main ||
+                                            ref.kind == DiskObjectKind::Backend
+                                                ? kDiskPageHeaderBytes
+                                                : 0);
+    if (header_bytes != 0 &&
+        !read_fully(input->buffered, header, header_bytes,
+                    static_cast<off_t>(ref.location.offset))) {
+        throw std::runtime_error("failed to read KV pack source header");
+    }
+    std::uint32_t record_crc = ~0U;
+    std::uint32_t payload_crc = ~0U;
+    std::uint64_t copied = 0;
+    while (copied < ref.bytes) {
+        const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(
+            buffer.size(), ref.bytes - copied));
+        if (!read_fully(input->buffered, buffer.data(), chunk,
+                        static_cast<off_t>(ref.location.offset + copied)) ||
+            !write_fully(output[index], buffer.data(), chunk,
+                         static_cast<off_t>(tail[index] + copied))) {
+            throw std::runtime_error("failed to copy KV pack extent");
         }
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPackCopy);
-        for (int fd : output) {
-            if (fd >= 0 && ::fdatasync(fd) != 0) { throw std::runtime_error("failed to sync compacted KV pack"); }
-        }
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPackSync);
-        close_outputs();
-        for (DiskObjectKind kind : {DiskObjectKind::Main, DiskObjectKind::Backend,
-                                    DiskObjectKind::State, DiskObjectKind::Ledger,
-                                    DiskObjectKind::Identity}) {
-            const std::size_t index = kind_index(kind);
-            const auto path = pack_path(*new_active, kind, segment[index]);
-            if (std::filesystem::exists(path)) { continue; }
-            const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
-            if (fd < 0) { throw std::runtime_error("failed to create compacted KV pack segment"); }
-            if (::fsync(fd) != 0) {
-                ::close(fd);
-                throw std::runtime_error("failed to sync compacted KV pack segment");
+        const std::uint64_t stored_begin = copied;
+        const std::uint64_t stored_end = std::min<std::uint64_t>(
+            copied + chunk, ref.location.stored_bytes);
+        if (stored_begin < stored_end) {
+            const auto stored = std::span<const std::uint8_t>(
+                buffer.data(), static_cast<std::size_t>(stored_end - stored_begin));
+            record_crc = crc32c_update(record_crc, stored);
+            const std::uint64_t payload_begin =
+                ref.kind == DiskObjectKind::State ? kDiskStatePayloadOffset
+                : (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend
+                       ? kDiskPageHeaderBytes
+                       : 0);
+            if (stored_begin < ref.location.stored_bytes &&
+                payload_begin < ref.location.stored_bytes) {
+                const std::uint64_t begin = std::max(stored_begin, payload_begin);
+                const std::uint64_t end = stored_end;
+                if (begin < end) {
+                    payload_crc = crc32c_update(
+                        payload_crc,
+                        std::span<const std::uint8_t>(
+                            buffer.data() + static_cast<std::size_t>(begin - copied),
+                            static_cast<std::size_t>(end - begin)));
+                }
             }
+        }
+        copied += chunk;
+    }
+    if (~record_crc != ref.location.record_crc32c) {
+        throw std::runtime_error("KV pack record CRC mismatch during compaction");
+    }
+    if (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend) {
+        std::uint32_t version = 0;
+        std::uint32_t expected = 0;
+        std::memcpy(&version, header + 8, sizeof(version));
+        std::memcpy(&expected, header + 12, sizeof(expected));
+        if (std::memcmp(header, kDiskPageMagic, 8) != 0 ||
+            version != kDiskFormatVersion || ref.location.stored_bytes !=
+                kDiskPageHeaderBytes + ref.location.logical_bytes ||
+            ref.bytes != aligned_page_file_bytes(ref.location.logical_bytes) ||
+            expected != ~payload_crc) {
+            throw std::runtime_error("invalid KV page record during compaction");
+        }
+    } else if (ref.kind == DiskObjectKind::State) {
+        const auto codec = static_cast<DiskCodec>(header[0]);
+        const auto state_kind = static_cast<DiskStateKind>(header[1]);
+        std::uint64_t unc = 0;
+        std::uint64_t cmp = 0;
+        std::uint32_t expected = 0;
+        std::memcpy(&unc, header + 4, sizeof(unc));
+        std::memcpy(&cmp, header + 12, sizeof(cmp));
+        std::memcpy(&expected, header + 20, sizeof(expected));
+        if (!valid_state_kind(static_cast<std::uint8_t>(state_kind)) ||
+            !codec_payload_ok(codec, unc, cmp, ref.location.logical_bytes) ||
+            unc != ref.location.logical_bytes ||
+            cmp != ref.location.stored_bytes - kDiskStatePayloadOffset ||
+            expected != ~payload_crc) {
+            throw std::runtime_error("invalid KV state record during compaction");
+        }
+    } else if (ref.location.logical_bytes != ref.location.stored_bytes) {
+        throw std::runtime_error("invalid KV raw record during compaction");
+    }
+    const CompactionRun::Move move{
+        id, ObjectRef::Location{nullptr, segment[index], tail[index], ref.bytes,
+                                ref.location.stored_bytes, ref.location.logical_bytes,
+                                ref.location.record_crc32c}};
+    tail[index] += ref.bytes;
+    return move;
+}
+
+void KVDiskCache::sync_compaction_outputs(CompactionRun& run) {
+    maybe_test_fault(DiskFaultPoint::CompactionAfterPackCopy);
+    for (int fd : run.output) {
+        if (fd >= 0 && ::fdatasync(fd) != 0) {
+            throw std::runtime_error("failed to sync compacted KV pack");
+        }
+    }
+    maybe_test_fault(DiskFaultPoint::CompactionAfterPackSync);
+}
+
+void KVDiskCache::prepare_compaction_maps(CompactionRun& run,
+                                          const std::vector<std::uint8_t>& base_bytes) {
+    for (DiskObjectKind kind : {DiskObjectKind::Main, DiskObjectKind::Backend,
+                                DiskObjectKind::State, DiskObjectKind::Ledger,
+                                DiskObjectKind::Identity}) {
+        const std::size_t index = kind_index(kind);
+        const auto path = pack_path(*run.target, kind, run.segment[index]);
+        if (std::filesystem::exists(path)) { continue; }
+        std::filesystem::create_directories(path.parent_path());
+        const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+        if (fd < 0) { throw std::runtime_error("failed to create compacted KV pack segment"); }
+        if (::fsync(fd) != 0) {
             ::close(fd);
+            throw std::runtime_error("failed to sync compacted KV pack segment");
         }
-        std::vector<PackedMapEntry> base_entries;
-        base_entries.reserve(moves.size());
-        for (const Move& move : moves) {
-            const ObjectRef& ref = objects_.at(move.id);
-            base_entries.push_back({move.id, ref.kind, move.location.segment, move.location.offset,
-                                    ref.bytes, move.location.stored_bytes,
-                                    move.location.logical_bytes,
-                                    move.location.record_crc32c});
+        ::close(fd);
+    }
+    const auto maps = config_.location / "maps";
+    const auto base = maps / ("objects-" + std::to_string(run.new_generation) + ".base");
+    const auto log  = maps / ("objects-" + std::to_string(run.new_generation) + ".log");
+    write_file_bytes(base, base_bytes.data(), base_bytes.size());
+    maybe_test_fault(DiskFaultPoint::CompactionAfterBaseWrite);
+    fsync_path(base);
+    maybe_test_fault(DiskFaultPoint::CompactionAfterBaseSync);
+    write_file_bytes(log, nullptr, 0);
+    maybe_test_fault(DiskFaultPoint::CompactionAfterLogWrite);
+    fsync_path(log);
+    maybe_test_fault(DiskFaultPoint::CompactionAfterLogSync);
+    fsync_dir(run.root / "main"); fsync_dir(run.root / "backend"); fsync_dir(run.root / "state");
+    fsync_dir(run.root / "ledger"); fsync_dir(run.root / "identity"); fsync_dir(run.root);
+    fsync_dir(config_.location / "packs"); fsync_dir(maps);
+}
+
+bool KVDiskCache::compaction_delta_locked(CompactionRun& run) {
+    std::vector<CompactionRun::Source> delta;
+    for (const auto& [id, ref] : objects_) {
+        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) { continue; }
+        if (ref.location.generation != run.source || run.copied.count(id) != 0) { continue; }
+        delta.push_back({id, ref});
+    }
+    if (delta.empty()) { return false; }
+    std::sort(delta.begin(), delta.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
+    run.pending = std::move(delta);
+    run.next    = 0;
+    run.synced  = false;
+    return true;
+}
+
+// Publication waits for no spill session to be allocating in the source generation.
+void KVDiskCache::publish_compaction(std::unique_lock<std::mutex>& lock, CompactionRun& run) {
+    std::vector<PackedMapEntry> base_entries;
+    base_entries.reserve(run.moves.size());
+    for (const CompactionRun::Move& move : run.moves) {
+        const auto it = objects_.find(move.id);
+        if (it == objects_.end() || it->second.location.generation != run.source) { continue; }
+        const ObjectRef& ref = it->second;
+        base_entries.push_back({move.id, ref.kind, move.location.segment, move.location.offset,
+                                ref.bytes, move.location.stored_bytes,
+                                move.location.logical_bytes, move.location.record_crc32c});
+    }
+    const auto base_bytes =
+        encode_pack_map_base(run.new_generation, next_object_id_, std::move(base_entries));
+    lock.unlock();
+    try {
+        prepare_compaction_maps(run, base_bytes);
+    } catch (...) {
+        lock.lock();
+        throw;
+    }
+    lock.lock();
+    // A spill may have started while the maps were written; publish after it
+    // commits instead (the maps are rewritten then).
+    if (compaction_publish_blocked_locked() || compaction_delta_locked(run)) { return; }
+    const auto tmp = config_.location / "tmp" / "PACKSET";
+    const auto bytes = encode_packset(run.new_generation, object_id_reservation_limit_);
+    write_file_bytes(tmp, bytes.data(), bytes.size());
+    maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetTmpWrite);
+    fsync_path(tmp);
+    maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetTmpSync);
+    run.close_outputs();
+    std::filesystem::rename(tmp, config_.location / "PACKSET");
+    run.published = true;
+    packset_publication_pending_sync_ = true;
+    // Rename success is an uncertain publication until root fsync.  The
+    // visible in-process generation must follow the rename immediately;
+    // the old generation remains leased and retained on a root-fsync
+    // failure because restart may observe either pointer.
+    pack_generation_ = run.new_generation;
+    pack_active_segment_ = run.segment;
+    pack_active_tail_ = run.tail;
+    if (active_generation_) { retired_generations_.push_back(std::move(active_generation_)); }
+    active_generation_ = run.target;
+    for (const CompactionRun::Move& move : run.moves) {
+        const auto it = objects_.find(move.id);
+        if (it == objects_.end() || it->second.location.generation != run.source) { continue; }
+        it->second.location            = move.location;
+        it->second.location.generation = active_generation_;
+    }
+    // Unreferenced map entries are physical garbage, not leases.  Drop
+    // their old-generation pointers after the new map is active so the
+    // retired generation can be reclaimed once real readers have drained.
+    for (auto it = objects_.begin(); it != objects_.end();) {
+        const ObjectRef& ref = it->second;
+        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) {
+            it = objects_.erase(it);
+        } else {
+            ++it;
         }
-        const auto base = config_.location / "maps" / ("objects-" + std::to_string(new_generation) + ".base");
-        const auto log = config_.location / "maps" / ("objects-" + std::to_string(new_generation) + ".log");
-        const auto base_bytes = encode_pack_map_base(new_generation, next_object_id_, std::move(base_entries));
-        write_file_bytes(base, base_bytes.data(), base_bytes.size());
-        maybe_test_fault(DiskFaultPoint::CompactionAfterBaseWrite);
-        fsync_path(base);
-        maybe_test_fault(DiskFaultPoint::CompactionAfterBaseSync);
-        write_file_bytes(log, nullptr, 0);
-        maybe_test_fault(DiskFaultPoint::CompactionAfterLogWrite);
-        fsync_path(log);
-        maybe_test_fault(DiskFaultPoint::CompactionAfterLogSync);
-        fsync_dir(new_root / "main"); fsync_dir(new_root / "backend"); fsync_dir(new_root / "state");
-        fsync_dir(new_root / "ledger"); fsync_dir(new_root / "identity"); fsync_dir(new_root);
-        fsync_dir(config_.location / "packs"); fsync_dir(config_.location / "maps");
-        const auto tmp = config_.location / "tmp" / "PACKSET";
-        const auto bytes = encode_packset(new_generation, object_id_reservation_limit_);
-        write_file_bytes(tmp, bytes.data(), bytes.size());
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetTmpWrite);
-        fsync_path(tmp);
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetTmpSync);
-        std::filesystem::rename(tmp, config_.location / "PACKSET");
-        published = true;
-        packset_publication_pending_sync_ = true;
-        // Rename success is an uncertain publication until root fsync.  The
-        // visible in-process generation must follow the rename immediately;
-        // the old generation remains leased and retained on a root-fsync
-        // failure because restart may observe either pointer.
-        pack_generation_ = new_generation;
-        pack_active_segment_ = segment; pack_active_tail_ = tail;
-        if (active_generation_) {
-            retired_generations_.push_back(std::move(active_generation_));
-        }
-        active_generation_ = new_active;
-        for (const Move& move : moves) {
-            objects_.at(move.id).location = move.location;
-            objects_.at(move.id).location.generation = active_generation_;
-        }
-        // Unreferenced map entries are physical garbage, not leases.  Drop
-        // their old-generation pointers after the new map is active so the
-        // retired generation can be reclaimed once real readers have drained.
-        for (auto it = objects_.begin(); it != objects_.end();) {
-            const ObjectRef& ref = it->second;
-            if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) {
-                it = objects_.erase(it);
-            } else {
-                ++it;
+    }
+    maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetRename);
+    fsync_dir(config_.location);
+    packset_publication_pending_sync_ = false;
+    maybe_test_fault(DiskFaultPoint::CompactionAfterRootSync);
+    compaction_.reset();
+    reap_retired_generations();
+}
+
+void KVDiskCache::discard_compaction_files(CompactionRun& run) noexcept {
+    run.close_outputs();
+    if (run.published) { return; }
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(run.root, cleanup_ec);
+    const auto maps = config_.location / "maps";
+    (void)std::filesystem::remove(
+        maps / ("objects-" + std::to_string(run.new_generation) + ".base"), cleanup_ec);
+    (void)std::filesystem::remove(
+        maps / ("objects-" + std::to_string(run.new_generation) + ".log"), cleanup_ec);
+}
+
+void KVDiskCache::compaction_step(std::unique_lock<std::mutex>& lock) {
+    try {
+        if (!compaction_) {
+            compaction_requested_ = false;
+            if (!begin_compaction_locked()) {
+                compaction_failed_generation_ = durable_generation_;
+            }
+            if (!compaction_) {
+                idle_cv_.notify_all();
+                cv_.notify_all();
+                return;
             }
         }
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetRename);
-        fsync_dir(config_.location);
-        packset_publication_pending_sync_ = false;
-        maybe_test_fault(DiskFaultPoint::CompactionAfterRootSync);
+        CompactionRun& run = *compaction_;
+        if (run.next < run.pending.size()) {
+            const std::size_t begin = run.next;
+            std::size_t end         = begin;
+            std::uint64_t bytes     = 0;
+            while (end < run.pending.size() && (end == begin || bytes < kCompactionSliceBytes)) {
+                bytes += run.pending[end].ref.bytes;
+                ++end;
+            }
+            std::vector<CompactionRun::Move> moved;
+            moved.reserve(end - begin);
+            lock.unlock();
+            try {
+                if (begin == 0) {
+                    for (DiskObjectKind kind : {DiskObjectKind::Main, DiskObjectKind::Backend,
+                                                DiskObjectKind::State, DiskObjectKind::Ledger,
+                                                DiskObjectKind::Identity}) {
+                        std::filesystem::create_directories(run.root / kind_dir(kind));
+                    }
+                }
+                for (std::size_t i = begin; i < end; ++i) {
+                    moved.push_back(copy_compaction_object(run, run.pending[i]));
+                }
+            } catch (...) {
+                lock.lock();
+                throw;
+            }
+            lock.lock();
+            for (const CompactionRun::Move& move : moved) {
+                run.copied.insert(move.id);
+                run.moves.push_back(move);
+            }
+            run.next   = end;
+            run.synced = false;
+            return;
+        }
+        if (!run.synced) {
+            lock.unlock();
+            try {
+                sync_compaction_outputs(run);
+            } catch (...) {
+                lock.lock();
+                throw;
+            }
+            lock.lock();
+            run.synced = true;
+            return;
+        }
+        if (compaction_publish_blocked_locked()) { return; }
+        // Objects committed to the source generation since the snapshot are
+        // copied in further slices before publication.
+        if (compaction_delta_locked(run)) { return; }
+        publish_compaction(lock, run);
     } catch (...) {
-        close_outputs();
-        if (!published) {
-            std::error_code cleanup_ec;
-            std::filesystem::remove_all(new_root, cleanup_ec);
-            (void)std::filesystem::remove(
-                config_.location / "maps" / ("objects-" + std::to_string(new_generation) + ".base"),
-                cleanup_ec);
-            (void)std::filesystem::remove(
-                config_.location / "maps" / ("objects-" + std::to_string(new_generation) + ".log"),
-                cleanup_ec);
+        if (!lock.owns_lock()) { lock.lock(); }
+        // Stamp before releasing the mutex so a concurrent spill admission does
+        // not immediately request the same failed rewrite again.
+        compaction_failed_generation_ = durable_generation_;
+        compaction_requested_         = false;
+        if (compaction_) {
+            std::unique_ptr<CompactionRun> run = std::move(compaction_);
+            lock.unlock();
+            discard_compaction_files(*run);
+            run.reset();
+            lock.lock();
         }
         // A successful PACKSET rename followed by a failed root fsync is an
-        // uncertain publication.  Keep the new generation active and retain
-        // the old lease; the caller reports maintenance failure.
-        return false;
+        // uncertain publication.  The new generation stays active and the old
+        // lease is retained; maintenance reports the failure.
     }
-    reap_retired_generations();
-    return true;
+    idle_cv_.notify_all();
+    cv_.notify_all();
 }
 
 void KVDiskCache::reap_retired_generations() {
@@ -4984,6 +5154,7 @@ void KVDiskCache::drop_spill(SpillSession& session) noexcept {
 void KVDiskCache::discard_spill(std::unique_lock<std::mutex>& lock) {
     drop_spill(*spill_);
     spill_.reset();
+    cv_.notify_all();
     flush_queued_unlinks(lock);
 }
 
@@ -5858,28 +6029,20 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
         }
     }
     const std::uint64_t logical_needed = append_bytes > credit ? append_bytes - credit : 0;
-    // Garbage is physical until a generation rewrite completes.  Compact at
-    // the admission boundary, before accepting any new append allocation,
-    // rather than allowing the append path to grow past the 25% threshold.
-    // While a restore or reader still owns the current generation, compaction
-    // is unsafe rather than failed: an idle spill retries at a later quiescent
-    // point, and an emergency spill appends past the threshold because the
-    // physical-room check below still reserves the deferred compaction copy.
-    const bool compaction_deferred = packs_need_compaction() && compaction_blocked_locked();
-    if (compaction_deferred && !emergency) {
+    // Garbage is physical until a generation rewrite completes.  The disk
+    // worker compacts in unlocked slices and publishes at a quiescent point;
+    // admission never copies the pack store itself.  An idle spill waits for
+    // that rewrite, while an emergency spill appends past the threshold because
+    // the physical-room check below still reserves the compaction copy.
+    // A generation retired while a read held its lease is reclaimed at the next
+    // admission; until then it occupies disk and blocks another rewrite.
+    if (!retired_generations_.empty()) { reap_retired_generations(); }
+    const bool compaction_pending = compaction_pending_locked();
+    if (compaction_pending) { request_compaction_locked(); }
+    if (compaction_pending && !emergency) {
         if (session.ticket != 0) { unpin_disk(session.ticket); }
         for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
         branch_shared_ids_.clear();
-        flush_queued_unlinks(lock);
-        return false;
-    }
-    if (!compaction_deferred && packs_need_compaction() && !compact_packs(lock, append_bytes)) {
-        if (session.ticket != 0) { unpin_disk(session.ticket); }
-        for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
-        branch_shared_ids_.clear();
-        note_it->second.failed_this_generation = true;
-        note_it->second.generation_stamp = durable_generation_;
-        ++drops_;
         flush_queued_unlinks(lock);
         return false;
     }
@@ -6278,6 +6441,57 @@ void KVDiskCache::install_committed_entry(SpillSession& session,
     flush_queued_unlinks(lock);
 }
 
+RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block) {
+    if (config_.ram == nullptr) { return RamReclaim::NoVictim; }
+    KVRamCache& ram = *config_.ram;
+    std::vector<std::uint64_t> candidates = ram.unpinned_ids();
+    if (candidates.empty()) {
+        ram.wait_pending_copies();
+        candidates = ram.unpinned_ids();
+    }
+    if (candidates.empty()) { return RamReclaim::NoVictim; }
+    std::optional<std::uint64_t> victim;
+    for (std::uint64_t id : candidates) {
+        if (ram_is_durable(id)) {
+            victim = id;
+            break;
+        }
+    }
+    bool unsaved = false;
+    if (!victim) {
+        victim = candidates.front();
+        if (may_block) {
+            cancel_idle_spill();
+            if (!emergency_spill_ram(*victim)) { return RamReclaim::Failed; }
+        } else {
+            unsaved = true;
+        }
+    }
+    begin_ram_idle_exclusion(*victim);
+    // A disk capacity eviction may have removed the durable copy since the
+    // choice; choose again rather than dropping an entry picked as durable.
+    if (!unsaved && !ram_is_durable(*victim)) {
+        end_ram_idle_exclusion(*victim);
+        return RamReclaim::Retry;
+    }
+    bool evicted = false;
+    try {
+        evicted = ram.evict_one_unpinned(*victim);
+    } catch (...) {
+        end_ram_idle_exclusion(*victim);
+        throw;
+    }
+    if (evicted) {
+        if (!ram_is_durable(*victim)) {
+            std::lock_guard lock(mutex_);
+            ++drops_;
+        }
+        forget_ram_resident(*victim);
+    }
+    end_ram_idle_exclusion(*victim);
+    return evicted ? RamReclaim::Evicted : RamReclaim::Retry;
+}
+
 bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
     if (config_.ram == nullptr) { return false; }
     auto wait_done = [&](std::unique_lock<std::mutex>& lock, bool allow_terminal = false) {
@@ -6323,7 +6537,7 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         return false;
     }
     try {
-        while (!config_.ram->copies_ready(ram_id)) { config_.ram->wait_pending_copies(); }
+        config_.ram->wait_entry_copies(ram_id);
     } catch (...) {
         unpin_extra();
         std::lock_guard inner(mutex_);
@@ -6432,7 +6646,14 @@ void KVDiskCache::wait_idle_and_fsync() {
                payload_io_inflight_ == 0 && restore_state_inflight_ == 0 &&
                reader_claims_.empty();
     });
-    if (packs_need_compaction()) { (void)compact_packs(lock); }
+    // Explicit maintenance retries a rewrite that failed earlier.
+    if (!compaction_ && retired_generations_.empty() && packs_need_compaction()) {
+        compaction_requested_ = true;
+    }
+    if (compaction_ || compaction_requested_) {
+        cv_.notify_all();
+        idle_cv_.wait(lock, [&] { return stopping_ || (!compaction_ && !compaction_requested_); });
+    }
     reap_retired_generations();
     lock.unlock();
     try {
@@ -6622,24 +6843,47 @@ void KVDiskCache::prefetch_window(std::uint64_t entry_id, std::uint32_t text_dst
     }
 }
 
+bool KVDiskCache::restore_window_busy_locked(std::uint64_t entry_id) const {
+    const auto it = entries_.find(entry_id);
+    if (it == entries_.end()) { return false; }
+    const std::uint64_t claim     = it->second.claim_generation;
+    const std::uint64_t committed = it->second.committed_generation;
+    for (const WindowSlot& slot : window_) {
+        const bool keep = slot.assigned && slot.disk_entry_id == entry_id &&
+                          slot.epoch == restore_epoch_ && slot.claim_generation == claim &&
+                          slot.committed_generation == committed;
+        if (slot.assigned && !slot.filled && !keep) { return true; }
+    }
+    return false;
+}
+
+bool KVDiskCache::restore_setup_ready(std::uint64_t entry_id) const {
+    std::lock_guard lock(mutex_);
+    if (stopping_) { return true; }
+    if (restore_window_busy_locked(entry_id)) { return false; }
+    for (const WindowSlot& slot : window_) {
+        if (!slot.assigned || slot.disk_entry_id != entry_id || !slot.h2d_done ||
+            slot.h2d_event == nullptr) {
+            continue;
+        }
+        const cudaError_t ready = cudaEventQuery(slot.h2d_event);
+        if (ready == cudaErrorNotReady) { return false; }
+        CUDA_CHECK(ready);
+    }
+    if (state_arena_h2d_pending_ && state_h2d_stream_ != nullptr) {
+        const cudaError_t ready = cudaStreamQuery(state_h2d_stream_);
+        if (ready == cudaErrorNotReady) { return false; }
+        CUDA_CHECK(ready);
+    }
+    return true;
+}
+
 std::uint64_t KVDiskCache::restore_device(std::uint64_t entry_id, const DiskRestoreTarget& target) {
     std::unique_lock lock(mutex_);
     std::uint64_t unpublished_ticket = 0;
     try {
-    idle_cv_.wait(lock, [&] {
-        if (stopping_) { return true; }
-        const auto it = entries_.find(entry_id);
-        if (it == entries_.end()) { return true; }
-        const std::uint64_t claim     = it->second.claim_generation;
-        const std::uint64_t committed = it->second.committed_generation;
-        for (const WindowSlot& slot : window_) {
-            const bool keep = slot.assigned && slot.disk_entry_id == entry_id &&
-                              slot.epoch == restore_epoch_ && slot.claim_generation == claim &&
-                              slot.committed_generation == committed;
-            if (slot.assigned && !slot.filled && !keep) { return false; }
-        }
-        return true;
-    });
+    // Another entry's in-flight window reads own their host slots until filled.
+    idle_cv_.wait(lock, [&] { return stopping_ || !restore_window_busy_locked(entry_id); });
     if (stopping_) { return 0; }
     wait_state_arena_idle(lock);
     if (stopping_) { return 0; }
@@ -8083,7 +8327,9 @@ void KVDiskCache::io_loop() {
                     return true;
                 }
                 if (!emergency_q_.empty() && !restore_readers_busy_locked()) { return true; }
-                if ((!idle_q_.empty() || (idle_requested_ && !emergency_preparing_)) &&
+                if (compaction_runnable_locked()) { return true; }
+                if ((!idle_q_.empty() || (idle_requested_ && !emergency_preparing_ &&
+                                          !compaction_ && !compaction_requested_)) &&
                     !restore_or_prefetch_busy_locked()) {
                     return true;
                 }
@@ -8116,8 +8362,11 @@ void KVDiskCache::io_loop() {
                     idle_cv_.notify_all();
                 }
                 continue;
-            } else if (!stopping_ && idle_requested_ && !emergency_preparing_ && !spill_ &&
-                       !idle_cancel_all_ &&
+            } else if (compaction_runnable_locked()) {
+                compaction_step(lock);
+                continue;
+            } else if (!stopping_ && idle_requested_ && !emergency_preparing_ && !compaction_ &&
+                       !compaction_requested_ && !spill_ && !idle_cancel_all_ &&
                        !restore_or_prefetch_busy_locked() && config_.ram != nullptr) {
                 std::uint64_t ram_id = 0;
                 try {
@@ -8157,7 +8406,7 @@ void KVDiskCache::io_loop() {
                 try {
                     config_.ram->pin_for_io(ram_id);
                     ram_pinned = true;
-                    while (!config_.ram->copies_ready(ram_id)) { config_.ram->wait_pending_copies(); }
+                    config_.ram->wait_entry_copies(ram_id);
                 } catch (...) {
                     if (ram_pinned) {
                         try {
@@ -8181,6 +8430,7 @@ void KVDiskCache::io_loop() {
                                        config_.ram->is_claimed(ram_id) ||
                                        restore_cancels_idle_locked();
                 bool prepared = false;
+                const std::uint64_t first_new_epoch = next_spill_epoch_;
                 try {
                     prepared = !abort_pin && prepare_spill(ram_id, false, inner);
                 } catch (...) {
@@ -8200,6 +8450,17 @@ void KVDiskCache::io_loop() {
                     idle_pinning_ram_ = 0;
                     idle_cv_.notify_all();
                     continue;
+                }
+                // prepare_spill may release the mutex (unlink flush, capacity
+                // eviction) before installing. A cancellation in that window saw
+                // no session to cancel, so the one installed here is discarded;
+                // this thread takes every payload job, so none is in flight.
+                if (spill_ && !spill_->emergency && spill_->epoch >= first_new_epoch &&
+                    (epoch != idle_cancel_epoch_ || idle_cancel_all_ ||
+                     idle_cancel_ram_ == ram_id || emergency_preparing_ ||
+                     restore_cancels_idle_locked())) {
+                    spill_->cancelled = true;
+                    discard_spill(inner);
                 }
                 idle_pinning_     = false;
                 idle_pinning_ram_ = 0;

@@ -409,7 +409,7 @@ void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction,
     if (done != nullptr) { wait_event_unlocked(lock, done, entry_id); }
     it = records_.find(entry_id);
     if (it == records_.end()) { return; }
-    orphaned_save_seconds_ += harvest_record(it->second);
+    add_orphaned_seconds(it->second, harvest_record(it->second));
     if (it->second.copies_start != nullptr) {
         CUDA_CHECK(cudaEventDestroy(it->second.copies_start));
         it->second.copies_start = nullptr;
@@ -461,6 +461,14 @@ double KVRamCache::copy_elapsed_seconds(const Record& record) const {
     return static_cast<double>(milliseconds) / 1000.0;
 }
 
+void KVRamCache::add_orphaned_seconds(const Record& record, double seconds) noexcept {
+    if (record.copies_are_load) {
+        orphaned_load_seconds_ += seconds;
+    } else {
+        orphaned_save_seconds_ += seconds;
+    }
+}
+
 double KVRamCache::harvest_record(Record& record) {
     if (!record.copies_timed || record.copies_start == nullptr || record.copies_done == nullptr) {
         return 0;
@@ -501,15 +509,14 @@ KvRamCopySeconds KVRamCache::harvest_copy_seconds() {
         save_seconds_ += seconds;
     }
     pending_save_ids_.clear();
-    if (pending_load_id_) {
-        const auto it = records_.find(*pending_load_id_);
-        if (it != records_.end()) {
-            const double seconds = harvest_record(it->second);
-            out.load += seconds;
-            load_seconds_ += seconds;
-        }
-        pending_load_id_.reset();
+    for (std::uint64_t id : pending_load_ids_) {
+        const auto it = records_.find(id);
+        if (it == records_.end()) { continue; }
+        const double seconds = harvest_record(it->second);
+        out.load += seconds;
+        load_seconds_ += seconds;
     }
+    pending_load_ids_.clear();
     for (std::uint64_t id : pinned) {
         const auto it = records_.find(id);
         if (it == records_.end() || it->second.io_pins == 0) { continue; }
@@ -538,7 +545,9 @@ bool KVRamCache::pending_copies_ready() const {
     for (std::uint64_t id : pending_save_ids_) {
         if (!copies_ready_locked(id)) { return false; }
     }
-    if (pending_load_id_ && !copies_ready_locked(*pending_load_id_)) { return false; }
+    for (std::uint64_t id : pending_load_ids_) {
+        if (!copies_ready_locked(id)) { return false; }
+    }
     return true;
 }
 
@@ -550,6 +559,8 @@ void KVRamCache::wait_pending_copies_on_stream(cudaStream_t stream) {
         pin_pending_copy_events(events, pinned);
     }
     try {
+        // The pins only keep each event alive while it is enqueued; the stream
+        // wait captures the event's current work, so the host does not block.
         for (cudaEvent_t event : events) {
             if (stream != nullptr) {
                 CUDA_CHECK(cudaStreamWaitEvent(stream, event, 0));
@@ -557,7 +568,6 @@ void KVRamCache::wait_pending_copies_on_stream(cudaStream_t stream) {
                 CUDA_CHECK(cudaEventSynchronize(event));
             }
         }
-        for (cudaEvent_t event : events) { CUDA_CHECK(cudaEventSynchronize(event)); }
     } catch (...) {
         unpin_copy_events(pinned);
         throw;
@@ -579,6 +589,24 @@ void KVRamCache::wait_pending_copies() {
         throw;
     }
     unpin_copy_events(pinned);
+}
+
+void KVRamCache::wait_entry_copies(std::uint64_t entry_id) {
+    cudaEvent_t event = nullptr;
+    {
+        std::lock_guard lock(io_mutex_);
+        const auto it = records_.find(entry_id);
+        if (it == records_.end() || it->second.copies_done == nullptr) { return; }
+        ++it->second.io_pins;
+        event = it->second.copies_done;
+    }
+    try {
+        CUDA_CHECK(cudaEventSynchronize(event));
+    } catch (...) {
+        unpin_copy_events({entry_id});
+        throw;
+    }
+    unpin_copy_events({entry_id});
 }
 
 void KVRamCache::wait_copies(Record& record) {
@@ -643,7 +671,7 @@ void KVRamCache::pin_pending_copy_events(std::vector<cudaEvent_t>& events,
             fail_copy_snapshot_allocation_stage_ = -1;
             throw std::bad_alloc();
         }
-        const std::size_t count = pending_save_ids_.size() + (pending_load_id_ ? 1 : 0);
+        const std::size_t count = pending_save_ids_.size() + pending_load_ids_.size();
         ids.reserve(count);
         if (fail_copy_snapshot_allocation_stage_ == 1) {
             fail_copy_snapshot_allocation_stage_ = -1;
@@ -662,7 +690,7 @@ void KVRamCache::pin_pending_copy_events(std::vector<cudaEvent_t>& events,
             }
         };
         for (const auto id : pending_save_ids_) { wait(id); }
-        if (pending_load_id_) { wait(*pending_load_id_); }
+        for (const auto id : pending_load_ids_) { wait(id); }
         return;
     }
     auto pin = [&](std::uint64_t id) {
@@ -673,7 +701,7 @@ void KVRamCache::pin_pending_copy_events(std::vector<cudaEvent_t>& events,
         events.push_back(it->second.copies_done);
     };
     for (std::uint64_t id : pending_save_ids_) { pin(id); }
-    if (pending_load_id_) { pin(*pending_load_id_); }
+    for (std::uint64_t id : pending_load_ids_) { pin(id); }
 }
 
 void KVRamCache::unpin_copy_events(const std::vector<std::uint64_t>& ids) noexcept {
@@ -694,7 +722,9 @@ void KVRamCache::drop_pending_save(std::uint64_t entry_id) noexcept {
 
 void KVRamCache::drop_pending_id(std::uint64_t entry_id) noexcept {
     drop_pending_save(entry_id);
-    if (pending_load_id_ && *pending_load_id_ == entry_id) { pending_load_id_.reset(); }
+    pending_load_ids_.erase(
+        std::remove(pending_load_ids_.begin(), pending_load_ids_.end(), entry_id),
+        pending_load_ids_.end());
 }
 
 void KVRamCache::claim(std::uint64_t entry_id) {
@@ -728,7 +758,6 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     if (done != nullptr) { wait_event_unlocked(lock, done, entry_id); }
     Record& live = require(entry_id);
     const double leftover    = copy_elapsed_seconds(live);
-    const bool load_pending  = pending_load_id_ && *pending_load_id_ == entry_id;
     // The source event has completed above, so no deferred owner is needed.
     // Arena free uses metadata reserved at allocation time and cannot allocate.
     if (live.copies_done != nullptr) {
@@ -741,12 +770,8 @@ void KVRamCache::consume(std::uint64_t entry_id) {
         (void)cudaEventDestroy(live.copies_start);
         live.copies_start = nullptr;
     }
+    add_orphaned_seconds(live, leftover);
     live.copies_timed = false;
-    if (load_pending) {
-        orphaned_load_seconds_ += leftover;
-    } else {
-        orphaned_save_seconds_ += leftover;
-    }
     drop_pending_id(entry_id);
     records_.erase(entry_id);
     fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
@@ -761,6 +786,17 @@ std::optional<std::uint64_t> KVRamCache::peek_oldest_unpinned() const {
         if (!record.pinned && record.io_pins == 0) { return id; }
     }
     return std::nullopt;
+}
+
+std::vector<std::uint64_t> KVRamCache::unpinned_ids() const {
+    std::lock_guard lock(io_mutex_);
+    std::vector<std::uint64_t> ids;
+    ids.reserve(fifo_.size());
+    for (std::uint64_t id : fifo_) {
+        const Record& record = require(id);
+        if (!record.pinned && record.io_pins == 0) { ids.push_back(id); }
+    }
+    return ids;
 }
 
 std::vector<std::uint64_t> KVRamCache::fifo_ids() const {
@@ -1353,106 +1389,118 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
     {
         std::lock_guard lock(io_mutex_);
         Record& record = require(entry_id);
-        orphaned_save_seconds_ += harvested;
+        add_orphaned_seconds(record, harvested);
         if (record.copies_start != nullptr) {
             CUDA_CHECK(cudaEventDestroy(record.copies_start));
             record.copies_start = nullptr;
         }
         record.copies_timed = false;
+        // Reserve before any H2D is enqueued so publishing the load cannot fail.
+        pending_load_ids_.reserve(pending_load_ids_.size() + 1);
         begin_copies(record, target.stream);
+        record.copies_are_load = true;
     }
-    unpack_paged_kv_allocation_from_host(*target.text, *target.text_pool, raw + header.offset[2],
-                                         header.text_mapped_pages, target.text_dst_pages,
-                                         target.stream);
-    if (target.backend != nullptr && header.length[3] != 0) {
-        unpack_paged_kv_allocation_from_host(*target.backend, *target.backend_pool,
-                                             raw + header.offset[3], header.backend_mapped_pages,
-                                             target.backend_dst_pages, target.stream);
-    }
-    const bool context_head =
-        is_staged_checkpoint_restore(target.reuse) && target.reuse_base != 0;
-    const RamLadderImage* matched_head = nullptr;
-    if (context_head) {
-        for (const RamLadderImage& image : header.ladder_images) {
-            if (image.frontier == target.reuse_base) {
-                matched_head = &image;
-                break;
+    // Every exit after the first enqueued read re-records copies_done, so the
+    // host block stays fenced until the H2D reads that were issued complete.
+    try {
+        unpack_paged_kv_allocation_from_host(*target.text, *target.text_pool, raw + header.offset[2],
+                                             header.text_mapped_pages, target.text_dst_pages,
+                                             target.stream);
+        if (target.backend != nullptr && header.length[3] != 0) {
+            unpack_paged_kv_allocation_from_host(*target.backend, *target.backend_pool,
+                                                 raw + header.offset[3], header.backend_mapped_pages,
+                                                 target.backend_dst_pages, target.stream);
+        }
+        const bool context_head =
+            is_staged_checkpoint_restore(target.reuse) && target.reuse_base != 0;
+        const RamLadderImage* matched_head = nullptr;
+        if (context_head) {
+            for (const RamLadderImage& image : header.ladder_images) {
+                if (image.frontier == target.reuse_base) {
+                    matched_head = &image;
+                    break;
+                }
             }
-        }
-        if (matched_head == nullptr) {
-            throw std::logic_error("RAM restore is missing the matched context-checkpoint head");
-        }
-        if (reuse_path_for_context_checkpoint_kind(matched_head->kind) != target.reuse) {
-            throw std::logic_error(
-                "RAM restore context-checkpoint kind does not match the reuse path");
-        }
-        if (target.gdn != nullptr) {
-            if (matched_head->conv_bytes != target.gdn->conv_host_image_bytes() ||
-                matched_head->recurrent_bytes != target.gdn->recurrent_host_image_bytes()) {
-                throw std::logic_error("RAM context-checkpoint GDN geometry mismatch");
+            if (matched_head == nullptr) {
+                throw std::logic_error("RAM restore is missing the matched context-checkpoint head");
             }
-            target.gdn->unpack_slot_from_host(target.gdn_current_slot, matched_head->conv,
-                                              matched_head->recurrent, target.stream);
-        }
-        if (target.tail_hidden != nullptr && matched_head->hidden != nullptr &&
-            matched_head->hidden_bytes != 0) {
-            if (matched_head->hidden_bytes != target.tail_hidden->bytes()) {
-                throw std::logic_error("RAM context-checkpoint hidden geometry mismatch");
+            if (reuse_path_for_context_checkpoint_kind(matched_head->kind) != target.reuse) {
+                throw std::logic_error(
+                    "RAM restore context-checkpoint kind does not match the reuse path");
             }
-            CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, matched_head->hidden,
-                                       matched_head->hidden_bytes, cudaMemcpyHostToDevice,
-                                       target.stream));
-        }
-        if (target.dflash_local != nullptr) {
-            if (matched_head->dflash == nullptr || matched_head->dflash_bytes == 0 ||
-                matched_head->dflash_bytes != target.dflash_local->lane_host_bytes()) {
-                throw std::logic_error("RAM context-checkpoint DFlash cyclic geometry mismatch");
+            if (target.gdn != nullptr) {
+                if (matched_head->conv_bytes != target.gdn->conv_host_image_bytes() ||
+                    matched_head->recurrent_bytes != target.gdn->recurrent_host_image_bytes()) {
+                    throw std::logic_error("RAM context-checkpoint GDN geometry mismatch");
+                }
+                target.gdn->unpack_slot_from_host(target.gdn_current_slot, matched_head->conv,
+                                                  matched_head->recurrent, target.stream);
             }
-            target.dflash_local->copy_lane_from_host(matched_head->dflash, target.dflash_lane,
+            if (target.tail_hidden != nullptr && matched_head->hidden != nullptr &&
+                matched_head->hidden_bytes != 0) {
+                if (matched_head->hidden_bytes != target.tail_hidden->bytes()) {
+                    throw std::logic_error("RAM context-checkpoint hidden geometry mismatch");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, matched_head->hidden,
+                                           matched_head->hidden_bytes, cudaMemcpyHostToDevice,
+                                           target.stream));
+            }
+            if (target.dflash_local != nullptr) {
+                if (matched_head->dflash == nullptr || matched_head->dflash_bytes == 0 ||
+                    matched_head->dflash_bytes != target.dflash_local->lane_host_bytes()) {
+                    throw std::logic_error("RAM context-checkpoint DFlash cyclic geometry mismatch");
+                }
+                target.dflash_local->copy_lane_from_host(matched_head->dflash, target.dflash_lane,
+                                                         target.stream);
+            }
+        } else if (target.gdn != nullptr && (header.length[4] != 0 || header.length[6] != 0)) {
+            target.gdn->unpack_slot_from_host(target.gdn_current_slot, raw + header.offset[4],
+                                              raw + header.offset[6], target.stream);
+        }
+        const bool unpack_rewrite =
+            !context_head || header.rewrite_frontier <= target.reuse_base;
+        if (unpack_rewrite && target.gdn != nullptr &&
+            (header.length[5] != 0 || header.length[7] != 0)) {
+            if (target.rewrite_state.conv == nullptr || target.rewrite_state.recurrent == nullptr) {
+                throw std::logic_error("RAM restore is missing the rewrite-checkpoint GDN image");
+            }
+            std::memcpy(target.rewrite_state.conv, raw + header.offset[5],
+                        static_cast<std::size_t>(header.length[5]));
+            std::memcpy(target.rewrite_state.recurrent, raw + header.offset[7],
+                        static_cast<std::size_t>(header.length[7]));
+        }
+        if (!context_head && target.tail_hidden != nullptr && header.length[8] != 0) {
+            CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, raw + header.offset[8],
+                                       static_cast<std::size_t>(header.length[8]),
+                                       cudaMemcpyHostToDevice, target.stream));
+        }
+        if (unpack_rewrite && target.rewrite_checkpoint_hidden != nullptr && header.length[9] != 0) {
+            CUDA_CHECK(cudaMemcpyAsync(target.rewrite_checkpoint_hidden->data, raw + header.offset[9],
+                                       static_cast<std::size_t>(header.length[9]),
+                                       cudaMemcpyHostToDevice, target.stream));
+        }
+        if (!context_head && target.dflash_local != nullptr && header.length[10] != 0) {
+            target.dflash_local->copy_lane_from_host(raw + header.offset[10], target.dflash_lane,
                                                      target.stream);
         }
-    } else if (target.gdn != nullptr && (header.length[4] != 0 || header.length[6] != 0)) {
-        target.gdn->unpack_slot_from_host(target.gdn_current_slot, raw + header.offset[4],
-                                          raw + header.offset[6], target.stream);
-    }
-    const bool unpack_rewrite =
-        !context_head || header.rewrite_frontier <= target.reuse_base;
-    if (unpack_rewrite && target.gdn != nullptr &&
-        (header.length[5] != 0 || header.length[7] != 0)) {
-        if (target.rewrite_state.conv == nullptr || target.rewrite_state.recurrent == nullptr) {
-            throw std::logic_error("RAM restore is missing the rewrite-checkpoint GDN image");
+        if (unpack_rewrite && target.dflash_local != nullptr && header.length[11] != 0) {
+            if (target.rewrite_state.dflash == nullptr) {
+                throw std::logic_error("RAM restore is missing the rewrite-checkpoint DFlash image");
+            }
+            std::memcpy(target.rewrite_state.dflash, raw + header.offset[11],
+                        static_cast<std::size_t>(header.length[11]));
         }
-        std::memcpy(target.rewrite_state.conv, raw + header.offset[5],
-                    static_cast<std::size_t>(header.length[5]));
-        std::memcpy(target.rewrite_state.recurrent, raw + header.offset[7],
-                    static_cast<std::size_t>(header.length[7]));
-    }
-    if (!context_head && target.tail_hidden != nullptr && header.length[8] != 0) {
-        CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, raw + header.offset[8],
-                                   static_cast<std::size_t>(header.length[8]),
-                                   cudaMemcpyHostToDevice, target.stream));
-    }
-    if (unpack_rewrite && target.rewrite_checkpoint_hidden != nullptr && header.length[9] != 0) {
-        CUDA_CHECK(cudaMemcpyAsync(target.rewrite_checkpoint_hidden->data, raw + header.offset[9],
-                                   static_cast<std::size_t>(header.length[9]),
-                                   cudaMemcpyHostToDevice, target.stream));
-    }
-    if (!context_head && target.dflash_local != nullptr && header.length[10] != 0) {
-        target.dflash_local->copy_lane_from_host(raw + header.offset[10], target.dflash_lane,
-                                                 target.stream);
-    }
-    if (unpack_rewrite && target.dflash_local != nullptr && header.length[11] != 0) {
-        if (target.rewrite_state.dflash == nullptr) {
-            throw std::logic_error("RAM restore is missing the rewrite-checkpoint DFlash image");
-        }
-        std::memcpy(target.rewrite_state.dflash, raw + header.offset[11],
-                    static_cast<std::size_t>(header.length[11]));
+    } catch (...) {
+        std::lock_guard lock(io_mutex_);
+        const auto it = records_.find(entry_id);
+        if (it != records_.end()) { record_copies(it->second, target.stream); }
+        throw;
     }
     {
         std::lock_guard lock(io_mutex_);
         Record& record = require(entry_id);
         record_copies(record, target.stream);
-        pending_load_id_ = entry_id;
+        pending_load_ids_.push_back(entry_id);
     }
     if (fail_next_restore_metadata_allocation_.exchange(false, std::memory_order_acq_rel)) {
         throw std::bad_alloc();
@@ -1472,7 +1520,7 @@ void KVRamCache::test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_
 
 std::size_t KVRamCache::test_pending_copy_count() const noexcept {
     std::lock_guard lock(io_mutex_);
-    return pending_save_ids_.size() + (pending_load_id_ ? 1 : 0);
+    return pending_save_ids_.size() + pending_load_ids_.size();
 }
 
 std::uint32_t KVRamCache::test_io_pins(std::uint64_t entry_id) const {

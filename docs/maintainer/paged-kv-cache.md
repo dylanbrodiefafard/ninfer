@@ -900,7 +900,11 @@ working set.
 ### 10.5 Inclusive SSD third tier
 
 `--kv-disk-capacity` enables an inclusive SSD store of completed bundles and requires
-`--kv-ram-capacity > 0`. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
+`--kv-ram-capacity > 0`. Each RAM capture requests a write-behind spill on the disk worker, so
+entries usually become durable while other requests decode. When a capture needs RAM, the oldest
+unpinned disk-durable entry is evicted first. Without one, the oldest entry is spilled
+synchronously only when no other lane is decoding; otherwise it is dropped unsaved, so decoding
+never waits for a disk write. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
 immutable entry and its pack-generation lease, restores directly into the selected VRAM lane,
 and never parks the restored bundle in the RAM FIFO. Consuming the claim releases its generation
 lease but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
@@ -978,13 +982,16 @@ new page required when an exact-hit bridge extends validity after cancelled pref
 
 Compaction copies live extents into a new generation, publishes its complete base map, and then
 atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
-durable and all reader leases have drained. Admission requires the copy-on-write reserve before
-the first compaction or spill byte is written. Compaction does not start while a restore, reader
-claim, or payload I/O still uses the current generation; an emergency spill then appends past
-the garbage threshold, and an idle spill defers without marking its entry failed, so compaction
-runs at the next quiescent admission. The deferred spill's room check counts the current
-compaction copy but not later appends, so a compaction that no longer fits falls back to
-low-space eviction. Eviction uses durable tombstones so an uncertain
+durable and all reader leases have drained. Spill admission only requests compaction; the disk
+worker runs it between its queued jobs, copying a snapshot of live extents in 64 MiB slices with
+the cache mutex released, then copying objects committed to the source generation meanwhile.
+Lookups, claims, and statistics therefore never wait for the copy. Publication switches object
+locations to the new generation and waits only for no spill session or payload I/O; restores and
+reader claims continue across it on their generation leases. While compaction is pending an idle spill defers without marking its entry failed,
+and an emergency spill appends past the garbage threshold inside the copy-on-write reserve. A
+spill's room check counts the pending compaction copy but not later appends, so a compaction that
+no longer fits falls back to low-space eviction; a failed compaction is not retried until the
+durable generation changes. Eviction uses durable tombstones so an uncertain
 metadata publication cannot make a referenced object reusable. Before capacity eviction, admission
 checks that the incoming incremental bytes plus unique extents protected by claims or I/O pins
 (including a spill's parent) fit the budget. Known capacity shortfalls are rejected without

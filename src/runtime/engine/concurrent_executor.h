@@ -382,7 +382,9 @@ private:
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
         assign_kv_ram_stats(snapshot, instance_.program->kv_ram_snapshot());
-        const auto disk = instance_.program->kv_disk_snapshot();
+        // The disk tier's mutex can be held by its worker for file I/O; a
+        // decode-loop stats publication keeps the last snapshot instead of waiting.
+        const auto disk = instance_.program->try_kv_disk_snapshot();
         const auto gpu                    = instance_.program->kv_gpu_snapshot();
         snapshot.gpu_kv_main_capacity_pages = gpu.main.page_group_count;
         snapshot.gpu_kv_main_entitled_pages = gpu.main.entitled_pages;
@@ -393,7 +395,7 @@ private:
         snapshot.gpu_kv_spec_mapped_pages   = gpu.spec.mapped_pages;
         snapshot.gpu_kv_spec_free_pages     = gpu.spec.free_pages;
         std::lock_guard lock(stats_mutex_);
-        note_kv_disk_snapshot_locked(disk);
+        if (disk) { note_kv_disk_snapshot_locked(*disk); }
         copy_kv_disk_stats(snapshot, latest_disk_stats_);
         published_stats_ = snapshot;
     }
@@ -1823,6 +1825,11 @@ private:
                 hold.restored = true;
             }
             if (hold.disk_hit && !hold.restored) {
+                // Setup waits for other entries' window reads; keep decoding members
+                // running until it can start without blocking.
+                if (!membership_empty && !instance_.program->disk_restore_ready(hold.disk_entry_id)) {
+                    return AdmissionProgress::CopyHold;
+                }
                 instance_.program->restore_disk_entry(lane, hold.disk_entry_id, hold.plan);
                 hold.disk_restore_epoch = instance_.program->pending_disk_restore_ticket();
                 hold.restored = true;
@@ -2050,6 +2057,12 @@ private:
             }
             std::array<std::uint32_t, kMaximumConcurrency> victims{};
             std::size_t victim_count = 0;
+            // While other lanes decode, freeing host RAM for these captures must
+            // not wait on a synchronous disk spill.
+            bool others_decoding = false;
+            for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+                others_decoding = others_decoding || (other != lane && slots_[other] != nullptr);
+            }
             if (choice.evict_retained) {
                 while (!instance_.program->can_admit_lane_after_releasing(lane, winning_plan,
                                                                           std::span(victims).first(victim_count))) {
@@ -2078,7 +2091,8 @@ private:
                     std::uint64_t ram_id = 0;
                     // Saving a completed prefix is optional. Even if its host
                     // image is dropped, this free lane can release its GPU pages.
-                    (void)instance_.program->capture_retained_lane(*victim, &ram_id);
+                    (void)instance_.program->capture_retained_lane(*victim, &ram_id,
+                                                                   !others_decoding);
                     if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                     victims[victim_count++] = *victim;
                 }
@@ -2087,7 +2101,7 @@ private:
             if (instance_.program->has_retained_lane(lane) &&
                 (ram_hit || disk_hit || winning_plan.summary().reusable_prompt_tokens == 0)) {
                 std::uint64_t ram_id = 0;
-                (void)instance_.program->capture_retained_lane(lane, &ram_id);
+                (void)instance_.program->capture_retained_lane(lane, &ram_id, !others_decoding);
                 if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                 if (std::find(victims.begin(), victims.begin() + victim_count, lane) ==
                     victims.begin() + victim_count) {
@@ -2524,28 +2538,30 @@ private:
                 }
             }
             stable_decode_epoch = false;
+            bool idle = false;
+            {
+                std::scoped_lock lock(queue_mutex_);
+                idle = !stopping_ && pending_.empty();
+            }
+            for (std::uint32_t lane = 0; idle && lane < max_concurrency_; ++lane) {
+                idle = slots_[lane] == nullptr;
+            }
+            // Cache-tier calls take the tiers' own locks and may wait on disk
+            // maintenance; submit() must never queue behind them on queue_mutex_.
+            bool copies_ready = false;
+            if (idle && !copy_hold_) {
+                try {
+                    copies_ready = instance_.program->kv_copies_ready();
+                    if (copies_ready) { instance_.program->request_idle_spill(); }
+                } catch (...) {}
+            }
             {
                 std::unique_lock lock(queue_mutex_);
-                if (!stopping_ && pending_.empty()) {
-                    bool active = false;
-                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-                        active = active || slots_[lane] != nullptr;
-                    }
-                    if (!active) {
-                        bool copies_ready = false;
-                        if (!copy_hold_) {
-                            try {
-                                copies_ready = instance_.program->kv_copies_ready();
-                                if (copies_ready) { instance_.program->request_idle_spill(); }
-                            } catch (...) {}
-                        }
-                        if (copies_ready) {
-                            queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
-                        } else {
-                            queue_cv_.wait_for(lock, std::chrono::milliseconds(20),
-                                              [&] { return stopping_ || !pending_.empty(); });
-                        }
-                    }
+                if (idle && copies_ready) {
+                    queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                } else if (idle) {
+                    queue_cv_.wait_for(lock, std::chrono::milliseconds(20),
+                                      [&] { return stopping_ || !pending_.empty(); });
                 }
                 if (stopping_) {
                     lock.unlock();
