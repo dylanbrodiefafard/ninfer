@@ -492,8 +492,22 @@ run_cpp_suite() {
   if [[ ${#CTEST_ARGS[@]} -gt 0 ]]; then
     ctest_cmd+=("${CTEST_ARGS[@]}")
   fi
+  # Disk-tier tests fsync heavily. Keep their scratch files on the source tree's
+  # filesystem instead of the container overlay, unless the caller chose a TMPDIR.
+  local scratch=""
+  if [[ -z "${TMPDIR:-}" ]]; then
+    mkdir -p "${src}/build"
+    scratch="$(mktemp -d "${src}/build/test-tmp.XXXXXX")"
+    export TMPDIR="$scratch"
+  fi
   echo "=== ${ctest_cmd[*]} ==="
-  "${ctest_cmd[@]}"
+  local status=0
+  "${ctest_cmd[@]}" || status=$?
+  if [[ -n "$scratch" ]]; then
+    rm -rf "$scratch"
+    unset TMPDIR
+  fi
+  return "$status"
 }
 
 run_inner() {

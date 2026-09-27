@@ -757,7 +757,13 @@ private:
                                  std::unique_lock<std::mutex>& lock,
                                  bool mark_durable = true, bool retain_replaced = false);
     void release_spill_pins(SpillSession& session, bool mark_failed);
-    void drop_spill(SpillSession& session, std::unique_lock<std::mutex>& lock);
+    // Releases the session's pins and draft objects under the held mutex; it never unlocks,
+    // so the caller resets spill_ before flushing the unlinks it queued.
+    void drop_spill(SpillSession& session) noexcept;
+    // drop_spill + spill_.reset() in one critical section, then the unlink flush.
+    void discard_spill(std::unique_lock<std::mutex>& lock);
+    // Worker failure path for the session of spill epoch `epoch`, if it is still installed.
+    void reset_failed_spill(std::uint64_t epoch, std::unique_lock<std::mutex>& lock);
     void purge_spill_jobs(std::uint64_t epoch);
     [[nodiscard]] bool draft_ready(const SpillSession& session) const;
     void record_uncertainty(std::uint64_t entry_id, const std::vector<std::uint64_t>& ids);
@@ -954,6 +960,7 @@ private:
     std::uint64_t idle_cancel_ram_ = 0;
     bool idle_pinning_              = false;
     std::uint64_t idle_pinning_ram_ = 0;
+    bool emergency_preparing_       = false;
     bool idle_cancel_all_           = false;
     std::uint64_t idle_cancel_epoch_ = 0;
     std::optional<SpillSession> spill_;

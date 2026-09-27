@@ -3460,8 +3460,7 @@ void KVDiskCache::finish_payload_io(std::unique_lock<std::mutex>& lock) {
     if (payload_io_inflight_ > 0) { --payload_io_inflight_; }
     if (spill_ && spill_->cancelled && !spill_->emergency && !spill_->committed &&
         payload_io_inflight_ == 0) {
-        drop_spill(*spill_, lock);
-        spill_.reset();
+        discard_spill(lock);
     }
     idle_cv_.notify_all();
     cv_.notify_all();
@@ -4515,8 +4514,7 @@ bool KVDiskCache::claim(std::uint64_t entry_id, PrefixHash128 expected_hash_f,
     if (spill_ && idle_rewrite_of(entry_id)) {
         spill_->cancelled = true;
         if (payload_io_inflight_ == 0) {
-            drop_spill(*spill_, lock);
-            spill_.reset();
+            discard_spill(lock);
         }
         idle_cv_.notify_all();
         cv_.notify_all();
@@ -4620,8 +4618,7 @@ void KVDiskCache::cancel_idle_locked(std::unique_lock<std::mutex>& lock) {
     if (spill_ && !spill_->emergency) {
         spill_->cancelled = true;
         if (payload_io_inflight_ == 0) {
-            drop_spill(*spill_, lock);
-            spill_.reset();
+            discard_spill(lock);
         }
         idle_cv_.notify_all();
     }
@@ -4636,8 +4633,7 @@ void KVDiskCache::cancel_idle_spill() {
     // writes are unrelated to idle cancellation (eviction skips I/O-pinned entries).
     idle_cv_.wait(lock, [&] { return (!spill_ || spill_->emergency) && !idle_pinning_; });
     if (spill_ && spill_->cancelled && !spill_->emergency) {
-        drop_spill(*spill_, lock);
-        spill_.reset();
+        discard_spill(lock);
         idle_cv_.notify_all();
     }
     idle_cancel_all_ = false;
@@ -4652,8 +4648,7 @@ void KVDiskCache::begin_ram_idle_exclusion(std::uint64_t ram_id) {
     if (spill_ && !spill_->emergency && spill_->ram_id == ram_id) {
         spill_->cancelled = true;
         if (payload_io_inflight_ == 0) {
-            drop_spill(*spill_, lock);
-            spill_.reset();
+            discard_spill(lock);
         }
         idle_cv_.notify_all();
         cv_.notify_all();
@@ -4671,8 +4666,7 @@ void KVDiskCache::begin_ram_idle_exclusion(std::uint64_t ram_id) {
                !(idle_pinning_ && idle_pinning_ram_ == ram_id);
     });
     if (spill_ && spill_->cancelled && !spill_->emergency && spill_->ram_id == ram_id) {
-        drop_spill(*spill_, lock);
-        spill_.reset();
+        discard_spill(lock);
         idle_cv_.notify_all();
     }
 }
@@ -4955,7 +4949,7 @@ void KVDiskCache::maybe_state_decode_stall() {
     if (ms > 0) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 }
 
-void KVDiskCache::drop_spill(SpillSession& session, std::unique_lock<std::mutex>& lock) {
+void KVDiskCache::drop_spill(SpillSession& session) noexcept {
     purge_spill_jobs(session.epoch);
     if (session.failed || session.committed) { return; }
     if (!session.meta_installed) {
@@ -4985,6 +4979,20 @@ void KVDiskCache::drop_spill(SpillSession& session, std::unique_lock<std::mutex>
     }
     session.failed = true;
     if (!session.cancelled) { ++drops_; }
+}
+
+void KVDiskCache::discard_spill(std::unique_lock<std::mutex>& lock) {
+    drop_spill(*spill_);
+    spill_.reset();
+    flush_queued_unlinks(lock);
+}
+
+void KVDiskCache::reset_failed_spill(std::uint64_t epoch, std::unique_lock<std::mutex>& lock) {
+    // finish_payload_io may already have discarded this session and released the
+    // mutex; a session installed since then belongs to another job.
+    if (!spill_ || spill_->epoch != epoch) { return; }
+    if (!spill_->committed && !spill_->meta_installed) { drop_spill(*spill_); }
+    spill_.reset();
     flush_queued_unlinks(lock);
 }
 
@@ -5513,8 +5521,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
         }
         if (!spill_->emergency) {
             spill_->cancelled = true;
-            drop_spill(*spill_, lock);
-            spill_.reset();
+            discard_spill(lock);
         } else {
             return false;
         }
@@ -5528,6 +5535,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
     SpillSession session;
     bool refresh_mtp_tail_identical = false;
     bool acquired_disk_pin = false;
+    bool installed = false;
     try {
     session.ram_id    = ram_id;
     session.ticket    = note_it->second.ticket;
@@ -5919,16 +5927,17 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
 
     session.epoch = next_spill_epoch_++;
     if (next_spill_epoch_ == 0) { next_spill_epoch_ = 1; }
+    if (spill_) { throw std::logic_error("concurrent KV disk spill installation"); }
     spill_ = std::move(session);
+    installed = true;
     enqueue_spill_jobs(*spill_);
     // Queue publication is the ownership boundary. Until every enqueue succeeds,
     // the preparing caller retains and releases its own RAM lease.
     spill_->ram_pin_owned = true;
     return true;
     } catch (...) {
-        if (spill_ && spill_->ram_id == ram_id && !spill_->committed && !spill_->failed) {
-            drop_spill(*spill_, lock);
-            spill_.reset();
+        if (installed && spill_ && !spill_->committed && !spill_->failed) {
+            discard_spill(lock);
         } else {
             if (acquired_disk_pin) {
                 if (session.ticket != 0) { unpin_disk(session.ticket); }
@@ -5954,17 +5963,17 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
 
 void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mutex>& lock) {
     if (session.cancelled || session.failed) {
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     if (crash_before_meta_) {
         crash_before_meta_ = false;
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     persist_checkpoints(session, lock);
     if (should_abandon_commit(session)) {
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     {
@@ -5979,7 +5988,7 @@ void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mute
         session.new_object_kinds.push_back(DiskObjectKind::Ledger);
     }
     if (should_abandon_commit(session)) {
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     {
@@ -5992,17 +6001,17 @@ void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mute
         session.new_object_kinds.push_back(DiskObjectKind::Identity);
     }
     if (should_abandon_commit(session)) {
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     if (!draft_ready(session)) {
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     session.draft.entry_id = session.child_id;
     const auto meta_bytes  = encode_meta(session.draft);
     if (meta_bytes.size() < 16 || std::memcmp(meta_bytes.data(), kDiskMetaMagic, 8) != 0) {
-        drop_spill(session, lock);
+        drop_spill(session);
         return;
     }
     const auto dir = entry_dir(session.child_id);
@@ -6077,7 +6086,9 @@ void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mute
             // prevent releasing its RAM/disk pins under allocation pressure.
             try { queue_unlink(dir); } catch (const std::bad_alloc&) {}
         }
-        drop_spill(session, lock);
+        drop_spill(session);
+        // Unlink the cancelled generation before the directory sync persists its removal.
+        flush_queued_unlinks(lock);
         if (!had_entry) {
             if (lock.owns_lock()) { lock.unlock(); }
             bool sync_failed = false;
@@ -6327,8 +6338,13 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         unpin_extra();
         return true;
     }
+    // prepare_spill may release the mutex (unlink flush, capacity eviction,
+    // compaction) before it installs spill_; the worker's idle prepare must not
+    // be in that span either, so neither installation overwrites the other.
     idle_cv_.wait(lock, [&] {
-        return payload_io_inflight_ == 0 || stopping_ || !spill_ || spill_->ram_id == ram_id;
+        return stopping_ ||
+               ((payload_io_inflight_ == 0 || !spill_ || spill_->ram_id == ram_id) &&
+                !idle_pinning_);
     });
     if (spill_ && spill_->ram_id == ram_id && !spill_->cancelled && !spill_->failed &&
         !spill_->committed) {
@@ -6339,6 +6355,7 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         lock.lock();
         return wait_done(lock);
     }
+    emergency_preparing_ = true;
     bool prepared = false;
     try {
         prepared = prepare_spill(ram_id, true, lock);
@@ -6351,6 +6368,9 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         }
         ++drops_;
     }
+    emergency_preparing_ = false;
+    idle_cv_.notify_all();
+    cv_.notify_all();
     // prepare_spill returns false when the note is already durable. A spill can
     // commit in the window after the check above, and that is success: the
     // caller only needed the image on disk before evicting it from RAM.
@@ -7898,10 +7918,7 @@ void KVDiskCache::process_job(const Job& job) {
             spill_page_batch(*spill_, std::span<const Job>(batch.data(), batch_size), lock);
         } catch (...) {
             for (std::size_t i = 0; i < batch_size; ++i) { finish_payload_io(lock); }
-            if (spill_ && !spill_->committed && !(spill_->meta_installed)) {
-                drop_spill(*spill_, lock);
-            }
-            spill_.reset();
+            reset_failed_spill(job.spill_epoch, lock);
             idle_cv_.notify_all();
             cv_.notify_all();
             return;
@@ -7924,17 +7941,19 @@ void KVDiskCache::process_job(const Job& job) {
             commit_spill(*spill_, lock);
         } catch (...) {
             finish_payload_io(lock);
-            if (spill_ && !spill_->committed && !(spill_->meta_installed)) {
-                drop_spill(*spill_, lock);
-            }
-            spill_.reset();
+            reset_failed_spill(job.spill_epoch, lock);
             idle_cv_.notify_all();
             cv_.notify_all();
             return;
         }
         finish_payload_io(lock);
-        if (spill_) { purge_spill_jobs(spill_->epoch); }
-        spill_.reset();
+        // finish_payload_io may already have discarded a cancelled session and
+        // released the mutex; a session installed since then is not this job's.
+        if (spill_ && spill_->epoch == job.spill_epoch) {
+            purge_spill_jobs(spill_->epoch);
+            spill_.reset();
+        }
+        flush_queued_unlinks(lock);
         idle_cv_.notify_all();
         cv_.notify_all();
     }
@@ -8064,7 +8083,8 @@ void KVDiskCache::io_loop() {
                     return true;
                 }
                 if (!emergency_q_.empty() && !restore_readers_busy_locked()) { return true; }
-                if ((!idle_q_.empty() || idle_requested_) && !restore_or_prefetch_busy_locked()) {
+                if ((!idle_q_.empty() || (idle_requested_ && !emergency_preparing_)) &&
+                    !restore_or_prefetch_busy_locked()) {
                     return true;
                 }
                 return restore_active_ && restore_target_ && !restore_state_loaded_ &&
@@ -8096,7 +8116,8 @@ void KVDiskCache::io_loop() {
                     idle_cv_.notify_all();
                 }
                 continue;
-            } else if (!stopping_ && idle_requested_ && !spill_ && !idle_cancel_all_ &&
+            } else if (!stopping_ && idle_requested_ && !emergency_preparing_ && !spill_ &&
+                       !idle_cancel_all_ &&
                        !restore_or_prefetch_busy_locked() && config_.ram != nullptr) {
                 std::uint64_t ram_id = 0;
                 try {
@@ -8156,7 +8177,7 @@ void KVDiskCache::io_loop() {
                 }
                 std::unique_lock inner(mutex_);
                 const bool abort_pin = epoch != idle_cancel_epoch_ || idle_cancel_all_ ||
-                                       idle_cancel_ram_ == ram_id ||
+                                       idle_cancel_ram_ == ram_id || emergency_preparing_ ||
                                        config_.ram->is_claimed(ram_id) ||
                                        restore_cancels_idle_locked();
                 bool prepared = false;
@@ -8201,9 +8222,13 @@ void KVDiskCache::io_loop() {
                 restore_worker_error_ = std::current_exception();
                 restore_failed_ = true;
             }
-            if (spill_ && !spill_->committed && !spill_->failed) {
-                drop_spill(*spill_, lock);
-                spill_.reset();
+            // Only this job's session, or a failed one with no I/O left to reset
+            // it, is discarded; cancellations wait for spill_ to clear. A failed
+            // restore must not abort an unrelated healthy spill.
+            if (spill_ && !spill_->committed &&
+                ((job.spill_epoch != 0 && spill_->epoch == job.spill_epoch) ||
+                 (spill_->failed && payload_io_inflight_ == 0))) {
+                discard_spill(lock);
             }
             idle_cv_.notify_all();
             cv_.notify_all();
