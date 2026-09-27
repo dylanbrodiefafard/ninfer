@@ -33,11 +33,10 @@ struct Bf16AttentionInputMmaOutput {
     }
 };
 
-template <bool FullTokens>
+template <class Schedule, bool FullTokens>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                     Tensor& v, cudaStream_t stream) {
     using Geometry = Bf16GemvGeometry<14336, 5120>;
-    using Schedule = Bf16MmaProductionSchedule<Geometry>;
     static_assert((Geometry::kOutputRows % Schedule::kBlockRows) == 0);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((6144 % Schedule::kBlockRows) == 0);
@@ -70,12 +69,22 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ga
 
 void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry = Bf16GemvGeometry<14336, 5120>;
-    using Schedule = Bf16MmaProductionSchedule<Geometry>;
-    if ((x.ne[1] % Schedule::kBlockCols) == 0) {
-        launch_variant<true>(x, weight, q, gate, k, v, stream);
+    const auto launch = [&]<class Schedule>() {
+        if ((x.ne[1] % Schedule::kBlockCols) == 0) {
+            launch_variant<Schedule, true>(x, weight, q, gate, k, v, stream);
+        } else {
+            launch_variant<Schedule, false>(x, weight, q, gate, k, v, stream);
+        }
+    };
+    if (x.ne[1] <= 36) {
+        // Weight passes of up to 32 columns for decode/verify; keep the same K reduction across
+        // per-request panels and packed batches. Larger prefill retains its wide tile.
+        using VerifySchedule = Bf16MmaSchedule<64, 32, 128, 32, 8, 3, 1, Cache::cg, Cache::cg,
+                                               Bf16MmaFragmentPipeline::PingPong,
+                                               Bf16MmaRaster::TokenFast>;
+        launch.template operator()<VerifySchedule>();
     } else {
-        launch_variant<false>(x, weight, q, gate, k, v, stream);
+        launch.template operator()<Bf16MmaProductionSchedule<Bf16GemvGeometry<14336, 5120>>>();
     }
 }
 

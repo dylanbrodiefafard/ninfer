@@ -56,8 +56,8 @@ int run_nvfp4_a16() {
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 10240, 723U, Comparison::Sampled, true, new_problem_invocations});
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
-    // Tensor-core DFlash projections aggregate every draft width in one weight pass.
-    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+    // W=1 must remain GEMV panels; widths 2..6 share the same MMA reduction.
+    for (const std::int32_t width : {1, 2, 3, 4, 5, 6}) {
         failures += run_packed_sequences_matches_panels(
             "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, width,
             dflash_batches);

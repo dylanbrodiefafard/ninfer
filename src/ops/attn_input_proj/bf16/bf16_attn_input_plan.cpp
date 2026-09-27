@@ -8,11 +8,6 @@ void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, 
         bf16_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
     }
-    // W=5 C=5/6 verify aggregates keep the SmallT reduction of their T=5 panels.
-    if (x.ne[1] <= kBf16AttnInputSmallTDispatchEnd || x.ne[1] == 25 || x.ne[1] == 30) {
-        bf16_attn_input_small_t_launch(x, weight, q, gate, k, v, stream);
-        return;
-    }
     bf16_attn_input_mma_launch(x, weight, q, gate, k, v, stream);
 }
 

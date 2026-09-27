@@ -5,9 +5,10 @@
 //   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
 //   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
 //
-// A CTA computes the same 16 output rows from both weights over 128 (27B) or
-// 64 (35B) tokens.
-// Split-K routes use a tuned eight- or sixteen-warp specialization and an
+// A CTA computes the same 16 output rows from both weights over a token tile.
+// Narrow 27B execution uses 8/16/32/48 columns and one warp per eight columns;
+// long-context 27B and 35B execution use 128 and 64 columns respectively.
+// Split-K routes use a tuned warp count and an
 // in-kernel cooperative grid reduction; the unsplit long-context route uses
 // eight warps for more independent MMA accumulators. Both preserve a single
 // kernel launch.
@@ -70,7 +71,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     constexpr int kBf16GdnKTiles      = kBf16GdnHidden / kBf16GdnBlockK;
     static_assert(SplitK >= 1 && kBf16GdnKTiles % SplitK == 0,
                   "BF16 GDN split-K must divide the exact geometry's K tiles");
-    static_assert(Warps == 8 || Warps == 16);
+    static_assert(Warps >= 1 && Warps <= 16);
     static_assert(kBf16GdnBlockN % Warps == 0);
     constexpr int kTilesPerSplit = kBf16GdnKTiles / SplitK;
     constexpr int kKSubtiles     = kBf16GdnBlockK / 16;

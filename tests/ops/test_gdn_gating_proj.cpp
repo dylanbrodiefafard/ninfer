@@ -717,7 +717,8 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     const std::size_t norm_interval =
         ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
     const std::size_t norm_witness = std::max(
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 16, 16),
+        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, geometry.heads == 48 ? 36 : 16,
+                                                                geometry.heads == 48 ? 36 : 16),
         ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
                                                            64));
     if (norm_interval != norm_witness) {
@@ -756,13 +757,13 @@ int main() {
     }
 
     int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 16, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen27, {36, 1024, 2048, 4096, 4097});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
     failures += verify_packed_workspace_rejections();
 
     // Every registered 27B projection route, including predicated and full token tiles.
-    // 16 is the last packed-GEMV width (product DFlash2 verify is 12); 17 is MMA split-8.
-    for (const std::int32_t tokens : {1, 2, 6, 8, 12, 16, 17, 1024, 1025, 2049, 4097}) {
+    // Narrow MMA tile boundaries and the T=36/37 transition to the long-context schedule.
+    for (const std::int32_t tokens : {1, 2, 6, 8, 9, 12, 16, 17, 32, 33, 36, 37, 1024, 1025, 2049, 4097}) {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }
@@ -775,6 +776,9 @@ int main() {
     failures += run_packed_columns_match_decode(kQwen27, 6, 0x5186u);
     failures += run_packed_columns_match_decode(kQwen27, 8, 0x5188u);
     failures += run_packed_columns_match_decode(kQwen27, 12, 0x518cu);
+    failures += run_packed_columns_match_decode(kQwen27, 17, 0x5191u);
+    failures += run_packed_columns_match_decode(kQwen27, 33, 0x51a1u);
+    failures += run_packed_columns_match_decode(kQwen27, 36, 0x51a4u);
     failures += run_norm_packed_columns_match_decode(kQwen27, 5, 0x6105u);
     failures += run_norm_packed_columns_match_decode(kQwen27, 10, 0x610au);
     failures += run_norm_packed_columns_match_decode(kQwen27, 15, 0x610fu);
@@ -789,6 +793,11 @@ int main() {
     failures += run_norm_packed_columns_match_decode(kQwen27, 36, 0x6224u, 6);
     failures += run_norm_packed_columns_match_decode(kQwen27, 24, 0x6118u, 12);
     failures += run_norm_packed_columns_match_decode(kQwen27, 34, 0x6122u, 17);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 6, 0x6126u, 1);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 32, 0x6120u, 16);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 48, 0x6130u, 16);
+    // W=12, B=4 falls back to panels whose split-40 scratch exceeds direct T=48 split-8.
+    failures += run_norm_packed_columns_match_decode(kQwen27, 48, 0x6131u, 12);
     // Every registered 35B projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures +=

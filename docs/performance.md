@@ -18,6 +18,144 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Tensor-core route audit (2026-09-27)
+
+Target: `qwen3.8-27b/nvfp4`, exact local artifact
+`qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`.
+Its directory confirms BF16 early attention matrices and GDN control matrices alongside the
+NVFP4 text/drafter weights and BF16 selector codebooks. RTX 5090, CUDA 13.1, `sm_120a`, driver
+580.173.02, 600 W limit. Jobs acquire `/tmp/ninfer-gpu-queue.lock` and wait for an idle GPU.
+
+Tensor cores are not automatically faster: the small projections can spend more time decoding
+weights, staging operands, executing padded tiles, or reducing partial sums than they save in
+multiply-add instructions. The audit selected these routes:
+
+| Public Op / matrix | Selected execution |
+|---|---|
+| BF16 attention input `[14336,5120]` | New 64-row × 32-column MMA schedule for T=2..36, existing GEMV at T=1 and prefill schedule above 36. W5 packed panels retain one reduction profile. |
+| BF16 GDN control, two `[48,5120]` projections | New narrow-token MMA split-40 schedule for T=1..36. Each split reads a disjoint 128-element K slice; FP32 partials and nonlinear control outputs. Packed execution uses the same reduction and caller-owned FP32 partial storage. |
+
+Cold public-Op screening used 256 MiB L2 flushes, eight warmups, and 61 samples. CUDA Graph
+external event nodes bracket only the Op body; the flush precedes the graph. Median microseconds
+from the baseline and integrated production routes (not end-to-end inference throughput):
+
+| Op | T | Previous | Production |
+|---|---:|---:|---:|
+| BF16 attention input | 12 | 106.496 | 100.352 |
+| BF16 attention input | 30 | 163.840 | 102.048 |
+| BF16 GDN control | 1 | 8.192 | 6.144 |
+| BF16 GDN control | 12 | 10.208 | 8.192 |
+| Packed RMSNorm + GDN control, W5 | 5 | 12.288 | 12.288 |
+| Packed RMSNorm + GDN control, W5 | 30 | 14.336 | 12.288 |
+
+The DFlash convolution `[1280,5120]` and selector hidden `[256,5120]` projections remain
+SIMT. At T=5 generic NVFP4 MMA lost: convolution 12.288→14.016 µs and selector
+10.240→14.336 µs. MMA won in isolated Linear calls at T=12 (20.480→14.304 and
+18.432→14.336 µs), but this target admits k=1..5 and chain width W=k+1<=6. A T>=8
+per-request crossover would therefore be unreachable. Switching only an aggregate to MMA
+would change its reduction relative to its C1 panel. The existing W5 convolution SIMT
+aggregation is retained; the wider winning experimental dispatch was removed. A narrower shared-memory NVFP4 tile
+and a register-fed, within-CTA K-split candidate did not improve the relevant crossover and
+were rejected. The old wide BF16 attention MMA also lost at T=5 (about 102→139 µs); the new
+32-column schedule removed that regression. BF16 residual projection already uses a specialized
+MMA from T=5: forcing generic MMA was substantially slower, and moving the specialized route
+below its crossover gave no reliable gain. Existing GDN split-8/4/2 alternatives were qualified
+and timed; the narrow split-40 route wins. Unsplit GDN failed its numerical criterion and was
+rejected before timing.
+
+Other audited sites retain their current execution:
+
+- DFlash feature/QKV/attention-output, W8 vocabulary and Q4 proposal heads, wide text projections,
+  chunked GDN matrix products, and vision attention already use tensor cores in their dense regimes.
+  In particular, the W8 head's `small_t` name does not mean SIMT.
+- Default-NVFP4-KV GQA decode and short verification already use tensor-core QK and PV,
+  including Sage-layout variants. DFlash SWA and bidirectional attention use BF16 MMA for both
+  products at T=1..16. Their scalar masking, softmax, quantization and split-result reductions
+  do not indicate missing matrix acceleration; SWA's direct/split crossover changes decomposition.
+- Remaining text NVFP4 GEMV and short SIMT bands use the measured decode crossovers documented in
+  `nvfp4-decode-linear.md`. The Linear bound gate rejects a generic forced-MMA rewrite in this
+  decode band; this audit did not rerun every historical rejected variant.
+- FP32 recurrent GDN state updates are sequential matrix-vector/rank-one work. Gathered rank-256
+  BF16 selector-codebook scores depend on a small candidate frontier. Neither is an accidentally
+  scalar dense GEMM; a tensor route would need a separately qualified algorithm with extra
+  conversion/padding work. No performance win is claimed for converting these sites.
+- Norms, activation/rotary functions, codecs, copies, softmax/top-k and short depthwise/dynamic
+  convolutions retain CUDA-core implementations; tensor cores do not directly implement them.
+
+The changed projections are checked against independent FP64 mathematical oracles from represented
+BF16 activations and exact stored weight values. The unchanged criteria are relative-L2 plus
+a gross-error bound `absolute + relative * max(abs(reference))`: attention uses
+`(2.9e-3, 4e-3, 4.5e-3)`, direct GDN control `(1.4e-6, 5e-7, 2.5e-6)`, and the composed
+norm/control profile `(8e-4, 1.5e-4, 1.05e-3)`. GDN tests include its FP32 nonlinear outputs,
+token-tile boundaries, and packed fallback scratch. The audit also fixes the existing NVFP4
+QKV/feature/attention-output aggregation guard: width-one requests retain their GEMV panels,
+with exact packed-versus-panel regression coverage.
+The arithmetic profile can change FP32 association and subsequent generated tokens relative to
+the old build; exact packed-versus-panel checks protect request isolation, not old-build token
+identity. The focused numerical tests passed. `./scripts/run-unit-tests.sh` passed 107 tests
+with zero failures and two artifact-dependent load-plan skips; the final focused tests passed
+again after removing the unreachable crossover. On the exact artifact with default NVFP4 KV,
+p-less C2 matched its C1 streams and passed prefix reuse during peer decode. Chain k4/W5 C6
+matched its C1 DFlash streams; adaptive N=5, terminal delivery, RAM reseed and in-flight RAM
+restore also passed. These isolation checks do not assert token identity between ordinary and
+speculative decoding's different numerical profiles. Local measurements and gate cards are
+under `profiles/bench/tensor-core-audit/`.
+
+### End-to-end decode comparison
+
+Same RTX 5090 and exact DFlash2 artifact as above. Baseline `cb6ec221` versus the retained
+projection changes, built with CUDA 13.1 and `NINFER_NVCC_THREADS=1`; unchanged object code
+is shared between the two binaries. The subsequent `8c232d01` disk-spill teardown fix was
+integrated before committing; disk and prefix caching are disabled in this workload.
+
+`tools.bench.run_serve_concurrency`, fixed DFlash k=5 (W=6), optimized proposal head,
+`long_decode_aime26_15` (335 prompt tokens), thinking, p-less temperature 2.0, fixed benchmark
+seeds, CUDA Graphs, NVFP4 KV, and 8192 output tokens per request. Max context is 32768;
+KV capacity is 32768 at C1 and 65536 at C4. Three waves per version alternate baseline/candidate,
+candidate/baseline, baseline/candidate. All requests reached their output limit. The GPU was
+queued exclusively; monitoring observed no competing compute process during any timed run.
+
+Aggregate committed decode tokens/s from complete one-second intervals at full occupancy:
+
+| Concurrency | Baseline median (range) | Retained median (range) | Change |
+|---|---:|---:|---:|
+| C1 | 163.406 (163.241–164.798) | 163.407 (163.303–163.428) | +0.00% |
+| C4 | 405.762 (405.477–406.788) | 417.208 (417.028–417.610) | +2.82% |
+
+The selected steady intervals span 48 seconds at C1 and 75–76 seconds at C4. C4's per-request
+equivalent is 101.44→104.30 tokens/s. These repeats measure hardware/run repeatability for
+one fixed workload, not variation across prompts or seeds.
+
+| Concurrency | Median ms/round, baseline → retained | Whole-wave draft acceptance |
+|---|---:|---:|
+| C1 | 14.229 → 14.174 | 27.078% → 26.805% |
+| C4 | 22.993 → 22.794 | 27.132% → 27.747% |
+
+Output hashes repeat exactly within each version at each concurrency, but differ between
+versions. Most of the C4 throughput gain comes from the changed speculative acceptance
+trajectory; the measured round-rate gain is only about 0.87%. C1 has no demonstrated
+end-to-end speedup. Do not interpret the 2.82% as a kernel-only gain or a universal decode
+speedup. Long-prefill schedules are unchanged and were not benchmarked by this comparison.
+
+The merged full unit suite passed 107 tests with two artifact-dependent skips; the three
+focused numerical tests also passed in the isolated benchmark build. Reports, per-wave logs,
+commands, and GPU monitoring are under `profiles/bench/tensor-core-decode/`.
+
+Reproduce each version with three waves, alternating version order:
+
+```bash
+for c in 1 4; do
+  if [ "$c" = 1 ]; then kv=32768; else kv=65536; fi
+  python3.11 -m tools.bench.run_serve_concurrency \
+    --serve /build/apps/ninfer-serve \
+    --artifact qwen3_8_27b=/models/qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+    --mode dflash5 --sampling p-less --suite decode-saturation \
+    --concurrency "$c" --decode-tokens 8192 --saturation-thinking \
+    --max-context 32768 --kv-capacity "$kv" --kv-dtype nvfp4 \
+    --output "/src/profiles/bench/tensor-core-decode-repro-c$c" --port 18279
+done
+```
+
 ## Upstream W4A4 TMA ports and DFlash2 sampler check (2026-09-26)
 
 RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4.ninfer` (Ostfralla NVFP4 + MTP), `ninfer_bench -p ...
@@ -96,6 +234,9 @@ narrow two-M-warp A8, and a 32 B BF16 swizzle. Evidence: `profiles/ncu/{a8,a16,a
 `profiles/bench/{a8-logs,dm-*,qh-*,fin-*}`, traces `profiles/nsys/wb-k4-c{4,6}`.
 
 ## Concurrency C=5/6 (2026-09-25)
+
+The GDN-control and BF16-attention schedules below describe that measurement build; the
+2026-09-27 tensor-core audit above supersedes those two dispatch details.
 
 `max_concurrency` admits 1–6. The C=5/6 verify aggregates (T=W×C up to 36) keep every
 request's C=1 arithmetic, so C=1–4 kernels and outputs are unchanged:
