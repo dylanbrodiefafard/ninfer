@@ -266,8 +266,9 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
-bool Program<Variant>::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id) {
-    return impl_->capture_retained_lane(lane, ram_entry_id);
+bool Program<Variant>::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
+                                             bool may_block) {
+    return impl_->capture_retained_lane(lane, ram_entry_id, may_block);
 }
 
 template <>
@@ -280,6 +281,11 @@ template <>
 void Program<Variant>::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
                                           const RequestPlan<Variant>& plan) {
     impl_->restore_disk_entry(lane, entry_id, plan);
+}
+
+template <>
+bool Program<Variant>::disk_restore_ready(std::uint64_t entry_id) const {
+    return impl_->disk_restore_ready(entry_id);
 }
 
 template <>
@@ -367,11 +373,6 @@ qwen3_6::detail::KvRamSnapshot Program<Variant>::kv_ram_snapshot() const noexcep
 template <>
 qwen3_6::detail::KvRamCopySeconds Program<Variant>::harvest_kv_ram_copy_seconds() {
     return impl_->harvest_kv_ram_copy_seconds();
-}
-
-template <>
-qwen3_6::detail::KvDiskSnapshot Program<Variant>::kv_disk_snapshot() const noexcept {
-    return impl_->kv_disk_snapshot();
 }
 
 template <>

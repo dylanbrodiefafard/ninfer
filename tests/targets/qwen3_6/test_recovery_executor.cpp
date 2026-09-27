@@ -23,6 +23,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -297,6 +298,9 @@ public:
     std::atomic<bool>* request_cancellation = nullptr;
     bool lifecycle_retries           = false;
     std::vector<std::vector<TokenId>> prefilled_prompts;
+    // Simulates the disk tier holding its mutex (for example during compaction).
+    std::atomic<int> copies_ready_stall_ms{0};
+    mutable std::atomic<bool> copies_ready_entered{false};
 
     void note(const char* event) {
         std::lock_guard lock(trace_mu_);
@@ -512,11 +516,16 @@ public:
         prefill_terminal = terminal;
     }
 
-    [[nodiscard]] bool kv_copies_ready() const { return false; }
+    [[nodiscard]] bool kv_copies_ready() const {
+        if (const int ms = copies_ready_stall_ms.load(); ms > 0) {
+            copies_ready_entered.store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+        return false;
+    }
     void request_idle_spill() {}
     void shutdown_kv_tiers(ninfer::LoadProgress = {}) {}
     [[nodiscard]] RamSnapshot kv_ram_snapshot() const noexcept { return {}; }
-    [[nodiscard]] DiskSnapshot kv_disk_snapshot() const noexcept { return {}; }
     [[nodiscard]] std::optional<DiskSnapshot> try_kv_disk_snapshot() const noexcept {
         return DiskSnapshot{};
     }
@@ -537,7 +546,9 @@ public:
     [[nodiscard]] std::uint64_t pending_disk_restore_ticket() const noexcept { return 0; }
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t) const noexcept { return 0; }
-    [[nodiscard]] bool capture_retained_lane(std::uint32_t, std::uint64_t* = nullptr) { return false; }
+    [[nodiscard]] bool capture_retained_lane(std::uint32_t, std::uint64_t* = nullptr, bool = true) {
+        return false;
+    }
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t, std::uint64_t,
                                         std::uint64_t, std::uint32_t, ninfer::PrefixReusePath,
                                         std::uint64_t) {
@@ -575,6 +586,7 @@ public:
     }
     void prefetch_disk_plan(std::uint64_t, const ProbePlan&) { note("prefetch_disk"); }
     void pump_disk_restore() {}
+    [[nodiscard]] bool disk_restore_ready(std::uint64_t) const { return true; }
     void restore_disk_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_disk");
         ++restore_disk_count;
@@ -997,6 +1009,55 @@ int run_admission(Frontend& frontend, CacheCase script) {
     }
 }
 
+// The idle worker polls the cache tiers; a slow tier call must not hold the
+// queue lock that submit() needs.
+int run_idle_poll_does_not_block_submit(Frontend& frontend) {
+    ProbeProgram program;
+    program.script = CacheCase::AdmitRamHit;
+    program.copies_ready_stall_ms.store(500);
+    ProbeLoaded loaded{frontend};
+    RecoveryProbe instance;
+    instance.program = &program;
+    instance.loaded  = &loaded;
+    ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine_options());
+    const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!program.copies_ready_entered.load() &&
+           std::chrono::steady_clock::now() < entered_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!program.copies_ready_entered.load()) {
+        program.copies_ready_stall_ms.store(0);
+        return check(false, "idle worker never polled the cache tiers");
+    }
+    auto prepared = frontend.prepare(thinking_input());
+    const auto summary = prepared.summary();
+    ninfer::runtime::ResolvedRequestOptions options;
+    options.execution.sampling.p_less    = true;
+    options.execution.allow_prefix_reuse = true;
+    options.stop.token_ids               = {kCallerStop};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto submission = executor.submit(std::move(prepared), summary, 0.0, std::move(options),
+                                      ninfer::OutputDelivery::TerminalOnly);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    program.copies_ready_stall_ms.store(0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    ninfer::CancellationView cancel([deadline] {
+        return std::chrono::steady_clock::now() >= deadline;
+    });
+    const auto result = submission.wait(nullptr, cancel);
+    int failures = 0;
+    if (elapsed > std::chrono::milliseconds(200)) {
+        std::cerr << "submit waited "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                  << " ms\n";
+    }
+    failures += check(elapsed <= std::chrono::milliseconds(200),
+                      "submit waited on an idle-worker cache-tier poll");
+    failures += check(result.finish_reason == FinishReason::StopToken,
+                      "request submitted during an idle cache poll did not finish");
+    return failures;
+}
+
 int run_retry_lifecycle(Frontend& frontend) {
     ProbeProgram program;
     program.script = CacheCase::RecoveryResidentHit;
@@ -1101,6 +1162,7 @@ int main() {
         failures += run_recovery(frontend, CacheCase::RecoveryDiskHit, true);
         for (const CacheCase script : admission_cases) { failures += run_admission(frontend, script); }
         failures += run_retry_lifecycle(frontend);
+        failures += run_idle_poll_does_not_block_submit(frontend);
         std::cout << "recovery executor failures=" << failures << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

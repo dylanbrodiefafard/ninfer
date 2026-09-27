@@ -193,6 +193,8 @@ public:
     [[nodiscard]] RamCaptureResult capture(const RamCaptureSource& source);
     [[nodiscard]] std::optional<std::uint64_t> peek_oldest_unpinned() const;
     [[nodiscard]] std::vector<std::uint64_t> fifo_ids() const;
+    // Oldest-first ids that are neither claimed nor pinned for I/O.
+    [[nodiscard]] std::vector<std::uint64_t> unpinned_ids() const;
     void pin_for_io(std::uint64_t entry_id);
     void unpin_for_io(std::uint64_t entry_id);
     bool evict_one_unpinned(std::uint64_t entry_id);
@@ -236,6 +238,8 @@ public:
     [[nodiscard]] bool pending_copies_ready() const;
     void wait_pending_copies_on_stream(cudaStream_t stream);
     void wait_pending_copies();
+    // Waits for one entry's device copies without waiting on unrelated entries.
+    void wait_entry_copies(std::uint64_t entry_id);
     [[nodiscard]] std::uint64_t index_version() const noexcept { return index_version_; }
     [[nodiscard]] std::uint64_t exact_comparisons() const noexcept { return exact_comparisons_; }
     void record_drop();
@@ -306,6 +310,8 @@ private:
         std::uint32_t io_pins          = 0;
         std::uint64_t disk_entry_id    = 0;
         bool copies_timed              = false;
+        // The timed copy pair belongs to a restore H2D rather than the capture D2H.
+        bool copies_are_load           = false;
         cudaEvent_t copies_start       = nullptr;
         cudaEvent_t copies_done        = nullptr;
     };
@@ -335,6 +341,7 @@ private:
     void pin_pending_copy_events(std::vector<cudaEvent_t>& events, std::vector<std::uint64_t>& ids);
     void unpin_copy_events(const std::vector<std::uint64_t>& ids) noexcept;
     void drop_pending_save(std::uint64_t entry_id) noexcept;
+    void add_orphaned_seconds(const Record& record, double seconds) noexcept;
     void drop_pending_id(std::uint64_t entry_id) noexcept;
     void bump_version() noexcept { ++index_version_; }
 
@@ -342,7 +349,7 @@ private:
     std::deque<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, Record> records_;
     std::vector<std::uint64_t> pending_save_ids_;
-    std::optional<std::uint64_t> pending_load_id_;
+    std::vector<std::uint64_t> pending_load_ids_;
     std::uint64_t next_id_           = 1;
     std::uint64_t index_version_     = 1;
     std::uint64_t captures_          = 0;

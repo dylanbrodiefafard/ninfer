@@ -1334,6 +1334,160 @@ int test_consume_after_unpack_folds_load(ninfer::DeviceContext& ctx, ninfer::Pag
     return failures;
 }
 
+template <typename Pred>
+bool wait_pred(Pred pred, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!pred() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return pred();
+}
+
+// Two restores in one round each own an in-flight H2D. Consuming the first
+// must account its copy as a load, not orphan it as save time.
+int test_two_pending_loads_fold_as_loads(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    constexpr std::size_t kBulkBytes = 8ULL << 20;
+    ninfer::DeviceBuffer bulk(kBulkBytes);
+    bulk.fill(0x3c);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+    q36::detail::KVRamCache cache(64ULL << 20);
+    const auto prompt_a = text_prompt({71, 72, 73, 74});
+    const auto prompt_b = text_prompt({81, 82, 83, 84});
+    for (const auto* prompt : {&prompt_a, &prompt_b}) {
+        auto source = pool.reserve(2);
+        source.materialize_pages(2, ctx.stream);
+        fill_logical_pages(pool, source, 36);
+        const int rc = capture_with_hidden(cache, pool, source, *prompt, hidden, ctx.copy_stream);
+        ctx.synchronize_all();
+        source.release();
+        if (rc != 0) { return fail("two-load capture failed"); }
+    }
+    (void)cache.harvest_copy_seconds();
+    const auto match_a = cache.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b = cache.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    if (!match_a || !match_b) { return fail("two-load captures did not index"); }
+    auto dest_a = pool.reserve(2);
+    auto dest_b = pool.reserve(2);
+    dest_a.materialize_pages(2, ctx.stream);
+    dest_b.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer out_a(kBulkBytes);
+    ninfer::DeviceBuffer out_b(kBulkBytes);
+    ninfer::Tensor out_a_t(out_a.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+    ninfer::Tensor out_b_t(out_b.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
+    const auto restore = [&](std::uint64_t id, ninfer::PagedKVAllocation& dest,
+                             ninfer::Tensor& out) {
+        q36::detail::RamRestoreTarget target;
+        target.text           = &dest;
+        target.text_pool      = &pool;
+        target.text_dst_pages = 2;
+        target.tail_hidden    = &out;
+        target.stream         = ctx.copy_stream;
+        cache.claim(id);
+        (void)cache.unpack_device(id, target);
+    };
+    restore(match_a->entry_id, dest_a, out_a_t);
+    restore(match_b->entry_id, dest_b, out_b_t);
+    cache.consume(match_a->entry_id);
+    cache.consume(match_b->entry_id);
+    const auto loaded = cache.harvest_copy_seconds();
+    dest_a.release();
+    dest_b.release();
+    if (loaded.save != 0.0 || loaded.load <= 0.0) {
+        std::cerr << "two pending loads harvested save=" << loaded.save
+                  << " load=" << loaded.load << '\n';
+        return fail("a second restore orphaned the first restore's load as save time");
+    }
+    return 0;
+}
+
+// A stream-ordered wait must order the consumer stream without blocking the host.
+int test_stream_wait_does_not_block_host(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    q36::detail::KVRamCache cache(64ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(2, ctx.stream);
+    ninfer::DeviceBuffer bulk(1ULL << 20);
+    ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {1 << 20});
+    int failures = 0;
+    {
+        ninfer::test::StreamCopyGate gate;
+        gate.launch(ctx.copy_stream);
+        if (capture_with_hidden(cache, pool, source, text_prompt({91, 92, 93}), hidden,
+                                ctx.copy_stream) != 0) {
+            gate.release();
+            ctx.synchronize_all();
+            source.release();
+            return fail("stream-wait capture failed");
+        }
+        std::atomic<bool> returned{false};
+        std::thread waiter([&] {
+            cache.wait_pending_copies_on_stream(ctx.stream);
+            returned.store(true);
+        });
+        const bool prompt = wait_pred([&] { return returned.load(); },
+                                      std::chrono::milliseconds(500));
+        gate.release();
+        waiter.join();
+        if (!prompt) { failures += fail("stream-ordered RAM wait blocked the host on a gated copy"); }
+    }
+    ctx.synchronize_all();
+    source.release();
+    return failures;
+}
+
+// A restore that fails validation after enqueueing H2D reads must still fence
+// the record; otherwise its host block looks idle while a copy reads it.
+int test_failed_unpack_fences_enqueued_reads(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
+    namespace q36 = ninfer::targets::qwen3_6;
+    q36::detail::KVRamCache cache(64ULL << 20);
+    const auto prompt = text_prompt({101, 102, 103, 104});
+    {
+        auto source = pool.reserve(2);
+        source.materialize_pages(2, ctx.stream);
+        ninfer::DeviceBuffer bulk(1ULL << 20);
+        ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {1 << 20});
+        const int rc = capture_with_hidden(cache, pool, source, prompt, hidden, ctx.copy_stream);
+        ctx.synchronize_all();
+        source.release();
+        if (rc != 0) { return fail("failed-unpack capture failed"); }
+    }
+    const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) { return fail("failed-unpack capture did not index"); }
+    auto dest = pool.reserve(2);
+    dest.materialize_pages(2, ctx.stream);
+    q36::detail::RamRestoreTarget target;
+    target.text           = &dest;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 2;
+    target.stream         = ctx.copy_stream;
+    // A context-checkpoint restore naming a frontier with no stored head fails
+    // after the text pages are already enqueued.
+    target.reuse      = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    target.reuse_base = 3;
+    cache.claim(match->entry_id);
+    int failures = 0;
+    {
+        ninfer::test::StreamCopyGate gate;
+        gate.launch(ctx.copy_stream);
+        bool threw = false;
+        try {
+            (void)cache.unpack_device(match->entry_id, target);
+        } catch (const std::logic_error&) { threw = true; }
+        if (!threw) {
+            failures += fail("failed-unpack fixture did not reject the missing head");
+        } else if (cache.copies_ready(match->entry_id)) {
+            failures += fail("a failed restore left its enqueued H2D reads unfenced");
+        }
+        gate.release();
+    }
+    ctx.synchronize_all();
+    cache.release(match->entry_id);
+    dest.release();
+    return failures;
+}
+
 int test_event_overlap_unpack(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     namespace q36 = ninfer::targets::qwen3_6;
     auto source   = pool.reserve(2);
@@ -5526,6 +5680,11 @@ int main(int argc, char** argv) {
                                         {ninfer::DType::FP16, 1, 2}});
     ninfer::DeviceArena paged_arena(paged_plan.bytes);
     ninfer::PagedKVPool paged_pool({paged_arena.base(), paged_arena.capacity()}, paged_plan.layout);
+    if (argc == 3 && std::strcmp(argv[1], "--case") == 0 && std::strcmp(argv[2], "copies") == 0) {
+        return test_two_pending_loads_fold_as_loads(ctx, paged_pool) +
+               test_stream_wait_does_not_block_host(ctx, paged_pool) +
+               test_failed_unpack_fences_enqueued_reads(ctx, paged_pool);
+    }
 
     auto keep = paged_pool.reserve(3);
     keep.materialize_pages(3);
@@ -5688,6 +5847,9 @@ int main(int argc, char** argv) {
     failures += test_unpack_without_harvest_keeps_save_and_load(ctx, paged_pool);
     failures += test_consume_without_harvest_clears_pending(ctx, paged_pool);
     failures += test_consume_after_unpack_folds_load(ctx, paged_pool);
+    failures += test_two_pending_loads_fold_as_loads(ctx, paged_pool);
+    failures += test_stream_wait_does_not_block_host(ctx, paged_pool);
+    failures += test_failed_unpack_fences_enqueued_reads(ctx, paged_pool);
     failures += test_event_overlap_unpack(ctx, paged_pool);
     failures += test_irregular_page_major_runs(ctx);
     failures += test_restore_throw_then_replay(ctx, paged_pool);

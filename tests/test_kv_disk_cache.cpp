@@ -10017,6 +10017,304 @@ int test_plan_match_does_not_wait_on_manifest(ninfer::DeviceContext& ctx, ninfer
     return 0;
 }
 
+// An idle prepare that makes capacity releases the mutex for the eviction's
+// MANIFEST write. A cancellation in that window must stop the spill before it
+// installs; otherwise cancel_idle_spill waits for the whole idle image write.
+int test_idle_cancel_during_capacity_eviction(ninfer::DeviceContext& ctx,
+                                              ninfer::PagedKVPool& pool) {
+    TmpDir dir("idle-cancel-evict");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    const auto first = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 21));
+    std::size_t used = 0;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        disk.note_ram_resident(first, 0);
+        if (!disk.emergency_spill_ram(first)) {
+            alloc.release();
+            return fail("idle-cancel-evict first spill failed");
+        }
+        disk.wait_idle_and_fsync();
+        used = disk.snapshot().used_bytes;
+    }
+    cfg.capacity_bytes = used;
+    q36::detail::KVDiskCache disk(cfg);
+    const auto second = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 22));
+    disk.note_ram_resident(second, 0);
+    disk.test_set_manifest_io_stall_ms(300);
+    disk.test_set_payload_io_stall_ms(2000);
+    disk.request_idle_spill();
+    if (!wait_pred([&] { return disk.test_manifest_io_entered(); }, std::chrono::seconds(5))) {
+        disk.test_set_manifest_io_stall_ms(0);
+        disk.test_set_payload_io_stall_ms(0);
+        disk.cancel_idle_spill();
+        alloc.release();
+        return fail("idle-cancel-evict idle prepare did not reach capacity eviction");
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    disk.cancel_idle_spill();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    disk.test_set_manifest_io_stall_ms(0);
+    disk.test_set_payload_io_stall_ms(0);
+    const bool durable = disk.ram_is_durable(second);
+    disk.wait_idle_and_fsync();
+    alloc.release();
+    if (elapsed > std::chrono::milliseconds(1200)) {
+        std::cerr << "cancel_idle_spill took "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                  << " ms\n";
+        return fail("idle cancel waited for a spill installed after cancellation");
+    }
+    if (durable) { return fail("idle spill committed after cancellation"); }
+    return 0;
+}
+
+// Pinning an entry for a disk spill waits for that entry's own device copies,
+// not every pending RAM copy: an unrelated gated capture must not stall it.
+int test_spill_pin_waits_only_its_entry(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("spill-own-copy");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    cudaStream_t side = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+    constexpr std::size_t kDelayBytes = 256ULL << 20;
+    ninfer::DeviceBuffer delay_src(kDelayBytes);
+    void* delay_dst = nullptr;
+    CUDA_CHECK(cudaMallocHost(&delay_dst, kDelayBytes));
+    int failures = 0;
+    {
+        ninfer::test::StreamCopyGate gate;
+        gate.launch(side);
+        auto unrelated_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 23));
+        auto unrelated        = unrelated_prompt;
+        unrelated.token_ids.push_back(0);
+        q36::detail::ResidentPrefixIdentity unrelated_identity;
+        auto gated = make_source(unrelated, unrelated_identity, alloc, pool, side, 64);
+        if (ram.capture(gated).status != q36::detail::RamCaptureStatus::Captured) {
+            failures += fail("spill-own-copy gated capture failed");
+        }
+        // Keep the spilled entry's own D2H in flight briefly behind a large copy.
+        CUDA_CHECK(cudaMemcpyAsync(delay_dst, delay_src.p, kDelayBytes, cudaMemcpyDeviceToHost,
+                                   ctx.copy_stream));
+        auto own_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 24));
+        auto own        = own_prompt;
+        own.token_ids.push_back(0);
+        q36::detail::ResidentPrefixIdentity own_identity;
+        auto source = make_source(own, own_identity, alloc, pool, ctx.copy_stream, 64);
+        // capture_or_evict synchronizes the device, which would wait on the gate.
+        const auto captured = ram.capture(source);
+        std::optional<std::uint64_t> own_id;
+        if (captured.status == q36::detail::RamCaptureStatus::Captured) {
+            own_id = captured.entry_id;
+        } else {
+            failures += fail("spill-own-copy capture failed");
+        }
+        if (failures == 0) {
+            disk.note_ram_resident(*own_id, 0);
+            std::atomic<bool> done{false};
+            std::atomic<bool> spilled{false};
+            std::thread spiller([&] {
+                spilled.store(disk.emergency_spill_ram(*own_id));
+                done.store(true);
+            });
+            const bool prompt = wait_pred([&] { return done.load(); }, std::chrono::milliseconds(1500));
+            gate.release();
+            spiller.join();
+            if (!prompt) {
+                failures += fail("disk spill pin waited for an unrelated gated RAM copy");
+            } else if (!spilled.load()) {
+                failures += fail("spill-own-copy spill failed");
+            }
+        }
+        gate.release();
+    }
+    ctx.synchronize_all();
+    CUDA_CHECK(cudaStreamSynchronize(side));
+    CUDA_CHECK(cudaStreamDestroy(side));
+    CUDA_CHECK(cudaFreeHost(delay_dst));
+    disk.wait_idle_and_fsync();
+    alloc.release();
+    return failures;
+}
+
+// Compaction copies the whole live pack store. Lookups and admission on the
+// scheduler thread must not wait for that copy.
+int test_plan_match_during_compaction(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("compaction-lock");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    const std::vector<ninfer::TokenId> tokens_a(64, 25);
+    const std::vector<ninfer::TokenId> tokens_b(128, 26);
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        for (const auto* tokens : {&tokens_a, &tokens_b}) {
+            const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
+            disk.note_ram_resident(ram_id, 0);
+            if (!disk.emergency_spill_ram(ram_id)) {
+                alloc.release();
+                return fail("compaction-lock fixture spill failed");
+            }
+        }
+        if (!disk.test_fifo_evict_one()) {
+            alloc.release();
+            return fail("compaction-lock fixture eviction failed");
+        }
+    }
+    const auto before = read_bytes(dir.path / "PACKSET");
+    q36::detail::KVDiskCache disk(cfg);
+    disk.test_set_compaction_copy_stall_ms(300);
+    std::thread maintenance([&] { disk.wait_idle_and_fsync(); });
+    if (!wait_pred([&] { return disk.test_compaction_copy_entered(); }, std::chrono::seconds(5))) {
+        disk.test_set_compaction_copy_stall_ms(0);
+        maintenance.join();
+        alloc.release();
+        return fail("compaction-lock maintenance never started copying");
+    }
+    const auto prompt  = text_prompt(tokens_b);
+    const auto t0      = std::chrono::steady_clock::now();
+    const auto match   = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    disk.test_set_compaction_copy_stall_ms(0);
+    maintenance.join();
+    const auto after = read_bytes(dir.path / "PACKSET");
+    alloc.release();
+    int failures = 0;
+    if (elapsed > std::chrono::milliseconds(150)) {
+        std::cerr << "plan_match waited "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+                  << " ms on compaction\n";
+        failures += fail("plan_match waited for the compaction copy");
+    }
+    if (!match) { failures += fail("compaction-lock lost the retained entry"); }
+    if (before.size() != 32 || after.size() != 32 ||
+        std::memcmp(before.data() + 12, after.data() + 12, sizeof(std::uint64_t)) == 0) {
+        failures += fail("compaction-lock maintenance did not publish a new generation");
+    }
+    return failures;
+}
+
+// Reclaiming RAM for a capture while other lanes decode must not wait on a
+// disk write: a disk-durable entry is evicted first, and without one the
+// oldest entry is dropped unsaved instead of being spilled synchronously.
+int test_ram_reclaim_never_blocks_on_disk(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const auto older = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 27));
+    disk.note_ram_resident(older, 0);
+    const auto newer = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 28));
+    disk.note_ram_resident(newer, 0);
+    if (!disk.emergency_spill_ram(newer)) {
+        alloc.release();
+        return fail("ram-reclaim fixture spill failed");
+    }
+    disk.wait_idle_and_fsync();
+    // Any disk write from here on would take seconds.
+    disk.test_set_payload_io_stall_ms(2000);
+    const auto resident = [&](std::uint64_t id) {
+        const auto ids = ram.fifo_ids();
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    int failures = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    auto result = disk.reclaim_ram_entry(false);
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    if (result != q36::detail::RamReclaim::Evicted || resident(newer) || !resident(older)) {
+        failures += fail("non-blocking reclaim did not evict the disk-durable entry first");
+    }
+    if (elapsed > std::chrono::milliseconds(500)) {
+        failures += fail("reclaim of a durable entry waited on disk I/O");
+    }
+    const auto drops = disk.snapshot().drops;
+    t0 = std::chrono::steady_clock::now();
+    result = disk.reclaim_ram_entry(false);
+    elapsed = std::chrono::steady_clock::now() - t0;
+    if (result != q36::detail::RamReclaim::Evicted || resident(older)) {
+        failures += fail("non-blocking reclaim did not drop the unsaved oldest entry");
+    }
+    if (elapsed > std::chrono::milliseconds(500)) {
+        failures += fail("non-blocking reclaim spilled synchronously");
+    }
+    if (disk.snapshot().drops != drops + 1) {
+        failures += fail("dropping an unsaved RAM entry was not counted");
+    }
+    disk.test_set_payload_io_stall_ms(0);
+    alloc.release();
+    return failures;
+}
+
+// restore_device waits for another entry's in-flight window reads. The
+// readiness probe lets admission keep decoding instead of taking that wait.
+int test_restore_setup_ready_tracks_window_reads(ninfer::DeviceContext& ctx,
+                                                 ninfer::PagedKVPool& pool) {
+    TmpDir dir("restore-ready");
+    q36::detail::KVRamCache ram(32ULL << 20);
+    auto alloc = pool.reserve(2);
+    alloc.materialize_pages(1, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           32ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    struct BarrierGuard {
+        q36::detail::KVDiskCache& disk;
+        ~BarrierGuard() { disk.test_release_page_read_barrier(); }
+    } barrier{disk};
+    for (const auto& tokens : {std::vector<ninfer::TokenId>{12, 13, 14, 15},
+                               std::vector<ninfer::TokenId>{16, 17, 18, 19}}) {
+        const auto ram_id = capture_tokens(ram, pool, alloc, ctx, tokens);
+        disk.note_ram_resident(ram_id, 0);
+        if (!disk.emergency_spill_ram(ram_id)) {
+            alloc.release();
+            return fail("restore-ready fixture spill failed");
+        }
+    }
+    const auto prompt_a = text_prompt({12, 13, 14, 15});
+    const auto prompt_b = text_prompt({16, 17, 18, 19});
+    const auto match_a  = disk.plan_match(prompt_a, q36::detail::prefix_hash_chain(prompt_a));
+    const auto match_b  = disk.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
+    if (!match_a || !match_b || !disk.claim(match_b->entry_id)) {
+        alloc.release();
+        return fail("restore-ready fixture could not claim the prefetched entry");
+    }
+    int failures = 0;
+    if (!disk.restore_setup_ready(match_a->entry_id)) {
+        failures += fail("restore setup reported busy with no window reads");
+    }
+    disk.test_arm_page_read_barrier();
+    disk.prefetch_window(match_b->entry_id, 1, 0);
+    if (!wait_pred([&] { return disk.test_page_read_entered(); }, std::chrono::seconds(2))) {
+        disk.test_release_page_read_barrier();
+        disk.release(match_b->entry_id);
+        alloc.release();
+        return fail("restore-ready prefetch did not enter its page read");
+    }
+    if (disk.restore_setup_ready(match_a->entry_id)) {
+        failures += fail("restore setup reported ready while another entry's read was in flight");
+    }
+    disk.test_release_page_read_barrier();
+    if (!wait_pred([&] { return disk.restore_setup_ready(match_a->entry_id); },
+                   std::chrono::seconds(2))) {
+        failures += fail("restore setup stayed busy after the window read finished");
+    }
+    disk.release(match_b->entry_id);
+    alloc.release();
+    return failures;
+}
+
 int test_disk_fifo_evict_clears_ram_durable(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("ram-durable");
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -16584,6 +16882,14 @@ int main(int argc, char** argv) {
         return test_branch_ref_allocation_preserves_parent(ctx, paged_pool);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "stalls") {
+        return test_idle_cancel_during_capacity_eviction(ctx, paged_pool) +
+               test_spill_pin_waits_only_its_entry(ctx, paged_pool) +
+               test_plan_match_during_compaction(ctx, paged_pool) +
+               test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool) +
+               test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
         std::string_view(argv[2]) == "spill-queue") {
         return test_spill_queue_failure_preserves_other_ram_pin(ctx, paged_pool);
     }
@@ -16736,6 +17042,11 @@ int main(int argc, char** argv) {
     failures += test_load_host_misses_evicted_entry(ctx, paged_pool);
     failures += test_wrong_gdn_decoded_size_is_skipped(ctx, paged_pool);
     failures += test_plan_match_does_not_wait_on_manifest(ctx, paged_pool);
+    failures += test_idle_cancel_during_capacity_eviction(ctx, paged_pool);
+    failures += test_spill_pin_waits_only_its_entry(ctx, paged_pool);
+    failures += test_plan_match_during_compaction(ctx, paged_pool);
+    failures += test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool);
+    failures += test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     failures += test_disk_fifo_evict_clears_ram_durable(ctx, paged_pool);
     failures += test_lock_does_not_wipe_tmp_before_flock(ctx, paged_pool);
     failures += test_missing_current_hidden_is_not_advertised(ctx, paged_pool);

@@ -197,11 +197,13 @@ public:
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane,
-                                             std::uint64_t* ram_entry_id = nullptr);
+                                             std::uint64_t* ram_entry_id = nullptr,
+                                             bool may_block = true);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
                            const RequestPlan<Variant>& plan);
     void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
                             const RequestPlan<Variant>& plan);
+    [[nodiscard]] bool disk_restore_ready(std::uint64_t entry_id) const;
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
     void consume_ram_entry(std::uint64_t entry_id);
@@ -223,7 +225,6 @@ public:
     void request_idle_spill();
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
-    [[nodiscard]] qwen3_6::detail::KvDiskSnapshot kv_disk_snapshot() const noexcept;
     [[nodiscard]] std::optional<qwen3_6::detail::KvDiskSnapshot> try_kv_disk_snapshot() const noexcept;
     qwen3_6::detail::KvDiskCopySeconds harvest_kv_disk_copy_seconds();
     [[nodiscard]] qwen3_6::detail::KvGpuSnapshot kv_gpu_snapshot() const noexcept;

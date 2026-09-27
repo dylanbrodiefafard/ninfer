@@ -139,6 +139,14 @@ struct DiskRestoreTarget {
     cudaStream_t stream = nullptr;
 };
 
+// Outcome of freeing one host-RAM entry for a new capture.
+enum class RamReclaim : std::uint8_t {
+    Evicted,   // one entry left RAM; retry the capture
+    Retry,     // the chosen entry changed state; choose again
+    NoVictim,  // every entry is claimed or in I/O
+    Failed,    // the blocking spill of the chosen entry failed
+};
+
 enum class DiskFaultPoint : std::uint8_t {
     None,
     AfterRecordWrite,
@@ -226,10 +234,17 @@ public:
     void begin_ram_idle_exclusion(std::uint64_t ram_id);
     void end_ram_idle_exclusion(std::uint64_t ram_id) noexcept;
     bool emergency_spill_ram(std::uint64_t ram_id);
+    // Frees one RAM entry, preferring the oldest disk-durable one. Without a
+    // durable entry the oldest is spilled first when `may_block`; otherwise it
+    // is dropped unsaved so decoding lanes never wait on a disk write.
+    RamReclaim reclaim_ram_entry(bool may_block);
 
     void prefetch_window(std::uint64_t entry_id, std::uint32_t text_dst_pages,
                          std::uint32_t backend_dst_pages);
     std::uint64_t restore_device(std::uint64_t entry_id, const DiskRestoreTarget& target);
+    // True when restore_device(entry_id) would not wait on another entry's window
+    // reads or on the immediate-state H2D stream.
+    [[nodiscard]] bool restore_setup_ready(std::uint64_t entry_id) const;
     void pump_restore(cudaStream_t stream);
     void cancel_restore();
 
@@ -299,6 +314,12 @@ public:
     void test_set_payload_io_stall_ms(int ms);
     [[nodiscard]] bool test_payload_io_entered() const;
     void test_set_manifest_io_stall_ms(int ms);
+    void test_set_compaction_copy_stall_ms(int ms) {
+        compaction_copy_stall_ms_.store(ms, std::memory_order_release);
+    }
+    [[nodiscard]] bool test_compaction_copy_entered() const {
+        return compaction_copy_entered_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] bool test_manifest_io_entered() const;
     void test_set_free_bytes_override(std::optional<std::uint64_t> bytes);
     void test_set_pack_position(DiskObjectKind kind, std::uint32_t segment,
@@ -577,6 +598,34 @@ private:
         std::uint32_t hold_refs = 0;
     };
 
+    // Worker-owned copy-on-write generation rewrite, advanced in unlocked slices.
+    struct CompactionRun {
+        struct Source {
+            std::uint64_t id = 0;
+            ObjectRef ref;
+        };
+        struct Move {
+            std::uint64_t id = 0;
+            ObjectRef::Location location;
+        };
+        std::uint64_t new_generation = 0;
+        std::shared_ptr<PackGeneration> source;
+        std::shared_ptr<PackGeneration> target;
+        std::filesystem::path root;
+        std::array<std::uint32_t, 5> segment{};
+        std::array<std::uint64_t, 5> tail{};
+        std::array<int, 5> output{-1, -1, -1, -1, -1};
+        std::vector<Source> pending;
+        std::size_t next = 0;
+        std::unordered_set<std::uint64_t> copied;
+        std::vector<Move> moves;
+        std::vector<std::uint8_t> buffer;
+        bool synced    = false;
+        bool published = false;
+
+        void close_outputs() noexcept;
+    };
+
     struct StartupObjectValidation {
         DiskObjectKind kind = DiskObjectKind::Main;
         bool page = false;
@@ -597,7 +646,7 @@ private:
     [[nodiscard]] std::optional<Job> take_job(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] std::optional<Job> take_restore_job(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] KvDiskSnapshot snapshot_locked() const noexcept;
-    [[nodiscard]] bool compaction_blocked_locked() const noexcept;
+    [[nodiscard]] bool compaction_publish_blocked_locked() const noexcept;
     [[nodiscard]] bool prefetch_readable_locked() const noexcept;
     [[nodiscard]] bool restore_readers_busy_locked() const noexcept;
     [[nodiscard]] bool restore_or_prefetch_busy_locked() const noexcept;
@@ -675,8 +724,18 @@ private:
     void load_pack_map();
     void validate_live_direct_segments() const;
     void append_pack_map(const SpillSession& session) const;
-    [[nodiscard]] bool compact_packs(std::unique_lock<std::mutex>& lock,
-                                     std::uint64_t additional_bytes = 0);
+    void request_compaction_locked() noexcept;
+    [[nodiscard]] bool compaction_pending_locked() const;
+    [[nodiscard]] bool compaction_runnable_locked() const noexcept;
+    [[nodiscard]] bool begin_compaction_locked();
+    CompactionRun::Move copy_compaction_object(CompactionRun& run,
+                                               const CompactionRun::Source& source);
+    void sync_compaction_outputs(CompactionRun& run);
+    void prepare_compaction_maps(CompactionRun& run, const std::vector<std::uint8_t>& base_bytes);
+    [[nodiscard]] bool compaction_delta_locked(CompactionRun& run);
+    void publish_compaction(std::unique_lock<std::mutex>& lock, CompactionRun& run);
+    void discard_compaction_files(CompactionRun& run) noexcept;
+    void compaction_step(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] std::uint64_t packed_allocated_bytes() const;
     [[nodiscard]] std::uint64_t packed_retained_bytes() const;
     [[nodiscard]] bool packs_need_compaction() const;
@@ -760,6 +819,7 @@ private:
     // Releases the session's pins and draft objects under the held mutex; it never unlocks,
     // so the caller resets spill_ before flushing the unlinks it queued.
     void drop_spill(SpillSession& session) noexcept;
+    [[nodiscard]] bool restore_window_busy_locked(std::uint64_t entry_id) const;
     // drop_spill + spill_.reset() in one critical section, then the unlink flush.
     void discard_spill(std::unique_lock<std::mutex>& lock);
     // Worker failure path for the session of spill epoch `epoch`, if it is still installed.
@@ -858,6 +918,12 @@ private:
     std::shared_ptr<PackGeneration> active_generation_;
     std::vector<std::shared_ptr<PackGeneration>> retired_generations_;
     bool packset_publication_pending_sync_ = false;
+    std::unique_ptr<CompactionRun> compaction_;
+    bool compaction_requested_ = false;
+    std::atomic<int> compaction_copy_stall_ms_{0};
+    std::atomic<bool> compaction_copy_entered_{false};
+    // A failed rewrite is not retried until the durable generation changes.
+    std::uint64_t compaction_failed_generation_ = 0;
     std::uint64_t object_id_reservation_limit_ = 1;
     std::array<std::uint32_t, 5> pack_active_segment_{};
     std::array<std::uint64_t, 5> pack_active_tail_{};

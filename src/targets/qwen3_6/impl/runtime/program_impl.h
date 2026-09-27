@@ -1540,7 +1540,8 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
     return source;
 }
 
-bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id) {
+bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
+                                            bool may_block) {
     if (ram_entry_id != nullptr) { *ram_entry_id = 0; }
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
     device.order_copy_after_compute();
@@ -1556,12 +1557,24 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
         if (result.status == qwen3_6::detail::RamCaptureStatus::Captured) {
             if (kv_disk_cache_) {
                 kv_disk_cache_->note_ram_resident(result.entry_id, source.disk_entry_id);
+                // Write the new entry behind on the disk worker so that a later
+                // RAM eviction usually finds it durable instead of spilling it
+                // synchronously on this thread. Shutdown flushes in order instead.
+                if (!kv_tiers_shutdown_) { kv_disk_cache_->request_idle_spill(); }
             }
             if (ram_entry_id != nullptr) { *ram_entry_id = result.entry_id; }
             return true;
         }
         if (result.status == qwen3_6::detail::RamCaptureStatus::Dropped) { return false; }
-        if (kv_disk_cache_) { kv_disk_cache_->cancel_idle_spill(); }
+        if (kv_disk_cache_) {
+            const auto reclaimed = kv_disk_cache_->reclaim_ram_entry(may_block);
+            if (reclaimed == qwen3_6::detail::RamReclaim::Evicted ||
+                reclaimed == qwen3_6::detail::RamReclaim::Retry) {
+                continue;
+            }
+            kv_ram_cache_->record_drop();
+            return false;
+        }
         std::optional<std::uint64_t> victim = kv_ram_cache_->peek_oldest_unpinned();
         if (!victim) {
             try {
@@ -1573,23 +1586,7 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
             kv_ram_cache_->record_drop();
             return false;
         }
-        if (kv_disk_cache_ && !kv_disk_cache_->ram_is_durable(*victim)) {
-            if (!kv_disk_cache_->emergency_spill_ram(*victim)) {
-                kv_ram_cache_->record_drop();
-                return false;
-            }
-        }
-        if (kv_disk_cache_) { kv_disk_cache_->begin_ram_idle_exclusion(*victim); }
-        bool evicted = false;
-        try {
-            evicted = kv_ram_cache_->evict_one_unpinned(*victim);
-        } catch (...) {
-            if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(*victim); }
-            throw;
-        }
-        if (evicted && kv_disk_cache_) { kv_disk_cache_->forget_ram_resident(*victim); }
-        if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(*victim); }
-        if (!evicted) { continue; }
+        (void)kv_ram_cache_->evict_one_unpinned(*victim);
     }
 }
 
@@ -2252,6 +2249,10 @@ void disk_reuse_pages(SpeculativeBackend backend, bool growing_backend, std::uin
 
 } // namespace
 
+bool ProgramImplCore::disk_restore_ready(std::uint64_t entry_id) const {
+    return !kv_disk_cache_ || kv_disk_cache_->restore_setup_ready(entry_id);
+}
+
 void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
                                          const RequestPlan& plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
@@ -2502,10 +2503,6 @@ void ProgramImplCore::shutdown_kv_tiers(LoadProgress progress) {
 
 void ProgramImplCore::request_idle_spill() {
     if (kv_disk_cache_) { kv_disk_cache_->request_idle_spill(); }
-}
-
-qwen3_6::detail::KvDiskSnapshot ProgramImplCore::kv_disk_snapshot() const noexcept {
-    return kv_disk_cache_ ? kv_disk_cache_->snapshot() : qwen3_6::detail::KvDiskSnapshot{};
 }
 
 std::optional<qwen3_6::detail::KvDiskSnapshot>
