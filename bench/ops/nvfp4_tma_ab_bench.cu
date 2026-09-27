@@ -218,12 +218,13 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     DeviceBuffer a_codes(static_cast<std::size_t>(tokens) * (cols / 2));
-    DeviceBuffer a_scales(static_cast<std::size_t>(tokens) * (cols / 16));
+    DeviceBuffer a_scales(static_cast<std::size_t>(nvfp4_w4a4_padded_tokens(tokens)) * (cols / 16));
     {
       constexpr int kThreads = 256;
       const std::int32_t kGroups = cols / 16;
-      const std::int32_t grid_x  = (tokens * kGroups + kThreads - 1) / kThreads;
-      nvfp4_w4a4_quantize_kernel<Act5120, 256><<<grid_x, kThreads, 0, stream>>>(
+      const std::int32_t grid_x  =
+          (nvfp4_w4a4_padded_tokens(tokens) * kGroups + kThreads - 1) / kThreads;
+      nvfp4_w4a4_quantize_kernel<Act5120, 256, Nvfp4ScaleLayout::Tiled><<<grid_x, kThreads, 0, stream>>>(
           (__nv_bfloat16*)x.p, (std::uint8_t*)a_codes.p, (std::uint8_t*)a_scales.p, tokens,
           input_div);
       CUDA_CHECK(cudaStreamSynchronize(stream));

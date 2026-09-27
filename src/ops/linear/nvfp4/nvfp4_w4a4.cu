@@ -40,14 +40,22 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
 
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                           cudaStream_t stream) {
+                           Nvfp4ScaleLayout layout, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     constexpr int kThreads    = 256;
-    const std::int32_t tasks  = tokens * ActivationGeometry::kGroupsPerRow;
-    nvfp4_w4a4_quantize_kernel<ActivationGeometry>
-        <<<(tasks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, tokens,
-            weight.input_scale_divisor);
+    const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
+    if (layout == Nvfp4ScaleLayout::Tiled) {
+        const std::int32_t tasks =
+            nvfp4_w4a4_padded_tokens(tokens) * ActivationGeometry::kGroupsPerRow;
+        nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled>
+            <<<(tasks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                input, workspace.codes, workspace.scales, tokens, weight.input_scale_divisor);
+    } else {
+        const std::int32_t tasks = tokens * ActivationGeometry::kGroupsPerRow;
+        nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>
+            <<<(tasks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                input, workspace.codes, workspace.scales, tokens, weight.input_scale_divisor);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -56,7 +64,7 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
                     std::int32_t tokens, cudaStream_t stream) {
     constexpr bool kResidualGeometry = std::is_same_v<Geometry, Nvfp4Residual6144Geometry> ||
                                        std::is_same_v<Geometry, Nvfp4Residual17408Geometry>;
-    if (tokens >= 1024) {
+    if (nvfp4_w4a4_tma_route(tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear(
             resolve_nvfp4_problem(Geometry::kOutputRows, Geometry::kInputRows), workspace.codes,
@@ -107,22 +115,22 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
 } // namespace
 
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream) {
+                                Nvfp4ScaleLayout layout, cudaStream_t stream) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 requires caller workspace");
     }
     switch (weight.k) {
     case Nvfp4Activation5120Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, layout, stream);
         return;
     case Nvfp4Activation6144Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, layout, stream);
         return;
     case Nvfp4Activation17408Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, layout, stream);
         return;
     case Nvfp4Activation10240Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation10240Geometry>(x, weight, workspace, stream);
+        launch_quantize_exact<Nvfp4Activation10240Geometry>(x, weight, workspace, layout, stream);
         return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
@@ -131,8 +139,9 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
 
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
+    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_projection_scale_layout(tokens),
+                               stream);
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::AttnInput:
         launch_problem<Nvfp4AttnInputGeometry>(weight, out, workspace, tokens, stream);

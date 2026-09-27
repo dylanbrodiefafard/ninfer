@@ -5,6 +5,35 @@
 
 namespace ninfer::ops::detail {
 
+// W4A4 TMA GEMMs read activation scales in [kNvfp4TmaBlockM tokens x kNvfp4ScaleTileGroups
+// groups] tiles, 4 KiB each and contiguous, so one TMA request moves one tile. The MMA kernels
+// read the row-major plane. Only the quantizer writes the plane, so the route that consumes it
+// selects its layout.
+inline constexpr std::int32_t kNvfp4TmaBlockM       = 256;
+inline constexpr std::int32_t kNvfp4ScaleTileGroups = 16;
+// Every registered W4A4 projection (linear, linear_add, attention and GDN input) takes the TMA
+// route from this width; the fused SwiGLU TMA route has its own whole-tile predicate.
+inline constexpr std::int32_t kNvfp4W4a4TmaMinTokens = 1024;
+
+enum class Nvfp4ScaleLayout : std::uint8_t {
+    RowMajor,
+    Tiled,
+};
+
+[[nodiscard]] constexpr bool nvfp4_w4a4_tma_route(std::int32_t tokens) noexcept {
+    return tokens >= kNvfp4W4a4TmaMinTokens;
+}
+
+[[nodiscard]] constexpr Nvfp4ScaleLayout nvfp4_w4a4_projection_scale_layout(
+    std::int32_t tokens) noexcept {
+    return nvfp4_w4a4_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled : Nvfp4ScaleLayout::RowMajor;
+}
+
+// Token extent of the tiled plane: whole tiles, padding zero-filled by the quantizer.
+[[nodiscard]] constexpr std::int32_t nvfp4_w4a4_padded_tokens(std::int32_t tokens) noexcept {
+    return ((tokens + kNvfp4TmaBlockM - 1) / kNvfp4TmaBlockM) * kNvfp4TmaBlockM;
+}
+
 enum class Nvfp4ScaleAccess : std::uint8_t {
     StagedRaw,
     Direct,

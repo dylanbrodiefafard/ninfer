@@ -119,9 +119,11 @@ __global__ __launch_bounds__(
                                   &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
                 if (load_scales) {
-                    nvfp4_tma_load_2d(tensors.a_scale4[nvfp4_tma_scale_slot<Schedule>(k_tile)],
-                                      &descriptors.a_scales, (k_tile / 2) * 16, token_begin,
-                                      &shared.full[stage]);
+                    nvfp4_tma_load_2d(
+                        tensors.a_scale4[nvfp4_tma_scale_slot<Schedule>(k_tile)],
+                        &descriptors.a_scales, 0,
+                        nvfp4_tiled_scale_row<Geometry, Schedule::kBlockM>(token_begin, k_tile),
+                        &shared.full[stage]);
                 }
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +

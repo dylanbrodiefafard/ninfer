@@ -194,7 +194,7 @@ int main() {
                 }
                 auto scope         = ws_w4.scope();
                 const auto scratch = allocate_nvfp4_w4a4_workspace(ws_w4, kT, kHidden);
-                launch_nvfp4_w4a4_quantize(x, gate.weight, scratch, s);
+                launch_nvfp4_w4a4_quantize(x, gate.weight, scratch, Nvfp4ScaleLayout::RowMajor, s);
                 c.gemm(x, gate.weight, m, scratch, s);
             };
             auto pair = [&](cudaStream_t s) {

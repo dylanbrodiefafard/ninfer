@@ -2,6 +2,7 @@
 
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 
 #include <cuda.h>
@@ -47,6 +48,36 @@ inline CUtensorMap nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_typ
     return map;
 }
 
+// The tiled activation-scale plane viewed as rows of kNvfp4TmaBlockM bytes: one 4 KiB tile is
+// kNvfp4ScaleTileGroups consecutive rows, and a BlockM-token slice of it is BlockM/16 rows, so
+// one request copies a contiguous range into the same token-major image the consumer reads.
+template <class Geometry, int BlockM>
+CUtensorMap make_nvfp4_tiled_scale_descriptor(const std::uint8_t* activation_scales,
+                                              std::int32_t tokens) {
+    static_assert(BlockM == 128 || BlockM == 256);
+    static_assert((Geometry::kGroupsPerRow % kNvfp4ScaleTileGroups) == 0);
+    constexpr std::uint64_t kTilesPerRow = Geometry::kGroupsPerRow / kNvfp4ScaleTileGroups;
+    if (tokens <= 0) {
+        throw std::invalid_argument("nvfp4 W4A4 TMA descriptors need a positive token count");
+    }
+    const std::uint64_t token_tiles =
+        static_cast<std::uint64_t>(nvfp4_w4a4_padded_tokens(tokens)) / kNvfp4TmaBlockM;
+    return nvfp4_make_tma_2d(const_cast<std::uint8_t*>(activation_scales),
+                             CU_TENSOR_MAP_DATA_TYPE_UINT8, kNvfp4TmaBlockM,
+                             token_tiles * kTilesPerRow * kNvfp4ScaleTileGroups, kNvfp4TmaBlockM,
+                             kNvfp4TmaBlockM, BlockM * kNvfp4ScaleTileGroups / kNvfp4TmaBlockM,
+                             CU_TENSOR_MAP_SWIZZLE_NONE, "encode activation scales TMA");
+}
+
+// First row of the tiled-plane view holding the scales of K-tile pair k_tile / 2 for the
+// BlockM tokens starting at token_begin.
+template <class Geometry, int BlockM>
+__device__ __forceinline__ int nvfp4_tiled_scale_row(int token_begin, int k_tile) {
+    constexpr int kTilesPerRow = Geometry::kGroupsPerRow / kNvfp4ScaleTileGroups;
+    return ((token_begin / kNvfp4TmaBlockM) * kTilesPerRow + k_tile / 2) * kNvfp4ScaleTileGroups +
+           (token_begin % kNvfp4TmaBlockM) * kNvfp4ScaleTileGroups / kNvfp4TmaBlockM;
+}
+
 template <class Geometry, int BlockM>
 Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* activation_codes,
                                                         const std::uint8_t* activation_scales,
@@ -55,10 +86,7 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
                                                         std::int32_t tokens) {
     static_assert(BlockM == 128 || BlockM == 256);
     constexpr std::uint32_t kCodeColumns = 64;
-    // TMA's innermost box is at least one 16-byte transaction. A K128 tile consumes the
-    // first eight bytes of each row; the second half is harmless look-ahead.
-    constexpr std::uint32_t kScaleColumns = 16;
-    constexpr std::uint32_t kBlockN       = 128;
+    constexpr std::uint32_t kBlockN = 128;
     constexpr std::uint64_t kWeightScaleBytes =
         static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
 
@@ -71,10 +99,8 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
         const_cast<std::uint8_t*>(weight_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
         Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow, kCodeColumns,
         kBlockN, CU_TENSOR_MAP_SWIZZLE_64B, "encode weight codes TMA");
-    descriptors.a_scales = nvfp4_make_tma_2d(
-        const_cast<std::uint8_t*>(activation_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        Geometry::kGroupsPerRow, tokens, Geometry::kGroupsPerRow, kScaleColumns, BlockM,
-        CU_TENSOR_MAP_SWIZZLE_NONE, "encode activation scales TMA");
+    descriptors.a_scales = make_nvfp4_tiled_scale_descriptor<Geometry, BlockM>(activation_scales,
+                                                                               tokens);
     descriptors.b_scales = nvfp4_make_tma_2d(
         const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
         kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
@@ -280,9 +306,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
                 if (load_scales) {
-                    nvfp4_tma_load_2d(tensors.a_scale4[nvfp4_tma_scale_slot<Schedule>(k_tile)],
-                                      &descriptors.a_scales, (k_tile / 2) * 16, token_begin,
-                                      &shared.full[stage]);
+                    nvfp4_tma_load_2d(
+                        tensors.a_scale4[nvfp4_tma_scale_slot<Schedule>(k_tile)],
+                        &descriptors.a_scales, 0,
+                        nvfp4_tiled_scale_row<Geometry, Schedule::kBlockM>(token_begin, k_tile),
+                        &shared.full[stage]);
                 }
                 const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
                                          k_tile * Schedule::kK64PerStage) *

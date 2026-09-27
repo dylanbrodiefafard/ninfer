@@ -64,7 +64,7 @@ void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Ten
 void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                      Tensor& z, Nvfp4W4a4Workspace workspace,
                                      cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    launch_nvfp4_w4a4_quantize(x, weight, workspace, Nvfp4ScaleLayout::RowMajor, stream);
     using Schedule = M32N64;
     const int tokens = x.ne[1];
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
@@ -80,9 +80,10 @@ void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Ten
 
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
-    if (tokens >= 1024) {
+    launch_nvfp4_w4a4_quantize(x, weight, workspace, nvfp4_w4a4_projection_scale_layout(tokens),
+                               stream);
+    if (nvfp4_w4a4_tma_route(tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_gdn(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),

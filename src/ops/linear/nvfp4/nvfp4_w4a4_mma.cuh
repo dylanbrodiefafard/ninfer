@@ -3,6 +3,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 
 #include <cuda_bf16.h>
@@ -428,16 +429,44 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     }
 }
 
-template <class Geometry, int Threads = 256>
+// Byte offset of scale (token, group) in the tiled plane: [kNvfp4TmaBlockM tokens x
+// kNvfp4ScaleTileGroups groups] tiles, token-tile major, each tile token-major exactly like the
+// shared image one TMA stage fills.
+template <class Geometry>
+__device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int group) {
+    constexpr int kTilesPerRow = (Geometry::kInputRows / 16) / kNvfp4ScaleTileGroups;
+    const std::int64_t tile =
+        static_cast<std::int64_t>(token / kNvfp4TmaBlockM) * kTilesPerRow +
+        group / kNvfp4ScaleTileGroups;
+    return tile * (kNvfp4TmaBlockM * kNvfp4ScaleTileGroups) +
+           (token % kNvfp4TmaBlockM) * kNvfp4ScaleTileGroups + group % kNvfp4ScaleTileGroups;
+}
+
+template <class Geometry, int Threads, Nvfp4ScaleLayout Layout>
 __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, float input_scale_divisor) {
     static_assert(Threads == 128 || Threads == 256 || Threads == 512);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+    static_assert(Layout == Nvfp4ScaleLayout::RowMajor ||
+                  (kGroupsPerRow % kNvfp4ScaleTileGroups) == 0);
     const int task =
         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     const int tasks = tokens * kGroupsPerRow;
-    if (task >= tasks) { return; }
+    if (task >= tasks) {
+        // The tiled launch also covers the last tile's padding tokens: they own no input or code
+        // byte, only the zero scale the TMA stage reads for them.
+        if constexpr (Layout == Nvfp4ScaleLayout::Tiled) {
+            const int pad_token = task / kGroupsPerRow;
+            const int padded_tokens =
+                ((tokens + kNvfp4TmaBlockM - 1) / kNvfp4TmaBlockM) * kNvfp4TmaBlockM;
+            if (pad_token < padded_tokens) {
+                scales[nvfp4_tiled_scale_offset<Geometry>(pad_token,
+                                                          task - pad_token * kGroupsPerRow)] = 0;
+            }
+        }
+        return;
+    }
 
     const int token                   = task / kGroupsPerRow;
     const int group                   = task - token * kGroupsPerRow;
@@ -447,7 +476,11 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
     auto* code_destination =
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
-    scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+    if constexpr (Layout == Nvfp4ScaleLayout::Tiled) {
+        scales[nvfp4_tiled_scale_offset<Geometry>(token, group)] = quantized.scale;
+    } else {
+        scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+    }
 }
 
 } // namespace ninfer::ops::detail

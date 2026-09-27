@@ -1213,7 +1213,8 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
             const auto scratch = ops::detail::allocate_nvfp4_w4a4_workspace(
                 codec_workspace, aggregate, kHidden);
             ops::detail::launch_nvfp4_w4a4_quantize(x.view({kHidden, aggregate}), parent.view(),
-                                                  scratch, nullptr);
+                                                  scratch,
+                                                  ops::detail::Nvfp4ScaleLayout::RowMajor, nullptr);
             std::vector<std::uint8_t> codes(encoded.codes.size()), scales(encoded.scales.size());
             CUDA_CHECK(cudaMemcpy(codes.data(), scratch.codes, codes.size(), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(scales.data(), scratch.scales, scales.size(), cudaMemcpyDeviceToHost));
