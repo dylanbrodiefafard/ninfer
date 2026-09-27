@@ -224,6 +224,7 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("weights", load.weights_id);
     print_metric("artifact file read", format_bytes(load.artifact_bytes_read));
     print_metric("weight H2D", format_bytes(load.host_to_device_bytes));
+    print_metric("weight pinned host", format_bytes(load.mapped_host_bytes));
     print_metric("pinned staging peak", format_bytes(load.peak_staging_bytes));
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));

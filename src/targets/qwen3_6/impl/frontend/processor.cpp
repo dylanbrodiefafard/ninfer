@@ -376,15 +376,19 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string replacement = placeholder(item);
-        if (rendered.rewrite_checkpoint) {
-            const std::size_t boundary = rendered.rewrite_checkpoint->offset;
-            const std::size_t end      = position + needle.size();
+        const auto shift_boundary     = [&](std::size_t boundary) {
+            const std::size_t end = position + needle.size();
             if (position < boundary && boundary < end) {
                 throw std::logic_error("rewrite checkpoint intersects a media placeholder");
             }
-            if (end <= boundary) {
-                rendered.rewrite_checkpoint->offset = boundary - needle.size() + replacement.size();
-            }
+            if (end <= boundary) { return boundary - needle.size() + replacement.size(); }
+            return boundary;
+        };
+        if (rendered.rewrite_checkpoint) {
+            rendered.rewrite_checkpoint->offset = shift_boundary(rendered.rewrite_checkpoint->offset);
+        }
+        for (std::size_t& offset : rendered.turn_closure_offsets) {
+            offset = shift_boundary(offset);
         }
         rendered.text.replace(position, needle.size(), replacement);
         for (ByteSpan& span : rendered.literal_spans) {
@@ -519,6 +523,63 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
     }
 }
 
+// Literal spans of text.substr(begin, end - begin), rebased to begin.
+std::vector<ByteSpan> literal_spans_between(std::span<const ByteSpan> spans, std::size_t begin,
+                                            std::size_t end) {
+    std::vector<ByteSpan> out;
+    for (const ByteSpan span : spans) {
+        if (span.end <= begin) { continue; }
+        if (span.begin >= end) { break; }
+        out.push_back(ByteSpan{.begin = std::max(span.begin, begin) - begin,
+                               .end   = std::min(span.end, end) - begin});
+    }
+    return out;
+}
+
+void append_turn_closure_frontiers(EncodedChat& encoded, const Tokenizer& tokenizer,
+                                   const RenderedChat& rendered) {
+    encoded.turn_closure_frontiers.reserve(rendered.turn_closure_offsets.size());
+    std::size_t byte_begin  = 0;
+    std::size_t token_begin = 0;
+    for (const std::size_t offset : rendered.turn_closure_offsets) {
+        if (offset < byte_begin || offset > rendered.text.size()) {
+            throw std::logic_error("turn closure byte offsets are outside the ordered chat");
+        }
+        if (rendered.rewrite_checkpoint && encoded.rewrite_checkpoint &&
+            offset == rendered.rewrite_checkpoint->offset) {
+            encoded.turn_closure_frontiers.push_back(encoded.rewrite_checkpoint->frontier);
+            byte_begin  = offset;
+            token_begin = encoded.rewrite_checkpoint->frontier;
+            continue;
+        }
+        if (offset == 0) { continue; }
+        // Each boundary ends the assistant header's newline, a Qwen tokenization
+        // boundary. Encode disjoint intervals, including NFC normalization, and
+        // check them against the full encoding instead of re-encoding history for
+        // every assistant turn.
+        const std::vector<int> interval = tokenizer.encode(
+            std::string_view(rendered.text).substr(byte_begin, offset - byte_begin), {},
+            literal_spans_between(rendered.literal_spans, byte_begin, offset));
+        if (interval.size() > encoded.input_ids.size() - token_begin ||
+            !std::equal(interval.begin(), interval.end(),
+                        encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_begin))) {
+            throw std::logic_error("turn closure is not an exact token prefix");
+        }
+        byte_begin = offset;
+        token_begin += interval.size();
+        if (token_begin == 0) {
+            throw std::logic_error("turn closure is not an exact token prefix");
+        }
+        if (token_begin > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("turn closure token frontier exceeds uint32");
+        }
+        const auto frontier = static_cast<std::uint32_t>(token_begin);
+        if (frontier < encoded.input_ids.size()) {
+            encoded.turn_closure_frontiers.push_back(frontier);
+        }
+    }
+}
+
 } // namespace
 
 std::string PreprocessStats::summary() const {
@@ -541,6 +602,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     EncodedChat encoded;
     if (!rendered.rewrite_checkpoint) {
         encoded.input_ids = tokenizer.encode(rendered.text, {}, rendered.literal_spans);
+        append_turn_closure_frontiers(encoded, tokenizer, rendered);
         return encoded;
     }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
@@ -554,14 +616,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         *tokens.prefix_tokens <= encoded.input_ids.size()) {
         frontier = *tokens.prefix_tokens;
     } else {
-        const std::size_t offset = rendered.rewrite_checkpoint->offset;
-        std::vector<ByteSpan> prefix_spans;
-        for (const ByteSpan span : rendered.literal_spans) {
-            if (span.begin >= offset) { break; }
-            prefix_spans.push_back(ByteSpan{.begin = span.begin, .end = std::min(span.end, offset)});
-        }
+        const std::size_t offset      = rendered.rewrite_checkpoint->offset;
         const std::vector<int> prefix = tokenizer.encode(
-            std::string_view(rendered.text).substr(0, offset), {}, prefix_spans);
+            std::string_view(rendered.text).substr(0, offset), {},
+            literal_spans_between(rendered.literal_spans, 0, offset));
         if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
             !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
             throw std::logic_error("rewrite checkpoint is not an exact token prefix");
@@ -575,6 +633,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         .kind     = rendered.rewrite_checkpoint->kind,
         .frontier = frontier,
     };
+    append_turn_closure_frontiers(encoded, tokenizer, rendered);
     return encoded;
 }
 
@@ -643,8 +702,9 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
 
     rendered                  = expand_placeholders(std::move(rendered), items);
     EncodedChat encoded       = encode_rendered_chat(tokenizer_, rendered);
-    output.input_ids          = std::move(encoded.input_ids);
-    output.rewrite_checkpoint = encoded.rewrite_checkpoint;
+    output.input_ids               = std::move(encoded.input_ids);
+    output.rewrite_checkpoint      = encoded.rewrite_checkpoint;
+    output.turn_closure_frontiers  = std::move(encoded.turn_closure_frontiers);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

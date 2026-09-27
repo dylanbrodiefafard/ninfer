@@ -17,6 +17,8 @@
 #undef NINFER_QWEN36_RUNTIME_NS
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
+#include "targets/qwen3_6/impl/runtime/prefill_schedule.h"
+#include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <ninfer/types.h>
 
@@ -29,6 +31,7 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -195,6 +198,135 @@ void test_mtp_alignment() {
     expect(final_visual.source_begin == 2 &&
                final_visual.destination_columns == std::vector<std::int32_t>({2}),
            "final shifted visual overlap excludes generated-token column");
+}
+
+void check_vision_prefill_shifted_inputs(
+    const std::array<std::vector<std::int32_t>, 2>& scatter) {
+    constexpr std::uint32_t tokens = 18;
+    std::vector<int> composed(tokens + 1);
+    for (std::uint32_t i = 0; i <= tokens; ++i) { composed[i] = static_cast<int>(i); }
+    for (std::size_t item = 0; item < scatter.size(); ++item) {
+        for (const auto column : scatter[item]) {
+            composed[column] = 1000 + static_cast<int>(item * 100) + column;
+        }
+    }
+    for (const bool mtp : {false, true}) {
+        std::array<q36::detail::VisionUseSpan, 2> uses;
+        for (std::size_t item = 0; item < scatter.size(); ++item) {
+            const auto first = static_cast<std::uint32_t>(scatter[item].front());
+            const auto end = static_cast<std::uint32_t>(scatter[item].back()) + 1;
+            uses[item] = {mtp && first != 0 ? first - 1 : first, first, end,
+                          static_cast<std::uint32_t>(item), 0};
+        }
+        for (const std::uint32_t base : {0U, 3U, 4U, 5U, 7U, 10U, 11U, 14U}) {
+            for (const std::uint32_t maximum : {1U, 4U, 128U}) {
+                std::uint32_t begin = base;
+                while (begin < tokens) {
+                    const auto chunk = q36::detail::select_vision_prefill_chunk(
+                        uses, begin, std::min(maximum, tokens - begin));
+                    expect(chunk.length != 0, "Vision chunk always advances");
+                    if (chunk.length == 0) { break; }
+                    // Independent exact oracle: Text consumes e[t], MTP consumes e[t+1].
+                    std::vector<int> text(chunk.length);
+                    std::vector<int> shifted(chunk.length);
+                    for (std::uint32_t j = 0; j < chunk.length; ++j) {
+                        text[j] = static_cast<int>(begin + j);
+                        shifted[j] = static_cast<int>(begin + j + 1);
+                    }
+                    if (chunk.use_index) {
+                        const auto item = uses[*chunk.use_index].item_index;
+                        for (const auto column : scatter[item]) {
+                            if (column >= static_cast<int>(begin) &&
+                                column < static_cast<int>(begin + chunk.length)) {
+                                text[column - begin] = composed[column];
+                            }
+                        }
+                        if (mtp) {
+                            const auto overlap = q36::shifted_visual_overlap(
+                                scatter[item], tokens,
+                                q36::plan_mtp_alignment_window(tokens, begin, chunk.length));
+                            for (std::size_t j = 0; j < overlap.size(); ++j) {
+                                shifted[overlap.destination_columns[j]] =
+                                    composed[scatter[item][overlap.source_begin + j]];
+                            }
+                        }
+                    }
+                    for (std::uint32_t j = 0; j < chunk.length; ++j) {
+                        expect(text[j] == composed[begin + j],
+                               "Vision chunk preserves every Text visual embedding");
+                        if (mtp) {
+                            expect(shifted[j] == composed[begin + j + 1],
+                                   "Vision chunk preserves MTP's shifted visual embedding");
+                        }
+                    }
+                    begin += chunk.length;
+                }
+            }
+        }
+    }
+}
+
+void test_vision_prefill_shifted_inputs() {
+    // A normal text gap before a noncontiguous video, minimum separation between
+    // image consumer spans, and a visual item starting at the first token.
+    check_vision_prefill_shifted_inputs({{{4, 5, 6}, {11, 13}}});
+    check_vision_prefill_shifted_inputs({{{4, 5, 6}, {8, 9}}});
+    check_vision_prefill_shifted_inputs({{{0, 1}, {3, 5}}});
+
+    const std::array<q36::detail::VisionUseSpan, 2> uses{{
+        {3, 4, 7, 0, 0}, {10, 11, 14, 1, 3}}};
+    const auto cold = q36::detail::select_vision_prefill_chunk(uses, 0, 18);
+    expect(cold.length == 4 && cold.use_index == 0,
+           "cold Text matches a four-token reused prefix while MTP sees the first image");
+    const auto prefix = q36::detail::select_vision_prefill_chunk(uses, 0, 3);
+    expect(prefix.length == 3 && !prefix.use_index,
+           "text before the shifted visual consumer needs no Vision embeddings");
+    const auto visual = q36::detail::select_vision_prefill_chunk(uses, 4, 14);
+    expect(visual.length == 6 && visual.use_index == 0,
+           "active image stops before the next item's shifted visual consumer");
+    const auto next_bridge = q36::detail::select_vision_prefill_chunk(uses, 10, 8);
+    expect(next_bridge.length == 1 && next_bridge.use_index == 1,
+           "next item's bridge-only chunk receives its shifted visual embedding");
+}
+
+void test_multimodal_prefill_service_projection() {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids.resize(800);
+    prompt.vision_items.resize(1);
+    prompt.turn_closure_frontiers = {100, 160, 220, 280, 340, 400, 460, 520, 580, 640, 700, 760};
+    constexpr std::uint32_t rewrite = 770;
+    const std::array<q36::detail::VisionUseSpan, 1> uses{{{3, 4, 67, 0, 0}}};
+    // Cold: one text/image boundary, twelve historical headers, the rewrite
+    // frontier, then the tail. Reused suffixes omit the boundaries behind them.
+    const std::array<std::pair<std::uint32_t, std::uint64_t>, 5> cases{{
+        {0, 15}, {67, 14}, {400, 8}, {760, 2}, {800, 1}}};
+    for (const auto& [base, expected] : cases) {
+        for (const std::uint32_t maximum : {128U, 1024U, 8192U}) {
+            const auto reserved =
+                q36::detail::projected_prefill_work(prompt, base, maximum, uses, rewrite);
+            expect(reserved == expected,
+                   "one-token image request reserves all historical turn prefill steps");
+        }
+    }
+    prompt.vision_items.clear();
+    expect(q36::detail::projected_prefill_work(prompt, 0, 1024, {}, rewrite) == 2,
+           "text-only projection does not reserve unused historical turn splits");
+    prompt.token_ids.resize(8192);
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, {}, 100) == 3,
+           "rewrite split of aligned 8192 tokens reserves both irregular tail steps");
+    prompt.vision_items.resize(1);
+    prompt.turn_closure_frontiers = {100};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, {}, std::nullopt) == 3,
+           "historical turn split reserves both irregular tail steps");
+    prompt.turn_closure_frontiers.clear();
+    const std::array<q36::detail::VisionUseSpan, 1> tail_image{{{100, 100, 164, 0, 0}}};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 8192, tail_image, std::nullopt) == 3,
+           "Vision split reserves both irregular tail steps");
+    prompt.token_ids.resize(18);
+    const std::array<q36::detail::VisionUseSpan, 2> two_images{{
+        {3, 4, 7, 0, 0}, {10, 11, 14, 1, 3}}};
+    expect(q36::detail::projected_prefill_work(prompt, 0, 128, two_images, std::nullopt) == 4,
+           "MTP image request reserves text-prefix, first image, next bridge, and next image");
 }
 
 void test_vision_control() {
@@ -957,6 +1089,92 @@ void test_cancelled_dflash_exact_prefix_reuse() {
            "valid DFlash exact prefix still appends ahead of its checkpoint");
 }
 
+q36::PreparedPromptData text_ids(std::vector<ninfer::TokenId> ids) {
+    q36::PreparedPromptData prompt;
+    const auto tokens = static_cast<std::uint32_t>(ids.size());
+    prompt.token_ids   = std::move(ids);
+    prompt.token_types.assign(tokens, 0);
+    std::vector<std::int32_t> positions;
+    positions.reserve(3 * static_cast<std::size_t>(tokens));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::uint32_t i = 0; i < tokens; ++i) {
+            positions.push_back(static_cast<std::int32_t>(i));
+        }
+    }
+    prompt.positions = std::move(positions);
+    return prompt;
+}
+
+// Recovery splice: the ledger still holds the failed generation after the prompt
+// prefix, and the candidate replaces that tail with a different suffix.
+void test_recovery_prefix_reuse() {
+    using Path    = ninfer::PrefixReusePath;
+    using Kind    = q36::RewriteCheckpointKind;
+    using Backend = ninfer::SpeculativeBackend;
+    constexpr std::uint32_t P = 16;
+    const auto prefix         = text_prompt(P);
+    std::vector<ninfer::TokenId> ledger = prefix.token_ids;
+    ledger.insert(ledger.end(), {9001, 9002, 9003, 9004});
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(prefix);
+    identity.append_generated(4, 0);
+    auto candidate_ids = prefix.token_ids;
+    candidate_ids.insert(candidate_ids.end(), {42, 43, 44});
+    const auto prompt = text_ids(candidate_ids);
+    q36::detail::ResidentReuseState state{&ledger, &identity, P + 4, true, Kind::ResponseReplay, P,
+                                          0, 0, true, false, {}};
+
+    {
+        const auto sel = decide(state, prompt, Backend::None);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == P,
+               "response replay at the prompt prefix restores that checkpoint");
+    }
+    {
+        auto turn            = state;
+        turn.rewrite_kind     = Kind::TurnClosure;
+        turn.rewrite_frontier = P - 3;
+        const auto sel        = decide(turn, prompt, Backend::None);
+        expect(sel.path == Path::RestoreTurnCheckpoint && sel.frontier == P - 3,
+               "a turn checkpoint before the prompt end restores that frontier");
+    }
+    {
+        auto missed = prompt;
+        missed.token_ids[3] = 1;
+        const auto sel      = decide(state, missed, Backend::None);
+        expect(sel.path == Path::FullReset && sel.frontier == 0,
+               "one changed prompt token misses the advertised rewrite checkpoint");
+    }
+    {
+        auto mtp          = state;
+        mtp.mtp_kv_valid  = 8;
+        mtp.context_checkpoints.push_back(
+            {8, q36::detail::prefix_hash_at(ledger, identity, 8),
+             q36::detail::ContextCheckpointKind::Ladder});
+        const auto sel = decide(mtp, prompt, Backend::Mtp);
+        expect(sel.path == Path::RestoreContextCheckpoint && sel.frontier == 8,
+               "an unready rewrite falls through to an earlier ready ladder");
+    }
+    {
+        constexpr std::uint32_t S1 = 24;
+        std::vector<ninfer::TokenId> stacked = prefix.token_ids;
+        for (std::uint32_t i = 0; i < S1 - P; ++i) { stacked.push_back(5000 + i); }
+        std::vector<ninfer::TokenId> long_ledger = stacked;
+        long_ledger.insert(long_ledger.end(), {9001, 9002, 9003, 9004});
+        q36::detail::ResidentPrefixIdentity stacked_identity;
+        stacked_identity.assign(prefix);
+        stacked_identity.append_generated(long_ledger.size() - P, 0);
+        stacked.push_back(77);
+        stacked.push_back(78);
+        const auto candidate = text_ids(std::move(stacked));
+        q36::detail::ResidentReuseState stacked_state{
+            &long_ledger, &stacked_identity, static_cast<std::uint32_t>(long_ledger.size()), true,
+            Kind::ResponseReplay, S1, 0, 0, true, false, {}};
+        const auto sel = decide(stacked_state, candidate, Backend::None);
+        expect(sel.path == Path::RestoreResponseCheckpoint && sel.frontier == S1,
+               "a second recovery suffix restores the previous spliced prompt");
+    }
+}
+
 void test_resident_reuse_decision() {
     using Path    = ninfer::PrefixReusePath;
     using Kind    = q36::RewriteCheckpointKind;
@@ -1247,11 +1465,14 @@ int main() {
     test_decoder_layout();
     test_round_layout();
     test_mtp_alignment();
+    test_vision_prefill_shifted_inputs();
+    test_multimodal_prefill_service_projection();
     test_vision_control();
     test_prefix_identity();
     test_prefix_hash_and_dflash_gate();
     test_prefill_context_marks();
     test_resident_reuse_decision();
+    test_recovery_prefix_reuse();
     test_cancelled_dflash_exact_prefix_reuse();
     test_dflash_chain_verify_kv_headroom();
     test_adaptive_capture_and_topology();

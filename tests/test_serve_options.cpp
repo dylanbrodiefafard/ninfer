@@ -309,6 +309,18 @@ int main() {
                           automatic.kv_capacity.automatic_headroom_bytes ==
                               ninfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
+    const ServeOptions headroom = parse(
+        {"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512", "--kv-capacity", "auto"});
+    failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          headroom.kv_capacity.automatic_headroom_bytes == 512ULL * 1024ULL * 1024ULL,
+                      "--kv-capacity-headroom did not set automatic headroom in MiB");
+    bool headroom_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512"});
+    } catch (const std::invalid_argument&) {
+        headroom_rejected = true;
+    }
+    failures += check(headroom_rejected, "--kv-capacity-headroom without auto was accepted");
 
     const ServeOptions ram_off = parse({"ninfer-serve", "model.ninfer"});
     failures += check(ram_off.kv_ram_capacity_bytes == 0,

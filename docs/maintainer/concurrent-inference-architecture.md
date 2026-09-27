@@ -157,19 +157,22 @@ of repeated work, not a generated-reasoning length limit.
 The state resets on retry and cannot use original prompt tokens or another attempt.
 There is no reasoning length limit. Runtime enables recovery for p-less, non-raw text-only
 thinking input; reasoning retries additionally require positive temperature. The family
-retains owning original input, removes historical and failed generated reasoning on repair,
-and supplies an explicitly labeled system notice without inventing a call/result/user turn.
-Planning reserves two additional cold prefills up to the original context entitlement
-(consumed completion space can accommodate the notice). A repair must fit the original
-resource commitment and preserve the
-remaining output budget; otherwise recovery fails explicitly for that request.
+retains the owning original input. The retry splices onto the resident prompt, keeps
+historical reasoning, closes the open think turn, and supplies an explicitly labeled
+system notice or rejected-call feedback. It does not invent a call, result, or user turn.
+Planning reserves service work for up to two retries, each within the original
+context entitlement (consumed completion space can accommodate the notice). A
+repair must fit the original resource commitment and preserve the remaining
+output budget; otherwise recovery fails explicitly for that request.
 
-At the committed round boundary the retry leaves the decode-ready set. With no other prefill
-owner or conflicting copy hold, the executor clears the old lane's complete KV/recurrent/
-speculative state and performs a fresh prefill without prefix reuse or checkpoint capture.
-It never attempts an arbitrary KV truncation with stale GDN state. Retry queue entries are
-bounded by admitted slots and checked against current lane ownership. Other decode-ready
-requests retain the usual maximal-batch semantics outside the exclusive retry prefill.
+At the committed round boundary the retry leaves the decode-ready set. It stays on its
+admitted lane, closes the open think turn, and splices the notice or rejected-call
+feedback onto the resident prompt, including historical reasoning. Only the failed
+generation is omitted. A ready checkpoint that is a prefix is restored and the suffix is
+prefilled. The retry does not take a new admission and does not trim at an arbitrary
+token. Retry queue entries are bounded by admitted slots and checked against current lane
+ownership. Other lanes still decode outside the exclusive retry prefill; a resident-miss
+host restore blocks them for the copy.
 
 Calls remain unpublished until recovery accepts the terminal result. Already streamed prose
 and reasoning cannot be retracted. All generated attempts consume the original token budget;

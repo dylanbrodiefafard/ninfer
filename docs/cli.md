@@ -167,6 +167,7 @@ the product) is in [dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
@@ -251,11 +252,14 @@ repetition-evidence threshold, not a 4,096-token reasoning limit. The occurrence
 have a fixed separation,
 so changing words elsewhere in a multi-paragraph loop does not hide the repeated passage.
 Hashes locate candidates; exact token comparison confirms them. Two copies alone do not
-trigger a retry. Long reasoning without that repetition is not limited. The failed
-generated reasoning and closed historical reasoning are omitted from
-the internal retry context; original user content and actual tool results are preserved,
-and an explicitly labeled engine system notice asks for concrete progress. No call or
-tool result is invented. Reasoning and duplicate-tool recovery share the two-retry budget.
+trigger a retry. Long reasoning without that repetition is not limited. The retry keeps
+the cached prompt, including historical reasoning. It closes the open think turn and
+appends the notice or rejected-call feedback. Only the failed generation is omitted. A
+later retry appends another notice after the same close; the earlier notice stays. A
+ready checkpoint that is a prefix is trimmed and the suffix is prefilled. Original user
+content and actual tool results stay in that prompt, and an explicitly labeled engine
+system notice asks for concrete progress. No call or tool result is invented. Reasoning
+and duplicate-tool recovery share the two-retry budget.
 Raw output and media inputs do not use these internal retries. See the serving reference
 for the detector's conservative scope and recovery usage fields.
 
@@ -284,8 +288,10 @@ remains a capacity alternative. The prepared prompt must fit
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, workspace, Vision
-request transient, and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
+request transient, and CUDA Graph allowance, while leaving `--kv-capacity-headroom` MiB (default 64)
+unallocated. The Engine allocates all device memory at startup, so the default only covers
+driver-side growth such as lazy per-kernel local memory; raise it when a desktop or another process
+uses the same GPU. A startup failure in automatic mode names this option. It does not probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 The startup log's `slack` includes the automatic `headroom`; they are not separate deductions.

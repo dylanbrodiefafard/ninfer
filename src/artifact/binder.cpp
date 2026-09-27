@@ -86,6 +86,16 @@ PayloadSpan Binder::payload(ObjectHandle handle) const {
 }
 
 void Binder::materialize_on_device(ObjectHandle handle) {
+    plan_tensor(handle, materialization_.device_capacity_bytes, materialization_.device_objects);
+}
+
+void Binder::materialize_on_mapped_host(ObjectHandle handle) {
+    plan_tensor(handle, materialization_.mapped_host_capacity_bytes,
+                materialization_.mapped_host_objects);
+}
+
+void Binder::plan_tensor(ObjectHandle handle, std::uint64_t& capacity_bytes,
+                         std::vector<DeviceMaterialization>& objects) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {
         throw ArtifactError("resource cannot be materialized as a device tensor");
@@ -95,14 +105,13 @@ void Binder::materialize_on_device(ObjectHandle handle) {
                             std::string(tensor->name));
     }
     const std::uint64_t alignment = tensor_alignment(tensor->layout);
-    const std::uint64_t offset    = align_up(materialization_.device_capacity_bytes, alignment);
+    const std::uint64_t offset    = align_up(capacity_bytes, alignment);
     if (tensor->bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
         throw ArtifactError("materialization plan size overflows u64");
     }
-    materialization_.device_objects.push_back(
-        DeviceMaterialization{handle, offset, tensor->bytes, alignment});
-    materialization_.device_capacity_bytes = offset + tensor->bytes;
-    planned_[handle.index]                 = true;
+    objects.push_back(DeviceMaterialization{handle, offset, tensor->bytes, alignment});
+    capacity_bytes         = offset + tensor->bytes;
+    planned_[handle.index] = true;
 }
 
 void Binder::retain_on_host(ObjectHandle handle) {

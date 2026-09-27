@@ -112,6 +112,18 @@ void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
         embed_gather_w8_2048_launch(ids, table, out, W8EmbedRoute::Auto, stream);
         return;
     }
+    const auto aligned16 = [](const void* p) {
+        return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0;
+    };
+    if (d == kEmbedGatherW8TextD && table.padded_shape[1] == kEmbedGatherW8TextD &&
+        aligned16(codes) && aligned16(out.data) &&
+        (reinterpret_cast<std::uintptr_t>(scales) & 1U) == 0) {
+        embed_gather_w8_row_5120_kernel<<<T, kEmbedGatherW8TextThreads, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), codes, scales,
+            static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     const std::int64_t n = static_cast<std::int64_t>(d) * T;
     embed_gather_w8_kernel<<<grid_for(n), kBlock, 0, stream>>>(

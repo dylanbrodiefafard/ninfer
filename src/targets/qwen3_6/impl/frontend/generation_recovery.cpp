@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -95,14 +96,12 @@ bool GenerationRecoveryContext::repeats(std::span<const ToolCall> calls, std::st
     }) && repeated_reasoning(reasoning, repeated_reasoning_);
 }
 
-PromptInput GenerationRecoveryContext::repair(std::span<const ToolCall> calls, std::uint32_t attempt) const {
+std::vector<ChatMessage> GenerationRecoveryContext::recovery_insert(
+    std::span<const ToolCall> calls, std::uint32_t attempt) const {
     if (attempt == 0 || attempt > maximum_attempts) {
         throw std::invalid_argument("invalid bounded generation recovery attempt");
     }
-    PromptInput repaired = input_;
-    for (auto& message : repaired.messages) {
-        if (message.role == ChatRole::Assistant) { message.reasoning_content.clear(); }
-    }
+    std::vector<ChatMessage> inserted;
     if (calls.empty()) {
         ChatMessage notice;
         notice.role = ChatRole::System;
@@ -117,21 +116,21 @@ PromptInput GenerationRecoveryContext::repair(std::span<const ToolCall> calls, s
                     "Use the existing results to take a concrete next step: "
                     "produce the needed answer or issue a relevant tool call. Do not merely repeat "
                     "an intention to act. This notice is engine feedback, not a new user request."});
-        repaired.messages.push_back(std::move(notice));
-        return repaired;
+        inserted.push_back(std::move(notice));
+        return inserted;
     }
     ChatMessage candidate;
     candidate.role = ChatRole::Assistant;
     candidate.tool_calls.assign(calls.begin(), calls.end());
     for (std::size_t i = 0; i < candidate.tool_calls.size(); ++i) {
-        candidate.tool_calls[i].id = "ninfer_rejected_" + std::to_string(attempt) + "_" + std::to_string(i);
+        candidate.tool_calls[i].id =
+            "ninfer_rejected_" + std::to_string(attempt) + "_" + std::to_string(i);
     }
-    repaired.messages.push_back(std::move(candidate));
-    const auto& proposed = repaired.messages.back().tool_calls;
-    std::vector<ChatMessage> feedback;
+    inserted.push_back(std::move(candidate));
+    const auto& proposed = inserted.back().tool_calls;
     for (const auto& call : proposed) {
         ChatMessage message;
-        message.role = ChatRole::Tool;
+        message.role         = ChatRole::Tool;
         message.tool_call_id = call.id;
         message.parts.push_back(MessagePart{.kind = MessagePartKind::Text,
             .text = "NInfer did not execute this proposed call. It detected repeated reasoning and "
@@ -140,10 +139,63 @@ PromptInput GenerationRecoveryContext::repair(std::span<const ToolCall> calls, s
                     "and take a substantive next step toward the user's task. Changing only a "
                     "read limit or rephrasing the same operation is not progress. If a repeat is "
                     "genuinely necessary, identify what changed or what new information it obtains."});
-        feedback.push_back(std::move(message));
+        inserted.push_back(std::move(message));
     }
-    for (auto& message : feedback) { repaired.messages.push_back(std::move(message)); }
-    return repaired;
+    return inserted;
+}
+
+bool recovery_suffix_tokens_ok(std::span<const TokenId> prefix, std::span<const TokenId> prologue,
+                               std::span<const TokenId> turn_close, std::span<const TokenId> insert,
+                               std::string_view prologue_text, std::string_view prologue_decoded,
+                               std::string_view turn_close_text, std::string_view turn_close_decoded,
+                               std::string_view insert_text, std::string_view insert_decoded) noexcept {
+    if (prefix.empty() || prologue.empty() || turn_close.empty() || insert.empty() ||
+        prologue_text.empty() || turn_close_text.empty() || insert_text.empty()) {
+        return false;
+    }
+    if (prefix.size() < prologue.size() ||
+        !std::equal(prologue.begin(), prologue.end(),
+                    prefix.end() - static_cast<std::ptrdiff_t>(prologue.size()))) {
+        return false;
+    }
+    return prologue_decoded == prologue_text && turn_close_decoded == turn_close_text &&
+           insert_decoded == insert_text;
+}
+
+bool recovery_output_budget_preserved(std::uint32_t spliced, std::uint32_t capacity,
+                                      std::uint32_t remaining) noexcept {
+    if (spliced > capacity) { return false; }
+    return static_cast<std::uint64_t>(remaining) <=
+           static_cast<std::uint64_t>(capacity) - spliced + 1ULL;
+}
+
+std::span<const TokenId> recovery_splice_prefix(std::span<const TokenId> resident_prefix,
+                                                   std::span<const TokenId> original_prompt) noexcept {
+    if (!resident_prefix.empty()) { return resident_prefix; }
+    return original_prompt;
+}
+
+RecoveryPrefillDecision route_recovery_prefill(const RecoveryPrefillInput& input) noexcept {
+    if (!input.splice_accepted) {
+        return {RecoveryPrefillRoute::Exhaust, kRecoveryPrologueExhausted};
+    }
+    if (!input.output_budget_preserved || !input.pages_fit) {
+        return {RecoveryPrefillRoute::Exhaust, kRecoveryBudgetExhausted};
+    }
+    if (input.force_cold_prefill || !input.allow_prefix_reuse || input.host_restore_failed) {
+        return {RecoveryPrefillRoute::Cold, {}};
+    }
+    if (input.lane_retained && input.resident_reusable_tokens > 0) {
+        if (!input.can_admit_lane) {
+            return {RecoveryPrefillRoute::Exhaust, kRecoveryLaneExhausted};
+        }
+        return {RecoveryPrefillRoute::ResidentSuffix, {}};
+    }
+    const std::uint32_t ram  = input.ram_reusable_tokens;
+    const std::uint32_t disk = input.disk_reusable_tokens;
+    if (ram == 0 && disk == 0) { return {RecoveryPrefillRoute::Cold, {}}; }
+    if (disk > ram) { return {RecoveryPrefillRoute::HostDisk, {}}; }
+    return {RecoveryPrefillRoute::HostRam, {}};
 }
 
 } // namespace ninfer::targets::qwen3_6
