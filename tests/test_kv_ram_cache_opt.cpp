@@ -65,6 +65,7 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
                       host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[3]), value);
         }
         CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
 
@@ -317,6 +318,7 @@ int main() {
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
         CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 0).data, conv_pattern.data(), conv_pattern.size(),
                                cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
     ninfer::DeviceBuffer hidden_buf(256);
     hidden_buf.fill(0x5a);

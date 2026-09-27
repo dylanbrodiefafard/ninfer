@@ -296,7 +296,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
                     install_and_upload(topology, i);
 
                     DecodeGraphProfile& profile = family.profiles[i];
-                    prepare(profile.min_execution_frontier, profile.batch_size);
+                    prepare(profile.min_execution_frontier, profile.batch_size, profile.draft_k);
                     device.synchronize();
                     topology.executable.launch(device.stream);
                     device.synchronize();
@@ -2507,6 +2507,12 @@ qwen3_6::detail::KvDiskSnapshot ProgramImplCore::kv_disk_snapshot() const noexce
     return kv_disk_cache_ ? kv_disk_cache_->snapshot() : qwen3_6::detail::KvDiskSnapshot{};
 }
 
+std::optional<qwen3_6::detail::KvDiskSnapshot>
+ProgramImplCore::try_kv_disk_snapshot() const noexcept {
+    return kv_disk_cache_ ? kv_disk_cache_->try_snapshot()
+                          : std::optional{qwen3_6::detail::KvDiskSnapshot{}};
+}
+
 qwen3_6::detail::KvDiskCopySeconds ProgramImplCore::harvest_kv_disk_copy_seconds() {
     return kv_disk_cache_ ? kv_disk_cache_->harvest_copy_seconds()
                           : qwen3_6::detail::KvDiskCopySeconds{};
@@ -2909,7 +2915,11 @@ void ProgramImplCore::prepare_graphs() {
         }
     };
 
-    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
+    // `k` is the draft length the graph was captured for: an adaptive family holds graphs for
+    // every captured k, and a representative sized for the configured window overruns a
+    // smaller-k graph's verify rows.
+    const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
+                                            std::uint32_t k) {
         if (batch_size == 0 || batch_size > max_concurrency) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
@@ -2941,7 +2951,7 @@ void ProgramImplCore::prepare_graphs() {
         if (io.dflash_decode) {
             *dflash_host_ingress       = {};
             *dflash_host_egress        = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
+            const std::uint32_t extent = std::min(k, capacity - frontier - 1U);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
@@ -2960,7 +2970,7 @@ void ProgramImplCore::prepare_graphs() {
         if (io.mtp_decode) {
             *mtp_host_ingress          = {};
             *mtp_host_egress           = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
+            const std::uint32_t extent = std::min(k, capacity - frontier - 1U);
             const std::uint32_t width  = draft_window + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 mtp_host_ingress->anchors[row] = 0;
@@ -3024,7 +3034,7 @@ void ProgramImplCore::prepare_graphs() {
                                                       *io.ordinary,          *ordinary_host_ingress,
                                                       *ordinary_host_egress, tail_hidden_store};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
-        prepare_representative(code_warm.min, 1);
+        prepare_representative(code_warm.min, 1, draft_window);
         device.synchronize();
         schedule::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
                                         nullptr);
@@ -3065,7 +3075,7 @@ void ProgramImplCore::prepare_graphs() {
             *mtp_host_ingress, *mtp_host_egress, tail_hidden_store, tool_masks.get()};
         const auto warm_profiles = mtp_graph_profiles(capacity, warm_k);
         const GraphExecutionProfile code_warm = warm_profiles.front();
-        prepare_representative(code_warm.min, 1);
+        prepare_representative(code_warm.min, 1, warm_k);
         device.synchronize();
         schedule::mtp_decode_batch(mtp_state, 1, warm_k,
                                    mtp_gqa_envelopes(code_warm.max, warm_k, capacity),
@@ -3125,7 +3135,7 @@ void ProgramImplCore::prepare_graphs() {
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                    capacity, static_cast<std::uint64_t>(code_warm.max) + warm_w))};
-        prepare_representative(code_warm.min, 1);
+        prepare_representative(code_warm.min, 1, warm_k);
         device.synchronize();
         schedule::dflash_decode_batch(dflash_state, 1, warm_k, warm_w,
                                       dflash_envelopes(code_warm.min, code_warm.max, warm_k),
@@ -3159,7 +3169,7 @@ void ProgramImplCore::prepare_graphs() {
                     const ops::GqaExecutionEnvelope target_envelope{
                         1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                                capacity, static_cast<std::uint64_t>(planned.max) + wk))};
-                    prepare_representative(planned.min, batch_size);
+                    prepare_representative(planned.min, batch_size, k);
                     device.synchronize();
                     schedule::capture_dflash_decode_batch(
                         dflash_state, static_cast<std::int32_t>(batch_size), k, wk,

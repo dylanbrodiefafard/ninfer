@@ -827,7 +827,11 @@ int exercise_vision(ninfer::Engine& engine) {
     const ninfer::GenerationResult visual_bridge_baseline =
         engine.generate(engine.prepare(first_input(image_bytes)), bridge_baseline_options);
     if (visual_bridge.generated_token_ids != visual_bridge_baseline.generated_token_ids) {
-        std::cerr << "visual MTP bridge changed greedy output relative to full prefill\n";
+        std::cerr << "visual MTP bridge changed greedy output relative to full prefill: reuse=[";
+        for (const auto id : visual_bridge.generated_token_ids) { std::cerr << ' ' << id; }
+        std::cerr << " ] full=[";
+        for (const auto id : visual_bridge_baseline.generated_token_ids) { std::cerr << ' ' << id; }
+        std::cerr << " ]\n";
         return 1;
     }
 

@@ -1113,8 +1113,13 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
             logical_bytes = plan.page_bytes;
             require_cuda(cudaMalloc(&device, count * sizeof(PagedKVScatterPlane)),
                          "KV disk page scatter descriptor allocation failed");
-            require_cuda(cudaMemcpy(device, plan.planes.data(),
-                                    count * sizeof(PagedKVScatterPlane), cudaMemcpyHostToDevice),
+            // Stream-ordered upload: a synchronous pageable cudaMemcpy can return before its DMA
+            // lands, and the scatter kernels run on non-blocking streams.
+            require_cuda(cudaMemcpyAsync(device, plan.planes.data(),
+                                         count * sizeof(PagedKVScatterPlane),
+                                         cudaMemcpyHostToDevice, page_scatter_stream_),
+                         "KV disk page scatter descriptor upload failed");
+            require_cuda(cudaStreamSynchronize(page_scatter_stream_),
                          "KV disk page scatter descriptor upload failed");
         };
         upload_scatter_plan(config_.text_pool, text_scatter_planes_, text_scatter_plane_count_,
@@ -2038,18 +2043,18 @@ bool KVDiskCache::packs_need_compaction() const {
     return allocated != 0 && retained < allocated && allocated - retained >= allocated / 4;
 }
 
+// Generation descriptor replacement is safe only between restore epochs: a reader
+// must never race deletion of its source generation.
+bool KVDiskCache::compaction_blocked_locked() const noexcept {
+    return spill_ || restore_active_ || restore_target_ || payload_io_inflight_ != 0 ||
+           window_inflight_ != 0 || restore_state_inflight_ != 0 || !restore_q_.empty() ||
+           !reader_claims_.empty();
+}
+
 bool KVDiskCache::compact_packs(std::unique_lock<std::mutex>& lock,
                                 std::uint64_t additional_bytes) {
     if (!packs_need_compaction()) { return true; }
-    // Generation descriptor replacement is safe only between restore epochs.
-    // The normal idle path defers maintenance while any page/state operation is
-    // in flight; emergency spill reports no durable capacity rather than racing
-    // a reader with deletion of its source generation.
-    if (spill_ || restore_active_ || restore_target_ || payload_io_inflight_ != 0 ||
-        window_inflight_ != 0 || restore_state_inflight_ != 0 || !restore_q_.empty() ||
-        !reader_claims_.empty()) {
-        return false;
-    }
+    if (compaction_blocked_locked()) { return false; }
     const auto available_bytes = [&]() -> std::optional<std::uint64_t> {
         if (test_free_bytes_override_) { return *test_free_bytes_override_; }
         struct statvfs fs {};
@@ -4627,9 +4632,9 @@ void KVDiskCache::cancel_idle_spill() {
     ++idle_cancel_epoch_;
     idle_cancel_all_ = true;
     cancel_idle_locked(lock);
-    idle_cv_.wait(lock, [&] {
-        return payload_io_inflight_ == 0 && (!spill_ || spill_->emergency) && !idle_pinning_;
-    });
+    // The cancelled idle session is dropped when its last batch drains; an emergency session's
+    // writes are unrelated to idle cancellation (eviction skips I/O-pinned entries).
+    idle_cv_.wait(lock, [&] { return (!spill_ || spill_->emergency) && !idle_pinning_; });
     if (spill_ && spill_->cancelled && !spill_->emergency) {
         drop_spill(*spill_, lock);
         spill_.reset();
@@ -4656,9 +4661,13 @@ void KVDiskCache::begin_ram_idle_exclusion(std::uint64_t ram_id) {
     idle_q_.erase(std::remove_if(idle_q_.begin(), idle_q_.end(),
                                  [ram_id](const Job& job) { return job.ram_entry_id == ram_id; }),
                   idle_q_.end());
+    // Wait only for this entry's own spill. Payload I/O belongs to the single spill session,
+    // and a session is dropped only once its I/O drains, so `spill_` no longer naming this
+    // entry already implies its writes are done. Waiting for the global in-flight count
+    // instead starves the scheduler behind another entry's continuous spill batches.
     idle_cv_.wait(lock, [&] {
-        return payload_io_inflight_ == 0 &&
-               (!spill_ || spill_->emergency || spill_->ram_id != ram_id) &&
+        const bool own_spill = spill_ && spill_->ram_id == ram_id;
+        return !(own_spill && (!spill_->emergency || payload_io_inflight_ != 0)) &&
                !(idle_pinning_ && idle_pinning_ram_ == ram_id);
     });
     if (spill_ && spill_->cancelled && !spill_->emergency && spill_->ram_id == ram_id) {
@@ -5844,7 +5853,19 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
     // Garbage is physical until a generation rewrite completes.  Compact at
     // the admission boundary, before accepting any new append allocation,
     // rather than allowing the append path to grow past the 25% threshold.
-    if (packs_need_compaction() && !compact_packs(lock, append_bytes)) {
+    // While a restore or reader still owns the current generation, compaction
+    // is unsafe rather than failed: an idle spill retries at a later quiescent
+    // point, and an emergency spill appends past the threshold because the
+    // physical-room check below still reserves the deferred compaction copy.
+    const bool compaction_deferred = packs_need_compaction() && compaction_blocked_locked();
+    if (compaction_deferred && !emergency) {
+        if (session.ticket != 0) { unpin_disk(session.ticket); }
+        for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
+        branch_shared_ids_.clear();
+        flush_queued_unlinks(lock);
+        return false;
+    }
+    if (!compaction_deferred && packs_need_compaction() && !compact_packs(lock, append_bytes)) {
         if (session.ticket != 0) { unpin_disk(session.ticket); }
         for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
         branch_shared_ids_.clear();
@@ -7417,6 +7438,16 @@ KvDiskCopySeconds KVDiskCache::harvest_copy_seconds() {
 
 KvDiskSnapshot KVDiskCache::snapshot() const noexcept {
     std::lock_guard lock(mutex_);
+    return snapshot_locked();
+}
+
+std::optional<KvDiskSnapshot> KVDiskCache::try_snapshot() const noexcept {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) { return std::nullopt; }
+    return snapshot_locked();
+}
+
+KvDiskSnapshot KVDiskCache::snapshot_locked() const noexcept {
     return KvDiskSnapshot{
         .capacity_bytes = config_.capacity_bytes,
         .used_bytes     = static_cast<std::size_t>(unique_bytes_),
@@ -7427,6 +7458,7 @@ KvDiskSnapshot KVDiskCache::snapshot() const noexcept {
         .drops          = drops_,
         .save_seconds   = save_seconds_,
         .load_seconds   = load_seconds_,
+        .sequence       = ++snapshot_sequence_,
     };
 }
 

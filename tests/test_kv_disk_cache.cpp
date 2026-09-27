@@ -333,6 +333,7 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
             }
         }
         CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
 
@@ -1339,6 +1340,7 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     std::vector<unsigned char> k_pattern(layer.k.slice(3, 0, 1).bytes(), 0x3c);
     CUDA_CHECK(cudaMemcpy(layer.k.slice(3, 0, 1).data, k_pattern.data(), k_pattern.size(),
                           cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);

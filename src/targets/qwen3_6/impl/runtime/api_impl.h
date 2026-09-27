@@ -375,6 +375,11 @@ qwen3_6::detail::KvDiskSnapshot Program<Variant>::kv_disk_snapshot() const noexc
 }
 
 template <>
+std::optional<qwen3_6::detail::KvDiskSnapshot> Program<Variant>::try_kv_disk_snapshot() const noexcept {
+    return impl_->try_kv_disk_snapshot();
+}
+
+template <>
 qwen3_6::detail::KvDiskCopySeconds Program<Variant>::harvest_kv_disk_copy_seconds() {
     return impl_->harvest_kv_disk_copy_seconds();
 }

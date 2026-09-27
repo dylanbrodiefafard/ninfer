@@ -283,8 +283,14 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        RuntimeStats out              = published_stats_;
+        const auto disk = instance_.program->try_kv_disk_snapshot();
+        RuntimeStats out;
+        {
+            std::lock_guard lock(stats_mutex_);
+            if (disk) { note_kv_disk_snapshot_locked(*disk); }
+            out = published_stats_;
+            copy_kv_disk_stats(out, latest_disk_stats_);
+        }
         out.waiting_requests          = published_waiting_requests_.load(std::memory_order_relaxed);
         out.computed_prefill_tokens   = published_computed_prefill_tokens_.load(
             std::memory_order_relaxed);
@@ -292,6 +298,9 @@ public:
             std::memory_order_relaxed);
         out.decode_rounds             = published_decode_rounds_.load(std::memory_order_relaxed);
         out.decode_row_rounds         = published_decode_row_rounds_.load(std::memory_order_relaxed);
+        // Background spill changes tier counters while the scheduler sleeps idle, so observers
+        // read the RAM tier live and the disk tier whenever its index lock is free.
+        assign_kv_ram_stats(out, instance_.program->kv_ram_snapshot());
         return out;
     }
 
@@ -315,6 +324,50 @@ private:
                                            std::memory_order_relaxed);
     }
 
+    static void assign_kv_ram_stats(RuntimeStats& out, const auto& ram) noexcept {
+        out.kv_ram_captures       = ram.captures;
+        out.kv_ram_restores       = ram.restores;
+        out.kv_ram_evictions      = ram.evictions;
+        out.kv_ram_drops          = ram.drops;
+        out.kv_ram_save_seconds   = ram.save_seconds;
+        out.kv_ram_load_seconds   = ram.load_seconds;
+        out.kv_ram_capacity_bytes = ram.capacity_bytes;
+        out.kv_ram_used_bytes     = ram.used_bytes;
+        out.kv_ram_entry_count    = ram.entry_count;
+    }
+
+    static void assign_kv_disk_stats(RuntimeStats& out, const auto& disk) noexcept {
+        out.kv_disk_captures       = disk.captures;
+        out.kv_disk_restores       = disk.restores;
+        out.kv_disk_evictions      = disk.evictions;
+        out.kv_disk_drops          = disk.drops;
+        out.kv_disk_save_seconds   = disk.save_seconds;
+        out.kv_disk_load_seconds   = disk.load_seconds;
+        out.kv_disk_capacity_bytes = disk.capacity_bytes;
+        out.kv_disk_used_bytes     = disk.used_bytes;
+        out.kv_disk_entry_count    = disk.entry_count;
+    }
+
+    static void copy_kv_disk_stats(RuntimeStats& out, const RuntimeStats& in) noexcept {
+        out.kv_disk_captures       = in.kv_disk_captures;
+        out.kv_disk_restores       = in.kv_disk_restores;
+        out.kv_disk_evictions      = in.kv_disk_evictions;
+        out.kv_disk_drops          = in.kv_disk_drops;
+        out.kv_disk_save_seconds   = in.kv_disk_save_seconds;
+        out.kv_disk_load_seconds   = in.kv_disk_load_seconds;
+        out.kv_disk_capacity_bytes = in.kv_disk_capacity_bytes;
+        out.kv_disk_used_bytes     = in.kv_disk_used_bytes;
+        out.kv_disk_entry_count    = in.kv_disk_entry_count;
+    }
+
+    // Keeps the newest disk snapshot seen from either the scheduler's blocking read or an
+    // observer's non-blocking one, so disk counters never step backwards between reads.
+    void note_kv_disk_snapshot_locked(const auto& disk) const noexcept {
+        if (disk.sequence <= latest_disk_sequence_) { return; }
+        latest_disk_sequence_ = disk.sequence;
+        assign_kv_disk_stats(latest_disk_stats_, disk);
+    }
+
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
         {
@@ -328,26 +381,8 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
-        const auto ram                    = instance_.program->kv_ram_snapshot();
-        snapshot.kv_ram_captures          = ram.captures;
-        snapshot.kv_ram_restores          = ram.restores;
-        snapshot.kv_ram_evictions         = ram.evictions;
-        snapshot.kv_ram_drops             = ram.drops;
-        snapshot.kv_ram_save_seconds      = ram.save_seconds;
-        snapshot.kv_ram_load_seconds      = ram.load_seconds;
-        snapshot.kv_ram_capacity_bytes    = ram.capacity_bytes;
-        snapshot.kv_ram_used_bytes        = ram.used_bytes;
-        snapshot.kv_ram_entry_count       = ram.entry_count;
-        const auto disk                   = instance_.program->kv_disk_snapshot();
-        snapshot.kv_disk_captures         = disk.captures;
-        snapshot.kv_disk_restores         = disk.restores;
-        snapshot.kv_disk_evictions        = disk.evictions;
-        snapshot.kv_disk_drops            = disk.drops;
-        snapshot.kv_disk_save_seconds     = disk.save_seconds;
-        snapshot.kv_disk_load_seconds     = disk.load_seconds;
-        snapshot.kv_disk_capacity_bytes   = disk.capacity_bytes;
-        snapshot.kv_disk_used_bytes       = disk.used_bytes;
-        snapshot.kv_disk_entry_count      = disk.entry_count;
+        assign_kv_ram_stats(snapshot, instance_.program->kv_ram_snapshot());
+        const auto disk = instance_.program->kv_disk_snapshot();
         const auto gpu                    = instance_.program->kv_gpu_snapshot();
         snapshot.gpu_kv_main_capacity_pages = gpu.main.page_group_count;
         snapshot.gpu_kv_main_entitled_pages = gpu.main.entitled_pages;
@@ -358,6 +393,8 @@ private:
         snapshot.gpu_kv_spec_mapped_pages   = gpu.spec.mapped_pages;
         snapshot.gpu_kv_spec_free_pages     = gpu.spec.free_pages;
         std::lock_guard lock(stats_mutex_);
+        note_kv_disk_snapshot_locked(disk);
+        copy_kv_disk_stats(snapshot, latest_disk_stats_);
         published_stats_ = snapshot;
     }
 
@@ -2632,6 +2669,8 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    mutable RuntimeStats latest_disk_stats_;       // disk fields only; guarded by stats_mutex_
+    mutable std::uint64_t latest_disk_sequence_ = 0;
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
     static_assert(std::atomic<bool>::is_always_lock_free);
     std::atomic<std::uint64_t> published_computed_prefill_tokens_{0};

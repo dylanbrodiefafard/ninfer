@@ -59,6 +59,7 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
             }
         }
         CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
 
@@ -265,6 +266,7 @@ int main() {
     }
     CUDA_CHECK(cudaMemcpy(gdn.conv_slot(0, 0).data, conv_pattern.data(), conv_pattern.size(),
                            cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     fill_logical_pages(pool, source, 22);
     ninfer::targets::qwen3_6::detail::KVRamCache gdn_cache(8ULL << 20);
     if (capture_entry(gdn_cache, pool, source, prompt, ctx.copy_stream, &gdn, &hidden) != 0) {

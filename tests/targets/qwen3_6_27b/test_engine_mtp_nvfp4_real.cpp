@@ -159,6 +159,9 @@ int check_k4_b4_isolation(ninfer::Engine& engine,
         seeds[0], seeds[1], seeds[2], seeds[0], seeds[1]};
     constexpr std::array<ninfer::TokenId, 5> fills{3709, 4120, 5200, 96220, 74455};
     for (std::size_t i = 0; i < prompts.size(); ++i) { prompts[i].resize(896, fills[i]); }
+    // Prefills are serialized, so short generations finish before the fourth prompt joins; long
+    // enough outputs make four-row rounds dominate and provable (rows > 3 * rounds).
+    constexpr std::uint32_t kIsolationTokens = 128;
 
     const auto run_wave = [&](const std::array<std::size_t, 4>& order, const char* wave)
         -> std::optional<std::array<std::vector<ninfer::TokenId>, 5>> {
@@ -167,15 +170,15 @@ int check_k4_b4_isolation(ninfer::Engine& engine,
             engine.prepare_tokens(prompts[order[2]]), engine.prepare_tokens(prompts[order[3]])};
         const ninfer::RuntimeStats before = engine.runtime_stats();
         std::array<ninfer::GenerationHandle, 4> handles{
-            engine.submit(std::move(prepared[0]), greedy_options(24)),
-            engine.submit(std::move(prepared[1]), greedy_options(24)),
-            engine.submit(std::move(prepared[2]), greedy_options(24)),
-            engine.submit(std::move(prepared[3]), greedy_options(24))};
+            engine.submit(std::move(prepared[0]), greedy_options(kIsolationTokens)),
+            engine.submit(std::move(prepared[1]), greedy_options(kIsolationTokens)),
+            engine.submit(std::move(prepared[2]), greedy_options(kIsolationTokens)),
+            engine.submit(std::move(prepared[3]), greedy_options(kIsolationTokens))};
 
         std::array<std::vector<ninfer::TokenId>, 5> outputs;
         for (std::size_t row = 0; row < handles.size(); ++row) {
             const ninfer::GenerationResult result = handles[row].wait();
-            if (result.generated_token_ids.size() != 24 || check_speculative(result, label) != 0) {
+            if (result.generated_token_ids.size() != kIsolationTokens || check_speculative(result, label) != 0) {
                 std::cerr << label << ' ' << wave << " row " << row
                           << " did not complete MTP decode\n";
                 dump_tokens("  got", result.generated_token_ids);
@@ -435,7 +438,7 @@ int main() {
     }
 
     {
-        const char* label = "MTP NVFP4 adaptive compact k=4 C=2";
+        const char* label = "MTP NVFP4 adaptive compact K<5 C=2";
         ninfer::Engine engine(mtp_adaptive_options(artifact, 5, 2));
         if (const int result = check_load(engine); result != 0) { return result; }
         auto ha = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(6));
@@ -450,9 +453,11 @@ int main() {
             dump_speculative("  B", rb.speculative);
             return 1;
         }
+        // The measured-time policy seeds at the smallest captured K, so which K<5 runs is a
+        // policy choice; the contract is that a compact (K below the N=5 window) round ran.
         if (ra.speculative.rounds_per_draft.size() < 5 ||
-            ra.speculative.rounds_per_draft[4] == 0) {
-            std::cerr << label << " did not record k=4 compact rounds under N=5\n";
+            ra.speculative.rounds_per_draft[3] + ra.speculative.rounds_per_draft[4] == 0) {
+            std::cerr << label << " did not record compact K<5 rounds under N=5\n";
             dump_speculative("  A", ra.speculative);
             return 1;
         }

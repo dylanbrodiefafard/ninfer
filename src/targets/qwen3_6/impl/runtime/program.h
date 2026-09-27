@@ -353,6 +353,7 @@ public:
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
     [[nodiscard]] qwen3_6::detail::KvDiskSnapshot kv_disk_snapshot() const noexcept;
+    [[nodiscard]] std::optional<qwen3_6::detail::KvDiskSnapshot> try_kv_disk_snapshot() const noexcept;
     qwen3_6::detail::KvDiskCopySeconds harvest_kv_disk_copy_seconds();
     [[nodiscard]] qwen3_6::detail::KvGpuSnapshot kv_gpu_snapshot() const noexcept;
     [[nodiscard]] bool kv_ram_copies_ready() const;
