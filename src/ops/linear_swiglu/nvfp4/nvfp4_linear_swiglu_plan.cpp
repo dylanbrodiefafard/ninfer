@@ -23,12 +23,11 @@ enum class Nvfp4LinearSwiGluRoute {
     TmaFusedW4A4,
 };
 
-constexpr std::int32_t kFirstTmaT = 1024;
-constexpr std::int32_t kTmaBlockM = 256;
+// The fused TMA kernel takes any width from one M tile, the last tile possibly partial. At
+// T=256/512/768 it runs 127/192/229 us against 155/312/410 us for Linear + silu_mul.
+constexpr std::int32_t kFirstTmaT = 256;
 
-bool is_tma_tokens(std::int32_t tokens) {
-    return tokens >= kFirstTmaT && (tokens % kTmaBlockM) == 0;
-}
+bool is_tma_tokens(std::int32_t tokens) { return tokens >= kFirstTmaT; }
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
@@ -103,13 +102,11 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (min_tokens <= 48 && max_tokens >= kNvfp4FirstW4a4MlpGateUp) {
         maximum = fused_workspace_bytes(std::min(max_tokens, 48));
     }
-    const std::int32_t last_tma = max_tokens - (max_tokens % kTmaBlockM);
-    if (last_tma >= std::max(min_tokens, kFirstTmaT)) {
-        maximum = std::max(maximum, fused_workspace_bytes(last_tma));
+    if (is_tma_tokens(max_tokens)) {
+        maximum = std::max(maximum, fused_workspace_bytes(max_tokens));
     }
 
-    std::int32_t last_baseline = max_tokens;
-    if (is_tma_tokens(last_baseline)) { --last_baseline; }
+    const std::int32_t last_baseline = std::min(max_tokens, kFirstTmaT - 1);
     if (last_baseline >= std::max(min_tokens, 49)) {
         maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
     }
