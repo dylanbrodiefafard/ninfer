@@ -106,6 +106,9 @@ routing map, not a mandatory reading list:
   performance-evidence rules;
 - `docs/maintainer/kernel-iteration.md`: Layer 0-3 CUDA speed procedure (`tools.kdev`
   bound/mma/Op sweep/production path);
+- `docs/maintainer/upstream-sync.md`: porting from upstream Neroued/ninfer `dev` (remote
+  `upstream`): the last reviewed upstream commit and per-commit verdicts, so a new review starts
+  after that watermark and updates it;
 - `include/ninfer/engine.h` and `include/ninfer/types.h`: in-tree C++ product interface.
 
 ## Product and ownership boundaries
