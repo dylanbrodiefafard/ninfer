@@ -95,9 +95,10 @@ void nvfp4_attn_input_w4a8_launch(const Tensor& x, const Weight& weight, Tensor&
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    launch_nvfp4_w4a4_quantize(x, weight, workspace,
+                               nvfp4_w4a4_projection_scale_layout(x.ne[1]), stream);
     const std::int32_t tokens = x.ne[1];
-    if (tokens >= 1024) {
+    if (nvfp4_w4a4_tma_route(tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_attention(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
