@@ -33,12 +33,14 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
+# Compile jobs; the default leaves room for other work on a shared host.
+ARG NINFER_BUILD_JOBS=8
 RUN cmake -S . -B /build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DNINFER_BUILD_APPS=ON \
         -DBUILD_TESTING=OFF \
         -DNINFER_BUILD_BENCHMARKS=OFF \
-    && cmake --build /build --parallel --target ninfer ninfer-serve
+    && cmake --build /build --parallel "${NINFER_BUILD_JOBS}" --target ninfer ninfer-serve
 
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 

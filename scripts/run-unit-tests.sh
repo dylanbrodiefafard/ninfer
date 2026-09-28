@@ -23,7 +23,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILDER="${NINFER_DEV_CONTAINER:-ninfer-builder}"
-JOBS="${NINFER_DEV_JOBS:-$(nproc)}"
+JOBS="${NINFER_DEV_JOBS:-8}"
 MIN_FREE_GIB="${NINFER_MIN_FREE_VRAM_GIB:-20}"
 MIN_FREE_MIB=$((MIN_FREE_GIB * 1024))
 INNER=0
