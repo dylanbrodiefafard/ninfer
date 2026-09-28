@@ -170,6 +170,7 @@ struct DecodeGraphProfile {
     std::uint32_t topology_class         = 0;
     std::uint32_t draft_k                = 0;
     std::uint32_t verify_width           = 0;
+    qwen3_6::ToolMaskSchedule tool_mask_schedule = qwen3_6::ToolMaskSchedule::Serial;
     DecodeGraphDefinition definition;
 };
 

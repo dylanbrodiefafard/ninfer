@@ -117,6 +117,19 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaEventCreateWithFlags(host_wait) failed", err));
     }
 
+    cudaStream_t host = nullptr;
+    err = cudaStreamCreateWithFlags(&host, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        destroy_event(wait);
+        destroy_event(order_event);
+        destroy_stream(copy);
+        destroy_stream(load);
+        destroy_stream(compute);
+        throw std::runtime_error(
+            cuda_error_message("cudaStreamCreateWithFlags(host_stream) failed", err));
+    }
+
+    host_stream       = host;
     stream           = compute;
     load_stream      = load;
     copy_stream      = copy;
@@ -126,9 +139,13 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
 DeviceContext::~DeviceContext() {
     if (stream != nullptr || load_stream != nullptr || copy_stream != nullptr ||
-        copy_order_event != nullptr || host_wait != nullptr) {
+        host_stream != nullptr || copy_order_event != nullptr || host_wait != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
+    if (host_stream != nullptr) {
+        log_cuda_error("cudaStreamSynchronize(host_stream)", cudaStreamSynchronize(host_stream));
+    }
+    destroy_stream(host_stream);
     destroy_event(host_wait);
     destroy_event(copy_order_event);
     destroy_stream(copy_stream);
@@ -138,11 +155,13 @@ DeviceContext::~DeviceContext() {
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), load_stream(other.load_stream),
-      copy_stream(other.copy_stream), copy_order_event(other.copy_order_event),
+      copy_stream(other.copy_stream), host_stream(other.host_stream),
+      copy_order_event(other.copy_order_event),
       host_wait(other.host_wait), props(other.props) {
     other.stream           = nullptr;
     other.load_stream      = nullptr;
     other.copy_stream      = nullptr;
+    other.host_stream      = nullptr;
     other.copy_order_event = nullptr;
     other.host_wait        = nullptr;
 }
@@ -151,9 +170,13 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
     if (stream != nullptr || load_stream != nullptr || copy_stream != nullptr ||
-        copy_order_event != nullptr || host_wait != nullptr) {
+        host_stream != nullptr || copy_order_event != nullptr || host_wait != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
+    if (host_stream != nullptr) {
+        log_cuda_error("cudaStreamSynchronize(host_stream)", cudaStreamSynchronize(host_stream));
+    }
+    destroy_stream(host_stream);
     destroy_event(host_wait);
     destroy_event(copy_order_event);
     destroy_stream(copy_stream);
@@ -165,12 +188,14 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     stream           = other.stream;
     load_stream      = other.load_stream;
     copy_stream      = other.copy_stream;
+    host_stream      = other.host_stream;
     copy_order_event = other.copy_order_event;
     host_wait        = other.host_wait;
 
     other.stream           = nullptr;
     other.load_stream      = nullptr;
     other.copy_stream      = nullptr;
+    other.host_stream      = nullptr;
     other.copy_order_event = nullptr;
     other.host_wait        = nullptr;
     return *this;
@@ -198,6 +223,8 @@ void DeviceContext::synchronize() const {
 
 void DeviceContext::synchronize_all() const {
     CUDA_CHECK(cudaEventRecord(host_wait, stream));
+    CUDA_CHECK(cudaEventSynchronize(host_wait));
+    CUDA_CHECK(cudaEventRecord(host_wait, host_stream));
     CUDA_CHECK(cudaEventSynchronize(host_wait));
     CUDA_CHECK(cudaEventRecord(host_wait, copy_stream));
     CUDA_CHECK(cudaEventSynchronize(host_wait));

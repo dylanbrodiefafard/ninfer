@@ -1,0 +1,144 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Use the declared tool to carry out the user request. Call emit_records once with the exact requested records. Do not summarize, omit, or alter any records."
+    },
+    {
+      "role": "user",
+      "content": "Call emit_records with these arguments: {\"records\":[{\"id\":1,\"label\":\"item-01\",\"status\":\"running\",\"score\":7},{\"id\":2,\"label\":\"item-02\",\"status\":\"done\",\"score\":14},{\"id\":3,\"label\":\"item-03\",\"status\":\"queued\",\"score\":21},{\"id\":4,\"label\":\"item-04\",\"status\":\"running\",\"score\":28},{\"id\":5,\"label\":\"item-05\",\"status\":\"done\",\"score\":35},{\"id\":6,\"label\":\"item-06\",\"status\":\"queued\",\"score\":42},{\"id\":7,\"label\":\"item-07\",\"status\":\"running\",\"score\":49},{\"id\":8,\"label\":\"item-08\",\"status\":\"done\",\"score\":56},{\"id\":9,\"label\":\"item-09\",\"status\":\"queued\",\"score\":63},{\"id\":10,\"label\":\"item-10\",\"status\":\"running\",\"score\":70},{\"id\":11,\"label\":\"item-11\",\"status\":\"done\",\"score\":77},{\"id\":12,\"label\":\"item-12\",\"status\":\"queued\",\"score\":84}]}"
+    }
+  ],
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "emit_records",
+        "description": "Record the supplied catalog entries exactly.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "records": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "queued",
+                      "running",
+                      "done"
+                    ]
+                  },
+                  "score": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "label",
+                  "status",
+                  "score"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "records"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "_expected_tool_call": {
+    "name": "emit_records",
+    "arguments": {
+      "records": [
+        {
+          "id": 1,
+          "label": "item-01",
+          "status": "running",
+          "score": 7
+        },
+        {
+          "id": 2,
+          "label": "item-02",
+          "status": "done",
+          "score": 14
+        },
+        {
+          "id": 3,
+          "label": "item-03",
+          "status": "queued",
+          "score": 21
+        },
+        {
+          "id": 4,
+          "label": "item-04",
+          "status": "running",
+          "score": 28
+        },
+        {
+          "id": 5,
+          "label": "item-05",
+          "status": "done",
+          "score": 35
+        },
+        {
+          "id": 6,
+          "label": "item-06",
+          "status": "queued",
+          "score": 42
+        },
+        {
+          "id": 7,
+          "label": "item-07",
+          "status": "running",
+          "score": 49
+        },
+        {
+          "id": 8,
+          "label": "item-08",
+          "status": "done",
+          "score": 56
+        },
+        {
+          "id": 9,
+          "label": "item-09",
+          "status": "queued",
+          "score": 63
+        },
+        {
+          "id": 10,
+          "label": "item-10",
+          "status": "running",
+          "score": 70
+        },
+        {
+          "id": 11,
+          "label": "item-11",
+          "status": "done",
+          "score": 77
+        },
+        {
+          "id": 12,
+          "label": "item-12",
+          "status": "queued",
+          "score": 84
+        }
+      ]
+    }
+  }
+}

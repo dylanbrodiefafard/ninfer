@@ -21,9 +21,13 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         throw std::logic_error("speculative tree verify frame is incomplete");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    cudaEvent_t masks_ready = nullptr;
     if (frame.tool_masks) {
-        frame.sampling = frame.tool_masks->enqueue(frame.ids, tree ? &frame.parent_index : nullptr,
-                                                   frame.valid_columns, execution.device.stream);
+        const auto submission = frame.tool_masks->enqueue(frame.ids, tree ? &frame.parent_index : nullptr,
+                                                   frame.valid_columns, execution.device.stream,
+                                                   execution.device.host_stream, frame.tool_mask_schedule);
+        frame.sampling = submission.sampling;
+        masks_ready = submission.ready;
     }
     card.set_sampling(frame.sampling);
     if (tree) {
@@ -33,12 +37,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 *frame.feature_sink, reset_workspace);
+                                 *frame.feature_sink, reset_workspace, masks_ready);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 reset_workspace);
+                                 reset_workspace, masks_ready);
     }
     if (tree) {
         ops::speculative_accept_tree_drafts(

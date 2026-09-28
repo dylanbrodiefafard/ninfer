@@ -1071,9 +1071,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         GraphExecutionProfile folded = planned;
                         folded.topology_class        = qwen3_6::adaptive_topology_class(
                             k_index, k_stride, planned.topology_class, impl->max_concurrency,
-                            batch_size);
+                            batch_size) * 2U;
                         expanded.push_back(folded);
                         expanded_w.push_back(wk);
+                        if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                            if (qwen3_6::has_tool_mask_overlap_profile(k, wk, batch_size)) {
+                                ++folded.topology_class;
+                                expanded.push_back(folded);
+                                expanded_w.push_back(wk);
+                            }
+                        }
                     }
                 }
             }

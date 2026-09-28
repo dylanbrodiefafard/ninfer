@@ -11,23 +11,41 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+enum class ToolMaskSchedule : std::uint32_t { Serial, Overlap };
+
+// The measured DFlash2 k4/W5 tool workload admits an extra captured schedule.
+inline bool has_tool_mask_overlap_profile(std::uint32_t draft_k, std::uint32_t width,
+                                          std::uint32_t batch) {
+    return draft_k == 4 && width == 5 && (batch == 4 || batch == 6);
+}
+
 // Program-owned, startup-sized exchange. Its address and pinned/device buffers
 // remain stable for every captured graph. Host copies are fixed-size 1D copies of
-// device staging: drivers may refuse to update 2D graph copies that touch host memory. The executor changes bindings only at
-// synchronized round boundaries; the CUDA host node makes no CUDA API calls.
+// device staging: drivers may refuse to update 2D graph copies that touch host
+// memory. The executor changes bindings only at synchronized round boundaries;
+// the CUDA host node makes no CUDA API calls. Program teardown and error paths
+// drain the DeviceContext host stream before destroying bound OutputSessions.
 class ToolMaskExchange {
 public:
     ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes);
+    ~ToolMaskExchange();
+    ToolMaskExchange(const ToolMaskExchange&) = delete;
+    ToolMaskExchange& operator=(const ToolMaskExchange&) = delete;
     void bind(std::span<const OutputSession* const> outputs,
               std::span<const ops::SamplingConfig> sampling);
     // Ordinary/prefill root sampling; called at a synchronized CPU boundary.
     [[nodiscard]] ops::SamplingConfig root(std::size_t row, cudaStream_t stream);
     // Called inside the speculative graph after ids/parents are constructed and
-    // before target argmax/accept. The returned configs are target-only: draft
+    // before target compute. The caller joins the returned ready event, if any, before
+    // target sampling. The returned configs are target-only: draft
     // proposal sampling must continue to use its own unmasked configs.
-    [[nodiscard]] const ops::SamplingConfig* enqueue(
+    struct Submission {
+        const ops::SamplingConfig* sampling;
+        cudaEvent_t ready;
+    };
+    [[nodiscard]] Submission enqueue(
         const Tensor& ids, const Tensor* parents, const Tensor& valid_columns,
-        cudaStream_t stream);
+        cudaStream_t compute, cudaStream_t host, ToolMaskSchedule schedule);
     void rethrow_error() const;
 
 private:
@@ -36,6 +54,8 @@ private:
     [[nodiscard]] std::uint32_t* host_mask(std::size_t row) const;
     [[nodiscard]] const std::uint32_t* device_mask(std::size_t row) const;
 
+    cudaEvent_t candidates_ready_ = nullptr;
+    cudaEvent_t masks_ready_ = nullptr;
     Tensor masks_;
     Tensor sampling_;
     Tensor nodes_;

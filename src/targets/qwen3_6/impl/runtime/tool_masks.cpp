@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/tool_masks.h"
 #include "core/device.h"
+#include "core/nvtx.h"
 
 #include <algorithm>
 #include <array>
@@ -26,8 +27,17 @@ ToolMaskExchange::ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes)
     }
     outputs_.resize(capacity_, nullptr);
     configs_.resize(capacity_);
+    (void)nvtx::registered_message(nvtx::Name::ToolGrammarMasks);
     std::fill_n(static_cast<std::uint32_t*>(host_masks_.data()), masks.bytes() / 4,
                 ~std::uint32_t{0});
+    CUDA_CHECK(cudaEventCreateWithFlags(&candidates_ready_, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&masks_ready_, cudaEventDisableTiming));
+}
+
+ToolMaskExchange::~ToolMaskExchange() {
+    // The Program drains DeviceContext before any bound session or exchange dies.
+    if (masks_ready_) { (void)cudaEventDestroy(masks_ready_); }
+    if (candidates_ready_) { (void)cudaEventDestroy(candidates_ready_); }
 }
 
 void ToolMaskExchange::bind(std::span<const OutputSession* const> outputs,
@@ -63,26 +73,40 @@ ops::SamplingConfig ToolMaskExchange::root(std::size_t row, cudaStream_t stream)
     return config;
 }
 
-const ops::SamplingConfig* ToolMaskExchange::enqueue(
-    const Tensor& ids, const Tensor* parents, const Tensor& valid_columns, cudaStream_t stream) {
+ToolMaskExchange::Submission ToolMaskExchange::enqueue(
+    const Tensor& ids, const Tensor* parents, const Tensor& valid_columns, cudaStream_t compute, cudaStream_t host, ToolMaskSchedule schedule) {
     const auto batch = static_cast<std::size_t>(ids.ne[1]);
     const auto width = static_cast<std::size_t>(ids.ne[0]);
     if (width > width_ || batch > capacity_ || ids.dtype != DType::I32 ||
         valid_columns.dtype != DType::I32 || valid_columns.ne[0] != ids.ne[1]) {
         throw std::invalid_argument("invalid speculative tool mask inputs");
     }
+    const bool overlap = schedule == ToolMaskSchedule::Overlap;
+    const cudaStream_t stream = overlap ? host : compute;
+    if (overlap) {
+        CUDA_CHECK(cudaEventRecord(candidates_ready_, compute));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, candidates_ready_, 0));
+    }
     // Captured graphs must not store per-launch stack addresses. Shape-specific
     // copies pack into device staging at the fixed max-width pitch; counts delimit
     // valid nodes at replay. Only fixed-size 1D copies cross to host memory.
     const std::size_t plane = width_ * capacity_ * sizeof(std::int32_t);
     auto* staged_ids        = static_cast<std::uint8_t*>(nodes_.data);
-    CUDA_CHECK(cudaMemcpy2DAsync(staged_ids, width_ * sizeof(TokenId), ids.data, ids.nb[1],
-                                width * sizeof(TokenId), batch, cudaMemcpyDeviceToDevice, stream));
+    // Frontier-profile graph updates may relocate source panels. CUDA rejects
+    // some 2D memcpy parameter updates; row-wise 1D nodes support those updates.
+    // Batch and width are fixed within each graph topology.
+    for (std::size_t row = 0; row < batch; ++row) {
+        CUDA_CHECK(cudaMemcpyAsync(staged_ids + row * width_ * sizeof(TokenId),
+                                    static_cast<const std::uint8_t*>(ids.data) + row * ids.nb[1],
+                                    width * sizeof(TokenId), cudaMemcpyDeviceToDevice, stream));
+    }
     CUDA_CHECK(cudaMemcpyAsync(host_ids_.data(), staged_ids, plane, cudaMemcpyDeviceToHost, stream));
     if (parents) {
-        CUDA_CHECK(cudaMemcpy2DAsync(staged_ids + plane, width_ * sizeof(std::int32_t),
-                                    parents->data, parents->nb[1], width * sizeof(std::int32_t),
-                                    batch, cudaMemcpyDeviceToDevice, stream));
+        for (std::size_t row = 0; row < batch; ++row) {
+            CUDA_CHECK(cudaMemcpyAsync(staged_ids + plane + row * width_ * sizeof(std::int32_t),
+                                        static_cast<const std::uint8_t*>(parents->data) + row * parents->nb[1],
+                                        width * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(host_parents_.data(), staged_ids + plane, plane,
                                    cudaMemcpyDeviceToHost, stream));
     }
@@ -105,7 +129,9 @@ const ops::SamplingConfig* ToolMaskExchange::enqueue(
                                cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(sampling_.data, host_sampling_.data(), sampling_.bytes(),
                                cudaMemcpyHostToDevice, stream));
-    return static_cast<const ops::SamplingConfig*>(sampling_.data);
+    if (overlap) { CUDA_CHECK(cudaEventRecord(masks_ready_, stream)); }
+    return {static_cast<const ops::SamplingConfig*>(sampling_.data),
+            overlap ? masks_ready_ : nullptr};
 }
 
 void CUDART_CB ToolMaskExchange::match(void* opaque) noexcept {
@@ -125,6 +151,8 @@ void CUDART_CB ToolMaskExchange::match(void* opaque) noexcept {
 }
 
 void ToolMaskExchange::fill() {
+    nvtx::ScopedRange range(nvtx::Name::ToolGrammarMasks, nvtx::Category::Control,
+                            outputs_.size());
     auto* configs = static_cast<ops::SamplingConfig*>(host_sampling_.data());
     const auto* counts = static_cast<const std::int32_t*>(host_counts_.data());
     const auto* ids = static_cast<const TokenId*>(host_ids_.data());

@@ -32,6 +32,10 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Maintainer references
 
+- [RTX 5090 inference research](../research/rtx5090-inference/README.md) preserves the external
+  investigation; [experimental applicability](../research/rtx5090-inference/experimental-review.md)
+  updates its local assumptions for Qwen3.8-27B NVFP4 on this branch.
+
 The active references under [`maintainer/`](maintainer/) record current architecture, model,
 artifact, and maintenance contracts. These files are not additional user workflows or installed
 API documentation.
