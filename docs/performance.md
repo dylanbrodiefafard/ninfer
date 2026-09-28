@@ -18,6 +18,66 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## NVFP4 decode attention pipelining and overlap candidates (2026-09-27)
+
+Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
+CUDA 13.1, base `5d6f6bf2`. Followup to the CUDA-core/tensor-core overlap shortlist.
+
+**Retained: two-stage NVFP4 split-KV decode attention for T=6 windows in (8198, 32768].**
+The tiled kernel gains a `Pipelined` form: tile t's QK/softmax and V dequant share one barrier
+interval with tile t-1's PV while tile t+1's compressed K/V copies land, so the single-stage
+kernel's second barrier per tile disappears. Its doubled buffers admit one 12-warp Bc=32 CTA per
+SM (49 KiB dynamic + 15 KiB static), which wins only while the grid fits one wave: at a fixed
+configuration pipelining is 7-12% faster, but under two saturating waves it is ~12% slower than
+two single-stage 6-warp CTAs per SM, whose independent barriers already overlap phases. The
+route therefore applies only to the DFlash graph bands ending at 16390 and 32768 and caps the
+split count to one wave of the batch grid (`170 / (4 x B)`, never below 64 pages per split);
+wider windows keep the previous route. The unpipelined path is unchanged in SASS.
+
+Public Op `ninfer_gqa_attention_decode_nvfp4_bench <ctx> 6` (27B geometry), base and candidate
+interleaved three times, median us:
+
+| Window | 4096 | 8500 | 12000 | 16384 | 20000 | 32768 | 40000 | 65536 | 153600 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Before | 25.2 | 29.4 | 33.1 | 34.6 | 43.1 | 51.4 | 51.5 | 73.6 | 146.0 |
+| After | 25.1 | 24.7 | 26.5 | 30.9 | 33.2 | 45.8 | 51.5 | 73.8 | 147.6 |
+
+`ninfer_gqa_attention_test` passes, with added T=6 NVFP4 cases at windows 9006 and 12288 and a
+two-request batch at 9000/12000 against the independent FP64 oracle.
+
+Engine: `tools.bench.run_serve_concurrency`, fixed DFlash k=5, p-less, thinking, NVFP4 KV,
+`long_decode_aime26_15`, 24576 output tokens (windows 335 to 24911), max context 32768, KV
+capacity 32768 (C1) / 102400 (C4), three alternating waves; steady-interval medians:
+
+| Concurrency | ms/round before -> after | Decode tok/s before -> after | Acceptance |
+|---|---:|---:|---:|
+| C1 | 15.887 -> 15.783 (-0.65%) | 180.93 -> 183.39 | 37.49% -> 38.04% |
+| C4 | 25.369 -> 25.122 (-0.98%) | 449.86 -> 452.27 | 37.31% -> 37.23% |
+
+Round time is the kernel-level claim; the acceptance shift is a changed sampling trajectory, so
+the tok/s change is not a kernel-only gain. Workloads that stay below 8198 visible keys (the
+8192-token decode suite) do not reach this route.
+
+**Rejected by measurement.**
+
+- Deferring the DFlash BF16 attention V-copy wait to PV: public-Op change 0 to +1.3% at T=5,
+  L=2048-32768. The V copy was already hidden by many small 2-warp CTAs per SM.
+- Pipelined Bc=16 (to keep two CTAs per SM): +1% to +7% at 9000-153600; halving the tile costs
+  more than the removed barrier.
+- DFlash2 selector hidden projection beside the proposal head: an Engine C1 node trace measures
+  the `[256,5120]` projection at 8.2 us per 15.6 ms round (0.05%), too small to pay for a graph
+  fork/join and a new Op boundary.
+- GDN control projection on a concurrent graph branch beside the QKVZ input projection
+  (prototype with a branch stream and a held control arena): bit-identical rounds and
+  acceptance, but ms/round +3.0% at C1 and +7.6% at C4 (8192-token suite). The latency-bound
+  control GEMM (178 us per C1 round across 48 layers) interferes with the DRAM-bound input
+  projection instead of hiding.
+
+The same C1 trace attributes 1.70 ms per round (10.9% of GPU time) to one
+`speculative_sampling_p_less_mass_finalize_kernel` launch; that p-less sampler cost is outside
+this overlap work. Evidence: `profiles/bench/tensor-core-overlap/`, trace
+`profiles/nsys/overlap-cand-c1.nsys-rep`.
+
 ## Tensor-core route audit (2026-09-27)
 
 Target: `qwen3.8-27b/nvfp4`, exact local artifact

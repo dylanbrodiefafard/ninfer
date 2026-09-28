@@ -219,6 +219,25 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// T=6 windows in (8198, 32768] use the two-stage pipelined NVFP4 kernel. Its double buffers
+// admit one CTA per SM, which wins only while the grid fits one wave, so these launches cap the
+// split count to one wave of the batch grid. Wider windows keep two single-stage CTAs per SM.
+constexpr std::int32_t kRtx5090SmCount = 170;
+
+bool nvfp4_pipelined_window(std::int32_t implementation_window) {
+    return implementation_window > 8198 && implementation_window <= 32768;
+}
+
+template <typename Geometry>
+std::int32_t nvfp4_pipelined_splits(std::int32_t capacity, std::int32_t implementation_window,
+                                    std::int32_t batch_size) {
+    const std::int32_t wave =
+        std::max<std::int32_t>(1, kRtx5090SmCount / (Geometry::KVHeads * batch_size));
+    // A split's page-id staging covers 64 pages.
+    const std::int32_t page_floor = div_up(implementation_window, 64 * kPagedKVPageSize);
+    return std::min(capacity, std::max(wave, page_floor));
+}
+
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool TreeMasked,
           typename CacheInput>
 void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
@@ -230,24 +249,27 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
-    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
+    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool Pipelined,
+                      bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
             DynamicArena
-                ? static_cast<std::size_t>(2 * KeyBlock * kGqaNvfp4CodeWidth +
-                                           2 * KeyBlock * kGqaHeadDim)
+                ? static_cast<std::size_t>((Pipelined ? 2 : 1) *
+                                           (2 * KeyBlock * kGqaNvfp4CodeWidth +
+                                            2 * KeyBlock * kGqaHeadDim))
                 : 0u;
         if constexpr (DynamicArena) {
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                        MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                        MinBlocksPerSm, KeyBlock, Pipelined,
+                                                        DynamicArena,
                                                         MultiBatch, Masked, TreeMasked, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                                KeyBlock, DynamicArena, MultiBatch, Masked,
-                                                TreeMasked, CacheInput>
+                                                KeyBlock, Pipelined, DynamicArena, MultiBatch,
+                                                Masked, TreeMasked, CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::uint8_t*>(cache_k.data),
@@ -273,42 +295,44 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
     };
     if constexpr (TokenTile == 6) {
         if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<24, 1, 32, false>();
+            launch.template operator()<24, 1, 32, false, false>();
         } else if (implementation_window <= 2054) {
-            launch.template operator()<12, 1, 32, false>();
+            launch.template operator()<12, 1, 32, false, false>();
         } else if (implementation_window <= 8198) {
-            launch.template operator()<12, 1, 64, true>();
+            launch.template operator()<12, 1, 64, false, true>();
+        } else if (nvfp4_pipelined_window(implementation_window)) {
+            launch.template operator()<12, 1, 32, true, true>();
         } else {
-            launch.template operator()<6, 2, 32, false>();
+            launch.template operator()<6, 2, 32, false, false>();
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<32, 1, 32, false>();
+                launch.template operator()<32, 1, 32, false, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<16, 1, 32, false>();
+                launch.template operator()<16, 1, 32, false, false>();
             } else {
-                launch.template operator()<8, 2, 32, false>();
+                launch.template operator()<8, 2, 32, false, false>();
             }
         } else {
             if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<24, 1, 32, false>();
+                launch.template operator()<24, 1, 32, false, false>();
             } else if (implementation_window <= 1029) {
-                launch.template operator()<24, 1, 32, false>();
+                launch.template operator()<24, 1, 32, false, false>();
             } else if (implementation_window <= 4096) {
-                launch.template operator()<12, 1, 32, false>();
+                launch.template operator()<12, 1, 32, false, false>();
             } else {
-                launch.template operator()<6, 2, 32, false>();
+                launch.template operator()<6, 2, 32, false, false>();
             }
         }
     } else if constexpr (TokenTile == 4) {
         if (implementation_window <= 1029) {
-            launch.template operator()<16, 1, 32, false>();
+            launch.template operator()<16, 1, 32, false, false>();
         } else {
-            launch.template operator()<8, 2, 32, false>();
+            launch.template operator()<8, 2, 32, false, false>();
         }
     } else {
-        launch.template operator()<8, 2, 32, false>();
+        launch.template operator()<8, 2, 32, false, false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -364,7 +388,12 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const std::int32_t splits_base =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
-    const std::int32_t splits = splits_base;
+    const std::int32_t splits =
+        cache.dtype == DType::U8 && !cache.sage_pv && invocation.width == 6 &&
+                nvfp4_pipelined_window(implementation_window)
+            ? nvfp4_pipelined_splits<Geometry>(splits_base, implementation_window,
+                                               static_cast<std::int32_t>(invocation.batch_size))
+            : splits_base;
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.

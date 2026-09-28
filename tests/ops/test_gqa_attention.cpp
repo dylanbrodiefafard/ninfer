@@ -4354,6 +4354,9 @@ int run_batch_cases(bool full) {
     failures += run_batch_case(kGeometries[0], DType::U8,
                                {5, {37, 128, 2048, 4096}, {5, 4, 3, 2}, {3, 0, 2, 1},
                                 MappingPattern::Identity, 507u});
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {6, {9000, 12000}, {6, 3}, {1, 0},
+                                MappingPattern::Fragmented, 508u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
     return failures;
@@ -4431,6 +4434,11 @@ int run_geometry(const Geometry& geometry, bool full) {
             }
             failures +=
                 run_a3_case(geometry, dtype, {4, 512, 1024, 310u}, MappingPattern::Identity);
+            // T=6 windows in (8198, 32768] take the two-stage pipelined decode route.
+            failures +=
+                run_a1_case(geometry, dtype, {6, 12282, 12288, 213u}, MappingPattern::Fragmented);
+            failures +=
+                run_a3_case(geometry, dtype, {6, 9000, 9006, 313u}, MappingPattern::Identity);
             if (full) {
                 failures +=
                     run_a3_case(geometry, dtype, {4, 2048, 4096, 311u}, MappingPattern::Identity);
