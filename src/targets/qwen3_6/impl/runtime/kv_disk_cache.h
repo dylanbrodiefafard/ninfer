@@ -145,6 +145,7 @@ enum class RamReclaim : std::uint8_t {
     Retry,     // the chosen entry changed state; choose again
     NoVictim,  // every entry is claimed or in I/O
     Failed,    // the blocking spill of the chosen entry failed
+    Pending,   // no entry is durable yet; the disk worker is spilling one
 };
 
 enum class DiskFaultPoint : std::uint8_t {
@@ -235,9 +236,13 @@ public:
     void end_ram_idle_exclusion(std::uint64_t ram_id) noexcept;
     bool emergency_spill_ram(std::uint64_t ram_id);
     // Frees one RAM entry, preferring the oldest disk-durable one. Without a
-    // durable entry the oldest is spilled first when `may_block`; otherwise it
-    // is dropped unsaved so decoding lanes never wait on a disk write.
+    // durable entry the in-flight spill, or else the oldest entry, is spilled
+    // first: synchronously when `may_block`, otherwise at emergency priority on
+    // the disk worker, returning Pending so decoding lanes never wait on a disk
+    // write. Only an entry the disk cannot save is dropped unsaved.
     RamReclaim reclaim_ram_entry(bool may_block);
+    // True while a Pending reclaim's spill has neither committed nor failed.
+    [[nodiscard]] bool ram_reclaim_pending() const;
 
     void prefetch_window(std::uint64_t entry_id, std::uint32_t text_dst_pages,
                          std::uint32_t backend_dst_pages);
@@ -547,6 +552,9 @@ private:
         std::uint64_t parent_id      = 0;
         std::uint64_t child_id       = 0;
         bool emergency               = false;
+        // Emergency priority on behalf of a non-blocking reclaim; nobody waits on
+        // it, so idle cancellation and entry exclusions still cancel it.
+        bool reclaim                 = false;
         bool cancelled               = false;
         bool failed                  = false;
         bool committed               = false;
@@ -805,6 +813,13 @@ private:
     }
 
     void promote_idle_spill_to_emergency();
+    void promote_spill_for_reclaim_locked();
+    void demote_reclaim_spill_locked();
+    [[nodiscard]] bool spill_live_locked() const noexcept;
+    [[nodiscard]] bool reclaim_target_live_locked() const;
+    // Worker-side pin and prepare of one RAM entry's spill; `urgent` spills a
+    // reclaim target at emergency priority.
+    void start_worker_spill(std::unique_lock<std::mutex>& lock, std::uint64_t ram_id, bool urgent);
     bool prepare_spill(std::uint64_t ram_id, bool emergency, std::unique_lock<std::mutex>& lock);
     void spill_one_page(SpillSession& session, std::uint32_t pool, std::uint32_t logical,
                         std::unique_lock<std::mutex>& lock);
@@ -1027,6 +1042,9 @@ private:
     bool idle_pinning_              = false;
     std::uint64_t idle_pinning_ram_ = 0;
     bool emergency_preparing_       = false;
+    // RAM entry a non-blocking reclaim waits on; the worker spills it at
+    // emergency priority. Cleared by any commit, or when its spill cannot start.
+    std::uint64_t reclaim_ram_      = 0;
     bool idle_cancel_all_           = false;
     std::uint64_t idle_cancel_epoch_ = 0;
     std::optional<SpillSession> spill_;

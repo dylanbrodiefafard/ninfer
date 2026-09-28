@@ -2034,6 +2034,29 @@ private:
             captured_ram_count = 0;
         };
 
+        // While other lanes decode, freeing host RAM for these captures must
+        // not wait on a synchronous disk spill.
+        bool others_decoding = false;
+        for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
+            others_decoding = others_decoding || (other != lane && slots_[other] != nullptr);
+        }
+        const bool captures_lane =
+            instance_.program->has_retained_lane(lane) &&
+            (ram_hit || disk_hit || winning_plan.summary().reusable_prompt_tokens == 0);
+        // A full RAM tier is spilling an entry on the disk worker so that this
+        // admission's captures can evict it instead of dropping it unsaved.
+        // Keep decoding until the spill lands; nothing is claimed or captured yet.
+        if (others_decoding && (choice.evict_retained || captures_lane) &&
+            instance_.program->kv_ram_reclaim_pending()) {
+            return AdmissionProgress::None;
+        }
+        auto defer_for_reclaim = [&]() {
+            harvest_kv_copy_seconds(request);
+            rollback_ram_captures();
+            release_host_if_needed();
+            return AdmissionProgress::None;
+        };
+
         try {
             if (disk_hit) {
                 const auto disk_summary = winning_plan.summary();
@@ -2057,12 +2080,6 @@ private:
             }
             std::array<std::uint32_t, kMaximumConcurrency> victims{};
             std::size_t victim_count = 0;
-            // While other lanes decode, freeing host RAM for these captures must
-            // not wait on a synchronous disk spill.
-            bool others_decoding = false;
-            for (std::uint32_t other = 0; other < max_concurrency_; ++other) {
-                others_decoding = others_decoding || (other != lane && slots_[other] != nullptr);
-            }
             if (choice.evict_retained) {
                 while (!instance_.program->can_admit_lane_after_releasing(lane, winning_plan,
                                                                           std::span(victims).first(victim_count))) {
@@ -2091,17 +2108,23 @@ private:
                     std::uint64_t ram_id = 0;
                     // Saving a completed prefix is optional. Even if its host
                     // image is dropped, this free lane can release its GPU pages.
+                    // A capture held back by a pending disk spill is retried
+                    // instead, keeping the victim's GPU pages until it lands.
+                    bool deferred = false;
                     (void)instance_.program->capture_retained_lane(*victim, &ram_id,
-                                                                   !others_decoding);
+                                                                   !others_decoding, &deferred);
+                    if (deferred) { return defer_for_reclaim(); }
                     if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                     victims[victim_count++] = *victim;
                 }
             }
 
-            if (instance_.program->has_retained_lane(lane) &&
-                (ram_hit || disk_hit || winning_plan.summary().reusable_prompt_tokens == 0)) {
+            if (captures_lane) {
                 std::uint64_t ram_id = 0;
-                (void)instance_.program->capture_retained_lane(lane, &ram_id, !others_decoding);
+                bool deferred = false;
+                (void)instance_.program->capture_retained_lane(lane, &ram_id, !others_decoding,
+                                                               &deferred);
+                if (deferred) { return defer_for_reclaim(); }
                 if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                 if (std::find(victims.begin(), victims.begin() + victim_count, lane) ==
                     victims.begin() + victim_count) {

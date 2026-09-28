@@ -10206,7 +10206,8 @@ int test_plan_match_during_compaction(ninfer::DeviceContext& ctx, ninfer::PagedK
 
 // Reclaiming RAM for a capture while other lanes decode must not wait on a
 // disk write: a disk-durable entry is evicted first, and without one the
-// oldest entry is dropped unsaved instead of being spilled synchronously.
+// oldest entry is spilled on the disk worker and evicted once durable, never
+// dropped unsaved and never spilled synchronously.
 int test_ram_reclaim_never_blocks_on_disk(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("ram-reclaim");
     q36::detail::KVRamCache ram(64ULL << 20);
@@ -10244,16 +10245,84 @@ int test_ram_reclaim_never_blocks_on_disk(ninfer::DeviceContext& ctx, ninfer::Pa
     t0 = std::chrono::steady_clock::now();
     result = disk.reclaim_ram_entry(false);
     elapsed = std::chrono::steady_clock::now() - t0;
-    if (result != q36::detail::RamReclaim::Evicted || resident(older)) {
-        failures += fail("non-blocking reclaim did not drop the unsaved oldest entry");
+    if (result == q36::detail::RamReclaim::Evicted || !resident(older)) {
+        failures += fail("non-blocking reclaim dropped the unsaved oldest entry");
     }
     if (elapsed > std::chrono::milliseconds(500)) {
         failures += fail("non-blocking reclaim spilled synchronously");
     }
-    if (disk.snapshot().drops != drops + 1) {
-        failures += fail("dropping an unsaved RAM entry was not counted");
+    disk.test_set_payload_io_stall_ms(0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (result != q36::detail::RamReclaim::Evicted &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        result = disk.reclaim_ram_entry(false);
+    }
+    if (result != q36::detail::RamReclaim::Evicted || resident(older)) {
+        failures += fail("non-blocking reclaim never evicted the spilled entry");
+    }
+    if (disk.snapshot().drops != drops) {
+        failures += fail("non-blocking reclaim dropped an unsaved RAM entry");
+    }
+    const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 27));
+    if (!disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
+        failures += fail("reclaimed RAM entry is not on disk");
+    }
+    alloc.release();
+    return failures;
+}
+
+// Under sustained load write-behind is still spilling the oldest entry when
+// RAM fills. That entry is I/O-pinned, so it is not an eviction candidate;
+// reclaim must finish its spill and evict it rather than drop a newer entry.
+int test_ram_reclaim_waits_for_inflight_spill(ninfer::DeviceContext& ctx,
+                                              ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim-inflight");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const auto older = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 37));
+    disk.note_ram_resident(older, 0);
+    const auto newer = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 38));
+    disk.note_ram_resident(newer, 0);
+    disk.test_set_payload_io_stall_ms(300);
+    disk.request_idle_spill();
+    if (!wait_pred([&] { return ram.test_io_pins(older) != 0; }, std::chrono::seconds(5))) {
+        disk.test_set_payload_io_stall_ms(0);
+        alloc.release();
+        return fail("ram-reclaim-inflight write-behind never started");
+    }
+    const auto resident = [&](std::uint64_t id) {
+        const auto ids = ram.fifo_ids();
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    int failures = 0;
+    const auto drops = disk.snapshot().drops;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto result = disk.reclaim_ram_entry(false);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    if (result == q36::detail::RamReclaim::Evicted || !resident(newer)) {
+        failures += fail("reclaim dropped a newer entry while the oldest was spilling");
+    }
+    if (elapsed > std::chrono::milliseconds(200)) {
+        failures += fail("non-blocking reclaim waited for the in-flight spill");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (result != q36::detail::RamReclaim::Evicted &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        result = disk.reclaim_ram_entry(false);
     }
     disk.test_set_payload_io_stall_ms(0);
+    if (result != q36::detail::RamReclaim::Evicted || resident(older) || !resident(newer)) {
+        failures += fail("reclaim did not evict the spilled oldest entry");
+    }
+    if (disk.snapshot().drops != drops) {
+        failures += fail("reclaim dropped an unsaved RAM entry");
+    }
     alloc.release();
     return failures;
 }
@@ -16887,6 +16956,7 @@ int main(int argc, char** argv) {
                test_spill_pin_waits_only_its_entry(ctx, paged_pool) +
                test_plan_match_during_compaction(ctx, paged_pool) +
                test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool) +
+               test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool) +
                test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
@@ -17046,6 +17116,7 @@ int main(int argc, char** argv) {
     failures += test_spill_pin_waits_only_its_entry(ctx, paged_pool);
     failures += test_plan_match_during_compaction(ctx, paged_pool);
     failures += test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool);
+    failures += test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool);
     failures += test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     failures += test_disk_fifo_evict_clears_ram_durable(ctx, paged_pool);
     failures += test_lock_does_not_wipe_tmp_before_flock(ctx, paged_pool);
