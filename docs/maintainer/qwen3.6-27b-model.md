@@ -430,7 +430,7 @@ One propose block:
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    single-request recommendation is k=4 (W=5, one SmallT GQA tile); concurrent long-reasoning
    settings are measured in [performance.md](../performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22).
-   Maximum k=5 (W=6). `--adaptive-draft` picks live k in `{1,2,3,4,5}` as in
+   Maximum k=5 (W=6). `--adaptive-draft` picks live k in `{3,4,5}` as in
    [§8.1](#81-adaptive-draft-length). Frozen
    `--draft-tokens 4` stays `{4}`. CUDA graphs capture one graph per k; the next k is chosen
    after the round (lagged one round, no post-draft host seam).
@@ -447,7 +447,7 @@ the **next** round. “Lock” means: do not mix k as a bandit; take the current
 
 | State | Lifetime | Role |
 |---|---|---|
-| CUDA graphs for DFlash `{1,2,3,4,5}` or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed |
+| CUDA graphs for DFlash or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed |
 | `T(k,C,L)` | Engine lifetime, one table per concurrency C | seconds for a k-round at this batch size and length |
 | hop chances `r_i` | one request | how far down the draft this prompt still matches |
 | `live_k` | chosen after each round, used next round | which graph to run |
@@ -464,10 +464,9 @@ sequence length L, so
 
 by online least squares: shared slope in L, per-k intercept, one table per C. That table is
 **shared across requests** on this server. After a few rounds, competitive captured widths have
-measured times. An unmeasured k is tried **at most once**, smallest first, and only if an optimistic
-bound (unseen hops treated as certain accept) still beats the best measured arm. Unmeasured
-`T(k)` is `max(T(k-1), 2 T(k-1) − T(k-2))`. Fallback rounds with draft extent 0 do not update
-T.
+measured times. Each captured k within the cap is measured once per batch size, smallest first,
+before the argmax applies; an unmeasured `T(k)` is never extrapolated from other arms. Fallback
+rounds with draft extent 0 do not update T.
 
 The numerator is the prompt. DFlash proposes a chain of k drafts. Hop i can succeed only if
 hops `0..i-1` already matched (Leviathan nested survival):
@@ -476,9 +475,16 @@ hops `0..i-1` already matched (Leviathan nested survival):
 `E[Y(k)] = 1 + q_0 + ⋯ + q_{k-1}`
 
 (The leading 1 is the bonus target token.) Online, each `r_i` is a discounted Beta-Bernoulli,
-updated only if the prefix reached i. Unseen `r_i` are omitted from mean `E[Y]` so a cold
-request does not invent a chain of successes. A new request **resets** these coins; it does
-not inherit the last prompt’s accept rate.
+updated only if the prefix reached i, so a k-round never observes `r_i` for `i >= k`. For DFlash
+an unseen `r_i` counts as 1 in `E[Y]`: its optimism is bounded by the seen prefix product `q_{i-1}`, and
+the first round that drafts that deep replaces it with the posterior. Omitting unseen hops
+instead gave every k above the deepest observed hop the same `E[Y]` at a higher T, so a request
+that started short could never move up. On a warm C=1 server that locked every new request at
+the cheapest k (k=1 at ~111 tok/s against ~148 tok/s for the fixed k=5 it should find). A new
+request **resets** these coins; it does not inherit the last prompt’s accept rate, and with no
+hops DFlash scores `E[Y(k)] = 1 + k`. MTP keeps the truncated sum (unseen hops add nothing): its
+draft cost grows with k, the truncation lands on its cheapest arm k=3, which is also its best
+fixed k on most prompts, and counting unseen hops measured 5% slower at C=1.
 
 Then `k* = argmax_k E[Y(k)] / T(k,C,L)`. Switching charges that arm an extra 1 ms so a
 coin-flip lead does not thrash graphs. Ties keep the smaller k. At C≥2 the batch has one k:
@@ -487,19 +493,17 @@ hops are observed per row; the next k is one number written onto every row.
 A mixing bandit would keep sampling 3, 4, and 5. Mixing k forks the greedy CUDA-graph path
 and, at C≥2, makes every row wait on the same k. T is engine-global per batch size, and each
 captured k is measured once per batch size before exploitation: shorter arms bound nothing,
-because verify routes and tiles change with T=W×C. With A16 W2/W3 verification a C=6 k=1 round
-(~36 ms) cost more than k=4 (~24 ms), and extrapolating 2T(k−1)−T(k−2) from k=1/2 hid k=3..5
-and locked C=6 at k=1. After T is measured the policy always takes the current argmax. That is sticky; it may still move if hops really change, or if budget
-cannot afford the locked k.
+because verify routes and tiles change with T=W×C (a C=4 k=4 round is cheaper than k=3 or k=5).
+After T is measured the policy always takes the current argmax. That is sticky; it may still
+move if hops really change, or if budget cannot afford the locked k.
 
-On a long-lived serve, T is known after the first requests. A later request still starts with
-empty hops (`live_k = 0` on C=1), so the first rounds mostly pick from known T until this
-prompt’s coins exist, then sit on one k. Host tests cover hop updates, dominance, one measurement per arm,
-and shared batch k. DFlash includes k=1/2 because short verification batches can win at C>1
-when later-hop acceptance is low. Their NVFP4 MLP and attention-input projections aggregate
-requests into one weight pass; W=2..4 NVFP4 residual projections do likewise. Every
-verification width, including k=1/2 (W2/W3), uses the same A8 policy as k=3..5 (W4–W6). The picker can still prefer
-k=4/5 for high-acceptance workloads.
+On a long-lived serve, T is known after the first requests. A later request starts with empty
+hops (`live_k = 0` on C=1), scores `1 + k` per arm, so it drafts the longest affordable
+competitive k first and learns its deep hops from that round. Host tests cover hop updates,
+dominance, one measurement per arm, the warm-server start, and shared batch k. DFlash captures
+`{3,4,5}` like MTP: on the A8 verify routes k=1/2 never beat k=3 at any C=1..6 (C=1 round time
+is nearly flat in k, 14.6 ms at k=1 to 15.3–15.8 ms at k=3–5; at C≥4 a k=4 round is cheaper than a
+k=1 round), see [performance.md](../performance.md#adaptive-draft-start-and-k-set-2026-09-27).
 
 ## 9. Speculative round semantics
 

@@ -78,6 +78,45 @@ The same C1 trace attributes 1.70 ms per round (10.9% of GPU time) to one
 this overlap work. Evidence: `profiles/bench/tensor-core-overlap/`, trace
 `profiles/nsys/overlap-cand-c1.nsys-rep`.
 
+## Adaptive draft start and k set (2026-09-27)
+
+RTX 5090, CUDA 13.1, DFlash2 `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, `ninfer-serve --spec dflash
+--draft-tokens 5 --lm-head-draft --kv-dtype nvfp4`, server-default p-less sampling. Driver
+`profiles/bench/adk/adk_drive.py`: one server per point, sequential waves of fixed prompts, so
+wave 1 sees a fresh server and later waves see the Engine-global `T(k,C,L)` tables. `c1long` is
+ten C=1 requests (story, Python, zh sci-fi, AIME, SQL, zh dialogue, zh→en, TypeScript, story,
+sci-fi); C=2/4/6 waves repeat the story/code/sci-fi/AIME prompts. Aggregate tok/s is completion
+tokens over wave wall time.
+
+The previous picker omitted unseen hops from `E[Y]`. A warm C=1 server therefore gave every new
+request `E[Y]=1` for every k, picked the cheapest round (k=1), and never observed a hop that would
+move it up: waves 2-10 ran k=1 in every repetition. Counting unseen hops as accepted and capturing
+`{3,4,5}` recovers the best fixed k:
+
+| aggregate tok/s | C=1 `c1long` | C=2 | C=4 | C=6 |
+|---|---|---|---|---|
+| previous adaptive `{1..5}` | 110.6-111.8 | 230.9-231.2 | 465.5 | 511-559 |
+| fixed k=1 / 2 / 3 / 4 / 5 (pinned on the adaptive route) | - / 123.1 / 130.9 / 138.8 / 147.6 | 189.4 / 211.4 / 235.3 / 231.7 / 245.3 | 296.9 / 322.3 / 357.3 / 466.6 / 389.2 | 262.5 / 389.0 / 445.6 / 559.4 / 424.2 |
+| unseen hops as accepted, `{1..5}` | 147.0 | 237.0 | 459.5 | 584.7 |
+| unseen hops as accepted, `{3,4,5}` (retained) | 148.2 | 235.4 | 463.8 | 527.3 |
+
+C=1 round time is nearly flat in k (14.6 ms at k=1, 15.2 at k=2, 15.3-15.8 at k=3-5); at C=4 a
+k=4 round is the cheapest width. k=2 never beat k=3 on any prompt at C=1/2/4/6 and k=1 was never
+close, so both left the captured set. At C≥2 every policy runs k=4 in 95-99% of rounds; the
+C=2/4/6 spread between those rows is sampled-content variance (an early k change forks the p-less
+RNG path and the prompt ends at a different length), not selection. Rejected in the same
+campaign: startup `T` timing (no gain; with unseen hops omitted it moved the k=1 lock to the first
+request), an Engine-pooled hop prior (one repetition locked the whole server at k=3, −12%), forcing
+the longest k on a request's first round, and probing only the next larger k (slid a low-acceptance
+prompt to k=1). Raw reports: `profiles/bench/adk/r1`-`r4`.
+
+Seed-varied repeats (`r6-seeds`, offsets 1000/2000) at C=2 and C=6 keep k=4 in 95-99% of rounds
+under both pickers; wave totals differ by one long low-acceptance straggler that finishes alone,
+whose length and acceptance change with the sampled text. MTP (`qwen3_8_27b_nvfp4.ninfer`
+MTP-NVFP4, `r5-mtp`) is left on the truncated `E[Y]`: its shipped picker settles on k=3, the best
+fixed MTP k on most prompts (C=1 `c1long`: shipped 152.8, fixed k=3/4/5 154.5/144.0/137.4,
+unseen-as-accepted 145.4 tok/s because it starts at k=5 and the switch cost holds it there).
+
 ## Tensor-core route audit (2026-09-27)
 
 Target: `qwen3.8-27b/nvfp4`, exact local artifact
@@ -1120,8 +1159,8 @@ The missing short-width aggregation made reducing k unnecessarily expensive: W=2
 and attention-input projections still launched separate request panels. The retained leaf
 uses the already-qualified aggregate A16 Ops at these widths; NVFP4 attention/GDN residual
 projections also aggregate W=2..4. It preserves the C=1 arithmetic policy and the existing
-BF16/FP8 panel boundaries. Adaptive DFlash now captures k=1/2 as well, so it can select these
-cheaper rounds. Fixed k=4 execution is unchanged.
+BF16/FP8 panel boundaries. Adaptive DFlash then captured k=1/2 as well (removed again on 2026-09-27 once A8 made them
+never competitive; see [adaptive k set](#adaptive-draft-start-and-k-set-2026-09-27)). Fixed k=4 execution is unchanged.
 
 Matched 2048-token-per-lane AIME waves isolate the aggregation change at fixed widths:
 

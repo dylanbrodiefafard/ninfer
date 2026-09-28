@@ -143,8 +143,8 @@ resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation 
 
 单 schedule graph families（ordinary、MTP、DFlash2）的 CUDA Graph allowance 按 `(K, B, topology)`
 executable 数 `n` 计 `min(12n, 24+6n)` MiB，包含其 reachable definitions：实测总量是固定 warm-up 部分加
-每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。DFlash adaptive
-`K={1,2,3,4,5}`、`C=4` 的 20 个 executable 共 144 MiB。不能套用 autoregressive DFlash 的 64/96 MiB
+每 executable 约 4 MiB（RTX 5090 serve benches：4 个 executable 最多 46 MiB，30 个 146 MiB）。以前的 DFlash adaptive
+`K={1,2,3,4,5}`、`C=4` 的 20 个 executable 实测 144 MiB（现在 `K={3,4,5}`、`C=4` 为 12 个）。不能套用 autoregressive DFlash 的 64/96 MiB
 unroll allowance。所有 definitions 和 executables
 在 startup 建立。实测值是 preparation 前后的 device-wide free-memory 差，会计入同一 GPU 上其他进程的
 分配/释放，因此只作为 observed/allowance 报告，不作为启动失败条件；allowance 校准由 real-artifact
