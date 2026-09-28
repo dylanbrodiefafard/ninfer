@@ -1547,8 +1547,9 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
 }
 
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
-                                            bool may_block) {
+                                            bool may_block, bool* deferred) {
     if (ram_entry_id != nullptr) { *ram_entry_id = 0; }
+    if (deferred != nullptr) { *deferred = false; }
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
     device.order_copy_after_compute();
     qwen3_6::detail::RamCaptureSource source;
@@ -1577,6 +1578,11 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
             if (reclaimed == qwen3_6::detail::RamReclaim::Evicted ||
                 reclaimed == qwen3_6::detail::RamReclaim::Retry) {
                 continue;
+            }
+            // Not a drop: the caller retries once the disk worker's spill lands.
+            if (reclaimed == qwen3_6::detail::RamReclaim::Pending) {
+                if (deferred != nullptr) { *deferred = true; }
+                return false;
             }
             kv_ram_cache_->record_drop();
             return false;
@@ -2257,6 +2263,10 @@ void disk_reuse_pages(SpeculativeBackend backend, bool growing_backend, std::uin
 
 bool ProgramImplCore::disk_restore_ready(std::uint64_t entry_id) const {
     return !kv_disk_cache_ || kv_disk_cache_->restore_setup_ready(entry_id);
+}
+
+bool ProgramImplCore::kv_ram_reclaim_pending() const {
+    return kv_disk_cache_ && kv_disk_cache_->ram_reclaim_pending();
 }
 
 void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,

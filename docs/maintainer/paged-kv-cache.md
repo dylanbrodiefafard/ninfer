@@ -902,9 +902,11 @@ working set.
 `--kv-disk-capacity` enables an inclusive SSD store of completed bundles and requires
 `--kv-ram-capacity > 0`. Each RAM capture requests a write-behind spill on the disk worker, so
 entries usually become durable while other requests decode. When a capture needs RAM, the oldest
-unpinned disk-durable entry is evicted first. Without one, the oldest entry is spilled
-synchronously only when no other lane is decoding; otherwise it is dropped unsaved, so decoding
-never waits for a disk write. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
+unpinned disk-durable entry is evicted first. Without one, the in-flight write-behind spill, or
+else the oldest savable entry, is spilled first: synchronously when no other lane is decoding,
+otherwise at emergency priority on the disk worker while the admission stays queued and the
+other lanes keep decoding. The admission retries once that spill commits, so decoding never waits
+for a disk write and an entry is dropped unsaved only when the disk cannot store it. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
 immutable entry and its pack-generation lease, restores directly into the selected VRAM lane,
 and never parks the restored bundle in the RAM FIFO. Consuming the claim releases its generation
 lease but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
