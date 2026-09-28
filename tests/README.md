@@ -409,7 +409,7 @@ NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
 KV capacity at context 260000, concurrency 4, NVFP4 KV, and prefill chunk 4096. It checks that
 the graph allowance fits the measured allocation without stranding more than 128 MiB, executes
 full prefill chunks and partial tails up to 259744 tokens, then drives the production Program
-through `K=1,2,3,4,5,4,5,3,2,1` at every batch size 1–4. The test sets the host adaptive selection at
+through `K=3,4,5,4,5,3,5,4,3` at every batch size 1–4. The test sets the host adaptive selection at
 round boundaries to make width transitions deterministic; it checks actual executed K, token
 counts, workspace bounds, and device-memory stability. Adaptive policy selection itself is
 covered by `ninfer_qwen3_6_adaptive_draft_test`.

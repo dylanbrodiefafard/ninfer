@@ -7,15 +7,16 @@
 //
 // Y(k) = 1 + sum_{i<k} q_i with q_i = prod_{j<=i} r_j and
 // r_i = P(accepted > i | accepted > i-1). r_i is a discounted Beta, updated
-// only when the prefix reached i. Unseen r_i are not invented in E[Y]; they
-// appear only as r=1 in an optimistic bound used to drop dominated k.
+// only when the prefix reached i, so a k-round never observes r_i for i >= k.
+// DFlash E[Y] therefore counts an unseen r_i as 1: omitting it made every k above the
+// deepest observed hop score the same tokens at a higher T, and a request that
+// started short could never move up (warm C=1 servers locked every request at
+// the cheapest k). The optimism is bounded by the seen prefix product and is
+// replaced by the posterior as soon as a longer k is drafted.
 //
 // T(k,C,L) = a_{C,k} + c_C L from online least squares (shared slope, per-k
-// intercept). Unmeasured T(k) is extrapolated as max(T(k-1), 2 T(k-1)-T(k-2))
-// and never schedules k just because a length bin is empty. k is probed at
-// most once when that bound still thinks it can win.
-//
-// Lock argmax E[Y]/T among surviving k. No Thompson, no dwell, no hop CUSUM.
+// intercept), one table per batch size. Each captured k within the cap is
+// measured once per batch size before exploitation; then argmax E[Y]/T.
 // Switching k adds 1 ms to that arm's T. Ties keep the smaller k.
 
 #include "ninfer/types.h"
@@ -58,11 +59,21 @@ struct AdaptiveBatchKState {
     std::uint32_t rounds_at_k = 0;
 };
 
+// How E[Y] treats a hop the request has not observed yet. DFlash counts it as accepted (see the
+// header). MTP keeps the truncated sum: its draft cost grows with k, the truncation lands on its
+// cheapest arm k=3, and optimism measured 5% slower there at C=1.
+enum class UnseenHop : std::uint8_t { Stop, Accept };
+
+[[nodiscard]] inline UnseenHop adaptive_unseen_hop(SpeculativeBackend backend) {
+    return backend == SpeculativeBackend::DFlash ? UnseenHop::Accept : UnseenHop::Stop;
+}
+
 struct AdaptiveDraftConfig {
     std::span<const std::uint32_t> captured_ks;
     const AdaptiveRoundTimeState* round_time = nullptr;
     std::uint32_t length_tokens              = 0;
     float switch_seconds                     = kAdaptiveSwitchSeconds;
+    UnseenHop unseen                         = UnseenHop::Stop;
 };
 
 [[nodiscard]] inline std::vector<std::uint32_t>
@@ -73,7 +84,9 @@ adaptive_draft_ks(SpeculativeBackend backend, std::uint32_t n, bool adaptive) {
         for (std::uint32_t k = 3; k <= 5 && k <= n; ++k) { out.push_back(k); }
         return out.empty() ? std::vector<std::uint32_t>{n} : out;
     }
-    if (n >= 5) { return {1, 2, 3, 4, 5}; }
+    // k=1/2 never beat k=3 at any C=1..6 on the A8 verify routes: C=1 round time is nearly flat
+    // in k, and at C>=4 a k=4 round is cheaper than a k=1 round.
+    if (n >= 5) { return {3, 4, 5}; }
     return {n};
 }
 
@@ -164,13 +177,14 @@ namespace detail {
     return state.alpha[i] / den;
 }
 
-[[nodiscard]] inline float expected_tokens(const AdaptiveDraftState& state, std::uint32_t k) {
+[[nodiscard]] inline float expected_tokens(const AdaptiveDraftState& state, std::uint32_t k,
+                                          UnseenHop unseen) {
     float e               = 1.0f;
     float run             = 1.0f;
     const std::uint32_t n = std::min(k, 5U);
     for (std::uint32_t i = 0; i < n; ++i) {
-        if (!r_seen_at(state, i)) { return e; }
-        run *= r_mean(state, i);
+        if (r_seen_at(state, i)) { run *= r_mean(state, i); }
+        else if (unseen == UnseenHop::Stop) { return e; }
         e += run;
     }
     return e;
@@ -214,14 +228,15 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
 }
 
 [[nodiscard]] inline float row_sum_e(std::span<const AdaptiveDraftState* const> states,
-                                     std::span<const std::uint32_t> row_cap, std::uint32_t k) {
+                                     std::span<const std::uint32_t> row_cap, std::uint32_t k,
+                                     UnseenHop unseen) {
     float sum_e = 0.0f;
     for (std::size_t r = 0; r < states.size(); ++r) {
         const AdaptiveDraftState* st = states[r];
         if (st == nullptr) { continue; }
         const std::uint32_t kr = r < row_cap.size() ? std::min(k, row_cap[r]) : k;
         if (kr == 0) { continue; }
-        sum_e += expected_tokens(*st, kr);
+        sum_e += expected_tokens(*st, kr, unseen);
     }
     return sum_e;
 }
@@ -273,8 +288,8 @@ inline void adaptive_assign_live_k(std::span<AdaptiveDraftState*> states, std::u
     }
 }
 
-// Round time need not grow smoothly with k: verify routes and tiles change with T=W*C, and a
-// k=1/2 round has cost more than k=4 at C=6. Shorter arms therefore bound nothing about an
+// Round time need not grow smoothly with k: verify routes and tiles change with T=W*C (a C=4
+// k=4 round is cheaper than k=3 or k=5). Shorter arms therefore bound nothing about an
 // unmeasured arm. Each captured k within the cap is measured once per batch size (T is
 // engine-global), then the policy takes argmax E[Y]/T.
 [[nodiscard]] inline std::uint32_t
@@ -299,7 +314,7 @@ adaptive_select_k(const AdaptiveDraftConfig& cfg,
         bool measured = false;
         detail::t_lookup(cfg.round_time, k, cfg.length_tokens, t, measured);
         if (!measured) { continue; }
-        const float e = detail::row_sum_e(states, row_cap, k);
+        const float e = detail::row_sum_e(states, row_cap, k, cfg.unseen);
         if (!(e > 0.0f)) { continue; }
         const float t_eff = t + ((live_k != 0 && k != live_k) ? cfg.switch_seconds : 0.0f);
         const float sc    = e / t_eff;
@@ -316,11 +331,12 @@ adaptive_select_batch_k(std::span<const AdaptiveDraftState* const> states,
                         std::span<const std::uint32_t> row_k,
                         std::span<const std::uint32_t> captured_ks,
                         const AdaptiveRoundTimeState* round_time, std::uint32_t length_tokens,
-                        std::uint32_t live_k) {
+                        std::uint32_t live_k, UnseenHop unseen) {
     AdaptiveDraftConfig cfg;
     cfg.captured_ks   = captured_ks;
     cfg.round_time    = round_time;
     cfg.length_tokens = length_tokens;
+    cfg.unseen        = unseen;
     const std::uint32_t cap_k = adaptive_batch_k(row_k, captured_ks);
     return adaptive_select_k(cfg, states, row_k, cap_k, live_k);
 }
@@ -328,9 +344,10 @@ adaptive_select_batch_k(std::span<const AdaptiveDraftState* const> states,
 [[nodiscard]] inline std::uint32_t
 adaptive_batch_next(AdaptiveBatchKState& batch, std::span<const AdaptiveDraftState* const> states,
                     std::span<const std::uint32_t> row_k, std::span<const std::uint32_t> captured_ks,
-                    const AdaptiveRoundTimeState* round_time, std::uint32_t length_tokens) {
+                    const AdaptiveRoundTimeState* round_time, std::uint32_t length_tokens,
+                    UnseenHop unseen) {
     const std::uint32_t next = adaptive_select_batch_k(states, row_k, captured_ks, round_time,
-                                                       length_tokens, batch.live_k);
+                                                       length_tokens, batch.live_k, unseen);
     if (batch.live_k != 0 && next == batch.live_k) { batch.rounds_at_k += 1; }
     else {
         batch.live_k      = next;

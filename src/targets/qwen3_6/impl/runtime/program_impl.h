@@ -3890,6 +3890,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             qwen3_6::AdaptiveDraftState& ad = requests[lanes[0]].adaptive;
             if (ad.live_k == 0) {
                 qwen3_6::AdaptiveDraftConfig cfg;
+                cfg.unseen        = qwen3_6::adaptive_unseen_hop(speculative_backend);
                 cfg.captured_ks   = captured_ks;
                 cfg.round_time    = &t_state;
                 cfg.length_tokens = maximum_frontier;
@@ -3904,7 +3905,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks);
         } else if (batch_st.live_k == 0) {
             batch_k = qwen3_6::adaptive_batch_next(batch_st, states, caps, captured_ks, &t_state,
-                                                   maximum_frontier);
+                                                   maximum_frontier,
+                                                   qwen3_6::adaptive_unseen_hop(speculative_backend));
         } else {
             batch_k = std::min(batch_st.live_k, batch_k);
         }
@@ -4044,6 +4046,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     if (lanes.size() == 1) {
                         if (budget_extent > 0) {
                             qwen3_6::AdaptiveDraftConfig cfg;
+                            cfg.unseen        = qwen3_6::adaptive_unseen_hop(speculative_backend);
                             cfg.captured_ks   = captured_ks;
                             cfg.round_time    = &adaptive_t_by_batch[batch_idx];
                             cfg.length_tokens = base_E + static_cast<std::uint32_t>(count_i);
@@ -4085,7 +4088,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 std::span<const qwen3_6::AdaptiveDraftState* const>(row_states.data(),
                                                                     lanes.size()),
                 std::span<const std::uint32_t>(next_caps.data(), lanes.size()), captured_ks,
-                &adaptive_t_by_batch[batch_idx], next_length);
+                &adaptive_t_by_batch[batch_idx], next_length,
+                qwen3_6::adaptive_unseen_hop(speculative_backend));
             qwen3_6::adaptive_assign_live_k(
                 std::span<qwen3_6::AdaptiveDraftState*>(mut_states.data(), lanes.size()), next);
             for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -4180,6 +4184,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             qwen3_6::AdaptiveDraftState& ad = requests[lanes[0]].adaptive;
             if (ad.live_k == 0) {
                 qwen3_6::AdaptiveDraftConfig cfg;
+                cfg.unseen        = qwen3_6::adaptive_unseen_hop(speculative_backend);
                 cfg.captured_ks   = captured_ks;
                 cfg.round_time    = &t_state;
                 cfg.length_tokens = maximum_frontier;
@@ -4194,7 +4199,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks);
         } else if (batch_st.live_k == 0) {
             batch_k = qwen3_6::adaptive_batch_next(batch_st, states, caps, captured_ks, &t_state,
-                                                   maximum_frontier);
+                                                   maximum_frontier,
+                                                   qwen3_6::adaptive_unseen_hop(speculative_backend));
         } else {
             batch_k = std::min(batch_st.live_k, batch_k);
         }
@@ -4370,6 +4376,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     if (lanes.size() == 1) {
                         if (budget_extent > 0) {
                             qwen3_6::AdaptiveDraftConfig cfg;
+                            cfg.unseen        = qwen3_6::adaptive_unseen_hop(speculative_backend);
                             cfg.captured_ks   = captured_ks;
                             cfg.round_time    = &adaptive_t_by_batch[batch_idx];
                             cfg.length_tokens = base_E + static_cast<std::uint32_t>(count_i);
@@ -4412,7 +4419,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 std::span<const qwen3_6::AdaptiveDraftState* const>(dflash_row_states.data(),
                                                                     lanes.size()),
                 std::span<const std::uint32_t>(next_caps.data(), lanes.size()), captured_ks,
-                &adaptive_t_by_batch[batch_idx], next_length);
+                &adaptive_t_by_batch[batch_idx], next_length,
+                qwen3_6::adaptive_unseen_hop(speculative_backend));
             qwen3_6::adaptive_assign_live_k(
                 std::span<qwen3_6::AdaptiveDraftState*>(mut_states.data(), lanes.size()), next);
             for (std::size_t row = 0; row < lanes.size(); ++row) {

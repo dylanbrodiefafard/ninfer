@@ -665,8 +665,8 @@ int exercise_dflash_vision(const char* artifact) {
     }
 
     {
-        // Adaptive N=5 starts by probing k=1. Persistent storage has width six, so
-        // the short request exercises compact W=2 strided panels at C=2.
+        // Adaptive N=5 starts by probing k=3. Persistent storage has width six, so
+        // the short request exercises compact W=4 strided panels at C=2.
         ninfer::EngineOptions options =
             adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 2);
         options.enable_vision = true;
@@ -700,11 +700,11 @@ int exercise_dflash_vision(const char* artifact) {
                          OracleKind::StrictTargetOnly) != 0 ||
             check_tokens("adaptive compact text target parity", text, target_text_tokens,
                          OracleKind::StrictTargetOnly) != 0 ||
-            chart.speculative.rounds_per_draft.size() <= 1 ||
-            chart.speculative.rounds_per_draft[1] == 0 ||
-            text.speculative.rounds_per_draft.size() <= 1 ||
-            text.speculative.rounds_per_draft[1] == 0 || row_rounds <= decode_rounds) {
-            std::cerr << label << " adaptive compact C=2 did not execute k=1/W=2\n";
+            chart.speculative.rounds_per_draft.size() <= 3 ||
+            chart.speculative.rounds_per_draft[3] == 0 ||
+            text.speculative.rounds_per_draft.size() <= 3 ||
+            text.speculative.rounds_per_draft[3] == 0 || row_rounds <= decode_rounds) {
+            std::cerr << label << " adaptive compact C=2 did not execute k=3/W=4\n";
             dump_speculative("  chart", chart.speculative);
             dump_speculative("  text", text.speculative);
             std::cerr << "  decode rounds=" << decode_rounds << " row rounds=" << row_rounds
@@ -755,8 +755,8 @@ int check_adaptive_dflash(const ninfer::GenerationResult& result, const char* la
         return 1;
     }
     const std::uint32_t live = result.speculative.live_draft_tokens;
-    if (live < 1 || live > 5) {
-        std::cerr << label << " live_draft_tokens " << live << " not in {1,2,3,4,5}\n";
+    if (live < 3 || live > 5) {
+        std::cerr << label << " live_draft_tokens " << live << " not in {3,4,5}\n";
         dump_speculative("  spec", result.speculative);
         return 1;
     }
@@ -2108,11 +2108,11 @@ int main() {
     }
 
     {
-        const char* label = "DFlash2 adaptive N=5 {1,2,3,4,5}";
+        const char* label = "DFlash2 adaptive N=5 {3,4,5}";
         ninfer::Engine engine(adaptive_engine_options(
             artifact, ninfer::SpeculativeBackend::DFlash, 5, 3));
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
-        // Adaptive selection probes the first unmeasured captured width, k=1. A seven-token
+        // Adaptive selection probes the first unmeasured captured width, k=3. A seven-token
         // request is the short-budget control; the longer request below exercises the retained
         // fastest width after calibration.
         const ninfer::GenerationResult compact =
@@ -2123,9 +2123,9 @@ int main() {
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
-        if (compact.speculative.rounds_per_draft.size() < 2 ||
-            compact.speculative.rounds_per_draft[1] == 0) {
-            std::cerr << label << " compact run did not record the initial k=1 probe\n";
+        if (compact.speculative.rounds_per_draft.size() < 4 ||
+            compact.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " compact run did not record the initial k=3 probe\n";
             dump_speculative("  spec", compact.speculative);
             return 1;
         }
@@ -2138,9 +2138,9 @@ int main() {
             compact_rb.generated_token_ids.size() != 7 ||
             check_speculative(compact_ra, label) != 0 ||
             check_speculative(compact_rb, label) != 0 ||
-            compact_ra.speculative.rounds_per_draft.size() < 2 ||
-            compact_ra.speculative.rounds_per_draft[1] == 0) {
-            std::cerr << label << " compact C=2 k=1 probe under N=5 failed\n";
+            compact_ra.speculative.rounds_per_draft.size() < 4 ||
+            compact_ra.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " compact C=2 k=3 probe under N=5 failed\n";
             dump_speculative("  A", compact_ra.speculative);
             dump_speculative("  B", compact_rb.speculative);
             return 1;
@@ -2166,8 +2166,8 @@ int main() {
             return 1;
         }
         const std::uint32_t live = seq.speculative.live_draft_tokens;
-        if (live < 1 || live > 5) {
-            std::cerr << label << " live_draft_tokens " << live << " not in {1,2,3,4,5}\n";
+        if (live < 3 || live > 5) {
+            std::cerr << label << " live_draft_tokens " << live << " not in {3,4,5}\n";
             return 1;
         }
         auto a = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(19));
@@ -2218,7 +2218,7 @@ int main() {
     }
 
     {
-        const char* label = "DFlash2 adaptive RAM reseed {1,2,3,4,5}";
+        const char* label = "DFlash2 adaptive RAM reseed {3,4,5}";
         ninfer::EngineOptions options =
             adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1);
         options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
@@ -2274,7 +2274,7 @@ int main() {
     }
 
     {
-        const char* label = "DFlash2 adaptive RAM restore in flight {1,2,3,4,5}";
+        const char* label = "DFlash2 adaptive RAM restore in flight {3,4,5}";
         ninfer::EngineOptions options =
             adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 2);
         options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
@@ -2298,7 +2298,7 @@ int main() {
         }
         const std::vector<ninfer::TokenId> history =
             resume_prefix(prompts[0], first.generated_token_ids);
-        // Restored exact-prefix generate overlaps a compact initial-k=1 probe on the other
+        // Restored exact-prefix generate overlaps a compact speculative request on the other
         // lane while copy_stream H2D-restores cyclic DFlash KV / GDN / pages.
         auto restored_h =
             engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
@@ -2314,9 +2314,8 @@ int main() {
             dump_speculative("  inflight", inflight.speculative);
             return 1;
         }
-        if (inflight.speculative.rounds_per_draft.size() < 2 ||
-            inflight.speculative.rounds_per_draft[1] == 0) {
-            std::cerr << label << " inflight compact did not record the initial k=1 probe\n";
+        if (inflight.speculative.rounds == 0) {
+            std::cerr << label << " inflight compact did not run a speculative round\n";
             dump_speculative("  inflight", inflight.speculative);
             return 1;
         }

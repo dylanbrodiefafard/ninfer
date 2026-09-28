@@ -57,6 +57,7 @@ q36::AdaptiveDraftConfig cfg_of(std::span<const std::uint32_t> ks,
     cfg.round_time     = &t;
     cfg.length_tokens  = L;
     cfg.switch_seconds = sw;
+    cfg.unseen         = q36::UnseenHop::Accept;
     return cfg;
 }
 
@@ -75,8 +76,8 @@ void test_capture_set() {
                        std::string_view msg) { expect(got == want, msg); };
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive {3,4,5}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true), {1, 2, 3, 4, 5},
-       "DFlash includes short concurrent verification widths");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true), {3, 4, 5},
+       "DFlash adaptive {3,4,5}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 4, true), {4}, "DFlash N=4 frozen {4}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, false), {7}, "frozen DFlash {N}");
 }
@@ -85,7 +86,7 @@ void test_seed_is_captured_min() {
     using ninfer::SpeculativeBackend;
     const auto df = q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true);
     const auto mt = q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true);
-    expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 1,
+    expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 3,
            "seed fallback is captured.front()");
     expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3, "MTP seed is also the smallest k");
     const std::uint32_t frozen[] = {7};
@@ -105,16 +106,17 @@ void test_y_is_one_plus_product_of_r() {
     const float q0 = 0.80f;
     const float q1 = 0.80f * 0.625f;
     const float q2 = q1 * 0.60f;
-    expect_near(q36::detail::expected_tokens(state, 3), 1.0f + q0 + q1 + q2, 0.02f,
+    expect_near(q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept), 1.0f + q0 + q1 + q2, 0.02f,
                 "Y(3) = 1 + r0 + r0 r1 + r0 r1 r2");
 }
 
-void test_unseen_r_not_added_to_mean_y() {
+void test_unseen_r_counts_as_certain_accept() {
     q36::AdaptiveDraftState state;
     plant_r(state, 3, {0.80f, 0.625f, 0.60f});
-    const float y3 = q36::detail::expected_tokens(state, 3);
-    expect_near(q36::detail::expected_tokens(state, 5), y3, 1e-5f,
-                "unseen r3,r4 do not add tokens to E[Y]");
+    const float y3 = q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept);
+    const float q2 = 0.80f * 0.625f * 0.60f;
+    expect_near(q36::detail::expected_tokens(state, 5, q36::UnseenHop::Accept), y3 + 2.0f * q2, 0.02f,
+                "unseen r3,r4 extend the seen prefix product q2 at r=1");
 }
 
 void test_r_updates_only_when_prefix_reached() {
@@ -191,8 +193,8 @@ void test_unmeasured_k5_is_probed_at_most_once_then_dropped() {
 }
 
 void test_unmeasured_arm_is_probed_despite_slower_short_arms() {
-    // Observed C=6 DFlash round times: k=1/2 rounds cost more than k=3..5. Measured short arms
-    // must not hide the unmeasured, faster arms.
+    // Round time is not monotone in k (A16-era C=6: k=1/2 rounds cost more than k=3..5; A8 C=4:
+    // k=4 is cheapest). Measured arms must not hide unmeasured, faster ones.
     q36::AdaptiveDraftState state;
     plant_r(state, 2, {0.61f, 0.40f});
     q36::AdaptiveRoundTimeState t;
@@ -236,21 +238,45 @@ void test_unmeasured_k4_probed_at_most_once() {
     expect(pick(cfg, state, 5, 5) == 3, "after expensive T(4)/T(5) both arms are dominated");
 }
 
-void test_argmin_t_when_hops_unseen() {
+// MTP keeps the truncated sum: unseen hops add nothing, so a request without hops takes the
+// cheapest measured round.
+void test_mtp_unseen_hop_stops_expected_tokens() {
+    expect(q36::adaptive_unseen_hop(ninfer::SpeculativeBackend::Mtp) == q36::UnseenHop::Stop &&
+               q36::adaptive_unseen_hop(ninfer::SpeculativeBackend::DFlash) ==
+                   q36::UnseenHop::Accept,
+           "only DFlash counts unseen hops as accepted");
+    q36::AdaptiveDraftState planted;
+    plant_r(planted, 3, {0.80f, 0.625f, 0.60f});
+    expect_near(q36::detail::expected_tokens(planted, 5, q36::UnseenHop::Stop),
+                q36::detail::expected_tokens(planted, 3, q36::UnseenHop::Stop), 1e-5f,
+                "MTP: unseen r3,r4 do not add tokens");
     q36::AdaptiveDraftState state;
     q36::seed_adaptive_draft_state(state, 0);
     q36::AdaptiveRoundTimeState t;
     plant_t(t, 3, 0.056f);
     plant_t(t, 4, 0.049f);
-    plant_t(t, 5, 0.073f);
+    plant_t(t, 5, 0.055f);
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
-    expect(pick(cfg, state) == 4, "no hop data: E[Y]=1, pick the smallest measured T");
+    cfg.unseen               = q36::UnseenHop::Stop;
+    expect(pick(cfg, state) == 4, "MTP: no hop data takes the smallest measured T");
+}
+
+void test_no_hops_scores_one_plus_k() {
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 0);
+    q36::AdaptiveRoundTimeState t;
+    plant_t(t, 3, 0.056f);
+    plant_t(t, 4, 0.049f);
+    plant_t(t, 5, 0.055f);
+    const std::uint32_t ks[] = {3, 4, 5};
+    auto cfg                 = cfg_of(ks, t);
+    expect(pick(cfg, state) == 5, "no hop data: E[Y(k)] = 1 + k, not the cheapest T");
 }
 
 void test_ties_keep_smaller_k() {
     q36::AdaptiveDraftState state;
-    plant_r(state, 3, {0.0f, 0.0f, 0.0f});
+    plant_r(state, 5, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f});
     q36::AdaptiveRoundTimeState t;
     plant_t(t, 3, 0.020f);
     plant_t(t, 4, 0.020f);
@@ -262,7 +288,7 @@ void test_ties_keep_smaller_k() {
 
 void test_switch_cost_holds_live_k() {
     q36::AdaptiveDraftState state;
-    plant_r(state, 4, {0.50f, 0.50f, 0.50f});
+    plant_r(state, 4, {0.50f, 0.50f, 0.50f, 0.50f});
     q36::AdaptiveRoundTimeState t;
     plant_t(t, 3, 0.0190f);
     plant_t(t, 4, 0.0197f);
@@ -291,6 +317,31 @@ void test_stationary_late_hop_does_not_force_k5() {
     expect((state.r_seen & 0x10U) == 0, "k=4 rounds never observe r4");
 }
 
+// Warm C=1 server: T is known for every k and nearly flat, a new request has no hops. The
+// request must start at the longest k and stay there while later hops keep accepting, instead of
+// locking the cheapest k because deeper hops were never observed.
+void test_warm_server_new_request_is_not_locked_short() {
+    q36::AdaptiveRoundTimeState t;
+    plant_t(t, 3, 0.0153f);
+    plant_t(t, 4, 0.0155f);
+    plant_t(t, 5, 0.0157f);
+    const std::uint32_t ks[] = {3, 4, 5};
+    auto cfg                 = cfg_of(ks, t, 512, 0.0f);
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 0);
+    state.live_k = pick(cfg, state);
+    expect(state.live_k == 5, "fresh request on measured flat T starts at the longest k");
+    for (int round = 0; round < 64; ++round) {
+        // Two of five drafts accepted: hops 0..2 are observed every round, hops 3..4 never.
+        (void)q36::adaptive_draft_next(cfg, state, 2, state.live_k, 5, state.live_k);
+    }
+    expect(state.live_k == 3, "a prefix that dies at hop 2 settles on k=3");
+    for (int round = 0; round < 64; ++round) {
+        (void)q36::adaptive_draft_next(cfg, state, state.live_k, state.live_k, 5, state.live_k);
+    }
+    expect(state.live_k == 5, "once every drafted hop accepts, unseen deeper hops pull k back up");
+}
+
 void test_batch_sum_e_over_t() {
     const std::uint32_t captured[] = {3, 4, 5};
     q36::AdaptiveRoundTimeState t;
@@ -304,11 +355,11 @@ void test_batch_sum_e_over_t() {
     const q36::AdaptiveDraftState* mid[] = {&hot, &cold};
     const std::uint32_t rows[]           = {5, 5};
     const std::uint32_t picked =
-        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0);
+        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, q36::UnseenHop::Accept);
     float best_s               = -1.0f;
     std::uint32_t want         = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e  = q36::detail::expected_tokens(hot, k) + q36::detail::expected_tokens(cold, k);
+        const float e  = q36::detail::expected_tokens(hot, k, q36::UnseenHop::Accept) + q36::detail::expected_tokens(cold, k, q36::UnseenHop::Accept);
         const float tk = q36::adaptive_t_hat(t, k, 512);
         const float sc = e / tk;
         if (sc > best_s) {
@@ -330,12 +381,12 @@ void test_batch_row_budget_clips_expected_tokens() {
     const q36::AdaptiveDraftState* mid[] = {&hot, &hot};
     const std::uint32_t rows[]           = {5, 3};
     const std::uint32_t picked =
-        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0);
+        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, q36::UnseenHop::Accept);
     float best_s               = -1.0f;
     std::uint32_t want         = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e = q36::detail::expected_tokens(hot, std::min(k, 5U)) +
-                        q36::detail::expected_tokens(hot, std::min(k, 3U));
+        const float e = q36::detail::expected_tokens(hot, std::min(k, 5U), q36::UnseenHop::Accept) +
+                        q36::detail::expected_tokens(hot, std::min(k, 3U), q36::UnseenHop::Accept);
         const float sc = e / q36::adaptive_t_hat(t, k, 512);
         if (sc > best_s) {
             best_s = sc;
@@ -359,7 +410,7 @@ void test_batch_next_writes_executed_k() {
     const std::uint32_t rows[]           = {5, 5};
     q36::AdaptiveBatchKState batch;
     const std::uint32_t k =
-        q36::adaptive_batch_next(batch, mid, rows, captured, &t, 512);
+        q36::adaptive_batch_next(batch, mid, rows, captured, &t, 512, q36::UnseenHop::Accept);
     expect(k == 4 && batch.live_k == 4, "batch live_k is the executed argmax, not a per-row pick");
     q36::AdaptiveDraftState* mut[] = {&a, &b};
     q36::adaptive_assign_live_k(mut, k);
@@ -395,7 +446,7 @@ int main() {
     test_seed_is_captured_min();
     test_topology_class();
     test_y_is_one_plus_product_of_r();
-    test_unseen_r_not_added_to_mean_y();
+    test_unseen_r_counts_as_certain_accept();
     test_r_updates_only_when_prefix_reached();
     test_pcur_zero_skips_update();
     test_t_ols_shared_slope();
@@ -405,7 +456,9 @@ int main() {
     test_unmeasured_arm_is_probed_despite_slower_short_arms();
     test_dominated_arm_is_measured_once_then_dropped();
     test_unmeasured_k4_probed_at_most_once();
-    test_argmin_t_when_hops_unseen();
+    test_mtp_unseen_hop_stops_expected_tokens();
+    test_no_hops_scores_one_plus_k();
+    test_warm_server_new_request_is_not_locked_short();
     test_ties_keep_smaller_k();
     test_switch_cost_holds_live_k();
     test_stationary_late_hop_does_not_force_k5();
