@@ -1,0 +1,36 @@
+# Additional engine coverage and stopping boundary
+
+> Follow-up depth audit: `competitive-depth-audit.md` adds SparkInfer, contradictory copy/PDL evidence, current PR patches, further Radiance descendants and corrected stale GDN claims. The original breadth closure below is a first-pass boundary, superseded by that expanded investigation.
+
+Cutoff/retrieval date: 2026-09-26. This is the bounded final gap sweep following the direct RTX 5090 engine, kernel, quantization and compiler investigations. Primary repository READMEs/release notes were read; targeted engine-name plus `5090`/`sm120` searches were used to find hardware evidence. Missing evidence means none was established in this pass, not a proof that no implementation can run. Most of these projects answer a materially different workload question.
+
+| Stable ID | Engine / primary source | Evidence at cutoff | Distinct mechanism and NInfer disposition |
+|---|---|---|---|
+| LC01 | LightLLM — https://github.com/ModelTC/lightllm | Primary README, no direct exact-model single-5090 result found | Python/Triton serving, token-level KV management and DP prefix transfer. Existing NInfer paging/prefix ownership already handles the relevant single-instance problem; distributed transfers out of scope. |
+| LC02 | FastDeploy — https://github.com/PaddlePaddle/FastDeploy/blob/develop/README_EN.md ; https://github.com/PaddlePaddle/FastDeploy/releases | Primary README/release notes; NVFP4 MoE release item explicitly SM100, not established SM120 evidence | W4AFP8 and MTP merit arithmetic/source comparison only if a relevant kernel appears. PD separation, global cache pooling and NVLink/RDMA do not improve the fixed one-GPU contract. |
+| LC03 | LMDeploy / TurboMind — https://github.com/InternLM/lmdeploy ; https://github.com/InternLM/lmdeploy/releases | Primary README and v0.13.0 release, May 2026 | TurboQuant KV (`quant_policy=42`, PR4510) is a concrete codec implementation worth the kernel research branch's inspection. C++ CUDA persistent batching, split/fuse and quantized KV overlap existing capabilities. |
+| LC04 | LMDeploy hardware issue — https://github.com/InternLM/lmdeploy/issues/3806 | Primary user bug August 2025, closed | SM120 instruction/build errors are historical, not proof current LMDeploy fails. Release claims for H800/MXFP4 do not establish a current 5090 dense-Qwen gain. |
+| LC05 | Sonar, formerly Aphrodite — https://github.com/dphnAI/sonar ; older https://github.com/PygmalionAI/aphrodite-engine resolves to same README | Primary current README | vLLM-derived runtime with extra samplers/formats, DFlash/DSpark/n-gram and protocol surfaces. No direct Qwen3.8 NVFP4 C1..4 5090 speed evidence found. Extra general response schemas are product feature candidates; generic model breadth/distributed serving are not. |
+| LC06 | Nano-vLLM — https://github.com/GeeeekExplorer/nano-vllm | Primary README benchmark | Clean compact implementation has graph/prefix/TP features; benchmark is Qwen3-0.6B, RTX4070 laptop, 256 sequences, not 5090/27B. Good educational implementation, no new performance mechanism beyond NInfer found. |
+| LC07 | PowerInfer — https://github.com/Tiiny-AI/PowerInfer ; https://arxiv.org/abs/2312.12456 | Primary current README and original paper | CPU/GPU hot/cold neuron placement needs activation sparsity/model compatibility. Headline evidence is RTX4090 and ReLU-oriented models. CPU execution and changed sparsified artifact violate the native target contract; no port recommendation. |
+| LC08 | InfiniGen — https://github.com/snu-comparch/InfiniGen ; https://arxiv.org/abs/2406.19707 | Primary artifact README/paper, 2024 | Rehearses next-layer attention to selectively prefetch host KV. Approximate selection plus host-tier transfer is not a native Qwen4 feature (tiers forbidden) or exact dense attention replacement. Its capacity/offload denominator differs. |
+| LC09 | FlexGen / FlexLLMGen — https://github.com/FMInference/FlexGen | Primary README | Optimizes CPU/disk offload with very large effective batches; README explicitly warns small batches can be slower than resident execution. Incompatible with C1..4 resident model objective. |
+| LC10 | FreeToken — https://github.com/FlashML-org/FreeToken | Primary README, detailed screening in vllm-engines.md | CPU/GPU coexecution, weight streaming and elastic expert caches: excluded native behavior; semantic checkpoint ideas already substantially present. |
+| LC11 | KTransformers — https://github.com/kvcache-ai/ktransformers | Primary README/kt-kernel documentation | CPU-expert kernels and heterogeneous MoE capacity, excluded native execution; no resident dense-27B speed conclusion. |
+| LC12 | Emmy / Mirage — https://github.com/cloudrift-ai/emmy ; https://github.com/mirage-project/mirage | Implementation read, compiler-runtime.md | Emmy concrete 5090 FP16 prefill techniques; Mirage inspected linear dispatch rejects CC120. No direct compatible NVFP4 runtime replacement. |
+
+## Cross-source contradictions resolved
+
+1. “NVFP4 has no native support on 5090” is stale/overbroad. vLLM issue47749 distinguishes weight-only layers from W4A4 layers; NInfer itself already uses architecture-specific FP4 paths.
+2. “Blackwell support” can mean SM100, SM120, or SM121. FastDeploy's SM100 NVFP4 item and Mirage's CC120 exclusion are not contradictory to their Blackwell claims; they are different hardware targets.
+3. “616 tok/s at 262K” conflates a short-prompt C4 code test with maximum context/pool. The original author discloses the workload and capacity separately.
+4. “Exact rerank makes greedy approximation safe” omits recall. Radiance's approximate target-head shortlist can omit the true maximizer; unchanged benchmark answers are not a universal guarantee.
+5. “Compiler speedup improves decode” is contradicted by Emmy's own reported slightly slower decode; its demonstrated gain is prefill/TTFT on a different FP16 model.
+6. “The same checkpoint yields the same numerics across kernels” is contradicted by the exact-model R183b W4A4/W4A16 fidelity study; precision route and fusion matter even when serialized weights match.
+7. “Latest dependency is necessarily faster” is unsupported: the adrienbrault recipe documents a FlashInfer-version regression and pins its tested route. This supports exact-route investigation, not blanket dependency downgrades.
+
+## Why this sweep stops here
+
+These additional families either duplicate mechanisms already deeply covered, lack relevant primary 5090 evidence, depend on another model's sparsity/architecture, or require excluded distributed/offload behavior. The one concrete new code lead, LMDeploy TurboQuant, was inspected by the kernel/codec branch and recorded in `kernels-speculation.md`: merged PR4510 implements K3+QJL/V2 with Hadamard/codebooks. Its paper link is erroneous (HyperSearch); the report uses the actual TurboQuant paper and does not inherit unsupported headline fidelity claims. No additional highest-priority native performance mechanism emerged that warrants cloning and auditing every general serving framework.
+
+This table is coverage evidence, not a claim to enumerate every public or private engine. Engine discovery was bounded by the research cutoff and accessible sources; new releases can reopen a specific avenue.

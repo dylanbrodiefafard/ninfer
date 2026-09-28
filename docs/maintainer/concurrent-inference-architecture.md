@@ -143,6 +143,19 @@ after draft IDs/parents have arrived on the host, then upload masks for target s
 Proposal sampling does not advance the grammar. Only the accepted publication transaction
 advances committed grammar; callback failures are surfaced before publication.
 
+For DFlash2 `k=4` with verification width 5, an actual compact batch of 4 or 6
+rows may overlap the mask exchange with target verification only when every
+active OutputSession owns a tool grammar. Other draft shapes, MTP, ordinary
+decode, and mixed grammar/non-grammar batches retain the serial schedule.
+Selection uses stable session grammar presence at the synchronized round
+boundary, not the matcher's current token phase or startup concurrency.
+The overlap schedule forks from completed proposal production onto a dedicated
+host-callback stream and joins before target sampling consumes masks/configs.
+Fixed-pitch device staging uses update-safe one-dimensional row copies; pinned
+host transfers keep fixed addresses. DeviceContext's complete drain includes
+the callback stream, and Program drains before destroying borrowed sessions,
+including an exception after a fork but before its join.
+
 Runtime may withhold a completed repeated call, or pause persistent thinking after a
 committed decode round, and rebuild that request on its existing
 lane. This is neither preemption nor another admission. The conservative family detector
@@ -1300,6 +1313,15 @@ kernel 参数和 launch shape 触发 `cudaGraphExecUpdate` 不兼容。资源数
 Profile 在 capture 前按 configured context ceiling 截断，只有实际 reachable 的 topology classes 才实例化
 executable。Backend-specific proposal shape 只有在真实改变 CUDA node topology 时才形成每个 exact `B`
 下的 topology class，不生成 ordinary-tail 或额外 `B=1` compatibility graph。
+
+The speculative tool-mask schedule is also an explicit profile/topology field.
+Eligible DFlash2 `k=4`, width-5, `B=4/6` profiles have separately captured serial
+and overlap variants; all other profiles have only serial exchange. Their
+executables are distinct because the fork/join changes CUDA node topology.
+Startup graph accounting includes these additional reachable definitions and
+executables. A round selects the variant from its actual compact sessions;
+switching between ordinary, all-grammar and mixed batches never captures a new
+graph or attempts a serial-to-overlap executable update.
 
 Startup 对 graph family 的准备顺序固定为：
 

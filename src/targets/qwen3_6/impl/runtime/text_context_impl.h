@@ -698,7 +698,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& linear_state_slots,
                                            ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                            Tensor& logits, Tensor& target_tokens, Tap& tap,
-                                           bool reset_workspace) {
+                                           bool reset_workspace, cudaEvent_t sampling_ready) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -758,6 +758,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear_packed_sequences(flat_hidden, *lm_head_, flat_logits, stream, width);
+        if (sampling_ready) { CUDA_CHECK(cudaStreamWaitEvent(stream, sampling_ready, 0)); }
         if (sampling_config_ != nullptr) {
             ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, sampling_config_, width,
                         stream);
@@ -773,11 +774,11 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
-                                      bool reset_workspace) {
+                                      bool reset_workspace, cudaEvent_t sampling_ready) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, tap,
-                             reset_workspace);
+                             reset_workspace, sampling_ready);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -785,10 +786,10 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink, bool reset_workspace) {
+                                      DFlashFeatureSink& sink, bool reset_workspace, cudaEvent_t sampling_ready) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, sink,
-                             reset_workspace);
+                             reset_workspace, sampling_ready);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,

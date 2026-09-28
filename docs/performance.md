@@ -274,6 +274,168 @@ tokens/round, 149.1 decode tok/s; upstream's T0.6/top-p 0.95/top-k 20/presence 1
 2.95 tokens/round, 207.9 tok/s. Upstream's published 35.2%/183.4 tok/s (k=7, W8 drafter) is
 therefore a sampler difference, not a drafter-precision one.
 
+## Grammar-mask overlap candidate (2026-09-27)
+
+**Retained:** DFlash2 k4/W5 compact batches of 4 or 6 in which every request
+carries a tool grammar overlap the mask exchange with target verification, from
+separately captured Serial/Overlap graph profiles. Tool-call waves are 1.06% (C4)
+and 1.18% (C6) faster (1.0–1.9% after rebasing onto `931617b2`); ordinary long
+decode is unchanged within order-balanced noise. Earlier unconditional and batch-only variants were rejected (below).
+
+Experimental `d29841e0`, RTX 5090, SM120a, CUDA 13.1, using the exact local
+`qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer` DFlash2 artifact with BF16 selector
+codebook. Both binaries include the same mRoPE prefill build repair and callback
+NVTX range. Public serving uses DFlash k4, optimized proposal head, NVFP4 KV,
+no prefix reuse, context 8192 and KV capacity `min(32768, 8192*C)`.
+The greedy `tools/bench/fixtures/tool_mask_records.json` request actually calls
+`emit_records`; every accepted response has the exact requested JSON arguments,
+`tool_calls` finish reason, 648 prompt tokens and 365 completion tokens.
+
+Each independently monitored matched pair uses one concurrency, one warmup wave
+and five measured waves per binary. Fixed pair order is AB, BA, AB for each C;
+A is serial masking and B initially overlaps masking at every active batch size.
+A pair is accepted only when both variants qualify and the outer queue reports
+completion with no foreign GPU client observed. Intrusions invalidate the whole
+pair; the first clean retry is retained. These measurements use normal application
+clocks and the same artifact, request and output length, not selected best waves.
+
+| Active C | Pair 1 wall reduction | Pair 2 | Pair 3 | Median paired reduction |
+|---:|---:|---:|---:|---:|
+| 1 | −0.140% | −2.345% | −0.277% | −0.277% |
+| 4 | +0.759% | +1.411% | +1.168% | +1.168% |
+| 6 | +1.109% | +1.609% | +1.283% | +1.283% |
+
+The unconditional implementation was rejected for C1. A second candidate
+forked only for actual active batch sizes 4 and 6; batches 1, 2, 3 and 5 retain
+serial masking. Batch size is already a separate CUDA Graph topology. Candidate
+IDs become ready before the host exchange starts; target compute proceeds
+independently and joins the mask completion event immediately before sampling.
+Teardown and partial-enqueue error paths drain the host stream before destroying
+borrowed output sessions. The selected exchange regression passed eager execution,
+capture, same-topology graph updates and distinct per-row masks at C1–6, plus a
+C4 fork-without-join drain before session destruction.
+The subsequent ordinary p-less C4 startup exposed a real graph-update failure
+at frontier 512: CUDA rejected a 2D D2D memcpy parameter update. The correction
+uses per-row 1D device copies into the same fixed-pitch staging and adds
+same-shape recapture with different input addresses to the regression. The
+corrected exchange regression and real serving graph startup passed; the table
+above describes the original selection experiment only.
+One clean matched AB confirmation per C on that corrected binary passed
+exact tool-output qualification, again with 365 completion tokens per response:
+C1 −0.131%, C4 +0.931%, C6 +1.175% wave-wall reductions. These confirm the
+larger-batch tool benefit and near-neutral serial C1 behavior. See
+`profiles/bench/experimental-candidates/grammar-rowcopy-tool-summary.json`.
+
+Long ordinary p-less comparisons then rejected batch-only overlap. With 4096
+output tokens per request, C4 steady throughput fell 0.972% and whole-wave time
+rose 1.043%; C6 throughput fell 1.198% and wave time rose 1.248%. The steady
+measurements contain 30/34 full-batch one-second intervals, respectively; both
+matched pairs passed output-limit and token-total checks without foreign GPU
+activity. Earlier 512-token windows were too coarse for this decision.
+Those two ordinary pairs both ran the candidate second (AB order); the retained
+measurements below show a comparable order effect, so that rejection may have
+overstated the batch-only cost, but it was not re-measured.
+
+The retained candidate captures separate Serial/Overlap profiles and selects
+Overlap only for DFlash2 k4/W5, actual C4/C6, and all active sessions bearing
+tool grammars; ordinary and mixed batches select Serial, whose only difference
+from baseline is the per-row staging copy. Graph allowance grows by 6/12 MiB at
+C4/C6. Its exchange regression passed eager/capture/update checks at C1–6 plus
+the partial-fork drain. Matched pairs, all with no foreign GPU client observed
+(ordinary C4 pair 0 attempt 1 was contaminated and replaced by attempt 2):
+
+| Workload | C | Pair 1 (AB) | Pair 2 (BA) | Pair 3 (AB) | Median |
+|---|---:|---:|---:|---:|---:|
+| Tool waves, wall reduction | 4 | +1.054% | +1.171% | +1.056% | +1.056% |
+| Tool waves, wall reduction | 6 | +1.120% | +1.829% | +1.179% | +1.179% |
+| Ordinary 4096-token, steady throughput | 4 | −0.548% | +0.357% | — | −0.10% mean |
+| Ordinary 4096-token, steady throughput | 6 | −0.733% | +0.591% | — | −0.07% mean |
+
+Tool responses remained exact (365 completion tokens, identical arguments).
+Ordinary pairs flip sign with execution order (30/34 full-batch intervals;
+committed tokens per row-round match), so no ordinary regression is resolved.
+Receipts: `profiles/bench/experimental-candidates/grammar-toolonly-summary.json`.
+
+After rebasing onto `931617b2` (tensor-core projections, sampled p-less drafts,
+disk-tier I/O changes), the same harness compared that revision with the rebased
+change in one AB and one BA pair per workload, again with no foreign GPU client
+observed. Tool waves: C4 +1.043%/+1.494%, C6 +1.373%/+1.860% wall reduction.
+Ordinary 4096-token steady throughput: C4 −0.211%/+0.147%, C6 −0.188%/+0.398%.
+The real-artifact `--case mrope-rewrite` replay also passed. Receipts are the
+`rebase-*` entries in the same directory.
+
+A separate clean C1/C4 trace motivated the trial: the final 76-round tool wave
+contained 19.62/44.70 ms of exposed compute gaps around grammar exchange, including
+13.58/36.74 ms of CPU mask filling. Trace timings are attribution, not the A/B
+speed result. Ordinary requests also traverse this exchange, so their regression
+gate remains necessary before keeping the larger-batch route. Local evidence:
+`profiles/bench/experimental-candidates/grammar-tool-pairs-summary.json`,
+`grammar-exposure-clean/` and `grammar-selected-exchange-job/` under that directory.
+
+## Selective TMA weight-cache hints rejected (2026-09-27)
+
+The NVFP4 A4 down-projection candidate was discarded on experimental `d29841e0`,
+RTX 5090, SM120a, CUDA 13.1. It added an L2 evict-first hint only to weight-code
+and weight-scale TMA loads at N=5120, K=17408. Activation loads, arithmetic,
+barrier accounting and the existing tile schedule stayed unchanged. The calibrated
+`tools.kdev` bound admitted prefill T=1024/4096; this was not a decode candidate.
+Both public Linear and LinearAdd passed their unchanged independent numerical oracles.
+
+Frozen baseline/candidate binaries were compared in three order-alternating pairs
+per Op and width, with 10 warmups and 80 cold-cache samples per run. Each complete
+A/B pair held the shared GPU lock and had its own interference monitor. All twelve
+accepted pairs completed successfully with no foreign GPU client observed; the
+monitor samples once per second and cannot distinguish same-container clients.
+Three earlier whole batches and one atomic pair were excluded for observed foreign
+GPU activity. The first clean retry of each fixed pair was used, independently of
+its timing. The table reports medians of the three run medians, not best samples.
+
+| Public Op | T | Baseline us | Candidate us | Latency change |
+|---|---:|---:|---:|---:|
+| Linear | 1024 | 198.112 | 197.632 | −0.24% |
+| Linear | 4096 | 710.272 | 726.400 | +2.27% |
+| LinearAdd | 1024 | 200.704 | 201.408 | +0.35% |
+| LinearAdd | 4096 | 728.736 | 761.504 | +4.50% |
+
+The small Linear T=1024 difference did not repeat consistently across pairs.
+Every T=4096 pair regressed for both Ops, including reversed execution order.
+The shape-wide hint was removed; baseline source remains selected. This rejects
+this particular weight/scales eviction policy and geometry, not every selective
+cache policy or alternative tile schedule. No Engine speed claim or additional
+Engine A/B follows from this losing Op candidate. Accepted receipts and frozen
+prototype evidence are under `profiles/bench/experimental-candidates/tma-pairs/`
+and `profiles/bench/experimental-candidates/tma-data/`.
+
+## GDN prefill state/output fusion rejected (2026-09-27)
+
+A grouped GDN state/output fusion was tested on experimental `d29841e0`, RTX 5090,
+SM120a and CUDA 13.1, for the Qwen3.8-27B public running-state Op
+(Hq16/Hv48, state dimension 128, normalization enabled, BF16 Q/K/V inputs and
+FP32 persistent state). The candidate retained FP16 private preparation and fused state passing
+with output production. The independent FP64 recurrence oracle passed, including
+an added grouped T4096 case, without changing numerical criteria.
+
+Three order-alternating A/B pairs used CUDA Graph execution, cold L2, 20 warmups
+and 200 samples per run. No foreign GPU client was observed during the accepted
+batch. Median latencies across the three runs were:
+
+| Tokens | Baseline (µs) | Fusion (µs) | Latency change |
+|---:|---:|---:|---:|
+| 1024 | 157.696 | 221.184 | +40.26% |
+| 3404 | 589.792 | 759.808 | +28.83% |
+| 4096 | 700.416 | 905.216 | +29.24% |
+| 8192 | 1394.720 | 1796.096 | +28.78% |
+
+The fusion was discarded; the original implementation remains selected. The
+baseline T4096 production trace attributed 47.4% of kernel time to state passing,
+25.0% to preparation, 22.3% to output and 5.2% to normalization. That exposure
+justified the experiment but did not predict a win: reducing the graph from five
+to four nodes did not offset the fused route's cost. No Engine speedup is claimed.
+Candidate code and its candidate-only test were removed, and the original GDN
+bench/test targets rebuilt. Local evidence is in
+`profiles/bench/experimental-candidates/gdn-data/result.md` and
+`profiles/bench/experimental-candidates/gdn-candidate/`.
+
 ## DFlash drafter tensor cores and A8 panel count (2026-09-26)
 
 Three changes on `qwen3.8-27b/nvfp4` DFlash2, RTX 5090, NVFP4 KV:

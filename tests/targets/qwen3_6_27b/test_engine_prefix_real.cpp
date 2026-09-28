@@ -655,7 +655,67 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     return 0;
 }
 
+// A reused image prefix leaves only text to prefill, but that suffix still needs mRoPE.
+// Its newly captured rewrite state must be usable by the next exact-prompt replay.
+int exercise_mrope_rewrite(ninfer::Engine& engine) {
+    ninfer::PromptInput first_input;
+    first_input.options.enable_thinking = false;
+    // Retain the turn closure before the no-thinking prologue: Qwen3.8 history
+    // omits that empty wrapper, so a full-prompt first checkpoint cannot match.
+    first_input.options.preserve_thinking = false;
+    ninfer::ChatMessage user = text_turn(ninfer::ChatRole::User, "Describe the image briefly.");
+    ninfer::MessagePart image;
+    image.kind = ninfer::MessagePartKind::Media;
+    image.media.kind = ninfer::MediaKind::Image;
+    image.media.bytes = gradient_ppm();
+    image.media.media_type = "image/x-portable-pixmap";
+    image.media.source_name = "mrope-rewrite.ppm";
+    user.parts.insert(user.parts.begin(), std::move(image));
+    first_input.messages.push_back(std::move(user));
+
+    const auto first = engine.generate(engine.prepare(first_input), greedy_reuse(false, 2));
+    if (!first.prompt.has_media || first.generated_token_ids.size() != 2) {
+        std::cerr << "mrope rewrite: initial image request failed\n";
+        return 1;
+    }
+    ninfer::PromptInput followup = first_input;
+    // The newly prefetched suffix checkpoint must cover its complete prompt.
+    followup.options.preserve_thinking = true;
+    auto assistant = text_turn(ninfer::ChatRole::Assistant, first.content);
+    assistant.reasoning_content = first.reasoning;
+    followup.messages.push_back(std::move(assistant));
+    followup.messages.push_back(text_turn(ninfer::ChatRole::User, "Give one more detail."));
+
+    const auto suffix = engine.generate(engine.prepare(followup), greedy_reuse(true, 4));
+    if (!suffix.prompt.has_media || suffix.reused_prompt_tokens == 0 ||
+        suffix.reused_prompt_tokens >= suffix.prompt.prompt_tokens ||
+        suffix.timings.vision_seconds != 0.0 || suffix.generated_token_ids.size() != 4) {
+        std::cerr << "mrope rewrite: expected a nonempty vision-free media suffix, reused="
+                  << suffix.reused_prompt_tokens << " prompt=" << suffix.prompt.prompt_tokens
+                  << " vision=" << suffix.timings.vision_seconds << '\n';
+        return 1;
+    }
+    const auto restored = engine.generate(engine.prepare(followup), greedy_reuse(true, 4));
+    if (restored.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
+        restored.reused_prompt_tokens != restored.prompt.prompt_tokens ||
+        restored.reused_prompt_tokens <= suffix.reused_prompt_tokens ||
+        restored.timings.vision_seconds != 0.0 ||
+        restored.generated_token_ids != suffix.generated_token_ids) {
+        std::cerr << "mrope rewrite: suffix checkpoint replay failed, path="
+                  << reuse_path_name(restored.prefix_reuse_path)
+                  << " reused=" << restored.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    // The oracle here is replay of the same captured prefill trajectory. A cold request
+    // with preserve_thinking=true omits the earlier TurnClosure split used by the first
+    // request, so cold argmax identity would additionally impose partition invariance
+    // on floating-point prefill; it does not qualify this host checkpoint transition.
+    std::cout << "mrope rewrite: vision-free suffix and full host checkpoint replay match\n";
+    return 0;
+}
+
 int exercise_vision(ninfer::Engine& engine) {
+    if (const int rc = exercise_mrope_rewrite(engine); rc != 0) { return rc; }
     const auto image_bytes = gradient_ppm();
     auto image_part        = [](const std::vector<std::uint8_t>& bytes, std::string name) {
         ninfer::MessagePart image;
@@ -929,10 +989,12 @@ int exercise_artifact(const char* artifact) {
 }
 
 int main(int argc, char** argv) {
-    const bool vision_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                             std::string(argv[2]) == "vision";
-    if (argc != 1 && !vision_only) {
-        std::cerr << "usage: prefix_real [--case vision]\n";
+    const std::string selected =
+        argc == 3 && std::string(argv[1]) == "--case" ? std::string(argv[2]) : std::string();
+    const bool vision_only = selected == "vision";
+    const bool mrope_only  = selected == "mrope-rewrite";
+    if (argc != 1 && !vision_only && !mrope_only) {
+        std::cerr << "usage: prefix_real [--case vision|mrope-rewrite]\n";
         return 1;
     }
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
@@ -944,6 +1006,16 @@ int main(int argc, char** argv) {
                      "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
                      "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
         return 77;
+    }
+    if (mrope_only) {
+        if (dflash == nullptr || *dflash == '\0') {
+            std::cerr << "mrope rewrite requires NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
+            return 77;
+        }
+        auto options = dflash_engine_options(dflash);
+        options.enable_vision = true;
+        ninfer::Engine engine(options);
+        return exercise_mrope_rewrite(engine);
     }
     if (vision_only && (groupwise == nullptr || *groupwise == '\0') &&
         (nvfp4 == nullptr || *nvfp4 == '\0')) {

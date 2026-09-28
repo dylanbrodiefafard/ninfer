@@ -188,11 +188,13 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label,
-                                         std::uint32_t draft_k = 0) {
+                                         std::uint32_t draft_k = 0,
+                                         qwen3_6::ToolMaskSchedule mask_schedule = qwen3_6::ToolMaskSchedule::Serial) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
-                   frontier <= profile.max_execution_frontier && profile.draft_k == draft_k;
+                   frontier <= profile.max_execution_frontier && profile.draft_k == draft_k &&
+                   profile.tool_mask_schedule == mask_schedule;
         });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
@@ -502,6 +504,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
+    // A round can fail after forking the host callback but before its compute
+    // join. Drain before destroying requests (the callback borrows sessions).
+    if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (device.host_stream != nullptr) { (void)cudaStreamSynchronize(device.host_stream); }
     try {
         shutdown_kv_tiers();
     } catch (...) {}
@@ -3143,8 +3149,12 @@ void ProgramImplCore::prepare_graphs() {
         std::size_t dflash_profile_count = 0;
         for (const std::uint32_t k : captured_ks) {
             const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
-            dflash_profile_count +=
-                dflash_graph_profiles(capacity, k, 1, wk).size() * max_concurrency;
+            for (std::uint32_t batch = 1; batch <= max_concurrency; ++batch) {
+                const std::size_t schedules =
+                    DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2 &&
+                    qwen3_6::has_tool_mask_overlap_profile(k, wk, batch) ? 2U : 1U;
+                dflash_profile_count += dflash_graph_profiles(capacity, k, batch, wk).size() * schedules;
+            }
         }
         dflash_graphs.profiles.reserve(dflash_profile_count);
         for (std::uint32_t k_index = 0; k_index < captured_ks.size(); ++k_index) {
@@ -3154,25 +3164,32 @@ void ProgramImplCore::prepare_graphs() {
                 const auto planned_profiles =
                     dflash_graph_profiles(capacity, k, batch_size, wk);
                 validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    dflash_graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    profile.draft_k                = k;
-                    profile.verify_width           = wk;
-                    profile.topology_class         = qwen3_6::adaptive_topology_class(
-                        k_index, k_stride, planned.topology_class, max_concurrency, batch_size);
-                    const ops::GqaExecutionEnvelope target_envelope{
-                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                               capacity, static_cast<std::uint64_t>(planned.max) + wk))};
-                    prepare_representative(planned.min, batch_size, k);
-                    device.synchronize();
-                    schedule::capture_dflash_decode_batch(
-                        dflash_state, static_cast<std::int32_t>(batch_size), k, wk,
-                        dflash_envelopes(planned.min, planned.max, k), target_envelope,
-                        profile.definition);
+                const std::uint32_t schedules =
+                    DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2 &&
+                    qwen3_6::has_tool_mask_overlap_profile(k, wk, batch_size) ? 2U : 1U;
+                for (std::uint32_t mask_mode = 0; mask_mode < schedules; ++mask_mode) {
+                    dflash_state.tool_mask_schedule = static_cast<qwen3_6::ToolMaskSchedule>(mask_mode);
+                    for (const GraphExecutionProfile planned : planned_profiles) {
+                        dflash_graphs.profiles.emplace_back();
+                        DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
+                        profile.batch_size             = batch_size;
+                        profile.min_execution_frontier = planned.min;
+                        profile.max_execution_frontier = planned.max;
+                        profile.draft_k                = k;
+                        profile.verify_width           = wk;
+                        profile.topology_class         = qwen3_6::adaptive_topology_class(
+                            k_index, k_stride, planned.topology_class, max_concurrency, batch_size) * 2U + mask_mode;
+                        profile.tool_mask_schedule = dflash_state.tool_mask_schedule;
+                        const ops::GqaExecutionEnvelope target_envelope{
+                            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                   capacity, static_cast<std::uint64_t>(planned.max) + wk))};
+                        prepare_representative(planned.min, batch_size, k);
+                        device.synchronize();
+                        schedule::capture_dflash_decode_batch(
+                            dflash_state, static_cast<std::int32_t>(batch_size), k, wk,
+                            dflash_envelopes(planned.min, planned.max, k), target_envelope,
+                            profile.definition);
+                    }
                 }
             }
         }
@@ -4179,6 +4196,14 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             std::max(maximum_target_tokens, sequences[lanes[row]].execution_frontier + live_w);
     }
 
+    const auto mask_schedule =
+        DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2 &&
+        qwen3_6::has_tool_mask_overlap_profile(batch_k, live_w,
+                                              static_cast<std::uint32_t>(lanes.size())) &&
+        std::all_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
+            return requests[lane].output && requests[lane].output->has_tool_grammar();
+        }) ? qwen3_6::ToolMaskSchedule::Overlap : qwen3_6::ToolMaskSchedule::Serial;
+
     try {
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, batch_k);
@@ -4186,7 +4211,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch", batch_k);
+                                     maximum_frontier, "DFlash batch", batch_k, mask_schedule);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
                                                profile.max_execution_frontier, batch_k);
@@ -4239,7 +4264,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                     *io.dflash_decode,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
-                                                    tail_hidden_store, tool_masks.get()};
+                                                    tail_hidden_store, tool_masks.get(), mask_schedule};
 
         bind_tool_mask_batch(lanes);
         mark_workspace_usage(workspace_plan.dflash_round);
