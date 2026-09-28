@@ -7,8 +7,11 @@
 
 namespace ninfer::ops {
 
+// Pipelined keeps two tile stages resident: tile t's QK/softmax and V dequant run in the same
+// barrier interval as tile t-1's PV, while tile t+1's compressed K/V copies are in flight.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, bool TreeMasked, typename CacheInput>
+          bool Pipelined, bool DynamicArena, bool MultiBatch, bool Masked, bool TreeMasked,
+          typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_nvfp4_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
@@ -38,6 +41,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
     constexpr float Log2E              = 1.4426950408889634074f;
     constexpr unsigned FullMask        = 0xffffffffu;
+    constexpr int Stages               = Pipelined ? 2 : 1;
+    constexpr int StageBytes           = 2 * Bc * CodeW + 2 * Bc * D;
 
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(Bc == 32 || Bc == 64);
@@ -46,19 +51,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
 
     __shared__ __align__(16) std::uint8_t q_s[Br * CodeW];
-    __shared__ __align__(16) std::uint8_t
-        static_r_s[DynamicArena ? 16 : (Bc * CodeW + Bc * CodeW + 2 * Bc * D)];
+    __shared__ __align__(16) std::uint8_t static_r_s[DynamicArena ? 16 : Stages * StageBytes];
     extern __shared__ __align__(16) std::uint8_t dynamic_r_s_nvfp4[];
-    std::uint8_t* r_s        = DynamicArena ? dynamic_r_s_nvfp4 : static_r_s;
-    std::uint8_t* q_codes    = q_s;
-    std::uint8_t* k_codes    = r_s;
-    std::uint8_t* v_codes    = r_s + Bc * CodeW;
-    __nv_bfloat16* v_bf16    = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * CodeW);
-    __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
-    __shared__ float alpha_s[Br];
+    std::uint8_t* r_s     = DynamicArena ? dynamic_r_s_nvfp4 : static_r_s;
+    std::uint8_t* q_codes = q_s;
+    __shared__ __align__(16) __nv_bfloat16 p_stages[Stages * Br * Bc];
+    __shared__ float alpha_stages[Stages * Br];
     __shared__ __align__(16) std::uint8_t q_scale_s[Br * Groups];
-    __shared__ __align__(16) std::uint8_t k_scale_s[Bc * Groups];
-    __shared__ __align__(16) std::uint8_t v_scale_s[Bc * Groups];
+    __shared__ __align__(16) std::uint8_t k_scale_stages[Stages * Bc * Groups];
+    __shared__ __align__(16) std::uint8_t v_scale_stages[Stages * Bc * Groups];
     __shared__ std::int32_t physical_pages_s[PageIds];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
@@ -236,7 +237,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
 
-    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+    auto issue_kv_tile = [&]<int Stage>(int tile_k0, int physical_page) {
+        std::uint8_t* k_codes   = r_s + Stage * StageBytes;
+        std::uint8_t* v_codes   = k_codes + Bc * CodeW;
+        std::uint8_t* k_scale_s = k_scale_stages + Stage * Bc * Groups;
+        std::uint8_t* v_scale_s = v_scale_stages + Stage * Bc * Groups;
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
@@ -270,17 +275,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         ninfer::ops::cp_commit();
     };
 
-    int physical_page = physical_pages_s[0];
-    issue_kv_tile(first_tile, physical_page);
-    ninfer::ops::cp_wait<0>();
-    __syncthreads();
-
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = first_tile + kb * Bc;
-
+    // Producer warps score tile kb into P/alpha[stage]; the remaining warps decode its V.
+    auto score_and_decode = [&]<int Stage>(int k0) {
+        const std::uint8_t* k_codes   = r_s + Stage * StageBytes;
+        const std::uint8_t* v_codes   = k_codes + Bc * CodeW;
+        __nv_bfloat16* v_bf16         = reinterpret_cast<__nv_bfloat16*>(
+            r_s + Stage * StageBytes + 2 * Bc * CodeW);
+        const std::uint8_t* k_scale_s = k_scale_stages + Stage * Bc * Groups;
+        const std::uint8_t* v_scale_s = v_scale_stages + Stage * Bc * Groups;
+        float* alpha_s                = alpha_stages + Stage * Br;
         if (warp < RowTiles) {
             const int producer_row_base = warp * 16;
-            __nv_bfloat16* p_sw         = &p_s[producer_row_base * Bc];
+            __nv_bfloat16* p_sw         = &p_stages[Stage * Br * Bc + producer_row_base * Bc];
             float score[QKNt][4];
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -432,21 +438,17 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
             }
         }
-        __syncthreads();
+    };
 
-        const bool has_next = kb + 1 < key_blocks;
-        if (has_next) {
-            const int next_k0 = k0 + Bc;
-            if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
-            }
-            issue_kv_tile(next_k0, physical_page);
-        }
-
+    // Every warp rescales its accumulator slice by tile alpha, then adds P[stage] x V[stage].
+    auto accumulate_pv = [&]<int Stage>() {
+        const __nv_bfloat16* v_bf16 =
+            reinterpret_cast<const __nv_bfloat16*>(r_s + Stage * StageBytes + 2 * Bc * CodeW);
+        const float* alpha_s        = alpha_stages + Stage * Br;
         const int consumer_tile     = warp % RowTiles;
         const int consumer_slice    = warp / RowTiles;
         const int consumer_row_base = consumer_tile * 16;
-        __nv_bfloat16* p_consumer   = &p_s[consumer_row_base * Bc];
+        const __nv_bfloat16* p_consumer = &p_stages[Stage * Br * Bc + consumer_row_base * Bc];
         const float alpha0          = alpha_s[consumer_row_base + gid];
         const float alpha1          = alpha_s[consumer_row_base + gid + 8];
 #pragma unroll
@@ -477,8 +479,54 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                          vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
-        __syncthreads();
+    };
+
+    int physical_page = physical_pages_s[0];
+    const auto next_page = [&](int next_k0) {
+        if ((next_k0 & kPagedKVPageMask) == 0) {
+            physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
+        }
+        return physical_page;
+    };
+    issue_kv_tile.template operator()<0>(first_tile, physical_page);
+    ninfer::ops::cp_wait<0>();
+    __syncthreads();
+
+    if constexpr (Pipelined) {
+        // Interval kb reads codes[kb & 1] and P/V[(kb - 1) & 1], writes P/V[kb & 1], and
+        // fills codes[(kb + 1) & 1]; each stage was last read before the previous barrier.
+        auto pipelined_interval = [&]<int Stage>(int kb) {
+            const int k0        = first_tile + kb * Bc;
+            const bool has_next = kb + 1 < key_blocks;
+            if (has_next) {
+                issue_kv_tile.template operator()<Stage ^ 1>(k0 + Bc, next_page(k0 + Bc));
+            }
+            score_and_decode.template operator()<Stage>(k0);
+            if (kb > 0) { accumulate_pv.template operator()<Stage ^ 1>(); }
+            if (has_next) { ninfer::ops::cp_wait<0>(); }
+            __syncthreads();
+        };
+        for (int kb = 0; kb < key_blocks; kb += 2) {
+            pipelined_interval.template operator()<0>(kb);
+            if (kb + 1 < key_blocks) { pipelined_interval.template operator()<1>(kb + 1); }
+        }
+        if ((key_blocks & 1) == 0) {
+            accumulate_pv.template operator()<1>();
+        } else {
+            accumulate_pv.template operator()<0>();
+        }
+    } else {
+        for (int kb = 0; kb < key_blocks; ++kb) {
+            const int k0 = first_tile + kb * Bc;
+            score_and_decode.template operator()<0>(k0);
+            __syncthreads();
+
+            const bool has_next = kb + 1 < key_blocks;
+            if (has_next) { issue_kv_tile.template operator()<0>(k0 + Bc, next_page(k0 + Bc)); }
+            accumulate_pv.template operator()<0>();
+            if (has_next) { ninfer::ops::cp_wait<0>(); }
+            __syncthreads();
+        }
     }
 
     if (warp < RowTiles && lid == 0) {
