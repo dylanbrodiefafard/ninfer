@@ -1547,7 +1547,8 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
 }
 
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
-                                            bool may_block, bool* deferred) {
+                                            bool may_block, bool* deferred,
+                                            std::span<const std::uint64_t> attempt_ram_ids) {
     if (ram_entry_id != nullptr) { *ram_entry_id = 0; }
     if (deferred != nullptr) { *deferred = false; }
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
@@ -1574,7 +1575,7 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
         }
         if (result.status == qwen3_6::detail::RamCaptureStatus::Dropped) { return false; }
         if (kv_disk_cache_) {
-            const auto reclaimed = kv_disk_cache_->reclaim_ram_entry(may_block);
+            const auto reclaimed = kv_disk_cache_->reclaim_ram_entry(may_block, attempt_ram_ids);
             if (reclaimed == qwen3_6::detail::RamReclaim::Evicted ||
                 reclaimed == qwen3_6::detail::RamReclaim::Retry) {
                 continue;

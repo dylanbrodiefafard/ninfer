@@ -547,7 +547,7 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t) const noexcept { return 0; }
     [[nodiscard]] bool capture_retained_lane(std::uint32_t, std::uint64_t* = nullptr, bool = true,
-                                             bool* = nullptr) {
+                                             bool* = nullptr, std::span<const std::uint64_t> = {}) {
         return false;
     }
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t, std::uint64_t,

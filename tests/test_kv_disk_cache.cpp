@@ -10327,6 +10327,60 @@ int test_ram_reclaim_waits_for_inflight_spill(ninfer::DeviceContext& ctx,
     return failures;
 }
 
+// An admission that captures several lanes rolls every capture back when it
+// defers. Its own earlier capture must not become a later capture's reclaim
+// target, or each retry recaptures it, targets it and rolls it back again.
+int test_ram_reclaim_skips_attempt_captures(ninfer::DeviceContext& ctx,
+                                            ninfer::PagedKVPool& pool) {
+    TmpDir dir("ram-reclaim-attempt");
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto alloc = pool.reserve(4);
+    alloc.materialize_pages(3, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           64ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(std::move(cfg));
+    const auto older = capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 47));
+    disk.note_ram_resident(older, 0);
+    disk.test_arm_fail_prepare_spill();
+    if (disk.emergency_spill_ram(older)) {
+        alloc.release();
+        return fail("ram-reclaim-attempt fixture spill did not fail");
+    }
+    const auto attempt =
+        capture_tokens(ram, pool, alloc, ctx, std::vector<ninfer::TokenId>(64, 48));
+    disk.note_ram_resident(attempt, 0);
+    // Any disk write from here on would take seconds.
+    disk.test_set_payload_io_stall_ms(2000);
+    const auto resident = [&](std::uint64_t id) {
+        const auto ids = ram.fifo_ids();
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    };
+    const std::array<std::uint64_t, 1> keep{attempt};
+    int failures = 0;
+    const auto drops = disk.snapshot().drops;
+    const auto t0    = std::chrono::steady_clock::now();
+    const auto first = disk.reclaim_ram_entry(false, keep);
+    if (first != q36::detail::RamReclaim::Evicted || resident(older) || !resident(attempt) ||
+        disk.ram_reclaim_pending()) {
+        failures += fail("reclaim targeted this attempt's capture instead of dropping the "
+                         "unsavable older entry");
+    }
+    if (disk.snapshot().drops != drops + 1) {
+        failures += fail("dropping the unsavable older entry was not counted");
+    }
+    const auto second = disk.reclaim_ram_entry(false, keep);
+    if (second != q36::detail::RamReclaim::NoVictim || !resident(attempt) ||
+        disk.ram_reclaim_pending()) {
+        failures += fail("reclaim with only this attempt's capture left did not refuse");
+    }
+    if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500)) {
+        failures += fail("reclaim excluding this attempt's capture waited on disk I/O");
+    }
+    disk.test_set_payload_io_stall_ms(0);
+    alloc.release();
+    return failures;
+}
+
 // restore_device waits for another entry's in-flight window reads. The
 // readiness probe lets admission keep decoding instead of taking that wait.
 int test_restore_setup_ready_tracks_window_reads(ninfer::DeviceContext& ctx,
@@ -16957,6 +17011,7 @@ int main(int argc, char** argv) {
                test_plan_match_during_compaction(ctx, paged_pool) +
                test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool) +
                test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool) +
+               test_ram_reclaim_skips_attempt_captures(ctx, paged_pool) +
                test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     }
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
@@ -17117,6 +17172,7 @@ int main(int argc, char** argv) {
     failures += test_plan_match_during_compaction(ctx, paged_pool);
     failures += test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool);
     failures += test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool);
+    failures += test_ram_reclaim_skips_attempt_captures(ctx, paged_pool);
     failures += test_restore_setup_ready_tracks_window_reads(ctx, paged_pool);
     failures += test_disk_fifo_evict_clears_ram_durable(ctx, paged_pool);
     failures += test_lock_does_not_wipe_tmp_before_flock(ctx, paged_pool);

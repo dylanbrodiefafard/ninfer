@@ -267,8 +267,9 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 
 template <>
 bool Program<Variant>::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
-                                             bool may_block, bool* deferred) {
-    return impl_->capture_retained_lane(lane, ram_entry_id, may_block, deferred);
+                                             bool may_block, bool* deferred,
+                                             std::span<const std::uint64_t> attempt_ram_ids) {
+    return impl_->capture_retained_lane(lane, ram_entry_id, may_block, deferred, attempt_ram_ids);
 }
 
 template <>

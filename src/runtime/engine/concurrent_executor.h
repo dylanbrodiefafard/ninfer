@@ -2111,8 +2111,9 @@ private:
                     // A capture held back by a pending disk spill is retried
                     // instead, keeping the victim's GPU pages until it lands.
                     bool deferred = false;
-                    (void)instance_.program->capture_retained_lane(*victim, &ram_id,
-                                                                   !others_decoding, &deferred);
+                    (void)instance_.program->capture_retained_lane(
+                        *victim, &ram_id, !others_decoding, &deferred,
+                        std::span(captured_ram_ids).first(captured_ram_count));
                     if (deferred) { return defer_for_reclaim(); }
                     if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                     victims[victim_count++] = *victim;
@@ -2122,8 +2123,9 @@ private:
             if (captures_lane) {
                 std::uint64_t ram_id = 0;
                 bool deferred = false;
-                (void)instance_.program->capture_retained_lane(lane, &ram_id, !others_decoding,
-                                                               &deferred);
+                (void)instance_.program->capture_retained_lane(
+                    lane, &ram_id, !others_decoding, &deferred,
+                    std::span(captured_ram_ids).first(captured_ram_count));
                 if (deferred) { return defer_for_reclaim(); }
                 if (ram_id != 0) { captured_ram_ids[captured_ram_count++] = ram_id; }
                 if (std::find(victims.begin(), victims.begin() + victim_count, lane) ==

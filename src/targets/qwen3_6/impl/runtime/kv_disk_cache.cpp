@@ -6497,9 +6497,14 @@ bool KVDiskCache::ram_reclaim_pending() const {
     return reclaim_target_live_locked();
 }
 
-RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block) {
+RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::uint64_t> keep) {
     if (config_.ram == nullptr) { return RamReclaim::NoVictim; }
     KVRamCache& ram = *config_.ram;
+    // Waiting on, or dropping, an entry the caller's deferral would roll back
+    // cannot free room: the retried attempt would recapture it and wait again.
+    const auto kept = [&](std::uint64_t id) {
+        return std::find(keep.begin(), keep.end(), id) != keep.end();
+    };
     // An in-flight spill holds an I/O pin on its entry, so it is never a
     // candidate below; finishing it is the fastest way to a durable victim.
     auto live_spill_ram = [&]() -> std::uint64_t {
@@ -6512,10 +6517,10 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block) {
     };
     std::vector<std::uint64_t> candidates = ram.unpinned_ids();
     if (candidates.empty()) {
-        if (const std::uint64_t spilling = live_spill_ram(); spilling != 0) {
+        if (const std::uint64_t spilling = live_spill_ram(); spilling != 0 && (may_block || !kept(spilling))) {
             if (may_block) { return wait_live_spill(spilling); }
             std::lock_guard lock(mutex_);
-            if (spill_live_locked()) {
+            if (spill_live_locked() && !kept(spill_->ram_id)) {
                 promote_spill_for_reclaim_locked();
                 reclaim_ram_ = spill_->ram_id;
                 return RamReclaim::Pending;
@@ -6544,13 +6549,14 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block) {
             if (!emergency_spill_ram(*victim)) { return RamReclaim::Failed; }
         } else {
             std::lock_guard lock(mutex_);
-            if (reclaim_target_live_locked()) { return RamReclaim::Pending; }
-            if (spill_live_locked()) {
+            if (reclaim_target_live_locked() && !kept(reclaim_ram_)) { return RamReclaim::Pending; }
+            if (spill_live_locked() && !kept(spill_->ram_id)) {
                 promote_spill_for_reclaim_locked();
                 reclaim_ram_ = spill_->ram_id;
                 return RamReclaim::Pending;
             }
             for (std::uint64_t id : candidates) {
+                if (kept(id)) { continue; }
                 const auto it = ram_notes_.find(id);
                 if (it == ram_notes_.end() || it->second.durable ||
                     (it->second.failed_this_generation &&
@@ -6561,8 +6567,11 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block) {
                 cv_.notify_all();
                 return RamReclaim::Pending;
             }
-            // No candidate can be saved to disk this generation.
-            victim  = candidates.front();
+            // No other candidate can be saved to disk this generation.
+            const auto dropped = std::find_if(candidates.begin(), candidates.end(),
+                                              [&](std::uint64_t id) { return !kept(id); });
+            if (dropped == candidates.end()) { return RamReclaim::NoVictim; }
+            victim  = *dropped;
             unsaved = true;
         }
     }
