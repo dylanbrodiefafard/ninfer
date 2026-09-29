@@ -239,8 +239,11 @@ public:
     // durable entry the in-flight spill, or else the oldest entry, is spilled
     // first: synchronously when `may_block`, otherwise at emergency priority on
     // the disk worker, returning Pending so decoding lanes never wait on a disk
-    // write. Only an entry the disk cannot save is dropped unsaved.
-    RamReclaim reclaim_ram_entry(bool may_block);
+    // write. Only an entry the disk cannot save is dropped unsaved. Without
+    // `may_block`, entries in `keep` (captures the caller would roll back on
+    // Pending) are never waited on or dropped unsaved; if only they remain the
+    // result is NoVictim.
+    RamReclaim reclaim_ram_entry(bool may_block, std::span<const std::uint64_t> keep = {});
     // True while a Pending reclaim's spill has neither committed nor failed.
     [[nodiscard]] bool ram_reclaim_pending() const;
 

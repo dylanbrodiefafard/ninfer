@@ -333,8 +333,11 @@ public:
     // false while other lanes are decoding. Without it a full RAM tier whose
     // entries are not yet on disk starts their spill on the disk worker and
     // returns false with `*deferred` set; retry after kv_ram_reclaim_pending() clears.
+    // `attempt_ram_ids` are this admission's earlier captures, which a deferral
+    // rolls back, so reclaim never targets them.
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id = nullptr,
-                                             bool may_block = true, bool* deferred = nullptr);
+                                             bool may_block = true, bool* deferred = nullptr,
+                                             std::span<const std::uint64_t> attempt_ram_ids = {});
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     [[nodiscard]] bool disk_restore_ready(std::uint64_t entry_id) const;

@@ -906,7 +906,9 @@ unpinned disk-durable entry is evicted first. Without one, the in-flight write-b
 else the oldest savable entry, is spilled first: synchronously when no other lane is decoding,
 otherwise at emergency priority on the disk worker while the admission stays queued and the
 other lanes keep decoding. The admission retries once that spill commits, so decoding never waits
-for a disk write and an entry is dropped unsaved only when the disk cannot store it. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
+for a disk write and an entry is dropped unsaved only when the disk cannot store it. The
+admission's own earlier captures, which a deferral rolls back, are never that spill or drop
+target; when only they remain, the capture is dropped and the admission proceeds. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
 immutable entry and its pack-generation lease, restores directly into the selected VRAM lane,
 and never parks the restored bundle in the RAM FIFO. Consuming the claim releases its generation
 lease but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
