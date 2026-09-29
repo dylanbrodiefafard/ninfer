@@ -11,14 +11,6 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-enum class ToolMaskSchedule : std::uint32_t { Serial, Overlap };
-
-// The measured DFlash2 k4/W5 tool workload admits an extra captured schedule.
-inline bool has_tool_mask_overlap_profile(std::uint32_t draft_k, std::uint32_t width,
-                                          std::uint32_t batch) {
-    return draft_k == 4 && width == 5 && (batch == 4 || batch == 6);
-}
-
 // Program-owned, startup-sized exchange. Its address and pinned/device buffers
 // remain stable for every captured graph. Host copies are fixed-size 1D copies of
 // device staging: drivers may refuse to update 2D graph copies that touch host
@@ -36,16 +28,16 @@ public:
     // Ordinary/prefill root sampling; called at a synchronized CPU boundary.
     [[nodiscard]] ops::SamplingConfig root(std::size_t row, cudaStream_t stream);
     // Called inside the speculative graph after ids/parents are constructed and
-    // before target compute. The caller joins the returned ready event, if any, before
-    // target sampling. The returned configs are target-only: draft
-    // proposal sampling must continue to use its own unmasked configs.
+    // before target compute. The exchange forks onto `host`; the caller joins the
+    // returned ready event before target sampling. The returned configs are
+    // target-only: draft proposal sampling keeps its own unmasked configs.
     struct Submission {
         const ops::SamplingConfig* sampling;
         cudaEvent_t ready;
     };
     [[nodiscard]] Submission enqueue(
         const Tensor& ids, const Tensor* parents, const Tensor& valid_columns,
-        cudaStream_t compute, cudaStream_t host, ToolMaskSchedule schedule);
+        cudaStream_t compute, cudaStream_t host);
     void rethrow_error() const;
 
 private:

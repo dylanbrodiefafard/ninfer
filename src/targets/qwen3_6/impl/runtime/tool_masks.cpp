@@ -74,19 +74,18 @@ ops::SamplingConfig ToolMaskExchange::root(std::size_t row, cudaStream_t stream)
 }
 
 ToolMaskExchange::Submission ToolMaskExchange::enqueue(
-    const Tensor& ids, const Tensor* parents, const Tensor& valid_columns, cudaStream_t compute, cudaStream_t host, ToolMaskSchedule schedule) {
+    const Tensor& ids, const Tensor* parents, const Tensor& valid_columns, cudaStream_t compute,
+    cudaStream_t host) {
+    const cudaStream_t stream = host;
     const auto batch = static_cast<std::size_t>(ids.ne[1]);
     const auto width = static_cast<std::size_t>(ids.ne[0]);
     if (width > width_ || batch > capacity_ || ids.dtype != DType::I32 ||
         valid_columns.dtype != DType::I32 || valid_columns.ne[0] != ids.ne[1]) {
         throw std::invalid_argument("invalid speculative tool mask inputs");
     }
-    const bool overlap = schedule == ToolMaskSchedule::Overlap;
-    const cudaStream_t stream = overlap ? host : compute;
-    if (overlap) {
-        CUDA_CHECK(cudaEventRecord(candidates_ready_, compute));
-        CUDA_CHECK(cudaStreamWaitEvent(stream, candidates_ready_, 0));
-    }
+    // Target compute proceeds while the host matcher runs; only sampling joins.
+    CUDA_CHECK(cudaEventRecord(candidates_ready_, compute));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, candidates_ready_, 0));
     // Captured graphs must not store per-launch stack addresses. Shape-specific
     // copies pack into device staging at the fixed max-width pitch; counts delimit
     // valid nodes at replay. Only fixed-size 1D copies cross to host memory.
@@ -125,13 +124,16 @@ ToolMaskExchange::Submission ToolMaskExchange::enqueue(
     CUDA_CHECK(cudaMemcpyAsync(host_counts_.data(), valid_columns.data,
                                batch * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaLaunchHostFunc(stream, parents ? tree_callback : chain_callback, this));
-    CUDA_CHECK(cudaMemcpyAsync(masks_.data, host_masks_.data(), masks_.bytes(),
+    // Rows are contiguous at the fixed max-width pitch; a topology uploads only its
+    // own batch. Rows without a grammar are uploaded but never read.
+    CUDA_CHECK(cudaMemcpyAsync(masks_.data, host_masks_.data(),
+                               batch * width_ * kWords * sizeof(std::uint32_t),
                                cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(sampling_.data, host_sampling_.data(), sampling_.bytes(),
-                               cudaMemcpyHostToDevice, stream));
-    if (overlap) { CUDA_CHECK(cudaEventRecord(masks_ready_, stream)); }
-    return {static_cast<const ops::SamplingConfig*>(sampling_.data),
-            overlap ? masks_ready_ : nullptr};
+    CUDA_CHECK(cudaMemcpyAsync(sampling_.data, host_sampling_.data(),
+                               batch * sizeof(ops::SamplingConfig), cudaMemcpyHostToDevice,
+                               stream));
+    CUDA_CHECK(cudaEventRecord(masks_ready_, stream));
+    return {static_cast<const ops::SamplingConfig*>(sampling_.data), masks_ready_};
 }
 
 void CUDART_CB ToolMaskExchange::match(void* opaque) noexcept {

@@ -64,6 +64,9 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--transitions", action="store_true", help="qualify serial/mixed/all-tool waves on one server")
+    parser.add_argument("--wave", choices=("tools", "mixed"), default="tools",
+                        help="measured wave body: every slot calls the tool, or even slots call it "
+                             "while odd slots decode plain 512-token text")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.runs < 1 or args.warmup < 0 or args.max_tokens < 1:
@@ -89,7 +92,7 @@ def main() -> None:
                       "List every integer from 1 through 1000 in order, one per line. Do not abbreviate or skip any integers."}]}
     records = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        modes = ["plain", "tools", "mixed", "tools", "plain"] if args.transitions else ["tools"] * (args.warmup + args.runs)
+        modes = ["plain", "tools", "mixed", "tools", "plain"] if args.transitions else [args.wave] * (args.warmup + args.runs)
         for wave, mode in enumerate(modes):
             barrier = threading.Barrier(args.concurrency)
 
