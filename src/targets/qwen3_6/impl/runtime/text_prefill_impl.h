@@ -18,7 +18,7 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(
-        state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
+        state, [&state](const Tensor& features, const Tensor& positions) {
             auto& frame  = *state.execution.io.dflash_decode;
             Tensor count = frame.append_counts.slice(0, 0, 1);
             Tensor lane  = frame.lanes.slice(0, 0, 1);
@@ -26,14 +26,6 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
-            if (rewrite_checkpoint) {
-                if (state.rewrite_checkpoint_state.dflash == nullptr) {
-                    throw std::logic_error("DFlash rewrite checkpoint has no host image");
-                }
-                state.dflash->local.copy_lane_to_host(state.dflash_host_ingress->lanes[0],
-                                                      state.rewrite_checkpoint_state.dflash,
-                                                      state.execution.device.stream);
-            }
         });
 }
 
@@ -67,8 +59,6 @@ PrefillChunkResult prefill_text_chunk(
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_rewrite_checkpoint_state_output(state.rewrite_checkpoint_state.conv,
-                                             state.rewrite_checkpoint_state.recurrent);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
@@ -92,8 +82,6 @@ PrefillChunkResult prefill_mrope_text_chunk(
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_rewrite_checkpoint_state_output(state.rewrite_checkpoint_state.conv,
-                                             state.rewrite_checkpoint_state.recurrent);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
@@ -118,8 +106,6 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
-    card.set_rewrite_checkpoint_state_output(state.rewrite_checkpoint_state.conv,
-                                             state.rewrite_checkpoint_state.recurrent);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)

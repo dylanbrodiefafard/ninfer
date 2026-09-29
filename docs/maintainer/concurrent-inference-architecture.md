@@ -353,13 +353,17 @@ state 始终重新创建。
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state；MTP 或 DFlash 引擎额外保留 slot `C` 作为 Engine-wide
 GDN：默认热 occupant 是 turn-rollback（append occupy 在 suffix prefill 之前把 current+`tail_hidden` 钉在
-上一完成 `E`），ladder freeze 借走后再装回。一份 slot 同时选择全部 GDN layers 的 convolution history
+上一完成 `E`），ladder freeze 借走后再装回；rewrite checkpoint capture 借走后不装回（同一 step 内的 freeze
+也因此不装回），之后的 rollback restore 走 host image H2D。一份 slot 同时选择全部 GDN layers 的 convolution history
 和 recurrent state。
 
 Rewrite checkpoint 不占 device slot：每条 lane 拥有一份 pinned host image（GDN slot 与 DFlash cyclic local
-lane 的 host-image layout），首次 capture 或 tier restore 时分配，之后随 lane 复用。Prefill chunk 恰好结束在
-checkpoint frontier 时，在 compute stream 上把 current D2H 进该 image（stream-ordered，先于下一 chunk
-更新 current）；rewrite restore 从该 image H2D 回 current。RAM/SSD tier 与该 image 之间只做 host copy。
+lane 的 host-image layout），随 Program 在启动时分配，之后随 lane 复用。Prefill chunk 恰好结束在
+checkpoint frontier 时，MTP/DFlash 在 compute stream 上把 current（及 DFlash local lane）D2D 进
+Engine-wide staging slot，再由 copy_stream 把 staging drain 进该 image，与后续 prefill/decode 重叠；
+staging 仍持有该 lane 当前 generation 的 image 时，rewrite restore 从 staging D2D 回 current，否则等待
+image copy 后 H2D。其他 staging writer 或 RAM/SSD tier restore（在 host 上替换 image）结束该 staging hit。
+无 MTP/DFlash 时没有 staging slot，capture 在 compute stream 上 D2H。RAM/SSD tier 与该 image 之间只做 host copy。
 Checkpoint hidden `[hidden,1]` 仍在 device。因此 per-lane device fixed state 只剩 current GDN 与 DFlash
 current local，不随 rewrite checkpoint 翻倍。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。

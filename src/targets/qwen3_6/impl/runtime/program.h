@@ -213,6 +213,9 @@ struct SequenceState {
     // allocated with the Program; rewrite_checkpoint says whether its contents are valid. Its
     // fence covers every asynchronous copy that reads or writes it.
     ContextCheckpointHead rewrite_image;
+    // Advances whenever the image contents are replaced (capture or tier restore), so a
+    // staging slot still holding an older capture is never mistaken for it.
+    std::uint64_t rewrite_image_generation = 0;
     std::vector<ContextCheckpointHead> context_checkpoints;
     std::uint32_t next_context_mark = 0;
     // Set by HostDisk staged restore after the matching head is unpacked into current.
@@ -538,13 +541,14 @@ private:
     void run_decode_score(PreparedPromptData&& prompt, runtime::TransientRegion transient,
                           std::span<const TokenId> ids, std::uint32_t prefix, ScoreResult& result);
     void maybe_freeze_context_checkpoint(SequenceState& sequence, RequestControl& request,
-                                         std::uint32_t chunk_tokens);
+                                         std::uint32_t chunk_tokens, bool rewrite_capture_follows);
     void maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
                                      const PreparedPromptData& prompt, ReusePath reuse,
                                      std::uint32_t base, std::uint32_t prompt_tokens,
                                      bool capture_enabled, bool request_pin);
     void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);
     void allocate_rewrite_image(SequenceState& sequence);
+    void capture_rewrite_image(SequenceState& sequence);
     void restore_rewrite_checkpoint_state(SequenceState& sequence);
     [[nodiscard]] qwen3_6::detail::RewriteStateHostTarget
     rewrite_state_host_target(SequenceState& sequence);
@@ -577,6 +581,10 @@ private:
         qwen3_6::detail::PrefixHash128 hash{};
         qwen3_6::detail::ContextCheckpointKind kind =
             qwen3_6::detail::ContextCheckpointKind::Ladder;
+        // Set instead of `occupied` while the slot and DFlash staging lane hold `lane`'s
+        // rewrite image at `rewrite_generation`, so a rewrite restore copies them on device.
+        bool rewrite                     = false;
+        std::uint64_t rewrite_generation = 0;
         cudaEvent_t d2d_done    = nullptr;
         cudaEvent_t copies_done = nullptr;
     };

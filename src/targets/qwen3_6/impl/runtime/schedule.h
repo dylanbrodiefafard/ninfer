@@ -52,14 +52,6 @@ struct ExecutionCore {
     std::int32_t xattn_min_len;
 };
 
-// Pinned host images that receive a rewrite-checkpoint capture: the lane's GDN slot
-// (LinearAttentionStatePool host-image layout) and, for DFlash, its cyclic local lane.
-struct RewriteCheckpointStateOutput {
-    void* conv      = nullptr;
-    void* recurrent = nullptr;
-    void* dflash    = nullptr;
-};
-
 struct PrefillContext {
     ExecutionCore execution;
     qwen3_6::PagedKVCacheView text_kv;
@@ -71,7 +63,6 @@ struct PrefillContext {
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
     std::int32_t current_state_slot                         = 0;
-    RewriteCheckpointStateOutput rewrite_checkpoint_state;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
 };

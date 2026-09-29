@@ -501,6 +501,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         disk.restore_io_threads  = 16;
         kv_disk_cache_.emplace(std::move(disk));
     }
+    // Rewrite captures always pass through staging, so its events exist from startup.
+    if (staging_hidden.data != nullptr) {
+        qwen3_6::detail::create_cache_cuda_event(&staging_.d2d_done, cudaEventDisableTiming);
+        try {
+            qwen3_6::detail::create_cache_cuda_event(&staging_.copies_done,
+                                                     cudaEventDisableTiming);
+        } catch (...) {
+            (void)cudaEventDestroy(staging_.d2d_done);
+            staging_.d2d_done = nullptr;
+            throw;
+        }
+    }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -1613,6 +1625,8 @@ void ProgramImplCore::fence_staging_copies() noexcept {
 }
 
 void ProgramImplCore::unoccupy_staging() noexcept {
+    staging_.rewrite            = false;
+    staging_.rewrite_generation = 0;
     staging_.occupied = false;
     staging_.lane     = 0;
     staging_.frontier = 0;
@@ -1650,6 +1664,7 @@ void ProgramImplCore::reload_turn_rollback_into_staging(std::uint32_t lane,
                                cudaMemcpyHostToDevice, device.copy_stream));
     CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
     record_context_checkpoint_head_use(*head, device.copy_stream);
+    staging_.rewrite  = false;
     staging_.occupied = true;
     staging_.lane     = lane;
     staging_.frontier = frontier;
@@ -1895,23 +1910,72 @@ void ProgramImplCore::allocate_rewrite_image(SequenceState& sequence) {
     }
 }
 
+// Snapshots the current GDN slot (and DFlash local lane) into the staging slot on the compute
+// stream, then drains staging into the lane's pinned image on copy_stream behind later work.
+// Staging keeps the image until another staging writer runs, so a prompt rewrite soon after
+// restores it device-to-device.
+void ProgramImplCore::capture_rewrite_image(SequenceState& sequence) {
+    ContextCheckpointHead& image = sequence.rewrite_image;
+    ++sequence.rewrite_image_generation;
+    const std::int32_t current =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    const auto lane = static_cast<std::int32_t>(sequence.lane);
+    if (staging_hidden.data == nullptr) {
+        // No staging slot without MTP/DFlash: copy to the image on the compute stream.
+        if (dflash) { throw std::logic_error("DFlash rewrite capture requires the staging lane"); }
+        CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
+        decoder->linear_attention.pack_slot_to_host(current, image.conv->data(),
+                                                    image.recurrent->data(), device.stream);
+        record_context_checkpoint_head_use(image, device.stream);
+        return;
+    }
+    unoccupy_staging();
+    // Earlier copy_stream reads of staging (a previous drain or checkpoint pack) finish first.
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, staging_.copies_done, 0));
+    const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    decoder->linear_attention.copy_slot_2d(current, staging, device.stream);
+    if (dflash) { dflash->staging_local.copy_lane_from(dflash->local, lane, 0, device.stream); }
+    CUDA_CHECK(cudaEventRecord(staging_.d2d_done, device.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
+    // A staging-miss restore may still be reading the previous image.
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, image.copies_done, 0));
+    decoder->linear_attention.pack_slot_to_host(staging, image.conv->data(),
+                                                image.recurrent->data(), device.copy_stream);
+    if (dflash) {
+        dflash->staging_local.copy_lane_to_host(0, image.dflash->data(), device.copy_stream);
+    }
+    CUDA_CHECK(cudaEventRecord(image.copies_done, device.copy_stream));
+    CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
+    staging_.rewrite            = true;
+    staging_.rewrite_generation = sequence.rewrite_image_generation;
+    staging_.lane               = sequence.lane;
+}
+
 void ProgramImplCore::restore_rewrite_checkpoint_state(SequenceState& sequence) {
     ContextCheckpointHead& image = sequence.rewrite_image;
-    CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
-    decoder->linear_attention.unpack_slot_from_host(
-        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), image.conv->data(),
-        image.recurrent->data(), device.stream);
-    if (dflash) {
-        dflash->local.copy_lane_from_host(image.dflash->data(),
-                                          static_cast<std::int32_t>(sequence.lane), device.stream);
+    const std::int32_t current =
+        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    const auto lane = static_cast<std::int32_t>(sequence.lane);
+    if (staging_.rewrite && staging_.lane == sequence.lane &&
+        staging_.rewrite_generation == sequence.rewrite_image_generation) {
+        // Staging was written on this stream; the drain only reads it.
+        decoder->linear_attention.copy_slot_2d(LinearStateSlots::staging_state_slot(max_concurrency),
+                                               current, device.stream);
+        if (dflash) { dflash->local.copy_lane_from(dflash->staging_local, 0, lane, device.stream); }
+        return;
     }
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
+    decoder->linear_attention.unpack_slot_from_host(current, image.conv->data(),
+                                                    image.recurrent->data(), device.stream);
+    if (dflash) { dflash->local.copy_lane_from_host(image.dflash->data(), lane, device.stream); }
     record_context_checkpoint_head_use(image, device.stream);
 }
 
 qwen3_6::detail::RewriteStateHostTarget
 ProgramImplCore::rewrite_state_host_target(SequenceState& sequence) {
-    // Tier restores overwrite the image with host copies.
+    // Tier restores overwrite the image with host copies, so staging no longer matches it.
     sequence.rewrite_image.wait_copies();
+    ++sequence.rewrite_image_generation;
     return qwen3_6::detail::RewriteStateHostTarget{
         .conv      = sequence.rewrite_image.conv->data(),
         .recurrent = sequence.rewrite_image.recurrent->data(),
@@ -1943,16 +2007,6 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
     const qwen3_6::detail::PrefixHash128 hash =
         qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity, base);
     auto& heads = sequence.context_checkpoints;
-    try {
-        if (staging_.d2d_done == nullptr) {
-            qwen3_6::detail::create_cache_cuda_event(&staging_.d2d_done, cudaEventDisableTiming);
-        }
-        if (staging_.copies_done == nullptr) {
-            qwen3_6::detail::create_cache_cuda_event(&staging_.copies_done, cudaEventDisableTiming);
-        }
-    } catch (const std::bad_alloc&) {
-        return;
-    }
     ContextCheckpointHead head;
     const auto existing_rollback =
         std::find_if(heads.begin(), heads.end(), [](const ContextCheckpointHead& existing) {
@@ -2006,7 +2060,8 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
 
 void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
                                                       RequestControl& request,
-                                                      std::uint32_t chunk_tokens) {
+                                                      std::uint32_t chunk_tokens,
+                                                      bool rewrite_capture_follows) {
     if (!request.prefill) { return; }
     RequestControl::Prefill& staged = *request.prefill;
     const std::uint32_t frontier    = staged.cursor;
@@ -2027,16 +2082,6 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
 
     const qwen3_6::detail::PrefixHash128 hash = qwen3_6::detail::prefix_hash_at(
         sequence.ledger, sequence.prefix_identity, frontier);
-    try {
-        if (staging_.d2d_done == nullptr) {
-            qwen3_6::detail::create_cache_cuda_event(&staging_.d2d_done, cudaEventDisableTiming);
-        }
-        if (staging_.copies_done == nullptr) {
-            qwen3_6::detail::create_cache_cuda_event(&staging_.copies_done, cudaEventDisableTiming);
-        }
-    } catch (const std::bad_alloc&) {
-        return;
-    }
     ContextCheckpointHead head;
     try {
         sequence.context_checkpoints.reserve(sequence.context_checkpoints.size() + 1);
@@ -2053,8 +2098,10 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
     head.kind     = qwen3_6::detail::ContextCheckpointKind::Ladder;
 
     fence_staging_copies();
+    // A rewrite capture in the same step overwrites staging next; reloading the rollback
+    // would only make the compute stream wait for a copy that is discarded.
     const bool reload_rollback =
-        staging_.occupied &&
+        !rewrite_capture_follows && staging_.occupied &&
         staging_.kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback;
     const std::uint32_t saved_lane     = staging_.lane;
     const std::uint32_t saved_frontier = staging_.frontier;
@@ -3456,16 +3503,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
-        schedule::RewriteCheckpointStateOutput rewrite_checkpoint_output;
-        if (staged.rewrite_checkpoint_capture &&
-            staged.cursor < staged.rewrite_checkpoint_capture->frontier) {
-            ContextCheckpointHead& image = sequence.rewrite_image;
-            rewrite_checkpoint_output    = schedule::RewriteCheckpointStateOutput{
-                   .conv      = image.conv->data(),
-                   .recurrent = image.recurrent->data(),
-                   .dflash    = image.dflash ? image.dflash->data() : nullptr,
-            };
-        }
+        const bool rewrite_capture_pending =
+            staged.rewrite_checkpoint_capture &&
+            staged.cursor < staged.rewrite_checkpoint_capture->frontier;
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -3480,7 +3520,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             &sequence.rewrite_checkpoint_hidden,
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            rewrite_checkpoint_output,
             staged.initial_mtp_extent,
             dflash_host_ingress};
 
@@ -3558,8 +3597,18 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
-            if (rewrite_checkpoint_output.conv != nullptr) {
-                record_context_checkpoint_head_use(sequence.rewrite_image, device.stream);
+            // A freeze host-fences staging and overwrites it, so it runs before the rewrite
+            // capture: the capture's drain then overlaps later work and staging keeps the image.
+            const bool capture_rewrite =
+                rewrite_capture_pending &&
+                staged.cursor >= staged.rewrite_checkpoint_capture->frontier;
+            maybe_freeze_context_checkpoint(sequence, request, result.processed_tokens,
+                                            capture_rewrite);
+            if (capture_rewrite) {
+                if (staged.cursor != staged.rewrite_checkpoint_capture->frontier) {
+                    throw std::logic_error("prefill chunk crossed the rewrite checkpoint frontier");
+                }
+                capture_rewrite_image(sequence);
             }
             if (staged.rewrite_checkpoint_capture &&
                 staged.cursor >= staged.rewrite_checkpoint_capture->frontier) {
@@ -3569,7 +3618,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     .frontier = staged.rewrite_checkpoint_capture->frontier,
                 };
             }
-            maybe_freeze_context_checkpoint(sequence, request, result.processed_tokens);
 
             if (!result.finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
