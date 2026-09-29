@@ -29,9 +29,13 @@ one layer). Workspace is 610.3 MiB for every `C`.
 
 The per-lane rewrite (turn) checkpoint's GDN slot and DFlash rewrite local lane are a lane-owned
 pinned host image allocated with the Program; the device GDN pool is `C` slots plus one
-Engine-wide staging slot (now index `C`). Capture D2Hs the current slot on the compute stream when
-a prefill chunk ends at the checkpoint frontier; rewrite restore H2Ds it back. RAM/SSD tiers copy
-the image on the host.
+Engine-wide staging slot (now index `C`). When a prefill chunk ends at the checkpoint frontier,
+capture copies the current slot (and DFlash local lane) into staging on the compute stream and
+drains staging into the image on `copy_stream`, overlapping later prefill and decode. A rewrite
+restore copies staging back on the device while staging still holds that lane's image at its
+generation; otherwise it H2Ds the image. Any other staging writer, and a RAM/SSD tier restore
+(which replaces the image on the host), ends the staging hit. RAM/SSD tiers copy the image on the
+host after waiting for the drain.
 
 Measured (`--max-context 262144 --kv-capacity auto --kv-dtype nvfp4`, 1 GiB headroom, serve startup
 before → after, together with C):
@@ -42,7 +46,13 @@ before → after, together with C):
 | MTP K4 | 262144 → 262144 (capped at `L`) | 635392 → 666816 tokens (+31424) |
 
 Costs: capture and restore move 146.8 MiB (+40 MiB DFlash) over PCIe at a measured 28.8 GB/s,
-about 5.4 ms (+1.5 ms) serialized on the compute stream per checkpoint, instead of a 0.31 ms D2D.
+about 5.4 ms (+1.5 ms) per checkpoint. Capture now pays the staging D2D on the compute stream, plus
+any wait for an earlier copy_stream reader of staging (a previous drain or checkpoint pack); a
+staging-miss restore still pays the H2D there. A capture evicts a turn-rollback occupant of staging
+without reloading it, so a later rollback restore takes the host-image H2D.
+Measured with staging (C=4 DFlash K4 NVFP4 KV, four multi-turn chats on resident lanes, host tiers
+off, three interleaved pairs): warm-turn TTFT p50 63.6-64.1 -> 57.7-58.1 ms, aggregate decode while
+three or more lanes run 301 -> 315-321 tok/s; per-request decode unchanged.
 A RAM/SSD tier capture or restore that carries a rewrite checkpoint does one extra 147–187 MiB host
 memcpy on the executor thread (≈ 10–13 ms at 15 GB/s). The pinned images take `C × 187 MiB` host
 RAM (DFlash), outside `--kv-ram-capacity`.
@@ -74,6 +84,5 @@ That does not justify the VMM, migration, and contract work today.
 ## Follow-ups
 
 1. Re-evaluate B only if per-lane device state grows again or `C_max` rises well above 6.
-2. The capture/restore D2H/H2D could overlap the next prefill chunk by staging through a device
-   slot on `copy_stream`, at the cost of one extra Engine-wide device slot; not needed at the
-   measured ≈ 7 ms per checkpoint.
+2. Implemented for capture (staging D2D plus a `copy_stream` drain, as in the R9700 fork); a
+   staging-miss restore still H2Ds on the compute stream.

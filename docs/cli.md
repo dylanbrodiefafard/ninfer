@@ -305,8 +305,10 @@ adaptive lengths 1/2/3/4/5 and four-way concurrency). All graphs are prepared at
 processing a full prefill chunk uses the already reserved runtime storage.
 Each lane's turn (rewrite) checkpoint lives in pinned host memory rather than the GPU pool: one
 image per lane of the GDN state (146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V),
-allocated at startup outside `--kv-ram-capacity` and outside the startup memory report. Capturing
-it costs one D2H at the prefill chunk that ends on the checkpoint, and restoring it one H2D.
+allocated at startup outside `--kv-ram-capacity` and outside the startup memory report. With MTP or
+DFlash, capture copies the state into the Engine-wide device staging slot (a device-to-device copy) and drains
+it to the host image on the copy stream behind later work; a restore while staging still holds that
+image copies it back on the device, otherwise it costs one H2D before the suffix prefill.
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.

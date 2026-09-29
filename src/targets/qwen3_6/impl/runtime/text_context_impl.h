@@ -227,13 +227,13 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
                                cudaMemcpyDeviceToDevice, stream));
 }
 
-void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
+void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens) {
     if (!consume_prefill || tokens != active_tokens) {
         throw std::logic_error("DFlash prefill feature consumer is unavailable");
     }
     Tensor feature_window  = features->slice(1, 0, tokens);
     Tensor position_window = positions->slice(0, 0, tokens);
-    consume_prefill(feature_window, position_window, rewrite_checkpoint);
+    consume_prefill(feature_window, position_window);
 }
 
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
@@ -1152,10 +1152,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         checkpoint_abs > base64 && checkpoint_abs <= base64 + static_cast<std::int64_t>(T);
     const int checkpoint_rel =
         has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
-    if (has_rewrite_checkpoint && (rewrite_checkpoint_conv_output_ == nullptr ||
-                                   rewrite_checkpoint_recurrent_output_ == nullptr)) {
-        throw std::logic_error("rewrite checkpoint capture has no host state image");
-    }
 
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&
@@ -1371,15 +1367,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
         }
 
-        if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+        if constexpr (requires { tap.consume_prefill_chunk(len); }) {
             work_.reset();
-            tap.consume_prefill_chunk(len, checkpoint_rel > 0 && t0 + len == checkpoint_rel);
-        }
-
-        if (checkpoint_rel > 0 && t0 + len == checkpoint_rel) {
-            // Stream-ordered before the next chunk updates the current slot.
-            state_.pack_slot_to_host(linear_state_current_slot_, rewrite_checkpoint_conv_output_,
-                                     rewrite_checkpoint_recurrent_output_, s);
+            tap.consume_prefill_chunk(len);
         }
 
         t0 += len;

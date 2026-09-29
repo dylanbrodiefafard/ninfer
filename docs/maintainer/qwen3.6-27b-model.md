@@ -292,9 +292,11 @@ is off, and `C+1` when MTP or DFlash is on:
   tensor, not `[5120,C]`.
 
 The turn (rewrite) checkpoint used by thinking-aware prefix reuse is not a device slot. Each lane owns
-one pinned host image of the GDN slot (and, under DFlash, its cyclic local lane): prefill D2Hs the
-current slot into it on the compute stream when a chunk ends at the checkpoint frontier, and a
-rewrite restore H2Ds it back into the current slot. Only its `[5120,1]` hidden stays on the device. DFlash2 checkpoint heads snapshot cyclic through
+one pinned host image of the GDN slot (and, under DFlash, its cyclic local lane). When a chunk ends at
+the checkpoint frontier, MTP/DFlash prefill copies the current slot into the Engine-wide staging slot
+and drains it to the image on `copy_stream`; a rewrite restore copies staging back while it still holds
+that image, else H2Ds the image into the current slot. Without MTP/DFlash there is no staging slot and
+capture D2Hs on the compute stream. Only its `[5120,1]` hidden stays on the device. DFlash2 checkpoint heads snapshot cyclic through
   a matching 1-lane Engine-wide staging window (D2D live→staging on compute, D2H from staging on
   `copy_stream`) so suffix prefill can mutate live local; restore writes the host image back and
   sets `dflash_context_frontier` to `F`.

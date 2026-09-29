@@ -126,7 +126,7 @@ struct PrefillChunkResult {
 
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
-    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
+    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&)>;
 
     Tensor* features                  = nullptr;
     Tensor* positions                 = nullptr;
@@ -143,7 +143,7 @@ struct DFlashFeatureSink {
     void begin(const Tensor& value);
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
-    void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
+    void consume_prefill_chunk(std::int32_t tokens);
 };
 
 class VisionPrefillSession;
@@ -186,13 +186,6 @@ public:
 
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
-    }
-
-    // Pinned host image receiving the current GDN slot when prefill crosses the rewrite
-    // checkpoint frontier (LinearAttentionStatePool::pack_slot_to_host layout).
-    void set_rewrite_checkpoint_state_output(void* conv, void* recurrent) noexcept {
-        rewrite_checkpoint_conv_output_      = conv;
-        rewrite_checkpoint_recurrent_output_ = recurrent;
     }
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
@@ -351,8 +344,6 @@ private:
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     std::span<const std::uint32_t> prefill_split_frontiers_{};
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
-    void* rewrite_checkpoint_conv_output_                 = nullptr;
-    void* rewrite_checkpoint_recurrent_output_            = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
     // Prefill tile-skip: keep_frac (Sparge) and xattn_tau (XAttention). Decode/SmallT
     // ignore these (forced dense). Defaults are exact attention.
