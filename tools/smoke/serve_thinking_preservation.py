@@ -242,10 +242,23 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     response_paths = [
         item.get("result", {}).get("prefix_reuse_path") for item in responses_done
     ]
+    # The inherited child continues the parent's resident frontier when the stored response
+    # re-renders to the generated tokens, and otherwise restores the parent's response
+    # checkpoint at its generation prologue; either way it reuses at least the parent prompt.
     require(
-        response_paths
-        == ["full_reset", "restore_response_checkpoint", "full_reset"],
+        response_paths[0] == "full_reset"
+        and response_paths[1] in ("append_frontier", "restore_response_checkpoint")
+        and response_paths[2] == "full_reset",
         f"unexpected Responses reuse paths: {response_paths}",
+    )
+    parent_prompt_tokens = responses_done[0]["result"].get("prompt_tokens")
+    inherited_hit_tokens = responses_done[1]["result"].get("prefix_cache_hit_tokens")
+    require(
+        isinstance(parent_prompt_tokens, int)
+        and isinstance(inherited_hit_tokens, int)
+        and inherited_hit_tokens >= parent_prompt_tokens,
+        f"inherited Responses child reused {inherited_hit_tokens} tokens, "
+        f"fewer than the parent prompt's {parent_prompt_tokens}",
     )
 
     return {
@@ -259,6 +272,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         },
         "responses_preserve_semantics": response_semantics,
         "responses_reuse_paths": response_paths,
+        "responses_inherited_hit_tokens": inherited_hit_tokens,
     }
 
 
