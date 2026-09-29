@@ -171,7 +171,6 @@ void run() {
     for (int batch : {1, 2, 3, 4, 5, 6, 1}) {
         for (bool tree : {false, true}) {
             for (int width : {3, 5}) {
-              for (auto schedule : {family::ToolMaskSchedule::Serial, family::ToolMaskSchedule::Overlap}) {
                 // Production gives each (batch, draft width) its own topology.
                 // CUDA cannot update a 2D memcpy node across changing extents.
                 DecodeGraphExecutable graph;
@@ -180,10 +179,8 @@ void run() {
                 Tensor count_view(counts_storage.data, DType::I32, {batch});
                 auto body = [&] {
                     const auto submission = exchange.enqueue(ids_view, tree ? &parent_view : nullptr,
-                                           count_view, device.stream, device.host_stream, schedule);
-                    if (submission.ready) {
-                        CUDA_CHECK(cudaStreamWaitEvent(device.stream, submission.ready, 0));
-                    }
+                                           count_view, device.stream, device.host_stream);
+                    CUDA_CHECK(cudaStreamWaitEvent(device.stream, submission.ready, 0));
                     CUDA_CHECK(cudaMemcpyAsync(result_masks.data(), masks.data, masks.bytes(),
                                                 cudaMemcpyDeviceToHost, device.stream));
                     CUDA_CHECK(cudaMemcpyAsync(result_sampling.data(), sampling.data, sampling.bytes(),
@@ -265,7 +262,6 @@ void run() {
                 const auto* actual_config = static_cast<const ops::SamplingConfig*>(result_sampling.data());
                 for (int row = 0; row < batch; ++row)
                     require(actual_config[row].allowed_token_words == nullptr, "callback failure left a constrained sampling domain");
-              }
             }
         }
     }
@@ -284,7 +280,7 @@ void run() {
         bool forked = false;
         try {
             const auto submission = exchange.enqueue(fork_ids, nullptr, fork_counts,
-                                                       device.stream, device.host_stream, family::ToolMaskSchedule::Overlap);
+                                                       device.stream, device.host_stream);
             forked = submission.ready != nullptr;
             throw std::runtime_error("interrupted after mask fork");
         } catch (const std::runtime_error&) {

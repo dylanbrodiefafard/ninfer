@@ -1032,11 +1032,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
                      ++batch_size) {
                     for (const GraphExecutionProfile planned : profiles) {
-                        GraphExecutionProfile folded = planned;
-                        folded.topology_class        = qwen3_6::adaptive_topology_class(
+                        const std::uint32_t topology = qwen3_6::adaptive_topology_class(
                             k_index, k_stride, planned.topology_class, impl->max_concurrency,
                             batch_size);
-                        expanded.push_back(folded);
+                        for (const bool exchange : {false, true}) {
+                            GraphExecutionProfile folded = planned;
+                            folded.topology_class =
+                                qwen3_6::grammar_exchange_topology(topology, exchange);
+                            expanded.push_back(folded);
+                        }
                     }
                 }
             }
@@ -1068,18 +1072,18 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const auto profiles =
                         dflash_graph_profiles(impl->capacity, k, batch_size, wk);
                     for (const GraphExecutionProfile planned : profiles) {
-                        GraphExecutionProfile folded = planned;
-                        folded.topology_class        = qwen3_6::adaptive_topology_class(
+                        const std::uint32_t topology = qwen3_6::adaptive_topology_class(
                             k_index, k_stride, planned.topology_class, impl->max_concurrency,
-                            batch_size) * 2U;
-                        expanded.push_back(folded);
-                        expanded_w.push_back(wk);
-                        if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
-                            if (qwen3_6::has_tool_mask_overlap_profile(k, wk, batch_size)) {
-                                ++folded.topology_class;
-                                expanded.push_back(folded);
-                                expanded_w.push_back(wk);
-                            }
+                            batch_size);
+                        for (std::uint32_t variant = 0; variant < kDFlashExchangeVariants;
+                             ++variant) {
+                            GraphExecutionProfile folded = planned;
+                            folded.topology_class =
+                                kDFlashExchangeVariants == 1
+                                    ? topology
+                                    : qwen3_6::grammar_exchange_topology(topology, variant == 1);
+                            expanded.push_back(folded);
+                            expanded_w.push_back(wk);
                         }
                     }
                 }

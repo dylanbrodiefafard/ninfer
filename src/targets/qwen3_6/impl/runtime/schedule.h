@@ -105,7 +105,6 @@ struct DFlashBatchContext {
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     qwen3_6::ToolMaskExchange* tool_masks = nullptr;
-    qwen3_6::ToolMaskSchedule tool_mask_schedule = qwen3_6::ToolMaskSchedule::Serial;
 };
 
 struct DFlashAppendContext {
@@ -155,7 +154,6 @@ struct TargetVerifyFrameView {
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
     qwen3_6::ToolMaskExchange* tool_masks = nullptr;
-    qwen3_6::ToolMaskSchedule tool_mask_schedule = qwen3_6::ToolMaskSchedule::Serial;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

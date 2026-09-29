@@ -170,7 +170,7 @@ struct DecodeGraphProfile {
     std::uint32_t topology_class         = 0;
     std::uint32_t draft_k                = 0;
     std::uint32_t verify_width           = 0;
-    qwen3_6::ToolMaskSchedule tool_mask_schedule = qwen3_6::ToolMaskSchedule::Serial;
+    bool grammar_exchange                = false;
     DecodeGraphDefinition definition;
 };
 
@@ -308,6 +308,7 @@ public:
     void clear_suppressed_tokens_lane(std::uint32_t lane);
     void set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled);
     void bind_tool_mask_batch(std::span<const std::uint32_t> lanes);
+    [[nodiscard]] bool any_tool_grammar(std::span<const std::uint32_t> lanes) const;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,

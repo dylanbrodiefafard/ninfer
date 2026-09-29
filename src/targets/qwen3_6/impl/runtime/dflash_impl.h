@@ -1135,7 +1135,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             .sampling        = frame.sampling,
             .feature_sink    = &sink,
             .tool_masks      = state.tool_masks,
-            .tool_mask_schedule = state.tool_mask_schedule,
         };
         if (use_tree) {
             verify_frame.parent_index    = parent_index;

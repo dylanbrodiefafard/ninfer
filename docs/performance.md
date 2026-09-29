@@ -313,13 +313,62 @@ tokens/round, 149.1 decode tok/s; upstream's T0.6/top-p 0.95/top-k 20/presence 1
 2.95 tokens/round, 207.9 tok/s. Upstream's published 35.2%/183.4 tok/s (k=7, W8 drafter) is
 therefore a sampler difference, not a drafter-precision one.
 
+## Grammar-mask exchange selection (2026-09-29)
+
+Every MTP and DFlash2 verify round now selects one of two captured graph variants
+from its compact sessions: with no tool-grammar row it skips the mask exchange
+entirely; with any grammar row the exchange overlaps target verification on the
+host-callback stream (all draft lengths and batch sizes). This replaces the
+DFlash2 k4, all-tool C4/C6-only overlap retained on 2026-09-27 (history below).
+
+RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer` (DFlash2 and its MTP
+heads), NVFP4 KV, optimized proposal head, no prefix reuse, fixed draft k. Baseline
+is `482274b9`. Each cell is one AB and one BA matched pair; every accepted pair had
+no foreign GPU client observed, and contaminated groups were rerun whole. Tool
+waves use the greedy `tool_mask_records.json` call (exact 365-token responses);
+mixed waves alternate that call with plain 512-token requests; plain decode uses
+`run_serve_concurrency` decode-saturation, p-less, 4096 tokens.
+
+Grammar rounds (measured with the overlap exchange on every round, identical to the
+retained grammar variant); wave wall-time reduction, mean of AB/BA:
+
+| Workload | C1 | C2 | C3 | C4 | C5 | C6 |
+|---|---:|---:|---:|---:|---:|---:|
+| DFlash k4, all tool | +0.23% | +0.81% | +1.12% | ≈0 (already overlapped) | +1.47% | ≈0 (already overlapped) |
+| DFlash k3, all tool | −0.08% | | | +0.88% | | +1.38% |
+| DFlash k5, all tool | +0.41% | | | +1.29% | | +1.50% |
+| DFlash k4, mixed | | −0.19% | | +0.34% | | +0.69% |
+| MTP k3, all tool | −0.08% | | | +1.00% | | |
+
+Overlapping every round, including plain ones, was rejected: plain decode lost
+0.4–1.1% (about 0.1 ms per round) in both orders. Skipping the exchange instead
+recovers the serial exchange cost that plain rounds paid at `482274b9`; retained
+two-variant binary, plain steady decode per-round time (throughput in brackets):
+
+| Plain decode | C1 | C4 | C6 |
+|---|---:|---:|---:|
+| DFlash k4 | −0.18/−0.52% (−0.17/+0.33%) | −0.35/−0.35% (+0.39/+0.38%) | −0.48/−0.47% (+0.55/+0.62%) |
+| MTP k3 | −0.57/−0.52% (+0.50/+0.47%) | | |
+
+Rounds with a single grammar row (C1 tool, mixed C2) are within ±0.25%; a third
+serial variant for them was not added because it would triple verify graphs.
+The CPU mask fill itself (≈0.18 ms/round at C1, ≈0.48 ms at C4 in the 2026-09-27
+trace) stays far below target verification (12–25 ms), so faster filling would not
+shorten overlapped rounds. Captured graph memory at C6, max context 32768:
+DFlash k4 34→44 MiB, adaptive k1–5 158→292 MiB, MTP k3 18→34 MiB (measured before
+`34c7119b` narrowed adaptive DFlash capture to k3–5, which reduces both). Serving
+transitions plain→tools→mixed→tools→plain passed exact tool qualification for
+DFlash k4 C4/C6, k3 C2 and MTP k3 C4. Receipts: `always-*`, `skip-*` and `variant-*`
+under `profiles/bench/experimental-candidates/`.
+
 ## Grammar-mask overlap candidate (2026-09-27)
 
-**Retained:** DFlash2 k4/W5 compact batches of 4 or 6 in which every request
-carries a tool grammar overlap the mask exchange with target verification, from
-separately captured Serial/Overlap graph profiles. Tool-call waves are 1.06% (C4)
-and 1.18% (C6) faster (1.0–1.9% after rebasing onto `931617b2`); ordinary long
-decode is unchanged within order-balanced noise. Earlier unconditional and batch-only variants were rejected (below).
+Superseded by the selection above. DFlash2 k4/W5 compact batches of 4 or 6 in which
+every request carried a tool grammar overlapped the mask exchange with target
+verification, from separately captured Serial/Overlap graph profiles. Tool-call
+waves were 1.06% (C4) and 1.18% (C6) faster (1.0–1.9% after rebasing onto
+`931617b2`); ordinary long decode was unchanged within order-balanced noise.
+Earlier unconditional and batch-only variants were rejected (below).
 
 Experimental `d29841e0`, RTX 5090, SM120a, CUDA 13.1, using the exact local
 `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer` DFlash2 artifact with BF16 selector

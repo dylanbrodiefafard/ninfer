@@ -110,6 +110,16 @@ adaptive_topology_class(std::uint32_t k_index, std::uint32_t k_stride,
     return k_index * k_stride + planned_topology * max_concurrency + (batch_size - 1U);
 }
 
+// Speculative verify graphs are captured with and without the tool-grammar mask
+// exchange: a round whose batch has no grammar row skips it, and any grammar row
+// selects the variant whose host-stream exchange overlaps target verification.
+inline constexpr std::uint32_t kGrammarExchangeVariants = 2;
+
+[[nodiscard]] constexpr std::uint32_t grammar_exchange_topology(std::uint32_t topology,
+                                                                bool exchange) noexcept {
+    return topology * kGrammarExchangeVariants + (exchange ? 1U : 0U);
+}
+
 [[nodiscard]] inline std::uint32_t
 adaptive_snap_captured_k(std::span<const std::uint32_t> captured_ks, std::uint32_t k) {
     if (captured_ks.empty()) { return k; }
