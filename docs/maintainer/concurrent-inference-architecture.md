@@ -802,7 +802,10 @@ committed prefill chunk 末尾的 current GDN 与该 chunk 最后一列 hidden�
 Qwen frontend 从有效 `preserve_thinking` 语义发布 desired checkpoint：`false` 选择最后一个真实 user
 之后第一条 assistant opener 的末尾；`true` 选择本次完整 deterministic generation prologue 的末尾，
 即当前 prompt frontier。Thinking generation 包含 `<think>\n`，non-thinking generation 包含完整 empty
-thinking block。Boundary 先作为 byte offset 产生，再独立 tokenize 并验证为完整 prompt token prefix；
+thinking block。例外：thinking 请求的最新 assistant turn 没有 reasoning（client 丢弃）时，下一轮
+re-render 在 opener 之后即分叉（effort template 省略空 wrapper；toggle template 的
+`<think>\n\n` 另行 tokenize），因此 checkpoint 放在 generation opener（`<think>\n` 之前），代价是多一个
+很短的 prefill unit。Boundary 先作为 byte offset 产生，再独立 tokenize 并验证为完整 prompt token prefix；
 schema adapter 不推断或改写这些 target-private 语义。
 
 Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState ownership 转移给新 request：

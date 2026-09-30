@@ -988,7 +988,16 @@ response's complete deterministic generation prologue. For thinking generation t
 `<think>\n`; for non-thinking generation it includes the complete empty thinking block. Capturing
 that frontier does not split a tiny trailing prologue into a separate prefill unit, and a normalized
 response which no longer matches the raw generated tokens replays only that response and its
-suffix. Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
+suffix. A closed turn with empty reasoning re-renders differently right after the assistant opener,
+so a thinking request whose latest assistant turn carries no reasoning (the client drops it) places
+the checkpoint at the generation opener instead, before `<think>\n`. That costs one short extra
+prefill unit, and its next turn replays the prologue, the response and the suffix rather than
+recomputing the whole prompt. A first turn keeps the prompt frontier, so a client that drops
+reasoning misses once, on its second turn. A client that echoes reasoning still reuses at least the
+previous prompt. Two shapes still miss on every turn: thinking off with `preserve_thinking=true` on
+the Qwen3.8 template (its history omits the empty generation wrapper), and a client that keeps
+reasoning inside a tool loop but strips it at the next user turn (the prompt diverges at the loop's
+first assistant turn). Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
 be recomputed without its reasoning.
 
 `preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility

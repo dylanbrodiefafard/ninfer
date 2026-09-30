@@ -652,7 +652,8 @@ void append_rendered_messages(RenderBuffer& rendered, const std::vector<ChatMess
                               bool effort_template, bool preserve_thinking, long last_query_index,
                               int& image_count, int& video_count,
                               std::optional<RewriteCheckpointByteSpec>* rewrite_checkpoint,
-                              std::vector<std::size_t>* turn_closure_offsets) {
+                              std::vector<std::size_t>* turn_closure_offsets,
+                              std::optional<bool>* latest_assistant_has_reasoning = nullptr) {
     for (std::size_t i = begin; i < messages.size(); ++i) {
         const ChatMessage& message = messages[i];
         if (is_instruction_role(message.role)) { validate_instruction_message(message); }
@@ -699,6 +700,9 @@ void append_rendered_messages(RenderBuffer& rendered, const std::vector<ChatMess
             body      = slice_fragment(content, split.content_begin, content.text.size());
         }
         reasoning = trim_ascii_whitespace(reasoning);
+        if (latest_assistant_has_reasoning != nullptr) {
+            *latest_assistant_has_reasoning = !reasoning.text.empty();
+        }
 
         const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
         rendered.markup("<|im_start|>assistant\n");
@@ -836,16 +840,19 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::vector<std::size_t> turn_closure_offsets;
+    std::optional<bool> latest_assistant_has_reasoning;
 
     int image_count = 0;
     int video_count = 0;
     append_rendered_messages(rendered, messages, message_begin, options, effort_template,
                              preserve_thinking, last_query_index, image_count, video_count,
-                             &rewrite_checkpoint, preserve_thinking ? nullptr : &turn_closure_offsets);
+                             &rewrite_checkpoint, preserve_thinking ? nullptr : &turn_closure_offsets,
+                             &latest_assistant_has_reasoning);
 
     if (options.add_generation_prompt) {
         rendered.markup("<|im_start|>assistant\n");
-        if (!preserve_thinking) { turn_closure_offsets.push_back(rendered.size()); }
+        const std::size_t generation_opener = rendered.size();
+        if (!preserve_thinking) { turn_closure_offsets.push_back(generation_opener); }
         if (!preserve_thinking && !rewrite_checkpoint) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
@@ -856,11 +863,21 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered.markup("<think>\n\n</think>\n\n");
         }
         if (preserve_thinking) {
-            // Response replay retains the deterministic generation prologue. This is the prompt
-            // frontier for both thinking modes, so capturing it does not split off a tiny final
-            // prefill unit. The complete rendered prefix is tokenized independently below.
+            // Response replay normally retains the deterministic generation prologue: that is
+            // the prompt frontier, so capturing it does not split off a tiny final prefill unit.
+            // When the latest assistant turn carries no reasoning, the client drops it, so this
+            // response will re-render with empty reasoning: the effort template omits the
+            // wrapper and the toggle template's `<think>\n\n` tokenizes differently, so both
+            // diverge at most one token past the opener. Its checkpoint sits at the opener (one
+            // extra short prefill unit). A first turn keeps the prompt frontier, which exact
+            // replays and recovery retries resume from.
+            // The complete rendered prefix is tokenized independently below.
+            const bool replay_at_opener = options.enable_thinking &&
+                                          latest_assistant_has_reasoning.has_value() &&
+                                          !*latest_assistant_has_reasoning;
             rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
+                .kind   = RewriteCheckpointKind::ResponseReplay,
+                .offset = replay_at_opener ? generation_opener : rendered.size()};
         }
     }
     RenderedFragment fragment = std::move(rendered).take();

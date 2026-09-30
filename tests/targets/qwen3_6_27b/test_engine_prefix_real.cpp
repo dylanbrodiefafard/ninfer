@@ -655,6 +655,73 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
     return 0;
 }
 
+// Multi-turn chat reuse across thinking/preserve modes and client reasoning echo. Preserve off
+// restores the turn closure at the previous generation opener; preserve on with echoed reasoning
+// reuses at least the previous prompt; preserve on with dropped reasoning restores the replay
+// checkpoint at the previous opener from the third turn on (the second turn has only the first
+// turn's prompt-frontier checkpoint, past the divergence). Thinking off with preserve on is out
+// of scope: Qwen3.8 history cannot match the empty generation wrapper.
+int exercise_thinking_preserve_matrix(ninfer::Engine& engine) {
+    struct MatrixCase {
+        bool thinking;
+        bool preserve;
+        bool echo_reasoning;
+        const char* name;
+    };
+    const MatrixCase cases[] = {
+        {false, false, false, "no-thinking preserve-off"},
+        {true, false, true, "thinking preserve-off echo"},
+        {true, false, false, "thinking preserve-off drop"},
+        {true, true, true, "thinking preserve-on echo"},
+        {true, true, false, "thinking preserve-on drop"},
+    };
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = 256;
+    options.execution.sampling.temperature    = 0.0F;
+    for (const MatrixCase& row : cases) {
+        // Generation prologue after the opener: `<think>\n` or `<think>\n\n</think>\n\n`.
+        const std::uint32_t prologue = row.thinking ? 2 : 4;
+        ninfer::PromptInput input;
+        input.options.enable_thinking   = row.thinking;
+        input.options.preserve_thinking = row.preserve;
+        input.messages.push_back(text_turn(
+            ninfer::ChatRole::User,
+            std::string("Matrix case ") + row.name + ": name one river in a short sentence."));
+        std::uint32_t previous_prompt = 0;
+        for (int turn = 0; turn < 3; ++turn) {
+            options.execution.allow_prefix_reuse = turn > 0;
+            const ninfer::GenerationResult result = engine.generate(engine.prepare(input), options);
+            std::cerr << "matrix " << row.name << " turn " << turn
+                      << ": path=" << reuse_path_name(result.prefix_reuse_path)
+                      << " reused=" << result.reused_prompt_tokens
+                      << " prompt=" << result.prompt.prompt_tokens << '\n';
+            bool ok = true;
+            if (turn > 0 && !row.preserve) {
+                ok = result.prefix_reuse_path == ninfer::PrefixReusePath::RestoreTurnCheckpoint &&
+                     result.reused_prompt_tokens == previous_prompt - prologue;
+            } else if (turn > 0 && row.echo_reasoning) {
+                ok = result.reused_prompt_tokens >= previous_prompt;
+            } else if (turn > 1) {
+                ok = result.prefix_reuse_path == ninfer::PrefixReusePath::RestoreResponseCheckpoint &&
+                     result.reused_prompt_tokens == previous_prompt - prologue;
+            }
+            if (!ok) {
+                std::cerr << "matrix " << row.name << ": turn " << turn
+                          << " did not reuse the previous prompt (" << previous_prompt
+                          << " tokens) up to its reachable checkpoint\n";
+                return 1;
+            }
+            previous_prompt = result.prompt.prompt_tokens;
+            ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, result.content);
+            if (row.echo_reasoning) { assistant.reasoning_content = result.reasoning; }
+            input.messages.push_back(std::move(assistant));
+            input.messages.push_back(
+                text_turn(ninfer::ChatRole::User, "Name one more, in a short sentence."));
+        }
+    }
+    return 0;
+}
+
 // A reused image prefix leaves only text to prefill, but that suffix still needs mRoPE.
 // Its newly captured rewrite state must be usable by the next exact-prompt replay.
 int exercise_mrope_rewrite(ninfer::Engine& engine) {
@@ -974,6 +1041,9 @@ int exercise_artifact(const char* artifact) {
         if (const int result = exercise_full_prefill_chunk(engine); result != 0) { return result; }
         if (const int result = exercise_prefix(engine); result != 0) { return result; }
         if (const int result = exercise_rewrite_checkpoints(engine); result != 0) { return result; }
+        if (const int result = exercise_thinking_preserve_matrix(engine); result != 0) {
+            return result;
+        }
         if (const int result = exercise_first_prompt_cancel_aborts(engine); result != 0) {
             return result;
         }
