@@ -858,8 +858,16 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last));
+        std::size_t swiglu_bytes = ops::linear_swiglu_workspace_capacity_bytes(
+            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last);
+        // post_mixer fuses RMSNorm into the A8 gate/up for widths up to the aggregate verify
+        // extent, including T=1, where the unfused A16 route needs no workspace.
+        if (gate_up_qtype == QType::NVFP4 && policy == ops::LinearPolicy::AllowA8 &&
+            first <= kMaximumAggregateVerifyTokens) {
+            swiglu_bytes = std::max(swiglu_bytes, ops::rmsnorm_linear_swiglu_workspace_capacity_bytes(
+                                                      std::min(last, kMaximumAggregateVerifyTokens)));
+        }
+        (void)layout.alloc_bytes(swiglu_bytes);
     }
     {
         auto scope = layout.scope();
