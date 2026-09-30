@@ -18,6 +18,36 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Batched DFlash drafting for every chain k (2026-09-29)
+
+The DFlash2 drafter ran batched across requests only at k=4; every other chain k looped it once
+per request. Every chain round now drafts in one batched pass, and the drafter gate-up/down
+W4A4 projections aggregate every width whose request panel already takes W4A4 (gate-up W≥2,
+down W≥3; previously W=5 only). Aggregates are bit-identical to their per-request panels
+(`ninfer_linear_nvfp4_a4_test`, W=2..6 × B=2..6), and `ninfer_qwen3_8_27b_dflash_real_test`
+still matches overlapping requests to their C=1 streams for k=1..5.
+
+RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, `run_serve_concurrency`
+decode-saturation (`long_decode_aime26_15`, thinking, 2048 tokens per request, max context
+16384, KV 16384×C, NVFP4 KV, optimized head), single waves, steady aggregate decode tok/s.
+Greedy fixed-k pairs have identical acceptance, so the difference is round time:
+
+| Mode | C2 before → after | C4 before → after |
+|---|---:|---:|
+| greedy fixed k=3 | 308.4 → 329.9 (+7.0%) | 479.7 → 560.8 (+16.9%) |
+| greedy fixed k=5 | 342.9 → 360.4 (+5.1%) | 520.5 → 586.9 (+12.8%) |
+| p-less T1.5, fixed k=5 | 318.2 → 337.7 (+6.1%) | 488.3 → 550.4 (+12.7%) |
+| p-less T1.5, adaptive `{3,4,5}` | 350.3 → 351.1 | 628.5 → 629.7 |
+| p-less T1.5, fixed k=4 (unchanged path) | 368.4 | 643.9 |
+
+P-less rows use draft temperature 0.4 and base `1e4dc811`; greedy rows base `37c63461`. Adaptive
+C4 runs k=4 in 99% of rounds, whose path is unchanged; its gap to fixed k=4 is acceptance variance
+(2.96 vs 3.01 tokens/round at equal 18.8 ms rounds). Adaptive C2 moved from k=4 to k=5 in 97% of
+rounds and stays level, 4.7% below fixed k=4 on this single AIME prompt, where a k=5 block
+accepted less at hops 1-3 than a k=4 block. That is prompt-specific: on a mixed-prompt wave k=5
+accepts more (see the [width-factored picker](maintainer/performance_enhancements.md#adaptive-draft-width-factored-acceptance-qwen38-27bnvfp4-dflash2)
+negative result), and the shipped picker is within 0-2% of the best fixed k at C=1..6. Evidence: `profiles/bench/dflash-batched-chain-20260929/`.
+
 ## Activation and KV numerics A/B (2026-09-29)
 
 Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /

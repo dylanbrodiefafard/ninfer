@@ -268,15 +268,17 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
 template <class V>
 void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes,
-                        [[maybe_unused]] std::uint32_t verify_width,
+                        std::uint32_t verify_width,
                         bool exact_sequence_envelope, std::int32_t row_begin = 0) {
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash proposal is unavailable for this target");
     } else {
         using Config = typename V::DFlashConfig;
-        const bool lockstep_dflash4 = Config::kind == qwen3_6::DFlashKind::DFlash2 && k == 4 &&
-                                      verify_width == k + 1;
-        if (batch_size > 1 && !lockstep_dflash4) {
+        // DFlash2 chain rounds draft every row in one batched pass; tree verify keeps per-row
+        // proposals.
+        const bool batched_chain =
+            Config::kind == qwen3_6::DFlashKind::DFlash2 && verify_width == k + 1;
+        if (batch_size > 1 && !batched_chain) {
             for (std::int32_t row = 0; row < batch_size; ++row) {
                 propose_batch_impl<V>(state, frame, 1, k, envelopes, verify_width,
                                       exact_sequence_envelope, row_begin + row);

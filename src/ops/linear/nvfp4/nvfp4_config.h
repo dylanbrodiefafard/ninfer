@@ -184,12 +184,6 @@ enum class Nvfp4Problem : std::uint8_t {
     MtpFc,
 };
 
-inline constexpr bool is_nvfp4_a16_only_problem(Nvfp4Problem problem) {
-    return problem == Nvfp4Problem::DflashFeature || problem == Nvfp4Problem::DflashQkv ||
-           problem == Nvfp4Problem::DflashAttnOut || problem == Nvfp4Problem::DflashConvProj ||
-           problem == Nvfp4Problem::DflashSelector;
-}
-
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
     return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
             input_rows == Nvfp4AttnInputGeometry::kInputRows) ||

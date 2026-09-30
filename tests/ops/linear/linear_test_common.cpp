@@ -566,7 +566,8 @@ int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator 
         Tensor x(device_activation.p, DType::BF16, {k, tokens});
         Tensor aggregate_out(aggregate.data(), DType::BF16, {n, tokens});
         Tensor panel_out(panels.data(), DType::BF16, {n, tokens});
-        const std::string case_label = std::string(label) + " B=" + std::to_string(batch);
+        const std::string case_label = std::string(label) + " W=" + std::to_string(sequence_width) +
+                                       " B=" + std::to_string(batch);
         std::vector<std::uint16_t> convenience_bits;
         if (verify_convenience) {
             ops::linear_packed_sequences(x, weight, aggregate_out, nullptr, sequence_width);
