@@ -99,15 +99,16 @@ std::int32_t packed_sequence_group_width(const Tensor& x, const Weight& w,
         detail::is_nvfp4_dflash_mma_aggregate_problem(w.n, w.k, policy)) {
         return x.ne[1];
     }
+    if (w.qtype == QType::NVFP4 &&
+        detail::is_nvfp4_dflash_w4a4_aggregate_problem(w.n, w.k, policy, sequence_width)) {
+        return x.ne[1];
+    }
     if (w.qtype == QType::NVFP4 && sequence_width == 5 && x.ne[1] >= 10 &&
-        detail::is_nvfp4_dflash_w5_aggregate_problem(w.n, w.k, policy)) {
+        detail::is_nvfp4_dflash_conv_w5_aggregate_problem(w.n, w.k, policy)) {
         // A16 SmallT uses eight values per lane only at T=17..20, so direct T=20 differs by a
         // few BF16 ulps on real recurrent activations; two T=10 groups keep the C=2 route.
-        // T=10/15/25/30 keep the T=5 association, and W4A4 is one M32 tile through T=32.
-        const bool a16_only =
-            detail::is_nvfp4_a16_only_problem(detail::resolve_nvfp4_problem(w.n, w.k));
-        if (x.ne[1] == 20 && a16_only) { return 2 * sequence_width; }
-        return x.ne[1];
+        // T=10/15/25/30 keep the T=5 association.
+        return x.ne[1] == 20 ? 2 * sequence_width : x.ne[1];
     }
     // The Q4 27B draft head reduces every column in the same order; one pass holds 32 columns.
     if (w.qtype == QType::Q4G64_F16S && policy == LinearPolicy::A16Only && sequence_width >= 2 &&

@@ -21,8 +21,15 @@ namespace ninfer::ops::detail {
 bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
                                            LinearPolicy policy) noexcept;
 
-bool is_nvfp4_dflash_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                          LinearPolicy policy) noexcept;
+// DFlash drafter gate-up/down whose width-W request panel already takes W4A4: activation
+// quantization and each output's reduction are column-local, so packed requests share one pass.
+bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                            LinearPolicy policy,
+                                            std::int32_t sequence_width) noexcept;
+
+// DFlash conv projection (A16 SmallT), aggregated only for W=5 packed requests.
+bool is_nvfp4_dflash_conv_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                               LinearPolicy policy) noexcept;
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream);
