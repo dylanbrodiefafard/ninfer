@@ -18,6 +18,83 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Activation and KV numerics A/B (2026-09-29)
+
+Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
+CUDA 13.1, base `34c7119b`. Three experiment builds against the base, each checked on
+accuracy, speed and the NIAH gate below:
+
+- **A8 prefill:** `kNvfp4TextPolicy` AllowA4 -> AllowA8, so prefill projections take per-token FP8
+  activations instead of NVFP4 with a static divisor (the NVFP4 GDN input needed a W4A8 route).
+- **FP32 partials:** split-KV decode partial accumulators stored as FP32 instead of BF16.
+- **KV fake-quant:** a diagnostic. BF16 KV with K/V rounded in place through the NVFP4 KV
+  codec, so attention runs with BF16 Q on exactly the NVFP4 K/V values.
+
+Accuracy is paired per-token ΔNLL from `ninfer-ppl` on WikiText-2 (`--skip half`). The error bar is
+the SE over 512-token blocks. The prefill schedule scores prompt-token logits from the prefill
+route. The decode schedule prefills half and then teacher-forces T=1 steps, which is the
+generation-relevant measurement.
+
+| Comparison | Cell | ΔNLL | z |
+|---|---|---:|---:|
+| NVFP4 KV − BF16 KV | 8K / 32K / 128K prefill | +0.0004 / +0.0007 / +0.0025 | 0.1 / 0.2 / 2.5 |
+| NVFP4 KV − BF16 KV | 8K / 64K decode | +0.0037 / +0.0028 | 2.4 / 4.4 |
+| KV fake-quant − BF16 KV (K/V storage) | 128K prefill / 64K decode | +0.0036 / +0.0020 | 3.6 / 3.7 |
+| NVFP4 KV − fake-quant (NVFP4 Q + kernel) | 128K prefill / 64K decode | −0.0011 / +0.0008 | −1.0 / 1.2 |
+| A8 prefill − base | 8K / 32K / 128K prefill | −0.0118 / −0.0102 / −0.0086 | −3.0 / −5.3 / −7.7 |
+| A8 prefill − base | 8K / 64K decode | −0.0021 / −0.0004 | −1.2 / −0.7 |
+| FP32 partials − base | 8K / 64K decode | −0.0010 / +0.0004 | −0.8 / 0.8 |
+
+Speed, `ninfer-serve` C1/C4 (DFlash k≤5 adaptive, p-less T=1.5, prefix reuse off):
+
+- **Base:** prefill runs at 14,628 / 12,032 / 6,741 tok/s at 8K / 32K / 128K.
+- **A8 prefill:** 3,491 / 3,315 / 2,711 tok/s. The W4A8 GEMM has only small-M (≤48-token)
+  schedules, so this measures a missing kernel. FP8×FP4 MMA runs at half the FP4 rate, which
+  bounds a tuned A8 prefill GEMM at ≤2× the W4A4 time.
+- **FP32 partials:** decode time per DFlash round is ×0.997 / 1.002 / 1.002 of base at C1-32K /
+  C1-64K / C4-32K.
+
+All three builds pass multi-key NIAH at 128K and 240K, greedy plus seeds 1-2: 30/30 each.
+
+Conclusions:
+
+- **NVFP4 prefill activations.** They cost about 0.01 NLL on the logits the prefill route itself
+  produces, and A8 recovers exactly the T=1 decode-route value. The prompt KV/GDN state they
+  build does not measurably hurt later tokens (64K decode −0.0004 ± 0.0006). The only generated
+  token that comes from a prefill logit is the first one. W4A4 prefill stays.
+- **NVFP4 KV.** The loss (about +0.003 NLL at 64K, 0.3% PPL) is entirely K/V storage. Q
+  re-quantization inside attention adds nothing measurable, so BF16/FP8 Q would not help.
+- **FP32 partials.** No accuracy or speed effect, so BF16 partials stay.
+
+Cells, scripts and the variant patches are in `profiles/bench/act-ab-20260928/`.
+
+## Long-context NIAH baseline, NVFP4 KV (2026-09-28)
+
+Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
+CUDA 13.1, base `34c7119b`. `ninfer-serve` with the production numerics: `--kv-dtype nvfp4`
+(NVFP4-G16 Q/K/V inside attention, W4A4 prefill projections), `--spec dflash --draft-tokens 5
+--adaptive-draft --lm-head-draft`, C=1, `--max-context 262144`, `--no-prefix-reuse`, sparse
+prefill (`--xattn-tau`, `--keep-frac`, `--sage`) off, thinking off.
+
+Suites from `tools/bench/make_niah_positions.py` (standard, and `--multikey`: the target record
+among 32 same-form records, four with near-miss relay names), needle at start/q25/mid/q75/end,
+scored by `tools/bench/run_niah_check.py --exact-answer` (the stripped answer must equal
+`ORCHID=493817; COLOR=COBALT`):
+
+| Suite | Lengths | Decoding | Result |
+|---|---|---|---|
+| standard | 8K/32K/64K/128K | greedy | 20/20 |
+| multi-key | 8K/32K/64K/128K | greedy | 20/20 |
+| multi-key | 8K/32K/64K/128K | p-less T=1.5, seeds 1-2 | 40/40 |
+| standard | 240K | greedy | 5/5 |
+| multi-key | 240K | greedy | 5/5 |
+| standard | 260K (260,094 prompt tokens) | greedy | 5/5 |
+| multi-key | 260K (261,131 prompt tokens) | greedy | 5/5 |
+
+The all-4-bit QK path (NVFP4 Q re-quantized in attention against NVFP4 K) therefore retrieves an
+exact key/value binding among near-miss distractors up to the 262,144-token context. Prefill wall
+time was 19.5 s at 128K, 54 s at 240K and 62 s at 260K. Script: `profiles/bench/niah-5090-baseline-20260928/run.sh`.
+
 ## NVFP4 decode attention pipelining and overlap candidates (2026-09-27)
 
 Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
