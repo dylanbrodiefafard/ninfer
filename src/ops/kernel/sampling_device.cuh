@@ -734,8 +734,8 @@ __device__ __forceinline__ float sampling_p_less_q_at(int v, int draft_id, const
 __device__ inline int sampling_p_less_pick_from_tile(
     const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     int tile, const SamplingPLessGate& gate, float admitted, float goal, int fallback,
-    bool residual, int draft_id, const int* q_ids, const float* q_vals, int q_n, float* weights,
-    float* running, int* picked, int* found) {
+    bool residual, float residual_weight, int draft_id, const int* q_ids, const float* q_vals,
+    int q_n, float* weights, float* running, int* picked, int* found) {
     if (threadIdx.x == 0) {
         *running = 0.0f;
         *picked  = fallback;
@@ -753,7 +753,7 @@ __device__ inline int sampling_p_less_pick_from_tile(
                 sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
             if (e > 0.0f) {
                 weight = residual
-                             ? fmaxf(0.0f, e / admitted -
+                             ? fmaxf(0.0f, residual_weight * e / admitted -
                                               sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n))
                              : e;
             }
@@ -1043,11 +1043,12 @@ __device__ __forceinline__ float sampling_p_less_prob(const __nv_bfloat16* logit
     return e > 0.0f ? e / admitted : 0.0f;
 }
 
-// Leviathan residual inverse-CDF of max(0, p'-q) under p-less. All threads call.
+// Residual inverse-CDF of max(0, w p' - q) under p-less (w = 1 is Leviathan's). All threads call.
 __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std::int64_t base,
                                                std::int32_t vocab, const SamplingConfig& cfg,
                                                const SamplingPLessGate& gate, float admitted,
-                                               float u, int draft_id, const int* q_ids,
+                                               float residual_weight, float u, int draft_id,
+                                               const int* q_ids,
                                                const float* q_vals, int q_n, int argmax,
                                                float* red_val, int* red_idx) {
     const int tid = threadIdx.x;
@@ -1059,7 +1060,8 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
         if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
         if (!(e > 0.0f)) { continue; }
-        const float r = e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
+        const float r =
+            residual_weight * e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
         if (r > 0.0f) { local_mass += r; }
     }
     const float mass = sampling_block_sum(local_mass, red_val);
@@ -1085,7 +1087,8 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
             const float e =
                 sampling_p_less_draw_exp(v, __bfloat162float(logits[base + v]), gate, cfg);
             if (!(e > 0.0f)) { continue; }
-            const float r = e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
+            const float r =
+            residual_weight * e * inv_z - sampling_p_less_q_at(v, draft_id, q_ids, q_vals, q_n);
             if (r <= 0.0f) { continue; }
             acc += r;
             local_pick = v;

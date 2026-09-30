@@ -50,8 +50,11 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *   draft temperature and one candidate is drawn by inverse-CDF using
  *
  *     u = splitmix64(configs[b].seed ^ seed_xor,
- *                    logical_positions[b] + position_offset + t + 1,
- *                    purpose=16) in [0,1).
+ *                    logical_positions[b] + position_offset + 1,
+ *                    purpose=16, hop=t) in [0,1),
+ *
+ *   keyed by the round's first position and the hop so a later round never reuses a draft
+ *   uniform.
  *
  *   Then prev[t,b] = path[t,b]. Candidate order does not affect a greedy pick; the sampled
  *   inverse-CDF walk runs in the unsorted top-16 order.

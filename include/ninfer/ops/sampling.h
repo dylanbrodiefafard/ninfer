@@ -43,6 +43,9 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    // Block verification's per-hop uniforms, keyed by the round's first position and the hop, so
+    // a later round never reuses a uniform this round's acceptance conditioned on.
+    kSamplePurposeSpeculativeBlockAccept = 5,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32

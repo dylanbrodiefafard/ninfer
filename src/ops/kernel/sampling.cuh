@@ -405,7 +405,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
         if (selected_tile >= 0) {
             result = sampling_p_less_pick_from_tile(
                 logits, base, token_domain, cfg, selected_tile, gate, admitted, selected_goal,
-                result, false, -1, nullptr, nullptr, 0, weights, &running, &picked, &found);
+                result, false, 1.0f, -1, nullptr, nullptr, 0, weights, &running, &picked, &found);
         }
         if (threadIdx.x == 0) {
             out[col] = sampling_clamp_token(result, sampling_p_less_support_fallback(moments, cfg),

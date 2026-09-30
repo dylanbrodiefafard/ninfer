@@ -231,7 +231,7 @@ content. There is no CLI flag. P-less membership is `p_v ≥ max(L·exp(-2ε/T),
 `ε = 1/16` (first-order softmax perturbation of the logits) and `M = 1024`; L is the
 unperturbed collision probability, and an empty set falls back to the eligible mode.
 Under MTP or DFlash2,
-p-less applies at every hop (chain Leviathan with the recorded draft `q`; DFlash2 drafts are sampled
+p-less applies at every hop (block verification over the chain with the recorded draft `q`; DFlash2 drafts are sampled
 at `--dflash-p-less-draft-temperature`, MTP drafts are one-hot) and to the bonus after a full
 accept. The cycle exclusion applies only to the first hop's next-token decision; later hops use
 their unmodified p-less candidate sets. Temperature zero remains greedy at every hop.

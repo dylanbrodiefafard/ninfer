@@ -100,13 +100,14 @@ __device__ __forceinline__ unsigned long long dflash2_path_select_splitmix64(
 }
 
 __device__ __forceinline__ float dflash2_path_select_uniform(unsigned long long seed, int position,
-                                                              int purpose) {
+                                                              int purpose, unsigned int hop) {
     unsigned long long key = seed;
     key                    = dflash2_path_select_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
                0xD1B54A32D192ED03ull));
     key = dflash2_path_select_splitmix64(
-        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21));
+        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21) ^
+        (static_cast<unsigned long long>(hop) * 0x2545F4914F6CDD1Dull));
     const unsigned int bits = static_cast<unsigned int>(key >> 40);
     return static_cast<float>(bits) * (1.0f / 16777216.0f);
 }
@@ -440,10 +441,13 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                     scores[c] = expf((scores[c] - m) * inv_temp);
                     sum += scores[c];
                 }
-                const int position =
-                    logical_positions[b] + position_offset + static_cast<int>(t) + 1;
-                const float u = dflash2_path_select_uniform(
-                    seed, position, kDflash2PathSelectRngPurposeDevice);
+                // Keyed by the round's first position and the hop: block verification's accepted
+                // length depends on drafts past it, so the next round must not reuse a draft
+                // uniform at the same absolute position.
+                const int round_start = logical_positions[b] + position_offset + 1;
+                const float u         = dflash2_path_select_uniform(
+                    seed, round_start, kDflash2PathSelectRngPurposeDevice,
+                    static_cast<unsigned int>(t));
                 const float goal = u * sum;
                 float run        = 0.0f;
                 pick             = kDflash2PathSelectK - 1;

@@ -128,6 +128,18 @@ The all-4-bit QK path (NVFP4 Q re-quantized in attention against NVFP4 K) theref
 exact key/value binding among near-miss distractors up to the 262,144-token context. Prefill wall
 time was 19.5 s at 128K, 54 s at 240K and 62 s at 260K. Script: `profiles/bench/niah-5090-baseline-20260928/run.sh`.
 
+## P-less block verification (2026-09-30)
+
+P-less DFlash2/MTP chains accept by block verification (Sun et al. 2024, Algorithm 2) instead of
+per-hop Leviathan: exact, never fewer accepted tokens in expectation. With q on at most 16
+candidates, each `Z_i` needs 16 p' lookups. `ninfer_speculative_round_test` checks both accept
+kernels: the first two emitted tokens match the p-less oracle, the mean accepted length matches an
+exact enumeration (0.2265 vs 0.2258), and a chained two-round case keeps it (0.268 vs 0.266).
+
+RTX 5090, DFlash2 NVFP4, `--draft-tokens 5 --adaptive-draft`, p-less: C=6 tokens/round
+2.29 -> 2.44 (aggregate 544.2 -> 623.7 tok/s, C=6 wave totals carry straggler noise); C=4
+464.2 -> 474.5; C=1 within seed noise. Raw reports: `profiles/bench/k7/p4`.
+
 ## NVFP4 decode attention pipelining and overlap candidates (2026-09-27)
 
 Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
