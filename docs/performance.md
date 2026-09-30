@@ -18,6 +18,41 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Short appends to long contexts: chunked and context-split prompt attention (2026-09-30)
+
+A 7..1024-row `gqa_attention` call with no batch took the dense NVFP4 Prompt tile, one 512-thread
+CTA per (128-row block, q head) streaming the whole causal history: 24 CTAs on 170 SMs for any
+append up to 128 rows. Two routes now cover that band for dense NVFP4 KV (no `--sage`,
+`--keep-frac`, or `--xattn-tau`):
+
+- 27B widths up to a visible-length crossover (12 rows through 4K keys, 18 through 8K, 36 through
+  16K, 48 through 32K, 54 through 64K, 60 beyond; none through 256 keys) run as six-row decode
+  chunks, the route 35B verification and B>1 already use.
+- Wider calls split each CTA's key tiles over grid.z (at most 16 splits, at least 8 tiles each,
+  W × splits ≤ 2048) when that needs fewer waves per key tile, and a merge kernel combines the
+  FP32 partials. The split count minimizes whole-wave tile work; the workspace query reserves the
+  partials for every such width.
+
+Every route qualifies against the FP64 NVFP4 oracle at the NVFP4 codec's usual 0.003 relative L2
+(`ninfer_gqa_attention_test`, unit and `GQA_FULL`, split and chunked cases on both geometries,
+masked B=1 tails, interval-capacity witness).
+
+RTX 5090, CUDA 13.1, 27B geometry, public `gqa_attention` with the envelope at the visible
+length (`ninfer_gqa_attention_nvfp4_sparse_bench`), median µs per layer call:
+
+| Visible keys | W=7 | W=12 | W=36 | W=64 | W=128 | W=256 | W=512 | W=1024 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 563 → 40 | 563 → 51 | → 103 | 565 → 105 | 561 → 113 | 561 → 212 | 563 → 414 | 1067 → 867 |
+| 22528 | 1530 → 57 | 1532 → 62 | → 186 | 1534 → 247 | 1520 → 252 | 1520 → 491 | 1523 → 1066 | 2998 → 2327 |
+| 65536 | 4435 → 104 | 4435 → 137 | → 408 | 4441 → 680 | 4393 → 678 | 4394 → 1337 | 4419 → 3034 | 8793 → 6765 |
+| 131072 | 8881 → 229 | 8881 → 245 | → 735 | 8893 → 1335 | 8791 → 1322 | 8794 → 2644 | 8823 → 6059 | 17637 → 13476 |
+
+The baseline row cost was flat from W=7 to 512, so W=36 matches its neighbors. The route
+boundaries show no cliff (W=48/49 at 22528 keys: 246/247 µs; W=60/61 at 131072: 1259/1333 µs).
+The full-attention layers are 16 of 64, so a 12-token follow-up on a 22K conversation spends
+about 1 ms instead of 24.5 ms in attention, and 3.9 ms instead of 142 ms at 131K. The default
+4096-row prefill chunk (768 CTAs) is unchanged. Evidence: `profiles/bench/prompt-attention-split-20260930/`.
+
 ## Batched DFlash drafting for every chain k (2026-09-29)
 
 The DFlash2 drafter ran batched across requests only at k=4; every other chain k looped it once

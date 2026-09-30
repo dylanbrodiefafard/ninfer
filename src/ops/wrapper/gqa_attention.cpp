@@ -26,6 +26,7 @@ constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
+constexpr std::int32_t kMaximumChunkedPromptWidth    = 60;
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
@@ -303,6 +304,29 @@ void validate_tree_verify(const Tensor& ancestor_mask, const Tensor& prefix_leng
     require_contiguous_nonnull(prefix_lengths, op, "prefix lengths");
 }
 
+// Dense NVFP4 profile (U8 cache without S3, no Sparge/XAttention skip requested).
+bool dense_nvfp4_profile(DType cache_dtype, bool sage_pv, float keep_frac, float xattn_tau) {
+    return cache_dtype == DType::U8 && !sage_pv && keep_frac >= 1.0f && xattn_tau >= 1.0f;
+}
+
+// The dense NVFP4 Prompt kernel runs for this call (not S3, Sparge, or XAttention sparse).
+bool prompt_split_eligible(DType cache_dtype, bool sage_pv, float keep_frac, float xattn_tau,
+                           std::uint32_t max_visible_keys, std::int32_t xattn_min_len) {
+    return cache_dtype == DType::U8 && !sage_pv && keep_frac >= 1.0f &&
+           !(xattn_tau < 1.0f && max_visible_keys > static_cast<std::uint32_t>(xattn_min_len));
+}
+
+template <class Allocator>
+detail::GqaPromptSplit allocate_prompt_split(Allocator& workspace, std::int32_t q_heads,
+                                             std::int32_t width, std::int32_t capacity) {
+    return {
+        .splits = capacity,
+        .acc    = workspace.alloc(DType::FP32, {kHeadDim, q_heads, width, capacity}),
+        .m      = workspace.alloc(DType::FP32, {q_heads, width, capacity}),
+        .l      = workspace.alloc(DType::FP32, {q_heads, width, capacity}),
+    };
+}
+
 struct SmallTWorkspace {
     Tensor acc;
     Tensor m;
@@ -369,19 +393,39 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
         });
 }
 
+// 27B NVFP4 crossover (RTX 5090, public-Op timing): the context-split Prompt tile costs about
+// seven six-row decode passes at 16K visible keys and eleven at 262K; below 512 keys the single
+// Prompt tile wins. Non-decreasing in the visible length, so a width's route changes at most
+// once across an execution envelope.
+std::int32_t chunked_prompt_max_width_27b(std::uint32_t visible_keys) {
+    if (visible_keys <= 256) { return 0; }
+    if (visible_keys <= 4096) { return 12; }
+    if (visible_keys <= 8192) { return 18; }
+    if (visible_keys <= 16384) { return 36; }
+    if (visible_keys <= 32768) { return 48; }
+    if (visible_keys <= 65536) { return 54; }
+    return 60;
+}
+
 } // namespace
 
 namespace detail {
 
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size,
-                                              GqaExecutionEnvelope envelope, bool tree_verify) {
+                                              GqaExecutionEnvelope envelope, bool tree_verify,
+                                              bool dense_nvfp4) {
     if (tree_verify) {
         if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
         return GqaAttentionRoute::ChunkedSmallT;
     }
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
+    if (q_heads == 24 && dense_nvfp4) {
+        return width <= chunked_prompt_max_width_27b(envelope.max_visible_keys)
+                   ? GqaAttentionRoute::ChunkedSmallT
+                   : GqaAttentionRoute::Prompt;
+    }
     const std::uint32_t prompt_visible_keys =
         width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
     if (q_heads == 16 && width <= kMaximumVerifyTokens &&
@@ -409,7 +453,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width, float keep_frac,
-                                                   bool tree_verify, float xattn_tau) {
+                                                   bool tree_verify, float xattn_tau,
+                                                   bool sage_pv) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
@@ -443,10 +488,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         }
         return layout.peak_bytes(1);
     };
-    const auto exact_capacity = [&](std::int32_t width) {
-        const detail::GqaAttentionRoute route =
-            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope, tree_verify);
+    const auto route_capacity = [&](std::int32_t width, detail::GqaAttentionRoute route) {
         if (route == detail::GqaAttentionRoute::Prompt) {
+            std::size_t maximum = 0;
             if (xattn_tau > 0.0f && xattn_tau < 1.0f && cache_dtype == DType::U8) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t kv_heads =
@@ -455,9 +499,20 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                 const int n_kb = gqa_xattn_n_kb(kGqaXattnRankTiles, envelope.max_visible_keys);
                 (void)layout.alloc_bytes(
                     gqa_xattn_scratch_bytes(q_heads, kv_heads, n_br, n_kb));
-                return layout.peak_bytes(1);
+                maximum = layout.peak_bytes(1);
             }
-            return std::size_t{0};
+            // XAttention stays dense up to its runtime minimum length, which this query does
+            // not receive, so a U8 XAttention profile also reserves the dense split.
+            if (cache_dtype == DType::U8 && !sage_pv && keep_frac >= 1.0f) {
+                const std::int32_t splits = detail::gqa_attention_prompt_split_capacity(
+                    q_heads, width, envelope.max_visible_keys);
+                if (splits > 1) {
+                    WorkspaceLayoutBuilder layout;
+                    (void)allocate_prompt_split(layout, q_heads, width, splits);
+                    maximum = std::max(maximum, layout.peak_bytes(1));
+                }
+            }
+            return maximum;
         }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
@@ -465,6 +520,20 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             maximum =
                 std::max(maximum, chunk_capacity(std::min(kSmallTChunkTokens, width - begin)));
         }
+        return maximum;
+    };
+    // A call's route follows its own maximum visible length. Routes change monotonically with
+    // it, so the envelope endpoints reach every route in between; Prompt split partials and
+    // chunk partials both grow with the length, so each is sized at the envelope maximum.
+    const auto exact_capacity = [&](std::int32_t width) {
+        const bool dense = dense_nvfp4_profile(cache_dtype, sage_pv, keep_frac, xattn_tau);
+        const detail::GqaAttentionRoute longest = detail::gqa_attention_resolve_route(
+            q_heads, width, batch_size, envelope, tree_verify, dense);
+        const detail::GqaAttentionRoute shortest = detail::gqa_attention_resolve_route(
+            q_heads, width, batch_size, {envelope.min_visible_keys, envelope.min_visible_keys},
+            tree_verify, dense);
+        std::size_t maximum = route_capacity(width, longest);
+        if (shortest != longest) { maximum = std::max(maximum, route_capacity(width, shortest)); }
         return maximum;
     };
 
@@ -475,11 +544,19 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
-    // Prompt widths historically needed no arena. XAttention ranker scratch
-    // grows with W (n_br) and the envelope (n_kb), so the interval peak must
-    // include the largest Prompt width, not only W<=16 SmallT/ChunkedSmallT.
+    // XAttention ranker scratch grows with W (n_br) and the envelope (n_kb), so the interval
+    // peak includes the largest Prompt width. Context-split partials peak at W * splits and
+    // chunked widths reach past W=16, neither monotone in W, so every such width is evaluated.
     if (max_width > kMaximumVerifyTokens) {
         maximum = std::max(maximum, exact_capacity(max_width));
+        const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
+        for (std::int32_t width = first; width < max_width; ++width) {
+            if (width > std::max(kMaximumChunkedPromptWidth,
+                                 detail::kGqaPromptSplitMaximumWidth)) {
+                break;
+            }
+            maximum = std::max(maximum, exact_capacity(width));
+        }
     }
     return maximum;
 }
@@ -530,8 +607,13 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     const bool tree_verify = ancestor_mask.data != nullptr;
 
     auto scope = workspace.scope();
+    const bool dense =
+        dump == nullptr && dense_nvfp4_profile(cache.dtype, cache.sage_pv, keep_frac, xattn_tau);
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope, tree_verify);
+        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope, tree_verify, dense);
+    if (dump != nullptr && route != detail::GqaAttentionRoute::Prompt) {
+        throw std::invalid_argument("gqa_attention: a prefill dump requires the Prompt route");
+    }
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream, ancestor_mask, prefix_lengths);
@@ -559,9 +641,20 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                             .alloc_bytes(gqa_xattn_scratch_bytes(q.ne[1], kv_heads, n_br, n_kb))
                             .data;
     }
+    detail::GqaPromptSplit split;
+    if (dump == nullptr && prompt_split_eligible(cache.dtype, cache.sage_pv, keep_frac, xattn_tau,
+                                                 envelope.max_visible_keys, xattn_min_len)) {
+        const std::int32_t capacity = detail::gqa_attention_prompt_split_capacity(
+            q.ne[1], width, envelope.max_visible_keys);
+        if (capacity > 1) {
+            split        = allocate_prompt_split(workspace, q.ne[1], width, capacity);
+            split.splits = detail::gqa_attention_prompt_splits(q.ne[1], width,
+                                                               envelope.max_visible_keys);
+        }
+    }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, out, stream, keep_frac, xattn_tau, xattn_min_len,
-                                        dump, xattn_scratch, envelope);
+                                        dump, xattn_scratch, envelope, split);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -623,7 +716,8 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
-    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope) ==
+    const bool dense = dense_nvfp4_profile(cache.dtype, cache.sage_pv, keep_frac, 1.0f);
+    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope, false, dense) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out,
                                       stream);
@@ -638,7 +732,20 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                                                     stream, 1.0f, {}, rank_dump);
         return;
     }
-    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    detail::GqaPromptSplit split;
+    if (prompt_split_eligible(cache.dtype, cache.sage_pv, keep_frac, 1.0f,
+                              envelope.max_visible_keys, 0)) {
+        const std::int32_t capacity = detail::gqa_attention_prompt_split_capacity(
+            q.ne[1], q.ne[2], envelope.max_visible_keys);
+        if (capacity > 1) {
+            split        = allocate_prompt_split(workspace, q.ne[1], q.ne[2], capacity);
+            split.splits = detail::gqa_attention_prompt_splits(q.ne[1], q.ne[2],
+                                                               envelope.max_visible_keys);
+        }
+    }
+    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream, 1.0f,
+                                                  1.0f, 8192, nullptr, nullptr, nullptr, nullptr,
+                                                  envelope, split);
 }
 
 void gqa_attention_s3_dump(const Tensor& q, const Tensor& k, const Tensor& v,

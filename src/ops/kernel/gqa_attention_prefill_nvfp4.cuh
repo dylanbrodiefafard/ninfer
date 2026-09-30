@@ -173,14 +173,28 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_kmean_nvfp4_kernel(
         sum / static_cast<float>(hi - lo);
 }
 
-template <typename Geometry, typename Metadata>
+// Context-split partials for one prompt call, split-major: acc[z][token][q_head][d] is the
+// unnormalized FP32 P·V sum over split z's key tiles, and m/l[z][token][q_head] are that split's
+// running maximum (log2 domain, scale folded in) and exp2 sum. A split with no visible key for a
+// row publishes m = -inf and leaves acc unwritten; the merge ignores it.
+struct GqaPrefillNvfp4SplitPartials {
+    float* acc = nullptr;
+    float* m   = nullptr;
+    float* l   = nullptr;
+};
+
+// Split=false: one CTA per (128-row block, q head) streams the whole causal key history and
+// writes normalized BF16. Split=true: grid.z partitions each CTA's key tiles into contiguous
+// ranges and publishes FP32 partials for gqa_attention_prefill_nvfp4_merge_kernel, so short
+// appends to long histories fill the GPU instead of running 24 serial CTAs.
+template <typename Geometry, typename Metadata, bool Split>
 // Occupancy-1: 16 warps × 128 regs = 65536. 512-thread CTA cannot exceed 128.
 __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
     const std::uint8_t* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, GqaPrefillNvfp4SplitPartials partials) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillNvfp4Br;
     constexpr int Bc            = kGqaPrefillNvfp4Bc;
@@ -223,8 +237,11 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                               kGqaPrefillNvfp4Threads);
+        // The split merge owns the invalid-tail zeros.
+        if constexpr (!Split) {
+            gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                                   kGqaPrefillNvfp4Threads);
+        }
         return;
     }
     const int base_pos              = positions[0];
@@ -232,7 +249,25 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
-    const int key_blocks    = max_query_abs / Bc + 1;
+    int kb_begin            = 0;
+    int kb_end              = max_query_abs / Bc + 1;
+    if constexpr (Split) {
+        const int split       = static_cast<int>(blockIdx.z);
+        const int per_split   = (kb_end + static_cast<int>(gridDim.z) - 1) /
+                                static_cast<int>(gridDim.z);
+        kb_begin              = min(kb_end, split * per_split);
+        kb_end                = min(kb_end, kb_begin + per_split);
+        if (kb_begin >= kb_end) {
+            for (int row = tid; row < tile_rows; row += kGqaPrefillNvfp4Threads) {
+                const std::int64_t stat =
+                    (static_cast<std::int64_t>(split) * width + q0 + row) * Geometry::QHeads +
+                    q_head;
+                partials.m[stat] = -CUDART_INF_F;
+                partials.l[stat] = 0.0f;
+            }
+            return;
+        }
+    }
 
     for (int i = tid; i < Br * CodeW; i += kGqaPrefillNvfp4Threads) { q_codes[i] = 0; }
     for (int i = tid; i < Br * Groups; i += kGqaPrefillNvfp4Threads) { q_scale[i] = 0; }
@@ -290,7 +325,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         ninfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
+    issue_kv_tile(kb_begin * Bc);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
@@ -319,7 +354,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
 
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -452,7 +487,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next = kb + 1 < kb_end;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
         const int row_tile = warp % kGqaPrefillNvfp4RowTiles;
@@ -491,19 +526,47 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         __syncthreads();
     }
 
-    if (warp < ProducerWarps && lid == 0) {
-        const int row0  = warp * 16 + gid;
-        const int row1  = row0 + 8;
-        final_l_s[row0] = running_l0;
-        final_l_s[row1] = running_l1;
-    }
-    __syncthreads();
-
     const int row_tile = warp % kGqaPrefillNvfp4RowTiles;
     const int d_slice  = warp / kGqaPrefillNvfp4RowTiles;
     const int row_base = row_tile * 16;
     const int row0     = row_base + gid;
     const int row1     = row0 + 8;
+    if constexpr (Split) {
+        const std::int64_t split_row = static_cast<std::int64_t>(blockIdx.z) * width + q0;
+        if (warp < ProducerWarps && lid == 0) {
+            const auto publish = [&](int row, float running_m, float running_l) {
+                if (row >= tile_rows) { return; }
+                const std::int64_t stat = (split_row + row) * Geometry::QHeads + q_head;
+                partials.m[stat] =
+                    running_m == -CUDART_INF_F ? -CUDART_INF_F : running_m * scale_l2;
+                partials.l[stat] = running_l;
+            };
+            publish(warp * 16 + gid, running_m0, running_l0);
+            publish(warp * 16 + gid + 8, running_m1, running_l1);
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
+            if (row0 < tile_rows) {
+                *reinterpret_cast<float2*>(
+                    &partials.acc[((split_row + row0) * Geometry::QHeads + q_head) * D + d0]) =
+                    make_float2(acc[n][0], acc[n][1]);
+            }
+            if (row1 < tile_rows) {
+                *reinterpret_cast<float2*>(
+                    &partials.acc[((split_row + row1) * Geometry::QHeads + q_head) * D + d0]) =
+                    make_float2(acc[n][2], acc[n][3]);
+            }
+        }
+        return;
+    }
+
+    if (warp < ProducerWarps && lid == 0) {
+        final_l_s[warp * 16 + gid]     = running_l0;
+        final_l_s[warp * 16 + gid + 8] = running_l1;
+    }
+    __syncthreads();
+
     const float inv_l0 = final_l_s[row0] > 0.0f ? __frcp_rn(final_l_s[row0]) : 0.0f;
     const float inv_l1 = final_l_s[row1] > 0.0f ? __frcp_rn(final_l_s[row1]) : 0.0f;
 #pragma unroll
@@ -520,6 +583,36 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
+}
+
+// Stable combine of the context-split partials: one CTA per (token, q head), one thread per
+// output dimension. Columns at or past the valid prefix get exact BF16 zero.
+template <typename Geometry, typename Metadata>
+__launch_bounds__(kGqaPrefillHeadDim) __global__ void gqa_attention_prefill_nvfp4_merge_kernel(
+    GqaPrefillNvfp4SplitPartials partials, Metadata metadata, __nv_bfloat16* __restrict__ out,
+    std::int32_t width, std::int32_t splits) {
+    const int token  = static_cast<int>(blockIdx.x);
+    const int q_head = static_cast<int>(blockIdx.y);
+    const int d      = static_cast<int>(threadIdx.x);
+    const std::int64_t out_index = gqa_prefill_q_index<Geometry>(q_head, d, token);
+    if (token >= metadata.valid_tokens(width)) {
+        out[out_index] = __float2bfloat16(0.0f);
+        return;
+    }
+    const std::int64_t split_stride = static_cast<std::int64_t>(width) * Geometry::QHeads;
+    const std::int64_t stat0        = static_cast<std::int64_t>(token) * Geometry::QHeads + q_head;
+    float m = -CUDART_INF_F;
+    for (int z = 0; z < splits; ++z) { m = fmaxf(m, partials.m[stat0 + z * split_stride]); }
+    float l   = 0.0f;
+    float acc = 0.0f;
+    for (int z = 0; z < splits; ++z) {
+        const float mz = partials.m[stat0 + z * split_stride];
+        if (mz == -CUDART_INF_F) { continue; }
+        const float w = exp2f(mz - m);
+        l             = __fmaf_rn(partials.l[stat0 + z * split_stride], w, l);
+        acc = __fmaf_rn(partials.acc[(stat0 + z * split_stride) * kGqaPrefillHeadDim + d], w, acc);
+    }
+    out[out_index] = __float2bfloat16(l > 0.0f ? acc / l : 0.0f);
 }
 
 } // namespace ninfer::ops

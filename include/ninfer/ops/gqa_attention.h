@@ -64,7 +64,9 @@ struct GqaS3PrefillDump;
  * exact logical batch size. B>1 SmallT/ChunkedSmallT peak is the B=1 decode scratch (one
  * sequence at a time). Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
- * return zero. Prefill Sparge keep-lists live in kernel smem. XAttention ranker
+ * return zero. A dense NVFP4 (U8, sage_pv=false, keep_frac=1) Prompt width whose grid underfills
+ * the GPU reserves FP32 context-split partials at the envelope maximum; sage_pv declares an S3
+ * cache, which never splits. Prefill Sparge keep-lists live in kernel smem. XAttention ranker
  * scratch (packed-K / logits / mass / keep) is sized here when xattn_tau < 1 on
  * a U8 Prompt route; it is allocated from the caller workspace. keep_frac < 1.0
  * on a sage U8 cache still sizes the sparge-decode tile-skip scratch for W=1
@@ -77,7 +79,7 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                        GqaExecutionEnvelope envelope, std::int32_t batch_size,
                                        std::int32_t min_width, std::int32_t max_width,
                                        float keep_frac = 1.0f, bool tree_verify = false,
-                                       float xattn_tau = 1.0f);
+                                       float xattn_tau = 1.0f, bool sage_pv = false);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let
