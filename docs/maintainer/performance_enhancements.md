@@ -85,3 +85,33 @@ top-k select, and HBM 4-warp record. Product DFlash2 is chain-only, with adaptiv
 - local-edge N=8 pack (collapses to a chain)
 - full beam W=16 (third GQA tile; slower than W=12)
 - 4-warp shared-memory GDN record at W=12 (occupancy 1, wash vs 1-warp)
+
+## Adaptive draft: width-factored acceptance (`qwen3.8-27b/nvfp4`, DFlash2)
+
+Hypothesis: the adaptive picker pools per-hop acceptance `r_i` across draft widths, while DFlash2
+drafts the whole block in parallel, so a width-5 block may accept less per hop than a width-4
+block. On one AIME prompt at C=2 (p-less T1.5) it did (hops 1-3 cumulative 0.52/0.34/0.23 vs
+0.56/0.41/0.30) and adaptive held k=5 at 4.7% below fixed k=4.
+
+Tried: engine-global conditional acceptance `g(d,i)` per drafted width, a per-request level
+`a_i = (Σ s + 2)/(Σ n·g + 2)`, scoring `r(d,i) = a_i g(d,i)`, and a 1-in-32 probe of the other
+captured widths. In a host simulation with the AIME per-width acceptance the pooled picker ran
+k=5 100% of the time and the width model k=4 97%.
+
+It does not help on real mixed traffic. RTX 5090, DFlash2 artifact, batched chain drafting,
+p-less T1.5, draft T0.4, NVFP4 KV, thinking, 3072 tokens/request, one server per point with a
+warmup wave, then two measured waves rotating `aime26_15`, `code_python`, `story_en_mystery`,
+`translation_zh_en`, `code_cuda`, `structured_csv` across slots. Mean aggregate tok/s:
+
+| C | pooled (shipped) | width model | fixed k=4 | fixed k=5 |
+|---:|---:|---:|---:|---:|
+| 1 | 169.1 | 166.8 | 160.4 | 169.0 |
+| 2 | 300.6 | 294.3 | 299.7 | 300.7 |
+| 4 | 532.1 | 528.9 | 536.0 | 496.8 |
+| 6 | 713.2 | 711.5 | 727.3 | 583.3 |
+
+Across these prompts k=5 blocks accept more than k=4 (C=2 tokens/round 2.61/3.14 vs 2.47/3.04),
+so the AIME drop does not generalise; the best fixed k is 5 at C≤2 and 4 at C≥4, and the pooled
+picker already tracks it within 0-2%. The width model is 0.2-2% lower at every C (probe rounds at
+a non-best k plus estimate noise), within wave-to-wave noise of 3-6%. Reverted. Reports:
+`profiles/bench/adaptive-width-model-20260930/`.

@@ -185,3 +185,9 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
   T>=20: row-owned kernels win there but must also match the K-split kernels at T<=20.
 - GDN record (~2x its FP32 state-read floor at C6) is latency-bound on warp-shuffle dot products;
   a change must keep record/fold/snapshot/overlay transitions identical.
+- Per-request draft k (mixed-width verify). Adaptive DFlash picks one k per batch because verify
+  graphs are captured per uniform width; mixed-prompt batches force every row to the batch k.
+  Test first whether per-row k would pay: from per-prompt fixed-k runs at C2-C6, estimate the
+  tokens/round each row would gain at its own best k against the batch-k policy, and compare with
+  the cost of a ragged verify (padded aggregate at the max width vs per-row widths, graph count).
+  Pursue only if the estimated aggregate gain beats the per-k picker by a clear margin.
