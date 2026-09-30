@@ -795,7 +795,17 @@ rate(ninfer_speculative_accepted_tokens_total[5m])
 `ninfer_generation_inter_token_latency_seconds` is decode seconds per output token (TPOT).
 `ninfer_generation_output_tokens_per_second` is the inverse and matches NInfer's tok/s reports.
 `ninfer_recovery_events_total{kind="cycle_exclusion"}` counts published events. The true exclusion
-count is `ninfer_recovery_cycle_exclusions_total`.
+count is `ninfer_recovery_cycle_exclusions_total`. An `exhausted` event's `cause` is its decision:
+`retry_budget`, `output_budget` (the repaired request cannot keep its admitted output budget or
+pages), `prologue`, or `lane_rebuild`; the JSONL `recovery` event keeps the raw detail.
+`ninfer_generation_media_requests_total` counts every generation attempt whose prompt had media,
+whatever its result.
+
+Every label value is from a closed set, so series are bounded: unknown API error codes collapse to
+`code="other"`, unnamed ones to `code="unnamed"`, and unknown routes, methods, or statuses to
+`"other"`. HTTP series appear once their route has served a request. Histogram buckets are sized
+for this workload: wall clocks span 1 ms to 20 minutes, inter-token latency 2 ms to 250 ms, token
+counts 32 to 262144, decode rate 5 to 1000 tok/s, and prefill rate 250 to 30000 tok/s.
 
 ## Structured request log
 

@@ -1,9 +1,11 @@
 #pragma once
 
 // Prometheus text and JSON snapshots for ninfer-serve. HttpServer owns one
-// ServeMetrics. The GPU executor never touches it. fill_metrics_snapshot is
-// the only reader of RuntimeStats into this snapshot; both encodings render
-// that snapshot and do not sample the engine again.
+// ServeMetrics. The GPU executor never touches it. Every label set is closed
+// and stored in fixed-index arrays, so an observation is a mutex-held array
+// update and a scrape copies one flat value. fill_metrics_snapshot is the only
+// reader of RuntimeStats into a snapshot; both encodings render that snapshot
+// and do not sample the engine again.
 
 #include "serve/generation_service.h"
 
@@ -22,6 +24,7 @@ namespace ninfer::serve {
 inline constexpr const char* kPrometheusContentType =
     "text/plain; version=0.0.4; charset=utf-8";
 
+// Rendered family inventory, in exposition order.
 inline constexpr std::string_view kMetricFamilies[] = {
     "ninfer_engine_info",
     "ninfer_build_info",
@@ -116,8 +119,11 @@ inline constexpr std::string_view kMetricFamilies[] = {
     "ninfer_response_store_max_bytes",
 };
 
-inline constexpr std::size_t kMetricFamilyCount =
-    sizeof(kMetricFamilies) / sizeof(kMetricFamilies[0]);
+inline constexpr std::size_t kMetricFamilyCount = std::size(kMetricFamilies);
+
+enum class MetricsProtocol : std::uint8_t { OpenAiChat, OpenAiResponses, AnthropicMessages };
+
+enum class GenerationResult : std::uint8_t { Cancelled, Error, Rejected, Success };
 
 struct HttpRouteClass {
     const char* protocol = "other";
@@ -126,9 +132,10 @@ struct HttpRouteClass {
 
 [[nodiscard]] HttpRouteClass classify_http_route(std::string_view path);
 [[nodiscard]] bool is_unauthenticated_path(std::string_view path);
-[[nodiscard]] const char* prometheus_protocol(std::string_view request_log_protocol);
+// Maps a request-log protocol name; an unknown name is a programming error.
+[[nodiscard]] MetricsProtocol metrics_protocol(std::string_view request_log_protocol);
 // Closed Prometheus cause. `kind` is the recovery event kind name. Exhausted
-// details collapse; JSONL keeps the raw string.
+// details collapse to their decision; JSONL keeps the raw string.
 [[nodiscard]] const char* prometheus_recovery_cause(std::string_view kind,
                                                     std::string_view cause);
 
@@ -142,37 +149,32 @@ struct ScrapeInputs {
 // One HTTP generation terminal or reject. `outcome` is set for a finished run.
 // `recovery` is set when the error path has stats and no outcome.
 struct GenerationObservation {
-    std::string_view protocol = "openai_chat";
-    bool stream               = false;
-    std::string_view result   = "success";
-    bool thinking             = false;
-    bool tools                = false;
-    bool capture_requested    = false;
-    bool has_media            = false;
+    MetricsProtocol protocol = MetricsProtocol::OpenAiChat;
+    bool stream              = false;
+    GenerationResult result  = GenerationResult::Success;
+    bool thinking            = false;
+    bool tools               = false;
+    bool capture_requested   = false;
+    bool has_media           = false;
     const GenerationOutcome* outcome = nullptr;
     const ninfer::GenerationRecoveryStats* recovery = nullptr;
 };
 
-struct ServeMetricsState;
 struct MetricsSnapshotData;
-class ServeMetrics;
+struct ServeMetricsState;
 
 class MetricsSnapshot {
 public:
     MetricsSnapshot();
     ~MetricsSnapshot();
-    MetricsSnapshot(const MetricsSnapshot&);
-    MetricsSnapshot& operator=(const MetricsSnapshot&);
     MetricsSnapshot(MetricsSnapshot&&) noexcept;
     MetricsSnapshot& operator=(MetricsSnapshot&&) noexcept;
 
+    [[nodiscard]] std::string prometheus_text() const;
+    [[nodiscard]] std::string json() const;
+
 private:
     friend class ServeMetrics;
-    friend MetricsSnapshot fill_metrics_snapshot(ServeMetrics& metrics, const ScrapeInputs& inputs);
-    friend std::string render_prometheus_text(const MetricsSnapshot& snapshot);
-    friend std::string render_metrics_json(const MetricsSnapshot& snapshot);
-    friend void handle_metrics(const MetricsSnapshot& snapshot, httplib::Response& response);
-    friend void handle_metrics_json(const MetricsSnapshot& snapshot, httplib::Response& response);
     std::unique_ptr<MetricsSnapshotData> data_;
 };
 
@@ -185,31 +187,22 @@ public:
     ServeMetrics(ServeMetrics&&)                 = delete;
     ServeMetrics& operator=(ServeMetrics&&)      = delete;
 
+    // Called once before the server accepts connections.
     void attach(const ServeOptions& options, const ninfer::LoadSummary& load,
-                const ninfer::MemorySummary& memory, std::string model_id,
-                std::string cuda_compile_version, std::string cuda_runtime_version);
+                const ninfer::MemorySummary& memory, std::string_view model_id,
+                std::string_view cuda_compile_version, std::string_view cuda_runtime_version);
+
+    void observe_generation(const GenerationObservation& observation);
+    void observe_recovery_event(const ninfer::RecoveryEvent& event);
+    void observe_http(std::string_view path, std::string_view method, int status, double seconds);
+    void observe_api_error(std::string_view code);
+    void observe_token_count(MetricsProtocol protocol);
+
+    [[nodiscard]] MetricsSnapshot snapshot(const ScrapeInputs& inputs) const;
 
 private:
-    friend void observe_generation(ServeMetrics& metrics, const GenerationObservation& observation);
-    friend void observe_recovery_event(ServeMetrics& metrics, const ninfer::RecoveryEvent& event);
-    friend void observe_http(ServeMetrics& metrics, std::string_view protocol, std::string_view route,
-                             std::string_view method, int status, double seconds);
-    friend void observe_api_error(ServeMetrics& metrics, std::string_view code);
-    friend void observe_token_count(ServeMetrics& metrics, std::string_view protocol);
-    friend MetricsSnapshot fill_metrics_snapshot(ServeMetrics& metrics, const ScrapeInputs& inputs);
     std::unique_ptr<ServeMetricsState> state_;
 };
-
-void observe_generation(ServeMetrics& metrics, const GenerationObservation& observation);
-void observe_recovery_event(ServeMetrics& metrics, const ninfer::RecoveryEvent& event);
-void observe_http(ServeMetrics& metrics, std::string_view protocol, std::string_view route,
-                  std::string_view method, int status, double seconds);
-void observe_api_error(ServeMetrics& metrics, std::string_view code);
-void observe_token_count(ServeMetrics& metrics, std::string_view protocol);
-
-[[nodiscard]] MetricsSnapshot fill_metrics_snapshot(ServeMetrics& metrics, const ScrapeInputs& inputs);
-[[nodiscard]] std::string render_prometheus_text(const MetricsSnapshot& snapshot);
-[[nodiscard]] std::string render_metrics_json(const MetricsSnapshot& snapshot);
 
 void handle_metrics(const MetricsSnapshot& snapshot, httplib::Response& response);
 void handle_metrics_json(const MetricsSnapshot& snapshot, httplib::Response& response);
