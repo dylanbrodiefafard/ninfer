@@ -211,12 +211,12 @@ void HttpServer::log_request_error(const RequestLogContext& context, const std::
 }
 
 void HttpServer::emit_openai_error(httplib::Response& response, const ApiError& error) {
-    observe_api_error(metrics_, error.code);
+    metrics_.observe_api_error(error.code);
     write_error(response, error);
 }
 
 void HttpServer::emit_messages_error(httplib::Response& response, const ApiError& error) {
-    observe_api_error(metrics_, error.code);
+    metrics_.observe_api_error(error.code);
     write_messages_error(response, error);
 }
 
@@ -229,54 +229,56 @@ void HttpServer::record_generation(const RequestLogContext& context, GenerationO
         std::max(0.0, handler_seconds - outcome.metrics.total_seconds);
     log_request_done(context, outcome);
     GenerationObservation observation;
-    observation.protocol = prometheus_protocol(context.protocol);
+    observation.protocol = metrics_protocol(context.protocol);
     observation.stream = context.stream;
-    observation.result =
-        outcome.finish_reason == ninfer::FinishReason::Cancelled ? "cancelled" : "success";
+    observation.result = outcome.finish_reason == ninfer::FinishReason::Cancelled
+                             ? GenerationResult::Cancelled
+                             : GenerationResult::Success;
     observation.thinking = context.enable_thinking;
     observation.tools = tools;
     observation.capture_requested = capture;
     observation.has_media = media;
     observation.outcome = &outcome;
-    observe_generation(metrics_, observation);
+    metrics_.observe_generation(observation);
 }
 
 void HttpServer::record_rejection(const RequestRejectionLogContext& context,
                                   const GenerationRequest& request) {
     log_request_rejected(context);
     GenerationObservation observation;
-    observation.protocol = prometheus_protocol(context.protocol);
+    observation.protocol = metrics_protocol(context.protocol);
     observation.stream = context.stream;
-    observation.result = "rejected";
+    observation.result = GenerationResult::Rejected;
     observation.thinking = request.enable_thinking.value_or(options_.enable_thinking);
     observation.tools = request.uses_tools();
     observation.capture_requested = request.capture_context_checkpoint;
     observation.has_media = request.media_item_count() != 0;
-    observe_generation(metrics_, observation);
+    metrics_.observe_generation(observation);
 }
 
 void HttpServer::record_failure(const RequestLogContext& context, bool tools, bool capture,
                                 bool media, const std::string& message, const ApiError* error,
                                 bool count_api_error) {
     log_request_error(context, message);
-    if (count_api_error && error != nullptr) { observe_api_error(metrics_, error->code); }
+    if (count_api_error && error != nullptr) { metrics_.observe_api_error(error->code); }
     GenerationObservation observation;
-    observation.protocol = prometheus_protocol(context.protocol);
+    observation.protocol = metrics_protocol(context.protocol);
     observation.stream = context.stream;
-    observation.result =
-        error != nullptr && error->code == "client_disconnected" ? "cancelled" : "error";
+    observation.result = error != nullptr && error->code == "client_disconnected"
+                             ? GenerationResult::Cancelled
+                             : GenerationResult::Error;
     observation.thinking = context.enable_thinking;
     observation.tools = tools;
     observation.capture_requested = capture;
     observation.has_media = media;
     if (error != nullptr) { observation.recovery = &error->recovery; }
-    observe_generation(metrics_, observation);
+    metrics_.observe_generation(observation);
 }
 
 std::function<void(const ninfer::RecoveryEvent&)>
 HttpServer::recovery_callback(std::uint64_t request_id) {
     return [this, request_id](const ninfer::RecoveryEvent& event) {
-        observe_recovery_event(metrics_, event);
+        metrics_.observe_recovery_event(event);
         request_jsonl_.write_recovery(request_id, event);
     };
 }
@@ -292,7 +294,7 @@ void HttpServer::handle_metrics_scrape(httplib::Response& response, bool json) {
     inputs.http_in_flight = service_->in_flight_requests();
     inputs.response_records = response_store_.size();
     inputs.response_bytes = response_store_.bytes();
-    const MetricsSnapshot snapshot = fill_metrics_snapshot(metrics_, inputs);
+    const MetricsSnapshot snapshot = metrics_.snapshot(inputs);
     if (json) {
         handle_metrics_json(snapshot, response);
     } else {
@@ -364,7 +366,7 @@ void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         const auto result = handle_unrendered_http_error(options_, request, response);
         if (result == httplib::Server::HandlerResponse::Handled && response.status == 413) {
-            observe_api_error(metrics_, "request_too_large");
+            metrics_.observe_api_error("request_too_large");
         }
         return result;
     });
@@ -374,8 +376,7 @@ void HttpServer::register_routes() {
                                                              http_request_clock.started)
                                    .count();
         http_request_clock.active = false;
-        const HttpRouteClass route = classify_http_route(request.path);
-        observe_http(metrics_, route.protocol, route.route, request.method, response.status, seconds);
+        metrics_.observe_http(request.path, request.method, response.status, seconds);
     });
     if (options_.enable_cors) {
         server_.set_default_headers(
@@ -715,7 +716,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 }
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
-    observe_token_count(metrics_, "anthropic_messages");
+    metrics_.observe_token_count(MetricsProtocol::AnthropicMessages);
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);

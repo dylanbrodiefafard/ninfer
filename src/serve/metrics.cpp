@@ -7,14 +7,17 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <initializer_list>
 #include <iterator>
-#include <limits>
 #include <map>
 #include <mutex>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -25,31 +28,118 @@ using Json = nlohmann::json;
 
 // Same value as ninfer::kPagedKVPageSize. Serve does not include the core KV header.
 constexpr std::uint32_t kKvPageTokens = 64;
+// DFlash draft_tokens upper bound; see product/speculative_options.h.
+constexpr std::size_t kMaxDraftTokens = 15;
 
-constexpr double kSecondBounds[] = {0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5,
-                                    5,     10,   30,    60,   120,  300};
-constexpr const char* kSecondTexts[] = {"0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5",
-                                        "1",     "2.5",  "5",     "10",   "30",  "60",   "120",
-                                        "300"};
-constexpr double kTokenBounds[] = {32,   64,   128,   256,    512,    1024,   2048,
-                                   4096, 8192, 16384, 32768,  65536,  131072};
-constexpr const char* kTokenTexts[] = {"32",   "64",   "128",  "256",   "512",   "1024",  "2048",
-                                       "4096", "8192", "16384", "32768", "65536", "131072"};
-constexpr double kToksBounds[] = {5, 10, 25, 50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000};
-constexpr const char* kToksTexts[] = {"5",  "10",  "25",  "50",  "75",  "100", "150",
-                                      "200", "250", "300", "400", "500", "750", "1000"};
-constexpr double kDraftBounds[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 15};
-constexpr const char* kDraftTexts[] = {"1", "2", "3", "4", "5", "6", "8", "10", "12", "15"};
+// ---------------------------------------------------------------------------
+// Histogram bounds. A Histogram type carries its bounds, so observation and
+// rendering cannot disagree.
+
+struct Bound {
+    double value;
+    const char* text;
+};
+
+// Request, phase, and copy wall clocks: sub-millisecond CPU phases up to
+// long reasoning generations.
+constexpr Bound kLatencyBounds[] = {
+    {0.001, "0.001"}, {0.0025, "0.0025"}, {0.005, "0.005"}, {0.01, "0.01"}, {0.025, "0.025"},
+    {0.05, "0.05"},   {0.1, "0.1"},       {0.25, "0.25"},   {0.5, "0.5"},   {1, "1"},
+    {2.5, "2.5"},     {5, "5"},           {10, "10"},       {30, "30"},     {60, "60"},
+    {120, "120"},     {300, "300"},       {600, "600"},     {1200, "1200"},
+};
+// Decode seconds per output token: 500 tok/s down to 4 tok/s.
+constexpr Bound kInterTokenBounds[] = {
+    {0.002, "0.002"}, {0.003, "0.003"},   {0.004, "0.004"}, {0.005, "0.005"}, {0.006, "0.006"},
+    {0.008, "0.008"}, {0.01, "0.01"},     {0.0125, "0.0125"}, {0.015, "0.015"}, {0.02, "0.02"},
+    {0.025, "0.025"}, {0.03, "0.03"},     {0.04, "0.04"},   {0.05, "0.05"},   {0.075, "0.075"},
+    {0.1, "0.1"},     {0.25, "0.25"},
+};
+constexpr Bound kTokenBounds[] = {
+    {32, "32"},       {64, "64"},       {128, "128"},     {256, "256"},       {512, "512"},
+    {1024, "1024"},   {2048, "2048"},   {4096, "4096"},   {8192, "8192"},     {16384, "16384"},
+    {32768, "32768"}, {65536, "65536"}, {131072, "131072"}, {262144, "262144"},
+};
+constexpr Bound kDecodeRateBounds[] = {
+    {5, "5"},     {10, "10"},   {25, "25"},   {50, "50"},   {75, "75"},   {100, "100"}, {150, "150"},
+    {200, "200"}, {250, "250"}, {300, "300"}, {400, "400"}, {500, "500"}, {750, "750"}, {1000, "1000"},
+};
+// Prefill runs at thousands of tokens per second.
+constexpr Bound kPrefillRateBounds[] = {
+    {250, "250"},     {500, "500"},     {1000, "1000"},   {2000, "2000"},   {3000, "3000"},
+    {4000, "4000"},   {5000, "5000"},   {6000, "6000"},   {8000, "8000"},   {10000, "10000"},
+    {12500, "12500"}, {15000, "15000"}, {20000, "20000"}, {30000, "30000"},
+};
+constexpr Bound kCountBounds[] = {
+    {1, "1"}, {2, "2"}, {3, "3"}, {4, "4"}, {5, "5"}, {6, "6"}, {8, "8"}, {10, "10"}, {12, "12"}, {15, "15"},
+};
+
+template <const auto& Bounds>
+constexpr bool strictly_increasing() {
+    for (std::size_t i = 1; i < std::size(Bounds); ++i) {
+        if (!(Bounds[i - 1].value < Bounds[i].value)) { return false; }
+    }
+    return true;
+}
+
+template <const auto& Bounds>
+struct Histogram {
+    static_assert(strictly_increasing<Bounds>());
+    static constexpr std::span<const Bound> bounds{Bounds};
+
+    // Per-bucket counts; the last entry is the +Inf overflow.
+    std::array<std::uint64_t, std::size(Bounds) + 1> buckets{};
+    double sum          = 0;
+    std::uint64_t count = 0;
+
+    void observe(double value) noexcept {
+        if (!std::isfinite(value)) { return; }
+        const auto it = std::lower_bound(bounds.begin(), bounds.end(), value,
+                                         [](const Bound& bound, double v) { return bound.value < v; });
+        ++buckets[static_cast<std::size_t>(it - bounds.begin())];
+        sum += value;
+        ++count;
+    }
+};
+
+using LatencyHistogram     = Histogram<kLatencyBounds>;
+using InterTokenHistogram  = Histogram<kInterTokenBounds>;
+using TokenHistogram       = Histogram<kTokenBounds>;
+using DecodeRateHistogram  = Histogram<kDecodeRateBounds>;
+using PrefillRateHistogram = Histogram<kPrefillRateBounds>;
+using CountHistogram       = Histogram<kCountBounds>;
+
+// ---------------------------------------------------------------------------
+// Closed label vocabularies. Array order is the storage index.
 
 constexpr const char* kProtocols[] = {"openai_chat", "openai_responses", "anthropic_messages"};
-constexpr const char* kStreams[]   = {"false", "true"};
 constexpr const char* kResults[]   = {"cancelled", "error", "rejected", "success"};
 constexpr const char* kBools[]     = {"false", "true"};
-constexpr const char* kPhases[]    = {"prepare_cpu", "media_wait", "media_fetch", "queue",
-                                      "copy_hold",   "vision",      "prefill",     "decode",
-                                      "recovery",    "http_tail"};
-constexpr const char* kFinishReasons[] = {"none",     "output_limit", "context_capacity", "stop_token",
-                                          "stop_string", "cancelled",  "tool_calls",       "unknown"};
+constexpr std::size_t kProtocolCount = std::size(kProtocols);
+constexpr std::size_t kResultCount   = std::size(kResults);
+static_assert(static_cast<std::size_t>(MetricsProtocol::AnthropicMessages) + 1 == kProtocolCount);
+static_assert(static_cast<std::size_t>(GenerationResult::Success) + 1 == kResultCount);
+
+enum Phase : std::size_t {
+    kPhasePrepareCpu,
+    kPhaseMediaWait,
+    kPhaseMediaFetch,
+    kPhaseQueue,
+    kPhaseCopyHold,
+    kPhaseVision,
+    kPhasePrefill,
+    kPhaseDecode,
+    kPhaseRecovery,
+    kPhaseHttpTail,
+    kPhaseCount,
+};
+constexpr const char* kPhases[kPhaseCount] = {"prepare_cpu", "media_wait", "media_fetch", "queue",
+                                              "copy_hold",   "vision",     "prefill",     "decode",
+                                              "recovery",    "http_tail"};
+
+constexpr const char* kFinishReasons[] = {"none",        "output_limit", "context_capacity",
+                                          "stop_token",  "stop_string",  "cancelled",
+                                          "tool_calls",  "unknown"};
 constexpr const char* kPrefixPaths[] = {
     "full_reset",
     "append_frontier",
@@ -61,13 +151,19 @@ constexpr const char* kPrefixPaths[] = {
 };
 constexpr const char* kPrefixSources[] = {"none", "vram_resident", "host_ram", "host_disk", "unknown"};
 constexpr const char* kRecoveryKinds[] = {
-    "cycle_exclusion", "retry_triggered",        "retry_started",
-    "retry_prefill_complete", "finished",        "exhausted",
+    "cycle_exclusion", "retry_triggered", "retry_started",
+    "retry_prefill_complete", "finished", "exhausted",
+};
+// Direct causes carried verbatim by non-exhausted events.
+constexpr const char* kDirectRecoveryCauses[] = {
+    "reasoning_cycle", "repeated_reasoning", "duplicate_tool_call", "cancelled",
+    "tool_calls",      "output_limit",       "context_capacity",    "stop",
 };
 constexpr const char* kRecoveryCauses[] = {
-    "reasoning_cycle",     "repeated_reasoning", "duplicate_tool_call", "cancelled",
-    "tool_calls",          "output_limit",       "context_capacity",    "stop",
-    "reservation_exceeded", "retry_budget",      "lane_rebuild",        "other",
+    "reasoning_cycle", "repeated_reasoning", "duplicate_tool_call", "cancelled",
+    "tool_calls",      "output_limit",       "context_capacity",    "stop",
+    "retry_budget",    "output_budget",      "prologue",            "lane_rebuild",
+    "other",
 };
 constexpr const char* kApiErrorCodes[] = {
     "invalid_api_key",
@@ -110,6 +206,7 @@ constexpr const char* kApiErrorCodes[] = {
     "reasoning_summary_not_supported",
     "reasoning_option_not_supported",
     "parameter_not_supported",
+    "unknown_parameter",
     "parallel_tool_calls_not_supported",
     "logprobs_not_supported",
     "truncation_not_supported",
@@ -125,840 +222,189 @@ constexpr const char* kApiErrorCodes[] = {
     "unnamed",
     "other",
 };
-constexpr const char* kTiers[] = {"disk", "ram"};
+constexpr const char* kTiers[]   = {"disk", "ram"};
 constexpr const char* kCopyOps[] = {"h2d", "load", "save"};
-constexpr const char* kMethods[] = {"DELETE", "GET", "OPTIONS", "PATCH", "POST", "PUT"};
+constexpr const char* kMethods[] = {"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "other"};
 
-enum class BucketKind { None, Seconds, Tokens, Toks, Draft };
+constexpr std::size_t kFinishCount   = std::size(kFinishReasons);
+constexpr std::size_t kPathCount     = std::size(kPrefixPaths);
+constexpr std::size_t kSourceCount   = std::size(kPrefixSources);
+constexpr std::size_t kKindCount     = std::size(kRecoveryKinds);
+constexpr std::size_t kCauseCount    = std::size(kRecoveryCauses);
+constexpr std::size_t kApiCodeCount  = std::size(kApiErrorCodes);
+constexpr std::size_t kTierCount     = std::size(kTiers);
+constexpr std::size_t kCopyOpCount   = std::size(kCopyOps);
+constexpr std::size_t kMethodCount   = std::size(kMethods);
 
-struct BoundSet {
-    const double* values = nullptr;
-    const char* const* texts = nullptr;
-    std::size_t count = 0;
+constexpr HttpRouteClass kRoutes[] = {
+    {"health", "/health"},
+    {"metrics", "/metrics"},
+    {"metrics", "/metrics.json"},
+    {"models", "/v1/models"},
+    {"models", "/v1/models/{id}"},
+    {"openai_chat", "/v1/chat/completions"},
+    {"openai_responses", "/v1/responses"},
+    {"openai_responses", "/v1/responses/input_tokens"},
+    {"openai_responses", "/v1/responses/compact"},
+    {"openai_responses", "/v1/responses/{id}"},
+    {"openai_responses", "/v1/responses/{id}/input_items"},
+    {"openai_responses", "/v1/responses/{id}/cancel"},
+    {"anthropic_messages", "/v1/messages"},
+    {"anthropic_messages", "/v1/messages/count_tokens"},
+    {"other", "other"},
 };
+constexpr std::size_t kRouteCount = std::size(kRoutes);
 
-[[nodiscard]] BoundSet bounds_for(BucketKind kind) {
+// Index of `value` in `names`, or `fallback` when absent.
+template <std::size_t N>
+[[nodiscard]] std::size_t index_of(const char* const (&names)[N], std::string_view value,
+                                   std::size_t fallback) noexcept {
+    for (std::size_t i = 0; i < N; ++i) {
+        if (value == names[i]) { return i; }
+    }
+    return fallback;
+}
+
+[[nodiscard]] std::size_t route_index(std::string_view path) noexcept {
+    for (std::size_t i = 0; i + 1 < kRouteCount; ++i) {
+        if (path == kRoutes[i].route) { return i; }
+    }
+    constexpr std::string_view kModelPrefix = "/v1/models/";
+    if (path.starts_with(kModelPrefix) && path.size() > kModelPrefix.size() &&
+        path.find('/', kModelPrefix.size()) == std::string_view::npos) {
+        return 4;
+    }
+    constexpr std::string_view kResponsePrefix = "/v1/responses/";
+    if (path.starts_with(kResponsePrefix) && path.size() > kResponsePrefix.size()) {
+        const std::string_view rest = path.substr(kResponsePrefix.size());
+        const auto slash            = rest.find('/');
+        if (slash == std::string_view::npos) { return 9; }
+        if (slash > 0) {
+            const std::string_view tail = rest.substr(slash);
+            if (tail == "/input_items") { return 10; }
+            if (tail == "/cancel") { return 11; }
+        }
+    }
+    return kRouteCount - 1;
+}
+
+[[nodiscard]] std::size_t recovery_kind_index(ninfer::RecoveryEventKind kind) noexcept {
     switch (kind) {
-    case BucketKind::Seconds:
-        return {kSecondBounds, kSecondTexts, std::size(kSecondBounds)};
-    case BucketKind::Tokens:
-        return {kTokenBounds, kTokenTexts, std::size(kTokenBounds)};
-    case BucketKind::Toks:
-        return {kToksBounds, kToksTexts, std::size(kToksBounds)};
-    case BucketKind::Draft:
-        return {kDraftBounds, kDraftTexts, std::size(kDraftBounds)};
-    case BucketKind::None:
-        break;
+    case ninfer::RecoveryEventKind::CycleExclusion:
+        return 0;
+    case ninfer::RecoveryEventKind::RetryTriggered:
+        return 1;
+    case ninfer::RecoveryEventKind::RetryStarted:
+        return 2;
+    case ninfer::RecoveryEventKind::RetryPrefillComplete:
+        return 3;
+    case ninfer::RecoveryEventKind::Finished:
+        return 4;
+    case ninfer::RecoveryEventKind::Exhausted:
+        return 5;
     }
-    return {};
-}
-
-[[nodiscard]] BucketKind bucket_kind(std::string_view family) {
-    if (family == "ninfer_http_request_duration_seconds" ||
-        family == "ninfer_generation_ttft_seconds" || family == "ninfer_generation_e2e_seconds" ||
-        family == "ninfer_generation_inter_token_latency_seconds" ||
-        family == "ninfer_generation_phase_seconds" ||
-        family == "ninfer_generation_kv_copy_seconds") {
-        return BucketKind::Seconds;
-    }
-    if (family == "ninfer_generation_prompt_tokens" ||
-        family == "ninfer_generation_completion_tokens" ||
-        family == "ninfer_generation_reasoning_tokens" ||
-        family == "ninfer_generation_computed_prefill_tokens") {
-        return BucketKind::Tokens;
-    }
-    if (family == "ninfer_generation_output_tokens_per_second" ||
-        family == "ninfer_generation_prefill_tokens_per_second") {
-        return BucketKind::Toks;
-    }
-    if (family == "ninfer_speculative_live_k" || family == "ninfer_recovery_attempts") {
-        return BucketKind::Draft;
-    }
-    return BucketKind::None;
-}
-
-struct Labels {
-    std::vector<std::pair<std::string, std::string>> pairs;
-
-    Labels() = default;
-    Labels(std::initializer_list<std::pair<const char*, const char*>> items) {
-        pairs.reserve(items.size());
-        for (const auto& item : items) { pairs.emplace_back(item.first, item.second); }
-        sort();
-    }
-
-    void add(std::string key, std::string value) { pairs.emplace_back(std::move(key), std::move(value)); }
-
-    void sort() {
-        std::sort(pairs.begin(), pairs.end(),
-                  [](const auto& a, const auto& b) { return a.first < b.first; });
-    }
-};
-
-[[nodiscard]] std::string series_key(std::string_view family, const Labels& labels) {
-    std::string key(family);
-    key.push_back('\n');
-    for (const auto& [name, value] : labels.pairs) {
-        key.append(name);
-        key.push_back('=');
-        key.append(value);
-        key.push_back('\n');
-    }
-    return key;
-}
-
-[[nodiscard]] Labels labels_from_key(std::string_view key) {
-    Labels labels;
-    const auto split = key.find('\n');
-    if (split == std::string_view::npos) { return labels; }
-    std::string_view rest = key.substr(split + 1);
-    while (!rest.empty()) {
-        const auto end = rest.find('\n');
-        const auto row = rest.substr(0, end);
-        const auto eq  = row.find('=');
-        if (eq != std::string_view::npos) {
-            labels.pairs.emplace_back(std::string(row.substr(0, eq)), std::string(row.substr(eq + 1)));
-        }
-        if (end == std::string_view::npos) { break; }
-        rest.remove_prefix(end + 1);
-    }
-    return labels;
-}
-
-[[nodiscard]] std::string escape_label(std::string_view value) {
-    std::string out;
-    out.reserve(value.size());
-    for (const char ch : value) {
-        if (ch == '\\' || ch == '"') {
-            out.push_back('\\');
-            out.push_back(ch);
-        } else if (ch == '\n') {
-            out.append("\\n");
-        } else {
-            out.push_back(ch);
-        }
-    }
-    return out;
-}
-
-void append_number(std::string& out, double value) {
-    if (!std::isfinite(value)) {
-        out.append("0");
-        return;
-    }
-    char buf[64];
-    if (value >= 0.0 && value == std::trunc(value) &&
-        value <= static_cast<double>(std::numeric_limits<std::uint64_t>::max())) {
-        const auto result =
-            std::to_chars(buf, buf + sizeof(buf), static_cast<std::uint64_t>(value));
-        out.append(buf, result.ptr);
-        return;
-    }
-    const auto result =
-        std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::general, 15);
-    if (result.ec != std::errc{}) {
-        out.append("0");
-        return;
-    }
-    out.append(buf, result.ptr);
-}
-
-[[nodiscard]] std::string format_labels(const Labels& labels) {
-    if (labels.pairs.empty()) { return {}; }
-    std::string out = "{";
-    bool first = true;
-    for (const auto& [key, value] : labels.pairs) {
-        if (!first) { out.push_back(','); }
-        first = false;
-        out.append(key);
-        out.append("=\"");
-        out.append(escape_label(value));
-        out.push_back('"');
-    }
-    out.push_back('}');
-    return out;
+    return 5;
 }
 
 [[nodiscard]] const char* yn(bool value) { return value ? "true" : "false"; }
 
-[[nodiscard]] const char* known_method(std::string_view method) {
-    for (const char* known : kMethods) {
-        if (method == known) { return known; }
-    }
-    return "other";
-}
-
-[[nodiscard]] const char* known_api_code(std::string_view code) {
-    if (code.empty()) { return "unnamed"; }
-    for (const char* known : kApiErrorCodes) {
-        if (code == known) { return known; }
-    }
-    return "other";
-}
-
-[[nodiscard]] const char* known_protocol(std::string_view protocol) {
-    for (const char* known : kProtocols) {
-        if (protocol == known) { return known; }
-    }
-    return "openai_chat";
-}
-
-[[nodiscard]] bool contains_text(std::string_view haystack, std::string_view needle) {
-    return haystack.find(needle) != std::string_view::npos;
-}
-
-struct HistState {
-    std::vector<std::uint64_t> buckets;
-    double sum          = 0;
-    std::uint64_t count = 0;
-};
-
-[[nodiscard]] HistState make_hist(BucketKind kind) {
-    HistState state;
-    const BoundSet bounds = bounds_for(kind);
-    state.buckets.assign(bounds.count + 1, 0);
-    return state;
-}
-
-struct Sample {
-    Labels labels;
-    double value          = 0;
-    double sum            = 0;
-    std::uint64_t count   = 0;
-    std::vector<std::uint64_t> buckets;
-};
-
-struct Family {
-    std::string name;
-    const char* help = "";
-    const char* type = "gauge";
-    BucketKind buckets = BucketKind::None;
-    std::vector<Sample> samples;
-};
+// ---------------------------------------------------------------------------
+// Stored state.
 
 struct Startup {
-    double max_context                 = 0;
-    double prefill_chunk               = 0;
-    double pending_timeout_seconds     = 0;
-    double default_max_tokens          = 0;
-    double keep_frac                   = 1;
-    double xattn_tau                   = 1;
-    double xattn_min_len               = static_cast<double>(kDefaultXattnMinLen);
-    double dflash_verify_width         = 0;
-    double configured_draft_tokens     = 0;
-    double load_seconds                = 0;
-    double cuda_graph_allowance_bytes  = 0;
-    double cuda_graph_observed_bytes   = 0;
-    double arena_weights               = 0;
-    double arena_sequence              = 0;
-    double arena_workspace             = 0;
-    double arena_request_transient     = 0;
-    double start_time_unix_s           = 0;
-    double max_concurrency             = 0;
-    double max_pending_requests        = 0;
-    double response_max_records        = 0;
-    double response_max_bytes          = 0;
-    Labels engine_labels;
-    Labels build_labels;
+    double max_context                = 0;
+    double prefill_chunk              = 0;
+    double pending_timeout_seconds    = 0;
+    double default_max_tokens         = 0;
+    double keep_frac                  = 1;
+    double xattn_tau                  = 1;
+    double xattn_min_len              = static_cast<double>(kDefaultXattnMinLen);
+    double dflash_verify_width        = 0;
+    double configured_draft_tokens    = 0;
+    double load_seconds               = 0;
+    double cuda_graph_allowance_bytes = 0;
+    double cuda_graph_observed_bytes  = 0;
+    double arena_weights              = 0;
+    double arena_sequence             = 0;
+    double arena_workspace            = 0;
+    double arena_request_transient    = 0;
+    double start_time_unix_s          = 0;
+    double max_concurrency            = 0;
+    double max_pending_requests       = 0;
+    double response_max_records       = 0;
+    double response_max_bytes         = 0;
+    // Sorted by key.
+    std::vector<std::pair<const char*, std::string>> engine_labels;
+    std::vector<std::pair<const char*, std::string>> build_labels;
 };
 
-void add_info(std::vector<Family>& out, const char* name, const char* help, const Labels& labels) {
-    Family family;
-    family.name = name;
-    family.help = help;
-    family.type = "gauge";
-    Sample sample;
-    sample.labels = labels;
-    sample.value  = 1;
-    family.samples.push_back(std::move(sample));
-    out.push_back(std::move(family));
-}
+struct Series {
+    // Key: route << 24 | method << 16 | status (0 renders as "other").
+    std::map<std::uint32_t, std::uint64_t> http_requests;
+    std::array<LatencyHistogram, kRouteCount> http_duration{};
+    std::array<std::uint64_t, kApiCodeCount> api_errors{};
 
-void add_gauge(std::vector<Family>& out, const char* name, const char* help, double value) {
-    Family family;
-    family.name = name;
-    family.help = help;
-    family.type = "gauge";
-    Sample sample;
-    sample.value = value;
-    family.samples.push_back(std::move(sample));
-    out.push_back(std::move(family));
-}
+    // [protocol][stream][result][thinking][tools]
+    std::uint64_t generation_requests[kProtocolCount][2][kResultCount][2][2]{};
+    std::array<LatencyHistogram, kProtocolCount> ttft{};
+    std::array<LatencyHistogram, kProtocolCount> e2e{};
+    std::array<InterTokenHistogram, kProtocolCount> inter_token{};
+    std::array<LatencyHistogram, kPhaseCount> phase{};
+    LatencyHistogram kv_copy[kTierCount][kCopyOpCount]{};
+    TokenHistogram prompt_tokens;
+    TokenHistogram completion_tokens;
+    TokenHistogram reasoning_tokens;
+    TokenHistogram computed_prefill_tokens;
+    DecodeRateHistogram output_tokens_per_second;
+    PrefillRateHistogram prefill_tokens_per_second;
+    std::array<std::uint64_t, kFinishCount> finish_reason{};
+    std::uint64_t tool_calls          = 0;
+    std::uint64_t ignored_tool_markup = 0;
+    std::uint64_t media_requests      = 0;
+    std::array<std::uint64_t, kProtocolCount> token_count_requests{};
 
-void add_absolute(std::vector<Family>& out, const char* name, const char* help, double value) {
-    Family family;
-    family.name = name;
-    family.help = help;
-    family.type = "counter";
-    Sample sample;
-    sample.value = value;
-    family.samples.push_back(std::move(sample));
-    out.push_back(std::move(family));
-}
+    std::uint64_t prefix_reuse[kPathCount][kSourceCount]{};
+    std::array<std::uint64_t, kSourceCount> prefix_hit_tokens{};
+    std::uint64_t prefix_query_tokens          = 0;
+    std::uint64_t checkpoint_restored_tokens   = 0;
+    std::uint64_t checkpoint_captured_tokens   = 0;
+    std::uint64_t checkpoint_capture_requests  = 0;
 
-void add_labeled_gauges(std::vector<Family>& out, const char* name, const char* help,
-                        std::vector<Sample> samples) {
-    Family family;
-    family.name    = name;
-    family.help    = help;
-    family.type    = "gauge";
-    family.samples = std::move(samples);
-    out.push_back(std::move(family));
-}
+    std::uint64_t speculative_rounds          = 0;
+    std::uint64_t speculative_draft_tokens    = 0;
+    std::uint64_t speculative_accepted_tokens = 0;
+    std::uint64_t speculative_fallback_steps  = 0;
+    // Index = draft position.
+    std::array<std::uint64_t, kMaxDraftTokens> speculative_accepted_by_position{};
+    // Index = k - 1.
+    std::array<std::uint64_t, kMaxDraftTokens> speculative_rounds_by_k{};
+    CountHistogram speculative_live_k;
 
-Sample labeled_value(std::initializer_list<std::pair<const char*, const char*>> labels, double value) {
-    Sample sample;
-    sample.labels = Labels(labels);
-    sample.value  = value;
-    return sample;
-}
-
-void add_mapped_counter(std::vector<Family>& out, const char* name, const char* help,
-                        const std::map<std::string, std::uint64_t>& counters) {
-    Family family;
-    family.name = name;
-    family.help = help;
-    family.type = "counter";
-    const std::string prefix = std::string(name) + "\n";
-    for (const auto& [key, value] : counters) {
-        if (key.compare(0, prefix.size(), prefix) != 0) { continue; }
-        Sample sample;
-        sample.labels = labels_from_key(key);
-        sample.value  = static_cast<double>(value);
-        family.samples.push_back(std::move(sample));
-    }
-    out.push_back(std::move(family));
-}
-
-void add_mapped_histogram(std::vector<Family>& out, const char* name, const char* help,
-                          BucketKind kind, const std::map<std::string, HistState>& hists) {
-    Family family;
-    family.name    = name;
-    family.help    = help;
-    family.type    = "histogram";
-    family.buckets = kind;
-    const std::string prefix = std::string(name) + "\n";
-    for (const auto& [key, state] : hists) {
-        if (key.compare(0, prefix.size(), prefix) != 0) { continue; }
-        Sample sample;
-        sample.labels  = labels_from_key(key);
-        sample.sum     = state.sum;
-        sample.count   = state.count;
-        sample.buckets = state.buckets;
-        family.samples.push_back(std::move(sample));
-    }
-    out.push_back(std::move(family));
-}
-
-[[nodiscard]] const char* label_value(const Labels& labels, const char* key) {
-    for (const auto& [name, value] : labels.pairs) {
-        if (name == key) { return value.c_str(); }
-    }
-    return "";
-}
-
-void append_help_type(std::string& out, const Family& family) {
-    out.append("# HELP ");
-    out.append(family.name);
-    out.push_back(' ');
-    out.append(family.help);
-    out.push_back('\n');
-    out.append("# TYPE ");
-    out.append(family.name);
-    out.push_back(' ');
-    out.append(family.type);
-    out.push_back('\n');
-}
-
-void append_sample_line(std::string& out, const std::string& name, const std::string& suffix,
-                        const Labels& labels, double value) {
-    out.append(name);
-    out.append(suffix);
-    out.append(format_labels(labels));
-    out.push_back(' ');
-    append_number(out, value);
-    out.push_back('\n');
-}
-
-std::string render_families(const std::vector<Family>& families) {
-    std::string out;
-    out.reserve(256 * 1024);
-    for (const Family& family : families) {
-        append_help_type(out, family);
-        if (family.type == std::string_view("histogram")) {
-            const BoundSet bounds = bounds_for(family.buckets);
-            for (const Sample& sample : family.samples) {
-                std::uint64_t cumulative = 0;
-                const std::size_t finite = std::min(bounds.count, sample.buckets.size());
-                for (std::size_t i = 0; i < finite; ++i) {
-                    cumulative += sample.buckets[i];
-                    Labels labels = sample.labels;
-                    labels.add("le", bounds.texts[i]);
-                    labels.sort();
-                    append_sample_line(out, family.name, "_bucket", labels,
-                                       static_cast<double>(cumulative));
-                }
-                if (!sample.buckets.empty()) {
-                    for (std::size_t i = finite; i < sample.buckets.size(); ++i) {
-                        cumulative += sample.buckets[i];
-                    }
-                }
-                Labels inf = sample.labels;
-                inf.add("le", "+Inf");
-                inf.sort();
-                append_sample_line(out, family.name, "_bucket", inf, static_cast<double>(cumulative));
-                append_sample_line(out, family.name, "_sum", sample.labels, sample.sum);
-                append_sample_line(out, family.name, "_count", sample.labels,
-                                   static_cast<double>(sample.count));
-            }
-        } else {
-            for (const Sample& sample : family.samples) {
-                append_sample_line(out, family.name, "", sample.labels, sample.value);
-            }
-        }
-    }
-    return out;
-}
-
-[[nodiscard]] double unlabeled(const Family& family) {
-    return family.samples.empty() ? 0.0 : family.samples.front().value;
-}
-
-[[nodiscard]] const Sample* find_labels(const Family& family, const char* key, const char* value) {
-    for (const Sample& sample : family.samples) {
-        if (std::string_view(label_value(sample.labels, key)) == value) { return &sample; }
-    }
-    return nullptr;
-}
-
-void add_hist_json_all(Json& object, const char* field, const Family& family) {
-    std::uint64_t count = 0;
-    double sum          = 0;
-    for (const Sample& sample : family.samples) {
-        count += sample.count;
-        sum += sample.sum;
-    }
-    object[field] = Json{{"count", count}, {"sum", sum}};
-}
-
-Json render_json(const std::vector<Family>& families) {
-    Json json = Json::object();
-    json["engine"]          = Json::object();
-    json["build"]           = Json::object();
-    json["scheduler"]       = Json::object();
-    json["http"]            = Json::object();
-    json["gpu_kv"]          = Json{{"main", Json::object()}, {"spec", Json::object()}};
-    json["kv_ram"]          = Json::object();
-    json["kv_disk"]         = Json::object();
-    json["prefix_reuse"]    = Json{{"requests", Json::object()}, {"hit_tokens", Json::object()}};
-    json["speculative"]     = Json::object();
-    json["recovery"]        = Json{{"events", Json::object()}};
-    json["generation"]      = Json::object();
-    json["phases"]          = Json::object();
-    json["response_store"]  = Json::object();
-    json["start_time_unix_s"] = 0.0;
-
-    const auto family_named = [&](const char* name) -> const Family* {
-        for (const Family& family : families) {
-            if (family.name == name) { return &family; }
-        }
-        return nullptr;
-    };
-
-    if (const Family* info = family_named("ninfer_engine_info")) {
-        if (!info->samples.empty()) {
-            for (const auto& [key, value] : info->samples.front().labels.pairs) {
-                json["engine"][key] = value;
-            }
-        }
-    }
-    if (const Family* info = family_named("ninfer_build_info")) {
-        if (!info->samples.empty()) {
-            for (const auto& [key, value] : info->samples.front().labels.pairs) {
-                json["build"][key] = value;
-            }
-        }
-    }
-
-    const auto gauge_into = [&](const char* name, Json& object, const char* field) {
-        if (const Family* family = family_named(name)) { object[field] = unlabeled(*family); }
-    };
-    gauge_into("ninfer_max_context_tokens", json["engine"], "max_context_tokens");
-    gauge_into("ninfer_prefill_chunk_tokens", json["engine"], "prefill_chunk_tokens");
-    gauge_into("ninfer_pending_timeout_seconds", json["engine"], "pending_timeout_seconds");
-    gauge_into("ninfer_default_max_tokens", json["engine"], "default_max_tokens");
-    gauge_into("ninfer_keep_frac", json["engine"], "keep_frac");
-    gauge_into("ninfer_xattn_tau", json["engine"], "xattn_tau");
-    gauge_into("ninfer_xattn_min_len", json["engine"], "xattn_min_len");
-    gauge_into("ninfer_dflash_verify_width", json["engine"], "dflash_verify_width");
-    gauge_into("ninfer_speculative_configured_draft_tokens", json["engine"],
-               "speculative_configured_draft_tokens");
-    gauge_into("ninfer_engine_load_seconds", json["engine"], "load_seconds");
-    gauge_into("ninfer_server_start_time_seconds", json, "start_time_unix_s");
-    gauge_into("ninfer_scheduler_running_requests", json["scheduler"], "running");
-    gauge_into("ninfer_scheduler_prefilling_requests", json["scheduler"], "prefilling");
-    gauge_into("ninfer_scheduler_decode_ready_requests", json["scheduler"], "decode_ready");
-    gauge_into("ninfer_scheduler_waiting_requests", json["scheduler"], "waiting");
-    gauge_into("ninfer_scheduler_max_concurrency", json["scheduler"], "max_concurrency");
-    gauge_into("ninfer_scheduler_max_pending_requests", json["scheduler"], "max_pending_requests");
-    gauge_into("ninfer_http_in_flight_requests", json["http"], "in_flight");
-    gauge_into("ninfer_kv_ram_capacity_bytes", json["kv_ram"], "capacity_bytes");
-    gauge_into("ninfer_kv_ram_used_bytes", json["kv_ram"], "used_bytes");
-    gauge_into("ninfer_kv_ram_entries", json["kv_ram"], "entries");
-    gauge_into("ninfer_kv_disk_capacity_bytes", json["kv_disk"], "capacity_bytes");
-    gauge_into("ninfer_kv_disk_used_bytes", json["kv_disk"], "used_bytes");
-    gauge_into("ninfer_kv_disk_entries", json["kv_disk"], "entries");
-    gauge_into("ninfer_response_store_records", json["response_store"], "records");
-    gauge_into("ninfer_response_store_bytes", json["response_store"], "bytes");
-    gauge_into("ninfer_response_store_max_records", json["response_store"], "max_records");
-    gauge_into("ninfer_response_store_max_bytes", json["response_store"], "max_bytes");
-
-    const auto counter_into = [&](const char* name, Json& object, const char* field) {
-        if (const Family* family = family_named(name)) { object[field] = unlabeled(*family); }
-    };
-    counter_into("ninfer_engine_computed_prefill_tokens_total", json["scheduler"],
-                 "computed_prefill_tokens");
-    counter_into("ninfer_engine_committed_decode_tokens_total", json["scheduler"],
-                 "committed_decode_tokens");
-    counter_into("ninfer_engine_decode_rounds_total", json["scheduler"], "decode_rounds");
-    counter_into("ninfer_engine_decode_row_rounds_total", json["scheduler"], "decode_row_rounds");
-    counter_into("ninfer_kv_ram_captures_total", json["kv_ram"], "captures");
-    counter_into("ninfer_kv_ram_restores_total", json["kv_ram"], "restores");
-    counter_into("ninfer_kv_ram_evictions_total", json["kv_ram"], "evictions");
-    counter_into("ninfer_kv_ram_drops_total", json["kv_ram"], "drops");
-    counter_into("ninfer_kv_ram_save_seconds_total", json["kv_ram"], "save_seconds");
-    counter_into("ninfer_kv_ram_load_seconds_total", json["kv_ram"], "load_seconds");
-    counter_into("ninfer_kv_disk_captures_total", json["kv_disk"], "captures");
-    counter_into("ninfer_kv_disk_restores_total", json["kv_disk"], "restores");
-    counter_into("ninfer_kv_disk_evictions_total", json["kv_disk"], "evictions");
-    counter_into("ninfer_kv_disk_drops_total", json["kv_disk"], "drops");
-    counter_into("ninfer_kv_disk_save_seconds_total", json["kv_disk"], "save_seconds");
-    counter_into("ninfer_kv_disk_load_seconds_total", json["kv_disk"], "load_seconds");
-    counter_into("ninfer_kv_disk_h2d_seconds_total", json["kv_disk"], "h2d_seconds");
-    counter_into("ninfer_kv_cache_fallbacks_total", json["kv_disk"], "cache_fallbacks");
-    counter_into("ninfer_prefix_cache_query_tokens_total", json["prefix_reuse"], "query_tokens");
-    counter_into("ninfer_context_checkpoint_restored_tokens_total", json["prefix_reuse"],
-                 "restored_tokens");
-    counter_into("ninfer_context_checkpoint_captured_tokens_total", json["prefix_reuse"],
-                 "captured_tokens");
-    counter_into("ninfer_context_checkpoint_capture_requests_total", json["prefix_reuse"],
-                 "capture_requests");
-    counter_into("ninfer_speculative_rounds_total", json["speculative"], "rounds");
-    counter_into("ninfer_speculative_draft_tokens_total", json["speculative"], "draft_tokens");
-    counter_into("ninfer_speculative_accepted_tokens_total", json["speculative"], "accepted_tokens");
-    counter_into("ninfer_speculative_fallback_steps_total", json["speculative"], "fallback_steps");
-    counter_into("ninfer_recovery_cycle_exclusions_total", json["recovery"], "cycle_exclusions");
-    counter_into("ninfer_recovery_discarded_reasoning_tokens_total", json["recovery"],
-                 "discarded_reasoning_tokens");
-    counter_into("ninfer_recovery_discarded_tool_calls_total", json["recovery"],
-                 "discarded_tool_calls");
-    counter_into("ninfer_generation_tool_calls_total", json["generation"], "tool_calls");
-    counter_into("ninfer_generation_ignored_tool_markup_total", json["generation"],
-                 "ignored_tool_markup");
-    counter_into("ninfer_generation_media_requests_total", json["generation"], "media_requests");
-
-    if (const Family* pages = family_named("ninfer_gpu_kv_pages")) {
-        for (const char* pool : {"main", "spec"}) {
-            for (const char* state : {"capacity", "entitled", "mapped", "free"}) {
-                for (const Sample& sample : pages->samples) {
-                    if (std::string_view(label_value(sample.labels, "pool")) == pool &&
-                        std::string_view(label_value(sample.labels, "state")) == state) {
-                        json["gpu_kv"][pool][state] = sample.value;
-                    }
-                }
-            }
-        }
-    }
-    if (const Family* tokens = family_named("ninfer_gpu_kv_capacity_tokens")) {
-        for (const Sample& sample : tokens->samples) {
-            json["gpu_kv"][label_value(sample.labels, "pool")]["capacity_tokens"] = sample.value;
-        }
-    }
-    if (const Family* reuse = family_named("ninfer_prefix_reuse_requests_total")) {
-        for (const Sample& sample : reuse->samples) {
-            json["prefix_reuse"]["requests"][label_value(sample.labels, "path")]
-                                [label_value(sample.labels, "source")] = sample.value;
-        }
-    }
-    if (const Family* hits = family_named("ninfer_prefix_cache_hit_tokens_total")) {
-        for (const Sample& sample : hits->samples) {
-            json["prefix_reuse"]["hit_tokens"][label_value(sample.labels, "source")] = sample.value;
-        }
-    }
-    if (const Family* positions = family_named("ninfer_speculative_accepted_tokens_position_total")) {
-        Json values = Json::array();
-        for (int position = 0; position < 15; ++position) {
-            double value = 0;
-            for (const Sample& sample : positions->samples) {
-                if (label_value(sample.labels, "position") == std::to_string(position)) {
-                    value = sample.value;
-                }
-            }
-            values.push_back(value);
-        }
-        json["speculative"]["accepted_by_position"] = std::move(values);
-    }
-    if (const Family* rounds = family_named("ninfer_speculative_rounds_by_k_total")) {
-        Json values = Json::array();
-        for (int k = 1; k <= 15; ++k) {
-            double value = 0;
-            for (const Sample& sample : rounds->samples) {
-                if (label_value(sample.labels, "k") == std::to_string(k)) { value = sample.value; }
-            }
-            values.push_back(value);
-        }
-        json["speculative"]["rounds_by_k"] = std::move(values);
-    }
-    if (const Family* events = family_named("ninfer_recovery_events_total")) {
-        for (const Sample& sample : events->samples) {
-            json["recovery"]["events"][label_value(sample.labels, "kind")]
-                            [label_value(sample.labels, "cause")] = sample.value;
-        }
-    }
-    if (const Family* finish = family_named("ninfer_generation_finish_reason_total")) {
-        Json reasons = Json::object();
-        for (const Sample& sample : finish->samples) {
-            reasons[label_value(sample.labels, "reason")] = sample.value;
-        }
-        json["generation"]["finish_reason"] = std::move(reasons);
-    }
-    if (const Family* requests = family_named("ninfer_generation_requests_total")) {
-        double total = 0;
-        for (const Sample& sample : requests->samples) { total += sample.value; }
-        json["generation"]["requests_total"] = total;
-    }
-    if (const Family* family = family_named("ninfer_generation_ttft_seconds")) {
-        add_hist_json_all(json["generation"], "ttft", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_e2e_seconds")) {
-        add_hist_json_all(json["generation"], "e2e", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_inter_token_latency_seconds")) {
-        add_hist_json_all(json["generation"], "inter_token_latency", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_output_tokens_per_second")) {
-        add_hist_json_all(json["generation"], "output_tokens_per_second", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_prefill_tokens_per_second")) {
-        add_hist_json_all(json["generation"], "prefill_tokens_per_second", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_prompt_tokens")) {
-        add_hist_json_all(json["generation"], "prompt_tokens", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_completion_tokens")) {
-        add_hist_json_all(json["generation"], "completion_tokens", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_reasoning_tokens")) {
-        add_hist_json_all(json["generation"], "reasoning_tokens", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_computed_prefill_tokens")) {
-        add_hist_json_all(json["generation"], "computed_prefill_tokens", *family);
-    }
-    if (const Family* family = family_named("ninfer_speculative_live_k")) {
-        add_hist_json_all(json["speculative"], "live_k", *family);
-    }
-    if (const Family* family = family_named("ninfer_recovery_attempts")) {
-        add_hist_json_all(json["recovery"], "attempts", *family);
-    }
-    if (const Family* family = family_named("ninfer_generation_phase_seconds")) {
-        for (const char* phase : kPhases) {
-            const Sample* sample = find_labels(*family, "phase", phase);
-            json["phases"][phase] = Json{{"count", sample == nullptr ? 0 : sample->count},
-                                         {"sum", sample == nullptr ? 0.0 : sample->sum}};
-        }
-    }
-    return json;
-}
-
-std::vector<Family> collect_families(const MetricsSnapshotData& data);
-
-} // namespace
-
-struct MetricsSnapshotData {
-    Startup startup;
-    ninfer::RuntimeStats stats;
-    std::size_t http_in_flight   = 0;
-    std::size_t response_records = 0;
-    std::size_t response_bytes   = 0;
-    std::map<std::string, std::uint64_t> counters;
-    std::map<std::string, HistState> histograms;
+    std::uint64_t recovery_events[kKindCount][kCauseCount]{};
+    std::uint64_t recovery_cycle_exclusions           = 0;
+    std::uint64_t recovery_discarded_reasoning_tokens = 0;
+    std::uint64_t recovery_discarded_tool_calls       = 0;
+    CountHistogram recovery_attempts;
 };
 
-struct ServeMetricsState {
-    std::mutex mutex;
-    Startup startup;
-    std::map<std::string, std::uint64_t> counters;
-    std::map<std::string, HistState> histograms;
-
-    void precreate_counter(const char* family, Labels labels) {
-        counters.emplace(series_key(family, labels), 0);
-    }
-
-    void precreate_histogram(const char* family, Labels labels) {
-        histograms.emplace(series_key(family, labels), make_hist(bucket_kind(family)));
-    }
-
-    void inc(const char* family, Labels labels, std::uint64_t amount) {
-        if (amount == 0) { return; }
-        const auto it = counters.find(series_key(family, labels));
-        if (it == counters.end()) { return; }
-        it->second += amount;
-    }
-
-    void inc_open(const char* family, Labels labels, std::uint64_t amount) {
-        if (amount == 0) { return; }
-        counters[series_key(family, labels)] += amount;
-    }
-
-    void observe(const char* family, Labels labels, double value) {
-        if (!std::isfinite(value)) { return; }
-        const std::string key = series_key(family, labels);
-        auto it = histograms.find(key);
-        if (it == histograms.end()) {
-            it = histograms.emplace(key, make_hist(bucket_kind(family))).first;
-        }
-        HistState& state = it->second;
-        const BoundSet bounds = bounds_for(bucket_kind(family));
-        std::size_t index = bounds.count;
-        for (std::size_t i = 0; i < bounds.count; ++i) {
-            if (value <= bounds.values[i]) {
-                index = i;
-                break;
-            }
-        }
-        if (index < state.buckets.size()) { ++state.buckets[index]; }
-        state.sum += value;
-        ++state.count;
-    }
-};
-
-namespace {
-
-void precreate(ServeMetricsState& state) {
-    for (const char* protocol : kProtocols) {
-        for (const char* stream : kStreams) {
-            for (const char* result : kResults) {
-                for (const char* thinking : kBools) {
-                    for (const char* tools : kBools) {
-                        state.precreate_counter(
-                            "ninfer_generation_requests_total",
-                            Labels{{"protocol", protocol},
-                                   {"result", result},
-                                   {"stream", stream},
-                                   {"thinking", thinking},
-                                   {"tools", tools}});
-                    }
-                }
-            }
-        }
-    }
-    for (const char* protocol : kProtocols) {
-        state.precreate_histogram("ninfer_generation_ttft_seconds", Labels{{"protocol", protocol}});
-        state.precreate_histogram("ninfer_generation_e2e_seconds", Labels{{"protocol", protocol}});
-        state.precreate_histogram("ninfer_generation_inter_token_latency_seconds",
-                                  Labels{{"protocol", protocol}});
-        state.precreate_counter("ninfer_token_count_requests_total", Labels{{"protocol", protocol}});
-    }
-    for (const char* phase : kPhases) {
-        state.precreate_histogram("ninfer_generation_phase_seconds", Labels{{"phase", phase}});
-    }
-    for (const char* tier : kTiers) {
-        for (const char* op : kCopyOps) {
-            state.precreate_histogram("ninfer_generation_kv_copy_seconds",
-                                      Labels{{"op", op}, {"tier", tier}});
-        }
-    }
-    state.precreate_histogram("ninfer_generation_prompt_tokens", {});
-    state.precreate_histogram("ninfer_generation_completion_tokens", {});
-    state.precreate_histogram("ninfer_generation_reasoning_tokens", {});
-    state.precreate_histogram("ninfer_generation_computed_prefill_tokens", {});
-    state.precreate_histogram("ninfer_generation_output_tokens_per_second", {});
-    state.precreate_histogram("ninfer_generation_prefill_tokens_per_second", {});
-    state.precreate_histogram("ninfer_speculative_live_k", {});
-    state.precreate_histogram("ninfer_recovery_attempts", {});
-    for (const char* reason : kFinishReasons) {
-        state.precreate_counter("ninfer_generation_finish_reason_total", Labels{{"reason", reason}});
-    }
-    state.precreate_counter("ninfer_generation_tool_calls_total", {});
-    state.precreate_counter("ninfer_generation_ignored_tool_markup_total", {});
-    state.precreate_counter("ninfer_generation_media_requests_total", {});
-    for (const char* code : kApiErrorCodes) {
-        state.precreate_counter("ninfer_api_errors_total", Labels{{"code", code}});
-    }
-    for (const char* path : kPrefixPaths) {
-        for (const char* source : kPrefixSources) {
-            state.precreate_counter("ninfer_prefix_reuse_requests_total",
-                                    Labels{{"path", path}, {"source", source}});
-        }
-    }
-    for (const char* source : kPrefixSources) {
-        state.precreate_counter("ninfer_prefix_cache_hit_tokens_total", Labels{{"source", source}});
-    }
-    state.precreate_counter("ninfer_prefix_cache_query_tokens_total", {});
-    state.precreate_counter("ninfer_context_checkpoint_restored_tokens_total", {});
-    state.precreate_counter("ninfer_context_checkpoint_captured_tokens_total", {});
-    state.precreate_counter("ninfer_context_checkpoint_capture_requests_total", {});
-    state.precreate_counter("ninfer_speculative_rounds_total", {});
-    state.precreate_counter("ninfer_speculative_draft_tokens_total", {});
-    state.precreate_counter("ninfer_speculative_accepted_tokens_total", {});
-    state.precreate_counter("ninfer_speculative_fallback_steps_total", {});
-    for (int position = 0; position <= 14; ++position) {
-        state.precreate_counter("ninfer_speculative_accepted_tokens_position_total",
-                                Labels{{"position", std::to_string(position).c_str()}});
-    }
-    for (int k = 1; k <= 15; ++k) {
-        state.precreate_counter("ninfer_speculative_rounds_by_k_total",
-                                Labels{{"k", std::to_string(k).c_str()}});
-    }
-    state.precreate_counter("ninfer_recovery_cycle_exclusions_total", {});
-    state.precreate_counter("ninfer_recovery_discarded_reasoning_tokens_total", {});
-    state.precreate_counter("ninfer_recovery_discarded_tool_calls_total", {});
-    for (const char* kind : kRecoveryKinds) {
-        for (const char* cause : kRecoveryCauses) {
-            state.precreate_counter("ninfer_recovery_events_total",
-                                    Labels{{"cause", cause}, {"kind", kind}});
-        }
-    }
+void observe_terminal_recovery(Series& series, const ninfer::GenerationRecoveryStats& stats) {
+    series.recovery_cycle_exclusions += stats.cycle_exclusions;
+    series.recovery_discarded_reasoning_tokens += stats.discarded_reasoning_tokens;
+    series.recovery_discarded_tool_calls += stats.discarded_tool_calls;
+    if (stats.attempts > 0) { series.recovery_attempts.observe(static_cast<double>(stats.attempts)); }
 }
 
-[[nodiscard]] const char* recovery_kind_name(ninfer::RecoveryEventKind kind) {
-    switch (kind) {
-    case ninfer::RecoveryEventKind::CycleExclusion:
-        return "cycle_exclusion";
-    case ninfer::RecoveryEventKind::RetryTriggered:
-        return "retry_triggered";
-    case ninfer::RecoveryEventKind::RetryStarted:
-        return "retry_started";
-    case ninfer::RecoveryEventKind::RetryPrefillComplete:
-        return "retry_prefill_complete";
-    case ninfer::RecoveryEventKind::Finished:
-        return "finished";
-    case ninfer::RecoveryEventKind::Exhausted:
-        return "exhausted";
-    }
-    return "other";
-}
-
-void observe_success(ServeMetricsState& state, const GenerationObservation& observation) {
-    const GenerationOutcome& outcome = *observation.outcome;
+void observe_success(Series& series, std::size_t protocol, const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics = outcome.metrics;
-    const char* protocol = known_protocol(observation.protocol);
-    const Labels protocol_labels{{"protocol", protocol}};
-    if (std::isfinite(metrics.ttft_seconds)) {
-        state.observe("ninfer_generation_ttft_seconds", protocol_labels, metrics.ttft_seconds);
-    }
-    if (std::isfinite(metrics.total_seconds)) {
-        state.observe("ninfer_generation_e2e_seconds", protocol_labels, metrics.total_seconds);
-    }
+    series.ttft[protocol].observe(metrics.ttft_seconds);
+    series.e2e[protocol].observe(metrics.total_seconds);
     const int decode_tokens =
         decode_eval_tokens(outcome.completion_tokens, metrics.recovery.prefill_samples);
     if (metrics.decode_seconds > 0.0 && decode_tokens > 0) {
-        state.observe("ninfer_generation_inter_token_latency_seconds", protocol_labels,
-                      metrics.decode_seconds / static_cast<double>(decode_tokens));
-        state.observe("ninfer_generation_output_tokens_per_second", {},
-                      static_cast<double>(decode_tokens) / metrics.decode_seconds);
+        series.inter_token[protocol].observe(metrics.decode_seconds / static_cast<double>(decode_tokens));
+        series.output_tokens_per_second.observe(static_cast<double>(decode_tokens) / metrics.decode_seconds);
     }
-    const double phases[] = {
+    const double phases[kPhaseCount] = {
         metrics.prepare_cpu_seconds,
         metrics.media_wait_seconds,
         metrics.media_fetch_seconds,
@@ -970,576 +416,827 @@ void observe_success(ServeMetricsState& state, const GenerationObservation& obse
         metrics.recovery.prepare_seconds + metrics.recovery.prefill_seconds,
         metrics.http_tail_seconds,
     };
-    for (std::size_t i = 0; i < std::size(kPhases); ++i) {
-        if (phases[i] > 0.0) {
-            state.observe("ninfer_generation_phase_seconds", Labels{{"phase", kPhases[i]}}, phases[i]);
-        }
+    for (std::size_t i = 0; i < kPhaseCount; ++i) {
+        if (phases[i] > 0.0) { series.phase[i].observe(phases[i]); }
     }
-    const double copies[][3] = {
+    const double copies[kTierCount][kCopyOpCount] = {
         {metrics.kv_disk_h2d_seconds, metrics.kv_disk_load_seconds, metrics.kv_disk_save_seconds},
         {0.0, metrics.kv_ram_load_seconds, metrics.kv_ram_save_seconds},
     };
-    for (std::size_t tier = 0; tier < 2; ++tier) {
-        for (std::size_t op = 0; op < 3; ++op) {
-            if (copies[tier][op] > 0.0) {
-                state.observe("ninfer_generation_kv_copy_seconds",
-                              Labels{{"op", kCopyOps[op]}, {"tier", kTiers[tier]}}, copies[tier][op]);
-            }
+    for (std::size_t tier = 0; tier < kTierCount; ++tier) {
+        for (std::size_t op = 0; op < kCopyOpCount; ++op) {
+            if (copies[tier][op] > 0.0) { series.kv_copy[tier][op].observe(copies[tier][op]); }
         }
     }
     if (outcome.prompt_tokens >= 0) {
-        state.observe("ninfer_generation_prompt_tokens", {}, static_cast<double>(outcome.prompt_tokens));
+        series.prompt_tokens.observe(static_cast<double>(outcome.prompt_tokens));
     }
     if (outcome.completion_tokens >= 0) {
-        state.observe("ninfer_generation_completion_tokens", {},
-                      static_cast<double>(outcome.completion_tokens));
+        series.completion_tokens.observe(static_cast<double>(outcome.completion_tokens));
     }
     if (outcome.reasoning_tokens > 0) {
-        state.observe("ninfer_generation_reasoning_tokens", {},
-                      static_cast<double>(outcome.reasoning_tokens));
+        series.reasoning_tokens.observe(static_cast<double>(outcome.reasoning_tokens));
     }
     const int computed =
         prefill_eval_tokens(outcome.prompt_tokens, static_cast<int>(metrics.prefix_cache_hit_tokens));
-    if (computed >= 0) {
-        state.observe("ninfer_generation_computed_prefill_tokens", {}, static_cast<double>(computed));
-    }
+    if (computed >= 0) { series.computed_prefill_tokens.observe(static_cast<double>(computed)); }
     if (metrics.prefill_tail_tok_s > 0.0) {
-        state.observe("ninfer_generation_prefill_tokens_per_second", {}, metrics.prefill_tail_tok_s);
+        series.prefill_tokens_per_second.observe(metrics.prefill_tail_tok_s);
     } else if (metrics.prefill_seconds > 0.0 && computed > 0) {
-        state.observe("ninfer_generation_prefill_tokens_per_second", {},
-                      static_cast<double>(computed) / metrics.prefill_seconds);
+        series.prefill_tokens_per_second.observe(static_cast<double>(computed) / metrics.prefill_seconds);
     }
+
     const char* reason = outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason)
                                                      : "tool_calls";
-    bool known_reason = false;
-    for (const char* candidate : kFinishReasons) {
-        if (std::string_view(reason) == candidate) { known_reason = true; }
-    }
-    state.inc("ninfer_generation_finish_reason_total",
-              Labels{{"reason", known_reason ? reason : "unknown"}}, 1);
-    state.inc("ninfer_generation_tool_calls_total", {}, outcome.tool_calls.size());
-    state.inc("ninfer_generation_ignored_tool_markup_total", {},
-              outcome.ignored_qwen_tool_call_names.size());
-    state.inc("ninfer_prefix_reuse_requests_total",
-              Labels{{"path", prefix_reuse_path_name(metrics.prefix_reuse_path)},
-                     {"source", prefix_reuse_source_name(metrics.prefix_reuse_source)}},
-              1);
-    state.inc("ninfer_prefix_cache_hit_tokens_total",
-              Labels{{"source", prefix_reuse_source_name(metrics.prefix_reuse_source)}},
-              metrics.prefix_cache_hit_tokens);
-    state.inc("ninfer_prefix_cache_query_tokens_total", {},
-              static_cast<std::uint64_t>(std::max(outcome.prompt_tokens, 0)));
-    state.inc("ninfer_context_checkpoint_restored_tokens_total", {},
-              metrics.restored_context_checkpoint_tokens);
-    state.inc("ninfer_context_checkpoint_captured_tokens_total", {},
-              metrics.captured_context_checkpoint_tokens);
+    ++series.finish_reason[index_of(kFinishReasons, reason, kFinishCount - 1)];
+    series.tool_calls += outcome.tool_calls.size();
+    series.ignored_tool_markup += outcome.ignored_qwen_tool_call_names.size();
+
+    const std::size_t path =
+        index_of(kPrefixPaths, prefix_reuse_path_name(metrics.prefix_reuse_path), kPathCount - 1);
+    const std::size_t source = index_of(
+        kPrefixSources, prefix_reuse_source_name(metrics.prefix_reuse_source), kSourceCount - 1);
+    ++series.prefix_reuse[path][source];
+    series.prefix_hit_tokens[source] += metrics.prefix_cache_hit_tokens;
+    series.prefix_query_tokens += static_cast<std::uint64_t>(std::max(outcome.prompt_tokens, 0));
+    series.checkpoint_restored_tokens += metrics.restored_context_checkpoint_tokens;
+    series.checkpoint_captured_tokens += metrics.captured_context_checkpoint_tokens;
+
     if (metrics.speculative_backend == SpeculativeBackend::None) { return; }
-    state.inc("ninfer_speculative_rounds_total", {}, metrics.speculative_rounds);
-    state.inc("ninfer_speculative_draft_tokens_total", {}, metrics.speculative_draft_tokens);
-    state.inc("ninfer_speculative_accepted_tokens_total", {}, metrics.speculative_accepted_tokens);
-    state.inc("ninfer_speculative_fallback_steps_total", {}, metrics.speculative_fallback_steps);
+    series.speculative_rounds += metrics.speculative_rounds;
+    series.speculative_draft_tokens += metrics.speculative_draft_tokens;
+    series.speculative_accepted_tokens += metrics.speculative_accepted_tokens;
+    series.speculative_fallback_steps += metrics.speculative_fallback_steps;
     const std::size_t positions =
-        std::min<std::size_t>(metrics.speculative_accepted_per_position.size(), 15);
+        std::min(metrics.speculative_accepted_per_position.size(), kMaxDraftTokens);
     for (std::size_t position = 0; position < positions; ++position) {
-        state.inc("ninfer_speculative_accepted_tokens_position_total",
-                  Labels{{"position", std::to_string(position).c_str()}},
-                  metrics.speculative_accepted_per_position[position]);
+        series.speculative_accepted_by_position[position] +=
+            metrics.speculative_accepted_per_position[position];
     }
-    for (int k = 1; k <= 15; ++k) {
-        if (static_cast<std::size_t>(k) >= metrics.speculative_rounds_per_draft.size()) { break; }
-        state.inc("ninfer_speculative_rounds_by_k_total",
-                  Labels{{"k", std::to_string(k).c_str()}},
-                  metrics.speculative_rounds_per_draft[static_cast<std::size_t>(k)]);
+    // rounds_per_draft is indexed by k; index 0 is unused.
+    const std::size_t widths =
+        std::min(metrics.speculative_rounds_per_draft.size(), kMaxDraftTokens + 1);
+    for (std::size_t k = 1; k < widths; ++k) {
+        series.speculative_rounds_by_k[k - 1] += metrics.speculative_rounds_per_draft[k];
     }
     if (metrics.speculative_live_draft_tokens > 0) {
-        state.observe("ninfer_speculative_live_k", {}, metrics.speculative_live_draft_tokens);
+        series.speculative_live_k.observe(static_cast<double>(metrics.speculative_live_draft_tokens));
     }
 }
 
-void observe_terminal_recovery(ServeMetricsState& state, const ninfer::GenerationRecoveryStats& stats) {
-    state.inc("ninfer_recovery_cycle_exclusions_total", {}, stats.cycle_exclusions);
-    state.inc("ninfer_recovery_discarded_reasoning_tokens_total", {}, stats.discarded_reasoning_tokens);
-    state.inc("ninfer_recovery_discarded_tool_calls_total", {}, stats.discarded_tool_calls);
-    if (stats.attempts > 0) {
-        state.observe("ninfer_recovery_attempts", {}, static_cast<double>(stats.attempts));
+// ---------------------------------------------------------------------------
+// Prometheus text.
+
+void append_number(std::string& out, double value) {
+    if (!std::isfinite(value)) {
+        out.append(std::isnan(value) ? "NaN" : value > 0 ? "+Inf" : "-Inf");
+        return;
     }
+    char buf[64];
+    const auto result = std::to_chars(buf, buf + sizeof(buf), value);
+    out.append(buf, result.ptr);
 }
 
-std::vector<Family> collect_families(const MetricsSnapshotData& data) {
-    std::vector<Family> families;
-    families.reserve(kMetricFamilyCount);
-    const Startup& startup = data.startup;
-    const ninfer::RuntimeStats& stats = data.stats;
-    add_info(families, "ninfer_engine_info", "Resident engine identity.", startup.engine_labels);
-    add_info(families, "ninfer_build_info", "CUDA build identity.", startup.build_labels);
-    add_gauge(families, "ninfer_max_context_tokens", "Configured max context tokens.",
-              startup.max_context);
-    add_gauge(families, "ninfer_prefill_chunk_tokens", "Configured prefill chunk tokens.",
-              startup.prefill_chunk);
-    add_gauge(families, "ninfer_pending_timeout_seconds", "Pending FIFO timeout.",
-              startup.pending_timeout_seconds);
-    add_gauge(families, "ninfer_default_max_tokens", "Default max output tokens.",
-              startup.default_max_tokens);
-    add_gauge(families, "ninfer_keep_frac", "Sparse attention keep fraction.", startup.keep_frac);
-    add_gauge(families, "ninfer_xattn_tau", "Sparse attention tau.", startup.xattn_tau);
-    add_gauge(families, "ninfer_xattn_min_len", "Cross-attention minimum length.",
-              startup.xattn_min_len);
-    add_gauge(families, "ninfer_dflash_verify_width", "DFlash verify width. 0 is automatic.",
-              startup.dflash_verify_width);
-    add_gauge(families, "ninfer_speculative_configured_draft_tokens", "Configured draft tokens.",
-              startup.configured_draft_tokens);
-    add_gauge(families, "ninfer_engine_load_seconds", "Artifact load seconds.", startup.load_seconds);
-    add_gauge(families, "ninfer_cuda_graph_allowance_bytes", "CUDA graph allowance at startup.",
-              startup.cuda_graph_allowance_bytes);
-    add_gauge(families, "ninfer_cuda_graph_observed_bytes", "CUDA graph bytes observed at startup.",
-              startup.cuda_graph_observed_bytes);
-    add_labeled_gauges(
-        families, "ninfer_arena_capacity_bytes", "Arena capacity at startup.",
-        {labeled_value({{"arena", "request_transient"}}, startup.arena_request_transient),
-         labeled_value({{"arena", "sequence"}}, startup.arena_sequence),
-         labeled_value({{"arena", "weights"}}, startup.arena_weights),
-         labeled_value({{"arena", "workspace"}}, startup.arena_workspace)});
-    add_gauge(families, "ninfer_server_start_time_seconds", "Server attach time as unix seconds.",
-              startup.start_time_unix_s);
-    add_gauge(families, "ninfer_scheduler_max_concurrency", "Configured resident requests.",
-              startup.max_concurrency);
-    add_gauge(families, "ninfer_scheduler_max_pending_requests", "Configured pending FIFO depth.",
-              startup.max_pending_requests);
-    add_mapped_counter(families, "ninfer_http_requests_total", "HTTP requests by route.",
-                       data.counters);
-    add_mapped_histogram(families, "ninfer_http_request_duration_seconds", "HTTP handler duration.",
-                         BucketKind::Seconds, data.histograms);
-    add_gauge(families, "ninfer_http_in_flight_requests", "Requests occupying a serve slot.",
-              static_cast<double>(data.http_in_flight));
-    add_mapped_counter(families, "ninfer_api_errors_total", "API errors by closed code.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_generation_requests_total", "HTTP generation attempts.",
-                       data.counters);
-    add_mapped_histogram(families, "ninfer_generation_ttft_seconds", "Time to first token.",
-                         BucketKind::Seconds, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_e2e_seconds", "Engine end to end seconds.",
-                         BucketKind::Seconds, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_inter_token_latency_seconds",
-                         "Decode seconds per output token.", BucketKind::Seconds, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_phase_seconds", "Closed generation phase seconds.",
-                         BucketKind::Seconds, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_kv_copy_seconds", "Per-request KV copy seconds.",
-                         BucketKind::Seconds, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_prompt_tokens", "Prompt tokens.",
-                         BucketKind::Tokens, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_completion_tokens", "Completion tokens.",
-                         BucketKind::Tokens, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_reasoning_tokens", "Reasoning tokens.",
-                         BucketKind::Tokens, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_computed_prefill_tokens",
-                         "Prompt tokens excluding prefix hits.", BucketKind::Tokens, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_output_tokens_per_second",
-                         "Decode output tokens per second.", BucketKind::Toks, data.histograms);
-    add_mapped_histogram(families, "ninfer_generation_prefill_tokens_per_second",
-                         "Prefill tokens per second.", BucketKind::Toks, data.histograms);
-    add_mapped_counter(families, "ninfer_generation_finish_reason_total", "Successful finish reasons.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_generation_tool_calls_total", "Returned tool calls.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_generation_ignored_tool_markup_total",
-                       "Ignored undeclared tool markup.", data.counters);
-    add_mapped_counter(families, "ninfer_generation_media_requests_total",
-                       "Generations whose prompt had media.", data.counters);
-    add_mapped_counter(families, "ninfer_token_count_requests_total", "Token-count requests.",
-                       data.counters);
-    add_gauge(families, "ninfer_scheduler_running_requests", "Requests with a lane.",
-              stats.running_requests);
-    add_gauge(families, "ninfer_scheduler_prefilling_requests", "Requests in prefill.",
-              stats.prefilling_requests);
-    add_gauge(families, "ninfer_scheduler_decode_ready_requests", "Requests waiting for decode.",
-              stats.decode_ready_requests);
-    add_gauge(families, "ninfer_scheduler_waiting_requests", "Requests in the pending FIFO.",
-              stats.waiting_requests);
-    add_absolute(families, "ninfer_engine_computed_prefill_tokens_total",
-                 "Prompt tokens evaluated by prefill.",
-                 static_cast<double>(stats.computed_prefill_tokens));
-    add_absolute(families, "ninfer_engine_committed_decode_tokens_total",
-                 "Tokens committed by decode rounds.",
-                 static_cast<double>(stats.committed_decode_tokens));
-    add_absolute(families, "ninfer_engine_decode_rounds_total", "Decode batch executions.",
-                 static_cast<double>(stats.decode_rounds));
-    add_absolute(families, "ninfer_engine_decode_row_rounds_total", "Decode rows across batches.",
-                 static_cast<double>(stats.decode_row_rounds));
-    add_labeled_gauges(
-        families, "ninfer_gpu_kv_pages", "GPU KV pages by pool and state.",
-        {labeled_value({{"pool", "main"}, {"state", "capacity"}}, stats.gpu_kv_main_capacity_pages),
-         labeled_value({{"pool", "main"}, {"state", "entitled"}}, stats.gpu_kv_main_entitled_pages),
-         labeled_value({{"pool", "main"}, {"state", "free"}}, stats.gpu_kv_main_free_pages),
-         labeled_value({{"pool", "main"}, {"state", "mapped"}}, stats.gpu_kv_main_mapped_pages),
-         labeled_value({{"pool", "spec"}, {"state", "capacity"}}, stats.gpu_kv_spec_capacity_pages),
-         labeled_value({{"pool", "spec"}, {"state", "entitled"}}, stats.gpu_kv_spec_entitled_pages),
-         labeled_value({{"pool", "spec"}, {"state", "free"}}, stats.gpu_kv_spec_free_pages),
-         labeled_value({{"pool", "spec"}, {"state", "mapped"}}, stats.gpu_kv_spec_mapped_pages)});
-    add_labeled_gauges(
-        families, "ninfer_gpu_kv_capacity_tokens", "GPU KV token capacity by pool.",
-        {labeled_value({{"pool", "main"}},
-                       static_cast<double>(stats.gpu_kv_main_capacity_pages) * kKvPageTokens),
-         labeled_value({{"pool", "spec"}},
-                       static_cast<double>(stats.gpu_kv_spec_capacity_pages) * kKvPageTokens)});
-    add_gauge(families, "ninfer_kv_ram_capacity_bytes", "Host RAM prefix cache capacity.",
-              static_cast<double>(stats.kv_ram_capacity_bytes));
-    add_gauge(families, "ninfer_kv_ram_used_bytes", "Host RAM prefix cache occupancy.",
-              static_cast<double>(stats.kv_ram_used_bytes));
-    add_gauge(families, "ninfer_kv_ram_entries", "Host RAM prefix cache entries.",
-              static_cast<double>(stats.kv_ram_entry_count));
-    add_absolute(families, "ninfer_kv_ram_captures_total", "Host RAM prefix captures.",
-                 static_cast<double>(stats.kv_ram_captures));
-    add_absolute(families, "ninfer_kv_ram_restores_total", "Host RAM prefix restores.",
-                 static_cast<double>(stats.kv_ram_restores));
-    add_absolute(families, "ninfer_kv_ram_evictions_total", "Host RAM prefix evictions.",
-                 static_cast<double>(stats.kv_ram_evictions));
-    add_absolute(families, "ninfer_kv_ram_drops_total", "Host RAM prefix drops.",
-                 static_cast<double>(stats.kv_ram_drops));
-    add_absolute(families, "ninfer_kv_ram_save_seconds_total", "Host RAM prefix save seconds.",
-                 stats.kv_ram_save_seconds);
-    add_absolute(families, "ninfer_kv_ram_load_seconds_total", "Host RAM prefix load seconds.",
-                 stats.kv_ram_load_seconds);
-    add_gauge(families, "ninfer_kv_disk_capacity_bytes", "Disk prefix cache capacity.",
-              static_cast<double>(stats.kv_disk_capacity_bytes));
-    add_gauge(families, "ninfer_kv_disk_used_bytes", "Disk prefix cache occupancy.",
-              static_cast<double>(stats.kv_disk_used_bytes));
-    add_gauge(families, "ninfer_kv_disk_entries", "Disk prefix cache entries.",
-              static_cast<double>(stats.kv_disk_entry_count));
-    add_absolute(families, "ninfer_kv_disk_captures_total", "Disk prefix captures.",
-                 static_cast<double>(stats.kv_disk_captures));
-    add_absolute(families, "ninfer_kv_disk_restores_total", "Disk prefix restores.",
-                 static_cast<double>(stats.kv_disk_restores));
-    add_absolute(families, "ninfer_kv_disk_evictions_total", "Disk prefix evictions.",
-                 static_cast<double>(stats.kv_disk_evictions));
-    add_absolute(families, "ninfer_kv_disk_drops_total", "Disk prefix drops.",
-                 static_cast<double>(stats.kv_disk_drops));
-    add_absolute(families, "ninfer_kv_disk_save_seconds_total", "Disk prefix save seconds.",
-                 stats.kv_disk_save_seconds);
-    add_absolute(families, "ninfer_kv_disk_load_seconds_total", "Disk prefix load seconds.",
-                 stats.kv_disk_load_seconds);
-    add_absolute(families, "ninfer_kv_disk_h2d_seconds_total", "Disk restore host to device seconds.",
-                 stats.kv_disk_h2d_seconds);
-    add_absolute(families, "ninfer_kv_cache_fallbacks_total",
-                 "Prefix restores that fell back to cold prefill.",
-                 static_cast<double>(stats.kv_cache_fallbacks));
-    add_mapped_counter(families, "ninfer_prefix_reuse_requests_total", "Prefix reuse path and source.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_prefix_cache_hit_tokens_total", "Prefix hit tokens by source.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_prefix_cache_query_tokens_total", "Prefix query tokens.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_context_checkpoint_restored_tokens_total",
-                       "Context checkpoint tokens restored.", data.counters);
-    add_mapped_counter(families, "ninfer_context_checkpoint_captured_tokens_total",
-                       "Context checkpoint tokens captured.", data.counters);
-    add_mapped_counter(families, "ninfer_context_checkpoint_capture_requests_total",
-                       "Requests that asked for a context checkpoint.", data.counters);
-    add_mapped_counter(families, "ninfer_speculative_rounds_total", "Speculative rounds.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_speculative_draft_tokens_total", "Draft tokens proposed.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_speculative_accepted_tokens_total", "Draft tokens accepted.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_speculative_fallback_steps_total", "Speculative fallback steps.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_speculative_accepted_tokens_position_total",
-                       "Accepted draft tokens by position.", data.counters);
-    add_mapped_counter(families, "ninfer_speculative_rounds_by_k_total", "Speculative rounds by draft k.",
-                       data.counters);
-    add_mapped_histogram(families, "ninfer_speculative_live_k", "Live draft width.", BucketKind::Draft,
-                         data.histograms);
-    add_mapped_counter(families, "ninfer_recovery_events_total", "Published recovery events.",
-                       data.counters);
-    add_mapped_counter(families, "ninfer_recovery_cycle_exclusions_total",
-                       "True cycle exclusions on terminal requests.", data.counters);
-    add_mapped_counter(families, "ninfer_recovery_discarded_reasoning_tokens_total",
-                       "Reasoning tokens discarded by recovery.", data.counters);
-    add_mapped_counter(families, "ninfer_recovery_discarded_tool_calls_total",
-                       "Tool calls discarded by recovery.", data.counters);
-    add_mapped_histogram(families, "ninfer_recovery_attempts", "Recovery attempts on terminal requests.",
-                         BucketKind::Draft, data.histograms);
-    add_gauge(families, "ninfer_response_store_records", "Stored response records.",
-              static_cast<double>(data.response_records));
-    add_gauge(families, "ninfer_response_store_bytes", "Stored response bytes.",
-              static_cast<double>(data.response_bytes));
-    add_gauge(families, "ninfer_response_store_max_records", "Response store record cap.",
-              startup.response_max_records);
-    add_gauge(families, "ninfer_response_store_max_bytes", "Response store byte cap.",
-              startup.response_max_bytes);
-    if (families.size() != kMetricFamilyCount) {
-        throw std::logic_error("metric family count drifted from kMetricFamilies");
-    }
-    for (std::size_t i = 0; i < families.size(); ++i) {
-        if (families[i].name != kMetricFamilies[i]) {
-            throw std::logic_error("metric family order drifted at " + families[i].name);
+void append_number(std::string& out, std::uint64_t value) {
+    char buf[24];
+    const auto result = std::to_chars(buf, buf + sizeof(buf), value);
+    out.append(buf, result.ptr);
+}
+
+void append_escaped(std::string& out, std::string_view value) {
+    for (const char ch : value) {
+        if (ch == '\\' || ch == '"') {
+            out.push_back('\\');
+            out.push_back(ch);
+        } else if (ch == '\n') {
+            out.append("\\n");
+        } else {
+            out.push_back(ch);
         }
     }
-    return families;
+}
+
+using LabelList = std::initializer_list<std::pair<std::string_view, std::string_view>>;
+
+// `a="x",b="y"` without braces. Closed values need no escaping.
+[[nodiscard]] std::string label_text(LabelList labels) {
+    std::string out;
+    for (const auto& [key, value] : labels) {
+        if (!out.empty()) { out.push_back(','); }
+        out.append(key);
+        out.append("=\"");
+        out.append(value);
+        out.push_back('"');
+    }
+    return out;
+}
+
+class TextWriter {
+public:
+    TextWriter() { out_.reserve(96 * 1024); }
+
+    void family(std::string_view name, std::string_view help, std::string_view type) {
+        name_ = name;
+        out_.append("# HELP ").append(name).push_back(' ');
+        out_.append(help).push_back('\n');
+        out_.append("# TYPE ").append(name).push_back(' ');
+        out_.append(type).push_back('\n');
+    }
+
+    template <typename Value>
+    void sample(std::string_view labels, Value value) {
+        line("", labels, value);
+    }
+
+    template <typename Value>
+    void gauge(std::string_view name, std::string_view help, Value value) {
+        family(name, help, "gauge");
+        sample("", value);
+    }
+
+    template <typename Value>
+    void counter(std::string_view name, std::string_view help, Value value) {
+        family(name, help, "counter");
+        sample("", value);
+    }
+
+    // Emits `le` first; every histogram label name sorts after it.
+    template <const auto& Bounds>
+    void histogram(std::string_view labels, const Histogram<Bounds>& histogram) {
+        std::uint64_t cumulative = 0;
+        for (std::size_t i = 0; i <= std::size(Bounds); ++i) {
+            cumulative += histogram.buckets[i];
+            out_.append(name_).append("_bucket{le=\"");
+            out_.append(i < std::size(Bounds) ? Bounds[i].text : "+Inf").push_back('"');
+            if (!labels.empty()) { out_.append(",").append(labels); }
+            out_.append("} ");
+            append_number(out_, cumulative);
+            out_.push_back('\n');
+        }
+        line("_sum", labels, histogram.sum);
+        line("_count", labels, histogram.count);
+    }
+
+    template <const auto& Bounds>
+    void histogram(std::string_view name, std::string_view help, const Histogram<Bounds>& histogram) {
+        family(name, help, "histogram");
+        this->histogram("", histogram);
+    }
+
+    [[nodiscard]] std::string take() { return std::move(out_); }
+
+private:
+    template <typename Value>
+    void line(std::string_view suffix, std::string_view labels, Value value) {
+        out_.append(name_).append(suffix);
+        if (!labels.empty()) { out_.append("{").append(labels).push_back('}'); }
+        out_.push_back(' ');
+        append_number(out_, value);
+        out_.push_back('\n');
+    }
+
+    std::string out_;
+    std::string_view name_;
+};
+
+[[nodiscard]] std::string info_labels(const std::vector<std::pair<const char*, std::string>>& labels) {
+    std::string out;
+    for (const auto& [key, value] : labels) {
+        if (!out.empty()) { out.push_back(','); }
+        out.append(key).append("=\"");
+        append_escaped(out, value);
+        out.push_back('"');
+    }
+    return out;
 }
 
 } // namespace
 
-MetricsSnapshot::MetricsSnapshot() = default;
-MetricsSnapshot::~MetricsSnapshot() = default;
-MetricsSnapshot::MetricsSnapshot(const MetricsSnapshot& other) {
-    if (other.data_) { data_ = std::make_unique<MetricsSnapshotData>(*other.data_); }
-}
-MetricsSnapshot& MetricsSnapshot::operator=(const MetricsSnapshot& other) {
-    if (this != &other) {
-        data_ = other.data_ ? std::make_unique<MetricsSnapshotData>(*other.data_) : nullptr;
+struct MetricsSnapshotData {
+    std::shared_ptr<const Startup> startup;
+    Series series;
+    ScrapeInputs inputs;
+};
+
+struct ServeMetricsState {
+    mutable std::mutex mutex;
+    std::shared_ptr<const Startup> startup = std::make_shared<const Startup>();
+    Series series;
+};
+
+namespace {
+
+std::string render_text(const MetricsSnapshotData& data) {
+    const Startup& startup            = *data.startup;
+    const Series& series              = data.series;
+    const ninfer::RuntimeStats& stats = data.inputs.stats;
+    TextWriter w;
+
+    w.family("ninfer_engine_info", "Resident engine identity.", "gauge");
+    w.sample(info_labels(startup.engine_labels), std::uint64_t{1});
+    w.family("ninfer_build_info", "CUDA build identity.", "gauge");
+    w.sample(info_labels(startup.build_labels), std::uint64_t{1});
+    w.gauge("ninfer_max_context_tokens", "Configured max context tokens.", startup.max_context);
+    w.gauge("ninfer_prefill_chunk_tokens", "Configured prefill chunk tokens.", startup.prefill_chunk);
+    w.gauge("ninfer_pending_timeout_seconds", "Pending FIFO timeout.", startup.pending_timeout_seconds);
+    w.gauge("ninfer_default_max_tokens", "Default max output tokens.", startup.default_max_tokens);
+    w.gauge("ninfer_keep_frac", "Sparse attention keep fraction.", startup.keep_frac);
+    w.gauge("ninfer_xattn_tau", "XAttention mass threshold.", startup.xattn_tau);
+    w.gauge("ninfer_xattn_min_len", "Cached length at or below which XAttention stays dense.",
+            startup.xattn_min_len);
+    w.gauge("ninfer_dflash_verify_width", "DFlash verify width. 0 is automatic.",
+            startup.dflash_verify_width);
+    w.gauge("ninfer_speculative_configured_draft_tokens", "Configured draft tokens.",
+            startup.configured_draft_tokens);
+    w.gauge("ninfer_engine_load_seconds", "Artifact load seconds.", startup.load_seconds);
+    w.gauge("ninfer_cuda_graph_allowance_bytes", "CUDA graph allowance at startup.",
+            startup.cuda_graph_allowance_bytes);
+    w.gauge("ninfer_cuda_graph_observed_bytes", "CUDA graph bytes observed at startup.",
+            startup.cuda_graph_observed_bytes);
+    w.family("ninfer_arena_capacity_bytes", "Arena capacity at startup.", "gauge");
+    w.sample(R"(arena="request_transient")", startup.arena_request_transient);
+    w.sample(R"(arena="sequence")", startup.arena_sequence);
+    w.sample(R"(arena="weights")", startup.arena_weights);
+    w.sample(R"(arena="workspace")", startup.arena_workspace);
+    w.gauge("ninfer_server_start_time_seconds", "Server attach time as unix seconds.",
+            startup.start_time_unix_s);
+    w.gauge("ninfer_scheduler_max_concurrency", "Configured resident requests.", startup.max_concurrency);
+    w.gauge("ninfer_scheduler_max_pending_requests", "Configured pending FIFO depth.",
+            startup.max_pending_requests);
+
+    w.family("ninfer_http_requests_total", "HTTP requests by route.", "counter");
+    for (const auto& [key, value] : series.http_requests) {
+        const HttpRouteClass& route = kRoutes[key >> 24];
+        const std::uint32_t status  = key & 0xFFFFU;
+        const std::string status_text = status == 0 ? std::string("other") : std::to_string(status);
+        w.sample(label_text({{"method", kMethods[(key >> 16) & 0xFFU]},
+                             {"protocol", route.protocol},
+                             {"route", route.route},
+                             {"status", status_text}}),
+                 value);
     }
-    return *this;
+    // Like the request counter, only routes that have served a request are exposed.
+    w.family("ninfer_http_request_duration_seconds", "HTTP handler duration.", "histogram");
+    for (std::size_t i = 0; i < kRouteCount; ++i) {
+        if (series.http_duration[i].count == 0) { continue; }
+        w.histogram(label_text({{"protocol", kRoutes[i].protocol}, {"route", kRoutes[i].route}}),
+                    series.http_duration[i]);
+    }
+    w.gauge("ninfer_http_in_flight_requests", "Requests occupying a serve slot.",
+            static_cast<std::uint64_t>(data.inputs.http_in_flight));
+    w.family("ninfer_api_errors_total", "API errors by closed code.", "counter");
+    for (std::size_t i = 0; i < kApiCodeCount; ++i) {
+        w.sample(label_text({{"code", kApiErrorCodes[i]}}), series.api_errors[i]);
+    }
+
+    w.family("ninfer_generation_requests_total", "HTTP generation attempts.", "counter");
+    for (std::size_t protocol = 0; protocol < kProtocolCount; ++protocol) {
+        for (std::size_t stream = 0; stream < 2; ++stream) {
+            for (std::size_t result = 0; result < kResultCount; ++result) {
+                for (std::size_t thinking = 0; thinking < 2; ++thinking) {
+                    for (std::size_t tools = 0; tools < 2; ++tools) {
+                        w.sample(label_text({{"protocol", kProtocols[protocol]},
+                                             {"result", kResults[result]},
+                                             {"stream", kBools[stream]},
+                                             {"thinking", kBools[thinking]},
+                                             {"tools", kBools[tools]}}),
+                                 series.generation_requests[protocol][stream][result][thinking][tools]);
+                    }
+                }
+            }
+        }
+    }
+    const auto per_protocol = [&](const char* name, const char* help, const auto& histograms) {
+        w.family(name, help, "histogram");
+        for (std::size_t i = 0; i < kProtocolCount; ++i) {
+            w.histogram(label_text({{"protocol", kProtocols[i]}}), histograms[i]);
+        }
+    };
+    per_protocol("ninfer_generation_ttft_seconds", "Time to first token.", series.ttft);
+    per_protocol("ninfer_generation_e2e_seconds", "Engine end to end seconds.", series.e2e);
+    per_protocol("ninfer_generation_inter_token_latency_seconds", "Decode seconds per output token.",
+                 series.inter_token);
+    w.family("ninfer_generation_phase_seconds", "Closed generation phase seconds.", "histogram");
+    for (std::size_t i = 0; i < kPhaseCount; ++i) {
+        w.histogram(label_text({{"phase", kPhases[i]}}), series.phase[i]);
+    }
+    w.family("ninfer_generation_kv_copy_seconds", "Per-request KV copy seconds.", "histogram");
+    for (std::size_t tier = 0; tier < kTierCount; ++tier) {
+        for (std::size_t op = 0; op < kCopyOpCount; ++op) {
+            w.histogram(label_text({{"op", kCopyOps[op]}, {"tier", kTiers[tier]}}), series.kv_copy[tier][op]);
+        }
+    }
+    w.histogram("ninfer_generation_prompt_tokens", "Prompt tokens.", series.prompt_tokens);
+    w.histogram("ninfer_generation_completion_tokens", "Completion tokens.", series.completion_tokens);
+    w.histogram("ninfer_generation_reasoning_tokens", "Reasoning tokens.", series.reasoning_tokens);
+    w.histogram("ninfer_generation_computed_prefill_tokens", "Prompt tokens excluding prefix hits.",
+                series.computed_prefill_tokens);
+    w.histogram("ninfer_generation_output_tokens_per_second", "Decode output tokens per second.",
+                series.output_tokens_per_second);
+    w.histogram("ninfer_generation_prefill_tokens_per_second", "Prefill tokens per second.",
+                series.prefill_tokens_per_second);
+    w.family("ninfer_generation_finish_reason_total", "Successful finish reasons.", "counter");
+    for (std::size_t i = 0; i < kFinishCount; ++i) {
+        w.sample(label_text({{"reason", kFinishReasons[i]}}), series.finish_reason[i]);
+    }
+    w.counter("ninfer_generation_tool_calls_total", "Returned tool calls.", series.tool_calls);
+    w.counter("ninfer_generation_ignored_tool_markup_total", "Ignored undeclared tool markup.",
+              series.ignored_tool_markup);
+    w.counter("ninfer_generation_media_requests_total", "Generation attempts whose prompt had media.",
+              series.media_requests);
+    w.family("ninfer_token_count_requests_total", "Token-count requests.", "counter");
+    for (std::size_t i = 0; i < kProtocolCount; ++i) {
+        w.sample(label_text({{"protocol", kProtocols[i]}}), series.token_count_requests[i]);
+    }
+
+    w.gauge("ninfer_scheduler_running_requests", "Requests with a lane.",
+            std::uint64_t{stats.running_requests});
+    w.gauge("ninfer_scheduler_prefilling_requests", "Requests in prefill.",
+            std::uint64_t{stats.prefilling_requests});
+    w.gauge("ninfer_scheduler_decode_ready_requests", "Requests waiting for decode.",
+            std::uint64_t{stats.decode_ready_requests});
+    w.gauge("ninfer_scheduler_waiting_requests", "Requests in the pending FIFO.",
+            std::uint64_t{stats.waiting_requests});
+    w.counter("ninfer_engine_computed_prefill_tokens_total", "Prompt tokens evaluated by prefill.",
+              stats.computed_prefill_tokens);
+    w.counter("ninfer_engine_committed_decode_tokens_total", "Tokens committed by decode rounds.",
+              stats.committed_decode_tokens);
+    w.counter("ninfer_engine_decode_rounds_total", "Decode batch executions.", stats.decode_rounds);
+    w.counter("ninfer_engine_decode_row_rounds_total", "Decode rows across batches.",
+              stats.decode_row_rounds);
+    w.family("ninfer_gpu_kv_pages", "GPU KV pages by pool and state.", "gauge");
+    constexpr const char* kPools[]      = {"main", "spec"};
+    constexpr const char* kPageStates[] = {"capacity", "entitled", "free", "mapped"};
+    const std::uint32_t pages[2][4] = {
+        {stats.gpu_kv_main_capacity_pages, stats.gpu_kv_main_entitled_pages,
+         stats.gpu_kv_main_free_pages, stats.gpu_kv_main_mapped_pages},
+        {stats.gpu_kv_spec_capacity_pages, stats.gpu_kv_spec_entitled_pages,
+         stats.gpu_kv_spec_free_pages, stats.gpu_kv_spec_mapped_pages},
+    };
+    for (std::size_t pool = 0; pool < 2; ++pool) {
+        for (std::size_t state = 0; state < 4; ++state) {
+            w.sample(label_text({{"pool", kPools[pool]}, {"state", kPageStates[state]}}),
+                     std::uint64_t{pages[pool][state]});
+        }
+    }
+    w.family("ninfer_gpu_kv_capacity_tokens", "GPU KV token capacity by pool.", "gauge");
+    for (std::size_t pool = 0; pool < 2; ++pool) {
+        w.sample(label_text({{"pool", kPools[pool]}}), std::uint64_t{pages[pool][0]} * kKvPageTokens);
+    }
+    w.gauge("ninfer_kv_ram_capacity_bytes", "Host RAM prefix cache capacity.",
+            std::uint64_t{stats.kv_ram_capacity_bytes});
+    w.gauge("ninfer_kv_ram_used_bytes", "Host RAM prefix cache occupancy.",
+            std::uint64_t{stats.kv_ram_used_bytes});
+    w.gauge("ninfer_kv_ram_entries", "Host RAM prefix cache entries.",
+            std::uint64_t{stats.kv_ram_entry_count});
+    w.counter("ninfer_kv_ram_captures_total", "Host RAM prefix captures.", stats.kv_ram_captures);
+    w.counter("ninfer_kv_ram_restores_total", "Host RAM prefix restores.", stats.kv_ram_restores);
+    w.counter("ninfer_kv_ram_evictions_total", "Host RAM prefix evictions.", stats.kv_ram_evictions);
+    w.counter("ninfer_kv_ram_drops_total", "Host RAM prefix drops.", stats.kv_ram_drops);
+    w.counter("ninfer_kv_ram_save_seconds_total", "Host RAM prefix save seconds.",
+              stats.kv_ram_save_seconds);
+    w.counter("ninfer_kv_ram_load_seconds_total", "Host RAM prefix load seconds.",
+              stats.kv_ram_load_seconds);
+    w.gauge("ninfer_kv_disk_capacity_bytes", "Disk prefix cache capacity.",
+            std::uint64_t{stats.kv_disk_capacity_bytes});
+    w.gauge("ninfer_kv_disk_used_bytes", "Disk prefix cache occupancy.",
+            std::uint64_t{stats.kv_disk_used_bytes});
+    w.gauge("ninfer_kv_disk_entries", "Disk prefix cache entries.",
+            std::uint64_t{stats.kv_disk_entry_count});
+    w.counter("ninfer_kv_disk_captures_total", "Disk prefix captures.", stats.kv_disk_captures);
+    w.counter("ninfer_kv_disk_restores_total", "Disk prefix restores.", stats.kv_disk_restores);
+    w.counter("ninfer_kv_disk_evictions_total", "Disk prefix evictions.", stats.kv_disk_evictions);
+    w.counter("ninfer_kv_disk_drops_total", "Disk prefix drops.", stats.kv_disk_drops);
+    w.counter("ninfer_kv_disk_save_seconds_total", "Disk prefix save seconds.",
+              stats.kv_disk_save_seconds);
+    w.counter("ninfer_kv_disk_load_seconds_total", "Disk prefix load seconds.",
+              stats.kv_disk_load_seconds);
+    w.counter("ninfer_kv_disk_h2d_seconds_total", "Disk restore host to device seconds.",
+              stats.kv_disk_h2d_seconds);
+    w.counter("ninfer_kv_cache_fallbacks_total", "Prefix restores that fell back to cold prefill.",
+              stats.kv_cache_fallbacks);
+
+    w.family("ninfer_prefix_reuse_requests_total", "Prefix reuse path and source.", "counter");
+    for (std::size_t path = 0; path < kPathCount; ++path) {
+        for (std::size_t source = 0; source < kSourceCount; ++source) {
+            w.sample(label_text({{"path", kPrefixPaths[path]}, {"source", kPrefixSources[source]}}),
+                     series.prefix_reuse[path][source]);
+        }
+    }
+    w.family("ninfer_prefix_cache_hit_tokens_total", "Prefix hit tokens by source.", "counter");
+    for (std::size_t source = 0; source < kSourceCount; ++source) {
+        w.sample(label_text({{"source", kPrefixSources[source]}}), series.prefix_hit_tokens[source]);
+    }
+    w.counter("ninfer_prefix_cache_query_tokens_total", "Prefix query tokens.",
+              series.prefix_query_tokens);
+    w.counter("ninfer_context_checkpoint_restored_tokens_total", "Context checkpoint tokens restored.",
+              series.checkpoint_restored_tokens);
+    w.counter("ninfer_context_checkpoint_captured_tokens_total", "Context checkpoint tokens captured.",
+              series.checkpoint_captured_tokens);
+    w.counter("ninfer_context_checkpoint_capture_requests_total",
+              "Requests that asked for a context checkpoint.", series.checkpoint_capture_requests);
+
+    w.counter("ninfer_speculative_rounds_total", "Speculative rounds.", series.speculative_rounds);
+    w.counter("ninfer_speculative_draft_tokens_total", "Draft tokens proposed.",
+              series.speculative_draft_tokens);
+    w.counter("ninfer_speculative_accepted_tokens_total", "Draft tokens accepted.",
+              series.speculative_accepted_tokens);
+    w.counter("ninfer_speculative_fallback_steps_total", "Speculative fallback steps.",
+              series.speculative_fallback_steps);
+    w.family("ninfer_speculative_accepted_tokens_position_total", "Accepted draft tokens by position.",
+             "counter");
+    for (std::size_t position = 0; position < kMaxDraftTokens; ++position) {
+        w.sample(label_text({{"position", std::to_string(position)}}),
+                 series.speculative_accepted_by_position[position]);
+    }
+    w.family("ninfer_speculative_rounds_by_k_total", "Speculative rounds by draft k.", "counter");
+    for (std::size_t k = 1; k <= kMaxDraftTokens; ++k) {
+        w.sample(label_text({{"k", std::to_string(k)}}), series.speculative_rounds_by_k[k - 1]);
+    }
+    w.histogram("ninfer_speculative_live_k", "Live draft width.", series.speculative_live_k);
+
+    w.family("ninfer_recovery_events_total", "Published recovery events.", "counter");
+    for (std::size_t kind = 0; kind < kKindCount; ++kind) {
+        for (std::size_t cause = 0; cause < kCauseCount; ++cause) {
+            w.sample(label_text({{"cause", kRecoveryCauses[cause]}, {"kind", kRecoveryKinds[kind]}}),
+                     series.recovery_events[kind][cause]);
+        }
+    }
+    w.counter("ninfer_recovery_cycle_exclusions_total", "True cycle exclusions on terminal requests.",
+              series.recovery_cycle_exclusions);
+    w.counter("ninfer_recovery_discarded_reasoning_tokens_total", "Reasoning tokens discarded by recovery.",
+              series.recovery_discarded_reasoning_tokens);
+    w.counter("ninfer_recovery_discarded_tool_calls_total", "Tool calls discarded by recovery.",
+              series.recovery_discarded_tool_calls);
+    w.histogram("ninfer_recovery_attempts", "Recovery attempts on terminal requests.",
+                series.recovery_attempts);
+
+    w.gauge("ninfer_response_store_records", "Stored response records.",
+            static_cast<std::uint64_t>(data.inputs.response_records));
+    w.gauge("ninfer_response_store_bytes", "Stored response bytes.",
+            static_cast<std::uint64_t>(data.inputs.response_bytes));
+    w.gauge("ninfer_response_store_max_records", "Response store record cap.",
+            startup.response_max_records);
+    w.gauge("ninfer_response_store_max_bytes", "Response store byte cap.", startup.response_max_bytes);
+    return w.take();
 }
-MetricsSnapshot::MetricsSnapshot(MetricsSnapshot&&) noexcept = default;
+
+// ---------------------------------------------------------------------------
+// JSON.
+
+template <const auto& Bounds>
+[[nodiscard]] Json summary(const Histogram<Bounds>& histogram) {
+    return Json{{"count", histogram.count}, {"sum", histogram.sum}};
+}
+
+template <typename Histograms>
+[[nodiscard]] Json summary_all(const Histograms& histograms) {
+    std::uint64_t count = 0;
+    double sum          = 0;
+    for (const auto& histogram : histograms) {
+        count += histogram.count;
+        sum += histogram.sum;
+    }
+    return Json{{"count", count}, {"sum", sum}};
+}
+
+Json render_json(const MetricsSnapshotData& data) {
+    const Startup& startup            = *data.startup;
+    const Series& series              = data.series;
+    const ninfer::RuntimeStats& stats = data.inputs.stats;
+
+    Json engine = Json::object();
+    for (const auto& [key, value] : startup.engine_labels) { engine[key] = value; }
+    engine["max_context_tokens"]                  = startup.max_context;
+    engine["prefill_chunk_tokens"]                = startup.prefill_chunk;
+    engine["pending_timeout_seconds"]             = startup.pending_timeout_seconds;
+    engine["default_max_tokens"]                  = startup.default_max_tokens;
+    engine["keep_frac"]                           = startup.keep_frac;
+    engine["xattn_tau"]                           = startup.xattn_tau;
+    engine["xattn_min_len"]                       = startup.xattn_min_len;
+    engine["dflash_verify_width"]                 = startup.dflash_verify_width;
+    engine["speculative_configured_draft_tokens"] = startup.configured_draft_tokens;
+    engine["load_seconds"]                        = startup.load_seconds;
+
+    Json build = Json::object();
+    for (const auto& [key, value] : startup.build_labels) { build[key] = value; }
+
+    Json gpu_kv = Json::object();
+    const std::uint32_t pools[2][4] = {
+        {stats.gpu_kv_main_capacity_pages, stats.gpu_kv_main_entitled_pages,
+         stats.gpu_kv_main_mapped_pages, stats.gpu_kv_main_free_pages},
+        {stats.gpu_kv_spec_capacity_pages, stats.gpu_kv_spec_entitled_pages,
+         stats.gpu_kv_spec_mapped_pages, stats.gpu_kv_spec_free_pages},
+    };
+    constexpr const char* kPoolNames[] = {"main", "spec"};
+    for (std::size_t pool = 0; pool < 2; ++pool) {
+        gpu_kv[kPoolNames[pool]] = Json{
+            {"capacity", pools[pool][0]},
+            {"entitled", pools[pool][1]},
+            {"mapped", pools[pool][2]},
+            {"free", pools[pool][3]},
+            {"capacity_tokens", std::uint64_t{pools[pool][0]} * kKvPageTokens},
+        };
+    }
+
+    Json reuse_requests = Json::object();
+    for (std::size_t path = 0; path < kPathCount; ++path) {
+        Json sources = Json::object();
+        for (std::size_t source = 0; source < kSourceCount; ++source) {
+            sources[kPrefixSources[source]] = series.prefix_reuse[path][source];
+        }
+        reuse_requests[kPrefixPaths[path]] = std::move(sources);
+    }
+    Json hit_tokens = Json::object();
+    for (std::size_t source = 0; source < kSourceCount; ++source) {
+        hit_tokens[kPrefixSources[source]] = series.prefix_hit_tokens[source];
+    }
+
+    Json events = Json::object();
+    for (std::size_t kind = 0; kind < kKindCount; ++kind) {
+        Json causes = Json::object();
+        for (std::size_t cause = 0; cause < kCauseCount; ++cause) {
+            causes[kRecoveryCauses[cause]] = series.recovery_events[kind][cause];
+        }
+        events[kRecoveryKinds[kind]] = std::move(causes);
+    }
+
+    Json finish = Json::object();
+    for (std::size_t i = 0; i < kFinishCount; ++i) { finish[kFinishReasons[i]] = series.finish_reason[i]; }
+    std::uint64_t requests_total = 0;
+    for (const auto& by_stream : series.generation_requests) {
+        for (const auto& by_result : by_stream) {
+            for (const auto& by_thinking : by_result) {
+                for (const auto& by_tools : by_thinking) {
+                    for (const std::uint64_t value : by_tools) { requests_total += value; }
+                }
+            }
+        }
+    }
+
+    Json phases = Json::object();
+    for (std::size_t i = 0; i < kPhaseCount; ++i) { phases[kPhases[i]] = summary(series.phase[i]); }
+
+    return Json{
+        {"engine", std::move(engine)},
+        {"build", std::move(build)},
+        {"start_time_unix_s", startup.start_time_unix_s},
+        {"scheduler",
+         {{"running", stats.running_requests},
+          {"prefilling", stats.prefilling_requests},
+          {"decode_ready", stats.decode_ready_requests},
+          {"waiting", stats.waiting_requests},
+          {"max_concurrency", startup.max_concurrency},
+          {"max_pending_requests", startup.max_pending_requests},
+          {"computed_prefill_tokens", stats.computed_prefill_tokens},
+          {"committed_decode_tokens", stats.committed_decode_tokens},
+          {"decode_rounds", stats.decode_rounds},
+          {"decode_row_rounds", stats.decode_row_rounds}}},
+        {"http", {{"in_flight", data.inputs.http_in_flight}}},
+        {"gpu_kv", std::move(gpu_kv)},
+        {"kv_ram",
+         {{"capacity_bytes", stats.kv_ram_capacity_bytes},
+          {"used_bytes", stats.kv_ram_used_bytes},
+          {"entries", stats.kv_ram_entry_count},
+          {"captures", stats.kv_ram_captures},
+          {"restores", stats.kv_ram_restores},
+          {"evictions", stats.kv_ram_evictions},
+          {"drops", stats.kv_ram_drops},
+          {"save_seconds", stats.kv_ram_save_seconds},
+          {"load_seconds", stats.kv_ram_load_seconds}}},
+        {"kv_disk",
+         {{"capacity_bytes", stats.kv_disk_capacity_bytes},
+          {"used_bytes", stats.kv_disk_used_bytes},
+          {"entries", stats.kv_disk_entry_count},
+          {"captures", stats.kv_disk_captures},
+          {"restores", stats.kv_disk_restores},
+          {"evictions", stats.kv_disk_evictions},
+          {"drops", stats.kv_disk_drops},
+          {"save_seconds", stats.kv_disk_save_seconds},
+          {"load_seconds", stats.kv_disk_load_seconds},
+          {"h2d_seconds", stats.kv_disk_h2d_seconds},
+          {"cache_fallbacks", stats.kv_cache_fallbacks}}},
+        {"prefix_reuse",
+         {{"requests", std::move(reuse_requests)},
+          {"hit_tokens", std::move(hit_tokens)},
+          {"query_tokens", series.prefix_query_tokens},
+          {"restored_tokens", series.checkpoint_restored_tokens},
+          {"captured_tokens", series.checkpoint_captured_tokens},
+          {"capture_requests", series.checkpoint_capture_requests}}},
+        {"speculative",
+         {{"rounds", series.speculative_rounds},
+          {"draft_tokens", series.speculative_draft_tokens},
+          {"accepted_tokens", series.speculative_accepted_tokens},
+          {"fallback_steps", series.speculative_fallback_steps},
+          {"accepted_by_position", series.speculative_accepted_by_position},
+          {"rounds_by_k", series.speculative_rounds_by_k},
+          {"live_k", summary(series.speculative_live_k)}}},
+        {"recovery",
+         {{"events", std::move(events)},
+          {"cycle_exclusions", series.recovery_cycle_exclusions},
+          {"discarded_reasoning_tokens", series.recovery_discarded_reasoning_tokens},
+          {"discarded_tool_calls", series.recovery_discarded_tool_calls},
+          {"attempts", summary(series.recovery_attempts)}}},
+        {"generation",
+         {{"requests_total", requests_total},
+          {"finish_reason", std::move(finish)},
+          {"tool_calls", series.tool_calls},
+          {"ignored_tool_markup", series.ignored_tool_markup},
+          {"media_requests", series.media_requests},
+          {"ttft", summary_all(series.ttft)},
+          {"e2e", summary_all(series.e2e)},
+          {"inter_token_latency", summary_all(series.inter_token)},
+          {"output_tokens_per_second", summary(series.output_tokens_per_second)},
+          {"prefill_tokens_per_second", summary(series.prefill_tokens_per_second)},
+          {"prompt_tokens", summary(series.prompt_tokens)},
+          {"completion_tokens", summary(series.completion_tokens)},
+          {"reasoning_tokens", summary(series.reasoning_tokens)},
+          {"computed_prefill_tokens", summary(series.computed_prefill_tokens)}}},
+        {"phases", std::move(phases)},
+        {"response_store",
+         {{"records", data.inputs.response_records},
+          {"bytes", data.inputs.response_bytes},
+          {"max_records", startup.response_max_records},
+          {"max_bytes", startup.response_max_bytes}}},
+    };
+}
+
+} // namespace
+
+MetricsSnapshot::MetricsSnapshot()                                 = default;
+MetricsSnapshot::~MetricsSnapshot()                                = default;
+MetricsSnapshot::MetricsSnapshot(MetricsSnapshot&&) noexcept            = default;
 MetricsSnapshot& MetricsSnapshot::operator=(MetricsSnapshot&&) noexcept = default;
 
-ServeMetrics::ServeMetrics() : state_(std::make_unique<ServeMetricsState>()) { precreate(*state_); }
+std::string MetricsSnapshot::prometheus_text() const {
+    return data_ ? render_text(*data_) : std::string();
+}
+
+std::string MetricsSnapshot::json() const { return data_ ? render_json(*data_).dump() : "{}"; }
+
+ServeMetrics::ServeMetrics() : state_(std::make_unique<ServeMetricsState>()) {}
 ServeMetrics::~ServeMetrics() = default;
 
 void ServeMetrics::attach(const ServeOptions& options, const ninfer::LoadSummary& load,
-                          const ninfer::MemorySummary& memory, std::string model_id,
-                          std::string cuda_compile_version, std::string cuda_runtime_version) {
-    Startup startup;
-    startup.max_context             = options.max_context;
-    startup.prefill_chunk           = options.prefill_chunk;
-    startup.pending_timeout_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0;
-    startup.default_max_tokens      = options.default_max_tokens;
-    startup.keep_frac               = options.keep_frac;
-    startup.xattn_tau               = options.xattn_tau;
-    startup.xattn_min_len           = static_cast<double>(kDefaultXattnMinLen);
-    startup.dflash_verify_width     = options.speculative.dflash_verify_width;
-    startup.configured_draft_tokens = options.speculative.draft_tokens;
-    startup.load_seconds            = load.load_seconds;
-    startup.cuda_graph_allowance_bytes =
-        static_cast<double>(memory.cuda_graph_allowance_bytes);
-    startup.cuda_graph_observed_bytes = static_cast<double>(memory.cuda_graph_observed_bytes);
-    startup.arena_weights             = static_cast<double>(memory.weights.capacity_bytes);
-    startup.arena_sequence            = static_cast<double>(memory.sequence.capacity_bytes);
-    startup.arena_workspace           = static_cast<double>(memory.workspace.capacity_bytes);
-    startup.arena_request_transient   = static_cast<double>(memory.request_transient.capacity_bytes);
-    startup.start_time_unix_s =
+                          const ninfer::MemorySummary& memory, std::string_view model_id,
+                          std::string_view cuda_compile_version,
+                          std::string_view cuda_runtime_version) {
+    auto startup                        = std::make_shared<Startup>();
+    startup->max_context                = options.max_context;
+    startup->prefill_chunk              = options.prefill_chunk;
+    startup->pending_timeout_seconds    = static_cast<double>(options.pending_timeout_ms) / 1000.0;
+    startup->default_max_tokens         = options.default_max_tokens;
+    startup->keep_frac                  = options.keep_frac;
+    startup->xattn_tau                  = options.xattn_tau;
+    startup->dflash_verify_width        = options.speculative.dflash_verify_width;
+    startup->configured_draft_tokens    = options.speculative.draft_tokens;
+    startup->load_seconds               = load.load_seconds;
+    startup->cuda_graph_allowance_bytes = static_cast<double>(memory.cuda_graph_allowance_bytes);
+    startup->cuda_graph_observed_bytes  = static_cast<double>(memory.cuda_graph_observed_bytes);
+    startup->arena_weights              = static_cast<double>(memory.weights.capacity_bytes);
+    startup->arena_sequence             = static_cast<double>(memory.sequence.capacity_bytes);
+    startup->arena_workspace            = static_cast<double>(memory.workspace.capacity_bytes);
+    startup->arena_request_transient    = static_cast<double>(memory.request_transient.capacity_bytes);
+    startup->start_time_unix_s =
         std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-    startup.max_concurrency      = options.max_concurrency;
-    startup.max_pending_requests = options.max_pending_requests;
-    startup.response_max_records = static_cast<double>(options.response_store_max_records);
-    startup.response_max_bytes   = static_cast<double>(options.response_store_max_bytes);
+    startup->max_concurrency      = options.max_concurrency;
+    startup->max_pending_requests = options.max_pending_requests;
+    startup->response_max_records = static_cast<double>(options.response_store_max_records);
+    startup->response_max_bytes   = static_cast<double>(options.response_store_max_bytes);
     const char* checkpoints = "default";
     if (options.context_checkpoint_marks.has_value()) {
         checkpoints = options.context_checkpoint_marks->empty() ? "off" : "custom";
     }
-    startup.engine_labels = Labels{
+    startup->engine_labels = {
         {"adaptive_draft", yn(options.speculative.adaptive_draft)},
         {"auth", yn(!options.api_key.empty())},
         {"context_checkpoints", checkpoints},
         {"cors", yn(options.enable_cors)},
         {"cuda_graph", yn(options.use_cuda_graph)},
-        {"device", std::to_string(options.device).c_str()},
+        {"device", std::to_string(options.device)},
         {"generation_recovery", yn(options.generation_recovery)},
         {"greedy", yn(options.greedy)},
         {"kv_capacity_mode", kv_capacity_mode_name(options.kv_capacity.mode)},
         {"kv_disk_compress", options.kv_disk_compress == ninfer::KvDiskCompress::Zstd ? "zstd" : "off"},
         {"kv_dtype", kv_cache_name(options.kv_cache)},
-        {"model_id", model_id.c_str()},
+        {"model_id", std::string(model_id)},
         {"p_less", yn(options.sampling_overrides.p_less)},
         {"prefix_reuse", yn(options.allow_prefix_reuse)},
         {"proposal_head", proposal_head_name(options.speculative.proposal_head)},
         {"sage_attn", yn(options.sage_attn)},
         {"spec", product::speculative_backend_name(options.speculative.backend)},
         {"system_prepend", yn(!options.system_prepend.empty())},
-        {"target", load.target.c_str()},
+        {"target", load.target},
         {"vision", yn(options.enable_vision)},
-        {"weights_id", load.weights_id.c_str()},
+        {"weights_id", load.weights_id},
     };
-    startup.build_labels = Labels{{"cuda_compile_version", cuda_compile_version.c_str()},
-                                  {"cuda_runtime_version", cuda_runtime_version.c_str()}};
+    startup->build_labels = {{"cuda_compile_version", std::string(cuda_compile_version)},
+                             {"cuda_runtime_version", std::string(cuda_runtime_version)}};
     std::lock_guard lock(state_->mutex);
     state_->startup = std::move(startup);
 }
 
-void observe_generation(ServeMetrics& metrics, const GenerationObservation& observation) {
-    std::lock_guard lock(metrics.state_->mutex);
-    ServeMetricsState& state = *metrics.state_;
-    const char* result = "error";
-    for (const char* known : kResults) {
-        if (observation.result == known) { result = known; }
+void ServeMetrics::observe_generation(const GenerationObservation& observation) {
+    const auto protocol = static_cast<std::size_t>(observation.protocol);
+    const auto result   = static_cast<std::size_t>(observation.result);
+    std::lock_guard lock(state_->mutex);
+    Series& series = state_->series;
+    ++series.generation_requests[protocol][observation.stream][result][observation.thinking]
+                                [observation.tools];
+    if (observation.capture_requested) { ++series.checkpoint_capture_requests; }
+    if (observation.has_media) { ++series.media_requests; }
+    if (observation.result == GenerationResult::Rejected) { return; }
+    if (observation.outcome != nullptr) {
+        observe_terminal_recovery(series, observation.outcome->metrics.recovery);
+    } else if (observation.recovery != nullptr) {
+        observe_terminal_recovery(series, *observation.recovery);
     }
-    state.inc("ninfer_generation_requests_total",
-              Labels{{"protocol", known_protocol(observation.protocol)},
-                     {"result", result},
-                     {"stream", yn(observation.stream)},
-                     {"thinking", yn(observation.thinking)},
-                     {"tools", yn(observation.tools)}},
-              1);
-    if (observation.capture_requested) {
-        state.inc("ninfer_context_checkpoint_capture_requests_total", {}, 1);
-    }
-    if (observation.has_media &&
-        (std::string_view(result) == "success" || std::string_view(result) == "rejected")) {
-        state.inc("ninfer_generation_media_requests_total", {}, 1);
-    }
-    const bool terminal = std::string_view(result) == "success" || std::string_view(result) == "error" ||
-                          std::string_view(result) == "cancelled";
-    if (terminal) {
-        if (observation.outcome != nullptr) {
-            observe_terminal_recovery(state, observation.outcome->metrics.recovery);
-        } else if (observation.recovery != nullptr) {
-            observe_terminal_recovery(state, *observation.recovery);
-        }
-    }
-    if (std::string_view(result) == "success" && observation.outcome != nullptr) {
-        observe_success(state, observation);
+    if (observation.result == GenerationResult::Success && observation.outcome != nullptr) {
+        observe_success(series, protocol, *observation.outcome);
     }
 }
 
-void observe_recovery_event(ServeMetrics& metrics, const ninfer::RecoveryEvent& event) {
-    std::lock_guard lock(metrics.state_->mutex);
-    const char* kind = recovery_kind_name(event.kind);
-    const char* cause = prometheus_recovery_cause(kind, event.cause);
-    metrics.state_->inc("ninfer_recovery_events_total", Labels{{"cause", cause}, {"kind", kind}}, 1);
+void ServeMetrics::observe_recovery_event(const ninfer::RecoveryEvent& event) {
+    const std::size_t kind  = recovery_kind_index(event.kind);
+    const std::size_t cause = index_of(
+        kRecoveryCauses, prometheus_recovery_cause(kRecoveryKinds[kind], event.cause), kCauseCount - 1);
+    std::lock_guard lock(state_->mutex);
+    ++state_->series.recovery_events[kind][cause];
 }
 
-void observe_http(ServeMetrics& metrics, std::string_view protocol, std::string_view route,
-                  std::string_view method, int status, double seconds) {
-    std::string status_text = (status >= 100 && status <= 599) ? std::to_string(status) : "other";
-    Labels labels{{"method", known_method(method)},
-                  {"protocol", protocol.empty() ? "other" : std::string(protocol).c_str()},
-                  {"route", route.empty() ? "other" : std::string(route).c_str()},
-                  {"status", status_text.c_str()}};
-    std::lock_guard lock(metrics.state_->mutex);
-    metrics.state_->inc_open("ninfer_http_requests_total", labels, 1);
-    if (std::isfinite(seconds) && seconds >= 0.0) {
-        Labels duration{{"protocol", protocol.empty() ? "other" : std::string(protocol).c_str()},
-                        {"route", route.empty() ? "other" : std::string(route).c_str()}};
-        metrics.state_->observe("ninfer_http_request_duration_seconds", std::move(duration), seconds);
-    }
+void ServeMetrics::observe_http(std::string_view path, std::string_view method, int status,
+                                double seconds) {
+    const std::size_t route        = route_index(path);
+    const std::size_t method_index = index_of(kMethods, method, kMethodCount - 1);
+    const std::uint32_t status_key =
+        status >= 100 && status <= 599 ? static_cast<std::uint32_t>(status) : 0U;
+    const std::uint32_t key = static_cast<std::uint32_t>(route) << 24 |
+                              static_cast<std::uint32_t>(method_index) << 16 | status_key;
+    std::lock_guard lock(state_->mutex);
+    ++state_->series.http_requests[key];
+    if (seconds >= 0.0) { state_->series.http_duration[route].observe(seconds); }
 }
 
-void observe_api_error(ServeMetrics& metrics, std::string_view code) {
-    std::lock_guard lock(metrics.state_->mutex);
-    metrics.state_->inc("ninfer_api_errors_total", Labels{{"code", known_api_code(code)}}, 1);
+void ServeMetrics::observe_api_error(std::string_view code) {
+    const std::size_t index = index_of(kApiErrorCodes, code.empty() ? "unnamed" : code,
+                                       kApiCodeCount - 1);
+    std::lock_guard lock(state_->mutex);
+    ++state_->series.api_errors[index];
 }
 
-void observe_token_count(ServeMetrics& metrics, std::string_view protocol) {
-    std::lock_guard lock(metrics.state_->mutex);
-    bool known = false;
-    for (const char* candidate : kProtocols) {
-        if (protocol == candidate) { known = true; }
-    }
-    if (!known) { return; }
-    metrics.state_->inc("ninfer_token_count_requests_total",
-                        Labels{{"protocol", std::string(protocol).c_str()}}, 1);
+void ServeMetrics::observe_token_count(MetricsProtocol protocol) {
+    std::lock_guard lock(state_->mutex);
+    ++state_->series.token_count_requests[static_cast<std::size_t>(protocol)];
 }
 
-MetricsSnapshot fill_metrics_snapshot(ServeMetrics& metrics, const ScrapeInputs& inputs) {
-    auto data = std::make_unique<MetricsSnapshotData>();
+MetricsSnapshot ServeMetrics::snapshot(const ScrapeInputs& inputs) const {
+    auto data    = std::make_unique<MetricsSnapshotData>();
+    data->inputs = inputs;
     {
-        std::lock_guard lock(metrics.state_->mutex);
-        data->startup    = metrics.state_->startup;
-        data->counters   = metrics.state_->counters;
-        data->histograms = metrics.state_->histograms;
+        std::lock_guard lock(state_->mutex);
+        data->startup = state_->startup;
+        data->series  = state_->series;
     }
-    data->stats            = inputs.stats;
-    data->http_in_flight   = inputs.http_in_flight;
-    data->response_records = inputs.response_records;
-    data->response_bytes   = inputs.response_bytes;
     MetricsSnapshot snapshot;
     snapshot.data_ = std::move(data);
     return snapshot;
 }
 
-std::string render_prometheus_text(const MetricsSnapshot& snapshot) {
-    if (!snapshot.data_) { return {}; }
-    return render_families(collect_families(*snapshot.data_));
-}
-
-std::string render_metrics_json(const MetricsSnapshot& snapshot) {
-    if (!snapshot.data_) { return "{}"; }
-    return render_json(collect_families(*snapshot.data_)).dump();
-}
-
 void handle_metrics(const MetricsSnapshot& snapshot, httplib::Response& response) {
     response.status = 200;
-    response.set_content(render_prometheus_text(snapshot), kPrometheusContentType);
+    response.set_content(snapshot.prometheus_text(), kPrometheusContentType);
 }
 
 void handle_metrics_json(const MetricsSnapshot& snapshot, httplib::Response& response) {
     response.status = 200;
-    response.set_content(render_metrics_json(snapshot), "application/json");
+    response.set_content(snapshot.json(), "application/json");
 }
 
-HttpRouteClass classify_http_route(std::string_view path) {
-    if (path == "/health") { return {"health", "/health"}; }
-    if (path == "/metrics") { return {"metrics", "/metrics"}; }
-    if (path == "/metrics.json") { return {"metrics", "/metrics.json"}; }
-    if (path == "/v1/models") { return {"models", "/v1/models"}; }
-    if (path == "/v1/chat/completions") { return {"openai_chat", "/v1/chat/completions"}; }
-    if (path == "/v1/responses") { return {"openai_responses", "/v1/responses"}; }
-    if (path == "/v1/responses/input_tokens") {
-        return {"openai_responses", "/v1/responses/input_tokens"};
-    }
-    if (path == "/v1/responses/compact") { return {"openai_responses", "/v1/responses/compact"}; }
-    if (path == "/v1/messages") { return {"anthropic_messages", "/v1/messages"}; }
-    if (path == "/v1/messages/count_tokens") {
-        return {"anthropic_messages", "/v1/messages/count_tokens"};
-    }
-    constexpr std::string_view kModelPrefix = "/v1/models/";
-    if (path.starts_with(kModelPrefix) && path.size() > kModelPrefix.size() &&
-        path.find('/', kModelPrefix.size()) == std::string_view::npos) {
-        return {"models", "/v1/models/{id}"};
-    }
-    constexpr std::string_view kResponsePrefix = "/v1/responses/";
-    if (path.starts_with(kResponsePrefix) && path.size() > kResponsePrefix.size()) {
-        const std::string_view rest = path.substr(kResponsePrefix.size());
-        constexpr std::string_view kItems = "/input_items";
-        constexpr std::string_view kCancel = "/cancel";
-        if (rest.size() > kItems.size() && rest.ends_with(kItems) &&
-            rest.find('/') == rest.size() - kItems.size()) {
-            return {"openai_responses", "/v1/responses/{id}/input_items"};
-        }
-        if (rest.size() > kCancel.size() && rest.ends_with(kCancel) &&
-            rest.find('/') == rest.size() - kCancel.size()) {
-            return {"openai_responses", "/v1/responses/{id}/cancel"};
-        }
-        if (rest.find('/') == std::string_view::npos) {
-            return {"openai_responses", "/v1/responses/{id}"};
-        }
-    }
-    return {"other", "other"};
-}
+HttpRouteClass classify_http_route(std::string_view path) { return kRoutes[route_index(path)]; }
 
 bool is_unauthenticated_path(std::string_view path) {
     return path == "/health" || path == "/metrics" || path == "/metrics.json";
 }
 
-const char* prometheus_protocol(std::string_view request_log_protocol) {
-    if (request_log_protocol == "openai_chat_completions" || request_log_protocol == "openai_chat") {
-        return "openai_chat";
-    }
-    if (request_log_protocol == "openai_responses") { return "openai_responses"; }
-    if (request_log_protocol == "anthropic_messages") { return "anthropic_messages"; }
-    return "other";
+MetricsProtocol metrics_protocol(std::string_view request_log_protocol) {
+    if (request_log_protocol == "openai_chat_completions") { return MetricsProtocol::OpenAiChat; }
+    if (request_log_protocol == "openai_responses") { return MetricsProtocol::OpenAiResponses; }
+    if (request_log_protocol == "anthropic_messages") { return MetricsProtocol::AnthropicMessages; }
+    throw std::logic_error("unknown request-log protocol: " + std::string(request_log_protocol));
 }
 
 const char* prometheus_recovery_cause(std::string_view kind, std::string_view cause) {
-    if (cause == "reasoning_cycle" || cause == "repeated_reasoning" || cause == "duplicate_tool_call" ||
-        cause == "cancelled" || cause == "tool_calls" || cause == "output_limit" ||
-        cause == "context_capacity" || cause == "stop") {
-        if (cause == "reasoning_cycle") { return "reasoning_cycle"; }
-        if (cause == "repeated_reasoning") { return "repeated_reasoning"; }
-        if (cause == "duplicate_tool_call") { return "duplicate_tool_call"; }
-        if (cause == "cancelled") { return "cancelled"; }
-        if (cause == "tool_calls") { return "tool_calls"; }
-        if (cause == "output_limit") { return "output_limit"; }
-        if (cause == "context_capacity") { return "context_capacity"; }
-        return "stop";
+    for (const char* direct : kDirectRecoveryCauses) {
+        if (cause == direct) { return direct; }
     }
     if (kind == "exhausted") {
-        if (contains_text(cause, "reservation")) { return "reservation_exceeded"; }
-        if (contains_text(cause, "output-token budget") || contains_text(cause, "retry or output-token") ||
-            contains_text(cause, "no retry")) {
-            return "retry_budget";
-        }
-        if (contains_text(cause, "reserved lane cannot be rebuilt safely")) { return "lane_rebuild"; }
+        const auto has = [cause](std::string_view needle) {
+            return cause.find(needle) != std::string_view::npos;
+        };
+        if (has("retry or output-token budget")) { return "retry_budget"; }
+        if (has("cannot preserve its admitted output budget")) { return "output_budget"; }
+        if (has("not the thinking prologue")) { return "prologue"; }
+        if (has("cannot be rebuilt safely")) { return "lane_rebuild"; }
     }
     return "other";
 }

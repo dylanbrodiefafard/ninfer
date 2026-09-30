@@ -365,7 +365,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 }
 
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {
-    observe_token_count(metrics_, "openai_responses");
+    metrics_.observe_token_count(MetricsProtocol::OpenAiResponses);
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
