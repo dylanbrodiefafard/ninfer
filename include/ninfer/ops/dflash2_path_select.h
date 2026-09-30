@@ -41,23 +41,24 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *       + sum_{r=0}^{255} (pred_code[r, prev[t-1,b]] * h[r,t,b]) * succ_code[r, candidates[c]].
  *
  *   configs is a device-resident SamplingConfig[B] (same buffer the round copies into ingress).
- *   If configs[b].temperature <= 0 or configs[b].p_less != 0, path[t,b] is the candidate with the
- *   greatest score; equal scores select the lower token id. P-less temperature parameterizes the
- *   target distribution in sampling.h, not these draft scores: a 16-way softmax at the product
- *   p-less T=2 is nearly uniform and is not a valid chain proposal. If temperature > 0 and
- *   p_less==0, the 16 scores are softmax-normalized after dividing by temperature and one
- *   candidate is drawn by inverse-CDF using
+ *   The draft temperature is configs[b].draft_temperature when configs[b].p_less != 0, else
+ *   configs[b].temperature (force_greedy makes it 0). P-less temperature parameterizes the target
+ *   distribution in sampling.h, not these draft scores: a 16-way softmax at the product p-less
+ *   T=2 is nearly uniform, so p-less drafts use their own draft_temperature. If the draft
+ *   temperature is <= 0, path[t,b] is the candidate with the greatest score; equal scores select
+ *   the lower token id. Otherwise the 16 scores are softmax-normalized after dividing by the
+ *   draft temperature and one candidate is drawn by inverse-CDF using
  *
  *     u = splitmix64(configs[b].seed ^ seed_xor,
  *                    logical_positions[b] + position_offset + t + 1,
  *                    purpose=16) in [0,1).
  *
- *   Then prev[t,b] = path[t,b]. Candidate order does not affect the selected token.
- *   An internal force_greedy call may override temperature for an intermediate refinement pass.
- *   When selector_ids / selector_q are non-null they receive the 16 candidate token ids and
- *   the proposal distribution q: one-hot at a greedy pick, else the 16-way softmax the draft was
- *   drawn from. Rows sample at temperature, or at draft_temperature under active p-less (<= 0
- *   greedy). Chain accept uses this q for truncated sampling and p-less alike.
+ *   Then prev[t,b] = path[t,b]. Candidate order does not affect a greedy pick; the sampled
+ *   inverse-CDF walk runs in the unsorted top-16 order.
+ *   An internal force_greedy call may override the draft temperature for an intermediate
+ *   refinement pass. When selector_ids / selector_q are non-null they receive the 16 candidate
+ *   token ids and the proposal distribution q: one-hot at a greedy pick, else the 16-way softmax
+ *   the draft was drawn from. Chain accept uses this q for truncated sampling and p-less alike.
  *   Null selectors leave q implicit one-hot at path[t,b].
  *
  * Logical shapes:
