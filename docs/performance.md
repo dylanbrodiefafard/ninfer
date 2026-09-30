@@ -74,6 +74,7 @@ generation-relevant measurement.
 | A8 prefill − base | 8K / 32K / 128K prefill | −0.0118 / −0.0102 / −0.0086 | −3.0 / −5.3 / −7.7 |
 | A8 prefill − base | 8K / 64K decode | −0.0021 / −0.0004 | −1.2 / −0.7 |
 | FP32 partials − base | 8K / 64K decode | −0.0010 / +0.0004 | −0.8 / 0.8 |
+| KV scale rounded up − base (base `163c6b38`) | 32K / 128K prefill; 64K decode | +0.0009 / +0.0002 / −0.0001 | 0.4 / 0.2 / −0.2 |
 
 Speed, `ninfer-serve` C1/C4 (DFlash k≤5 adaptive, p-less T=1.5, prefix reuse off):
 
@@ -95,6 +96,8 @@ Conclusions:
 - **NVFP4 KV.** The loss (about +0.003 NLL at 64K, 0.3% PPL) is entirely K/V storage. Q
   re-quantization inside attention adds nothing measurable, so BF16/FP8 Q would not help.
 - **FP32 partials.** No accuracy or speed effect, so BF16 partials stay.
+- **KV scale rounding.** Rounding each K/V group's E4M3 scale up (no clipping, no zeroed groups)
+  instead of to nearest leaves the NVFP4-KV loss unchanged, so the RN codec stays.
 
 Cells, scripts and the variant patches are in `profiles/bench/act-ab-20260928/`.
 
