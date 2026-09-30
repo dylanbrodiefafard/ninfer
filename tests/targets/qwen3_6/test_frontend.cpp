@@ -931,12 +931,26 @@ int test_reasoning_effort_empty_history_think() {
     const std::string assistant_header = "<|im_start|>assistant\n";
     const fi::RenderedChat empty_replay =
         reasoning_effort_template().render(closed_empty, preserve_generate);
+    // Empty reasoning on the latest assistant turn means the client drops it, so the next
+    // re-render omits the wrapper and diverges at the opener: the replay checkpoint sits there.
+    const std::string replay_opener_tail = assistant_header + "<think>\n";
     failures += check(empty_replay.rewrite_checkpoint &&
                           empty_replay.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          empty_replay.rewrite_checkpoint->offset == empty_replay.text.size() &&
-                          empty_replay.text.ends_with("<think>\n"),
-                      "empty history reasoning moved the preserve-on thinking replay checkpoint");
+                          empty_replay.text.ends_with(replay_opener_tail) &&
+                          empty_replay.rewrite_checkpoint->offset ==
+                              empty_replay.text.size() - std::string("<think>\n").size(),
+                      "dropped history reasoning left the preserve-on thinking replay checkpoint "
+                      "past the generation opener");
+    const fi::RenderedChat first_replay = reasoning_effort_template().render(
+        {chat_message(ninfer::ChatRole::User, "q1")}, preserve_generate);
+    failures += check(first_replay.rewrite_checkpoint &&
+                          first_replay.rewrite_checkpoint->kind ==
+                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                          first_replay.text.ends_with(replay_opener_tail) &&
+                          first_replay.rewrite_checkpoint->offset == first_replay.text.size(),
+                      "a first preserve-on thinking turn moved its replay checkpoint off the prompt "
+                      "frontier");
 
     fi::ChatMessage kept_history = empty_history;
     kept_history.reasoning_content = "old thought";

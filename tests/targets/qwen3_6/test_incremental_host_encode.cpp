@@ -798,6 +798,115 @@ int test_engine_shaped_cache() {
     (void)tc;
     (void)empty_suffix;
 
+    // Checkpoint placement matrix through the host-encode cache, each identical to cold:
+    // preserve off -> TurnClosure at the generation opener; preserve on with thinking ->
+    // ResponseReplay at the prompt end unless the latest assistant turn has empty reasoning (the
+    // client drops it), then at the opener. Thinking off with preserve on is out of scope.
+    enum class At { End, Opener, None };
+    const auto user = [&](std::string text) {
+        return product_message(ninfer::ChatRole::User, std::move(text));
+    };
+    const auto reply = [&](bool reasoning) {
+        ninfer::ChatMessage message = product_message(ninfer::ChatRole::Assistant, "old answer");
+        if (reasoning) { message.reasoning_content = "old thought"; }
+        return message;
+    };
+    const auto tool_call = [&](bool reasoning) {
+        ninfer::ChatMessage message = product_message(ninfer::ChatRole::Assistant, "");
+        if (reasoning) { message.reasoning_content = "look it up"; }
+        message.tool_calls.push_back(
+            ninfer::ToolCall{.id = "call_1", .name = "lookup", .arguments_json = "{\"key\":\"a\"}"});
+        return message;
+    };
+    const auto tool_result = [&] {
+        ninfer::ChatMessage message = product_message(ninfer::ChatRole::Tool, "{\"value\":1}");
+        message.tool_call_id        = "call_1";
+        return message;
+    };
+    // History shapes; `latest_dropped` says the latest assistant turn carries no reasoning.
+    struct Shape {
+        const char* name;
+        std::vector<ninfer::ChatMessage> messages;
+        bool generation_prompt;
+        bool tool_loop;
+        bool latest_dropped;
+    };
+    const std::vector<Shape> shapes{
+        {"first turn", {user("q1")}, true, false, false},
+        {"kept", {user("q1"), reply(true), user("q2")}, true, false, false},
+        {"dropped", {user("q1"), reply(false), user("q2")}, true, false, true},
+        {"earlier kept, latest dropped", {user("q1"), reply(true), user("q2"), reply(false), user("q3")},
+         true, false, true},
+        {"earlier dropped, latest kept", {user("q1"), reply(false), user("q2"), reply(true), user("q3")},
+         true, false, false},
+        {"tool loop kept", {user("q1"), tool_call(true), tool_result()}, true, true, false},
+        {"tool loop dropped", {user("q1"), tool_call(false), tool_result()}, true, true, true},
+        {"no generation prompt", {user("q1"), reply(false)}, false, false, true},
+    };
+    for (const Frontend* template_frontend : {&frontend, &effort_frontend}) {
+        const char* template_name = template_frontend == &frontend ? "toggle" : "effort";
+        for (const bool thinking : {true, false}) {
+            for (const bool preserve : {true, false}) {
+                for (const Shape& shape : shapes) {
+                    const std::string label = std::string("E-H13 ") + template_name +
+                                              (thinking ? " thinking" : " no-thinking") +
+                                              (preserve ? " preserve-on " : " preserve-off ") +
+                                              shape.name;
+                    ninfer::PromptOptions options;
+                    options.enable_thinking       = thinking;
+                    options.preserve_thinking     = preserve;
+                    options.add_generation_prompt = shape.generation_prompt;
+                    options.tool_jsons.push_back(
+                        R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
+                    ninfer::PromptOptions first_options = options;
+                    first_options.add_generation_prompt = true;
+                    fi::EncodedHistoryCache turn_cache;
+                    (void)cached_prepare(*template_frontend, turn_cache,
+                                         product_input({user("q1")}, first_options));
+                    const auto cached = cached_prepare(*template_frontend, turn_cache,
+                                                       product_input(shape.messages, options));
+                    // Without a generation prompt the effort template's preserve-off render
+                    // misses the cache (pre-existing); it must still equal cold.
+                    failures += check(cached.observation.cache_hit || !shape.generation_prompt,
+                                      (label + ": missed the host-encode cache").c_str());
+                    failures += expect_match_cold(*template_frontend, cached,
+                                                  product_input(shape.messages, options),
+                                                  cached.observation.cache_hit, label.c_str());
+                    const auto& data       = FrontendFactory::inspect(cached.prompt);
+                    const auto& checkpoint = data.identity.rewrite_checkpoint;
+                    const auto replay = ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay;
+                    const auto closure = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
+                    if (!shape.generation_prompt) {
+                        failures += check(preserve ? !checkpoint || checkpoint->kind != replay
+                                                   : checkpoint && checkpoint->kind == closure,
+                                          (label + ": wrong checkpoint without a generation prompt").c_str());
+                        continue;
+                    }
+                    const std::vector<int> prologue = official_tokenizer().encode(
+                        thinking ? "<think>\n" : "<think>\n\n</think>\n\n");
+                    const std::size_t opener = data.token_ids.size() - prologue.size();
+                    std::size_t expected = data.token_ids.size();
+                    if (!preserve) {
+                        // First assistant opener after the last user: a tool loop's first turn.
+                        const auto first_turn = template_frontend->prepare(
+                            product_input({user("q1")}, first_options));
+                        expected = shape.tool_loop
+                                       ? FrontendFactory::inspect(first_turn).identity.rewrite_checkpoint->frontier
+                                       : opener;
+                    } else if (thinking && shape.latest_dropped) {
+                        expected = opener;
+                    }
+                    const bool prologue_tail = std::equal(
+                        prologue.begin(), prologue.end(),
+                        data.token_ids.end() - static_cast<std::ptrdiff_t>(prologue.size()));
+                    failures += check(checkpoint && checkpoint->kind == (preserve ? replay : closure) &&
+                                          prologue_tail && checkpoint->frontier == expected,
+                                      (label + ": checkpoint kind or frontier is wrong").c_str());
+                }
+            }
+        }
+    }
+
     auto nt = cached_prepare(
         frontend, cache, product_input({product_message(ninfer::ChatRole::User, "nt")}, think_off));
     auto nt2 = cached_prepare(
