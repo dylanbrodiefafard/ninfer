@@ -1457,6 +1457,11 @@ epilogue不因 paging 改变。最后一个partial tile继续通过logical visib
 
 Cached prompt route使用相同page-aware key traversal，但不执行fill。
 
+Dense NVFP4 prompt在grid未填满GPU时按grid.z切分每个CTA的key tiles：split `z` 遍历连续的
+`[z*ceil(n/Z), min(n,(z+1)*ceil(n/Z)))` tile区间，其中 `n` 是该query block的causal tile数。
+每个tile仍是一个page，因此split边界天然page-aligned，fill与visibility mask不变。各split写FP32
+未归一化P·V、log2域running max与exp2 sum，merge kernel稳定合并后写BF16输出。
+
 ### 17.5 Standalone append
 
 Full append和device-count prefix append都直接写最终physical pages，不建立连续staging cache。

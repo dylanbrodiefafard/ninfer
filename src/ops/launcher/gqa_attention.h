@@ -30,12 +30,38 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 
+// dense_nvfp4: the call would run the dense NVFP4 Prompt kernel (U8 cache without S3, no
+// Sparge/XAttention skip, no dump). Only such 27B calls move short appends to six-row chunks;
+// every skip, S3, and dump profile keeps its Prompt-route semantics.
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size,
                                               GqaExecutionEnvelope envelope,
-                                              bool tree_verify = false);
+                                              bool tree_verify = false, bool dense_nvfp4 = false);
 
 const char* gqa_attention_route_name(GqaAttentionRoute route);
+
+// Context-split execution of the dense NVFP4 Prompt kernel. splits <= 1 selects the unsplit
+// kernel; otherwise acc is FP32 [256, q_heads, W, splits] and m/l are FP32 [q_heads, W, splits].
+struct GqaPromptSplit {
+    std::int32_t splits = 1;
+    Tensor acc;
+    Tensor m;
+    Tensor l;
+};
+
+// Widest Prompt call that can split (W * splits within the partial-row budget).
+inline constexpr std::int32_t kGqaPromptSplitMaximumWidth = 1024;
+
+// Partial-buffer split capacity for one dense NVFP4 Prompt call over at most visible_keys keys.
+// It is non-decreasing in visible_keys, so the capacity at the envelope maximum covers every
+// call a workspace query admits. 1 means the call never splits, including every W above
+// kGqaPromptSplitMaximumWidth and every grid that already fills whole waves.
+std::int32_t gqa_attention_prompt_split_capacity(std::int32_t q_heads, std::int32_t width,
+                                                 std::uint32_t visible_keys);
+
+// Launch split count in [1, capacity]: the count that minimizes whole-wave key-tile work.
+std::int32_t gqa_attention_prompt_splits(std::int32_t q_heads, std::int32_t width,
+                                         std::uint32_t visible_keys);
 
 struct GqaSmallTKeepScratch {
     // Sparge-decode tile-skip scratch (all empty unless the sage tile-skip is
@@ -72,7 +98,8 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  float xattn_tau = 1.0f, std::int32_t xattn_min_len = 8192,
                                  GqaS3PrefillDump* dump = nullptr, void* xattn_scratch = nullptr,
                                  GqaExecutionEnvelope envelope = {
-                                     1, kGqaAttentionMaximumVisibleKeys});
+                                     1, kGqaAttentionMaximumVisibleKeys},
+                                 const GqaPromptSplit& split = {});
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
@@ -91,6 +118,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            std::uint8_t* dbg_q = nullptr,
                                            void* xattn_scratch = nullptr,
                                            GqaExecutionEnvelope envelope = {
-                                               1, kGqaAttentionMaximumVisibleKeys});
+                                               1, kGqaAttentionMaximumVisibleKeys},
+                                           const GqaPromptSplit& split = {});
 
 } // namespace ninfer::ops::detail

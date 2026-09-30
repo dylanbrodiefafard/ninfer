@@ -2537,7 +2537,8 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens, 1.0f, false,
+        1.0f, sage);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -3429,7 +3430,8 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.q_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens, 1.0f, false,
+        1.0f, sage);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
@@ -4359,6 +4361,12 @@ int run_batch_cases(bool full) {
                                 MappingPattern::Fragmented, 508u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+    // Masked B=1 context-split prompts: the merge writes the invalid tail, including a fully
+    // invalid final 128-row block.
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {128, {4000}, {77}, {0}, MappingPattern::Identity, 509u});
+    failures += run_batch_case(kGeometries[1], DType::U8,
+                               {300, {1800}, {211}, {0}, MappingPattern::Fragmented, 510u});
     return failures;
 }
 
@@ -4431,6 +4439,27 @@ int run_geometry(const Geometry& geometry, bool full) {
                     run_a1_case(geometry, dtype, {129, 64, 256, 211u}, MappingPattern::Identity);
                 failures +=
                     run_a1_case(geometry, dtype, {128, 64, 256, 212u}, MappingPattern::Fragmented);
+            }
+            // Short appends to long histories. Six-row chunks past W=16 (27B: W=18 at 8K keys),
+            // then the context-split dense prompt (2..8 splits): one partial 128-row block, a
+            // full fragmented block, a partial final block, and a three-block chunk.
+            failures +=
+                run_a1_case(geometry, dtype, {7, 4089, 4096, 220u}, MappingPattern::Identity);
+            failures +=
+                run_a1_case(geometry, dtype, {18, 8000, 8018, 225u}, MappingPattern::Fragmented);
+            failures +=
+                run_a1_case(geometry, dtype, {16, 4080, 4096, 226u}, MappingPattern::Identity);
+            failures +=
+                run_a1_case(geometry, dtype, {128, 1920, 2048, 221u}, MappingPattern::Fragmented);
+            failures +=
+                run_a1_case(geometry, dtype, {150, 1900, 2050, 222u}, MappingPattern::Identity);
+            failures +=
+                run_a1_case(geometry, dtype, {300, 800, 1100, 223u}, MappingPattern::Identity);
+            if (full) {
+                failures += run_a1_case(geometry, dtype, {48, 20000, 20048, 224u},
+                                        MappingPattern::Fragmented);
+                failures += run_a1_case(geometry, dtype, {64, 20000, 20064, 227u},
+                                        MappingPattern::Identity);
             }
             failures +=
                 run_a3_case(geometry, dtype, {4, 512, 1024, 310u}, MappingPattern::Identity);
@@ -4530,6 +4559,21 @@ int verify_workspace_capacity_contract() {
         }
         if (interval != witness) {
             std::cerr << "gqa_attention interval capacity has no exact route witness\n";
+            ++failures;
+        }
+    }
+    for (const std::int32_t q_heads : {24, 16}) {
+        // Context-split partials peak at an interior W, not at the interval end.
+        constexpr ops::GqaExecutionEnvelope envelope{1, 8192};
+        const std::size_t interval =
+            ops::gqa_attention_workspace_capacity_bytes(q_heads, DType::U8, envelope, 1, 1, 1536);
+        std::size_t witness = 0;
+        for (std::int32_t tokens = 1; tokens <= 1536; ++tokens) {
+            witness = std::max(witness, ops::gqa_attention_workspace_capacity_bytes(
+                                            q_heads, DType::U8, envelope, 1, tokens, tokens));
+        }
+        if (interval != witness || witness == 0) {
+            std::cerr << "gqa_attention prompt-split interval capacity has no exact witness\n";
             ++failures;
         }
     }
