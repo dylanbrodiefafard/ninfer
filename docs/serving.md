@@ -738,8 +738,8 @@ sampler resolution.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
 p-less remains exact argmax. P-less membership is `p_v ≥ max(L·exp(-2ε/T), 1/M)` with
 `ε = 1/16` and `M = 1024`; L is the unperturbed collision probability, and an empty set
-falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (chain Leviathan with
-the recorded draft `q`; DFlash2 drafts are sampled at `--dflash-p-less-draft-temperature`) and to the
+falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (block verification over
+the chain with the recorded draft `q`; DFlash2 drafts are sampled at `--dflash-p-less-draft-temperature`) and to the
 bonus. A thinking-cycle exclusion affects only the next token,
 not later hops in the same speculative round. There is
 no OpenAI or Anthropic schema field for this mode.

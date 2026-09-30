@@ -426,9 +426,11 @@ One propose block:
    Packed GDN recurrence uses one
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
    accepts the matching prefix.
-   Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less also uses Leviathan
-   on every hop with the recorded selector `q`, and samples the bonus from its column's p-less
-   distribution.
+   Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less uses block verification
+   (Sun et al. 2024) over the chain with the recorded selector `q`: exact, never shorter in
+   expectation than per-hop Leviathan, correction from `max(p_τ p' − q, 0)`, bonus from its
+   column's p-less distribution. Draft and block-accept uniforms are keyed by the round's first
+   position and the hop, so a round never reuses a uniform the previous round conditioned on.
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    single-request recommendation is k=4 (W=5, one SmallT GQA tile); concurrent long-reasoning
    settings are measured in [performance.md](../performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22).

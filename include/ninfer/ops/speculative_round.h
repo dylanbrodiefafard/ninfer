@@ -68,8 +68,14 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   selector_ids/selector_q is the one-hot draft convention: accept iff u < p_i(d) and the
  *   residual excludes d. Greedy mode ignores q. When configs[b].p_less is set, p is the p-less
  *   distribution from sampling.h rather than the top-k/top-p/min-p truncation; selector q is
- *   still the recorded proposal law (one-hot for greedy drafts). Every hop applies that
- *   Leviathan test to its own target p-less distribution, and the bonus samples its own column.
+ *   still the recorded proposal law (one-hot for greedy drafts). The p-less chain uses block
+ *   verification (Sun et al. 2024, Algorithm 2) instead of the per-hop test: with p'_i the
+ *   p-less law of column i, p_0 = 1, p_i = min(p_{i-1} p'_{i-1}(d)/q_{i-1}(d), 1),
+ *   h_i = Z_i/(Z_i + 1 - p_i) with Z_i = sum_x max(p_i p'_i(x) - q_i(x), 0) and h_extent =
+ *   p_extent, it accepts tau = max{i : eta_i <= h_i} drafts and samples the correction from
+ *   max(p_tau p'_tau - q_tau, 0), or the bonus from p'_extent when tau = extent. eta_i uses
+ *   purpose kSamplePurposeSpeculativeBlockAccept at the round's first position with sub-key i.
+ *   A one-hot q gives token verification's acceptance length.
  *   Only hop 0 applies the cycle-exit restriction p' of sampling.h (V without a typical exclude,
  *   or Dirac on the runner-up when V is that singleton); typical_exclude is cleared for later
  *   hops because it describes one next-token decision, not a sequence-wide token ban. A

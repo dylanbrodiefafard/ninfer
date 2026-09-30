@@ -40,9 +40,8 @@ unsigned long long host_splitmix64(unsigned long long x) {
     return x ^ (x >> 31);
 }
 
-float host_sampling_uniform(unsigned long long seed, int position, int purpose) {
-    constexpr unsigned int sub = 0u;
-    unsigned long long key     = seed;
+float host_sampling_uniform(unsigned long long seed, int position, int purpose, unsigned int sub) {
+    unsigned long long key = seed;
     key                        = host_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
                0xD1B54A32D192ED03ull));
@@ -52,9 +51,10 @@ float host_sampling_uniform(unsigned long long seed, int position, int purpose) 
     return static_cast<float>(static_cast<unsigned int>(key >> 40)) * (1.0f / 16777216.0f);
 }
 
-unsigned long long seed_with_uniform_in(int position, int purpose, float lo, float hi) {
+unsigned long long seed_with_uniform_in(int position, int purpose, unsigned int sub, float lo,
+                                        float hi) {
     for (unsigned long long seed = 1; seed < 200000ull; ++seed) {
-        const float u = host_sampling_uniform(seed, position, purpose);
+        const float u = host_sampling_uniform(seed, position, purpose, sub);
         if (u >= lo && u < hi) { return seed; }
     }
     throw std::logic_error("no sampling seed in the requested uniform interval");
@@ -1483,8 +1483,10 @@ int p_less_fractional_q_residual_does_not_reemit_draft(int physical_rows, int to
     ops::SamplingConfig config{};
     config.temperature = 2.0f;
     config.p_less      = 1;
-    config.seed        = seed_with_uniform_in(initial_length + 1, ops::kSamplePurposeSpeculativeAccept,
-                                              0.625f, 1.0f);
+    // Block verification's hop-1 uniform: h_1 = p_1 = min(p'(draft)/q(draft), 1) = 0.625.
+    config.seed        = seed_with_uniform_in(initial_length + 1,
+                                              ops::kSamplePurposeSpeculativeBlockAccept, 1u, 0.625f,
+                                              1.0f);
     constexpr int cap  = 16;
     std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k, 0);
     std::vector<float> q(static_cast<std::size_t>(cap) * k, 0.0f);
@@ -1730,6 +1732,259 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
     return 1;
 }
 
+
+// Block verification exactness over a two-draft chain. Drafts come from two different 16-way q
+// that leave real target mass uncovered. The first two emitted tokens (the second drawn from the
+// oracle when a round emits one) must follow p'_0 x p'_1, and the mean and second moment of the
+// accepted length must match an independent enumeration of Algorithm 2 over every draft pair.
+// `chained` gives every column the same law and runs two rounds per trial with one seed, the
+// second starting where the first ended: its accepted length must also match, which fails if a
+// round reuses a uniform the previous round's acceptance conditioned on.
+int p_less_block_verification_case(int physical_rows, int token_domain, bool chained) {
+    constexpr int active = 64;
+    constexpr int k      = 2;
+    constexpr int cap    = 16;
+    constexpr int trials = 60000;
+    constexpr float temperature = 1.5f;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
+    for (int col = 0; col <= k; ++col) {
+        const float shift = chained ? 0.0f : 0.13f * static_cast<float>(col);
+        for (int t = 0; t < active; ++t) {
+            logits[static_cast<std::size_t>(col) * physical_rows + static_cast<std::size_t>(t)] =
+                2.5f * std::sin((0.7f + shift) * static_cast<float>(t)) + 0.04f * static_cast<float>(t);
+        }
+        for (int t = token_domain; t < physical_rows; ++t) {
+            logits[static_cast<std::size_t>(col) * physical_rows + static_cast<std::size_t>(t)] = 100.0f;
+        }
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    ops::SamplingConfig config{};
+    config.temperature = temperature;
+    config.p_less      = 1;
+    std::vector<std::vector<double>> target(k + 1, std::vector<double>(token_domain, 0.0));
+    std::vector<std::vector<int>> support(k + 1);
+    for (int col = 0; col <= k; ++col) {
+        support[col] = p_less_support_oracle(logits, physical_rows, col, token_domain, config);
+        const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
+        double max_scaled      = -1e30;
+        for (const int t : support[col]) {
+            max_scaled = std::max(max_scaled, static_cast<double>(logits[base + t]) / temperature);
+        }
+        double z = 0.0;
+        for (const int t : support[col]) { z += std::exp(logits[base + t] / temperature - max_scaled); }
+        for (const int t : support[col]) {
+            target[col][static_cast<std::size_t>(t)] =
+                std::exp(logits[base + t] / temperature - max_scaled) / z;
+        }
+    }
+
+    // Hop-major selector layout [cap, k]: hop h owns entries [h*cap, (h+1)*cap). Distinct ids.
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k);
+    std::vector<float> q(static_cast<std::size_t>(cap) * k);
+    for (int h = 0; h < k; ++h) {
+        double qsum = 0.0;
+        for (int c = 0; c < cap; ++c) {
+            const int token = (c * (5 + 2 * h) + 3 + h) % active;
+            ids[static_cast<std::size_t>(h * cap + c)] = token;
+            const double w = std::exp(logits[static_cast<std::size_t>(h) * physical_rows + token] / 0.8 +
+                                      0.3 * std::cos(static_cast<double>(c + h)));
+            q[static_cast<std::size_t>(h * cap + c)] = static_cast<float>(w);
+            qsum += w;
+        }
+        for (int c = 0; c < cap; ++c) {
+            q[static_cast<std::size_t>(h * cap + c)] =
+                static_cast<float>(q[static_cast<std::size_t>(h * cap + c)] / qsum);
+        }
+    }
+    const auto q_at = [&](int h, int token) {
+        for (int c = 0; c < cap; ++c) {
+            if (ids[static_cast<std::size_t>(h * cap + c)] == token) {
+                return static_cast<double>(q[static_cast<std::size_t>(h * cap + c)]);
+            }
+        }
+        return 0.0;
+    };
+    double uncovered = 1.0;
+    for (int c = 0; c < cap; ++c) { uncovered -= target[1][static_cast<std::size_t>(ids[static_cast<std::size_t>(cap + c)])]; }
+
+    // Independent Algorithm 2 over dense laws: E[tau] = 2 h2 + (1 - h2) h1, E[tau^2] = 4 h2 + (1 - h2) h1.
+    double mean_tau = 0.0;
+    double mean_tau2 = 0.0;
+    for (int c0 = 0; c0 < cap; ++c0) {
+        for (int c1 = 0; c1 < cap; ++c1) {
+            const int d0   = ids[static_cast<std::size_t>(c0)];
+            const int d1   = ids[static_cast<std::size_t>(cap + c1)];
+            const double w = static_cast<double>(q[static_cast<std::size_t>(c0)]) *
+                             static_cast<double>(q[static_cast<std::size_t>(cap + c1)]);
+            const double p1 = std::min(target[0][static_cast<std::size_t>(d0)] / q_at(0, d0), 1.0);
+            double z1       = 0.0;
+            for (int x = 0; x < token_domain; ++x) {
+                z1 += std::max(p1 * target[1][static_cast<std::size_t>(x)] - q_at(1, x), 0.0);
+            }
+            const double denom = z1 + 1.0 - p1;
+            const double h1    = denom > 0.0 ? z1 / denom : 1.0;
+            const double h2 = std::min(p1 * target[1][static_cast<std::size_t>(d1)] / q_at(1, d1), 1.0);
+            mean_tau += w * (2.0 * h2 + (1.0 - h2) * h1);
+            mean_tau2 += w * (4.0 * h2 + (1.0 - h2) * h1);
+        }
+    }
+    const double sd_tau = std::sqrt(std::max(mean_tau2 - mean_tau * mean_tau, 1e-12));
+
+    std::vector<std::int32_t> counts_init(token_domain, 0);
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(k + 1, 0));
+    DeviceBuffer d_logits  = to_device(logits_bits);
+    DeviceBuffer d_drafts  = to_device(std::vector<std::int32_t>(k, 0));
+    DeviceBuffer d_counts  = to_device(counts_init);
+    DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+    DeviceBuffer d_sel_ids = to_device(ids);
+    DeviceBuffer d_sel_q   = to_device(q);
+    config.token_counts    = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config  = device_config(config);
+    GuardedDeviceBuffer d_length(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_token(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_num(sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(sizeof(std::int32_t));
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, k + 1});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+    Tensor extent(d_extent.p, DType::I32, {1});
+    Tensor length(d_length.data(), DType::I32, {1});
+    Tensor token(d_token.data(), DType::I32, {1});
+    Tensor sampled(d_sampled.data(), DType::I32, {k + 1});
+    Tensor num_sampled(d_num.data(), DType::I32, {1});
+    Tensor accepted(d_accepted.data(), DType::I32, {1});
+    Tensor sel_ids_t(d_sel_ids.p, DType::I32, {cap, k});
+    Tensor sel_q_t(d_sel_q.p, DType::FP32, {cap, k});
+    WorkspaceArena workspace(std::max<std::size_t>(
+        256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1)));
+
+    std::mt19937_64 rng(chained ? 0xc4a1ULL : 0xb10cULL);
+    std::discrete_distribution<int> draw0(q.begin(), q.begin() + cap);
+    std::discrete_distribution<int> draw1(q.begin() + cap, q.end());
+    std::discrete_distribution<int> oracle1(target[1].begin(), target[1].end());
+    const auto run_round = [&](std::int32_t start, std::vector<std::int32_t>& out, int& produced,
+                               int& acc) {
+        const std::vector<std::int32_t> drafts{ids[static_cast<std::size_t>(draw0(rng))],
+                                               ids[static_cast<std::size_t>(cap + draw1(rng))]};
+        cuda_check(cudaMemcpy(d_drafts.p, drafts.data(), drafts.size() * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice),
+                   "drafts");
+        initialize(d_length, std::vector<std::int32_t>{start});
+        workspace.reset();
+        ops::speculative_accept_greedy_drafts(
+            targets, logits_t, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
+            token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
+            &sel_ids_t, &sel_q_t);
+        out      = read<std::int32_t>(d_sampled, k + 1);
+        produced = read<std::int32_t>(d_num, 1)[0];
+        acc      = read<std::int32_t>(d_accepted, 1)[0];
+    };
+
+    const auto top3 = [&](int col) {
+        std::vector<int> order = support[col];
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            return target[col][static_cast<std::size_t>(a)] > target[col][static_cast<std::size_t>(b)];
+        });
+        order.resize(std::min<std::size_t>(3, order.size()));
+        return order;
+    };
+    const std::vector<int> top0 = top3(0);
+    const std::vector<int> top1 = top3(1);
+    const auto bucket = [](const std::vector<int>& top, int t) {
+        const auto it = std::find(top.begin(), top.end(), t);
+        return it == top.end() ? static_cast<int>(top.size()) : static_cast<int>(it - top.begin());
+    };
+    const int b0 = static_cast<int>(top0.size()) + 1;
+    const int b1 = static_cast<int>(top1.size()) + 1;
+    std::vector<std::int64_t> observed(static_cast<std::size_t>(b0 * b1), 0);
+    std::vector<std::int64_t> marginal0(token_domain, 0);
+    std::vector<std::int64_t> marginal1(token_domain, 0);
+    double tau_sum        = 0.0;
+    double second_tau_sum = 0.0;
+    int outside           = 0;
+    for (int trial = 0; trial < trials; ++trial) {
+        config.seed = 0x9e3779b97f4a7c15ULL * static_cast<unsigned long long>(trial + 1);
+        cuda_check(cudaMemcpy(d_config.p, &config, sizeof(config), cudaMemcpyHostToDevice), "config");
+        std::vector<std::int32_t> out;
+        int produced = 0;
+        int acc      = 0;
+        run_round(40, out, produced, acc);
+        tau_sum += acc;
+        const int t0 = out[0];
+        const int t1 = produced >= 2 ? out[1] : oracle1(rng);
+        if (chained) {
+            std::vector<std::int32_t> out2;
+            int produced2 = 0;
+            int acc2      = 0;
+            run_round(40 + produced, out2, produced2, acc2);
+            second_tau_sum += acc2;
+        }
+        if (t0 < 0 || t0 >= token_domain || t1 < 0 || t1 >= token_domain) {
+            std::cerr << "block verification: emitted token out of range\n";
+            return 1;
+        }
+        outside += target[0][static_cast<std::size_t>(t0)] <= 0.0;
+        outside += target[1][static_cast<std::size_t>(t1)] <= 0.0;
+        ++marginal0[static_cast<std::size_t>(t0)];
+        ++marginal1[static_cast<std::size_t>(t1)];
+        ++observed[static_cast<std::size_t>(bucket(top0, t0) * b1 + bucket(top1, t1))];
+    }
+    const auto chi2_marginal = [&](const std::vector<std::int64_t>& obs, int col, double& dof) {
+        double chi2 = 0.0;
+        for (const int t : support[col]) {
+            const double expected = target[col][static_cast<std::size_t>(t)] * trials;
+            const double diff     = static_cast<double>(obs[static_cast<std::size_t>(t)]) - expected;
+            chi2 += diff * diff / expected;
+        }
+        dof = std::max(1.0, static_cast<double>(support[col].size()) - 1.0);
+        return chi2;
+    };
+    double dof0 = 0.0;
+    double dof1 = 0.0;
+    const double chi0 = chi2_marginal(marginal0, 0, dof0);
+    const double chi1 = chi2_marginal(marginal1, 1, dof1);
+    double chij       = 0.0;
+    for (int a = 0; a < b0; ++a) {
+        double pa = 0.0;
+        for (const int t : support[0]) {
+            if (bucket(top0, t) == a) { pa += target[0][static_cast<std::size_t>(t)]; }
+        }
+        for (int b = 0; b < b1; ++b) {
+            double pb = 0.0;
+            for (const int t : support[1]) {
+                if (bucket(top1, t) == b) { pb += target[1][static_cast<std::size_t>(t)]; }
+            }
+            const double expected = pa * pb * trials;
+            if (expected <= 0.0) { continue; }
+            const double diff =
+                static_cast<double>(observed[static_cast<std::size_t>(a * b1 + b)]) - expected;
+            chij += diff * diff / expected;
+        }
+    }
+    const double dofj   = static_cast<double>(b0 * b1 - 1);
+    const auto limit    = [](double dof) { return dof + 6.0 * std::sqrt(2.0 * dof); };
+    const double tau_tolerance = 5.0 * sd_tau / std::sqrt(static_cast<double>(trials));
+    const double mean_observed = tau_sum / trials;
+    const double second_mean   = second_tau_sum / trials;
+    const bool tau_ok = std::abs(mean_observed - mean_tau) < tau_tolerance &&
+                        (!chained || std::abs(second_mean - mean_tau) < tau_tolerance);
+    std::cout << "p-less block verification V=" << token_domain << (chained ? " chained" : "")
+              << ": chi2 t0=" << chi0 << " (" << limit(dof0) << ") t1=" << chi1 << " ("
+              << limit(dof1) << ") joint=" << chij << " (" << limit(dofj) << ") E[tau]="
+              << mean_observed << (chained ? " / round2 " + std::to_string(second_mean) : "")
+              << " exact=" << mean_tau << " tol=" << tau_tolerance << " uncovered=" << uncovered
+              << " outside=" << outside << "\n";
+    if (outside == 0 && chi0 < limit(dof0) && chi1 < limit(dof1) && chij < limit(dofj) && tau_ok &&
+        uncovered > 0.05) {
+        return 0;
+    }
+    std::cerr << "p-less block verification changed the target law or the accepted length\n";
+    return 1;
+}
 
 bool p_less_support_contains(const std::vector<int>& support, int token) {
     return std::find(support.begin(), support.end(), token) != support.end();
@@ -3134,6 +3389,11 @@ int main() {
     failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 0.0f);
     failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 1.0f);
     failures += p_less_sampled_draft_preserves_target_distribution(248320, 248077, 0.0f);
+    // Both verify routes: single-block (small vocabulary) and multi-block finalize (product V).
+    failures += p_less_block_verification_case(64, 64, false);
+    failures += p_less_block_verification_case(64, 64, true);
+    failures += p_less_block_verification_case(248320, 248077, false);
+    failures += p_less_block_verification_case(248320, 248077, true);
     failures += p_less_fractional_q_residual_does_not_reemit_draft(
         64, 64, 11, "p-less fractional q residual does not re-emit draft V=64");
     failures += p_less_fractional_q_residual_does_not_reemit_draft(
