@@ -44,7 +44,9 @@ public:
         const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
         const auto aligned = (address + Reader::direct_io_alignment - 1) /
                              Reader::direct_io_alignment * Reader::direct_io_alignment;
-        data_              = reinterpret_cast<std::byte*>(aligned);
+        // Offsetting the owned pointer keeps its provenance; the padding is at most the
+        // direct_io_alignment - 1 extra bytes the buffer reserves.
+        data_ = static_cast<std::byte*>(buffer.data()) + (aligned - address);
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
 

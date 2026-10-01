@@ -26,15 +26,35 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace ninfer::runtime {
+
+namespace detail {
+
+// Runs one step of failure or shutdown cleanup and discards the step's own exception. Callers use
+// it only where an outcome is already decided: a primary exception is propagating to its owner,
+// or the caller is noexcept (abort, shutdown, worker teardown). A secondary failure there must
+// not replace the primary error or skip the later steps that release claims, lanes, and waiting
+// requests.
+template <class Step>
+void run_secondary_cleanup(Step&& step) noexcept {
+    try {
+        std::forward<Step>(step)();
+        // NOLINTNEXTLINE(bugprone-empty-catch): secondary cleanup failure; see above.
+    } catch (...) {}
+}
+
+} // namespace detail
 
 template <class Instance>
 class ConcurrentExecutor;
@@ -144,9 +164,8 @@ public:
             : owner_(&owner), request_(std::move(request)) {}
 
         void reset() noexcept {
-            if (owner_ != nullptr && request_ != nullptr) {
-                owner_->abandon_request(std::move(request_));
-            }
+            if (owner_ != nullptr && request_ != nullptr) { owner_->abandon_request(request_); }
+            request_.reset();
             owner_ = nullptr;
         }
 
@@ -304,11 +323,14 @@ public:
     }
 
     void reset_memory_peaks() noexcept {
+        // Only acquiring the execution mutex can throw (std::system_error); a peak reset is a
+        // diagnostic request that is skipped rather than allowed to terminate the caller.
         try {
             std::scoped_lock lock(execution_mutex_);
             instance_.program->reset_memory_peaks();
             instance_.request_memory.reset_peak();
-        } catch (...) {}
+            // NOLINTNEXTLINE(bugprone-empty-catch): a skipped diagnostic reset; see above.
+        } catch (const std::system_error&) {}
     }
 
 private:
@@ -652,7 +674,7 @@ private:
         if (release) { release_reserved_capacity(); }
     }
 
-    void abandon_request(std::shared_ptr<Request> request) noexcept {
+    void abandon_request(const std::shared_ptr<Request>& request) noexcept {
         request->cancelled.store(true, std::memory_order_release);
         signal_control();
         release_consumer(request);
@@ -696,6 +718,9 @@ private:
         publish_runtime_stats();
     }
 
+    // The request is taken by value: callers may pass slots_[lane] itself, which
+    // retire_request() resets before the result is published through the request.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): the copy keeps the request alive.
     void complete_error(std::shared_ptr<Request> request, std::exception_ptr error) {
         end_copy_hold(request);
         request->recovery.cycle_exclusions = request->cycle_exclusions;
@@ -715,9 +740,9 @@ private:
     }
 
     void publish_recovery(const std::shared_ptr<Request>& request, RecoveryEventKind kind,
-                          std::string cause) {
+                          std::string_view cause) {
         RecoveryEvent event{.kind                 = kind,
-                            .cause                = std::move(cause),
+                            .cause                = std::string(cause),
                             .attempts             = request->recovery.attempts,
                             .cycle_exclusions     = request->cycle_exclusions,
                             .discarded_tool_calls = request->recovery.discarded_tool_calls,
@@ -732,6 +757,8 @@ private:
         request->cv.notify_one();
     }
 
+    // The request is taken by value for the same slot-aliasing reason as complete_error().
+    // NOLINTNEXTLINE(performance-unnecessary-value-param): the copy keeps the request alive.
     void complete_success(std::shared_ptr<Request> request, FinishReason reason) {
         if (request->cycle_exclusions != 0 || !request->recovery_cause.empty()) {
             publish_recovery(request, RecoveryEventKind::Finished,
@@ -818,7 +845,7 @@ private:
         request->cv.notify_one();
     }
 
-    void complete_cancelled(std::shared_ptr<Request> request) {
+    void complete_cancelled(const std::shared_ptr<Request>& request) {
         if (!request->output.terminal()) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             append_output(request, request->output.commit_preview(), false);
@@ -826,7 +853,7 @@ private:
         complete_success(request, FinishReason::Cancelled);
     }
 
-    void recovery_exhausted(const std::shared_ptr<Request>& request, std::string detail) {
+    void recovery_exhausted(const std::shared_ptr<Request>& request, const std::string& detail) {
         publish_recovery(request, RecoveryEventKind::Exhausted, detail);
         const auto lane = *request->lane;
         instance_.program->abort_lane(lane);
@@ -905,15 +932,13 @@ private:
         auto release_claim                = [&]() noexcept {
             if (consumed) { return; }
             if (ram_claimed) {
-                try {
-                    instance_.program->release_ram_entry(ram_entry_id);
-                } catch (...) {}
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->release_ram_entry(ram_entry_id); });
                 ram_claimed = false;
             }
             if (disk_claimed) {
-                try {
-                    instance_.program->release_disk_entry(disk_entry_id);
-                } catch (...) {}
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->release_disk_entry(disk_entry_id); });
                 disk_claimed = false;
             }
         };
@@ -971,33 +996,23 @@ private:
             resolve_recovery_prefill(request, first);
             return true;
         } catch (const CacheRestoreFailure&) {
-            try {
-                instance_.program->cancel_disk_restore();
-            } catch (...) {}
-            try {
-                instance_.program->synchronize_all();
-            } catch (...) {}
+            detail::run_secondary_cleanup([&] { instance_.program->cancel_disk_restore(); });
+            detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
             release_claim();
             if (ram_owned) {
-                try {
-                    instance_.program->discard_ram_capture(ram_entry_id);
-                } catch (...) {}
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->discard_ram_capture(ram_entry_id); });
             }
             if (disk_owned) {
-                try {
-                    instance_.program->invalidate_disk_entry(disk_entry_id);
-                } catch (...) {}
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->invalidate_disk_entry(disk_entry_id); });
             }
             release_recovery_lane(lane);
             if (!request->prompt) { throw; }
             return false;
         } catch (...) {
-            try {
-                instance_.program->cancel_disk_restore();
-            } catch (...) {}
-            try {
-                instance_.program->synchronize_all();
-            } catch (...) {}
+            detail::run_secondary_cleanup([&] { instance_.program->cancel_disk_restore(); });
+            detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
             release_claim();
             release_recovery_lane(lane);
             throw;
@@ -1118,12 +1133,10 @@ private:
             std::optional<Plan> ram_plan;
             std::optional<Plan> disk_plan;
             if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Cold && reuse_enabled) {
-                try {
-                    ram_plan.emplace(instance_.program->plan_ram_reuse(*spliced, base));
-                } catch (const std::bad_alloc&) {}
-                try {
-                    disk_plan.emplace(instance_.program->plan_disk_reuse(*spliced, base));
-                } catch (const std::bad_alloc&) {}
+                ram_plan = optional_host_reuse_plan(
+                    [&] { return instance_.program->plan_ram_reuse(*spliced, base); });
+                disk_plan = optional_host_reuse_plan(
+                    [&] { return instance_.program->plan_disk_reuse(*spliced, base); });
                 const auto host_tokens = [](const std::optional<Plan>& plan,
                                             PrefixReuseSource source,
                                             bool ram_source) -> std::uint32_t {
@@ -1186,7 +1199,8 @@ private:
             using Route = targets::qwen3_6::RecoveryPrefillRoute;
             switch (decision.route) {
             case Route::ResidentSuffix: {
-                const auto first = begin_recovery_prefill(request, lane, std::move(*lane_plan));
+                const auto first =
+                    begin_recovery_prefill(request, lane, std::move(lane_plan.value()));
                 resolve_recovery_prefill(request, first);
                 return true;
             }
@@ -1194,8 +1208,9 @@ private:
             case Route::HostDisk: {
                 release_recovery_lane(lane);
                 const bool ram = decision.route == Route::HostRam;
-                if (!prefill_recovery_from_host(
-                        request, lane, ram, ram ? std::move(*ram_plan) : std::move(*disk_plan))) {
+                if (!prefill_recovery_from_host(request, lane, ram,
+                                                ram ? std::move(ram_plan.value())
+                                                    : std::move(disk_plan.value()))) {
                     const auto failed = route_of(true, true, true, 0, true, 0, 0, true);
                     if (failed.route != Route::Cold) {
                         throw std::logic_error("recovery host restore failure must cold-prefill");
@@ -1545,7 +1560,7 @@ private:
             std::rethrow_exception(error);
         } catch (const RequestError& request_error) {
             return std::make_exception_ptr(
-                RequestError(request_error.kind(), request_error.what(), std::move(stats)));
+                RequestError(request_error.kind(), request_error.what(), stats));
         } catch (...) { return error; }
     }
 
@@ -1587,6 +1602,15 @@ private:
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
     }
 
+    // Host-tier prefix lookup is optional: when planning it runs out of host memory, the request
+    // keeps lane and cold admission instead of failing. Other planning errors propagate.
+    template <class Lookup>
+    [[nodiscard]] static std::optional<Plan> optional_host_reuse_plan(Lookup&& lookup) {
+        try {
+            return std::optional<Plan>(std::forward<Lookup>(lookup)());
+        } catch (const std::bad_alloc&) { return std::nullopt; }
+    }
+
     void ensure_ram_candidate(const std::shared_ptr<Request>& request) {
         if (!request->options.execution.allow_prefix_reuse) {
             request->ram_plan.reset();
@@ -1595,15 +1619,15 @@ private:
         const std::uint64_t version = instance_.program->kv_ram_index_version();
         if (request->ram_index_version == version) { return; }
         request->ram_plan.reset();
-        try {
-            Plan plan = instance_.program->plan_ram_reuse(request->prompt, *request->base_plan);
-            if (plan.summary().reusable_prompt_tokens > 0 && plan.summary().ram_entry_id != 0 &&
-                plan.summary().reuse_source == PrefixReuseSource::HostRam) {
-                request->ram_plan.emplace(std::move(plan));
-            }
-        } catch (const std::bad_alloc&) {
-            // Cache lookup is optional. Keep normal lane/cold admission available
-            // and remember this index version so allocation pressure cannot spin.
+        // Recording the index version even when the lookup ran out of host memory keeps
+        // allocation pressure from re-planning the same index every scheduler pass.
+        std::optional<Plan> plan = optional_host_reuse_plan([&] {
+            return instance_.program->plan_ram_reuse(request->prompt, *request->base_plan);
+        });
+        if (plan && plan->summary().reusable_prompt_tokens > 0 &&
+            plan->summary().ram_entry_id != 0 &&
+            plan->summary().reuse_source == PrefixReuseSource::HostRam) {
+            request->ram_plan = std::move(plan);
         }
         request->ram_index_version = version;
     }
@@ -1616,15 +1640,15 @@ private:
         const std::uint64_t version = instance_.program->kv_disk_index_version();
         if (request->disk_index_version == version) { return; }
         request->disk_plan.reset();
-        try {
-            Plan plan = instance_.program->plan_disk_reuse(request->prompt, *request->base_plan);
-            if (plan.summary().reusable_prompt_tokens > 0 && plan.summary().disk_entry_id != 0 &&
-                plan.summary().reuse_source == PrefixReuseSource::HostDisk) {
-                request->disk_plan.emplace(std::move(plan));
-            }
-        } catch (const std::bad_alloc&) {
-            // Cache lookup is optional. Keep normal lane/cold admission available
-            // and remember this index version so allocation pressure cannot spin.
+        // Recording the index version even when the lookup ran out of host memory keeps
+        // allocation pressure from re-planning the same index every scheduler pass.
+        std::optional<Plan> plan = optional_host_reuse_plan([&] {
+            return instance_.program->plan_disk_reuse(request->prompt, *request->base_plan);
+        });
+        if (plan && plan->summary().reusable_prompt_tokens > 0 &&
+            plan->summary().disk_entry_id != 0 &&
+            plan->summary().reuse_source == PrefixReuseSource::HostDisk) {
+            request->disk_plan = std::move(plan);
         }
         request->disk_index_version = version;
     }
@@ -1700,7 +1724,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
-            const Plan& plan          = *request->lane_plans[lane];
+            const Plan& plan          = request->lane_plans[lane].value();
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane(lane, plan)) {
                 consider_vram(lane, reuse, false);
@@ -1717,7 +1741,7 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
-            const Plan& plan          = *request->lane_plans[lane];
+            const Plan& plan          = request->lane_plans[lane].value();
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan)) {
                 consider_vram(lane, reuse, true);
@@ -1742,64 +1766,55 @@ private:
 
     void harvest_kv_copy_seconds(const std::shared_ptr<Request>& request) noexcept {
         if (request == nullptr) { return; }
-        try {
+        detail::run_secondary_cleanup([&] {
             const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
             request->kv_ram_save_seconds += copies.save;
             request->kv_ram_load_seconds += copies.load;
-        } catch (...) {}
-        try {
+        });
+        detail::run_secondary_cleanup([&] {
             const auto copies = instance_.program->harvest_kv_disk_copy_seconds();
             request->kv_disk_save_seconds += copies.save;
             request->kv_disk_load_seconds += copies.load;
             request->kv_disk_h2d_seconds += copies.h2d;
             cumulative_stats_.kv_disk_h2d_seconds += copies.h2d;
-        } catch (...) {}
+        });
     }
 
-    [[nodiscard]] static bool is_request_local_admission_error(std::exception_ptr error) {
+    [[nodiscard]] static bool is_request_local_admission_error(const std::exception_ptr& error) {
+        if (!error) { return false; }
         try {
-            if (error) { std::rethrow_exception(error); }
+            std::rethrow_exception(error);
         } catch (const RequestError&) { return true; } catch (...) {
+            return false;
         }
-        return false;
     }
 
     void drain_copy_hold_before_abort() noexcept {
         if (!copy_hold_) { return; }
-        const std::uint32_t lane = copy_hold_->lane;
-        try {
-            instance_.program->cancel_disk_restore();
-        } catch (...) {}
-        try {
-            instance_.program->synchronize_all();
-        } catch (...) {}
-        harvest_kv_copy_seconds(copy_hold_->request);
-        if (copy_hold_->ram_claimed && !copy_hold_->ram_consumed) {
-            try {
-                instance_.program->release_ram_entry(copy_hold_->ram_entry_id);
-            } catch (...) {}
-            copy_hold_->ram_claimed = false;
+        CopyHold& hold = *copy_hold_;
+        detail::run_secondary_cleanup([&] { instance_.program->cancel_disk_restore(); });
+        detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
+        harvest_kv_copy_seconds(hold.request);
+        if (hold.ram_claimed && !hold.ram_consumed) {
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->release_ram_entry(hold.ram_entry_id); });
+            hold.ram_claimed = false;
         }
-        if (copy_hold_->disk_claimed && !copy_hold_->disk_consumed) {
-            try {
-                instance_.program->release_disk_entry(copy_hold_->disk_entry_id);
-            } catch (...) {}
-            copy_hold_->disk_claimed = false;
+        if (hold.disk_claimed && !hold.disk_consumed) {
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->release_disk_entry(hold.disk_entry_id); });
+            hold.disk_claimed = false;
         }
-        end_copy_hold(copy_hold_->request);
-        if (!copy_hold_->victims_evicted) {
-            try {
-                for (const std::uint32_t victim :
-                     std::span(copy_hold_->victim_lanes).first(copy_hold_->victim_count)) {
-                    instance_.program->evict_retained_lane(victim);
-                    invalidate_lane_plans(victim);
-                }
-            } catch (...) {}
-            copy_hold_->victims_evicted = true;
+        end_copy_hold(hold.request);
+        if (!hold.victims_evicted) {
+            for (const std::uint32_t victim :
+                 std::span(hold.victim_lanes).first(hold.victim_count)) {
+                instance_.program->evict_retained_lane(victim);
+                invalidate_lane_plans(victim);
+            }
+            hold.victims_evicted = true;
         }
-        try {
-            instance_.program->abort_lane(lane);
-        } catch (...) {}
+        instance_.program->abort_lane(hold.lane);
         copy_hold_.reset();
     }
 
@@ -1911,19 +1926,20 @@ private:
                 !request->generated.empty()) {
                 throw;
             }
+            CopyHold& failed = *copy_hold_;
             instance_.program->cancel_disk_restore();
             instance_.program->synchronize_all();
             harvest_kv_copy_seconds(request);
-            if (copy_hold_->ram_claimed && !copy_hold_->ram_consumed) {
+            if (failed.ram_claimed && !failed.ram_consumed) {
                 instance_.program->release_ram_entry(ram_entry_id);
-                copy_hold_->ram_claimed = false;
+                failed.ram_claimed = false;
                 instance_.program->discard_ram_capture(ram_entry_id);
             }
-            if (copy_hold_->disk_claimed && !copy_hold_->disk_consumed) {
+            if (failed.disk_claimed && !failed.disk_consumed) {
                 instance_.program->release_disk_entry(disk_entry_id);
-                copy_hold_->disk_claimed = false;
+                failed.disk_claimed = false;
             }
-            if (copy_hold_->disk_hit) { instance_.program->invalidate_disk_entry(disk_entry_id); }
+            if (failed.disk_hit) { instance_.program->invalidate_disk_entry(disk_entry_id); }
             instance_.program->abort_lane(lane);
             end_copy_hold(request);
             copy_hold_.reset();
@@ -1959,14 +1975,12 @@ private:
                 drain_copy_hold_before_abort();
             } else {
                 if (ram_claimed && !ram_consumed) {
-                    try {
-                        instance_.program->release_ram_entry(ram_entry_id);
-                    } catch (...) {}
+                    detail::run_secondary_cleanup(
+                        [&] { instance_.program->release_ram_entry(ram_entry_id); });
                 }
                 if (disk_claimed && !disk_consumed) {
-                    try {
-                        instance_.program->release_disk_entry(disk_entry_id);
-                    } catch (...) {}
+                    detail::run_secondary_cleanup(
+                        [&] { instance_.program->release_disk_entry(disk_entry_id); });
                 }
             }
             instance_.program->abort_lane(lane);
@@ -2021,9 +2035,9 @@ private:
         } else if (!request->lane_plans[lane]) {
             throw std::logic_error("selected admission lane has no request plan");
         }
-        Plan& winning_plan = ram_hit    ? *request->ram_plan
-                             : disk_hit ? *request->disk_plan
-                                        : *request->lane_plans[lane];
+        Plan& winning_plan = ram_hit    ? request->ram_plan.value()
+                             : disk_hit ? request->disk_plan.value()
+                                        : request->lane_plans[lane].value();
 
         bool ram_claimed  = false;
         bool disk_claimed = false;
@@ -2031,23 +2045,19 @@ private:
         std::size_t captured_ram_count = 0;
         auto release_host_if_needed    = [&]() {
             if (ram_claimed) {
-                try {
-                    instance_.program->release_ram_entry(choice.ram_entry_id);
-                } catch (...) {}
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->release_ram_entry(choice.ram_entry_id); });
                 ram_claimed = false;
             }
             if (disk_claimed) {
-                try {
-                    instance_.program->release_disk_entry(choice.disk_entry_id);
-                } catch (...) {}
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->release_disk_entry(choice.disk_entry_id); });
                 disk_claimed = false;
             }
         };
         auto rollback_ram_captures = [&]() {
             for (const std::uint64_t id : std::span(captured_ram_ids).first(captured_ram_count)) {
-                try {
-                    instance_.program->discard_ram_capture(id);
-                } catch (...) {}
+                detail::run_secondary_cleanup([&] { instance_.program->discard_ram_capture(id); });
             }
             captured_ram_count = 0;
         };
@@ -2220,21 +2230,8 @@ private:
             return AdmissionProgress::CopyHold;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            try {
-                instance_.program->synchronize_all();
-            } catch (...) {}
-            try {
-                const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
-                request->kv_ram_save_seconds += copies.save;
-                request->kv_ram_load_seconds += copies.load;
-            } catch (...) {}
-            try {
-                const auto copies = instance_.program->harvest_kv_disk_copy_seconds();
-                request->kv_disk_save_seconds += copies.save;
-                request->kv_disk_load_seconds += copies.load;
-                request->kv_disk_h2d_seconds += copies.h2d;
-                cumulative_stats_.kv_disk_h2d_seconds += copies.h2d;
-            } catch (...) {}
+            detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
+            harvest_kv_copy_seconds(request);
             if (!(copy_hold_ && copy_hold_->lane == lane)) { rollback_ram_captures(); }
             release_host_if_needed();
             const bool claimed = slots_[lane] == request;
@@ -2528,7 +2525,7 @@ private:
         }
     }
 
-    void fail_all(std::exception_ptr error) noexcept {
+    void fail_all(const std::exception_ptr& error) noexcept {
         std::scoped_lock execution_lock(execution_mutex_);
         std::vector<std::shared_ptr<Request>> pending;
         {
@@ -2585,11 +2582,14 @@ private:
             }
             // Cache-tier calls take the tiers' own locks and may wait on disk
             // maintenance; submit() must never queue behind them on queue_mutex_.
+            // Idle spill is opportunistic: if the readiness query or spill request fails, the
+            // worker polls again below, and a broken device fails the next scheduled request.
             bool copies_ready = false;
             if (idle && !copy_hold_) {
                 try {
                     copies_ready = instance_.program->kv_copies_ready();
                     if (copies_ready) { instance_.program->request_idle_spill(); }
+                    // NOLINTNEXTLINE(bugprone-empty-catch): opportunistic spill; see above.
                 } catch (...) {}
             }
             {
@@ -2605,9 +2605,8 @@ private:
                     {
                         std::scoped_lock execution_lock(execution_mutex_);
                         drain_copy_hold_before_abort();
-                        try {
-                            instance_.program->shutdown_kv_tiers(load_progress_);
-                        } catch (...) {}
+                        detail::run_secondary_cleanup(
+                            [&] { instance_.program->shutdown_kv_tiers(load_progress_); });
                     }
                     fail_all(std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down")));
@@ -2647,7 +2646,7 @@ private:
                     } else {
                         const AdmissionProgress progress = admit_complete(membership.empty());
                         if (progress == AdmissionProgress::CopyHold && !membership.empty() &&
-                            !membership_contains(membership, copy_hold_->lane)) {
+                            !membership_contains(membership, copy_hold_.value().lane)) {
                             run_membership_decode();
                         }
                     }
@@ -2683,9 +2682,8 @@ private:
                 {
                     std::scoped_lock execution_lock(execution_mutex_);
                     drain_copy_hold_before_abort();
-                    try {
-                        instance_.program->shutdown_kv_tiers(load_progress_);
-                    } catch (...) {}
+                    detail::run_secondary_cleanup(
+                        [&] { instance_.program->shutdown_kv_tiers(load_progress_); });
                 }
                 fail_all(std::current_exception());
                 return;
