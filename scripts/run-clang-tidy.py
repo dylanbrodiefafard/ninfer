@@ -159,7 +159,10 @@ def translate_database(build: Path, output: Path) -> dict[str, dict]:
             "arguments": arguments,
         }
     output.mkdir(parents=True, exist_ok=True)
-    (output / "compile_commands.json").write_text(json.dumps(list(translated.values()), indent=1))
+    # Write then rename, so concurrent runs never read a partially written database.
+    staging = output / f"compile_commands.json.{os.getpid()}"
+    staging.write_text(json.dumps(list(translated.values()), indent=1))
+    staging.replace(output / "compile_commands.json")
     return translated
 
 
