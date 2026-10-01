@@ -38,12 +38,12 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
             b == batch - 1 ? licensed[static_cast<std::size_t>(b)] : 12 - b;
         rope_deltas[static_cast<std::size_t>(b)] = 3 * b - 2;
         for (int j = 0; j < T; ++j) {
-            verify[static_cast<std::size_t>(b * T + j)] = 1000 + 101 * b + 7 * j;
+            verify[static_cast<std::size_t>(b) * T + j] = 1000 + 101 * b + 7 * j;
         }
         for (int j = 0; j < T; ++j) {
-            expected_alignment[static_cast<std::size_t>(b * T + j)] =
+            expected_alignment[static_cast<std::size_t>(b) * T + j] =
                 j < accepted[static_cast<std::size_t>(b)]
-                    ? verify[static_cast<std::size_t>(b * T + j + 1)]
+                    ? verify[static_cast<std::size_t>(b) * T + j + 1]
                     : anchors[static_cast<std::size_t>(b)];
         }
         const int budget_extent = std::max(
@@ -53,7 +53,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
         expected_extents[static_cast<std::size_t>(b)] =
             std::min({k, budget_extent, context_extent});
         for (int s = 0; s < steps; ++s) {
-            const std::size_t offset   = static_cast<std::size_t>(s * batch + b);
+            const std::size_t offset   = static_cast<std::size_t>(s) * batch + b;
             expected_positions[offset] = frontiers[static_cast<std::size_t>(b)] + s;
             expected_rope_positions[offset] =
                 expected_positions[offset] + rope_deltas[static_cast<std::size_t>(b)];

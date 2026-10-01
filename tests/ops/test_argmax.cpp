@@ -138,30 +138,33 @@ int run_suppressed_case(std::int32_t physical_rows, std::int32_t valid_rows, con
 
 int column_masks(int physical, int domain) {
     constexpr int width = 6, batch = 2;
-    const int stride = (domain + 31) / 32 + 1;
-    std::vector<std::uint32_t> masks(batch * width * stride, 0);
-    std::vector<std::uint16_t> logits(batch * width * physical, f32_to_bf16(0));
+    const int stride              = (domain + 31) / 32 + 1;
+    constexpr std::size_t columns = static_cast<std::size_t>(batch) * width;
+    std::vector<std::uint32_t> masks(columns * stride, 0);
+    std::vector<std::uint16_t> logits(columns * physical, f32_to_bf16(0));
     std::vector<std::int32_t> expected;
     for (int col = 0; col < batch * width; ++col) {
-        const int token = domain - 1 - col;
+        const int token               = domain - 1 - col;
+        const std::size_t mask_base   = static_cast<std::size_t>(col) * stride;
+        const std::size_t logits_base = static_cast<std::size_t>(col) * physical;
         expected.push_back(token);
-        masks[col * stride + token / 32] |= 1u << (token % 32);
-        masks[col * stride] |= 1u << 8;
-        logits[col * physical]     = f32_to_bf16(100);
-        logits[col * physical + 8] = f32_to_bf16(90);
+        masks[mask_base + token / 32] |= 1u << (token % 32);
+        masks[mask_base] |= 1u << 8;
+        logits[logits_base]     = f32_to_bf16(100);
+        logits[logits_base + 8] = f32_to_bf16(90);
     }
     auto device_masks = to_device(masks);
     std::vector<ops::SamplingConfig> configs(batch);
     for (int row = 0; row < batch; ++row) {
-        configs[row].allowed_token_words =
-            static_cast<const std::uint32_t*>(device_masks.p) + row * width * stride;
+        configs[row].allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p) +
+                                           static_cast<std::ptrdiff_t>(row) * width * stride;
         configs[row].allowed_token_column_stride = stride;
         configs[row].suppressed_token_count      = 1;
         configs[row].suppressed_tokens[0]        = 8;
     }
     auto device_logits  = to_device(logits);
     auto device_configs = to_device(configs);
-    auto device_output  = to_device(std::vector<std::int32_t>(batch * width, -1));
+    auto device_output  = to_device(std::vector<std::int32_t>(columns, -1));
     Tensor x(device_logits.p, DType::BF16, {physical, batch * width});
     Tensor y(device_output.p, DType::I32, {batch * width});
     ops::argmax(x, y, domain, static_cast<const ops::SamplingConfig*>(device_configs.p), width,

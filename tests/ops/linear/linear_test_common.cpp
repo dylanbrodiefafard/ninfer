@@ -343,8 +343,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         DecodeGraphDefinition graph_definition;
         DecodeGraphExecutable graph;
         if (invocation.graph_replay) graph_context = std::make_unique<DeviceContext>();
-        const cudaStream_t stream = graph_context ? graph_context->stream : nullptr;
-        const auto launch         = [&] {
+        cudaStream_t stream = graph_context ? graph_context->stream : nullptr;
+        const auto launch   = [&] {
             if (invocation.call_form == CallForm::A16Convenience) {
                 ops::linear(input, weight, destination, stream);
             } else {

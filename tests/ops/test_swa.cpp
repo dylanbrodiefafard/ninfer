@@ -341,11 +341,9 @@ int main() {
         std::cerr << "swa interval capacity did not resolve to its monotonic endpoint\n";
         ++failures;
     }
-    try {
-        (void)ops::swa_workspace_capacity_bytes(capacity_envelope, 0, 16, 1);
-        std::cerr << "swa accepted an invalid token interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] { return ops::swa_workspace_capacity_bytes(capacity_envelope, 0, 16, 1); },
+        "swa accepted an invalid token interval");
     failures += run_case(1, 0);
     failures += run_case(16, 1);
     failures += run_case(8, 96, InputProfile::Random, 4096);

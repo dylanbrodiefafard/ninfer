@@ -100,11 +100,11 @@ int run_batch_case() {
 
     int failures =
         verify_exact("prepare_masked_block B=2 ids",
-                     from_device<std::int32_t>(ids.data(), static_cast<std::size_t>(width * batch)),
+                     from_device<std::int32_t>(ids.data(), static_cast<std::size_t>(width) * batch),
                      expected_ids);
     failures += verify_exact(
         "prepare_masked_block B=2 positions",
-        from_device<std::int32_t>(positions.data(), static_cast<std::size_t>(width * batch)),
+        from_device<std::int32_t>(positions.data(), static_cast<std::size_t>(width) * batch),
         expected_positions);
     failures += ids.verify_guards("prepare_masked_block B=2 ids guards");
     failures += positions.verify_guards("prepare_masked_block B=2 positions guards");

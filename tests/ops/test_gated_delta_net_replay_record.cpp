@@ -320,9 +320,9 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
             const std::int32_t src = tokens[static_cast<std::size_t>(dst)];
             for (std::int32_t head = 0; head < kQkHeads; ++head) {
                 const std::size_t src_base =
-                    static_cast<std::size_t>((src * kQkHeads + head) * kStateDim);
+                    (static_cast<std::size_t>(src) * kQkHeads + head) * kStateDim;
                 const std::size_t dst_base =
-                    static_cast<std::size_t>((dst * kQkHeads + head) * kStateDim);
+                    (static_cast<std::size_t>(dst) * kQkHeads + head) * kStateDim;
                 std::copy_n(q_bits.begin() + static_cast<std::ptrdiff_t>(src_base), kStateDim,
                             q_pair.begin() + static_cast<std::ptrdiff_t>(dst_base));
                 std::copy_n(k_bits.begin() + static_cast<std::ptrdiff_t>(src_base), kStateDim,
@@ -330,15 +330,15 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
             }
             for (std::int32_t head = 0; head < value_heads; ++head) {
                 const std::size_t src_base =
-                    static_cast<std::size_t>((src * value_heads + head) * kStateDim);
+                    (static_cast<std::size_t>(src) * value_heads + head) * kStateDim;
                 const std::size_t dst_base =
-                    static_cast<std::size_t>((dst * value_heads + head) * kStateDim);
+                    (static_cast<std::size_t>(dst) * value_heads + head) * kStateDim;
                 std::copy_n(v_bits.begin() + static_cast<std::ptrdiff_t>(src_base), kStateDim,
                             v_pair.begin() + static_cast<std::ptrdiff_t>(dst_base));
-                g_pair[static_cast<std::size_t>(dst * value_heads + head)] =
-                    g[static_cast<std::size_t>(src * value_heads + head)];
-                beta_pair[static_cast<std::size_t>(dst * value_heads + head)] =
-                    beta[static_cast<std::size_t>(src * value_heads + head)];
+                g_pair[static_cast<std::size_t>(dst) * value_heads + head] =
+                    g[static_cast<std::size_t>(src) * value_heads + head];
+                beta_pair[static_cast<std::size_t>(dst) * value_heads + head] =
+                    beta[static_cast<std::size_t>(src) * value_heads + head];
             }
         }
         return std::tuple{q_pair, k_pair, v_pair, g_pair, beta_pair};
@@ -453,18 +453,18 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
     compare_col("tree value record child 0", tree_value, seq0_value, 1, 1, value_heads * kStateDim);
     compare_col("tree value record child 1", tree_value, seq1_value, 2, 1, value_heads * kStateDim);
     for (std::int32_t head = 0; head < value_heads * 2; ++head) {
-        if (tree_gate[static_cast<std::size_t>(1 * value_heads * 2 + head)] !=
-                seq0_gate[static_cast<std::size_t>(1 * value_heads * 2 + head)] ||
-            tree_gate[static_cast<std::size_t>(2 * value_heads * 2 + head)] !=
-                seq1_gate[static_cast<std::size_t>(1 * value_heads * 2 + head)]) {
+        if (tree_gate[1 * static_cast<std::size_t>(value_heads) * 2 + head] !=
+                seq0_gate[1 * static_cast<std::size_t>(value_heads) * 2 + head] ||
+            tree_gate[2 * static_cast<std::size_t>(value_heads) * 2 + head] !=
+                seq1_gate[1 * static_cast<std::size_t>(value_heads) * 2 + head]) {
             std::cerr << "tree gate record mismatch" << suffix << "\n";
             return failures + 1;
         }
     }
     if (seq0_out != seq1_out &&
-        std::equal(tree_out.begin() + static_cast<std::ptrdiff_t>(value_heads * kStateDim),
-                   tree_out.begin() + static_cast<std::ptrdiff_t>(2 * value_heads * kStateDim),
-                   tree_out.begin() + static_cast<std::ptrdiff_t>(2 * value_heads * kStateDim))) {
+        std::equal(tree_out.begin() + static_cast<std::ptrdiff_t>(value_heads) * kStateDim,
+                   tree_out.begin() + 2 * static_cast<std::ptrdiff_t>(value_heads) * kStateDim,
+                   tree_out.begin() + 2 * static_cast<std::ptrdiff_t>(value_heads) * kStateDim)) {
         std::cerr << "tree sibling outputs are identical" << suffix << "\n";
         ++failures;
     }
