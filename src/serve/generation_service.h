@@ -129,9 +129,9 @@ public:
         return engine_->sampling_defaults();
     }
 
-    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
+    [[nodiscard]] PreparedRequest prepare(const GenerationRequest& request,
                                           std::function<bool()> is_cancelled = {}) const;
-    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
+    [[nodiscard]] int count_prompt_tokens(const GenerationRequest& request,
                                           std::function<bool()> is_cancelled = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.

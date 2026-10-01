@@ -339,28 +339,30 @@ std::string format_request_start(const RequestLogContext& context) {
     return out.str();
 }
 
-std::string format_recovery_event(std::uint64_t request_id, const ninfer::RecoveryEvent& event) {
-    const char* stage = "unknown";
-    switch (event.kind) {
+namespace {
+
+const char* recovery_stage_name(ninfer::RecoveryEventKind kind) noexcept {
+    switch (kind) {
     case ninfer::RecoveryEventKind::CycleExclusion:
-        stage = "cycle_exclusion";
-        break;
+        return "cycle_exclusion";
     case ninfer::RecoveryEventKind::RetryTriggered:
-        stage = "retry_triggered";
-        break;
+        return "retry_triggered";
     case ninfer::RecoveryEventKind::RetryStarted:
-        stage = "retry_started";
-        break;
+        return "retry_started";
     case ninfer::RecoveryEventKind::RetryPrefillComplete:
-        stage = "retry_prefill_complete";
-        break;
+        return "retry_prefill_complete";
     case ninfer::RecoveryEventKind::Finished:
-        stage = "finished";
-        break;
+        return "finished";
     case ninfer::RecoveryEventKind::Exhausted:
-        stage = "exhausted";
-        break;
+        return "exhausted";
     }
+    return "unknown";
+}
+
+} // namespace
+
+std::string format_recovery_event(std::uint64_t request_id, const ninfer::RecoveryEvent& event) {
+    const char* const stage = recovery_stage_name(event.kind);
     std::ostringstream out;
     out << "[req " << request_id << "] recovery event=" << stage << " cause=" << event.cause
         << " attempts=" << event.attempts << " cycle_exclusions=" << event.cycle_exclusions
@@ -545,12 +547,15 @@ std::string format_throughput(const ThroughputReport& report) {
     return out.str();
 }
 
-std::string format_server_start_json(
-    const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
-    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
-    Json record = event_base(server_instance_id, timestamp, "server_start");
+std::string format_server_start_json(const std::string& server_instance_id,
+                                     std::uint64_t timestamp_unix_ms, const ServeOptions& options,
+                                     const ninfer::ModelSamplingDefaults& sampling_defaults,
+                                     const std::string& public_model_id,
+                                     const ninfer::LoadSummary& load,
+                                     const ninfer::MemorySummary& memory,
+                                     const ServerLogEnvironment& environment,
+                                     std::optional<std::uint64_t> artifact_size_bytes) {
+    Json record = event_base(server_instance_id, timestamp_unix_ms, "server_start");
 
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
@@ -644,26 +649,28 @@ std::string format_server_start_json(
 }
 
 std::string format_request_start_json(const std::string& server_instance_id,
-                                      std::uint64_t timestamp, const RequestLogContext& context) {
-    Json record       = event_base(server_instance_id, timestamp, "request_start");
+                                      std::uint64_t timestamp_unix_ms,
+                                      const RequestLogContext& context) {
+    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_start");
     record["request"] = request_json(context);
     return record.dump();
 }
 
 std::string format_request_rejected_json(const std::string& server_instance_id,
-                                         std::uint64_t timestamp,
+                                         std::uint64_t timestamp_unix_ms,
                                          const RequestRejectionLogContext& context) {
-    Json record       = event_base(server_instance_id, timestamp, "request_rejected");
+    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_rejected");
     record["phase"]   = "prepare";
     record["request"] = rejected_request_json(context);
     record["error"]   = error_json(context.error);
     return record.dump();
 }
 
-std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
+std::string format_request_done_json(const std::string& server_instance_id,
+                                     std::uint64_t timestamp_unix_ms,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
-    Json record       = event_base(server_instance_id, timestamp, "request_done");
+    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_done");
     record["request"] = request_json(context);
     record["result"] =
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
@@ -731,15 +738,15 @@ const char* recovery_event_kind_name(ninfer::RecoveryEventKind kind) {
 }
 
 std::string format_recovery_event_json(const std::string& server_instance_id,
-                                       std::uint64_t timestamp, std::uint64_t request_id,
+                                       std::uint64_t timestamp_unix_ms, std::uint64_t request_id,
                                        const ninfer::RecoveryEvent& event) {
-    Json record                          = event_base(server_instance_id, timestamp, "recovery");
-    record["request"]                    = Json{{"id", request_id}};
-    record["kind"]                       = recovery_event_kind_name(event.kind);
-    record["cause"]                      = event.cause;
-    record["attempts"]                   = event.attempts;
-    record["cycle_exclusions"]           = event.cycle_exclusions;
-    record["discarded_tool_calls"]       = event.discarded_tool_calls;
+    Json record                    = event_base(server_instance_id, timestamp_unix_ms, "recovery");
+    record["request"]              = Json{{"id", request_id}};
+    record["kind"]                 = recovery_event_kind_name(event.kind);
+    record["cause"]                = event.cause;
+    record["attempts"]             = event.attempts;
+    record["cycle_exclusions"]     = event.cycle_exclusions;
+    record["discarded_tool_calls"] = event.discarded_tool_calls;
     record["discarded_reasoning_tokens"] = event.discarded_reasoning_tokens;
     record["generated_tokens"]           = event.generated_tokens;
     record["remaining_tokens"]           = event.remaining_tokens;
@@ -747,17 +754,19 @@ std::string format_recovery_event_json(const std::string& server_instance_id,
 }
 
 std::string format_request_error_json(const std::string& server_instance_id,
-                                      std::uint64_t timestamp, const RequestLogContext& context,
+                                      std::uint64_t timestamp_unix_ms,
+                                      const RequestLogContext& context,
                                       const std::string& message) {
-    Json record       = event_base(server_instance_id, timestamp, "request_error");
+    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_error");
     record["request"] = request_json(context);
     record["error"]   = Json{{"message", message}};
     return record.dump();
 }
 
-std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
+std::string format_throughput_json(const std::string& server_instance_id,
+                                   std::uint64_t timestamp_unix_ms,
                                    const ThroughputReport& report) {
-    Json record = event_base(server_instance_id, timestamp, "throughput");
+    Json record = event_base(server_instance_id, timestamp_unix_ms, "throughput");
     const double prefill_rate =
         report.interval_seconds > 0.0
             ? static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds
@@ -911,7 +920,7 @@ void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
     append(format_throughput_json(server_instance_id_, unix_time_ms(), report));
 }
 
-void JsonlRequestLog::append(std::string record) {
+void JsonlRequestLog::append(const std::string& record) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (failed_) { return; }
     output_ << record << '\n';

@@ -88,7 +88,7 @@ void write_stream_item(httplib::DataSink& sink, StreamingResponse& request,
 }
 
 void write_stream_items(httplib::DataSink& sink, StreamingResponse& request,
-                        std::vector<std::string> items) {
+                        const std::vector<std::string>& items) {
     for (const std::string& item : items) { write_stream_item(sink, request, item); }
 }
 
@@ -323,7 +323,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     stored.preserve_thinking = stream->prepared.preserve_thinking;
                     response_store_.put(std::move(stored));
                 }
-                write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
+                write_stream_items(sink, *stream, finished.events_before_terminal);
                 write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
                 record_generation(stream->log_context, std::move(outcome), generation_tools,
                                   generation_capture, generation_media, generation_started);

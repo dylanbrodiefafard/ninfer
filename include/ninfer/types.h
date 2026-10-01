@@ -565,8 +565,9 @@ struct GenerationRecoveryStats {
 
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message, GenerationRecoveryStats recovery = {})
-        : std::invalid_argument(std::move(message)), kind_(kind), recovery_(std::move(recovery)) {}
+    RequestError(RequestErrorKind kind, const std::string& message,
+                 const GenerationRecoveryStats& recovery = {})
+        : std::invalid_argument(message), kind_(kind), recovery_(recovery) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 

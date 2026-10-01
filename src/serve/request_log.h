@@ -240,7 +240,7 @@ public:
     void write_throughput(const ThroughputReport& report);
 
 private:
-    void append(std::string record);
+    void append(const std::string& record);
 
     std::string path_;
     std::string server_instance_id_;

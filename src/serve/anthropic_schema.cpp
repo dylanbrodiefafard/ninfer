@@ -27,9 +27,8 @@ constexpr std::size_t kMaxToolNameLength = 128;
     throw ApiException(std::move(error));
 }
 
-const Json& require_object(const Json& body) {
+void require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
 }
 
 bool get_bool(const Json& obj, const char* key, bool fallback) {
@@ -485,7 +484,7 @@ void parse_output_config(const Json& body, GenerationRequest& out) {
         bad_request("output_config.effort must be one of low, medium, high, xhigh, or max",
                     "output_config.effort");
     }
-    out.reasoning_effort       = *effort;
+    out.reasoning_effort       = effort;
     out.reasoning_effort_param = "output_config.effort";
 }
 

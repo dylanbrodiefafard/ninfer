@@ -5,11 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <exception>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ninfer::product {
 namespace {
@@ -89,7 +91,7 @@ LoadProgressRendererOptions stderr_load_progress_options() noexcept {
 
 LoadProgressRenderer::LoadProgressRenderer(std::ostream& output,
                                            LoadProgressRendererOptions options)
-    : output_(&output), options_(options) {}
+    : output_(&output), options_(std::move(options)) {}
 
 LoadProgressRenderer::~LoadProgressRenderer() { finish(); }
 
@@ -102,10 +104,13 @@ LoadProgress LoadProgressRenderer::callback() {
 
 void LoadProgressRenderer::finish() noexcept {
     if (!line_open_) { return; }
+    // finish() runs from the destructor: an output stream configured to throw cannot report a
+    // failed final newline anywhere, and the renderer state is reset either way.
     try {
         *output_ << '\n';
         output_->flush();
-    } catch (...) {}
+        // NOLINTNEXTLINE(bugprone-empty-catch): unreportable final newline; see above.
+    } catch (const std::exception&) {}
     line_open_      = false;
     terminal_width_ = 0;
 }

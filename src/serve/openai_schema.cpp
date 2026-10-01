@@ -39,9 +39,8 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-const Json& require_object(const Json& body) {
+void require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
 }
 
 bool get_bool(const Json& obj, const char* key, bool fallback) {
@@ -761,7 +760,7 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
                     "max",
                     "reasoning_effort");
     }
-    out.reasoning_effort       = *effort;
+    out.reasoning_effort       = effort;
     out.reasoning_effort_param = "reasoning_effort";
 }
 
@@ -802,7 +801,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
     if (const std::optional<bool> enable_thinking = parse_openai_enable_thinking(body)) {
-        out.enable_thinking = *enable_thinking;
+        out.enable_thinking = enable_thinking;
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
