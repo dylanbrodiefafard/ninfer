@@ -107,13 +107,14 @@ int main() {
     failures += expect_shape(layer2.key, 128, 2, 4, 3, "layer key slice");
     failures += expect_shape(layer2.value, 128, 6, 4, 3, "layer value slice");
     failures += expect_shape(layer2.gate, 2, 6, 4, 3, "layer gate slice");
-    failures += expect(
-        static_cast<std::byte*>(layer2.conv.data) - static_cast<std::byte*>(records.conv.data) ==
-            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.conv.nb[2]),
-        "layer conv slice offset differs");
+    failures += expect(static_cast<std::byte*>(layer2.conv.data) -
+                               static_cast<std::byte*>(records.conv.data) ==
+                           static_cast<std::ptrdiff_t>(std::int64_t{2} * spec.record_capacity *
+                                                       records.conv.nb[2]),
+                       "layer conv slice offset differs");
     failures += expect(
         static_cast<std::byte*>(layer2.key.data) - static_cast<std::byte*>(records.key.data) ==
-            static_cast<std::ptrdiff_t>(2 * spec.record_capacity * records.key.nb[3]),
+            static_cast<std::ptrdiff_t>(std::int64_t{2} * spec.record_capacity * records.key.nb[3]),
         "layer key slice offset differs");
     const auto layer2_row1 = records.layer(2, 1, 2);
     failures += expect_shape(layer2_row1.conv, 256, 4, 2, 1, "layer row_begin conv slice");

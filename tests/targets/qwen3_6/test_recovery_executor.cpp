@@ -569,7 +569,7 @@ public:
 
     void request_idle_spill() {}
 
-    void shutdown_kv_tiers(ninfer::LoadProgress = {}) {}
+    void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) {}
 
     [[nodiscard]] RamSnapshot kv_ram_snapshot() const noexcept { return {}; }
 

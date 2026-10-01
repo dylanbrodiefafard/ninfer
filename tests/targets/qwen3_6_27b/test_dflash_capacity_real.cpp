@@ -56,7 +56,7 @@ void exercise(const char* artifact) {
     const auto profile             = Package::resolve_weights(reader.identity(), binder);
     auto load         = target::bind_artifact(binder, profile, family::startup_features(options));
     auto materialized = ninfer::artifact::materialize(reader, load.materialization, device);
-    target::LoadedModelData model(std::move(load.bindings), std::move(materialized));
+    target::LoadedModelData model(load.bindings, std::move(materialized));
     auto frontend = family::make_frontend(model.frontend, false);
     device.synchronize();
 

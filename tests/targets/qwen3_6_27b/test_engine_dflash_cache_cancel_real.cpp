@@ -122,7 +122,7 @@ public:
                         << " prefill=" << stats.prefilling_requests
                         << " decode_ready=" << stats.decode_ready_requests
                         << " computed=" << stats.computed_prefill_tokens
-                        << " decoded=" << stats.committed_decode_tokens << std::endl;
+                        << " decoded=" << stats.committed_decode_tokens << '\n';
               std::_Exit(1);
           }) {}
 

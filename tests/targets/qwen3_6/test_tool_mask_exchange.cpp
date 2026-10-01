@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -168,7 +169,7 @@ void run() {
 
     DeviceContext device;
     constexpr int words = (family::kTokenDomain + 31) / 32;
-    DeviceArena arena(4 * 1024 * 1024);
+    DeviceArena arena(std::size_t{4} * 1024 * 1024);
     auto masks       = arena.alloc(DType::I32, {words, width_max, capacity});
     auto sampling    = arena.alloc(DType::I32, {int(sizeof(ops::SamplingConfig) / 4), capacity});
     auto nodes       = arena.alloc(DType::I32, {width_max, capacity, 2});
@@ -182,9 +183,9 @@ void run() {
     PinnedHostBuffer result_masks(masks.bytes()), result_sampling(sampling.bytes());
     std::array<const family::OutputSession*, capacity> outputs{};
     std::array<ops::SamplingConfig, capacity> configs{};
-    std::array<int, width_max * capacity> ids{}, parents{};
+    std::array<int, std::size_t{width_max} * capacity> ids{}, parents{};
     std::array<int, capacity> counts{};
-    std::vector<std::uint32_t> expected(width_max * words);
+    std::vector<std::uint32_t> expected(std::size_t{width_max} * words);
 
     for (int batch : {1, 2, 3, 4, 5, 6, 1}) {
         for (bool tree : {false, true}) {
@@ -240,11 +241,11 @@ void run() {
                     // Inputs are ordered on the launch stream: the DeviceContext streams are
                     // nonblocking, so legacy-stream uploads could race the overlap branch.
                     CUDA_CHECK(cudaMemcpyAsync(ids_view.data, ids.data(),
-                                               width * batch * sizeof(int), cudaMemcpyHostToDevice,
-                                               device.stream));
+                                               std::size_t(width) * batch * sizeof(int),
+                                               cudaMemcpyHostToDevice, device.stream));
                     CUDA_CHECK(cudaMemcpyAsync(parent_view.data, parents.data(),
-                                               width * batch * sizeof(int), cudaMemcpyHostToDevice,
-                                               device.stream));
+                                               std::size_t(width) * batch * sizeof(int),
+                                               cudaMemcpyHostToDevice, device.stream));
                     CUDA_CHECK(cudaMemcpyAsync(count_view.data, counts.data(), batch * sizeof(int),
                                                cudaMemcpyHostToDevice, device.stream));
                     if (replay == 0)
@@ -268,8 +269,8 @@ void run() {
                         for (int node = 0; node < counts[row]; ++node)
                             row_parents[node] = tree ? parents[row * width + node] : node - 1;
                         sessions[row].fill_tool_masks(
-                            {ids.data() + row * width, std::size_t(counts[row])}, row_parents,
-                            {expected.data(), std::size_t(counts[row] * words)});
+                            {ids.data() + std::ptrdiff_t(row) * width, std::size_t(counts[row])},
+                            row_parents, {expected.data(), std::size_t(counts[row]) * words});
                         for (int other = 0; other < capacity; ++other) {
                             const int value_token = 1000 + '1' + other;
                             const bool allowed =
@@ -277,12 +278,13 @@ void run() {
                             require(allowed == (other == row),
                                     "row fixture does not distinguish its own enum value");
                         }
-                        require(std::equal(expected.begin(), expected.begin() + counts[row] * words,
-                                           actual + row * width_max * words),
+                        require(std::equal(expected.begin(),
+                                           expected.begin() + std::ptrdiff_t(counts[row]) * words,
+                                           actual + std::ptrdiff_t(row) * width_max * words),
                                 "GPU mask differs from committed CPU grammar snapshot");
                         require(actual_config[row].allowed_token_words ==
                                     static_cast<std::uint32_t*>(masks.data) +
-                                        row * width_max * words,
+                                        std::ptrdiff_t(row) * width_max * words,
                                 "mask row pointer changed across graph replay");
                         require(actual_config[row].allowed_token_column_stride == words,
                                 "invalid node mask stride");

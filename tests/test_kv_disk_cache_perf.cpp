@@ -196,6 +196,7 @@ bool sync_benchmark_pool() {
                      [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '-'; })) {
         return false;
     }
+    // NOLINTNEXTLINE(bugprone-command-processor): zpool has no library API; the name is validated.
     return std::system(("zpool sync " + pool).c_str()) == 0;
 }
 

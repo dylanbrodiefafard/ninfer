@@ -226,7 +226,7 @@ int exercise_prefill_cancel_keeps_checkpoint(ninfer::Engine& engine) {
     }
 
     std::string long_user;
-    long_user.reserve(3500 * 9);
+    long_user.reserve(std::size_t{3500} * 9);
     for (int index = 0; index < 3500; ++index) { long_user += "continue "; }
 
     ninfer::PromptInput followup  = first_input;
@@ -558,7 +558,7 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine) {
             .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
         return message;
     };
-    auto assistant_call = [&](std::string reasoning, std::string id, std::string key) {
+    auto assistant_call = [&](std::string reasoning, std::string id, const std::string& key) {
         ninfer::ChatMessage message = text_message(ninfer::ChatRole::Assistant, "");
         message.reasoning_content   = std::move(reasoning);
         message.tool_calls.push_back(ninfer::ToolCall{

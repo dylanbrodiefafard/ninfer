@@ -38,7 +38,6 @@ namespace {
 using Json = nlohmann::json;
 using ninfer::targets::qwen3_6_27b::detail::ArtifactLoadPlan;
 using ninfer::targets::qwen3_6_27b::detail::LoadedModelData;
-using ninfer::targets::qwen3_6_27b::detail::Variant;
 using ninfer::targets::qwen3_6_27b::detail::WeightsProfile;
 namespace runtime = ninfer::targets::qwen3_6::detail::qwen3_6_27b_runtime;
 
@@ -191,7 +190,7 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
         ninfer::targets::qwen3_6_27b::detail::bind_artifact(binder, profile, {.vision = true});
     ninfer::artifact::MaterializedArtifact materialized =
         ninfer::artifact::materialize(reader, load.materialization, device);
-    LoadedModelData model(std::move(load.bindings), std::move(materialized));
+    LoadedModelData model(load.bindings, std::move(materialized));
     auto frontend = ninfer::targets::qwen3_6::make_frontend(model.frontend, true);
     auto prepared = frontend.prepare(std::move(input));
     auto prompt   = ninfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(prepared));

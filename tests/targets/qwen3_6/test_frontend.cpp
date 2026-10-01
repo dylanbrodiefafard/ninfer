@@ -311,14 +311,14 @@ fi::ChatMessage chat_message(ninfer::ChatRole role, std::string content) {
     return message;
 }
 
-fi::RenderedChat render_chat(std::vector<fi::ChatMessage> messages,
-                             fi::ChatRenderOptions options = {}) {
-    return thinking_toggle_template().render(messages, std::move(options));
+fi::RenderedChat render_chat(const std::vector<fi::ChatMessage>& messages,
+                             const fi::ChatRenderOptions& options = {}) {
+    return thinking_toggle_template().render(messages, options);
 }
 
-std::string render_chat_text(std::vector<fi::ChatMessage> messages,
-                             fi::ChatRenderOptions options = {}) {
-    return render_chat(std::move(messages), std::move(options)).text;
+std::string render_chat_text(const std::vector<fi::ChatMessage>& messages,
+                             const fi::ChatRenderOptions& options = {}) {
+    return render_chat(messages, options).text;
 }
 
 template <class Callable>
@@ -695,7 +695,10 @@ int test_ordered_instruction_turns() {
               "developer turn carrying media was accepted");
 
     fi::ChatMessage invalid_role = chat_message(ninfer::ChatRole::User, "bad");
-    invalid_role.role            = static_cast<ninfer::ChatRole>(255);
+    // ChatRole has a fixed std::uint8_t underlying type, so 255 is a representable value that names
+    // no enumerator: exactly the out-of-contract role the renderer must reject.
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): deliberate invalid role.
+    invalid_role.role = static_cast<ninfer::ChatRole>(255);
     failures +=
         check(throws_invalid_argument([&] {
                   (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), invalid_role},
@@ -813,8 +816,9 @@ int test_reasoning_effort_chat_template() {
 }
 
 int test_reasoning_effort_empty_history_think() {
-    const auto render = [](std::vector<fi::ChatMessage> messages, fi::ChatRenderOptions options) {
-        return reasoning_effort_template().render(std::move(messages), std::move(options)).text;
+    const auto render = [](const std::vector<fi::ChatMessage>& messages,
+                           const fi::ChatRenderOptions& options) {
+        return reasoning_effort_template().render(messages, options).text;
     };
 
     fi::ChatRenderOptions medium_closed;
@@ -1306,14 +1310,14 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         }
     }
     failures += check(
-        prepared_data.patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
-            prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
-            prepared_data.identity.rewrite_checkpoint &&
+        prepared_data.patches.size() == std::size_t{16} * 1536 &&
+            prepared_data.prepare.raw_patches == 16 && prepared_data.prepare.vision_tokens == 4 &&
+            prepared_data.identity.reusable && prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
                 ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
-    if (prepared_data.patches.size() == 16 * 1536) {
+    if (prepared_data.patches.size() == std::size_t{16} * 1536) {
         failures += check(near(prepared_data.patches[0], -1.0F) &&
                               near(prepared_data.patches[1], 1.0F / 127.5F - 1.0F) &&
                               near(prepared_data.patches[256], -1.0F) &&
@@ -1380,7 +1384,7 @@ int test_video_prepare(const Frontend& frontend) {
                   "video frontend temporal/grid/placeholder metadata is incorrect");
     }
     failures +=
-        check(prepared_data.patches.size() == 16 * 1536 &&
+        check(prepared_data.patches.size() == std::size_t{16} * 1536 &&
                   near(prepared_data.patches[0], prepared_data.patches[256]) &&
                   prepared_data.prepare.raw_patches == 16 &&
                   prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable,
@@ -1949,11 +1953,13 @@ int run_encode_bench() {
     cases.push_back({"plain_16k", plain_messages(16384), {}, 6});
     cases.push_back({"plain_32k", plain_messages(32768), {}, 4});
     cases.push_back({"plain_150k", plain_messages(150000), {}, 3});
-    cases.push_back({"large_tools", tool_messages(16, 4 * 1024, 1), with_tools, 6});
-    cases.push_back({"tools_100_parallel", tool_messages(100, 4 * 1024, 1), tools_100_opts, 4});
+    cases.push_back({"large_tools", tool_messages(16, std::size_t{4} * 1024, 1), with_tools, 6});
+    cases.push_back(
+        {"tools_100_parallel", tool_messages(100, std::size_t{4} * 1024, 1), tools_100_opts, 4});
     cases.push_back({"tools_200_150k", tool_messages(200, 1536, 1), tools_200_opts, 3});
-    cases.push_back({"tools_100_turns", tool_messages(4, 4 * 1024, 25), tools_100_opts, 4});
-    cases.push_back({"massive_tools", tool_messages(32, 32 * 1024, 2), with_tools, 3});
+    cases.push_back(
+        {"tools_100_turns", tool_messages(4, std::size_t{4} * 1024, 25), tools_100_opts, 4});
+    cases.push_back({"massive_tools", tool_messages(32, std::size_t{32} * 1024, 2), with_tools, 3});
     cases.push_back({"tool_loop_history", tool_messages(4, 1024, 8), with_tools, 6});
 
     std::cerr << std::fixed << std::setprecision(3);
