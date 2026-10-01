@@ -18,14 +18,13 @@ from tools.convert.qwen3_6.common.inventory import (
     Q6,
     RESOURCE_SPECS,
     ROW_SPLIT_LAYOUT,
+    W8,
     ResourceSpec,
     StoredObjectSpec,
     TensorSpec,
-    W8,
     build_vision_specs,
     tensor_spec,
 )
-
 
 MODEL_ID = "qwen3.6-35b-a3b"
 WEIGHTS_ID = "groupwise-int"
@@ -205,13 +204,13 @@ __all__ = [
     "Q6_ROUTED_DOWN_LAYERS",
     "RESOURCE_SPECS",
     "ROW_SPLIT_LAYOUT",
-    "ResourceSpec",
-    "StoredObjectSpec",
     "TARGET_KEY",
     "TENSOR_SPECS",
     "TEXT_CORE_TENSOR_SPECS",
     "TEXT_LAYERS",
-    "TensorSpec",
     "VISION_TENSOR_SPECS",
     "W8",
+    "ResourceSpec",
+    "StoredObjectSpec",
+    "TensorSpec",
 ]

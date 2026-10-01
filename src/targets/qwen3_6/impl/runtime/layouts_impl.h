@@ -213,9 +213,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, effective_prefill_chunk}, "step prefill hidden");
     qwen3_6::complete_round_state_layout(builder, out.round);
-    const auto i32 = [&](std::size_t n, const char* label) {
-        return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
-    };
     out.token_counts =
         add_tensor(builder, DType::I32,
                    {TextConfig::token_domain, static_cast<std::int32_t>(plan.max_concurrency)},

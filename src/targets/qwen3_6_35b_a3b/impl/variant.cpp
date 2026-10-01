@@ -144,7 +144,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
 void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
                                        Tensor& gate, Tensor& key, Tensor& value,
-                                       WorkspaceArena& workspace, cudaStream_t stream) {
+                                       WorkspaceArena&, cudaStream_t stream) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 

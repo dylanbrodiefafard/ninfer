@@ -146,7 +146,7 @@ Result run_atom(const char* name, int m, int n, int k, const Options& opt, int s
 
     auto launch = [&]() {
         CUDA_CHECK(cudaMemset(sink, 0, sizeof(float)));
-        mma_issue_kernel<kAtom><<<blocks, threads>>>(sink, opt.iters);
+        mma_issue_kernel<kAtom><<<blocks, threads, 0, cudaStreamLegacy>>>(sink, opt.iters);
         CUDA_CHECK(cudaGetLastError());
     };
 

@@ -429,9 +429,9 @@ def main() -> int:
             continue
         acc = agg.get("accept_rate_mean")
         print(
-            f"{record['id']:<16} {str(record.get('suite')):<10} "
+            f"{record['id']:<16} {record.get('suite')!s:<10} "
             f"{'on' if record.get('thinking') else 'off':<5} "
-            f"{str(agg.get('prompt_tokens')):>7} {str(agg.get('completion_tokens')):>6} "
+            f"{agg.get('prompt_tokens')!s:>7} {agg.get('completion_tokens')!s:>6} "
             f"{fmt(agg.get('prefill_tok_s_mean')):>8} {fmt(agg.get('prefill_tail_tok_s_mean')):>9} "
             f"{fmt(agg.get('ttft_ms_mean')):>8} "
             f"{fmt(agg.get('decode_tok_s_mean')):>8} {fmt(agg.get('verify_rounds_s_mean')):>8} {fmt(agg.get('wall_s_mean'), 2):>7} "

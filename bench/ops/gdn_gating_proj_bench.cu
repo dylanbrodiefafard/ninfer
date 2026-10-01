@@ -2,7 +2,7 @@
 //
 // Examples:
 //   ./build/bench/ninfer_gdn_gating_proj_bench --35b --candidate auto
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b \
+//   ./build/bench/ninfer_gdn_gating_proj_bench --35b
 //     --candidate mma-split16 -p 128,512,1024
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"

@@ -5,9 +5,11 @@ repeats captured rows to exercise production route boundaries and tiled tails.
 """
 import argparse
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
+
 import numpy as np
+
 from tools.reference.qwen3_8_27b.artifact import TextArtifact, bf16
 
 

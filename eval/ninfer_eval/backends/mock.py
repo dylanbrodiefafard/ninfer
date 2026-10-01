@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import ClassVar
 
 from ..config import ConfigError, JobConfig
 from ..events import EventSink, RunEvent
@@ -15,7 +16,9 @@ from .base import BackendRun, RunContext, WorkPlan
 class MockBackend:
     name = "mock"
 
-    _ALLOWED = {"items", "sleep_seconds", "wrong_every", "unknown_total", "fail_at"}
+    _ALLOWED: ClassVar[frozenset[str]] = frozenset(
+        {"items", "sleep_seconds", "wrong_every", "unknown_total", "fail_at"}
+    )
 
     def validate(
         self, job: JobConfig, target: ResolvedTarget | None, for_run: bool = False

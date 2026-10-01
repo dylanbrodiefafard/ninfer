@@ -8,29 +8,22 @@ from __future__ import annotations
 
 from tools.convert.qwen3_6.common.inventory import (
     BF16,
-    CONTIGUOUS_LAYOUT,
-    DIRECT_FORMATS,
     FORMAT_NAMES,
     FP32,
     I32,
     LAYOUT_NAMES,
-    LogicalAliasSpec,
-    LogicalRowViewSpec,
     Q4,
     Q5,
     Q6,
-    RESOURCE_ENCODING,
     RESOURCE_SPECS,
-    ROW_SPLIT_LAYOUT,
-    ResourceSpec,
+    W8,
+    LogicalAliasSpec,
+    LogicalRowViewSpec,
     StoredObjectSpec,
     TensorSpec,
-    VISION_LAYERS,
-    W8,
     build_vision_specs,
     tensor_spec,
 )
-
 
 MODEL_ID = "qwen3.6-27b"
 WEIGHTS_ID = "groupwise-int"

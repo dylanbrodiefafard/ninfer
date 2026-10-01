@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import math
 import statistics
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
-
 
 HEAD_DIM = 256
 Q_HEADS = 24
@@ -233,17 +233,17 @@ def run_decode_bench(torch_mod, flash_attn_with_kvcache, positions, warmup, repe
         v_new.normal_(mean=0.0, std=0.5)
         cache_seqlens = torch_mod.full((1,), pos, device="cuda", dtype=torch_mod.int32)
 
-        def decode_launch():
-            return flash_attn_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                k=k_new,
-                v=v_new,
-                cache_seqlens=cache_seqlens,
-                softmax_scale=SCALE,
-                causal=True,
-            )
+        decode_launch = functools.partial(
+            flash_attn_with_kvcache,
+            q,
+            k_cache,
+            v_cache,
+            k=k_new,
+            v=v_new,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=SCALE,
+            causal=True,
+        )
 
         result = bench_cuda_events(decode_launch, torch_mod, warmup, repeat, min_time_ms)
         median_us = float(result["median_us"])
@@ -306,17 +306,17 @@ def run_verify_bench(
             v_new.normal_(mean=0.0, std=0.5)
             cache_seqlens = torch_mod.full((1,), context, device="cuda", dtype=torch_mod.int32)
 
-            def verify_launch():
-                return flash_attn_with_kvcache(
-                    q,
-                    k_cache,
-                    v_cache,
-                    k=k_new,
-                    v=v_new,
-                    cache_seqlens=cache_seqlens,
-                    softmax_scale=SCALE,
-                    causal=True,
-                )
+            verify_launch = functools.partial(
+                flash_attn_with_kvcache,
+                q,
+                k_cache,
+                v_cache,
+                k=k_new,
+                v=v_new,
+                cache_seqlens=cache_seqlens,
+                softmax_scale=SCALE,
+                causal=True,
+            )
 
             result = bench_cuda_events(verify_launch, torch_mod, warmup, repeat, min_time_ms)
             median_us = float(result["median_us"])
@@ -469,9 +469,7 @@ def main() -> int:
     contexts = parse_i32_list(args.context, "--context")
 
     modes = ["attention"]
-    if args.include_fill:
-        modes.append("attention_with_cache_fill")
-    elif not args.attention_only:
+    if args.include_fill or not args.attention_only:
         modes.append("attention_with_cache_fill")
 
     rows: list[dict] = []
@@ -485,8 +483,9 @@ def main() -> int:
             k_full.normal_(mean=0.0, std=0.5)
             v_full.normal_(mean=0.0, std=0.5)
 
-            def attention_launch():
-                return flash_attn_func(q, k_full, v_full, dropout_p=0.0, softmax_scale=SCALE, causal=True)
+            attention_launch = functools.partial(
+                flash_attn_func, q, k_full, v_full, dropout_p=0.0, softmax_scale=SCALE, causal=True
+            )
 
             if "attention" in modes:
                 result = bench_cuda_events(
@@ -508,7 +507,16 @@ def main() -> int:
                 k_new = k_full[:, context:end_context].contiguous()
                 v_new = v_full[:, context:end_context].contiguous()
 
-                def fill_and_attention_launch():
+                def fill_and_attention_launch(
+                    *,
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    k_new=k_new,
+                    v_new=v_new,
+                    context=context,
+                    end_context=end_context,
+                ):
                     k_cache[:, context:end_context].copy_(k_new)
                     v_cache[:, context:end_context].copy_(v_new)
                     return flash_attn_func(

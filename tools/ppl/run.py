@@ -15,7 +15,7 @@ import os
 import struct
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from schemes import BASELINE, ORDER, SCHEMES
@@ -76,8 +76,8 @@ def select_schedules(raw: str | None) -> list[str]:
     if not raw:
         return list(SCHEDULES)
     selected: list[str] = []
-    for name in raw.split(","):
-        name = name.strip()
+    for raw_name in raw.split(","):
+        name = raw_name.strip()
         if name not in SCHEDULES:
             raise SystemExit(f"unknown schedule {name!r}; known: {', '.join(SCHEDULES)}")
         if name not in selected:
@@ -267,11 +267,11 @@ def write_markdown(path: Path, payload: dict) -> None:
         f"- artifact: `{payload['weights']}`",
         f"- lengths: {payload['lengths']}",
         f"- skip default: {payload['skip']}",
-        f"- cuda graphs: on unless a cell sets cuda_graph=false",
+        "- cuda graphs: on unless a cell sets cuda_graph=false",
         f"- terrible token: nll >= {TERRIBLE_NLL}",
         f"- baseline: `{payload['baseline']}` per (length, schedule, spec)",
-        f"- decode spec: {payload.get('spec', '-')} (draft {payload.get('draft_tokens', '-')}) "
-        f"unless a cell sets spec=none; prefill lane is spec-free",
+        (f"- decode spec: {payload.get('spec', '-')} (draft {payload.get('draft_tokens', '-')}) "
+        f"unless a cell sets spec=none; prefill lane is spec-free"),
         "",
         "| length | schedule | scheme | spec | graph | skip | scored | mean_nll | max_nll | terrible | ppl | Δ mean_nll | Δ 1σ | σ nll | noise | gate |",
         "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
@@ -285,10 +285,7 @@ def write_markdown(path: Path, payload: dict) -> None:
         std_text = "-" if nll_std is None else f"{nll_std:.3f}"
         noise_text = "yes" if cell.get("in_noise") else ""
         gate = cell.get("gate")
-        if gate is None:
-            gate_text = "report"
-        else:
-            gate_text = "PASS" if cell.get("pass") else "FAIL"
+        gate_text = "report" if gate is None else "PASS" if cell.get("pass") else "FAIL"
         graph = "on" if cell.get("cuda_graph", True) else "off"
         lines.append(
             f"| {cell.get('prompt_tokens', '')} | {cell.get('schedule', '')} | `{cell['scheme']}` | "
@@ -307,10 +304,10 @@ def write_markdown(path: Path, payload: dict) -> None:
     lines.extend(
         [
             "",
-            "_Noise columns: `σ nll` is the per-token NLL std for the cell; `Δ 1σ` is the SE of "
+            ("_Noise columns: `σ nll` is the per-token NLL std for the cell; `Δ 1σ` is the SE of "
             "the per-token paired Δnll vs the group's bf16 baseline (index-aligned tokens, from "
             "the .nllf32 sidecars). `noise` marks |Δ| ≤ 2·Δ1σ — the delta is not resolved above "
-            "the per-token noise floor._",
+            "the per-token noise floor._"),
         ]
     )
     lines.append("")
@@ -362,7 +359,7 @@ def main() -> int:
         raise SystemExit(f"artifact not found: {args.weights}")
 
     ensure_corpus(args.ids, max(lengths), args.weights, args.ppl_bin)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
     out_dir = args.out or (REPO / "profiles" / "ppl" / stamp)
     out_dir.mkdir(parents=True, exist_ok=True)
 

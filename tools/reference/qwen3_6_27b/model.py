@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
 
 import torch
 
@@ -20,7 +20,6 @@ from .state import ModelState, StateSnapshot
 from .text import run as run_text
 from .vision import VisionEncoder, VisionOutput, VisionStats
 from .weights import WeightStore
-
 
 COMPILED_CODEC_MIN_TOKENS = 12
 
@@ -809,7 +808,7 @@ class RefModel:
         self.active_compile_codec = None
         self.binding.close()
 
-    def __enter__(self) -> "RefModel":
+    def __enter__(self) -> RefModel:
         return self
 
     def __exit__(self, *_args) -> None:

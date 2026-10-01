@@ -509,8 +509,8 @@ int main() {
         return fail("disk_perf store is on tmpfs; set NINFER_KV_DISK_PERF_DIR to an SSD path");
     }
     if (disk_write_bytes().has_value() && fs_type_name(root) == "zfs") {
-        const char* pool = std::getenv("NINFER_KV_DISK_PERF_ZPOOL");
-        if (pool == nullptr || *pool == '\0') {
+        const char* zpool = std::getenv("NINFER_KV_DISK_PERF_ZPOOL");
+        if (zpool == nullptr || *zpool == '\0') {
             fs::remove_all(root);
             return fail("disk_perf physical ZFS accounting requires NINFER_KV_DISK_PERF_ZPOOL");
         }
@@ -727,7 +727,7 @@ int main() {
             fs::remove_all(root);
             return fail("disk_perf restore claim failed");
         }
-        double sum_s = 0.0;
+        double restore_sum_s = 0.0;
         for (int rep = 0; rep < kReps; ++rep) {
             double restore_s = 0;
             double harvest_s = 0;
@@ -750,10 +750,10 @@ int main() {
                 fs::remove_all(root);
                 return fail("disk_perf restore is slower than 40 MB/s");
             }
-            sum_s += restore_s;
+            restore_sum_s += restore_s;
         }
         std::cerr << "kv_disk_perf restore window=" << window
-                  << " mean=" << (image_bytes / 1.0e6) / (sum_s / kReps) << " MB/s\n";
+                  << " mean=" << (image_bytes / 1.0e6) / (restore_sum_s / kReps) << " MB/s\n";
         disk.release(match.entry_id);
     }
 

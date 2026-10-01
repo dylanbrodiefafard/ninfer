@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from dataclasses import asdict, dataclass
 import json
-from pathlib import Path
 import tempfile
-from typing import Sequence
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
-from safetensors import safe_open
 import torch
+from safetensors import safe_open
 
 from tools.artifact.container import (
     Artifact,
@@ -33,7 +33,6 @@ from tools.artifact.numeric import QuantFormat, get_format
 from tools.convert.common.safetensors import ShardReader
 
 from . import draft_head, inventory, recipe
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -168,7 +167,7 @@ def validate_structure(artifact: Artifact) -> StructureSummary:
     formats: Counter[str] = Counter()
     layouts: Counter[str] = Counter()
     for position, (actual, expected) in enumerate(
-        zip(artifact.objects, inventory.OBJECT_SPECS)
+        zip(artifact.objects, inventory.OBJECT_SPECS, strict=True)
     ):
         if actual.name != expected.name:
             _contract_error(

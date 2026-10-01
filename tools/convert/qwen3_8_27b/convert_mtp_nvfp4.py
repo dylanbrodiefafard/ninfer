@@ -14,11 +14,11 @@ Text / Vision / heads / norms / object order stay identical. Identity stays
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Iterator
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -27,8 +27,12 @@ from tools.artifact.container import (
     ArtifactIdentity,
     ArtifactWriter,
     ResourceObject,
-    ResourceSpec as ArtifactResourceSpec,
     TensorObject,
+)
+from tools.artifact.container import (
+    ResourceSpec as ArtifactResourceSpec,
+)
+from tools.artifact.container import (
     TensorSpec as ArtifactTensorSpec,
 )
 from tools.convert.common.nvfp4_quantize import ENCODER_PROFILE, encode_nvfp4_from_bf16
@@ -40,7 +44,6 @@ from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
 from tools.convert.qwen3_6_27b import recipe
 from tools.convert.qwen3_6_27b.inventory import W8
 from tools.convert.qwen3_8_27b.inventory_dflash2 import BLOCK_SCALE_LAYOUT, NVFP4
-
 
 RECIPE_ID = "qwen3_8_27b_nvfp4_mtp_nvfp4-v2"
 PINNED_REPO = "Qwen/Qwen3.8-27B"

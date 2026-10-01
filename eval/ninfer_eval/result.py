@@ -34,7 +34,7 @@ class DatasetResult:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DatasetResult":
+    def from_dict(cls, data: dict[str, Any]) -> DatasetResult:
         value = dict(data)
         value["counts"] = ResultCounts(**value["counts"])
         return cls(**value)

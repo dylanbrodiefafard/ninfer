@@ -1261,7 +1261,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                     }
                     // Evolve all rows inspected by the canonical oracle independently from
                     // decoded codes/scales. Other reference rows are never read by that oracle.
-                    for (const auto [offset, rows] : std::array<std::pair<int, int>, 3>{
+                    for (const auto& [offset, rows] : std::array<std::pair<int, int>, 3>{
                              {{0, kQueryRows}, {kQueryRows, kKeyRows},
                               {kQueryRows + kKeyRows, kValueRows}}}) {
                         for (int local : sampled_rows(rows, 7)) {
@@ -1385,8 +1385,8 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     if (qtype == QType::NVFP4 && policy == ops::LinearPolicy::A16Only) {
         for (int batch : {2, 3, 4}) {
             failures += run_shape(6, batch, {}, {}, 2600U + batch);
-            std::vector<int> valid(batch, 6), parents(batch * 6);
-            valid.back() = 3;
+            std::vector<int> valid(batch), parents(batch * 6);
+            for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? 3 : 6; }
             for (int b = 0; b < batch; ++b)
                 for (int t = 0; t < 6; ++t)
                     parents[b * 6 + t] = t == 0 ? -1 : (t - 1) / 2;
@@ -1396,8 +1396,8 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     if (qtype == QType::NVFP4 && policy != ops::LinearPolicy::A16Only) {
         for (int width : {6, 8, 16}) {
             for (int batch : {1, 2, 3, 4}) {
-                std::vector<int> valid(batch, width);
-                valid.back() = width - 1;
+                std::vector<int> valid(batch);
+                for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? width - 1 : width; }
                 failures += run_shape(width, batch, valid, {}, 2300U + width * 4 + batch);
             }
         }
@@ -1423,8 +1423,8 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         for (int width : {3, 7, 8, 9, 10, 11, 16}) {
             for (int batch : {1, 2, 3, 4}) {
-                std::vector<int> valid(batch, width);
-                valid.back() = width - 1;
+                std::vector<int> valid(batch);
+                for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? width - 1 : width; }
                 std::vector<int> tree(width * batch);
                 for (int b = 0; b < batch; ++b)
                     for (int t = 0; t < width; ++t)

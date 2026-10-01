@@ -820,11 +820,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
-            const std::string body = make_messages_response(
+            const std::string response_body = make_messages_response(
                 id, model, outcome.text, outcome.reasoning, outcome.tool_calls, stop_reason, usage);
             record_generation(log_context, std::move(outcome), generation_tools, generation_capture,
                               generation_media, generation_started);
-            set_owned_content(res, body, prepared.lifetime);
+            set_owned_content(res, response_body, prepared.lifetime);
         } catch (const ApiException& e) {
             record_failure(log_context, generation_tools, generation_capture, generation_media,
                            e.error().message, &e.error(), false);

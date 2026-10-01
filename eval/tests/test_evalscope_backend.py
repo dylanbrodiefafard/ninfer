@@ -1,9 +1,9 @@
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
-import os
 from pathlib import Path
 
 from ninfer_eval.backends.base import BackendRun, RunContext, WorkPlan

@@ -68,12 +68,11 @@ struct VerifyInputsExpected {
 VerifyInputsExpected verify_inputs_oracle(std::int32_t token,
                                           const std::vector<std::int32_t>& drafts,
                                           std::int32_t length) {
-    VerifyInputsExpected expected{
-        .verify_ids = std::vector<std::int32_t>(drafts.size() + 1),
-        .positions  = std::vector<std::int32_t>(drafts.size() + 1),
-    };
-    expected.verify_ids[0] = token;
-    for (std::size_t i = 0; i < drafts.size(); ++i) expected.verify_ids[i + 1] = drafts[i];
+    VerifyInputsExpected expected;
+    expected.verify_ids.reserve(drafts.size() + 1);
+    expected.verify_ids.push_back(token);
+    expected.verify_ids.insert(expected.verify_ids.end(), drafts.begin(), drafts.end());
+    expected.positions.resize(expected.verify_ids.size());
     for (std::size_t i = 0; i < expected.positions.size(); ++i) {
         expected.positions[i] = length + static_cast<std::int32_t>(i);
     }
@@ -135,6 +134,9 @@ struct AcceptExpected {
 AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std::int32_t accepted,
                                    std::int32_t terminal_token, std::int32_t initial_length) {
     const int k = static_cast<int>(drafts.size());
+    if (accepted < 0 || accepted > k) {
+        throw std::invalid_argument("accept oracle accepted count exceeds the draft count");
+    }
     AcceptExpected expected{
         .sampled     = std::vector<std::int32_t>(static_cast<std::size_t>(k + 1), 0),
         .num_sampled = accepted + 1,

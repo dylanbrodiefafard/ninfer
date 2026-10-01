@@ -89,8 +89,8 @@ def render(verdict: dict) -> str:
     kpi_s = f"{kpi:.4f}" if isinstance(kpi, (int, float)) else "-"
     cases = ", ".join(o.get("cases") or []) or "-"
     lines = [
-        f"[kdev] {verdict['op']} ({verdict['tier']}) oracle={flag} kpi={kpi_s}"
-        f"{perf}  git@{verdict['git']}",
+        (f"[kdev] {verdict['op']} ({verdict['tier']}) oracle={flag} kpi={kpi_s}"
+        f"{perf}  git@{verdict['git']}"),
         f"       cases: {cases}",
     ]
     san = verdict.get("sanitizer")

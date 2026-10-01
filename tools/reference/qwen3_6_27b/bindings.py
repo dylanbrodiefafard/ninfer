@@ -22,7 +22,6 @@ from tools.artifact import (
     decode_direct,
 )
 
-
 MODEL_ID = "qwen3.6-27b"
 WEIGHTS_ID = "groupwise-int"
 QWEN3_8_MODEL_ID = "qwen3.8-27b"
@@ -690,7 +689,7 @@ class ArtifactBinding:
         self._validate_draft_ids()
 
     @classmethod
-    def open(cls, path: str | Path) -> "ArtifactBinding":
+    def open(cls, path: str | Path) -> ArtifactBinding:
         artifact = Artifact.open(path)
         try:
             return cls(artifact, owns_artifact=True)
@@ -699,7 +698,7 @@ class ArtifactBinding:
             raise
 
     @classmethod
-    def bind(cls, artifact: Artifact) -> "ArtifactBinding":
+    def bind(cls, artifact: Artifact) -> ArtifactBinding:
         return cls(artifact, owns_artifact=False)
 
     @property
@@ -750,7 +749,7 @@ class ArtifactBinding:
         if self._owns_artifact:
             self._artifact.close()
 
-    def __enter__(self) -> "ArtifactBinding":
+    def __enter__(self) -> ArtifactBinding:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -868,7 +867,7 @@ class VisionArtifactBinding:
         )
 
     @classmethod
-    def open(cls, path: str | Path) -> "VisionArtifactBinding":
+    def open(cls, path: str | Path) -> VisionArtifactBinding:
         artifact = Artifact.open(path)
         try:
             return cls(artifact, owns_artifact=True)
@@ -893,7 +892,7 @@ class VisionArtifactBinding:
         if self._owns_artifact:
             self._artifact.close()
 
-    def __enter__(self) -> "VisionArtifactBinding":
+    def __enter__(self) -> VisionArtifactBinding:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -918,9 +917,9 @@ __all__ = [
     "RowAddressable",
     "TextBinding",
     "TextLayerBinding",
+    "VisionArtifactBinding",
     "VisionBinding",
     "VisionLayerBinding",
     "VisionMergerBinding",
     "WeightObject",
-    "VisionArtifactBinding",
 ]

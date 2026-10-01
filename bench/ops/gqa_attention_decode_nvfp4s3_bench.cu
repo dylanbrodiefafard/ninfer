@@ -94,7 +94,7 @@ Nvfp4s3Cache make_cache(int context) {
         4u * kPageSize * kKVHeads * physical_pages;
     cache.k_mean = DeviceBuffer(kmean_elems * sizeof(float));
     std::vector<float> h_kmean(kmean_elems);
-    for (std::size_t p = 0; p < physical_pages; ++p) {
+    for (std::size_t p = 0; p < static_cast<std::size_t>(physical_pages); ++p) {
         const float v = static_cast<float>(p % 97);
         for (std::size_t i = 0; i < 4u * kPageSize * kKVHeads; ++i) {
             h_kmean[p * (4u * kPageSize * kKVHeads) + i] = v;

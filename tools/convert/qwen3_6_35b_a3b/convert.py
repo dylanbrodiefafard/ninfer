@@ -15,11 +15,11 @@ the 35B output head.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -30,7 +30,6 @@ from tools.convert.qwen3_6.common import conversion as family_conversion
 from tools.convert.qwen3_6.common import official_resources
 
 from . import draft_head, inventory, recipe
-
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
 ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"

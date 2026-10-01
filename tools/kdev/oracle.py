@@ -7,7 +7,8 @@ final OK/FAIL line. The oracle tier only picks which cases run (fast = cheapest,
 full = representative matrix) — it never edits source.
 """
 
-import os
+
+import contextlib
 
 from . import harness
 
@@ -27,16 +28,14 @@ def run_op_test(op, tier: str) -> dict:
     # "PASS ..." on success, l2norm prints "OK ..."; a failure prints the failing
     # case verbatim (or a "FAIL ..." line). Accept either success prefix.
     last = output.strip().splitlines()[-1] if output.strip() else ""
-    passed = result.ok and (last.startswith("PASS") or last.startswith("OK"))
+    passed = result.ok and last.startswith(("PASS", "OK"))
     stats = harness.parse_op_stats(output)
     # Reduce to the KPIs that matter (drop the raw rmse/rms noise, keep ratios).
     for record in stats:
         for key in ("rel_l2_ratio", "gross_ratio", "non_finite", "max_abs", "max_reference"):
             if key in record:
-                try:
+                with contextlib.suppress(ValueError):
                     record[key] = float(record[key])
-                except ValueError:
-                    pass
     return {
         "op": op.name,
         "tier": tier,

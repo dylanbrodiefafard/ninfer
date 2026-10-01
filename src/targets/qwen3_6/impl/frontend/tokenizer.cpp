@@ -673,11 +673,6 @@ void for_each_qwen_word(std::string_view text, Emit&& emit) {
     }
 }
 
-bool is_added_token_id(const std::vector<AddedToken>& added_tokens, int id) {
-    return std::any_of(added_tokens.begin(), added_tokens.end(),
-                       [id](const AddedToken& token) { return token.id == id; });
-}
-
 bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
     return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
 }

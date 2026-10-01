@@ -440,11 +440,12 @@ std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
     }
-    std::vector<PrefixHash128> chain(tokens + 1);
-    chain[0]                 = initial_hash();
-    std::size_t item_cursor  = 0;
+    std::vector<PrefixHash128> chain;
+    chain.reserve(tokens + 1);
+    PrefixHash128 hash      = initial_hash();
+    chain.push_back(hash);
+    std::size_t item_cursor = 0;
     for (std::size_t k = 1; k <= tokens; ++k) {
-        PrefixHash128 hash = chain[k - 1];
         const std::size_t i = k - 1;
         mix_token(hash, prompt.token_ids[i], prompt.token_types[i], prompt.positions[i],
                   prompt.positions[tokens + i], prompt.positions[2 * tokens + i]);
@@ -459,7 +460,7 @@ std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
             mix_vision_item(hash, item);
             ++item_cursor;
         }
-        chain[k] = hash;
+        chain.push_back(hash);
     }
     return chain;
 }

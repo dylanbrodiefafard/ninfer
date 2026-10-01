@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from tools.convert.qwen3_6_27b import inventory as qwen3_6_inventory
 
-
 MODEL_ID = "qwen3.8-27b"
 WEIGHTS_ID = "groupwise-int"
 TARGET_KEY = "qwen3_8_27b"

@@ -190,9 +190,9 @@ def main() -> int:
         positions = ([p.strip() for p in args.positions.split(",") if p.strip()]
                      if args.positions else list(NIAH_POSITIONS))
         # validate against the known sets so a typo fails fast
-        for l in lengths:
-            if l not in known_lengths:
-                raise SystemExit(f"unknown NIAH length {l!r} (choose from "
+        for length in lengths:
+            if length not in known_lengths:
+                raise SystemExit(f"unknown NIAH length {length!r} (choose from "
                            f"{', '.join(known_lengths)})")
         for p in positions:
             if p not in NIAH_POSITIONS:
@@ -241,7 +241,7 @@ def main() -> int:
             t0 = time.perf_counter()
             try:
                 data = post(args.base, key, body, args.timeout)
-            except Exception as exc:  # noqa: BLE001 - report and continue
+            except Exception as exc:
                 total += 1
                 snippets.append(f"RUN ERROR: {exc}")
                 print(f"  [{label}] run {run + 1}/{args.runs}: ERROR {exc}")

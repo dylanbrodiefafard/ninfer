@@ -52,7 +52,7 @@ inline Nvfp4ActivationReference nvfp4_activation_reference(std::span<const float
         for (std::size_t i = 0; i < 16; ++i) {
             const float normalized = (input[base + i] * divisor) / scale;
             auto code = nearest_positive_code(std::abs(normalized), 8,
-                [](int code) { return quantized_weight::detail::decode_e2m1(code); });
+                [](int candidate) { return quantized_weight::detail::decode_e2m1(candidate); });
             if (std::signbit(normalized)) { code |= 8; }
             out.codes[(base + i) / 2] |= code << (4 * (i & 1));
             out.represented[base + i] = static_cast<float>(

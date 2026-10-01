@@ -16,7 +16,6 @@ from tools.artifact.container import (
 from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
 from tools.convert.qwen3_6_27b import convert, inventory, recipe
 
-
 OFFICIAL_MODEL = Path(
     "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
 )

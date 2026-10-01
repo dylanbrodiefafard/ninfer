@@ -1,4 +1,4 @@
-"""Print the Layer 0–3 kernel-iteration recipe, filled when a Linear point is given.
+"""Print the Layer 0-3 kernel-iteration recipe, filled when a Linear point is given.
 
 The contract is docs/maintainer/kernel-iteration.md. Without geometry this command
 prints the procedure, idea catalog, and exact public-Op commands. With a Linear
@@ -217,14 +217,14 @@ def render_filled(card: dict) -> str:
         f"policy={p['policy']}  phase={p['phase']}"
         + (f"  ({label})" if label else ""),
         f"2. Floor  bound={card['bound']}  model_bytes={_fmt_bytes(card['model_bytes'])}",
-        f"          weight={_fmt_bytes(card['weight_bytes'])}  "
-        f"act={_fmt_bytes(card['activation_bytes'])}",
+        (f"          weight={_fmt_bytes(card['weight_bytes'])}  "
+        f"act={_fmt_bytes(card['activation_bytes'])}"),
         f"          useful_flops={_fmt_flops(card['useful_flops'])}  "
         f"AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
         f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
         + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else ""),
-        f"          t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us  "
-        f"t_issue={t_issue}  floor={card['floor_us']:.2f}us",
+        (f"          t_mem={card['t_mem_us']:.2f}us  t_comp={card['t_comp_us']:.2f}us  "
+        f"t_issue={t_issue}  floor={card['floor_us']:.2f}us"),
     ]
     if hint:
         lines.append(f"          note: {hint}")
@@ -321,8 +321,8 @@ def _guide_payload() -> dict:
         "kdev_ops": registry.names(),
         "fill": [
             "python3 -m tools.kdev recipe --preset attn_in --t 1 --idea occupancy",
-            "python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 "
-            "--policy a4 --measured-us 152.6 --idea tile_shape",
+            ("python3 -m tools.kdev recipe --n 14336 --k 5120 --t 1024 --qtype nvfp4 "
+            "--policy a4 --measured-us 152.6 --idea tile_shape"),
         ],
     }
 

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from tools.reference.qwen3_6.common.frontend import Frontend
 
-
 MODEL = Path("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16")
 CONFIG_ONLY_TOKENS = {
     "<|audio_start|>": 248070,

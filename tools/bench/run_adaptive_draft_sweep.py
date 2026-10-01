@@ -215,7 +215,7 @@ def run(spec: dict, mode: str) -> None:
 
 
 def main() -> int:
-    global ADAPTIVE_OUT
+    global ADAPTIVE_OUT  # noqa: PLW0603 -- argv override of the module-level dest read by out_dir()
     args = [a for a in sys.argv[1:] if a]
     phase = "adaptive"
     new_only = False

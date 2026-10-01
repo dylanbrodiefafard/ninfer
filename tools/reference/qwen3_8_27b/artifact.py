@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import json
 import mmap
-from pathlib import Path
 import struct
+from pathlib import Path
 
 import numpy as np
 

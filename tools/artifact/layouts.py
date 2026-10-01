@@ -7,27 +7,27 @@ roles to tensors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
-from math import prod
 import operator
 import struct
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from functools import lru_cache
+from math import prod
 from types import MappingProxyType
-from typing import Sequence, TypeAlias
+from typing import TypeAlias
 
 import torch
 
 from .numeric import (
     DirectFormat,
     Fp8RowFormat,
-    Nvfp4Format,
     NumericFormat,
+    Nvfp4Format,
     QuantFormat,
     get_format,
     valid_positive_fp32_word,
 )
-
 
 PLANE_ALIGNMENT = 256
 K_ALIGNMENT = 128
@@ -1071,14 +1071,14 @@ def dequantize_row_split(
 
 __all__ = [
     "BLOCKSCALE_K16_M128X4_V1",
-    "BlockScaleGeometry",
     "CONTIGUOUS_LE_V1",
     "K_ALIGNMENT",
     "LAYOUTS",
-    "Layout",
     "PLANE_ALIGNMENT",
-    "ROW_SPLIT_K128_V1",
     "ROW_SCALE_V1",
+    "ROW_SPLIT_K128_V1",
+    "BlockScaleGeometry",
+    "Layout",
     "RowPlanes",
     "RowScaleGeometry",
     "RowSplitGeometry",

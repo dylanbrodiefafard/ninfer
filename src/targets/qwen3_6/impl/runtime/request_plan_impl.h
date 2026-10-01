@@ -487,7 +487,7 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
         return RequestPlan(std::move(plan));
     }
 
-    const std::optional<qwen3_6::detail::DiskRestoredHost> loaded =
+    std::optional<qwen3_6::detail::DiskRestoredHost> loaded =
         kv_disk_cache_->load_host(match->entry_id);
     if (!loaded) {
         finish_request_plan(*plan, nullptr, prompt, base);

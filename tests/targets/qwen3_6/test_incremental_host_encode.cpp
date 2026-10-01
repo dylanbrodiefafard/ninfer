@@ -24,6 +24,7 @@
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -47,7 +48,9 @@ int check(bool condition, const char* message) {
 std::string read_file(const char* path) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) { throw std::runtime_error(std::string("failed to open test resource: ") + path); }
-    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    std::ostringstream contents;
+    contents << stream.rdbuf();
+    return std::move(contents).str();
 }
 
 std::string read_template_fixture(const char* path) {
@@ -846,15 +849,15 @@ int test_engine_shaped_cache() {
     for (const Frontend* template_frontend : {&frontend, &effort_frontend}) {
         const char* template_name = template_frontend == &frontend ? "toggle" : "effort";
         for (const bool thinking : {true, false}) {
-            for (const bool preserve : {true, false}) {
+            for (const bool preserve_thinking : {true, false}) {
                 for (const Shape& shape : shapes) {
                     const std::string label = std::string("E-H13 ") + template_name +
                                               (thinking ? " thinking" : " no-thinking") +
-                                              (preserve ? " preserve-on " : " preserve-off ") +
+                                              (preserve_thinking ? " preserve-on " : " preserve-off ") +
                                               shape.name;
                     ninfer::PromptOptions options;
                     options.enable_thinking       = thinking;
-                    options.preserve_thinking     = preserve;
+                    options.preserve_thinking     = preserve_thinking;
                     options.add_generation_prompt = shape.generation_prompt;
                     options.tool_jsons.push_back(
                         R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
@@ -874,10 +877,10 @@ int test_engine_shaped_cache() {
                                                   cached.observation.cache_hit, label.c_str());
                     const auto& data       = FrontendFactory::inspect(cached.prompt);
                     const auto& checkpoint = data.identity.rewrite_checkpoint;
-                    const auto replay = ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay;
+                    const auto response_replay = ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay;
                     const auto closure = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
                     if (!shape.generation_prompt) {
-                        failures += check(preserve ? !checkpoint || checkpoint->kind != replay
+                        failures += check(preserve_thinking ? !checkpoint || checkpoint->kind != response_replay
                                                    : checkpoint && checkpoint->kind == closure,
                                           (label + ": wrong checkpoint without a generation prompt").c_str());
                         continue;
@@ -886,7 +889,7 @@ int test_engine_shaped_cache() {
                         thinking ? "<think>\n" : "<think>\n\n</think>\n\n");
                     const std::size_t opener = data.token_ids.size() - prologue.size();
                     std::size_t expected = data.token_ids.size();
-                    if (!preserve) {
+                    if (!preserve_thinking) {
                         // First assistant opener after the last user: a tool loop's first turn.
                         const auto first_turn = template_frontend->prepare(
                             product_input({user("q1")}, first_options));
@@ -899,7 +902,7 @@ int test_engine_shaped_cache() {
                     const bool prologue_tail = std::equal(
                         prologue.begin(), prologue.end(),
                         data.token_ids.end() - static_cast<std::ptrdiff_t>(prologue.size()));
-                    failures += check(checkpoint && checkpoint->kind == (preserve ? replay : closure) &&
+                    failures += check(checkpoint && checkpoint->kind == (preserve_thinking ? response_replay : closure) &&
                                           prologue_tail && checkpoint->frontier == expected,
                                       (label + ": checkpoint kind or frontier is wrong").c_str());
                 }

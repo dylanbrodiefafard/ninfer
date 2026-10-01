@@ -16,7 +16,6 @@ from tools.artifact import (
     decode_direct,
 )
 
-
 MODEL_ID = "qwen3.6-35b-a3b"
 WEIGHTS_ID = "groupwise-int"
 TOKENIZER_VOCAB_SIZE = 248077

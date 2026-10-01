@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 CONTIGUOUS_LAYOUT = "contiguous-le-v1"
 ROW_SPLIT_LAYOUT = "row-split-k128-v1"
 RESOURCE_ENCODING = "raw-bytes-v1"
@@ -149,19 +148,19 @@ __all__ = [
     "FP32",
     "I32",
     "LAYOUT_NAMES",
-    "LogicalAliasSpec",
-    "LogicalRowViewSpec",
     "Q4",
     "Q5",
     "Q6",
     "RESOURCE_ENCODING",
     "RESOURCE_SPECS",
     "ROW_SPLIT_LAYOUT",
+    "VISION_LAYERS",
+    "W8",
+    "LogicalAliasSpec",
+    "LogicalRowViewSpec",
     "ResourceSpec",
     "StoredObjectSpec",
     "TensorSpec",
-    "VISION_LAYERS",
-    "W8",
     "build_vision_specs",
     "tensor_spec",
 ]

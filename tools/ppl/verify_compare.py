@@ -127,8 +127,8 @@ def logit_comparison(a: Path, b: Path) -> list[dict]:
         ta, tb = heapq.nlargest(2, range(len(la)), key=la.__getitem__), heapq.nlargest(2, range(len(lb)), key=lb.__getitem__)
         result.append({"lane": key[0], "position": key[1], "gold": gold,
                        "delta_nll": (zb - lb[gold]) - (za - la[gold]),
-                       "kl_baseline_candidate": math.fsum(p * ((x - za) - (y - zb)) for p, x, y in zip(pa, la, lb)),
-                       "total_variation": .5 * math.fsum(abs(p - q) for p, q in zip(pa, pb)),
+                       "kl_baseline_candidate": math.fsum(p * ((x - za) - (y - zb)) for p, x, y in zip(pa, la, lb, strict=True)),
+                       "total_variation": .5 * math.fsum(abs(p - q) for p, q in zip(pa, pb, strict=True)),
                        "baseline_top": ta[0], "candidate_top": tb[0],
                        "baseline_margin": la[ta[0]] - la[ta[1]], "candidate_margin": lb[tb[0]] - lb[tb[1]],
                        "baseline_gold_probability": pa[gold], "candidate_gold_probability": pb[gold]})

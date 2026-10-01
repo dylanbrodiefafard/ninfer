@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from types import MethodType
-from typing import Any, Iterable
+from typing import Any
 
 from .multimodal import MultimodalBatch, batch_from_processor_output
-
 
 _SPECIAL_TOKEN_IDS = {
     "<|vision_start|>": 248053,
@@ -31,7 +31,7 @@ def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):
             )
             for item in video_or_videos
         ]
-        return list(zip(*fetched))
+        return list(zip(*fetched, strict=True))
     return load_video(
         video_or_videos,
         backend="opencv",

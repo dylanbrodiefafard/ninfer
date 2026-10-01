@@ -142,7 +142,7 @@ if [[ "$(realpath -m "$src_mount")" != "$(realpath -m "$ROOT")" ]]; then
 fi
 
 if docker exec "$BUILDER" test -f /build/build.ninja; then
-  echo "Restatting /build ninja log for bind-mounted sources..."
+  echo "Refreshing /build ninja log timestamps for bind-mounted sources..."
   docker exec "$BUILDER" ninja -C /build -t restat
 fi
 

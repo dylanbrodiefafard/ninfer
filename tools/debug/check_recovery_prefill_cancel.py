@@ -4,14 +4,14 @@ Requires an isolated diagnostic server with 500 ms throughput logs.
 No returned tool is executed.
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
-from pathlib import Path
 import socket
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from jsonschema import validate
 

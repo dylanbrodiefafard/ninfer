@@ -26,13 +26,6 @@ void require_dtype(const Tensor& t, DType dtype, const char* op, const char* nam
     require_contiguous_nonnull(t, op, name);
 }
 
-void require_scalar(const Tensor& t, DType dtype, const char* op, const char* name) {
-    require_dtype(t, dtype, op, name);
-    if (t.ne[0] != 1 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": invalid scalar shape for " + name);
-    }
-}
-
 void require_vector(const Tensor& t, DType dtype, std::int32_t n, const char* op,
                     const char* name) {
     require_dtype(t, dtype, op, name);

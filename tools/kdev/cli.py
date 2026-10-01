@@ -1,6 +1,6 @@
 """CLI entry point.
 
-Layer 0–3:
+Layer 0-3:
     python3 -m tools.kdev recipe [--preset ... --t T --idea ...]
     python3 -m tools.kdev bound ...
     python3 -m tools.kdev mma
@@ -16,7 +16,7 @@ import argparse
 import json
 import sys
 
-from . import bench, bound, harness, mma, oracle, profile, recipe, registry, san, sage, verdict
+from . import bench, bound, harness, mma, oracle, profile, recipe, registry, sage, san, verdict
 
 _USAGE = """\
 usage: python3 -m tools.kdev <command>

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import time
-from typing import Sequence
 
 import torch
 

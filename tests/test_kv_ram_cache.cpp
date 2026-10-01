@@ -45,10 +45,16 @@ void* operator new(std::size_t bytes) {
     throw std::bad_alloc();
 }
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+// The replacement operator new above allocates with malloc, so free is the matching release.
+// GCC 13 still pairs a std::allocator call to the replaceable operator new with this body once
+// it is inlined, and reports a malloc/new mismatch that cannot occur.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 void operator delete(void* memory) noexcept { std::free(memory); }
 void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 void operator delete[](void* memory) noexcept { std::free(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
+#pragma GCC diagnostic pop
 
 namespace {
 
@@ -5384,9 +5390,9 @@ int test_bounded_ram_lifecycle(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& 
                 return mismatch("copy retirement differs from oracle");
             }
             const int victim = oldest(model);
-            const auto expected_victim = victim < 0 ? std::optional<std::uint64_t>{}
-                                                   : std::optional<std::uint64_t>{ids[victim]};
-            if (cache.peek_oldest_unpinned() != expected_victim) {
+            const auto oldest_unpinned = cache.peek_oldest_unpinned();
+            if ((victim < 0) != !oldest_unpinned ||
+                (oldest_unpinned && *oldest_unpinned != ids[victim])) {
                 return mismatch("eviction selected a claimed source or changed FIFO order");
             }
             for (int key = 0; key < 2; ++key) {

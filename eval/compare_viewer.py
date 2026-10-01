@@ -8,6 +8,7 @@ jobs that have not started yet are skipped. Open http://127.0.0.1:8765
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import signal
@@ -103,9 +104,12 @@ def usage_fields(record: dict[str, Any]) -> tuple[int | None, int | None, str]:
         if not isinstance(message, dict):
             continue
         perf = message.get("perf_metrics") or {}
-        if message.get("role") == "assistant" and isinstance(perf, dict):
-            if isinstance(perf.get("output_tokens"), int):
-                output_tokens = perf["output_tokens"]
+        if (
+            message.get("role") == "assistant"
+            and isinstance(perf, dict)
+            and isinstance(perf.get("output_tokens"), int)
+        ):
+            output_tokens = perf["output_tokens"]
     model_output = record.get("model_output")
     if isinstance(model_output, dict):
         usage = model_output.get("usage") or {}
@@ -538,10 +542,8 @@ def make_handler(app: ViewerApp) -> type[BaseHTTPRequestHandler]:
         protocol_version = "HTTP/1.1"
 
         def handle_one_request(self) -> None:
-            try:
+            with contextlib.suppress(*DISCONNECT):
                 super().handle_one_request()
-            except DISCONNECT:
-                pass
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -590,10 +592,8 @@ def make_handler(app: ViewerApp) -> type[BaseHTTPRequestHandler]:
 
 
 def main() -> int:
-    try:
+    with contextlib.suppress(AttributeError, ValueError):
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-    except (AttributeError, ValueError):
-        pass
     repo = HERE.parent
     parser = argparse.ArgumentParser(description="Compare production vs p-less AIME transcripts")
     parser.add_argument("--runs-dir", type=Path, default=HERE / "runs")

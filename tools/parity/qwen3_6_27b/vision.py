@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from pathlib import Path
 import subprocess
 import tempfile
-from typing import Callable
+from collections.abc import Callable
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -33,7 +33,6 @@ from tools.reference.qwen3_6_27b.config import VISION_CFG
 from tools.reference.qwen3_6_27b.ops import linear, residual_add
 from tools.reference.qwen3_6_27b.vision import VisionEncoder
 from tools.reference.qwen3_6_27b.weights import WeightStore
-
 
 # The cross-runtime profile permits independent BF16 reduction association at every public Op.
 # sqrt(54) times the linear A16 gross allowance (two residual branches in each of 27 blocks), plus
@@ -1071,7 +1070,13 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
                     modality = manifest["items"][item]["modality"]
                     artifact_names: list[str] = []
 
-                    def artifact_tap(name: str, value: torch.Tensor, *, item=item) -> None:
+                    def artifact_tap(
+                        name: str,
+                        value: torch.Tensor,
+                        *,
+                        item=item,
+                        artifact_names: list[str] = artifact_names,
+                    ) -> None:
                         _record_ordered_tap(
                             artifact_names, name, item=item, label="artifact schedule"
                         )
@@ -1115,7 +1120,13 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
                 for item, (pixels, grid) in enumerate(item_inputs):
                     source_names: list[str] = []
 
-                    def source_tap(name: str, value: torch.Tensor, *, item=item) -> None:
+                    def source_tap(
+                        name: str,
+                        value: torch.Tensor,
+                        *,
+                        item=item,
+                        source_names: list[str] = source_names,
+                    ) -> None:
                         _record_ordered_tap(
                             source_names, name, item=item, label="source schedule"
                         )

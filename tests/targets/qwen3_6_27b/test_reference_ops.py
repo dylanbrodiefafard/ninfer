@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from tools.reference.qwen3_6.common.vision_ops import vision_attention
 from tools.reference.qwen3_6_27b.config import ATTN_SCALE, CFG, VISION_CFG
 from tools.reference.qwen3_6_27b.ops import (
     _naive_gated_delta_net,
@@ -15,7 +16,6 @@ from tools.reference.qwen3_6_27b.ops import (
     gated_delta_net,
 )
 from tools.reference.qwen3_6_27b.state import KVCache
-from tools.reference.qwen3_6.common.vision_ops import vision_attention
 
 
 def test_causal_conv_matches_direct_channel_major_math() -> None:

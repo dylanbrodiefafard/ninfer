@@ -1,9 +1,11 @@
 """Independent exact row-scale and FP8 rounding checks on real source matrices."""
-import json
 import argparse
+import json
 from pathlib import Path
+
 import numpy as np
 import torch
+
 from tools.reference.qwen3_8_27b.artifact import TextArtifact, rounded_bf16
 from tools.reference.qwen3_8_27b.source_weights import SourceWeights
 

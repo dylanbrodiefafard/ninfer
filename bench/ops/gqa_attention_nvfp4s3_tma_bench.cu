@@ -826,11 +826,11 @@ int main() {
                 // staged bytes are not a permutation of the plane tile (coordinate bug).
                 const std::uint8_t* st0 = staged.data();
                 const std::uint8_t* gp0 = kplane.data();
-                auto cand_mismatch = [&](const char* name, auto phys_of) -> int {
+                auto cand_mismatch = [&](const char* name, auto candidate_phys) -> int {
                     int bad = 0;
                     for (int r = 0; r < 64; ++r)
                         for (int b = 0; b < 128; ++b)
-                            if (st0[phys_of(r, b)] != gp0[static_cast<std::size_t>(r) * 128 + b])
+                            if (st0[candidate_phys(r, b)] != gp0[static_cast<std::size_t>(r) * 128 + b])
                                 ++bad;
                     (void)name;
                     return bad;

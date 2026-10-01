@@ -66,10 +66,10 @@ def test_key_dense_moe_mtp_and_vision_signatures() -> None:
     assert tensors["dflash/layers/5/mlp/down"].shape == (2048, 6144)
     assert tensors["dflash/final_norm"].format == inventory.BF16
 
-    assert inventory.FULL_ATTENTION_LAYERS == tuple(range(3, 40, 4))
+    assert tuple(range(3, 40, 4)) == inventory.FULL_ATTENTION_LAYERS
     assert len(inventory.GDN_LAYERS) == 30
     assert inventory.Q6_ROUTED_DOWN_LAYERS == (34, 38, 39)
-    assert inventory.DFLASH_LAYERS == tuple(range(6))
+    assert tuple(range(6)) == inventory.DFLASH_LAYERS
     assert len(inventory.DFLASH_TENSOR_SPECS) == 51
     assert len(inventory.TENSOR_SPECS) == 934
     assert len(inventory.OBJECT_SPECS) == 940

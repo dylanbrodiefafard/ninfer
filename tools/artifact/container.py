@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import mmap
 import struct
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence, TypeAlias
+from typing import TypeAlias
 
 from .layouts import align_up, encoded_size, get_layout
-
 
 MAGIC = b"NINFER\x00\x02"
 _V1_MAGIC = b"NINFER\x00\x01"
@@ -331,7 +331,7 @@ class Artifact:
             raise
 
     @classmethod
-    def open(cls, path: str | Path) -> "Artifact":
+    def open(cls, path: str | Path) -> Artifact:
         return cls(path)
 
     def find(self, name: str) -> ArtifactObject:
@@ -352,7 +352,7 @@ class Artifact:
         if not self._file.closed:
             self._file.close()
 
-    def __enter__(self) -> "Artifact":
+    def __enter__(self) -> Artifact:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -428,7 +428,7 @@ class ArtifactWriter:
         if not self._file.closed:
             self._file.close()
 
-    def __enter__(self) -> "ArtifactWriter":
+    def __enter__(self) -> ArtifactWriter:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:

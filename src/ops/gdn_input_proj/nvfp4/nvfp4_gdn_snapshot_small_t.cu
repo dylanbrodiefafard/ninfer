@@ -102,7 +102,7 @@ __global__ __launch_bounds__(256) void nvfp4_grouped_gdn_conv_kernel(
 template <int Width, int RequestsPerGroup, bool Tree, class Publish>
 void launch_grouped_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                            const Tensor& conv_states, const Tensor& valid_columns,
-                           const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                           const Tensor& initial_slot, Tensor& query,
                            Tensor& key, Tensor& value, Tensor& z, Publish publish,
                            WorkspaceArena& workspace, cudaStream_t stream,
                            const std::int32_t* parent_index) {
@@ -150,7 +150,7 @@ void launch_grouped_record(const Tensor& x, const Weight& weight, const Tensor& 
 template <int Width, int Batch, bool Tree, class Publish>
 void launch_contiguous_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                               const Tensor& conv_states, const Tensor& valid_columns,
-                              const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                              const Tensor& initial_slot, Tensor& query,
                               Tensor& key, Tensor& value, Tensor& z, Publish publish,
                               WorkspaceArena& workspace, cudaStream_t stream,
                               const std::int32_t* parent_index) {
@@ -282,11 +282,11 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                 if (parent_index == nullptr) {
                     launch_contiguous_record<ActiveTokens, 1, false>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream, nullptr);
+                        query, key, value, z, publish, workspace, stream, nullptr);
                 } else {
                     launch_contiguous_record<ActiveTokens, 1, true>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream,
+                        query, key, value, z, publish, workspace, stream,
                         parent_index);
                 }
                 return;
@@ -297,13 +297,13 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                 if (x.ne[2] == 3) {
                     launch_contiguous_record<ActiveTokens, 3, false>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream, nullptr);
+                        query, key, value, z, publish, workspace, stream, nullptr);
                     return;
                 }
             }
             {
                 launch_grouped_record<ActiveTokens, 2, false>(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
+                    x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                     query, key, value, z, publish, workspace, stream, nullptr);
             }
         } else {
@@ -311,14 +311,14 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
                 if (x.ne[2] == 3) {
                     launch_contiguous_record<ActiveTokens, 3, true>(
                         x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                        conv_record, query, key, value, z, publish, workspace, stream,
+                        query, key, value, z, publish, workspace, stream,
                         parent_index);
                     return;
                 }
             }
             {
                 launch_grouped_record<ActiveTokens, 2, true>(
-                    x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record,
+                    x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                     query, key, value, z, publish, workspace, stream, parent_index);
             }
         }

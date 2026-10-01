@@ -138,8 +138,8 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
         require(bool(logit_dump), "cannot open verifier logit dump");
     }
     std::set<std::size_t> capture_positions;
-    if (const char* positions = std::getenv("NINFER_VERIFY_LOGIT_POSITIONS")) {
-        std::istringstream input(positions);
+    if (const char* position_list = std::getenv("NINFER_VERIFY_LOGIT_POSITIONS")) {
+        std::istringstream input(position_list);
         std::string item;
         while (std::getline(input, item, ',')) { capture_positions.insert(std::stoul(item)); }
     }
@@ -528,7 +528,9 @@ int main(int argc, char** argv) {
         if (argc > 5) {
             std::ifstream input(argv[5]);
             require(bool(input), "cannot open corpus document");
-            text.assign(std::istreambuf_iterator<char>(input), {});
+            std::ostringstream contents;
+            contents << input.rdbuf();
+            text = std::move(contents).str();
         }
         auto gold = tokenizer.encode(text, {.parse_added_tokens = false});
         if (argc > 6) {

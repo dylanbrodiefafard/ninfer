@@ -229,21 +229,21 @@ int main() {
         }
         host.free(whole);
 
-        void* a = host.try_alloc(256, 256);
-        void* b = host.try_alloc(256, 256);
-        void* c = host.try_alloc(256, 256);
-        if (a == nullptr || b == nullptr || c == nullptr) {
+        void* left = host.try_alloc(256, 256);
+        void* middle = host.try_alloc(256, 256);
+        void* right = host.try_alloc(256, 256);
+        if (left == nullptr || middle == nullptr || right == nullptr) {
             ++failures;
             std::cerr << "three 256-byte host allocations failed\n";
         } else {
-            host.free(b);
+            host.free(middle);
             failures += expect_size(host.used(), 512, "host used with middle hole");
             if (host.try_alloc(384, 256) != nullptr) {
                 ++failures;
                 std::cerr << "first-fit allocated across a pinned middle hole\n";
             }
-            host.free(a);
-            host.free(c);
+            host.free(left);
+            host.free(right);
             if (host.try_alloc(768, 256) == nullptr) {
                 ++failures;
                 std::cerr << "coalesced host arena failed to absorb the middle hole\n";
@@ -261,22 +261,22 @@ int main() {
         // Dense allocation followed by isolated frees is the peak free-span case
         // for cache retirement. Every surviving block must keep its contents and
         // releasing all blocks must recover the complete pinned region.
-        constexpr std::size_t count = 64;
+        constexpr std::size_t block_count = 64;
         constexpr std::size_t bytes = 256;
-        ninfer::HostPinnedArena host(count * bytes);
-        std::array<void*, count> blocks{};
-        for (std::size_t i = 0; i < count; ++i) {
+        ninfer::HostPinnedArena host(block_count * bytes);
+        std::array<void*, block_count> blocks{};
+        for (std::size_t i = 0; i < block_count; ++i) {
             blocks[i] = host.try_alloc(bytes, bytes);
             if (blocks[i] == nullptr) { return fail("dense host arena allocation failed"); }
             std::memset(blocks[i], static_cast<int>(i), bytes);
         }
-        for (std::size_t i = 1; i < count; i += 2) { host.free(blocks[i]); }
-        failures += expect_size(host.used(), count / 2 * bytes, "fragmented host arena used");
-        for (std::size_t i = 1; i < count; i += 2) {
+        for (std::size_t i = 1; i < block_count; i += 2) { host.free(blocks[i]); }
+        failures += expect_size(host.used(), block_count / 2 * bytes, "fragmented host arena used");
+        for (std::size_t i = 1; i < block_count; i += 2) {
             void* replacement = host.try_alloc(bytes, bytes);
             failures += expect_ptr(replacement, blocks[i], "fragmented host first-fit reuse");
         }
-        for (std::size_t i = 0; i < count; i += 2) {
+        for (std::size_t i = 0; i < block_count; i += 2) {
             const auto* data = static_cast<const unsigned char*>(blocks[i]);
             for (std::size_t j = 0; j < bytes; ++j) {
                 if (data[j] != static_cast<unsigned char>(i)) {
@@ -285,9 +285,9 @@ int main() {
             }
             host.free(blocks[i]);
         }
-        for (std::size_t i = count; i > 0; i -= 2) { host.free(blocks[i - 1]); }
+        for (std::size_t i = block_count; i > 0; i -= 2) { host.free(blocks[i - 1]); }
         failures += expect_size(host.used(), 0, "fully reclaimed host arena used");
-        void* whole = host.try_alloc(count * bytes, bytes);
+        void* whole = host.try_alloc(block_count * bytes, bytes);
         if (whole != host.base()) { return fail("fragmented host arena did not fully coalesce"); }
         host.free(whole);
     }
