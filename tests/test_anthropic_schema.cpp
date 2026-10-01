@@ -652,7 +652,8 @@ int test_response_serialization() {
         make_messages_response("msg_2", "m", "", "", {}, "end_turn", CompletionUsage{1, 0}));
     failures +=
         check(empty.at("content").size() == 1 && empty.at("content").at(0).at("type") == "text" &&
-                  empty.at("content").at(0).at("text") == "",
+                  empty.at("content").at(0).at("text").is_string() &&
+                  empty.at("content").at(0).at("text").get_ref<const std::string&>().empty(),
               "empty output -> empty text block");
     return failures;
 }

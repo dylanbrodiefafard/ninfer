@@ -10,7 +10,6 @@
 namespace {
 
 using ninfer::TokenId;
-using ninfer::runtime::TypicalCycle;
 using ninfer::runtime::kTypicalCyclePeriodMax;
 using ninfer::runtime::kTypicalCyclePeriodMin;
 using ninfer::runtime::least_square_period;
@@ -353,7 +352,8 @@ int singleton_trap_lemma() {
         failures += check(mode_in && other_in, "tied 2-mass did not keep both atoms");
     }
     // Proof obligation: r >= q^2+r^2 with q+r<=1 requires q<=1/2.
-    for (double q = 0.51; q <= 1.0; q += 0.01) {
+    for (int q_percent = 51; q_percent <= 100; ++q_percent) {
+        const double q = q_percent / 100.0;
         const double r = 1.0 - q;
         const double L = q * q + r * r;
         if (r >= L) {

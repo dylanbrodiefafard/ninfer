@@ -460,7 +460,8 @@ int main() {
         }
         const std::array<std::uint32_t, 3> c3_lengths{19, 13, 7};
         std::vector<ninfer::GenerationHandle> handles;
-        for (std::size_t i = 0; i < 3; ++i) {
+        handles.reserve(c3_lengths.size());
+        for (std::size_t i = 0; i < c3_lengths.size(); ++i) {
             handles.push_back(
                 engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(c3_lengths[i])));
         }

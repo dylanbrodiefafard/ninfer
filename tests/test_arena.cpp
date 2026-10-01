@@ -83,6 +83,7 @@ int main() {
         [&] { buffer.copy_from_host(host_source.data(), 2, buffer.bytes - 1); },
         "device buffer upload range");
     ninfer::DeviceBuffer moved_buffer(std::move(buffer));
+    // NOLINTNEXTLINE(bugprone-use-after-move): the move constructor guarantees an empty source.
     failures += expect_ptr(buffer.p, nullptr, "moved-from device buffer pointer");
     failures += expect_size(buffer.bytes, 0, "moved-from device buffer size");
     failures += expect_size(moved_buffer.bytes, host_source.size(), "moved device buffer size");
@@ -164,6 +165,7 @@ int main() {
     failures += expect_size(arena.peak_used(), 4, "arena.peak after reset allocation");
 
     ninfer::DeviceArena moved(std::move(arena));
+    // NOLINTNEXTLINE(bugprone-use-after-move): the move constructor guarantees an empty source.
     if (arena.base() != nullptr || arena.capacity() != 0 || arena.used() != 0) {
         ++failures;
         std::cerr << "move construction did not clear source arena\n";

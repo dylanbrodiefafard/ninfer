@@ -796,10 +796,11 @@ int test_engine_shaped_cache() {
     failures += expect_match_cold(
         frontend, tc2, product_input({product_message(ninfer::ChatRole::User, "x")}, turn_closure),
         true, "E-H8 TurnClosure");
-    failures += check(FrontendFactory::inspect(tc2.prompt).identity.rewrite_checkpoint &&
-                          FrontendFactory::inspect(tc2.prompt).identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
-                      "E-H8 kind is not TurnClosure from this render");
+    failures +=
+        check(FrontendFactory::inspect(tc2.prompt).identity.rewrite_checkpoint &&
+                  FrontendFactory::inspect(tc2.prompt).identity.rewrite_checkpoint.value().kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
+              "E-H8 kind is not TurnClosure from this render");
 
     auto rr = cached_prepare(
         frontend, cache, product_input({product_message(ninfer::ChatRole::User, "rr")}, preserve));
@@ -808,13 +809,13 @@ int test_engine_shaped_cache() {
     failures += expect_match_cold(
         frontend, rr2, product_input({product_message(ninfer::ChatRole::User, "rr")}, preserve),
         true, "E-H9 ResponseReplay thinking");
-    failures +=
-        check(FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint &&
-                  FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint->kind ==
-                      ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                  FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint->frontier ==
-                      FrontendFactory::inspect(rr2.prompt).token_ids.size(),
-              "E-H9 ResponseReplay frontier is not prompt end");
+    failures += check(
+        FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint &&
+            FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint.value().kind ==
+                ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+            FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint.value().frontier ==
+                FrontendFactory::inspect(rr2.prompt).token_ids.size(),
+        "E-H9 ResponseReplay frontier is not prompt end");
     (void)rr;
     (void)tc;
     (void)empty_suffix;
@@ -923,7 +924,8 @@ int test_engine_shaped_cache() {
                         const auto first_turn =
                             template_frontend->prepare(product_input({user("q1")}, first_options));
                         expected = shape.tool_loop ? FrontendFactory::inspect(first_turn)
-                                                         .identity.rewrite_checkpoint->frontier
+                                                         .identity.rewrite_checkpoint.value()
+                                                         .frontier
                                                    : opener;
                     } else if (thinking && shape.latest_dropped) {
                         expected = opener;
@@ -1125,9 +1127,11 @@ int test_concurrency_and_copy_out() {
     int failures               = 0;
 
     std::atomic<int> thread_failures{0};
+    constexpr int kThreads = 8;
     std::vector<std::thread> threads;
+    threads.reserve(kThreads);
     fi::EncodedHistoryCache shared;
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
             const std::string tag = "hist-" + std::to_string(t);
             auto first            = cached_prepare(
@@ -1157,7 +1161,7 @@ int test_concurrency_and_copy_out() {
     fi::EncodedHistoryCache identical;
     threads.clear();
     thread_failures.store(0);
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&] {
             auto first = cached_prepare(
                 frontend, identical,
@@ -1546,8 +1550,10 @@ int test_coverage_gaps() {
             frontend, mixed,
             product_input({product_message(ninfer::ChatRole::User, "mix")}, preserve));
         std::atomic<int> mix_failures{0};
+        constexpr int kMixThreads = 8;
         std::vector<std::thread> mix_threads;
-        for (int t = 0; t < 8; ++t) {
+        mix_threads.reserve(kMixThreads);
+        for (int t = 0; t < kMixThreads; ++t) {
             mix_threads.emplace_back([&, t] {
                 if ((t % 2) == 0) {
                     const std::uint32_t count = EncodedHistoryPrepare::count_tokens(
@@ -1663,12 +1669,12 @@ int test_coverage_gaps() {
                                              product_message(ninfer::ChatRole::User, "next")},
                                             preserve),
                               true, "V7 verify ResponseReplay append");
-        failures +=
-            check(!rr.observation.verified_mismatch &&
-                      FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint &&
-                      FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint->kind ==
-                          ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay,
-                  "V7 verify frontier/kind disagreed");
+        failures += check(
+            !rr.observation.verified_mismatch &&
+                FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint &&
+                FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint.value().kind ==
+                    ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay,
+            "V7 verify frontier/kind disagreed");
         setenv("NINFER_VERIFY_HOST_ENCODE", "0", 1);
         return failures;
     } catch (const std::exception& error) {
@@ -1817,9 +1823,9 @@ int test_byte_match_and_boundaries() {
                           "could not find a legal cut followed by an illegal longer prefix");
         if (legal_short != 0 && illegal_long > legal_short) {
             const fi::EncodedText marked = tokenizer.encode(word.text, legal_short);
-            std::vector<int> short_ids(marked.ids.begin(),
-                                       marked.ids.begin() +
-                                           static_cast<std::ptrdiff_t>(*marked.prefix_tokens));
+            std::vector<int> short_ids(
+                marked.ids.begin(),
+                marked.ids.begin() + static_cast<std::ptrdiff_t>(marked.prefix_tokens.value()));
             fi::EncodedHistoryCache mixed;
             mixed.insert_committed(word.text.substr(0, illegal_long), {1, 2, 3});
             mixed.insert_committed(word.text.substr(0, legal_short), short_ids);

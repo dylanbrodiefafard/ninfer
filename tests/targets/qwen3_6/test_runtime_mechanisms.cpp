@@ -125,7 +125,8 @@ void test_decoder_layout() {
     expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
                int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
            "INT8 MTP KV has scale planes");
-    expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
+    expect(int8.kv_payload_bytes() ==
+               int8.text_kv.payload_bytes() + int8.mtp_kv.value().payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 
     ninfer::LayoutBuilder nvfp4_builder;
@@ -155,7 +156,7 @@ void test_round_layout() {
                round.mtp->target_input_ids.shape[0] == 6,
            "MTP prefill scratch shapes");
     expect(round.logits.region.offset < exact_prefill.region.offset &&
-               exact_prefill.region.offset < round.mtp->draft_tokens.region.offset,
+               exact_prefill.region.offset < round.mtp.value().draft_tokens.region.offset,
            "exact prefill extension retains established round-region order");
     expect(round.mtp.has_value() && round.mtp->position.shape[0] == 1,
            "MTP prefill scratch is explicit");

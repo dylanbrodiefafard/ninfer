@@ -124,10 +124,11 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
     auto logits    = frame.target_logits.slice(2, 0, batch);
     auto tokens    = frame.target_argmax.slice(1, 0, batch);
     require(ids.ne[0] == w, "qualification width differs from startup width");
-    const std::size_t vocab  = target::TextConfig::output_rows;
-    const std::size_t domain = target::TextConfig::token_domain;
-    std::vector<std::uint16_t> host_logits(vocab * width * batch);
-    std::vector<std::int32_t> host_argmax(width * batch);
+    const std::size_t vocab         = target::TextConfig::output_rows;
+    const std::size_t domain        = target::TextConfig::token_domain;
+    const std::size_t columns_total = static_cast<std::size_t>(width) * batch;
+    std::vector<std::uint16_t> host_logits(vocab * columns_total);
+    std::vector<std::int32_t> host_argmax(columns_total);
     // Qualification-only capture. Each record is four LE u32s (domain, lane, position,
     // gold ID), followed by domain BF16 logits. Default: first lane/column at each host
     // checkpoint. An explicit position list also captures token-level regression outliers.
@@ -152,7 +153,7 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
     std::size_t round = 0;
     while (true) {
         bool any = false;
-        std::vector<std::int32_t> host_ids(width * batch), host_pos(width * batch),
+        std::vector<std::int32_t> host_ids(columns_total), host_pos(columns_total),
             host_valid(batch), host_rows(batch), host_slots(batch), selectors(batch);
         std::uint32_t max_end = 0;
         for (int row = 0; row < batch; ++row) {
@@ -205,7 +206,8 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
                 target::Variant::gdn_norm_control_projection(
                     embedding, first.input_norm, target::TextConfig::rms_epsilon, first.projection,
                     normalized, g, beta, p.work, p.device.stream, w);
-                std::vector<std::uint16_t> bits(target::TextConfig::hidden * columns);
+                std::vector<std::uint16_t> bits(
+                    static_cast<std::size_t>(target::TextConfig::hidden) * columns);
                 CUDA_CHECK(cudaMemcpyAsync(bits.data(), normalized.data,
                                            bits.size() * sizeof(bits[0]), cudaMemcpyDeviceToHost,
                                            p.device.stream));
@@ -234,8 +236,8 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
                                  logits, tokens, sink);
         auto gold_tensor = p.work.alloc(ninfer::DType::I32, {w * batch});
         auto nll_tensor  = p.work.alloc(ninfer::DType::FP32, {w * batch});
-        std::vector<std::int32_t> gold_columns(width * batch);
-        std::vector<float> nll_columns(width * batch);
+        std::vector<std::int32_t> gold_columns(columns_total);
+        std::vector<float> nll_columns(columns_total);
         for (int row = 0; row < batch; ++row) {
             for (std::uint32_t col = 0; col < counts[row]; ++col) {
                 gold_columns[row * width + col] =
@@ -399,7 +401,7 @@ void check_decode(execution::ProgramImplCore& p, const family::Frontend& fronten
     const auto vocab  = target::TextConfig::output_rows;
     const auto domain = target::TextConfig::token_domain;
     std::vector<std::uint16_t> logits(static_cast<std::size_t>(vocab) * width * batch);
-    std::vector<std::int32_t> drafts((width - 1) * batch);
+    std::vector<std::int32_t> drafts(static_cast<std::size_t>(width - 1) * batch);
     unsigned checked = 0;
     for (unsigned round_index = 0; round_index < 16; ++round_index) {
         std::vector<std::uint32_t> old_execution(batch), old_ledger(batch);
@@ -408,7 +410,7 @@ void check_decode(execution::ProgramImplCore& p, const family::Frontend& fronten
             old_ledger[row]    = p.sequences[row].ledger_frontier;
         }
         const auto round  = p.decode_batch(lanes, budgets);
-        const auto& frame = *p.io.dflash_decode;
+        const auto& frame = p.io.dflash_decode.value();
         CUDA_CHECK(cudaMemcpy(logits.data(), frame.target_logits.data, logits.size() * 2,
                               cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(drafts.data(), frame.draft_tokens.data, drafts.size() * 4,
@@ -422,9 +424,10 @@ void check_decode(execution::ProgramImplCore& p, const family::Frontend& fronten
             for (unsigned col = 0; col < counts[row]; ++col) {
                 const auto token = round.tokens[row * round.row_stride + col];
                 require(token >= 0 && token < domain, "licensed token outside domain");
-                const auto* values = logits.data() + (row * width + col) * vocab;
-                double maximum     = -std::numeric_limits<double>::infinity();
-                int argmax         = 0;
+                const auto* values =
+                    logits.data() + (static_cast<std::size_t>(row) * width + col) * vocab;
+                double maximum = -std::numeric_limits<double>::infinity();
+                int argmax     = 0;
                 for (int v = 0; v < domain; ++v) {
                     require(std::isfinite(bf16(values[v])), "nonfinite candidate logit");
                     if (bf16(values[v]) > maximum) {
@@ -560,7 +563,7 @@ int main(int argc, char** argv) {
         const auto profile             = Package::resolve_weights(reader.identity(), binder);
         auto load = target::bind_artifact(binder, profile, family::startup_features(options));
         auto materialized = ninfer::artifact::materialize(reader, load.materialization, device);
-        target::LoadedModelData model(std::move(load.bindings), std::move(materialized));
+        target::LoadedModelData model(load.bindings, std::move(materialized));
         auto frontend = family::make_frontend(model.frontend, false);
         family::frontend_internal::Tokenizer tokenizer({model.frontend.tokenizer_json,
                                                         model.frontend.tokenizer_config_json,

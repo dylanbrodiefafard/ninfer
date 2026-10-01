@@ -72,7 +72,8 @@ std::uint32_t pick(const q36::AdaptiveDraftConfig& cfg, const q36::AdaptiveDraft
 
 void test_capture_set() {
     using ninfer::SpeculativeBackend;
-    const auto eq = [](std::vector<std::uint32_t> got, std::vector<std::uint32_t> want,
+    const auto eq = [](const std::vector<std::uint32_t>& got,
+                       const std::vector<std::uint32_t>& want,
                        std::string_view msg) { expect(got == want, msg); };
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive {3,4,5}");

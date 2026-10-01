@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -14,6 +16,7 @@
 #include <new>
 #include <span>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -170,7 +173,7 @@ bool looks_like_counting_collapse(const std::string& text) {
     int best = 0;
     std::string tok;
     const auto flush = [&](bool integer) {
-        if (integer && tok.size() >= 1 && tok.size() <= 4) {
+        if (integer && !tok.empty() && tok.size() <= 4) {
             ++run;
             if (run > best) { best = run; }
         } else {
@@ -1451,7 +1454,7 @@ int exercise_p_less_finished_thinking_followup(const char* artifact) {
 
 ninfer::PromptInput tool_loop_prompt(int completed_responses, bool preserve_thinking,
                                      bool enable_thinking) {
-    auto assistant_call = [](std::string reasoning, std::string id, std::string key) {
+    auto assistant_call = [](std::string reasoning, std::string id, const std::string& key) {
         ninfer::ChatMessage message = text_turn(ninfer::ChatRole::Assistant, "");
         message.reasoning_content   = std::move(reasoning);
         message.tool_calls.push_back(ninfer::ToolCall{
@@ -1810,6 +1813,7 @@ int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prom
     std::vector<decltype(engine.submit(engine.prepare_tokens(prompts[0]),
                                        greedy_options(lengths[0])))>
         handles;
+    handles.reserve(prompts.size());
     for (std::size_t i = 0; i < prompts.size(); ++i) {
         handles.push_back(
             engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(lengths[i])));
@@ -2088,8 +2092,15 @@ int main() {
             dflash_options.speculative.dflash_verify_width = draft_tokens + 1;
         }
         if (const char* verify_width = std::getenv("NINFER_DFLASH_TEST_VERIFY_WIDTH")) {
-            dflash_options.speculative.dflash_verify_width =
-                static_cast<std::uint32_t>(std::atoi(verify_width));
+            const char* const text_end     = verify_width + std::strlen(verify_width);
+            std::uint32_t width            = 0;
+            const auto [parsed_end, error] = std::from_chars(verify_width, text_end, width);
+            if (error != std::errc{} || parsed_end != text_end) {
+                std::cerr << "NINFER_DFLASH_TEST_VERIFY_WIDTH is not an unsigned 32-bit integer: '"
+                          << verify_width << "'\n";
+                return 1;
+            }
+            dflash_options.speculative.dflash_verify_width = width;
         }
         try {
             ninfer::Engine engine(dflash_options);
