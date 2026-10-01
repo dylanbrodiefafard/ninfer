@@ -106,6 +106,8 @@ routing map, not a mandatory reading list:
   performance-evidence rules;
 - `docs/maintainer/kernel-iteration.md`: Layer 0-3 CUDA speed procedure (`tools.kdev`
   bound/mma/Op sweep/production path);
+- `docs/maintainer/code-quality.md`: compiler-warning, clang-tidy, formatter, linter, spelling,
+  and sanitizer gates, their pinned versions, commands, and suppression policy;
 - `docs/maintainer/upstream-sync.md`: porting from upstream Neroued/ninfer `dev` (remote
   `upstream`): the last reviewed upstream commit and per-commit verdicts, so a new review starts
   after that watermark and updates it;
@@ -174,6 +176,56 @@ Where relevant to the changed behavior, account for numeric-format decode, BF16 
 GDN state, BF16/INT8/NVFP4 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address
 stability. This is a risk map, not a checklist for every numerical task.
 
+## Code and comment quality
+
+The quality bar is code a demanding senior reviewer would merge without comment, on the first
+submission. Every change is correct at its boundaries, explicit about ownership and invariants,
+consistent with the code around it, and free of anything it does not need. A change that works
+but is unclear, loosely typed, under-checked, or inaccurately commented is not finished; shipping
+sooner is never a reason to lower this bar.
+
+Code:
+
+- Encode invariants in types where C++ allows it: distinct enums or strong types rather than
+  interchangeable `bool`/`int` parameters, `[[nodiscard]]` on results that must be consumed,
+  `const`/`constexpr` by default, and RAII ownership for every resource (device memory, streams,
+  events, graphs, files, threads, sockets).
+- Check every fallible operation (CUDA runtime/driver calls, kernel launches, I/O, parsing,
+  allocation) where it fails, and propagate a typed error with context; never discard a status,
+  swallow an exception, or log-and-continue past a broken invariant.
+- Size, offset, and index arithmetic cannot overflow at real model shapes: 64-bit element and
+  byte offsets for tensors and arenas, explicit and justified narrowing, and no product of two
+  32-bit values widened after the fact.
+- No undefined behavior, data races, or unstated synchronization assumptions. A kernel's
+  correctness under concurrency is demonstrated with compute-sanitizer, not inferred.
+- No dead code, commented-out code, unused parameters or variables, debug output, duplicated
+  logic, or hooks for hypothetical callers. Names state meaning and unit (`bytes`, `elems`,
+  `tokens`, `rows`) where a bare number would be ambiguous.
+
+Comments:
+
+- Comments state what the code cannot: why this approach, the invariants and preconditions it
+  relies on, units, layouts, alignment, numerical reasoning, hardware limits, and
+  synchronization. A comment that restates the code is removed.
+- Every kernel documents its grid/block/warp-to-data mapping, shared-memory layout,
+  synchronization points, and the shapes and alignment it requires. Every Op and every
+  non-obvious interface documents preconditions, ownership and lifetime, and error behavior.
+- Comments are part of the change: code that changes without its comments is a defect, and a
+  stale or inaccurate comment is fixed or deleted when found.
+- Comments describe the current code, never its history or the process that produced it ("now",
+  "new", "fixed", "previously", "as requested", task or agent references); history belongs in
+  commit messages and the active references. No `TODO` without the concrete condition that
+  resolves it.
+- Comments and documentation are precise English in complete sentences, with correct spelling
+  and consistent terminology.
+
+Every applicable gate in [`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md)
+passes with zero findings before a commit: the `-Werror` build, `pre-commit run` (formatting,
+ruff, shellcheck, typos, file hygiene), and `./scripts/run-clang-tidy.py --changed` for any C++
+or CUDA change. Findings are fixed, including pre-existing ones on the lines a change touches; a
+suppression is reserved for correct code, is scoped to one line, and states its reason. Never
+weaken, disable, or bypass a gate (`--no-verify`, removing a check or flag) to land a change.
+
 ## Performance work
 
 CLI, serve, Engine A/Bs, and decode-speed work use the Engine default `--kv-dtype nvfp4` unless
@@ -205,12 +257,15 @@ active-link/stale-reference review and `git diff --check`; C++ runtime/API chang
 affected explicit targets and meaningful tests; Python tooling gets `py_compile` and affected
 Python tests; `.ninfer` reader/converter/binder changes get affected contract tests and a real
 artifact when semantics require it; CUDA math gets an independent numerical oracle at relevant
-shapes; memory/lifetime changes get the affected execution, with a sanitizer only for a
-concrete lifetime risk; performance changes get measurement at the claimed scope, with
+shapes; new or changed kernels with shared-memory staging, asynchronous copies, or warp-level
+synchronization get compute-sanitizer memcheck and racecheck on their tests; memory/lifetime
+changes get the affected execution, with initcheck or AddressSanitizer for a concrete lifetime
+risk; performance changes get measurement at the claimed scope, with
 attribution tools only when needed; serving changes get affected OpenAI/Anthropic schema tests
 and observable request/stream behavior.
 
-After substantial work, and before a commit or push, run the full C++ unit-test suite with
+The quality gates in `docs/maintainer/code-quality.md` apply to every change in addition to this
+evidence. After substantial work, and before a commit or push, run the full C++ unit-test suite with
 `./scripts/run-unit-tests.sh`. That command builds the test targets in the `ninfer-builder`
 GPU container and runs every CTest except the opt-in real-artifact Engine tests.
 `--real` includes those Engine tests and binds `.ninfer` files from `models/`, `/models`, or `models/weights.env`. Focused checks remain the right evidence during the work;
@@ -226,7 +281,8 @@ are checkout-specific, not a convention; normal build in `build/`; profiler outp
 CUDA 13.1; speed and Engine A/B work uses `--kv-dtype nvfp4`. GPU tests and kernel iteration
 run in the `ninfer-builder` container, started with `./scripts/dev-setup.sh`. That image is
 the Dockerfile `build` stage (`docker build --target build --tag local/ninfer-builder:5090 .`),
-not the runtime serve image. Use the selected Python 3.11 interpreter explicitly; do not
+not the runtime serve image, and it carries the pinned clang-tidy; the other quality tools are
+pinned in `.pre-commit-config.yaml` and installed by `pre-commit`. Use the selected Python 3.11 interpreter explicitly; do not
 install or upgrade dependencies unless the task requires it. Never select an artifact by glob,
 modification time, or an unqualified "latest" name; large artifacts, source checkpoints, and
 profiler outputs are local prerequisites, not things to download or regenerate unless in scope.

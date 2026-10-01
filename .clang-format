@@ -1,9 +1,10 @@
+# C++/CUDA layout. The clang-format version is pinned in .pre-commit-config.yaml.
 BasedOnStyle: LLVM
 
-# 预处理指令缩进
+# Preprocessor directive indentation
 IndentPPDirectives: AfterHash
 
-# 允许短句在同一行
+# Allow short statements on one line
 AllowShortIfStatementsOnASingleLine: true
 AllowShortLoopsOnASingleLine: true
 AllowShortBlocksOnASingleLine: true
@@ -12,7 +13,7 @@ AllowShortEnumsOnASingleLine: true
 
 ColumnLimit: 100
 
-# 连续声明对齐
+# Align consecutive declarations
 AlignConsecutiveAssignments: true
 AlignConsecutiveMacros: true
 AlignTrailingComments:
@@ -20,40 +21,40 @@ AlignTrailingComments:
   OverEmptyLines: 0
 # AlignConsecutiveDeclarations: true
 
-# 模板声明断行
+# Break after template declarations
 AlwaysBreakTemplateDeclarations: Yes
 
-# 打包参数
+# Bin-pack arguments
 BinPackArguments: true
 BinPackParameters: true
 
-# 大括号断行
+# Brace wrapping
 # BreakBeforeBraces: Allman
 
-# 移除访问修饰符之后所有的空行
+# Remove blank lines after access modifiers
 EmptyLineAfterAccessModifier: Never
 EmptyLineBeforeAccessModifier: Leave
 
-# include块风格
+# Include block style
 IncludeBlocks: Regroup
 SortIncludes: Never
 
 SortUsingDeclarations: Never
 
-# 打包构造函数初始化列表
+# Bin-pack constructor initializer lists
 PackConstructorInitializers: BinPack
 
-# 指针和引用对齐
+# Pointer and reference alignment
 PointerAlignment: Left
 ReferenceAlignment: Left
 
-# 分离定义语句块
+# Separate definition blocks
 SeparateDefinitionBlocks: Always
 
-# 缩进长度
+# Indentation width
 IndentWidth: 4
 TabWidth: 4
 AccessModifierOffset: -4
 
-# 最大空行数量
+# Maximum consecutive empty lines
 MaxEmptyLinesToKeep: 3
