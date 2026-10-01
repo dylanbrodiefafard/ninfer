@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -25,7 +25,7 @@ from .secrets import ResolvedTarget, resolve_target
 
 
 def _utc_compact() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 class TargetReservations:
@@ -301,7 +301,7 @@ class Coordinator:
                 final_status = "failed"
             write_summary(run_dir, run_id, final_status, ordered)
             state.update_run(
-                status=final_status, finished_at=datetime.now(timezone.utc).isoformat()
+                status=final_status, finished_at=datetime.now(UTC).isoformat()
             )
             events.emit(
                 RunEvent(
@@ -354,7 +354,7 @@ class Coordinator:
             status="running",
             error=None,
             granted_concurrency=granted,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
         )
         events.emit(
             RunEvent(
@@ -376,7 +376,7 @@ class Coordinator:
             state.update_job(
                 job.id,
                 status="completed",
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(UTC).isoformat(),
                 result=str((job_dir / "job-result.json").relative_to(jobs_dir.parent)),
             )
             events.emit(
@@ -404,7 +404,7 @@ class Coordinator:
             state.update_job(
                 job.id,
                 status="cancelled",
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(UTC).isoformat(),
             )
             events.emit(
                 RunEvent(
@@ -425,7 +425,7 @@ class Coordinator:
                 job.id,
                 status="failed",
                 error=str(exc),
-                finished_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(UTC).isoformat(),
             )
             events.emit(
                 RunEvent(
@@ -465,7 +465,7 @@ class Coordinator:
             "schema_version": 1,
             "run_id": run_id,
             "suite": self.suite_name,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "config_fingerprint": fingerprint,
             "framework_version": __version__,
             "python": sys.version,

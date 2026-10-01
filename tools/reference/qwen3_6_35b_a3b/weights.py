@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from math import prod
-from typing import Iterator, Sequence
-import warnings
 
 import torch
 
@@ -27,7 +27,6 @@ from .bindings import (
 )
 from .config import CFG
 
-
 GIB = 1 << 30
 PROGRAM_WORKSPACE_BYTES = 256 << 20
 _DIRECT_BYTES = {"BF16": 2, "FP32": 4, "I32": 4}
@@ -47,7 +46,8 @@ class MemoryPlan:
     streamed_blocks: int
 
     def summary(self) -> str:
-        gib = lambda value: value / GIB
+        def gib(value):
+            return value / GIB
         return (
             f"free={gib(self.free_bytes):.2f}GiB "
             f"headroom={gib(self.headroom_bytes):.2f}GiB "
@@ -506,8 +506,8 @@ class WeightStore:
 
 __all__ = [
     "GIB",
-    "MemoryPlan",
     "PROGRAM_WORKSPACE_BYTES",
+    "MemoryPlan",
     "WeightStore",
     "estimate_fixed_bytes",
 ]

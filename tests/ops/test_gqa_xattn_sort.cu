@@ -93,7 +93,7 @@ int run_case(int live, float* d_input_keys, int* d_input_ids, float* d_output_ke
                "copy input ids");
     constexpr std::size_t kSharedBytes =
         kMaxRank * (sizeof(float) + sizeof(int));
-    xattn_sort_oracle_kernel<<<1, kThreads, kSharedBytes>>>(
+    xattn_sort_oracle_kernel<<<1, kThreads, kSharedBytes, cudaStreamLegacy>>>(
         d_input_keys, d_input_ids, d_output_keys, d_output_ids, width);
     cuda_check(cudaGetLastError(), "launch XAttention sort oracle kernel");
 

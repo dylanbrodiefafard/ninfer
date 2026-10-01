@@ -61,10 +61,16 @@ void* operator new(std::size_t bytes) {
     throw std::bad_alloc();
 }
 void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+// The replacement operator new above allocates with malloc, so free is the matching release.
+// GCC 13 still pairs a std::allocator call to the replaceable operator new with this body once
+// it is inlined, and reports a malloc/new mismatch that cannot occur.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#pragma GCC diagnostic pop
 
 namespace {
 
@@ -5913,8 +5919,6 @@ int test_post_rename_failure_keeps_a_valid_generation(ninfer::DeviceContext& ctx
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit64 =
-        reopened.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
     const auto hit128 =
         reopened.plan_match(text_prompt(extended),
                             q36::detail::prefix_hash_chain(text_prompt(extended)));
@@ -5986,8 +5990,6 @@ int test_rollback_meta_failure_keeps_a_valid_generation(ninfer::DeviceContext& c
         disk.wait_idle_and_fsync();
     }
     q36::detail::KVDiskCache reopened(cfg);
-    const auto hit64 =
-        reopened.plan_match(text_prompt(aligned), q36::detail::prefix_hash_chain(text_prompt(aligned)));
     const auto hit128 =
         reopened.plan_match(text_prompt(extended),
                             q36::detail::prefix_hash_chain(text_prompt(extended)));
@@ -13044,7 +13046,7 @@ int test_startup_allocation_preserves_ownership(ninfer::DeviceContext& ctx,
                                                 int selected_stage = -1) {
     // Bucket, FIFO, node and staging buckets; skipped ownership; spawned worker;
     // fallback rebuild after an indexed or skipped manifest prefix was loaded.
-    for (const auto [stage, after, too_long] : {
+    for (const auto& [stage, after, too_long] : {
              std::tuple{0, 0, false}, std::tuple{0, 1, false},
              std::tuple{0, 2, false}, std::tuple{0, 3, false},
              std::tuple{1, 0, true}, std::tuple{2, 0, false},

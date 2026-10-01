@@ -33,11 +33,11 @@ speed path.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Iterator, Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -46,11 +46,14 @@ from tools.artifact.container import (
     ArtifactIdentity,
     ArtifactWriter,
     ResourceObject,
-    ResourceSpec as ArtifactResourceSpec,
     TensorObject,
+)
+from tools.artifact.container import (
+    ResourceSpec as ArtifactResourceSpec,
+)
+from tools.artifact.container import (
     TensorSpec as ArtifactTensorSpec,
 )
-from tools.artifact.layouts import encode_direct
 from tools.convert.common.nvfp4_quantize import ENCODER_PROFILE, encode_nvfp4_from_bf16
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
@@ -58,7 +61,6 @@ from tools.convert.qwen3_6.common import conversion as family_conversion
 from tools.convert.qwen3_6.common.inventory import TensorSpec
 
 from . import inventory_dflash2 as dflash2
-
 
 RECIPE_ID = "qwen3_8_27b_nvfp4_dflash2-v1"
 _COPY_CHUNK = 64 << 20

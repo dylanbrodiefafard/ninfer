@@ -160,8 +160,7 @@ inline constexpr std::uint32_t kPackMapBaseHeaderBytes = 8 + 4 + 4 + 8 + 8 + 8 +
 }
 
 #if defined(__x86_64__)
-__attribute__((target("sse4.2")))
-[[nodiscard]] std::uint32_t crc32c_update_hardware(
+[[nodiscard]] __attribute__((target("sse4.2"))) std::uint32_t crc32c_update_hardware(
     std::uint32_t crc, std::span<const std::uint8_t> bytes) noexcept {
     const auto* data = bytes.data();
     std::size_t size = bytes.size();
@@ -204,8 +203,7 @@ __attribute__((target("sse4.2")))
                                             std::uint64_t right_bytes) noexcept;
 
 #if defined(__x86_64__)
-__attribute__((target("sse4.2")))
-[[nodiscard]] std::uint32_t crc32c_three_way_hardware(
+[[nodiscard]] __attribute__((target("sse4.2"))) std::uint32_t crc32c_three_way_hardware(
     std::span<const std::uint8_t> bytes) noexcept {
     const std::size_t block = (bytes.size() / 3) & ~std::size_t{7};
     const auto* first = bytes.data();

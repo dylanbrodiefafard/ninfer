@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 # RTX 5090 facts used by the Linear bench contract.
 DRAM_SPEC_GB_S = 1792.0
@@ -561,7 +560,7 @@ def analyze(
     if idea_card and idea_card["verdict"] == "refuse":
         next_step = f"REFUSE this idea. {idea_card['reason']}"
     elif idea_card and idea_card["verdict"] == "allow":
-        next_step = f"Allowed. Implement only as a parameter inside the current family, then Layer 2 microbench."
+        next_step = "Allowed. Implement only as a parameter inside the current family, then Layer 2 microbench."
         if idea_card["name"] == "quality_tradeoff":
             next_step = "Requested quality candidate admitted. Verify candidate ISA and oracle, then measure public-Op latency before paired model quality. Existing roof is baseline-only."
     elif idea_card and idea_card["name"] == "grid_underfill":
@@ -615,8 +614,8 @@ def render(card: dict) -> str:
     idea = card.get("idea")
     verdict = (idea or {}).get("verdict", "n/a")
     lines = [
-        f"[kdev-bound] {card.get('label') or 'linear'} "
-        f"[{p['n']},{p['k']}] T={p['t']} {p['qtype']} {p['policy']} phase={p['phase']}",
+        (f"[kdev-bound] {card.get('label') or 'linear'} "
+        f"[{p['n']},{p['k']}] T={p['t']} {p['qtype']} {p['policy']} phase={p['phase']}"),
         f"       bound={card['bound']}  AI={card['ai_flop_per_byte']:.1f} FLOP/B  "
         f"ridge={card['ridge_flop_per_byte']:.0f} FLOP/B"
         + (f"  ridge_T≈{card['ridge_t']:.0f}" if card.get("ridge_t") else ""),

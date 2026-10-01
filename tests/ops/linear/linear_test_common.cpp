@@ -417,11 +417,11 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                         const auto canonical = compute_reduction_stats(actual.selected.data(), reference.data(), reference.size());
                         auto criterion = tolerance_for(ActivationCompute::A16);
                         failures += verify_reduction(case_label + " codec residual", actual.selected, quantized, criterion);
-                        double squared = 0, maximum = 0;
-                        for (double v : quantized) { squared += v * v; maximum = std::max(maximum, std::abs(v)); }
+                        double squared = 0, max_quantized = 0;
+                        for (double v : quantized) { squared += v * v; max_quantized = std::max(max_quantized, std::abs(v)); }
                         criterion.relative_l2 = distortion.relative_l2 + criterion.relative_l2 *
                             std::sqrt(squared / quantized.size()) / std::max(distortion.reference_root_mean_square, 1e-30);
-                        criterion.gross_absolute += distortion.maximum_absolute_error + criterion.gross_relative_to_max_reference * maximum;
+                        criterion.gross_absolute += distortion.maximum_absolute_error + criterion.gross_relative_to_max_reference * max_quantized;
                         criterion.gross_relative_to_max_reference = 0;
                         failures += verify_reduction(case_label + " canonical", actual.selected, reference, criterion);
                         std::cout << case_label << " canonical=" << canonical.relative_l2

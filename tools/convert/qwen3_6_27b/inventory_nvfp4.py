@@ -6,7 +6,6 @@ from tools.convert.qwen3_6.common.inventory import TensorSpec
 
 from . import inventory as base
 
-
 MODEL_ID = base.MODEL_ID
 WEIGHTS_ID = "nvfp4"
 TARGET_KEY = base.TARGET_KEY
@@ -227,7 +226,8 @@ LOGICAL_ROW_VIEW_SPECS = (
         (6144, 5120),
         GDN_LAYERS,
     ),
-) + base.LOGICAL_ROW_VIEW_SPECS[8:]
+    *base.LOGICAL_ROW_VIEW_SPECS[8:],
+)
 ALIAS_SPECS = base.ALIAS_SPECS
 
 NVFP4_TENSOR_SPECS = tuple(
@@ -301,13 +301,13 @@ __all__ = [
     "Q5",
     "Q6",
     "RESOURCE_SPECS",
-    "ResourceSpec",
-    "StoredObjectSpec",
     "TARGET_KEY",
     "TENSOR_SPECS",
     "TEXT_CORE_TENSOR_SPECS",
-    "TensorSpec",
     "VISION_TENSOR_SPECS",
     "W8",
+    "ResourceSpec",
+    "StoredObjectSpec",
+    "TensorSpec",
     "validate_inventory",
 ]

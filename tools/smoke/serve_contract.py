@@ -10,7 +10,6 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-
 # A one-pixel PNG. The target frontend performs its normal resize/patch expansion.
 _IMAGE_DATA_URI = (
     "data:image/png;base64,"

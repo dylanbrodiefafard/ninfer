@@ -5,9 +5,9 @@ maximum acceptable reasoning length. A normal length finish is NOT a loop failur
 """
 import argparse
 import json
-from pathlib import Path
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from jsonschema import validate
 

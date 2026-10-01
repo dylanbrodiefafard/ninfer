@@ -6,19 +6,31 @@ norms and any draft. No source-FP8 bank, alternate checkpoint or GPU is needed.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
 
-from tools.artifact.container import (Artifact, ArtifactIdentity, ArtifactWriter,
-                                      ResourceObject, ResourceSpec, TensorObject, TensorSpec)
+from tools.artifact.container import (
+    Artifact,
+    ArtifactIdentity,
+    ArtifactWriter,
+    ResourceObject,
+    ResourceSpec,
+    TensorObject,
+    TensorSpec,
+)
 from tools.artifact.layouts import encode_fp8_row_scaled
 from tools.convert.common.safetensors import ShardReader
-from tools.convert.qwen3_6.common.recipe import (Concat, TensorRecipe, expression_shape,
-    materialize_recipe, preflight_source_reader)
+from tools.convert.qwen3_6.common.recipe import (
+    Concat,
+    TensorRecipe,
+    expression_shape,
+    materialize_recipe,
+    preflight_source_reader,
+)
 from tools.convert.qwen3_6_27b import recipe as family_recipe
 from tools.convert.qwen3_6_27b.convert import validate_config
 
@@ -120,7 +132,7 @@ def convert(base_path: Path, model_path: Path, output: Path) -> Path:
                     del weights,payload
                     print('FP8',obj.name,flush=True)
                 else:
-                    def copied_chunks():
+                    def copied_chunks(obj=obj,digest=digest):
                         for chunk in _chunks(base,obj):
                             digest.update(chunk)
                             yield chunk

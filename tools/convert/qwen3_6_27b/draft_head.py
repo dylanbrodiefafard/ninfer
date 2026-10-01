@@ -12,14 +12,17 @@ import numpy as np
 
 from tools.convert.qwen3_6.common.draft_head import (
     DraftHeadContext,
-    compute_shortlist as _compute_shortlist,
-    load_total_counts as _load_total_counts,
     materialize_draft_head,
     materialize_draft_head_token_ids,
     read_special_ids,
     select_shortlist,
 )
-
+from tools.convert.qwen3_6.common.draft_head import (
+    compute_shortlist as _compute_shortlist,
+)
+from tools.convert.qwen3_6.common.draft_head import (
+    load_total_counts as _load_total_counts,
+)
 
 VOCAB_SIZE = 248320
 TOKENIZER_VOCAB_SIZE = 248077
@@ -64,9 +67,9 @@ __all__ = [
     "DRAFT_HEAD_OBJECT",
     "DRAFT_HEAD_TOKEN_IDS_OBJECT",
     "DRAFT_HEAD_WIDTH",
-    "DraftHeadContext",
     "TOKENIZER_VOCAB_SIZE",
     "VOCAB_SIZE",
+    "DraftHeadContext",
     "compute_shortlist",
     "load_total_counts",
     "materialize_draft_head",

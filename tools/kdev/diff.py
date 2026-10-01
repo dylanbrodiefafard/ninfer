@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 
 from . import harness, registry
@@ -53,7 +52,7 @@ def run_diff(op_name: str, rel_tol: float = 1e-4, abs_tol: float = 1e-5) -> dict
         ref = stage.get("ref", [])
         first = None
         max_rel = 0.0
-        for i, (kv, rv) in enumerate(zip(kernel, ref)):
+        for i, (kv, rv) in enumerate(zip(kernel, ref, strict=True)):
             denom = max(abs(rv), 1e-30)
             rel = abs(kv - rv) / denom
             max_rel = max(max_rel, rel)
@@ -84,8 +83,8 @@ def run_diff(op_name: str, rel_tol: float = 1e-4, abs_tol: float = 1e-5) -> dict
 def render(report: dict) -> str:
     if not report.get("ok"):
         return f"[kdev-diff] {report['op']}: could not produce dump:\n{report.get('error','')}"
-    lines = [f"[kdev-diff] {report['op']} case='{report['case']}' rows={report['rows']}"
-             f" (rel_tol={report['rel_tol']:.0e} abs_tol={report['abs_tol']:.0e})"]
+    lines = [(f"[kdev-diff] {report['op']} case='{report['case']}' rows={report['rows']}"
+             f" (rel_tol={report['rel_tol']:.0e} abs_tol={report['abs_tol']:.0e})")]
     for stage in report["stages"]:
         if stage["clean"]:
             lines.append(f"  {stage['name']:<6} clean (max rel {stage['max_rel']:.2e})")
@@ -143,8 +142,8 @@ def run_s3_diff(op_name: str) -> dict:
 def render_s3(report: dict) -> str:
     if not report.get("ok"):
         return f"[kdev-s3diff] {report['op']}: could not produce s3 dump:\n{report.get('error','')}"
-    lines = [f"[kdev-s3diff] {report['op']} case='{report['case']}' "
-             f"(heads={report.get('heads')} rows={report.get('rows')})"]
+    lines = [(f"[kdev-s3diff] {report['op']} case='{report['case']}' "
+             f"(heads={report.get('heads')} rows={report.get('rows')})")]
     for s in report["stages"]:
         name = s["name"]
         if name in ("p_code", "psf"):

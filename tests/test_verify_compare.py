@@ -1,7 +1,7 @@
 """Observable paired-score accounting and distribution diagnostics."""
 
-import math
 import json
+import math
 import struct
 import tempfile
 import unittest

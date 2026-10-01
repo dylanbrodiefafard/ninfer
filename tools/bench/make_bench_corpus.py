@@ -32,8 +32,9 @@ import json
 import math
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 TOKENIZER_MODEL_ID = "Qwen/Qwen3.6-27B"
 DEFAULT_TOKENS = 65536
@@ -44,41 +45,41 @@ DEFAULT_TOKENS = 65536
 # so this bank fills long corpora by rotated tiling. For genuinely diverse very long content, pass
 # --source-text instead.
 PARAGRAPHS: tuple[str, ...] = (
-    "周末旅行规划资料：目的地是一个适合亲子散步的湖边小城，市中心到湖区有直达公交，车程大约"
+    ("周末旅行规划资料：目的地是一个适合亲子散步的湖边小城，市中心到湖区有直达公交，车程大约"
     "四十分钟。周六下午两点以后人流会增加，建议提前购买返程车票，并把儿童水杯、薄外套、充电宝"
-    "和少量现金放在随身包里。",
-    "天气预报显示周六白天多云，傍晚可能有小雨，湖边风会比城区更明显。行程中可以安排室内书店、"
-    "湖边步道和家庭餐厅三个停留点，这样下雨时也能快速调整，不需要临时寻找避雨地点。",
-    "餐饮方面，湖区东门附近有一家面馆和一家简餐店，面馆上菜快，适合孩子饿的时候优先选择；简餐店"
+    "和少量现金放在随身包里。"),
+    ("天气预报显示周六白天多云，傍晚可能有小雨，湖边风会比城区更明显。行程中可以安排室内书店、"
+    "湖边步道和家庭餐厅三个停留点，这样下雨时也能快速调整，不需要临时寻找避雨地点。"),
+    ("餐饮方面，湖区东门附近有一家面馆和一家简餐店，面馆上菜快，适合孩子饿的时候优先选择；简餐店"
     "座位宽敞，但晚餐高峰可能排队二十分钟。预算按交通、饮料、晚餐和临时雨具计算，一家三口控制在"
-    "三百元以内比较稳妥。",
-    "光合作用是绿色植物把二氧化碳和水，在光照和叶绿素的参与下转化为葡萄糖并释放氧气的过程。它分为"
+    "三百元以内比较稳妥。"),
+    ("光合作用是绿色植物把二氧化碳和水，在光照和叶绿素的参与下转化为葡萄糖并释放氧气的过程。它分为"
     "依赖光的反应和不依赖光的碳同化两个阶段，前者在类囊体膜上进行，后者主要在叶绿体基质中完成，"
-    "共同支撑了地球上绝大多数生态系统的能量来源。",
-    "丝绸之路并不是一条单独的道路，而是横贯欧亚大陆的商路网络。沿途的绿洲城市既是补给点，也是不同"
+    "共同支撑了地球上绝大多数生态系统的能量来源。"),
+    ("丝绸之路并不是一条单独的道路，而是横贯欧亚大陆的商路网络。沿途的绿洲城市既是补给点，也是不同"
     "语言、宗教和技术交流的枢纽；除了丝绸，还流通着香料、纸张、玻璃和数学天文知识，深刻影响了沿线"
-    "文明的发展节奏。",
-    "A single-stream language model runtime spends almost all of its decode time moving weights "
+    "文明的发展节奏。"),
+    ("A single-stream language model runtime spends almost all of its decode time moving weights "
     "from memory, so throughput at batch size one is bounded by memory bandwidth rather than raw "
     "arithmetic. Prefill, by contrast, processes the whole prompt at once and is usually compute "
-    "bound, which is why the two phases must be measured separately.",
-    "When you profile an inference engine, keep the prompt content fixed and vary only the lengths "
+    "bound, which is why the two phases must be measured separately."),
+    ("When you profile an inference engine, keep the prompt content fixed and vary only the lengths "
     "you care about. Report prefill tokens per second and decode tokens per second as independent "
     "numbers, because a change that speeds up one phase can easily slow down the other, and an "
-    "averaged single figure hides that trade-off.",
-    "Distributed systems replace the certainty of a single machine with probabilities. Messages are "
+    "averaged single figure hides that trade-off."),
+    ("Distributed systems replace the certainty of a single machine with probabilities. Messages are "
     "delayed, reordered, or lost; clocks drift; and any node can fail at the least convenient moment. "
     "Good designs therefore assume partial failure from the start, favouring idempotent operations, "
-    "explicit timeouts, and state that can be reconstructed rather than trusted blindly.",
-    "A vegetable garden rewards patience more than effort. Seeds need warmth and consistent moisture "
+    "explicit timeouts, and state that can be reconstructed rather than trusted blindly."),
+    ("A vegetable garden rewards patience more than effort. Seeds need warmth and consistent moisture "
     "to germinate, seedlings need light and room to breathe, and mature plants need steady feeding "
     "and a watchful eye for pests. The gardener who checks a little every day usually harvests far "
-    "more than the one who works furiously once a week.",
-    "In economics, opportunity cost is the value of the best alternative you give up when you make a "
+    "more than the one who works furiously once a week."),
+    ("In economics, opportunity cost is the value of the best alternative you give up when you make a "
     "choice. It reminds us that resources spent on one project are unavailable for another, so a "
     "decision that looks free in cash terms can still be expensive once the road not taken is priced "
-    "in honestly.",
-    "def moving_average(values, window):\n"
+    "in honestly."),
+    ("def moving_average(values, window):\n"
     "    if window <= 0:\n"
     "        raise ValueError(\"window must be positive\")\n"
     "    total = 0.0\n"
@@ -89,8 +90,8 @@ PARAGRAPHS: tuple[str, ...] = (
     "            total -= values[index - window]\n"
     "        if index >= window - 1:\n"
     "            result.append(total / window)\n"
-    "    return result",
-    "template <typename T>\n"
+    "    return result"),
+    ("template <typename T>\n"
     "T clamp(T value, T low, T high) {\n"
     "    if (value < low) {\n"
     "        return low;\n"
@@ -99,31 +100,31 @@ PARAGRAPHS: tuple[str, ...] = (
     "        return high;\n"
     "    }\n"
     "    return value;\n"
-    "}",
-    "SELECT department_id, AVG(salary) AS avg_salary, COUNT(*) AS headcount\n"
+    "}"),
+    ("SELECT department_id, AVG(salary) AS avg_salary, COUNT(*) AS headcount\n"
     "FROM employees\n"
     "WHERE hire_date >= '2020-01-01'\n"
     "GROUP BY department_id\n"
     "HAVING COUNT(*) >= 5\n"
-    "ORDER BY avg_salary DESC;",
-    "Consider a sequence defined by a_1 = 1 and a_{n+1} = a_n + 1 / a_n for n >= 1. Each step adds a "
+    "ORDER BY avg_salary DESC;"),
+    ("Consider a sequence defined by a_1 = 1 and a_{n+1} = a_n + 1 / a_n for n >= 1. Each step adds a "
     "positive amount, so the sequence is strictly increasing. Squaring the recurrence gives "
     "a_{n+1}^2 = a_n^2 + 2 + 1 / a_n^2, hence a_n^2 grows at least linearly and a_n is on the order "
-    "of the square root of 2n for large n.",
-    "The probability that at least two people in a room of twenty-three share a birthday is greater "
+    "of the square root of 2n for large n."),
+    ("The probability that at least two people in a room of twenty-three share a birthday is greater "
     "than one half. The result feels surprising because we instinctively compare ourselves to one "
     "other person, but there are two hundred fifty-three distinct pairs among twenty-three people, "
-    "and it is the number of pairs, not the number of people, that drives the collision.",
-    "睡眠不是简单的休息，而是大脑进行记忆巩固和代谢清理的重要阶段。深度睡眠有助于把当天的短期记忆"
+    "and it is the number of pairs, not the number of people, that drives the collision."),
+    ("睡眠不是简单的休息，而是大脑进行记忆巩固和代谢清理的重要阶段。深度睡眠有助于把当天的短期记忆"
     "转为长期记忆，而快速眼动睡眠与情绪调节和创造性联想相关。长期睡眠不足会削弱注意力、判断力和"
-    "免疫功能，其代价往往在数周后才显现。",
-    "会议纪要：本周完成了基准测试工具的重构评审，确认新的吞吐量工具只负责测速，正确性与逐层对齐仍由"
+    "免疫功能，其代价往往在数周后才显现。"),
+    ("会议纪要：本周完成了基准测试工具的重构评审，确认新的吞吐量工具只负责测速，正确性与逐层对齐仍由"
     "独立的校验工具负责。下一步先固化预填充与解码两个阶段的计时边界，再补充机器可读的输出格式，方便"
-    "把历史结果归档和比较。",
-    "Reproducibility is the quiet backbone of good benchmarking. Fix the model, the input tokens, the "
+    "把历史结果归档和比较。"),
+    ("Reproducibility is the quiet backbone of good benchmarking. Fix the model, the input tokens, the "
     "context length, and the measurement boundary, then record the exact command, the commit, and the "
     "hardware. A number without that context is a rumour; a number with it is evidence others can "
-    "check and build on.",
+    "check and build on."),
 )
 
 

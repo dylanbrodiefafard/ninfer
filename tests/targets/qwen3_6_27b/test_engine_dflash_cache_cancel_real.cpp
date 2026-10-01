@@ -248,7 +248,7 @@ void exercise_c2_admission(const char* artifact) {
         for (unsigned round = 0; round < 3; ++round) {
             deadline.phase = "seed disk target with one-entry RAM";
             Tokens source = prompt;
-            source[3] += round;
+            source.at(3) += round;
             const auto first = engine->generate(engine->prepare_tokens(source), greedy(16, false));
             if (first.speculative.rounds == 0 || first.generated_token_ids.size() < 2) {
                 throw std::runtime_error("full-RAM C2 fixture did not execute DFlash");

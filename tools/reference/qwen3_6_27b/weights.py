@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from math import prod
-from typing import Iterator, Sequence
-import warnings
 
 import torch
 
@@ -18,15 +18,14 @@ from tools.artifact import (
 )
 
 from .bindings import (
+    ArtifactBinding,
     AxisView,
     LogicalRowView,
     PhysicalBlock,
     RowAddressable,
     WeightObject,
-    ArtifactBinding,
 )
 from .config import CFG
-
 
 GIB = 1 << 30
 _DIRECT_BYTES = {"BF16": 2, "FP32": 4, "I32": 4}
@@ -46,7 +45,8 @@ class MemoryPlan:
     streamed_blocks: int
 
     def summary(self) -> str:
-        gib = lambda value: value / GIB
+        def gib(value):
+            return value / GIB
         return (
             f"free={gib(self.free_bytes):.2f}GiB "
             f"headroom={gib(self.headroom_bytes):.2f}GiB "

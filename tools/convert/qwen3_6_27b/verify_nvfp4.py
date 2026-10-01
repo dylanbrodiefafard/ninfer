@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from dataclasses import asdict, dataclass
 import json
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
 
-from safetensors import safe_open
 import torch
+from safetensors import safe_open
 
 from tools.artifact.container import (
     Artifact,
@@ -73,7 +73,7 @@ def validate_structure(artifact: Artifact) -> int:
     formats: Counter[str] = Counter()
     layouts: Counter[str] = Counter()
     for position, (actual, expected) in enumerate(
-        zip(artifact.objects, inventory.OBJECT_SPECS)
+        zip(artifact.objects, inventory.OBJECT_SPECS, strict=True)
     ):
         if actual.name != expected.name:
             _error(

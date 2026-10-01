@@ -172,9 +172,8 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
 }
 
 void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream) {
-    if (page_ids.empty()) { return; }
-
     std::vector<std::int32_t> sorted(page_ids.begin(), page_ids.end());
+    if (sorted.empty()) { return; }
     std::sort(sorted.begin(), sorted.end());
     if (sorted.front() < 0 || sorted.back() >= static_cast<std::int32_t>(page_group_count())) {
         throw std::out_of_range("Paged KV physical page is out of range");

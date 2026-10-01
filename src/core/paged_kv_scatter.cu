@@ -15,9 +15,9 @@ __global__ void scatter_paged_kv_page(const unsigned char* packed,
                                       std::size_t max_plane_bytes) {
     const std::size_t plane_index = blockIdx.y;
     if (plane_index >= plane_count) { return; }
-    __shared__ PagedKVScatterPlane plane;
-    if (threadIdx.x == 0) { plane = planes[plane_index]; }
-    __syncthreads();
+    // Every thread reads the same descriptor, so the load is a broadcast. A __shared__ copy is
+    // not used: the type's default member initializers cannot apply to shared storage.
+    const PagedKVScatterPlane plane = planes[plane_index];
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= plane.packed_bytes || index >= max_plane_bytes) { return; }
     const std::size_t row = index / plane.row_bytes;
@@ -48,9 +48,8 @@ PagedKVScatterPlan make_paged_kv_scatter_plan(const PagedKVPool& pool) {
             plane.row_bytes    = static_cast<std::uint32_t>(tensor.nb[3]);
             plane.rows         = 1;
         } else {
-            if (tensor.ne[3] <= 0 || tensor.ne[3] > std::numeric_limits<std::uint32_t>::max() ||
-                tensor.nb[2] <= 0 || tensor.nb[2] > std::numeric_limits<std::uint32_t>::max() ||
-                tensor.nb[3] <= 0) {
+            if (tensor.ne[3] <= 0 || tensor.nb[2] <= 0 ||
+                tensor.nb[2] > std::numeric_limits<std::uint32_t>::max() || tensor.nb[3] <= 0) {
                 throw std::logic_error("Paged KV HeadMajor scatter geometry is invalid");
             }
             plane.packed_bytes = static_cast<std::uint64_t>(tensor.ne[3]) * tensor.nb[2];

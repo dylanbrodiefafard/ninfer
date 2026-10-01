@@ -160,8 +160,8 @@ std::size_t kv_input_index(const Geometry& geometry, std::int32_t head, std::int
                 static_cast<std::size_t>(geometry.kv_heads) * static_cast<std::size_t>(token));
 }
 
-std::size_t cache_index(const Geometry& geometry, std::int32_t padded_context, std::int32_t head,
-                        std::int32_t position, std::int32_t d) {
+std::size_t cache_index(std::int32_t padded_context, std::int32_t head, std::int32_t position,
+                        std::int32_t d) {
     return static_cast<std::size_t>(d) +
            static_cast<std::size_t>(kHeadDim) *
                (static_cast<std::size_t>(position) +
@@ -243,7 +243,7 @@ void encode_sage_v_dp(const Geometry& geometry, std::int32_t padded_context, std
     float max0 = 0.0f;
     float max1 = 0.0f;
     for (std::int32_t j = 0; j < 16; ++j) {
-        const std::size_t base = cache_index(geometry, padded_context, head, key0 + j, d0);
+        const std::size_t base = cache_index(padded_context, head, key0 + j, d0);
         max0 = std::max(max0, std::abs(logical_v[base]));
         max1 = std::max(max1, std::abs(logical_v[base + 1]));
     }
@@ -254,7 +254,7 @@ void encode_sage_v_dp(const Geometry& geometry, std::int32_t padded_context, std
     scales[sage_v_scale_host_index(padded_context, head, page, d0, key_block)]      = sc0;
     scales[sage_v_scale_host_index(padded_context, head, page, d0 + 1, key_block)]  = sc1;
     for (std::int32_t j = 0; j < 16; ++j) {
-        const std::size_t base = cache_index(geometry, padded_context, head, key0 + j, d0);
+        const std::size_t base = cache_index(padded_context, head, key0 + j, d0);
         const std::size_t code = nvfp4_code_index(geometry, padded_context, head, key0 + j, dp);
         const float x          = dec0 == 0.0f ? 0.0f : logical_v[base] / dec0;
         const float y          = dec1 == 0.0f ? 0.0f : logical_v[base + 1] / dec1;
@@ -580,7 +580,7 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
                     for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
                         const std::int32_t d = group * kNvfp4Group;
                         const std::size_t source =
-                            cache_index(geometry, logical_capacity, head, position, d);
+                            cache_index(logical_capacity, head, position, d);
                         const std::size_t code = nvfp4_code_index(geometry, logical_capacity, head,
                                                                   position, group * 8);
                         const std::size_t scale =
@@ -604,7 +604,7 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
                 for (std::int32_t group = 0; group < kNvfp4Groups; ++group) {
                     const std::int32_t d = group * kNvfp4Group;
                     const std::size_t source =
-                        cache_index(geometry, logical_capacity, head, position, d);
+                        cache_index(logical_capacity, head, position, d);
                     const std::size_t code =
                         nvfp4_code_index(geometry, logical_capacity, head, position, group * 8);
                     const std::size_t scale =
@@ -626,7 +626,7 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
                 const std::int32_t d   = group * kQuantGroup;
-                const std::size_t code = cache_index(geometry, logical_capacity, head, position, d);
+                const std::size_t code = cache_index(logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, logical_capacity, head, position, group);
                 encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
@@ -647,7 +647,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     const std::size_t source = kv_input_index(geometry, head, d, token);
                     const std::size_t target =
-                        cache_index(geometry, cache.logical_capacity, head, position, d);
+                        cache_index(cache.logical_capacity, head, position, d);
                     cache.k_bf16[target] = f32_to_bf16(k[source]);
                     cache.v_bf16[target] = f32_to_bf16(v[source]);
                 }
@@ -679,7 +679,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                 const std::int32_t d     = group * kQuantGroup;
                 const std::size_t source = kv_input_index(geometry, head, d, token);
                 const std::size_t target =
-                    cache_index(geometry, cache.logical_capacity, head, position, d);
+                    cache_index(cache.logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, cache.logical_capacity, head, position, group);
                 encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
@@ -791,7 +791,7 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
 
 double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int32_t position,
                    std::int32_t d) {
-    const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
+    const std::size_t code = cache_index(cache.logical_capacity, head, position, d);
     if (cache.dtype == DType::BF16) {
         return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
     }
@@ -913,13 +913,11 @@ double sage_qk_dot(const SageSmoothQ& sq, const HostCache& cache, std::int32_t k
 // max — mirroring the kernel's S-argument exactly. A correct kernel must sit
 // within ~1e-4 of this (its extra error is fp32 exp2/divide/accumulate noise);
 // a residual of O(0.01+) localizes a real kernel bug.
-void sage_orc_pdump(const std::string& label, const std::vector<float>& q, const HostCache& cache,
-                    const std::vector<std::int32_t>& positions) {
+void sage_orc_pdump(const std::string& label, const std::vector<float>& q, const HostCache& cache) {
     if (std::getenv("S3_ORC_DUMP") == nullptr) { return; }
     constexpr double kLog2E = 1.4426950408889634;
     constexpr double kAmp   = 2688.0;
     constexpr double kSMax  = 448.0;
-    static const double kPTableEmu[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
     const Geometry& geometry = cache.geometry;
     // CTA (q_head=0, q_block=0, kb=0) rows = the first 16 NEW tokens (local
     // index 0..15) of q_head 0; first tile = keys 0..63 (S-arg = tile max).
@@ -1253,211 +1251,6 @@ std::vector<double> sage_ideal_attention(const std::vector<float>& q, const Host
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 output[q_index(geometry, q_head, d, token)] =
                     l_sum > 0.0 ? value[static_cast<std::size_t>(d)] / (kAmp * l_sum) : 0.0;
-            }
-        }
-    }
-    return output;
-}
-
-// Decoded per-kv-head keep sets for the decode tile-skip oracle: kept[tile] is
-// true when the rank kernel kept that Bc-key tile of the kv head's window.
-struct KeptTileSets {
-    std::int32_t kv_heads  = 0;
-    std::int32_t tiles     = 0;
-    std::vector<std::vector<bool>> kept;
-};
-
-KeptTileSets build_kept_tile_sets(const std::vector<std::int32_t>& keep_tiles,
-                                  const std::vector<std::int32_t>& keep_count, std::int32_t tiles,
-                                  std::int32_t keep_tiles_stride) {
-    const std::int32_t kv_rows = static_cast<std::int32_t>(keep_count.size());
-    KeptTileSets sets;
-    sets.kv_heads = kv_rows;
-    sets.tiles    = tiles;
-    sets.kept.resize(static_cast<std::size_t>(kv_rows));
-    for (std::int32_t h = 0; h < kv_rows; ++h) {
-        sets.kept[static_cast<std::size_t>(h)].assign(static_cast<std::size_t>(tiles), false);
-        const std::int32_t n = keep_count[static_cast<std::size_t>(h)];
-        if (n < 0 || n > tiles) {
-            throw std::invalid_argument("decode rank keep count out of range");
-        }
-        for (std::int32_t i = 0; i < n; ++i) {
-            const std::int32_t tile =
-                keep_tiles[static_cast<std::size_t>(h) * keep_tiles_stride + i];
-            if (tile < 0 || tile >= tiles) {
-                throw std::invalid_argument("decode rank keep tile out of range");
-            }
-            sets.kept[static_cast<std::size_t>(h)][static_cast<std::size_t>(tile)] = true;
-        }
-    }
-    return sets;
-}
-
-// Sage (FP4-PV recipe) reference restricted to the per-kv-head kept tiles: the
-// kernel's decode tile-skip computes attention over kept tiles only, so the
-// oracle reference is the same codec-faithful body as sage_ideal_attention with
-// non-kept keys excluded (their P is -inf: out of the L sum, out of the PV).
-std::vector<double> sage_ideal_attention_kept(const std::vector<float>& q, const HostCache& cache,
-                                               const std::vector<std::int32_t>& positions,
-                                               const KeptTileSets& kept, std::int32_t tile_block) {
-    constexpr double kLog2E = 1.4426950408889634;
-    const Geometry& geometry  = cache.geometry;
-    const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
-    std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
-                               static_cast<std::size_t>(geometry.q_heads) *
-                               static_cast<std::size_t>(tokens));
-    constexpr double kAmp    = 2688.0;  // 448 * 6
-    constexpr double kSMax   = 448.0;   // e4m3 max finite
-    constexpr double kPTable[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
-    const double neg_inf      = -std::numeric_limits<double>::infinity();
-
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
-        for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
-            const std::int32_t kv_head = q_head / geometry.query_group();
-            const std::vector<bool>& tile_kept = kept.kept[static_cast<std::size_t>(kv_head)];
-            // NVFP4 Q-quant (kernel state) - identical to sage_ideal_attention.
-            std::vector<double> q_log(kHeadDim, 0.0);
-            for (std::int32_t grp = 0; grp < kHeadDim / kNvfp4Group; ++grp) {
-                float absmax = 0.0f;
-                for (std::int32_t i = 0; i < kNvfp4Group; ++i) {
-                    const std::int32_t d = grp * kNvfp4Group + i;
-                    absmax = std::max(absmax, std::abs(q[q_index(geometry, q_head, d, token)]));
-                }
-                const std::uint8_t scale_bits = encode_e4m3fn_rne(absmax / 6.0f);
-                const float stored_scale      = static_cast<float>(decode_e4m3fn_word(scale_bits));
-                for (std::int32_t pair = 0; pair < kNvfp4Group / 2; ++pair) {
-                    const std::int32_t d0 = grp * kNvfp4Group + 2 * pair;
-                    const std::int32_t d1 = d0 + 1;
-                    float x               = 0.0f;
-                    float y               = 0.0f;
-                    if (stored_scale != 0.0f) {
-                        x = q[q_index(geometry, q_head, d0, token)] / stored_scale;
-                        y = q[q_index(geometry, q_head, d1, token)] / stored_scale;
-                    }
-                    const float2 packed = {x, y};
-                    const std::uint8_t code =
-                        __nv_cvt_float2_to_fp4x2(packed, __NV_E2M1, cudaRoundNearest);
-                    q_log[static_cast<std::size_t>(d0)] =
-                        static_cast<double>(decode_e2m1_word(code & 0x0Fu)) * stored_scale;
-                    q_log[static_cast<std::size_t>(d1)] =
-                        static_cast<double>(decode_e2m1_word((code >> 4) & 0x0Fu)) * stored_scale;
-                }
-            }
-            std::vector<double> p(visible, neg_inf);
-            double max_score = neg_inf;
-            for (std::int32_t position = 0; position < visible; ++position) {
-                if (!tile_kept[static_cast<std::size_t>(position / tile_block)]) { continue; }
-                double dot = 0.0;
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += q_log[static_cast<std::size_t>(d)] * cache_value(cache, true, kv_head,
-                                                                           position, d);
-                }
-                const double score = dot * static_cast<double>(kAttentionScale);
-                p[static_cast<std::size_t>(position)] = score;
-                max_score                              = std::max(max_score, score);
-            }
-            double l_sum = 0.0;
-            for (std::int32_t position = 0; position < visible; ++position) {
-                if (p[static_cast<std::size_t>(position)] == neg_inf) { continue; }
-                p[static_cast<std::size_t>(position)] =
-                    std::exp2(static_cast<double>(kLog2E) * (p[static_cast<std::size_t>(position)] -
-                                                              max_score));
-                l_sum += p[static_cast<std::size_t>(position)];
-            }
-
-            std::vector<double> value(kHeadDim, 0.0);
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                double acc = 0.0;
-                for (std::int32_t kb = 0; kb < visible; kb += 16) {
-                    const std::int32_t k1      = std::min(kb + 16, visible);
-                    double block_max           = 0.0;
-                    for (std::int32_t k = kb; k < k1; ++k) {
-                        block_max = std::max(block_max, p[static_cast<std::size_t>(k)]);
-                    }
-                    const std::uint8_t sc =
-                        block_max == 0.0
-                            ? 0
-                            : encode_e4m3fn_rne(static_cast<float>(
-                                  std::min(kSMax, kSMax * block_max)));
-                    const double s_dec = static_cast<double>(decode_e4m3fn_word(sc));
-                    const double v_dec = static_cast<double>(decode_e4m3fn_word(
-                        cache.v_fp8[sage_v_scale_host_index(cache.logical_capacity, kv_head,
-                                                            kb / kPagedKVPageSize, d,
-                                                            (kb % kPagedKVPageSize) / 16)]));
-                    double pv = 0.0;
-                    for (std::int32_t k = kb; k < k1; ++k) {
-                        if (p[static_cast<std::size_t>(k)] == neg_inf) { continue; }
-                        const double p_p = s_dec == 0.0
-                                               ? 0.0
-                                               : std::min(6.0, kAmp * p[static_cast<std::size_t>(k)] / s_dec);
-                        const std::uint8_t p_code =
-                            static_cast<std::uint8_t>(encode_e2m1_rne(static_cast<float>(p_p)) & 0x0fu);
-                        const std::size_t v_code_idx =
-                            nvfp4_code_index(geometry, cache.logical_capacity, kv_head, k, d / 2);
-                        const std::uint8_t v_byte  = cache.v_u8[v_code_idx];
-                        const std::uint8_t v_nibble = (d & 1) == 0 ? (v_byte & 0x0fu) : (v_byte >> 4);
-                        pv += kPTable[p_code] * decode_e2m1_word(v_nibble);
-                    }
-                    acc += pv * s_dec * v_dec;
-                }
-                value[static_cast<std::size_t>(d)] = acc;
-            }
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                output[q_index(geometry, q_head, d, token)] =
-                    l_sum > 0.0 ? value[static_cast<std::size_t>(d)] / (kAmp * l_sum) : 0.0;
-            }
-        }
-    }
-    return output;
-}
-
-// Exact (BF16) reference restricted to the per-kv-head kept tiles (the strict-PV
-// decode combination: same restriction, exact P/PV numerics).
-std::vector<double> ideal_attention_kept(const std::vector<float>& q, const HostCache& cache,
-                                          const std::vector<std::int32_t>& positions,
-                                          const KeptTileSets& kept, std::int32_t tile_block) {
-    const Geometry& geometry  = cache.geometry;
-    const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
-    std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
-                               static_cast<std::size_t>(geometry.q_heads) *
-                               static_cast<std::size_t>(tokens));
-
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
-        for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
-            const std::int32_t kv_head = q_head / geometry.query_group();
-            const std::vector<bool>& tile_kept = kept.kept[static_cast<std::size_t>(kv_head)];
-            double max_score                    = -std::numeric_limits<double>::infinity();
-            std::vector<double> probability(visible, 0.0);
-            for (std::int32_t position = 0; position < visible; ++position) {
-                if (!tile_kept[static_cast<std::size_t>(position / tile_block)]) { continue; }
-                double dot = 0.0;
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
-                           cache_value(cache, true, kv_head, position, d);
-                }
-                const double score = dot * static_cast<double>(kAttentionScale);
-                probability[static_cast<std::size_t>(position)] = score;
-                max_score                                        = std::max(max_score, score);
-            }
-            double sum = 0.0;
-            for (std::int32_t position = 0; position < visible; ++position) {
-                if (probability[static_cast<std::size_t>(position)] ==
-                    -std::numeric_limits<double>::infinity()) {
-                    continue;
-                }
-                probability[static_cast<std::size_t>(position)] = std::exp(
-                    probability[static_cast<std::size_t>(position)] - max_score);
-                sum += probability[static_cast<std::size_t>(position)];
-            }
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                double value = 0.0;
-                for (std::int32_t position = 0; position < visible; ++position) {
-                    value += probability[static_cast<std::size_t>(position)] *
-                             cache_value(cache, false, kv_head, position, d);
-                }
-                output[q_index(geometry, q_head, d, token)] = sum > 0.0 ? value / sum : 0.0;
             }
         }
     }
@@ -2119,7 +1912,6 @@ int verify_cache(const std::string& label, const HostCache& got, const HostCache
             const std::int64_t dc = first_diff(got.v_u8, expected.v_u8);
             const std::int64_t ds = first_diff(got.v_fp8, expected.v_fp8);
             const int cap = static_cast<int>(expected.logical_capacity);
-            const int heads = expected.geometry.kv_heads;
             std::cerr << "SAGE_DUMP v-code diff " << dc << " v-scale diff " << ds << '\n';
             if (dc >= 0) {
                 const int h = static_cast<int>(dc / (128 * cap));
@@ -2288,7 +2080,7 @@ void sage_floor_report(const std::string& label, const std::vector<double>& actu
         compute_reduction_stats(sage_pwidth_reference(q, cache, positions, 2).data(),
                                 exact_reference.data(), n)
             .relative_l2;
-    sage_orc_pdump(label, q, cache, positions);
+    sage_orc_pdump(label, q, cache);
     std::cerr << label << " SAGE_FLOOR: floor=" << floor_l2 << " device_vs_exact=" << dev_vs_exact
               << " device_vs_sage=" << dev_vs_sage << " dev_vs_step_pref64=" << dev_vs_step_prefill
               << " dev_vs_step_dec32=" << dev_vs_step_decode << " step64_vs_sage=" << step64_vs_sage
@@ -3833,10 +3625,10 @@ int cache_position_mismatch(const HostCache& got, std::int32_t got_pos, const Ho
         }
         if (got.dtype == DType::I8) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                if (got.k_i8[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
-                        want.k_i8[cache_index(geometry, logical_capacity, head, want_pos, d)] ||
-                    got.v_i8[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
-                        want.v_i8[cache_index(geometry, logical_capacity, head, want_pos, d)]) {
+                if (got.k_i8[cache_index(logical_capacity, head, got_pos, d)] !=
+                        want.k_i8[cache_index(logical_capacity, head, want_pos, d)] ||
+                    got.v_i8[cache_index(logical_capacity, head, got_pos, d)] !=
+                        want.v_i8[cache_index(logical_capacity, head, want_pos, d)]) {
                     return 1;
                 }
             }
@@ -3853,10 +3645,10 @@ int cache_position_mismatch(const HostCache& got, std::int32_t got_pos, const Ho
             continue;
         }
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
-            if (got.k_bf16[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
-                    want.k_bf16[cache_index(geometry, logical_capacity, head, want_pos, d)] ||
-                got.v_bf16[cache_index(geometry, logical_capacity, head, got_pos, d)] !=
-                    want.v_bf16[cache_index(geometry, logical_capacity, head, want_pos, d)]) {
+            if (got.k_bf16[cache_index(logical_capacity, head, got_pos, d)] !=
+                    want.k_bf16[cache_index(logical_capacity, head, want_pos, d)] ||
+                got.v_bf16[cache_index(logical_capacity, head, got_pos, d)] !=
+                    want.v_bf16[cache_index(logical_capacity, head, want_pos, d)]) {
                 return 1;
             }
         }
@@ -3890,10 +3682,10 @@ void assign_cache_position(HostCache& dst, std::int32_t dst_pos, const HostCache
         }
         if (dst.dtype == DType::I8) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                dst.k_i8[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
-                    src.k_i8[cache_index(geometry, logical_capacity, head, src_pos, d)];
-                dst.v_i8[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
-                    src.v_i8[cache_index(geometry, logical_capacity, head, src_pos, d)];
+                dst.k_i8[cache_index(logical_capacity, head, dst_pos, d)] =
+                    src.k_i8[cache_index(logical_capacity, head, src_pos, d)];
+                dst.v_i8[cache_index(logical_capacity, head, dst_pos, d)] =
+                    src.v_i8[cache_index(logical_capacity, head, src_pos, d)];
             }
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
                 dst.k_scale[scale_index(geometry, logical_capacity, head, dst_pos, group)] =
@@ -3904,10 +3696,10 @@ void assign_cache_position(HostCache& dst, std::int32_t dst_pos, const HostCache
             continue;
         }
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
-            dst.k_bf16[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
-                src.k_bf16[cache_index(geometry, logical_capacity, head, src_pos, d)];
-            dst.v_bf16[cache_index(geometry, logical_capacity, head, dst_pos, d)] =
-                src.v_bf16[cache_index(geometry, logical_capacity, head, src_pos, d)];
+            dst.k_bf16[cache_index(logical_capacity, head, dst_pos, d)] =
+                src.k_bf16[cache_index(logical_capacity, head, src_pos, d)];
+            dst.v_bf16[cache_index(logical_capacity, head, dst_pos, d)] =
+                src.v_bf16[cache_index(logical_capacity, head, src_pos, d)];
         }
     }
 }
@@ -5361,11 +5153,11 @@ int s3_dump_case(const Geometry& geometry, const AttentionCase& test_case, const
                           [](const Probe& x, const Probe& y) { return x.rel < y.rel; });
                 std::ostringstream po;
                 po << "{\"tile\": " << t << ", \"identity_max_rel\": " << identity_rel << ", \"top\": [";
-                for (int k = 0; k < 3 && k < static_cast<int>(probes.size()); ++k) {
-                    const Probe& pb = probes[static_cast<std::size_t>(k)];
+                for (int rank = 0; rank < 3 && rank < static_cast<int>(probes.size()); ++rank) {
+                    const Probe& pb = probes[static_cast<std::size_t>(rank)];
                     const std::vector<int>& pp = perms[static_cast<std::size_t>(pb.pi)];
                     const std::vector<int>& vp = perms[static_cast<std::size_t>(pb.vi)];
-                    po << (k ? ", " : "")
+                    po << (rank ? ", " : "")
                        << "{\"p\": [" << pp[0] << "," << pp[1] << "," << pp[2] << "," << pp[3]
                        << "], \"v\": [" << vp[0] << "," << vp[1] << "," << vp[2] << "," << vp[3]
                        << "], \"max_rel\": " << pb.rel << "}";
@@ -5379,9 +5171,9 @@ int s3_dump_case(const Geometry& geometry, const AttentionCase& test_case, const
                     po << (r ? ", " : "") << dev_r[static_cast<std::size_t>(r)];
                 }
                 po << "], \"worst\": [";
-                for (int k = 0; k < 5 && k < static_cast<int>(worst.size()); ++k) {
-                    const Probe& w = worst[static_cast<std::size_t>(k)];
-                    po << (k ? ", " : "") << "{\"r\": " << w.pi << ", \"d\": " << w.vi
+                for (int rank = 0; rank < 5 && rank < static_cast<int>(worst.size()); ++rank) {
+                    const Probe& w = worst[static_cast<std::size_t>(rank)];
+                    po << (rank ? ", " : "") << "{\"r\": " << w.pi << ", \"d\": " << w.vi
                        << ", \"rel\": " << w.rel << "}";
                 }
                 po << "]}";

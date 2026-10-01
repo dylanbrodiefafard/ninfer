@@ -7,17 +7,16 @@ geometry; only checkpoint-invariant Vision recipes are built here.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
-from typing import Mapping, Sequence
 
 import torch
 
 from tools.convert.common.safetensors import ShardReader
 
-from .inventory import FP32, TensorSpec, VISION_LAYERS
-
+from .inventory import FP32, VISION_LAYERS, TensorSpec
 
 SOURCE_DTYPE = "BF16"
 
@@ -165,7 +164,7 @@ def expression_shape(expression: Expression) -> tuple[int, ...]:
         for shape in shapes:
             if len(shape) != rank:
                 raise ValueError("concat sources have different ranks")
-            for axis, (got, expected) in enumerate(zip(shape, shapes[0])):
+            for axis, (got, expected) in enumerate(zip(shape, shapes[0], strict=True)):
                 if axis != expression.axis and got != expected:
                     raise ValueError("concat sources have incompatible shapes")
             output[expression.axis] += shape[expression.axis]
@@ -398,13 +397,13 @@ def materialize_recipe(
 
 
 __all__ = [
+    "SOURCE_DTYPE",
     "Cast",
     "Concat",
     "DraftHeadTokenIds",
     "Expression",
     "GatherRows",
     "Reshape",
-    "SOURCE_DTYPE",
     "ShardReader",
     "Slice",
     "SourcePreflight",

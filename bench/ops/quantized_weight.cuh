@@ -131,7 +131,7 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
         CUDA_CHECK(cudaMemset(static_cast<std::uint8_t*>(result.storage.p) + high_offset,
                               fill.high_byte, high_bytes));
     }
-    detail::fill_f16_kernel<<<detail::launch_grid(groups), 256>>>(
+    detail::fill_f16_kernel<<<detail::launch_grid(groups), 256, 0, cudaStreamLegacy>>>(
         reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(result.storage.p) +
                                          scale_offset),
         groups, fill.scale_f16);

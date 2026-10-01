@@ -39,11 +39,6 @@ struct StreamingResponse {
     bool started = false;
 };
 
-void write_error(httplib::Response& response, const ApiError& error) {
-    response.status = error.status;
-    response.set_content(make_error_body(error), "application/json");
-}
-
 ApiError responses_error(ApiError error) {
     if (error.param == "messages") { error.param = "input"; }
     return error;

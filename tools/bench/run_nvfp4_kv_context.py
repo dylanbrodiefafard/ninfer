@@ -15,8 +15,9 @@ import json
 import shlex
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"

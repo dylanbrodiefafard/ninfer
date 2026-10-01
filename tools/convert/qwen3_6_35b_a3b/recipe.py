@@ -6,13 +6,13 @@ from pathlib import Path
 
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common.recipe import (
+    SOURCE_DTYPE,
     Cast,
     Concat,
     DraftHeadTokenIds,
     Expression,
     GatherRows,
     Reshape,
-    SOURCE_DTYPE,
     Slice,
     SourcePreflight,
     SourceTensor,
@@ -26,12 +26,15 @@ from tools.convert.qwen3_6.common.recipe import (
     materialize_recipe,
     preflight_source_reader,
     source,
+)
+from tools.convert.qwen3_6.common.recipe import (
     source_requirements as _common_source_requirements,
+)
+from tools.convert.qwen3_6.common.recipe import (
     validate_recipe_coverage as _common_validate_recipe_coverage,
 )
 
 from . import inventory
-
 
 DRAFT_ROWS = 131072
 DRAFT_RANKING_PATH = (
@@ -532,31 +535,31 @@ def preflight_dflash_sources(model_dir: str | Path) -> SourcePreflight:
 __all__ = [
     "BASE_RECIPES_BY_NAME",
     "BASE_RECIPE_SPECS",
-    "Cast",
-    "Concat",
     "DFLASH_RECIPES_BY_NAME",
     "DFLASH_RECIPE_SPECS",
     "DRAFT_RANKING_PATH",
     "DRAFT_ROWS",
+    "RECIPES_BY_NAME",
+    "RECIPE_SPECS",
+    "SOURCE_DTYPE",
+    "Cast",
+    "Concat",
     "DraftHeadTokenIds",
     "Expression",
     "GatherRows",
-    "RECIPE_SPECS",
-    "RECIPES_BY_NAME",
     "Reshape",
-    "SOURCE_DTYPE",
     "ShardReader",
     "Slice",
     "SourcePreflight",
     "SourceTensor",
     "TensorRecipe",
     "Transpose",
+    "base_source_requirements",
+    "dflash_source_requirements",
     "expression_shape",
     "expression_sources",
     "materialize_expression",
     "materialize_recipe",
-    "base_source_requirements",
-    "dflash_source_requirements",
     "preflight_base_sources",
     "preflight_dflash_sources",
     "validate_recipe_coverage",

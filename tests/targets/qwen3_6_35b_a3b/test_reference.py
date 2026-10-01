@@ -12,7 +12,6 @@ from tools.reference.qwen3_6_35b_a3b.weights import (
     estimate_fixed_bytes,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 

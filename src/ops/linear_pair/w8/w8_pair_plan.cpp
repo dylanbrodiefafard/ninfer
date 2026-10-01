@@ -249,6 +249,14 @@ std::int32_t schedule_cols(W8PairScheduleId schedule) {
         return 256;
     case W8PairScheduleId::DualSplitKMmaExactT:
         throw std::logic_error("w8 pair exact-T schedule has runtime column tile");
+    case W8PairScheduleId::ExactConcatMmaR32C96:
+    case W8PairScheduleId::ExactConcatMmaR32C128:
+    case W8PairScheduleId::ExactConcatMmaR64C96:
+    case W8PairScheduleId::ExactConcatMmaR64C128:
+    case W8PairScheduleId::ExactConcatMmaR96C96:
+    case W8PairScheduleId::ExactConcatMmaR128C64:
+    case W8PairScheduleId::ExactConcatMmaR128C80:
+        throw std::logic_error("w8 pair: homogeneous_schedule returned an exact-tail schedule");
     }
     throw std::logic_error("w8 pair: unknown schedule");
 }

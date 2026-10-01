@@ -7,13 +7,13 @@ recipe, shortlist provenance, and conversion entry point.
 
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import platform
 import subprocess
-from typing import Mapping, Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -22,10 +22,14 @@ from tools.artifact.container import (
     ArtifactObject,
     ObjectSpec,
     ResourceObject,
-    ResourceSpec as ArtifactResourceSpec,
     TensorObject,
-    TensorSpec as ArtifactTensorSpec,
     plan_objects,
+)
+from tools.artifact.container import (
+    ResourceSpec as ArtifactResourceSpec,
+)
+from tools.artifact.container import (
+    TensorSpec as ArtifactTensorSpec,
 )
 from tools.artifact.layouts import align_up, encode_direct, encoded_size
 from tools.convert.common.quantize import quantize_and_encode

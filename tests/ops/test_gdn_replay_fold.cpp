@@ -55,10 +55,6 @@ void* offset_pointer(void* pointer, std::size_t bytes) {
     return static_cast<void*>(static_cast<std::byte*>(pointer) + bytes);
 }
 
-const void* offset_pointer(const void* pointer, std::size_t bytes) {
-    return static_cast<const void*>(static_cast<const std::byte*>(pointer) + bytes);
-}
-
 struct FoldProfile {
     std::int32_t layers;
     std::int32_t value_heads;
@@ -70,7 +66,7 @@ constexpr ReductionCriterion recurrent_state_criterion() {
             /*gross_relative_to_max_reference=*/3.9e-3};
 }
 
-int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32_t commit,
+int verify_fold_oracle(const FoldProfile profile, std::int32_t commit,
                        std::uint32_t seed, const std::vector<std::uint16_t>& key_records,
                        const std::vector<std::uint16_t>& value_records,
                        const std::vector<std::uint32_t>& gate_records,
@@ -129,7 +125,6 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed) {
     const std::vector<std::int32_t> slots = selected_slots(rows);
     const std::int32_t slot_count         = rows == 1 ? 3 : 11;
-    const std::int32_t outer              = profile.layers * kRecordCapacity;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
     const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
@@ -322,7 +317,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
     Tensor initial_selector(initial_device.p, DType::I32, {1});
     Tensor base_selector(base_device.p, DType::I32, {1});
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
@@ -424,7 +419,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             }
             if (layer == 0 && row == 0 && profile.layers == 30 && width == 2 && rows == 1 &&
                 commits[0] == 2) {
-                failures += verify_fold_oracle(profile, width, commits[0], seed, key_records,
+                failures += verify_fold_oracle(profile, commits[0], seed, key_records,
                                                value_records, gate_records, actual_recurrent);
             }
 
@@ -507,7 +502,7 @@ int run_record_fold_rounds() {
     constexpr std::int32_t kStateSlots   = 3;
     constexpr std::int32_t kInitialSlot  = 2;
     constexpr std::int32_t kSnapshotBase = 0;
-    constexpr float kScale               = 1.0F / std::sqrt(128.0F);
+    const float kScale               = 1.0F / std::sqrt(128.0F);
 
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, kParentRows, kHidden, 1901U));

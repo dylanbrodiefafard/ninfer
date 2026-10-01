@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import struct
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TypeAlias
 
@@ -152,23 +152,23 @@ def get_format(name: str) -> NumericFormat:
 __all__ = [
     "BF16",
     "DIRECT_FORMATS",
-    "DirectFormat",
     "FP8_E4M3FN_ROW_BF16S",
     "FP8_ROW_FORMATS",
     "FP32",
-    "Fp8RowFormat",
     "I32",
     "NUMERIC_FORMATS",
     "NVFP4",
     "NVFP4_FORMATS",
-    "Nvfp4Format",
-    "NumericFormat",
     "Q4G64_F16S",
     "Q5G64_F16S",
     "Q6G64_F16S",
     "QUANT_FORMATS",
-    "QuantFormat",
     "W8G32_F16S",
+    "DirectFormat",
+    "Fp8RowFormat",
+    "NumericFormat",
+    "Nvfp4Format",
+    "QuantFormat",
     "decode_e2m1_word",
     "decode_e4m3fn_word",
     "get_format",

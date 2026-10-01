@@ -232,7 +232,7 @@ int detector_fuzzy_budget() {
 // Unique IDs isolate period/tolerance behavior from vocabulary coincidences.
 int detector_new_long_periods() {
     int failures = 0;
-    for (const auto [period, tolerance] :
+    for (const auto& [period, tolerance] :
          {std::pair<std::size_t, std::size_t>{1081, 4}, {1516, 5}, {1886, 7}, {2048, 8}}) {
         std::vector<TokenId> block(period);
         for (std::size_t i = 0; i < period; ++i) { block[i] = static_cast<TokenId>(10000 + i); }

@@ -13,11 +13,11 @@ import concurrent.futures
 import hashlib
 import json
 import os
-from pathlib import Path
 import statistics
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 
 def qualification(response: dict, expected: dict) -> list[str]:
@@ -31,7 +31,7 @@ def qualification(response: dict, expected: dict) -> list[str]:
         failures.append(f"finish_reason={choice.get('finish_reason')!r}; expected tool_calls")
     calls = choice.get("message", {}).get("tool_calls", [])
     if len(calls) != 1:
-        return failures + [f"expected one tool call, got {len(calls)}"]
+        return [*failures, f"expected one tool call, got {len(calls)}"]
     function = calls[0].get("function", {})
     if function.get("name") != expected["name"]:
         failures.append("wrong completed tool name")
@@ -96,7 +96,9 @@ def main() -> None:
         for wave, mode in enumerate(modes):
             barrier = threading.Barrier(args.concurrency)
 
-            def request(slot: int) -> dict:
+            def request(
+                slot: int, *, mode: str = mode, barrier: threading.Barrier = barrier
+            ) -> dict:
                 tool_request = mode == "tools" or (mode == "mixed" and slot % 2 == 0)
                 request_body = body if tool_request else plain_body
                 req = urllib.request.Request(args.base_url.rstrip("/") + "/v1/chat/completions",

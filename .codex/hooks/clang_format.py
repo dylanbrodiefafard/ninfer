@@ -4,7 +4,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 SOURCE_SUFFIXES = {
     ".c",
     ".cc",

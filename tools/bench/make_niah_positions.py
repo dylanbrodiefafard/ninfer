@@ -160,7 +160,7 @@ def _line_boundary(text: str, pos: int) -> int:
     """The newline index at or before `pos` (the line boundary just before it),
     or 0 if there is none. Used to splice the needle at a clean line boundary."""
     j = text.rfind("\n", 0, max(1, pos))
-    return j if j > 0 else 0
+    return max(0, j)
 
 
 def _splice(essay: str, frac: float) -> str:
@@ -172,7 +172,7 @@ def _splice(essay: str, frac: float) -> str:
         return NEEDLE + "\n\n" + essay
     if frac >= 1.0:
         return essay.rstrip("\n") + "\n\n" + NEEDLE
-    j = _line_boundary(essay, int(round(len(essay) * frac)))
+    j = _line_boundary(essay, round(len(essay) * frac))
     if j <= 0:
         return NEEDLE + "\n\n" + essay
     return essay[:j] + "\n\n" + NEEDLE + "\n\n" + essay[j + 1:]
@@ -184,7 +184,7 @@ def _splice_line(essay: str, frac: float, line: str) -> str:
         return line + "\n\n" + essay
     if frac >= 1.0:
         return essay.rstrip("\n") + "\n\n" + line
-    j = _line_boundary(essay, int(round(len(essay) * frac)))
+    j = _line_boundary(essay, round(len(essay) * frac))
     if j <= 0:
         return line + "\n\n" + essay
     return essay[:j] + "\n\n" + line + "\n\n" + essay[j + 1:]
@@ -227,7 +227,7 @@ def default_path(length_name: str, pos_name: str, multikey: bool = False) -> str
 def write_fixture(fixture: list[dict], rel_path: str, length_name: str, pos_name: str) -> None:
     root = _repo_root()
     out = (Path(rel_path) if Path(rel_path).is_absolute()
-         else (Path(_repo_root()) / rel_path))
+         else (Path(root) / rel_path))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(fixture, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {out}  (length={length_name}, needle {pos_name})")
@@ -239,7 +239,7 @@ def main() -> None:
                     help="master (longest) fixture providing the clean stream")
     ap.add_argument("--length", choices=sorted(LENGTH_CHARS), default="200k",
                     help="target document length preset")
-    ap.add_argument("--position", default="mid", choices=sorted(POS_FRACTION) + ["all"])
+    ap.add_argument("--position", default="mid", choices=[*sorted(POS_FRACTION), "all"])
     ap.add_argument("--out", default="", help="explicit output path (relative to repo root)")
     ap.add_argument("--multikey", action="store_true",
                     help="add same-form distractor records (RULER-style multi-key retrieval)")

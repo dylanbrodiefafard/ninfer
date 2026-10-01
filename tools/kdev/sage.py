@@ -26,8 +26,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
 
@@ -43,7 +41,7 @@ _KV_RE = re.compile(r"([a-z_0-9]+)=(\S+)")
 # nvfp4s3 bench table row: context window fill(us) attn_median(us) attn_p95(us) gbps
 _BENCH_ROW_RE = re.compile(
     r"^(?P<ctx>\d+)\s+(?P<window>\d+)\s+(?P<fill>[\d.]+)\s+(?P<median>[\d.]+)\s+"
-    r"(?P<p95>[\d.]+)\s+(?P<gbps>[\d.]+)\s*$", re.M,
+    r"(?P<p95>[\d.]+)\s+(?P<gbps>[\d.]+)\s*$", re.MULTILINE,
 )
 
 
@@ -67,7 +65,7 @@ def _parse_floor_lines(output: str) -> list:
         if not match:
             continue
         label = match.group("label")
-        values = {k: v for k, v in _KV_RE.findall(match.group("kv"))}
+        values = dict(_KV_RE.findall(match.group("kv")))
         record = {"case": label}
         for key in ("floor", "device_vs_exact", "device_vs_sage", "dev_vs_step_pref64",
                     "dev_vs_step_dec32", "step64_vs_sage", "step32_vs_sage",
@@ -132,7 +130,7 @@ def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
     # Gate on the exit code + the absence of a FAIL verdict line: the SAGE_FLOOR
     # diagnostics go to cerr and can land AFTER the stdout "PASS" line in the
     # merged capture, so the last line is not the verdict.
-    fail_line = next((l for l in lines if l.startswith("FAIL")), None)
+    fail_line = next((line for line in lines if line.startswith("FAIL")), None)
     gate_passed = result.ok and fail_line is None
 
     cases = _parse_floor_lines(output)
@@ -190,8 +188,8 @@ def render(v: dict) -> str:
     keep = v["keep_frac"]
     flag = "PASS" if o["passed"] else "FAIL"
     lines = [
-        f"[kdev-sage] {v['op']} (sage-{v['tier'][5:]}) gate={flag} keep_frac={keep:g}"
-        f"  git@{v['git']}",
+        (f"[kdev-sage] {v['op']} (sage-{v['tier'][5:]}) gate={flag} keep_frac={keep:g}"
+        f"  git@{v['git']}"),
     ]
     if not o["sage_cases"]:
         lines.append("  no SAGE_FLOOR lines parsed — check the test output tail:\n"
@@ -202,7 +200,7 @@ def render(v: dict) -> str:
               f"{'vs_sage':>8s} {'bug_resid':>10s}  class")
     lines.append(header)
     for c in o["sage_cases"]:
-        def f(key):
+        def f(key, c=c):
             value = c.get(key)
             return f"{value:.4g}" if isinstance(value, (int, float)) else "-"
         lines.append(
@@ -210,7 +208,6 @@ def render(v: dict) -> str:
             f"{f('device_vs_exact'):>9s} {f('device_vs_sage'):>8s} "
             f"{f('bug_residual'):>10s}  {c.get('bug_class', '-')}")
 
-    floors = [c["floor"] for c in o["sage_cases"] if c.get("floor") is not None]
     # Only classifiable cases count toward the worst residual: single-tile A1 cases
     # have no independent step signal (step64 == closed-form), so their residual is
     # the expected independent-rounding distance, not a bug candidate.

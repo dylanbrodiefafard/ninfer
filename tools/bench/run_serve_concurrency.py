@@ -18,16 +18,15 @@ import statistics
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools.bench import run_serve_corpus as corpus  # noqa: E402
-
 
 SUITES = ("decode-saturation", "corpus-makespan")
 DEFAULT_STATS_INTERVAL_MS = 1000
@@ -695,6 +694,10 @@ def run_clients(
         with dispatch_condition:
             dispatch_condition.notify_all()
 
+    def dispatch_turn_reached(job_index: int) -> bool:
+        # Reads the live shared counter; call only while holding dispatch_condition.
+        return failed.is_set() or job_index == next_dispatch_index
+
     def worker() -> None:
         nonlocal next_dispatch_index
         connection = http.client.HTTPConnection(
@@ -719,7 +722,7 @@ def run_clients(
                     if ordered_dispatch:
                         with dispatch_condition:
                             dispatch_condition.wait_for(
-                                lambda: failed.is_set() or job.index == next_dispatch_index
+                                lambda job_index=job.index: dispatch_turn_reached(job_index)
                             )
                             if failed.is_set():
                                 return

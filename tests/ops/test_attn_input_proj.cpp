@@ -192,6 +192,7 @@ int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kKeyBegin   = kQRows;
     constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
     constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    static_assert(kValueBegin + kKvRows == kParentRows);
     const std::string suffix           = " BF16 A16 T=" + std::to_string(tokens);
     int failures                       = 0;
     if (tokens == 1) {
@@ -625,7 +626,7 @@ int run_target_projection_case(DevicePackedWeight& parent, DevicePackedWeight* g
     int failures = 0;
     for (int phase = 0; phase < (replay ? 2 : 1); ++phase) {
         if (phase) {
-            for (auto& v : activation) v = -v;
+            for (auto& element : activation) element = -element;
             activation_bits = bf16_bits(activation);
             input.copy_from_host(activation_bits.data(), input.bytes);
         }

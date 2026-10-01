@@ -11,11 +11,12 @@ from pathlib import Path
 
 from tools.convert.qwen3_6.common.draft_head import (
     DraftHeadContext,
-    compute_shortlist as _compute_shortlist,
     materialize_draft_head,
     materialize_draft_head_token_ids,
 )
-
+from tools.convert.qwen3_6.common.draft_head import (
+    compute_shortlist as _compute_shortlist,
+)
 
 VOCAB_SIZE = 248320
 TOKENIZER_VOCAB_SIZE = 248077
@@ -57,10 +58,10 @@ __all__ = [
     "DRAFT_HEAD_N",
     "DRAFT_HEAD_OBJECT",
     "DRAFT_HEAD_TOKEN_IDS_OBJECT",
-    "DraftHeadContext",
     "RANKING_SOURCE_TARGET",
     "TOKENIZER_VOCAB_SIZE",
     "VOCAB_SIZE",
+    "DraftHeadContext",
     "compute_shortlist",
     "materialize_draft_head",
     "materialize_draft_head_token_ids",

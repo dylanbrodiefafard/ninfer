@@ -243,9 +243,9 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
                          const qwen3_6::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
-      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv),
+      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state), io_(io),
+      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -283,7 +283,6 @@ void TextContext::set_tree_verify(const Tensor* parent_index, const Tensor* ance
 }
 
 void TextContext::bind() {
-    using TargetBindings = LoadedModelData;
     using TargetMlp      = MlpWeights;
     const auto bind_mlp  = [](const TargetMlp& source) { return MlpW{&source}; };
 

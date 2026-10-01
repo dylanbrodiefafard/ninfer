@@ -14,9 +14,9 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
@@ -220,7 +220,7 @@ class RunningServer:
         self.process: subprocess.Popen[bytes] | None = None
         self.tail: ServerLogTail | None = None
 
-    def __enter__(self) -> "RunningServer":
+    def __enter__(self) -> RunningServer:
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
         self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
@@ -1119,7 +1119,7 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
 def mode_display_name(mode_name: str) -> str:
     if mode_name not in SPECULATIVE_MODES:
         raise CampaignError(f"unsupported summary mode: {mode_name}")
-    backend, draft_tokens, verify_width = SPECULATIVE_MODES[mode_name]
+    backend, draft_tokens, _verify_width = SPECULATIVE_MODES[mode_name]
     if backend == "none":
         return "MTP0"
     if backend == "mtp":

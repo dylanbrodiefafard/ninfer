@@ -54,8 +54,9 @@ DFlashPersistentState& dflash_state(DFlashBatchContext& state) { return state.df
 
 DFlashPersistentState& dflash_state(DFlashAppendContext& state) { return state.dflash; }
 
-void copy_fused_row_range(const Tensor& fused, std::int32_t row0, Tensor& out,
-                          cudaStream_t stream) {
+// Used only by Variants with a fused QKV projection.
+[[maybe_unused]] void copy_fused_row_range(const Tensor& fused, std::int32_t row0, Tensor& out,
+                                           cudaStream_t stream) {
     const std::size_t elem = dtype_size(DType::BF16);
     CUDA_CHECK(cudaMemcpy2DAsync(
         out.data, static_cast<std::size_t>(out.ne[0]) * elem,
@@ -96,7 +97,8 @@ void dflash_for_each_sequence(std::int32_t cols, std::int32_t sequence_width, Fn
     }
 }
 
-const Weight* dflash2_nvfp4_codebook(const Weight& weight) {
+// Used only by DFlash2 Variants.
+[[maybe_unused]] const Weight* dflash2_nvfp4_codebook(const Weight& weight) {
     return weight.qdata != nullptr ? &weight : nullptr;
 }
 
@@ -512,12 +514,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     Tensor key_flat   = key_raw.view({Config::kv_size, columns});
                     Tensor value_flat = value.view({Config::kv_size, columns});
                     dflash_for_each_sequence(columns, width, [&](std::int32_t offset, std::int32_t n) {
-                        Tensor q = query_flat.slice(1, offset, n);
-                        Tensor k = key_flat.slice(1, offset, n);
-                        Tensor v = value_flat.slice(1, offset, n);
+                        Tensor query_slice = query_flat.slice(1, offset, n);
+                        Tensor key_slice   = key_flat.slice(1, offset, n);
+                        Tensor value_slice = value_flat.slice(1, offset, n);
                         ops::attn_input_proj(roots.hidden.slice(1, offset, n),
-                                             weight.query_key_value, q, k, v,
-                                             state.execution.device.stream);
+                                             weight.query_key_value, query_slice, key_slice,
+                                             value_slice, state.execution.device.stream);
                     });
                     Tensor query =
                         roots.query.view({Config::head_dim, Config::query_heads, columns});

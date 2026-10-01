@@ -11,11 +11,11 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -34,7 +34,6 @@ from . import draft_head
 from . import inventory_nvfp4 as inventory
 from . import recipe as base_recipe
 from . import recipe_nvfp4 as recipe
-
 
 RECIPE_ID = "qwen3_6_27b_nvfp4-v1"
 OUTPUT_BASENAME = "qwen3_6_27b_nvfp4.ninfer"
@@ -363,41 +362,40 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     with ShardReader(preflight.base_dir) as base_reader, ShardReader(
         preflight.nvfp4_dir
-    ) as nvfp4_reader:
-        with ArtifactWriter(
-            output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-            preflight.object_plan.specs,
-        ) as writer:
-            if writer.objects != preflight.object_plan.objects:
-                raise RuntimeError(
-                    "writer object plan differs from completed preflight"
+    ) as nvfp4_reader, ArtifactWriter(
+        output,
+        ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        preflight.object_plan.specs,
+    ) as writer:
+        if writer.objects != preflight.object_plan.objects:
+            raise RuntimeError(
+                "writer object plan differs from completed preflight"
+            )
+        for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            if isinstance(spec, inventory.ResourceSpec):
+                payload = resources[spec.name]
+            elif spec.format == inventory.NVFP4:
+                payload = _encode_nvfp4_weight(spec, nvfp4_reader)
+            elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
+                scalar = recipe.materialize_input_divisor(
+                    recipe.INPUT_DIVISORS_BY_NAME[spec.name],
+                    nvfp4_reader,
                 )
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
-                if isinstance(spec, inventory.ResourceSpec):
-                    payload = resources[spec.name]
-                elif spec.format == inventory.NVFP4:
-                    payload = _encode_nvfp4_weight(spec, nvfp4_reader)
-                elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
-                    scalar = recipe.materialize_input_divisor(
-                        recipe.INPUT_DIVISORS_BY_NAME[spec.name],
-                        nvfp4_reader,
-                    )
-                    payload = encode_direct(scalar, inventory.FP32)
-                else:
-                    tensor = _materialize_base_tensor(
-                        spec, base_reader, preflight.draft
-                    )
-                    payload = family_conversion.encode_tensor_payload(
-                        tensor, spec, resolved_device
-                    )
-                    del tensor
-                writer.write(spec.name, payload)
-                del payload
-                print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
-                    flush=True,
+                payload = encode_direct(scalar, inventory.FP32)
+            else:
+                tensor = _materialize_base_tensor(
+                    spec, base_reader, preflight.draft
                 )
+                payload = family_conversion.encode_tensor_payload(
+                    tensor, spec, resolved_device
+                )
+                del tensor
+            writer.write(spec.name, payload)
+            del payload
+            print(
+                f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
+                flush=True,
+            )
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size

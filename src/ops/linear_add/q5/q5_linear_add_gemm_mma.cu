@@ -40,8 +40,8 @@ void launch_kernel(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
                     static_cast<unsigned>(div_up(cols, Schedule::kBlockCols)), 1u);
 
     q5_rowsplit_gemm_mma_kernel<Schedule, Full, Q5MmaEpilogue::CtaCollectiveResidual>
-        <<<grid, Schedule::kThreads, 0, stream>>>(xp, codes, high, scales, out, out, rows, k, cols,
-                                                  padded_k);
+        <<<grid, Schedule::kThreads, 0, stream>>>(xp, codes, high, scales, nullptr, out, rows, k,
+                                                  cols, padded_k);
     CUDA_CHECK(cudaGetLastError());
 }
 

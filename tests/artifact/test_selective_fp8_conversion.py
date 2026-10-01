@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-from tools.convert.qwen3_8_27b.convert_selective_fp8 import encode_source_fp8
 from tools.artifact.layouts import decode_fp8_row_scaled_words
+from tools.convert.qwen3_8_27b.convert_selective_fp8 import encode_source_fp8
 
 
 def test_source_quantization_rounding_and_zero_rows():

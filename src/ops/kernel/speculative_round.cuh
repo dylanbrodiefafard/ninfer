@@ -305,7 +305,6 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     __shared__ int done_sh;
     __shared__ int tstar_sh;
     __shared__ int L_sh;
-    __shared__ int decision_sh;
 
     const bool p_less = sampling_p_less_active(cfg);
 

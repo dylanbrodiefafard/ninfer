@@ -11,7 +11,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-
 JOB_TEMP = {
     "aime25_t06": ("aime25", 0.6),
     "aime26_t06": ("aime26", 0.6),
@@ -230,7 +229,7 @@ def fmt_pct(score: float | None, completed: int | None) -> str:
     if score is None:
         return "-"
     if completed:
-        correct = int(round(score * completed))
+        correct = round(score * completed)
         return f"{100.0 * score:.2f}% ({correct}/{completed})"
     return f"{100.0 * score:.2f}%"
 
@@ -269,15 +268,15 @@ def render(
         f"- Production run: `{production_dir}`",
         f"- P-less run: `{pless_dir}`",
         "",
-        "Claim under test: p-less degrades less than the production sampler as "
-        "temperature rises (not a guaranteed win at T=0.6).",
+        ("Claim under test: p-less degrades less than the production sampler as "
+        "temperature rises (not a guaranteed win at T=0.6)."),
         "",
         "## Mechanism verification",
         "",
-        f"- Production p_less observed: {prod_req['p_less_observed']}/"
-        f"{prod_req['request_starts']} request starts (expected 0).",
-        f"- P-less p_less observed: {pless_req['p_less_observed']}/"
-        f"{pless_req['request_starts']} request starts.",
+        (f"- Production p_less observed: {prod_req['p_less_observed']}/"
+        f"{prod_req['request_starts']} request starts (expected 0)."),
+        (f"- P-less p_less observed: {pless_req['p_less_observed']}/"
+        f"{pless_req['request_starts']} request starts."),
         "",
         "## Accuracy",
         "",
@@ -303,12 +302,12 @@ def render(
         if isinstance(left_score, (int, float)):
             by_temp[temp]["production"].append(float(left_score))
             if left_n:
-                prod_correct += int(round(float(left_score) * int(left_n)))
+                prod_correct += round(float(left_score) * int(left_n))
                 prod_n += int(left_n)
         if isinstance(right_score, (int, float)):
             by_temp[temp]["p_less"].append(float(right_score))
             if right_n:
-                pless_correct += int(round(float(right_score) * int(right_n)))
+                pless_correct += round(float(right_score) * int(right_n))
                 pless_n += int(right_n)
         delta = ""
         if isinstance(left_score, (int, float)) and isinstance(right_score, (int, float)):
@@ -427,8 +426,8 @@ def render(
             "",
             f"- P-less correct / production wrong: {len(split['p_less_only'])}",
             f"- Production correct / p-less wrong: {len(split['prod_only'])}",
-            f"- Both wrong or score-tied with different extracted answers: "
-            f"{len(split['both_wrong_diff'])}",
+            (f"- Both wrong or score-tied with different extracted answers: "
+            f"{len(split['both_wrong_diff'])}"),
             "",
         ]
     )
@@ -443,13 +442,13 @@ def render(
         for item in cases[:limit]:
             lines.extend(
                 [
-                    f"**{item['job_id']}** item `{item['key']}` (T={item['temp']:g}, "
-                    f"gold `{item['gold']}`)",
+                    (f"**{item['job_id']}** item `{item['key']}` (T={item['temp']:g}, "
+                    f"gold `{item['gold']}`)"),
                     "",
-                    f"- Production: score={item['prod_score']} extracted=`{item['prod_extract']}` "
-                    f"chars={item['prod_chars']}",
-                    f"- P-less: score={item['pless_score']} extracted=`{item['pless_extract']}` "
-                    f"chars={item['pless_chars']}",
+                    (f"- Production: score={item['prod_score']} extracted=`{item['prod_extract']}` "
+                    f"chars={item['prod_chars']}"),
+                    (f"- P-less: score={item['pless_score']} extracted=`{item['pless_extract']}` "
+                    f"chars={item['pless_chars']}"),
                     "",
                     "<details><summary>Production tail</summary>",
                     "",

@@ -4,13 +4,14 @@ import argparse
 import json
 import signal
 import threading
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
 
-from .backends.registry import backend_names
 from .backends.base import BackendDependencyError
+from .backends.registry import backend_names
 from .config import ConfigError, load_config
 from .coordinator import Coordinator, load_resume_config, plan_suite, validate_suite
 from .result import load_summary

@@ -10,12 +10,12 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
 import time
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -27,7 +27,6 @@ from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
 from tools.convert.qwen3_6_27b import draft_head, recipe
 
 from . import inventory
-
 
 RECIPE_ID = "qwen3_8_27b-v1"
 
@@ -204,27 +203,26 @@ def convert(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    with ShardReader(model) as reader:
-        with ArtifactWriter(
-            output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-            preflight.object_plan.specs,
-        ) as writer:
-            if writer.objects != preflight.object_plan.objects:
-                raise RuntimeError("writer object plan differs from completed preflight")
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
-                if isinstance(spec, inventory.ResourceSpec):
-                    payload = resources[spec.name]
-                else:
-                    tensor = materialize_tensor(spec, reader, preflight.draft)
-                    payload = encode_tensor_payload(tensor, spec, resolved_device)
-                    del tensor
-                writer.write(spec.name, payload)
-                del payload
-                print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
-                    flush=True,
-                )
+    with ShardReader(model) as reader, ArtifactWriter(
+        output,
+        ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        preflight.object_plan.specs,
+    ) as writer:
+        if writer.objects != preflight.object_plan.objects:
+            raise RuntimeError("writer object plan differs from completed preflight")
+        for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            if isinstance(spec, inventory.ResourceSpec):
+                payload = resources[spec.name]
+            else:
+                tensor = materialize_tensor(spec, reader, preflight.draft)
+                payload = encode_tensor_payload(tensor, spec, resolved_device)
+                del tensor
+            writer.write(spec.name, payload)
+            del payload
+            print(
+                f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
+                flush=True,
+            )
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size

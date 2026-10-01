@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from ..config import ConfigError, JobConfig
 from ..events import EventSink, RunEvent
@@ -81,7 +81,7 @@ class EvalScopeBackend:
     name = "evalscope"
     _serpapi_lock = threading.Lock()
 
-    _ALLOWED_ARGS = {
+    _ALLOWED_ARGS: ClassVar[frozenset[str]] = frozenset({
         "subset_list",
         "dataset_args",
         "few_shot_num",
@@ -97,7 +97,7 @@ class EvalScopeBackend:
         "underscore_to_dot",
         "serpapi_api_key_env",
         "allow_network_downloads",
-    }
+    })
 
     def validate(
         self, job: JobConfig, target: ResolvedTarget | None, for_run: bool = False
@@ -173,7 +173,7 @@ class EvalScopeBackend:
             per_subset = int(params.get("context_lengths_num_intervals", 10)) * int(
                 params.get("document_depth_percent_intervals", 10)
             )
-            counts = {subset: per_subset for subset in ("english", "chinese")}
+            counts = dict.fromkeys(("english", "chinese"), per_subset)
         subsets = tuple(
             job.backend_args.get("subset_list") or (counts.keys() if counts else ())
         )

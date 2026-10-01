@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import struct
-from typing import Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 import torch
 
@@ -12,7 +12,6 @@ from tools.artifact.numeric import valid_positive_fp32_word
 from tools.convert.common.safetensors import ShardReader
 
 from . import inventory_nvfp4 as inventory
-
 
 BASE_REPOSITORY = "Qwen/Qwen3.6-27B"
 BASE_REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
@@ -348,7 +347,7 @@ def preflight_metadata(reader: ShardReader) -> dict[str, int]:
     expected_names = set(SOURCE_REQUIREMENTS)
     missing = expected_names.difference(reader.names)
     if missing:
-        raise ValueError(f"NVFP4 source is missing {sorted(missing)[0]}")
+        raise ValueError(f"NVFP4 source is missing {min(missing)}")
 
     quant_prefixes = {source.name for source in NVFP4_SOURCES}
     bf16_prefixes = {item.source.name for item in BF16_COMPARISONS}
@@ -509,13 +508,13 @@ __all__ = [
     "BASE_REPOSITORY",
     "BASE_REVISION",
     "BF16_COMPARISONS",
-    "INPUT_DIVISOR_RECIPES",
     "INPUT_DIVISORS_BY_NAME",
+    "INPUT_DIVISOR_RECIPES",
     "NVFP4_REPOSITORY",
     "NVFP4_REVISION",
     "NVFP4_SOURCES",
-    "NVFP4_WEIGHT_RECIPES",
     "NVFP4_WEIGHTS_BY_NAME",
+    "NVFP4_WEIGHT_RECIPES",
     "SOURCE_REQUIREMENTS",
     "WEIGHT_DIVISOR_GROUPS",
     "compare_bf16_sources",

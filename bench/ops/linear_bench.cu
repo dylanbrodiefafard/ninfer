@@ -4,7 +4,7 @@
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
 //   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-//   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
+//   ncu --profile-from-start off ./build/bench/ninfer_linear_bench
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
 #include "ninfer/ops/linear.h"
@@ -495,7 +495,7 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         const auto bytes = checked_add(scales, 2ULL * n, "FP8 payload");
         LinearBenchWeight result{DeviceBuffer(bytes), {}, codes + 2ULL * n};
         CUDA_CHECK(cudaMemset(result.storage.p, 0x38, codes));
-        bench::detail::fill_f16_kernel<<<bench::detail::launch_grid(n), 256>>>(
+        bench::detail::fill_f16_kernel<<<bench::detail::launch_grid(n), 256, 0, cudaStreamLegacy>>>(
             reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(result.storage.p) + scales),
             n, 0x3b80);
         CUDA_CHECK(cudaGetLastError());

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -307,7 +307,7 @@ class VisionEncoder:
     def close(self) -> None:
         self.weights.close()
 
-    def __enter__(self) -> "VisionEncoder":
+    def __enter__(self) -> VisionEncoder:
         return self
 
     def __exit__(self, *_args) -> None:

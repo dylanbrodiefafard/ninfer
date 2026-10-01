@@ -330,33 +330,33 @@ DeviceBuffer make_normalized_bf16(std::size_t rows, std::uint32_t seed) {
 }
 
 struct Operands {
-    explicit Operands(Problem problem, bool normalized_qk)
-        : problem(problem),
+    explicit Operands(Problem shape, bool normalized_qk)
+        : problem(shape),
           q(normalized_qk
-                ? make_normalized_bf16(static_cast<std::size_t>(problem.qk_heads) * problem.tokens *
-                                           problem.batch,
+                ? make_normalized_bf16(static_cast<std::size_t>(shape.qk_heads) * shape.tokens *
+                                           shape.batch,
                                        0x12345678U)
                 : make_varied_bf16(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                       problem.qk_heads * problem.tokens * problem.batch,
+                                       shape.qk_heads * shape.tokens * shape.batch,
                                    0x12345678U)),
           k(normalized_qk
-                ? make_normalized_bf16(static_cast<std::size_t>(problem.qk_heads) * problem.tokens *
-                                           problem.batch,
+                ? make_normalized_bf16(static_cast<std::size_t>(shape.qk_heads) * shape.tokens *
+                                           shape.batch,
                                        0x87654321U)
                 : make_varied_bf16(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                       problem.qk_heads * problem.tokens * problem.batch,
+                                       shape.qk_heads * shape.tokens * shape.batch,
                                    0x87654321U)),
           v(make_varied_bf16(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                 problem.value_heads * problem.tokens * problem.batch,
+                                 shape.value_heads * shape.tokens * shape.batch,
                              0x31415926U)),
-          g(make_constant_f32(static_cast<std::size_t>(problem.value_heads) * problem.tokens *
-                                  problem.batch,
+          g(make_constant_f32(static_cast<std::size_t>(shape.value_heads) * shape.tokens *
+                                  shape.batch,
                               -1.0F)),
-          beta(make_constant_f32(static_cast<std::size_t>(problem.value_heads) * problem.tokens *
-                                     problem.batch,
+          beta(make_constant_f32(static_cast<std::size_t>(shape.value_heads) * shape.tokens *
+                                     shape.batch,
                                  0.5F)),
           out(make_zeros(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                         problem.value_heads * problem.tokens * problem.batch *
+                         shape.value_heads * shape.tokens * shape.batch *
                          sizeof(std::uint16_t))) {}
 
     Tensor query() const {

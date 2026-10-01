@@ -1,14 +1,14 @@
 """Real Engine tool-mask isolation and disconnect check; never executes tools."""
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import json
-from pathlib import Path
 import signal
 import socket
 import subprocess
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from jsonschema import validate
 

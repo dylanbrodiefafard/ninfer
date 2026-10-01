@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
 import json
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-import struct
-from typing import Mapping, Sequence
 
 from tools.artifact.container import (
     MAGIC,
@@ -28,7 +27,6 @@ from tools.artifact.container import (
 from tools.artifact.layouts import align_up
 from tools.convert.qwen3_6_27b import inventory as inventory_27b
 from tools.convert.qwen3_6_35b_a3b import inventory as inventory_35b
-
 
 V1_MAGIC = b"NINFER\x00\x01"
 BACKUP_SUFFIX = ".v1-metadata-backup"
@@ -160,7 +158,7 @@ def _validate_inventory(
 
     specs: list[ResourceSpec | TensorSpec] = []
     for position, (raw, expected) in enumerate(
-        zip(directory.raw_objects, candidate.inventory)
+        zip(directory.raw_objects, candidate.inventory, strict=True)
     ):
         if expected.kind == "resource":
             required_members = frozenset(("name", "kind", "encoding", "offset", "bytes"))
@@ -195,7 +193,7 @@ def _validate_inventory(
         planned = plan_objects(specs)
     except (ArtifactError, KeyError, TypeError, ValueError) as exc:
         raise MigrationError(f"v1 object inventory is invalid: {exc}") from exc
-    for position, (raw, expected) in enumerate(zip(directory.raw_objects, planned)):
+    for position, (raw, expected) in enumerate(zip(directory.raw_objects, planned, strict=True)):
         if raw != expected.to_json():
             raise MigrationError(
                 f"v1 object at position {position} does not match the published "
