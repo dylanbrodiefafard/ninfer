@@ -223,8 +223,9 @@ Comments:
 
 Every applicable gate in [`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md)
 passes with zero findings before a commit: the `-Werror` build, `pre-commit run` (formatting,
-ruff, shellcheck, typos, file hygiene), and `./scripts/run-clang-tidy.py --changed` for any C++
-or CUDA change. Findings are fixed, including pre-existing ones on the lines a change touches; a
+ruff, shellcheck, typos, file hygiene), and, for any C++ or CUDA change, the whole-tree
+`./scripts/run-clang-tidy.py` (`--changed` is the fast check while iterating). The tree is clean
+under every gate, so any finding belongs to the change that produced it and is fixed; a
 suppression is reserved for correct code, is scoped to one line, and states its reason. Never
 weaken, disable, or bypass a gate (`--no-verify`, removing a check or flag) to land a change.
 

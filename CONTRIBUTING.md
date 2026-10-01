@@ -73,7 +73,8 @@ Use the existing project workflows instead of inventing parallel verification pa
   substantial work;
 - [`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md) for the mandatory quality
   gates: the `-Werror` build, `pre-commit run` (formatting, ruff, shellcheck, typos, file
-  hygiene), `./scripts/run-clang-tidy.py --changed`, and compute-sanitizer for changed kernels;
+  hygiene), the whole-tree `./scripts/run-clang-tidy.py`, and compute-sanitizer for changed
+  kernels;
 - [`tests/README.md`](tests/README.md) for test organization and commands;
 - [`bench/README.md`](bench/README.md) for product and operator benchmarks; and
 - [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op

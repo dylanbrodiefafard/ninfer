@@ -59,8 +59,8 @@ repos:
   - repo: local
     hooks:
       - id: clang-tidy
-        name: clang-tidy (changed lines, builder container)
-        entry: scripts/run-clang-tidy.py --changed
+        name: clang-tidy (whole tree, builder container)
+        entry: scripts/run-clang-tidy.py
         language: system
         pass_filenames: false
         stages: [manual]
