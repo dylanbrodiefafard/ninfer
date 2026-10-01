@@ -55,12 +55,19 @@ pkgs=()
 command -v git >/dev/null 2>&1 || pkgs+=(git)
 command -v patch >/dev/null 2>&1 || pkgs+=(patch)
 command -v python3 >/dev/null 2>&1 || pkgs+=(python3)
+python3 -c "import venv, ensurepip" >/dev/null 2>&1 || pkgs+=(python3-venv)
 command -v ccache >/dev/null 2>&1 || pkgs+=(ccache)
 pkg-config --exists libzstd || pkgs+=(libzstd-dev)
 if ((${#pkgs[@]})); then
   echo "Installing missing builder packages: ${pkgs[*]}"
   apt-get update -qq
   apt-get install -y -qq "${pkgs[@]}"
+fi
+clang_tidy_version="$(sed -n "s/^CLANG_TIDY_VERSION = \"\(.*\)\"$/\1/p" /src/scripts/run-clang-tidy.py)"
+if ! /opt/ninfer-lint/bin/clang-tidy --version 2>/dev/null | grep -q "version ${clang_tidy_version}"; then
+  echo "Installing clang-tidy ${clang_tidy_version} into /opt/ninfer-lint"
+  python3 -m venv /opt/ninfer-lint
+  /opt/ninfer-lint/bin/pip install -q --no-cache-dir "clang-tidy==${clang_tidy_version}"
 fi
 '
 

@@ -1,0 +1,66 @@
+# Pinned formatters, linters, and file checks. Every tool version lives here (clang-tidy, which
+# needs the CUDA build tree, is pinned in scripts/run-clang-tidy.py and runs in the builder).
+#
+#   pre-commit install                          # run the fast hooks on every commit
+#   pre-commit run --all-files                  # whole tree (what CI runs)
+#   pre-commit run clang-tidy --hook-stage manual
+#
+# `prek` (https://github.com/j178/prek) is a drop-in, faster runner for this same file.
+# Policy and rationale: docs/maintainer/code-quality.md.
+minimum_pre_commit_version: "4.0.0"
+exclude: ^third_party/
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-merge-conflict
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: \.patch$
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+        exclude: \.patch$
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v22.1.8
+    hooks:
+      - id: clang-format
+        types_or: [c, c++, cuda]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.50.3
+    hooks:
+      - id: typos
+        args: [--force-exclude]
+
+  - repo: local
+    hooks:
+      - id: clang-tidy
+        name: clang-tidy (changed lines, builder container)
+        entry: scripts/run-clang-tidy.py --changed
+        language: system
+        pass_filenames: false
+        stages: [manual]
