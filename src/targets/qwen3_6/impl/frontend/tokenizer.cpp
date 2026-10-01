@@ -138,7 +138,7 @@ VocabMetadata load_vocab(const Json& model, std::string_view label) {
         max_id = std::max(max_id, id);
     }
 
-    metadata.id_to_token.resize(static_cast<std::size_t>(max_id + 1));
+    metadata.id_to_token.resize(static_cast<std::size_t>(max_id) + 1);
     for (const auto& item : vocab.items()) {
         const int id = parse_token_id(item.value(), "model.vocab", label);
         metadata.id_to_token.at(static_cast<std::size_t>(id)) = item.key();

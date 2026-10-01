@@ -30,11 +30,10 @@ inline bool dflash_candidate_stats_enabled() {
 }
 
 namespace dflash_candidate_stats {
-namespace {
 
-constexpr int kMaxDrafts = 8;
-constexpr int kMaxWidth  = 16;
-constexpr int kVocabCap  = 248320;
+inline constexpr int kMaxDrafts = 8;
+inline constexpr int kMaxWidth  = 16;
+inline constexpr int kVocabCap  = 248320;
 
 struct Probe {
     std::mutex mu;
@@ -139,8 +138,6 @@ inline int rank_in_column(const Probe& p, int token, int depth) {
     }
     return better;
 }
-
-} // namespace
 
 inline void capture_logits(const Tensor& logits, const Tensor* logit_token_ids, int drafts,
                            cudaStream_t stream) {

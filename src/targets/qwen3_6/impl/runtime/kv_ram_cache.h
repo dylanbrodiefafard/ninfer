@@ -198,7 +198,7 @@ public:
     void pin_for_io(std::uint64_t entry_id);
     void unpin_for_io(std::uint64_t entry_id);
     bool evict_one_unpinned(std::uint64_t entry_id);
-    void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_entry_id);
+    void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_id);
     [[nodiscard]] std::uint64_t disk_entry_id(std::uint64_t entry_id) const;
     [[nodiscard]] const void* host_block(std::uint64_t entry_id) const;
     [[nodiscard]] std::size_t host_bytes(std::uint64_t entry_id) const;

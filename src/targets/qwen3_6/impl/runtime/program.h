@@ -276,8 +276,8 @@ struct RequestControl {
 
 class ProgramImplCore {
 public:
-    ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
-                    DeviceContext& device, std::unique_ptr<HostPinnedArena> kv_ram_arena);
+    ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
+                    DeviceContext& device_in, std::unique_ptr<HostPinnedArena> kv_ram_arena);
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -285,11 +285,11 @@ public:
                       const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
-                                                    const RequestBasePlan& base);
+                                                    const RequestBasePlan& base_plan);
     [[nodiscard]] RequestPlan plan_ram_reuse(const PreparedPromptData& prompt,
-                                             const RequestBasePlan& base);
+                                             const RequestBasePlan& base_plan);
     [[nodiscard]] RequestPlan plan_disk_reuse(const PreparedPromptData& prompt,
-                                              const RequestBasePlan& base);
+                                              const RequestBasePlan& base_plan);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
@@ -497,8 +497,9 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
-    void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
-                             std::uint32_t backend_pages);
+    // Reserves the lane's KV bundle and returns it; the lane must not already own one.
+    SequenceKVBundle& reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
+                                          std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
@@ -570,7 +571,7 @@ private:
     void install_ram_context_checkpoints(SequenceState& sequence,
                                          const qwen3_6::detail::RamRestoredHost& host);
     void install_disk_context_checkpoints(SequenceState& sequence,
-                                          qwen3_6::detail::DiskRestoredHost&& host);
+                                          qwen3_6::detail::DiskRestoredHost host);
     [[nodiscard]] bool staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
                                      std::uint32_t frontier) const noexcept;
     [[nodiscard]] bool captures_context_checkpoints() const noexcept;
