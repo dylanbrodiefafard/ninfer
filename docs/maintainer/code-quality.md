@@ -45,12 +45,14 @@ clang-tidy runs in the builder container against `/build/compile_commands.json`:
 ./scripts/run-clang-tidy.py                      # whole tree: the existing-findings backlog
 ```
 
-The runner rewrites nvcc commands into clang CUDA commands for `sm_120a`, so kernels, launchers,
-and host code share one configuration. `--changed` analyzes every translation unit that is or
-includes a changed file and reports only diagnostics on changed lines: new and modified code
-meets the full check set, while findings in untouched code stay a visible backlog to burn down
-by check family rather than a reason to weaken `.clang-tidy`. Header changes are mapped to their
-includers through Ninja's dependency log, so build the tree first.
+The runner rewrites nvcc commands into clang CUDA commands for `sm_120a`, so kernels, launchers, and
+host code share one configuration. `--changed` analyzes every translation unit that is or includes a
+changed file and reports only diagnostics on changed lines: new and modified code meets the full
+check set, while findings in untouched code stay a visible backlog to burn down by check family
+rather than a reason to weaken `.clang-tidy`. The two widening checks apply to host translation
+units only: device index arithmetic is 32-bit by design and bounded by each kernel's shape contract,
+which its host launcher validates under those checks. Header changes are mapped to their includers
+through Ninja's dependency log, so build the tree first.
 
 Runtime checkers are opt-in because they are slow:
 

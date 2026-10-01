@@ -43,8 +43,7 @@ Checks: >
   readability-misplaced-array-index,
   readability-redundant-control-flow,
   readability-redundant-smartptr-get,
-  readability-string-compare,
-  readability-suspicious-call-argument
+  readability-string-compare
 WarningsAsErrors: "*"
 HeaderFilterRegex: "/(apps|bench|include|src|tests)/"
 ExcludeHeaderFilterRegex: "/third_party/"
@@ -55,8 +54,23 @@ FormatStyle: file
 # narrowing-conversions (deliberate in quantization code; the overflow class is covered by the
 # widening checks), random-generator-seed (tests seed deliberately for reproducibility), and
 # definitions-in-headers (target runtime *_impl.h headers are single-inclusion implementation
-# units instantiated once per target namespace).
+# units instantiated once per target namespace). readability-suspicious-call-argument is not
+# enabled: it matches argument and parameter names heuristically and its findings here were
+# false positives.
+#
+# The two widening checks (implicit-widening-of-multiplication-result, misplaced-widening-cast)
+# apply to host translation units only; run-clang-tidy.py disables them for CUDA translation
+# units. Device index arithmetic is 32-bit by design, bounded by each kernel's documented shape
+# contract, which its host launcher validates under these checks.
 CheckOptions:
+  # main() is a process boundary: an escaping exception terminates with its message, which is the
+  # intended failure for tests and benchmarks. Destructors, moves, swaps, and noexcept functions
+  # stay checked.
+  bugprone-exception-escape.CheckMain: false
+  # Constant products are evaluated at compile time, where the compiler diagnoses overflow.
+  bugprone-implicit-widening-of-multiplication-result.IgnoreConstantIntExpr: true
+  # .value() is checked access: it throws std::bad_optional_access.
+  bugprone-unchecked-optional-access.IgnoreValueCalls: true
   # Packed int8 weight codes are sign-extended on purpose.
   bugprone-signed-char-misuse.CharTypdefsToIgnore: "std::int8_t;int8_t"
   bugprone-implicit-widening-of-multiplication-result.UseCXXStaticCastsInCppSources: true

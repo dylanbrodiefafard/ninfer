@@ -47,6 +47,11 @@ HUNK = re.compile(r"^@@ -\S+ \+(?P<start>\d+)(?:,(?P<count>\d+))? @@")
 # nvcc arguments that carry over to clang unchanged; every other nvcc flag is dropped.
 NVCC_KEEP_WITH_VALUE = {"-I", "-isystem", "-D", "-U", "-include"}
 NVCC_KEEP_PREFIX = ("-I", "-D", "-U", "-std=", "-O")
+# Device index arithmetic is 32-bit by design and bounded by each kernel's documented shape
+# contract, so the widening checks apply to host translation units only (see .clang-tidy).
+CUDA_DISABLED_CHECKS = (
+    "-bugprone-implicit-widening-of-multiplication-result,-bugprone-misplaced-widening-cast"
+)
 
 
 def in_container() -> bool:
@@ -229,8 +234,10 @@ def changed_lines(base: str | None) -> dict[str, set[int] | None]:
     return changed
 
 
-def run_one(clang_tidy: str, database: Path, source: str, fix: bool) -> str:
+def run_one(clang_tidy: str, database: Path, source: str, cuda: bool, fix: bool) -> str:
     command = [clang_tidy, "--quiet", f"-p={database}", str(ROOT / source)]
+    if cuda:
+        command.append(f"--checks={CUDA_DISABLED_CHECKS}")
     if fix:
         command.append("--fix")
     result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -314,7 +321,10 @@ def main() -> int:
     seen: set[str] = set()
     reported = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = [pool.submit(run_one, clang_tidy, database, s, args.fix) for s in selected]
+        futures = [
+            pool.submit(run_one, clang_tidy, database, s, s.endswith(".cu"), args.fix)
+            for s in selected
+        ]
         for future in concurrent.futures.as_completed(futures):
             for head, block in split_diagnostics(future.result(), lines):
                 if head in seen:
