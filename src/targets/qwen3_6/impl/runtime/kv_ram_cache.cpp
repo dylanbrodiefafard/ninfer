@@ -414,7 +414,7 @@ void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction,
     if (it->second.io_pins != 0) {
         throw std::logic_error("RAM cache cannot destroy an I/O-pinned entry");
     }
-    const cudaEvent_t done = it->second.copies_done;
+    cudaEvent_t done = it->second.copies_done;
     if (done != nullptr) { wait_event_unlocked(lock, done, entry_id); }
     it = records_.find(entry_id);
     if (it == records_.end()) { return; }
@@ -437,8 +437,10 @@ void KVRamCache::destroy_record(std::uint64_t entry_id, bool count_eviction,
 }
 
 void KVRamCache::create_copy_event(cudaEvent_t* event, unsigned int flags) {
-    if (fail_copy_event_allocation_after_ >= 0 && fail_copy_event_allocation_after_-- == 0) {
-        check_cache_cuda_event_allocation(cudaErrorMemoryAllocation);
+    if (fail_copy_event_allocation_after_ >= 0) {
+        const bool fail_now = fail_copy_event_allocation_after_ == 0;
+        --fail_copy_event_allocation_after_;
+        if (fail_now) { check_cache_cuda_event_allocation(cudaErrorMemoryAllocation); }
     }
     create_cache_cuda_event(event, flags);
 }
@@ -763,7 +765,7 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     Record& record = require(entry_id);
     if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     io_cv_.wait(lock, [&] { return record.io_pins == 0; });
-    const cudaEvent_t done = record.copies_done;
+    cudaEvent_t done = record.copies_done;
     if (done != nullptr) { wait_event_unlocked(lock, done, entry_id); }
     Record& live          = require(entry_id);
     const double leftover = copy_elapsed_seconds(live);

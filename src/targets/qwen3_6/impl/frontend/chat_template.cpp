@@ -802,7 +802,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
-                                          ChatRenderOptions options) const {
+                                          const ChatRenderOptions& options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
@@ -891,7 +891,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 }
 
 RenderedFragment CompiledChatTemplate::render_fragment(const std::vector<ChatMessage>& messages,
-                                                       ChatRenderOptions options) const {
+                                                       const ChatRenderOptions& options) const {
     if (messages.empty()) { return {}; }
     const bool effort_template   = semantics_ == ChatTemplateSemantics::ReasoningEffort;
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);

@@ -104,6 +104,14 @@ Size smart_resize_video(int frames, int height, int width, std::uint64_t min_pix
     return {h, w};
 }
 
+// Pillow's precompute_coeffs bounds the filter window with (int)(x + 0.5): truncation toward zero
+// after a half offset, not round-half-away-from-zero. Reference preprocessing parity requires the
+// identical window bounds, including for negative x before the caller clamps to zero.
+int pil_window_bound(double x) {
+    // NOLINTNEXTLINE(bugprone-incorrect-roundings): exact Pillow window-bound arithmetic.
+    return static_cast<int>(x + 0.5);
+}
+
 double cubic(double x) {
     // Torchvision's antialiased bicubic path uses the Keys/Pillow coefficient.
     constexpr double a = -0.5;
@@ -122,14 +130,14 @@ struct Coefficients {
 Coefficients coefficients(int input, int output) {
     Coefficients out;
     out.starts.resize(static_cast<std::size_t>(output));
-    out.offsets.resize(static_cast<std::size_t>(output + 1));
+    out.offsets.resize(static_cast<std::size_t>(output) + 1);
     const double scale    = static_cast<double>(input) / output;
     const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
     const double support  = 2.0 * (scale >= 1.0 ? scale : 1.0);
     for (int dst = 0; dst < output; ++dst) {
         const double center = scale * (dst + 0.5);
-        const int begin     = std::max(static_cast<int>(center - support + 0.5), 0);
-        const int size      = std::min(static_cast<int>(center + support + 0.5), input) - begin;
+        const int begin     = std::max(pil_window_bound(center - support), 0);
+        const int size      = std::min(pil_window_bound(center + support), input) - begin;
         out.starts[static_cast<std::size_t>(dst)]  = begin;
         out.offsets[static_cast<std::size_t>(dst)] = static_cast<int>(out.weights.size());
         double sum                                 = 0.0;
@@ -156,7 +164,7 @@ media::decode::Image resize_bicubic(const media::decode::Image& input, Size size
     for (int y = 0; y < input.height; ++y) {
         for (int x = 0; x < size.w; ++x) {
             const int first = horizontal.offsets[static_cast<std::size_t>(x)];
-            const int last  = horizontal.offsets[static_cast<std::size_t>(x + 1)];
+            const int last  = horizontal.offsets[static_cast<std::size_t>(x) + 1];
             for (int c = 0; c < 3; ++c) {
                 float value = 0.0f;
                 for (int i = first; i < last; ++i) {
@@ -179,7 +187,7 @@ media::decode::Image resize_bicubic(const media::decode::Image& input, Size size
     out.rgb.resize(static_cast<std::size_t>(size.h) * size.w * 3);
     for (int y = 0; y < size.h; ++y) {
         const int first = vertical.offsets[static_cast<std::size_t>(y)];
-        const int last  = vertical.offsets[static_cast<std::size_t>(y + 1)];
+        const int last  = vertical.offsets[static_cast<std::size_t>(y) + 1];
         for (int x = 0; x < size.w; ++x) {
             for (int c = 0; c < 3; ++c) {
                 float value = 0.0f;
@@ -276,15 +284,16 @@ Prepared prepare_video(const ChatPart& part, const ProcessorOptions& options,
         timestamp_indices.push_back(timestamp_indices.back());
     }
     for (int t = 0; t < gt; ++t) {
-        out.item.timestamps.push_back(
-            static_cast<double>(timestamp_indices[2 * t] + timestamp_indices[2 * t + 1]) /
-            (2.0 * video.fps));
+        const std::size_t first_index = static_cast<std::size_t>(t) * kTemporal;
+        out.item.timestamps.push_back(static_cast<double>(timestamp_indices[first_index] +
+                                                          timestamp_indices[first_index + 1]) /
+                                      (2.0 * video.fps));
     }
     out.patches.reserve(static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures);
     for (int t = 0; t < gt; ++t) {
         const std::vector<const media::decode::Image*> frames{
-            &video.frames[static_cast<std::size_t>(2 * t)],
-            &video.frames[static_cast<std::size_t>(2 * t + 1)]};
+            &video.frames[static_cast<std::size_t>(t) * kTemporal],
+            &video.frames[(static_cast<std::size_t>(t) * kTemporal) + 1]};
         for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
             for (int block_x = 0; block_x < gw / kMerge; ++block_x) {
                 for (int merge_y = 0; merge_y < kMerge; ++merge_y) {
@@ -413,7 +422,7 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
     const std::uint64_t patches =
         checked_mul(static_cast<std::uint64_t>(item.grid.t), spatial, "vision raw patches");
     stats.raw_patches += patches;
-    stats.vision_tokens += patches / (kMerge * kMerge);
+    stats.vision_tokens += patches / (static_cast<std::uint64_t>(kMerge) * kMerge);
     stats.attention_pairs += checked_mul(static_cast<std::uint64_t>(item.grid.t),
                                          checked_mul(spatial, spatial, "vision attention pairs"),
                                          "vision attention pairs");
@@ -640,7 +649,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
 
 Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,
                      ProcessorOptions options)
-    : tokenizer_(tokenizer), chat_template_(chat_template), options_(std::move(options)) {
+    : tokenizer_(tokenizer), chat_template_(chat_template), options_(options) {
     if (options_.max_media_items == 0 || options_.max_media_bytes == 0 ||
         options_.max_decoded_pixels == 0 || options_.max_decoded_video_pixels == 0 ||
         options_.image_min_pixels == 0 || options_.image_max_pixels < options_.image_min_pixels ||
@@ -656,13 +665,13 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
 }
 
 ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
-                                  ChatRenderOptions render_options) const {
+                                  const ChatRenderOptions& render_options) const {
     const std::vector<const ChatPart*> parts = media_parts(messages);
     if (parts.size() > options_.max_media_items) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "media item count exceeds processor budget");
     }
-    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    RenderedChat rendered = chat_template_.render(messages, render_options);
     const media::decode::Policy policy{
         .max_bytes                  = options_.max_media_bytes,
         .max_decoded_pixels         = options_.max_decoded_pixels,

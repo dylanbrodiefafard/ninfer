@@ -157,7 +157,7 @@ public:
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
-    ~TextContext();
+    ~TextContext() = default;
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
@@ -269,8 +269,8 @@ private:
     }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
-    void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const FullLayerW& weights, Tensor& x, int full_index, Phase phase);
+    void gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>

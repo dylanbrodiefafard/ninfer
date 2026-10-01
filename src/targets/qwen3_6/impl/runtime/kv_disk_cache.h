@@ -864,7 +864,9 @@ private:
     void promote_idle_spill_to_emergency();
     void promote_spill_for_reclaim_locked();
     void demote_reclaim_spill_locked();
-    [[nodiscard]] bool spill_live_locked() const noexcept;
+    // RAM entry id of the installed spill session while it is neither cancelled, failed, nor
+    // committed; empty when no live session is installed.
+    [[nodiscard]] std::optional<std::uint64_t> live_spill_ram_locked() const noexcept;
     [[nodiscard]] bool reclaim_target_live_locked() const;
     // Worker-side pin and prepare of one RAM entry's spill; `urgent` spills a
     // reclaim target at emergency priority.

@@ -76,9 +76,9 @@ ops::SamplingConfig ToolMaskExchange::root(std::size_t row, cudaStream_t stream)
 ToolMaskExchange::Submission ToolMaskExchange::enqueue(const Tensor& ids, const Tensor* parents,
                                                        const Tensor& valid_columns,
                                                        cudaStream_t compute, cudaStream_t host) {
-    const cudaStream_t stream = host;
-    const auto batch          = static_cast<std::size_t>(ids.ne[1]);
-    const auto width          = static_cast<std::size_t>(ids.ne[0]);
+    cudaStream_t stream = host;
+    const auto batch    = static_cast<std::size_t>(ids.ne[1]);
+    const auto width    = static_cast<std::size_t>(ids.ne[0]);
     if (width > width_ || batch > capacity_ || ids.dtype != DType::I32 ||
         valid_columns.dtype != DType::I32 || valid_columns.ne[0] != ids.ne[1]) {
         throw std::invalid_argument("invalid speculative tool mask inputs");

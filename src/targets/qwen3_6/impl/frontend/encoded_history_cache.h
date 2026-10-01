@@ -20,7 +20,7 @@ namespace ninfer::targets::qwen3_6::frontend_internal {
 
 inline constexpr std::size_t kHostEncodeCacheEntries  = 16;
 inline constexpr std::size_t kHostEncodeCacheMaxIds   = 262144;
-inline constexpr std::size_t kHostEncodeCacheMaxBytes = 2 * 1024 * 1024;
+inline constexpr std::size_t kHostEncodeCacheMaxBytes = std::size_t{2} * 1024 * 1024;
 
 struct HostEncodeObservation {
     bool cache_hit           = false;

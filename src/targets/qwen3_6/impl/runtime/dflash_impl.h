@@ -37,7 +37,6 @@
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 void require_dflash_state(const PrefillContext& state) {
     if (state.dflash == nullptr || !state.execution.model.dflash.has_value()) {
@@ -53,6 +52,15 @@ DFlashPersistentState& dflash_state(PrefillContext& state) {
 DFlashPersistentState& dflash_state(DFlashBatchContext& state) { return state.dflash; }
 
 DFlashPersistentState& dflash_state(DFlashAppendContext& state) { return state.dflash; }
+
+// Returns the loaded DFlash weights, which every DFlash schedule requires; throws
+// std::logic_error when the model was loaded without them.
+template <class Context>
+const auto& dflash_weights(const Context& state) {
+    const auto& weights = state.execution.model.dflash;
+    if (!weights) { throw std::logic_error("DFlash schedule requires DFlash weights"); }
+    return *weights;
+}
 
 // Used only by Variants with a fused QKV projection.
 [[maybe_unused]] void copy_fused_row_range(const Tensor& fused, std::int32_t row0, Tensor& out,
@@ -145,6 +153,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
         using Config               = typename V::DFlashConfig;
+        const auto& weights        = dflash_weights(state);
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
@@ -185,23 +194,21 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         Tensor projected = context_roots.projected;
         if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
             ops::linear_packed_sequences(
-                features.view({Config::feature_rows, columns}),
-                state.execution.model.dflash->feature_projection, projected,
-                dflash_weight_policy(state.execution.model.dflash->feature_projection.qtype),
+                features.view({Config::feature_rows, columns}), weights.feature_projection,
+                projected, dflash_weight_policy(weights.feature_projection.qtype),
                 state.execution.work, state.execution.device.stream, width);
         } else {
             ops::linear_packed_sequences(features.view({Config::feature_rows, columns}),
-                                         state.execution.model.dflash->feature_projection,
-                                         projected, state.execution.device.stream, width);
+                                         weights.feature_projection, projected,
+                                         state.execution.device.stream, width);
         }
         Tensor context = context_roots.normalized;
-        ops::rmsnorm(projected, state.execution.model.dflash->context_norm, Config::rms_epsilon,
-                     false, context, state.execution.device.stream);
+        ops::rmsnorm(projected, weights.context_norm, Config::rms_epsilon, false, context,
+                     state.execution.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
-            auto layer_scope = state.execution.work.scope();
-            const auto& weight =
-                state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
+            auto layer_scope        = state.execution.work.scope();
+            const auto& weight      = weights.layers.at(static_cast<std::size_t>(layer));
             const bool local_layer  = layer < Config::local_layers;
             const int layer_width   = local_layer ? local_width : width;
             const int layer_columns = layer_width * batch;
@@ -286,6 +293,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             }
             return;
         }
+        const auto& weights = dflash_weights(state);
         // Eager callers provide the batch maximum for workspace safety, but SWA's direct/split
         // route is selected from max_context. Use the host ingress frontier so an isolated row
         // takes the same route as an eager C=1 call. Captured graphs retain their fixed profile
@@ -422,7 +430,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                     if (exact_sequence_envelope) {
                                         const std::int32_t frontier =
                                             state.host_ingress.execution_frontiers.at(
-                                                static_cast<std::size_t>(row_begin + row));
+                                                static_cast<std::size_t>(row_begin) +
+                                                static_cast<std::size_t>(row));
                                         if (frontier < 0) {
                                             throw std::logic_error(
                                                 "DFlash proposal frontier must be non-negative");
@@ -497,7 +506,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                               state.execution.device.stream);
                         }
                     }
-                }(*state.execution.model.dflash);
+                }(weights);
             } else {
                 [&](const auto& dflash) {
                     for (int layer = 0; layer < Config::layers; ++layer) {
@@ -592,7 +601,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 });
                         }
                     }
-                }(*state.execution.model.dflash);
+                }(weights);
             }
         };
         if (two_block) {
@@ -657,9 +666,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                             packed.data, row_bytes, src, source_pitch, row_bytes,
                             static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                             state.execution.device.stream));
-                        ops::rmsnorm(packed, state.execution.model.dflash->final_norm,
-                                     Config::rms_epsilon, false, proposal_hidden,
-                                     state.execution.device.stream);
+                        ops::rmsnorm(packed, weights.final_norm, Config::rms_epsilon, false,
+                                     proposal_hidden, state.execution.device.stream);
                         Tensor hidden_batch =
                             proposal_hidden.view({Config::hidden, pack_k, batch_size});
                         const auto run_select = [&](const Tensor& logits_batch,
@@ -721,10 +729,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     auto* pth = static_cast<std::int32_t*>(path_first.data);
                     for (std::int32_t b = 0; b < batch_size; ++b) {
                         for (std::int32_t u = 0; u < split; ++u) {
-                            CUDA_CHECK(cudaMemcpyAsync(idp + (1 + u) + full_width * b,
-                                                       pth + u + split * b, sizeof(std::int32_t),
-                                                       cudaMemcpyDeviceToDevice,
-                                                       state.execution.device.stream));
+                            CUDA_CHECK(cudaMemcpyAsync(
+                                idp + (1 + u) + static_cast<std::ptrdiff_t>(full_width) * b,
+                                pth + u + static_cast<std::ptrdiff_t>(split) * b,
+                                sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+                                state.execution.device.stream));
                         }
                     }
                     width         = full_width;
@@ -743,7 +752,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     Tensor anchors2 = state.execution.work.alloc(DType::I32, {batch_size});
                     for (std::int32_t b = 0; b < batch_size; ++b) {
                         CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(anchors2.data) + b,
-                                                   pth + (split - 1) + split * b,
+                                                   pth + (split - 1) +
+                                                       static_cast<std::ptrdiff_t>(split) * b,
                                                    sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
                                                    state.execution.device.stream));
                     }
@@ -760,7 +770,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                        state.execution.device.stream);
                     copy_selector_hops(sel_q_view, sel_q_suffix, split,
                                        state.execution.device.stream);
-                }(*state.execution.model.dflash);
+                }(weights);
             }
         } else {
             Tensor packed = state.execution.work.alloc(
@@ -779,8 +789,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                              row_bytes, static_cast<std::size_t>(batch_size),
                                              cudaMemcpyDeviceToDevice,
                                              state.execution.device.stream));
-                ops::rmsnorm(packed, state.execution.model.dflash->final_norm, Config::rms_epsilon,
-                             false, proposal_hidden, state.execution.device.stream);
+                ops::rmsnorm(packed, weights.final_norm, Config::rms_epsilon, false,
+                             proposal_hidden, state.execution.device.stream);
             };
             pack_proposal();
             ninfer::targets::qwen3_6::detail::dflash_candidate_stats::capture_activation(
@@ -888,10 +898,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         const int k_i     = static_cast<int>(k);
                         for (int b = 0; b < batch_size; ++b) {
                             for (int u = 0; u < prefix; ++u) {
-                                CUDA_CHECK(cudaMemcpyAsync(idp + (1 + u) + width_i * b,
-                                                           drp + u + k_i * b, sizeof(std::int32_t),
-                                                           cudaMemcpyDeviceToDevice,
-                                                           state.execution.device.stream));
+                                CUDA_CHECK(cudaMemcpyAsync(
+                                    idp + (1 + u) + static_cast<std::ptrdiff_t>(width_i) * b,
+                                    drp + u + static_cast<std::ptrdiff_t>(k_i) * b,
+                                    sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+                                    state.execution.device.stream));
                             }
                         }
                         run_embed_layers();
@@ -905,7 +916,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                             static_cast<std::size_t>(Config::hidden) * sizeof(std::uint16_t);
                         for (int b = 0; b < batch_size; ++b) {
                             for (int u = 0; u < prefix; ++u) {
-                                const std::size_t col = static_cast<std::size_t>(u + k_i * b);
+                                const std::size_t col =
+                                    static_cast<std::size_t>(u) +
+                                    (static_cast<std::size_t>(k_i) * static_cast<std::size_t>(b));
                                 CUDA_CHECK(cudaMemcpyAsync(
                                     static_cast<std::byte*>(logits.data) + col * logit_col,
                                     static_cast<std::byte*>(stash_logits.data) + col * logit_col,
@@ -961,7 +974,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     copy_selector_hops(sel_ids_view, sel_ids, 0, state.execution.device.stream);
                     copy_selector_hops(sel_q_view, sel_q, 0, state.execution.device.stream);
                     (void)flat_drafts;
-                }(*state.execution.model.dflash);
+                }(weights);
             } else if (state.execution.proposal_head == ProposalHead::Full) {
                 Tensor logits = state.execution.work.alloc(
                     DType::BF16,
@@ -1203,8 +1216,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    state.execution.device.stream));
     };
 }
-
-} // namespace
 
 DFlashFeatureSink dflash_feature_sink(PrefillContext& state,
                                       DFlashFeatureSink::PrefillConsumer consume_prefill) {

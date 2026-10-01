@@ -506,14 +506,14 @@ std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
                         SequencePlan<Variant>&& plan, DeviceContext& device,
                         std::unique_ptr<HostPinnedArena> kv_ram_arena) {
-    if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->weights_profile != weights_profile) {
+    const SequencePlan<Variant> consumed = std::move(plan);
+    if (consumed.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
+    if (consumed.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *consumed.impl_, device,
                                                                std::move(kv_ram_arena));
-    plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }
 

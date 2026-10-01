@@ -11,7 +11,6 @@
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
@@ -27,8 +26,6 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
     });
 }
-
-} // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
@@ -123,6 +120,9 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
         bridge.position < 0 ||
         static_cast<std::uint32_t>(bridge.position) + 1 != state.text_kv_base) {
         throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
+    }
+    if (!state.execution.io.mtp) {
+        throw std::logic_error("multimodal MTP bridge requires MTP round state");
     }
 
     Tensor bridge_token = state.execution.io.mtp->target_input_ids.slice(0, 0, 1);

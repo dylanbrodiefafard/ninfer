@@ -31,10 +31,11 @@ VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         VisionLayerPlan& target  = out.layers[layer];
         const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
-        target.qkv         = bind(prefix + "attention/qkv", NumericFormat::Q4G64_F16S,
-                                  {3 * VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
+        target.qkv =
+            bind(prefix + "attention/qkv", NumericFormat::Q4G64_F16S,
+                 {std::uint64_t{3} * VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
         target.qkv_bias    = bind(prefix + "attention/qkv_bias", NumericFormat::BF16,
-                                  {3 * VisionBackboneConfig::hidden});
+                                  {std::uint64_t{3} * VisionBackboneConfig::hidden});
         target.output      = bind(prefix + "attention/output", NumericFormat::Q5G64_F16S,
                                   {VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
         target.output_bias = bind(prefix + "attention/output_bias", NumericFormat::BF16,
@@ -112,8 +113,9 @@ VisionCommonWeights materialize_vision_common(const artifact::MaterializedArtifa
         target.qkv                    = artifact::materialized_weight(
             materialized, source.qkv, NumericFormat::Q4G64_F16S, 3 * VisionBackboneConfig::hidden,
             VisionBackboneConfig::hidden);
-        target.qkv_bias = artifact::materialized_tensor(
-            materialized, source.qkv_bias, NumericFormat::BF16, {3 * VisionBackboneConfig::hidden});
+        target.qkv_bias =
+            artifact::materialized_tensor(materialized, source.qkv_bias, NumericFormat::BF16,
+                                          {std::uint64_t{3} * VisionBackboneConfig::hidden});
         target.output = artifact::materialized_weight(
             materialized, source.output, NumericFormat::Q5G64_F16S, VisionBackboneConfig::hidden,
             VisionBackboneConfig::hidden);
