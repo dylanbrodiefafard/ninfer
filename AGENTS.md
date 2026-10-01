@@ -193,9 +193,11 @@ Code:
 - Check every fallible operation (CUDA runtime/driver calls, kernel launches, I/O, parsing,
   allocation) where it fails, and propagate a typed error with context; never discard a status,
   swallow an exception, or log-and-continue past a broken invariant.
-- Size, offset, and index arithmetic cannot overflow at real model shapes: 64-bit element and
-  byte offsets for tensors and arenas, explicit and justified narrowing, and no product of two
-  32-bit values widened after the fact.
+- Size, offset, and index arithmetic cannot overflow at real model shapes. Host code uses 64-bit
+  element and byte offsets for tensors, arenas, and workspaces, with explicit and justified
+  narrowing and no product of two 32-bit values widened after the fact. Device code may index in
+  32 bits, which saves registers and instructions, only when the kernel's documented shape
+  contract bounds every product below 2^31 and its host launcher validates that bound.
 - No undefined behavior, data races, or unstated synchronization assumptions. A kernel's
   correctness under concurrency is demonstrated with compute-sanitizer, not inferred.
 - No dead code, commented-out code, unused parameters or variables, debug output, duplicated
