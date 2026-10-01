@@ -37,7 +37,6 @@ enum class Q5ScaleLoad {
 
 enum class Q5MmaEpilogue {
     Store,
-    AddResidual,
     CtaCollectiveResidual,
 };
 
@@ -113,7 +112,6 @@ void q5_rowsplit_gemm_mma_kernel(
     const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high,
     const std::uint8_t* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ residual,
     __nv_bfloat16* __restrict__ out,
     std::int32_t rows,
     std::int32_t k,
@@ -121,7 +119,7 @@ void q5_rowsplit_gemm_mma_kernel(
     std::int32_t padded_k) {
     // clang-format on
     using Schedule = Schedule_;
-    static_assert(Epilogue == Q5MmaEpilogue::Store || Epilogue == Q5MmaEpilogue::AddResidual ||
+    static_assert(Epilogue == Q5MmaEpilogue::Store ||
                       Epilogue == Q5MmaEpilogue::CtaCollectiveResidual,
                   "Q5 MMA requires a supported epilogue");
 
@@ -500,9 +498,6 @@ void q5_rowsplit_gemm_mma_kernel(
                 const int output_col1 = output_col0 + 1;
                 const float* values   = accum[mi][ni];
                 auto store_value      = [&](std::int64_t index, float value) {
-                    if constexpr (Epilogue == Q5MmaEpilogue::AddResidual) {
-                        value = __bfloat162float(residual[index]) + value;
-                    }
                     out[index] = __float2bfloat16_rn(value);
                 };
                 if constexpr (kFull) {

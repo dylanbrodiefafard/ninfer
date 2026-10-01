@@ -244,6 +244,9 @@ def render(v: dict) -> str:
             f"{f('bug_residual'):>10s}  {c.get('bug_class', '-')}"
         )
 
+    # avg_floor is None when no case produced a floor value.
+    avg_floor = o.get("avg_floor")
+    floor_text = f"{avg_floor:.4f}" if avg_floor is not None else "n/a"
     # Only classifiable cases count toward the worst residual: single-tile A1 cases
     # have no independent step signal (step64 == closed-form), so their residual is
     # the expected independent-rounding distance, not a bug candidate.
@@ -255,11 +258,11 @@ def render(v: dict) -> str:
     worst = max((c["bug_residual"] for c in classifiable), default=None)
     if worst is not None:
         lines.append(
-            f"  floor: avg {o.get('avg_floor'):.4f} (documented 0.053-0.059) | "
+            f"  floor: avg {floor_text} (documented 0.053-0.059) | "
             f"worst bug-residual (classifiable cases) {worst:.4g}"
         )
     else:
-        lines.append(f"  floor: avg {o.get('avg_floor'):.4f}")
+        lines.append(f"  floor: avg {floor_text}")
     if worst is None:
         return "\n".join(lines)
     if keep < 1.0:
@@ -287,7 +290,7 @@ def render(v: dict) -> str:
         )
         lines.append(
             f"  => the kernel adds {worst:.4g} rel_L2 on top of the FP4-P floor "
-            f"(avg floor {o.get('avg_floor'):.4f}; class {worst_class}): a systematic "
+            f"(avg floor {floor_text}; class {worst_class}): a systematic "
             "deviation beyond the intrinsic quant floor. Localize it: the S3_ORC_DUMP / "
             "SAGE_DUMP env dumps of this test already per-block-dump the s3 P-quant "
             "stages, and the P2 side-band port (op_dump + diff.py) localizes the first "
