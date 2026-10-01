@@ -5,7 +5,7 @@
 # Policy and rationale: docs/maintainer/code-quality.md.
 #
 # Checks are selected for defect classes, not style: use-after-move, dangling references,
-# integer overflow in index arithmetic, swapped arguments, slicing, missing virtual
+# integer overflow in index arithmetic, slicing, missing virtual
 # destructors, unchecked optional access, exception-safety errors, and path-sensitive
 # analyzer findings (null dereference, leaks, uninitialized reads).
 Checks: >

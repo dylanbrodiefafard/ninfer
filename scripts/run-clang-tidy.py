@@ -8,15 +8,15 @@ sm_120a, so kernels, launchers, and host code are analyzed by the same configura
 (.clang-tidy). Diagnostics from headers are reported once, not once per including TU.
 
 Usage:
-  ./scripts/run-clang-tidy.py                    # every project TU in the build tree
+  ./scripts/run-clang-tidy.py                    # every project TU: the gate, zero findings
   ./scripts/run-clang-tidy.py --changed          # diagnostics on lines changed vs. origin/HEAD
   ./scripts/run-clang-tidy.py --changed HEAD~3   # diagnostics on lines changed since a ref
   ./scripts/run-clang-tidy.py src/serve/foo.cpp  # named TUs (headers select their includers)
 
---changed analyzes every TU that is or includes a changed file, and reports only diagnostics on
-changed lines, so new code is held to the full check set while existing findings in untouched
-code remain a visible backlog (run without --changed to list it). Exit status is 1 when any
-diagnostic is reported. The clang-tidy version is pinned below (the Dockerfile build stage
+--changed analyzes every TU that is or includes a changed file and reports only diagnostics on
+changed lines, as a fast check while iterating. The full run is the gate: a change can expose a
+path-sensitive analyzer finding on a line it did not touch. Exit status is 1 when any diagnostic
+is reported. The clang-tidy version is pinned below (the Dockerfile build stage
 installs the same version); see docs/maintainer/code-quality.md.
 """
 
