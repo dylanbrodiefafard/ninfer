@@ -65,6 +65,8 @@ cmake --build build-asan
 ASAN_OPTIONS=protect_shadow_gap=0 ctest --test-dir build-asan -E '_real_test$'
 ```
 
+An instrumented tree reports compiler warnings without failing, because ASan instrumentation makes
+GCC's flow-based warnings report paths that do not exist; the normal tree is the warning gate.
 `--compute-sanitizer` changes only the CTest launcher (`NINFER_TEST_LAUNCHER`), so switching
 tools does not recompile. CUDA's runtime maps memory inside ASan's shadow gap, hence
 `protect_shadow_gap=0`. Run memcheck and racecheck for new or changed kernels with shared-memory

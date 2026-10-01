@@ -7,6 +7,13 @@
 option(NINFER_WARNINGS_AS_ERRORS "Treat compiler warnings in project code as errors" ON)
 set(NINFER_SANITIZE "" CACHE STRING
   "Host sanitizers for project code, e.g. address,undefined (use a separate build tree)")
+# Sanitizer instrumentation makes GCC's flow-based warnings (-Warray-bounds, -Wnull-dereference)
+# report paths that do not exist, so an instrumented tree reports warnings without failing; the
+# uninstrumented tree is the warning gate.
+if(NINFER_SANITIZE AND NINFER_WARNINGS_AS_ERRORS)
+  message(STATUS "NINFER_SANITIZE is set: compiler warnings are not errors in this tree")
+  set(NINFER_WARNINGS_AS_ERRORS OFF)
+endif()
 
 # Each flag targets a defect class the builder toolchain (GCC 13, nvcc 13.1) reports reliably:
 # shadowed locals, missing virtual destructors, hidden overloads, null dereference on a proven
@@ -53,12 +60,17 @@ add_compile_options(
   "$<$<COMPILE_LANGUAGE:CUDA>:${ninfer_cuda_warnings}>")
 
 if(NINFER_SANITIZE)
-  set(ninfer_sanitize_flags -fsanitize=${NINFER_SANITIZE} -fno-omit-frame-pointer)
+  # One -fsanitize= flag per sanitizer: nvcc splits -Xcompiler arguments on commas.
+  string(REPLACE "," ";" ninfer_sanitizers "${NINFER_SANITIZE}")
+  list(TRANSFORM ninfer_sanitizers PREPEND "-fsanitize=")
+  set(ninfer_sanitize_flags ${ninfer_sanitizers} -fno-omit-frame-pointer)
   list(JOIN ninfer_sanitize_flags "," ninfer_sanitize_flags_csv)
+  list(JOIN ninfer_sanitizers "," ninfer_sanitizers_csv)
   add_compile_options(
     "$<$<COMPILE_LANGUAGE:C,CXX>:${ninfer_sanitize_flags}>"
     "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${ninfer_sanitize_flags_csv}>")
+  # Host link only; the CUDA device-link step takes no sanitizer runtime.
   add_link_options(
-    "$<$<LINK_LANGUAGE:C,CXX>:-fsanitize=${NINFER_SANITIZE}>"
-    "$<$<LINK_LANGUAGE:CUDA>:-Xcompiler=-fsanitize=${NINFER_SANITIZE}>")
+    "$<HOST_LINK:$<$<LINK_LANGUAGE:C,CXX>:${ninfer_sanitizers}>>"
+    "$<HOST_LINK:$<$<LINK_LANGUAGE:CUDA>:-Xcompiler=${ninfer_sanitizers_csv}>>")
 endif()
