@@ -21,9 +21,7 @@ RAW_BYTES_V1 = "raw-bytes-v1"
 
 _ROOT_MEMBERS = frozenset({"identity", "objects"})
 _IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
-_TENSOR_MEMBERS = frozenset(
-    {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
-)
+_TENSOR_MEMBERS = frozenset({"name", "kind", "shape", "format", "layout", "offset", "bytes"})
 _RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
 
 
@@ -153,7 +151,9 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             raise ArtifactError(f"duplicate object name: {name}")
         names.add(name)
         if isinstance(spec, TensorSpec):
-            shape = tuple(_require_integer(dim, "shape dimension", positive=True) for dim in spec.shape)
+            shape = tuple(
+                _require_integer(dim, "shape dimension", positive=True) for dim in spec.shape
+            )
             layout = get_layout(_require_string(spec.layout, "tensor layout"))
             payload_bytes = encoded_size(layout, spec.format, shape)
             offset = align_up(cursor, layout.alignment)
@@ -187,9 +187,7 @@ def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
     )
 
 
-def encode_directory(
-    identity: ArtifactIdentity, objects: Sequence[ArtifactObject]
-) -> bytes:
+def encode_directory(identity: ArtifactIdentity, objects: Sequence[ArtifactObject]) -> bytes:
     checked_identity = _require_identity(identity)
     if not objects:
         raise ArtifactError("objects must not be empty")
@@ -247,13 +245,8 @@ def parse_directory(
     if not isinstance(value, dict) or frozenset(value) != _ROOT_MEMBERS:
         raise ArtifactError("directory root must contain exactly identity and objects")
     raw_identity = value["identity"]
-    if (
-        not isinstance(raw_identity, dict)
-        or frozenset(raw_identity) != _IDENTITY_MEMBERS
-    ):
-        raise ArtifactError(
-            "artifact identity must contain exactly model_id and weights_id"
-        )
+    if not isinstance(raw_identity, dict) or frozenset(raw_identity) != _IDENTITY_MEMBERS:
+        raise ArtifactError("artifact identity must contain exactly model_id and weights_id")
     identity = ArtifactIdentity(
         model_id=_require_string(raw_identity["model_id"], "model_id"),
         weights_id=_require_string(raw_identity["weights_id"], "weights_id"),

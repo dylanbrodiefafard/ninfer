@@ -165,8 +165,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     const unsigned k_r         = static_cast<unsigned>(b_rin << 4);
     const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
                                  static_cast<unsigned>(b_rin * RowBytes);
-    const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
-    const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
+    const unsigned v_as        = static_cast<unsigned>((lane >> 4) << 4);
+    const unsigned v_r         = static_cast<unsigned>(b_rin << 4);
 
     vision_attention_stage_q<Br, Threads>(q_s, q, tile.q0, tile.end, head, tid, q_stride_d,
                                           q_stride_h, q_stride_t);

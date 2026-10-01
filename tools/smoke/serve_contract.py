@@ -90,8 +90,14 @@ def require_usage(usage: Any, prompt_key: str, completion_key: str) -> tuple[int
     return prompt, completion
 
 
-def openai_nonstream(base_url: str, model: str, messages: list[dict[str, Any]], *, max_tokens: int,
-                     stop: list[str] | None = None) -> dict[str, Any]:
+def openai_nonstream(
+    base_url: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    stop: list[str] | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -384,9 +390,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         response_count.get("input_tokens"), int
     ):
         raise ContractError("Responses input_tokens returned the wrong shape")
-    response_sync = responses_nonstream(
-        base_url, model, responses_input, store=False
-    )
+    response_sync = responses_nonstream(base_url, model, responses_input, store=False)
     response_sync_text, response_sync_reasoning = response_text(response_sync)
     response_prompt_tokens, response_output_tokens = require_responses_usage(
         response_sync.get("usage")
@@ -401,9 +405,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "store": False,
         "stream": True,
     }
-    response_stream = request(
-        base_url, "POST", "/v1/responses", response_stream_payload
-    )
+    response_stream = request(base_url, "POST", "/v1/responses", response_stream_payload)
     streamed_text, streamed_reasoning, response_stream_terminal = parse_responses_stream(
         response_stream
     )
@@ -425,9 +427,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     retrieved = json_response(base_url, "GET", f"/v1/responses/{stored_id}")
     if retrieved != stored_response:
         raise ContractError("retrieved Response differs from the created Response")
-    input_items = json_response(
-        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc"
-    )
+    input_items = json_response(base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc")
     if input_items.get("object") != "list" or len(input_items.get("data", [])) != 1:
         raise ContractError("Responses input_items list has the wrong shape")
     continuation_input = "What code word was given? Reply with only that word."

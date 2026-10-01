@@ -22,6 +22,7 @@ struct ToolGrammarData {
         nlohmann::ordered_json parameters;
         std::optional<xgrammar::CompiledGrammar> arguments_validator;
     };
+
     std::vector<Definition> definitions;
     xgrammar::CompiledGrammar compiled;
     [[nodiscard]] std::optional<ToolCall> decode_call(std::string_view text) const;
@@ -44,8 +45,7 @@ public:
     // node consumes its draft token from an earlier parent. Output is node-major,
     // including the final bonus column. Unreachable nodes have an unrestricted
     // mask, not an empty sampling domain: their parent forbids their acceptance.
-    void fill_masks(std::span<const TokenId> tokens,
-                    std::span<const std::int32_t> parents,
+    void fill_masks(std::span<const TokenId> tokens, std::span<const std::int32_t> parents,
                     std::span<std::uint32_t> words) const;
 
 private:
@@ -61,8 +61,8 @@ private:
 class ToolGrammarCompiler {
 public:
     explicit ToolGrammarCompiler(std::shared_ptr<const Tokenizer> tokenizer);
-    [[nodiscard]] std::shared_ptr<const ToolGrammarData>
-    compile(std::span<const std::string> tools, bool starts_in_reasoning);
+    [[nodiscard]] std::shared_ptr<const ToolGrammarData> compile(std::span<const std::string> tools,
+                                                                 bool starts_in_reasoning);
 
 private:
     std::shared_ptr<const Tokenizer> tokenizer_;

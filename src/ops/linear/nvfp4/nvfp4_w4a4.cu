@@ -13,14 +13,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using M32N64S3                    = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
-using M32N64S4                    = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
-using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N64                      = Nvfp4W4a4MmaSchedule<64, 64, 256, 4, 2, 2, 1>;
-using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using M64N128S3                   = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
-using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+using M32N64S3          = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
+using M32N64S4          = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
+using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using M64N64            = Nvfp4W4a4MmaSchedule<64, 64, 256, 4, 2, 2, 1>;
+using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using M64N128S3         = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
+using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+using M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace,
@@ -140,9 +140,9 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
-    launch_nvfp4_w4a4_quantize(
-        x, weight, workspace, nvfp4_w4a4_projection_scale_layout(weight.n, weight.k, tokens),
-        stream);
+    launch_nvfp4_w4a4_quantize(x, weight, workspace,
+                               nvfp4_w4a4_projection_scale_layout(weight.n, weight.k, tokens),
+                               stream);
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::AttnInput:
         launch_problem<Nvfp4AttnInputGeometry>(weight, out, workspace, tokens, stream);

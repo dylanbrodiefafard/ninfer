@@ -33,9 +33,7 @@ Q6 = "Q6G64_F16S"
 W8 = "W8G32_F16S"
 
 FULL_ATTENTION_LAYERS = tuple(range(3, 40, 4))
-GDN_LAYERS = tuple(
-    layer for layer in range(40) if layer not in FULL_ATTENTION_LAYERS
-)
+GDN_LAYERS = tuple(layer for layer in range(40) if layer not in FULL_ATTENTION_LAYERS)
 Q6_ROUTED_DOWN_LAYERS = frozenset((34, 38, 39))
 VISION_LAYERS = tuple(range(27))
 
@@ -319,9 +317,7 @@ def _moe_contract(
 
 
 def _text_contract() -> tuple[_ExpectedTensor, ...]:
-    tensors: list[_ExpectedTensor] = [
-        _tensor("text/token_embedding", (248320, 2048), W8)
-    ]
+    tensors: list[_ExpectedTensor] = [_tensor("text/token_embedding", (248320, 2048), W8)]
     for layer in range(40):
         prefix = f"text/layers/{layer}/"
         tensors.append(_tensor(prefix + "input_norm", (2048,), BF16))
@@ -345,9 +341,7 @@ def _text_contract() -> tuple[_ExpectedTensor, ...]:
                     _tensor(prefix + "gdn/dt_bias", (32,), FP32),
                     _tensor(prefix + "gdn/convolution", (4, 8192), BF16),
                     _tensor(prefix + "gdn/a_b_projection", (64, 2048), BF16),
-                    _tensor(
-                        prefix + "gdn/query_key_value_z", (12288, 2048), W8
-                    ),
+                    _tensor(prefix + "gdn/query_key_value_z", (12288, 2048), W8),
                     _tensor(prefix + "gdn/norm", (128,), BF16),
                     _tensor(prefix + "gdn/output", (2048, 4096), W8),
                 )
@@ -377,9 +371,7 @@ def _mtp_contract() -> tuple[_ExpectedTensor, ...]:
         _tensor("mtp/embedding_norm", (2048,), BF16),
         _tensor("mtp/hidden_norm", (2048,), BF16),
         _tensor("mtp/layer/input_norm", (2048,), BF16),
-        _tensor(
-            "mtp/layer/attention/query_key_gate_value", (9216, 2048), W8
-        ),
+        _tensor("mtp/layer/attention/query_key_gate_value", (9216, 2048), W8),
         _tensor("mtp/layer/attention/query_norm", (256,), BF16),
         _tensor("mtp/layer/attention/key_norm", (256,), BF16),
         _tensor("mtp/layer/attention/output", (2048, 4096), W8),
@@ -496,13 +488,11 @@ def _validate_inventory(artifact: Artifact) -> None:
     expected_identity = ArtifactIdentity(MODEL_ID, WEIGHTS_ID)
     if artifact.identity != expected_identity:
         raise BindingError(
-            f"artifact identity is {artifact.identity!r}; expected "
-            f"{expected_identity!r}"
+            f"artifact identity is {artifact.identity!r}; expected {expected_identity!r}"
         )
     if len(artifact.objects) != len(_OBJECT_CONTRACT):
         raise BindingError(
-            f"artifact has {len(artifact.objects)} objects; "
-            f"expected {len(_OBJECT_CONTRACT)}"
+            f"artifact has {len(artifact.objects)} objects; expected {len(_OBJECT_CONTRACT)}"
         )
     expected_by_name = {obj.name: obj for obj in _OBJECT_CONTRACT}
     actual_names = {obj.name for obj in artifact.objects}
@@ -510,9 +500,7 @@ def _validate_inventory(artifact: Artifact) -> None:
     if actual_names != expected_names:
         missing = sorted(expected_names - actual_names)
         extra = sorted(actual_names - expected_names)
-        raise BindingError(
-            f"artifact object names differ; missing={missing!r}, extra={extra!r}"
-        )
+        raise BindingError(f"artifact object names differ; missing={missing!r}, extra={extra!r}")
     for actual in artifact.objects:
         expected = expected_by_name[actual.name]
         if isinstance(expected, _ExpectedTensor):
@@ -522,25 +510,31 @@ def _validate_inventory(artifact: Artifact) -> None:
                 expected.format,
                 expected.layout,
             )
-            if not isinstance(actual, TensorObject) or (
-                actual.name,
-                actual.shape,
-                actual.format,
-                actual.layout,
-            ) != signature:
+            if (
+                not isinstance(actual, TensorObject)
+                or (
+                    actual.name,
+                    actual.shape,
+                    actual.format,
+                    actual.layout,
+                )
+                != signature
+            ):
                 raise BindingError(
-                    f"object {actual.name!r} does not match tensor signature "
-                    f"{signature!r}"
+                    f"object {actual.name!r} does not match tensor signature {signature!r}"
                 )
         else:
             signature = (expected.name, expected.encoding)
-            if not isinstance(actual, ResourceObject) or (
-                actual.name,
-                actual.encoding,
-            ) != signature:
+            if (
+                not isinstance(actual, ResourceObject)
+                or (
+                    actual.name,
+                    actual.encoding,
+                )
+                != signature
+            ):
                 raise BindingError(
-                    f"object {actual.name!r} does not match resource signature "
-                    f"{signature!r}"
+                    f"object {actual.name!r} does not match resource signature {signature!r}"
                 )
 
 
@@ -603,12 +597,8 @@ def _moe_binding(
         router_shared_gate=router_shared_gate,
         router=_row_view(router_shared_gate, 0, 256, row_views),
         shared_gate=_row_view(router_shared_gate, 256, 257, row_views),
-        routed_gate_up=_expert_bank(
-            blocks[prefix + "routed_gate_up"], 1024, 512, expert_banks
-        ),
-        routed_down=_expert_bank(
-            blocks[prefix + "routed_down"], 2048, None, expert_banks
-        ),
+        routed_gate_up=_expert_bank(blocks[prefix + "routed_gate_up"], 1024, 512, expert_banks),
+        routed_down=_expert_bank(blocks[prefix + "routed_down"], 2048, None, expert_banks),
         shared_gate_up=shared_gate_up,
         shared_expert_gate=_row_view(shared_gate_up, 0, 512, row_views),
         shared_up=_row_view(shared_gate_up, 512, 1024, row_views),
@@ -652,15 +642,11 @@ class ArtifactBinding:
         for layer in range(40):
             prefix = f"text/layers/{layer}/"
             if layer in FULL_ATTENTION_LAYERS:
-                attention = _attention_binding(
-                    prefix + "attention/", blocks, row_views
-                )
+                attention = _attention_binding(prefix + "attention/", blocks, row_views)
                 gdn = None
             else:
                 convolution_storage = blocks[prefix + "gdn/convolution"]
-                convolution = AxisView(
-                    convolution_storage, (1, 0), (8192, 4)
-                )
+                convolution = AxisView(convolution_storage, (1, 0), (8192, 4))
                 axis_views.append(convolution)
                 a_b = blocks[prefix + "gdn/a_b_projection"]
                 qkvz = blocks[prefix + "gdn/query_key_value_z"]
@@ -689,9 +675,7 @@ class ArtifactBinding:
                     attention=attention,
                     gdn=gdn,
                     post_attention_norm=blocks[prefix + "post_attention_norm"],
-                    moe=_moe_binding(
-                        prefix + "moe/", blocks, row_views, expert_banks
-                    ),
+                    moe=_moe_binding(prefix + "moe/", blocks, row_views, expert_banks),
                 )
             )
 
@@ -715,15 +699,9 @@ class ArtifactBinding:
             hidden_norm=blocks["mtp/hidden_norm"],
             layer=MtpLayerBinding(
                 input_norm=blocks["mtp/layer/input_norm"],
-                attention=_attention_binding(
-                    "mtp/layer/attention/", blocks, row_views
-                ),
-                post_attention_norm=blocks[
-                    "mtp/layer/post_attention_norm"
-                ],
-                moe=_moe_binding(
-                    "mtp/layer/moe/", blocks, row_views, expert_banks
-                ),
+                attention=_attention_binding("mtp/layer/attention/", blocks, row_views),
+                post_attention_norm=blocks["mtp/layer/post_attention_norm"],
+                moe=_moe_binding("mtp/layer/moe/", blocks, row_views, expert_banks),
             ),
             final_norm=blocks["mtp/final_norm"],
         )
@@ -737,9 +715,7 @@ class ArtifactBinding:
                     attention_qkv=blocks[prefix + "attention/qkv"],
                     attention_qkv_bias=blocks[prefix + "attention/qkv_bias"],
                     attention_output=blocks[prefix + "attention/output"],
-                    attention_output_bias=blocks[
-                        prefix + "attention/output_bias"
-                    ],
+                    attention_output_bias=blocks[prefix + "attention/output_bias"],
                     mlp_fc1=blocks[prefix + "mlp/fc1"],
                     mlp_fc1_bias=blocks[prefix + "mlp/fc1_bias"],
                     mlp_fc2=blocks[prefix + "mlp/fc2"],
@@ -783,9 +759,7 @@ class ArtifactBinding:
                         key_norm=blocks[prefix + "attention/key_norm"],
                         output=blocks[prefix + "attention/output"],
                     ),
-                    post_attention_norm=blocks[
-                        prefix + "post_attention_norm"
-                    ],
+                    post_attention_norm=blocks[prefix + "post_attention_norm"],
                     mlp=DFlashMlpBinding(
                         gate_up=gate_up,
                         gate=_row_view(gate_up, 0, 6144, row_views),
@@ -842,9 +816,7 @@ class ArtifactBinding:
 
     def _validate_draft_ids(self) -> None:
         block = self.text.draft_head.token_ids
-        token_ids = decode_direct(
-            self.payload(block), block.format, block.shape, device="cpu"
-        )
+        token_ids = decode_direct(self.payload(block), block.format, block.shape, device="cpu")
         if int(token_ids.min()) < 0 or int(token_ids.max()) >= TOKENIZER_VOCAB_SIZE:
             raise BindingError("draft token IDs are outside 0..248076")
         if torch.unique(token_ids).numel() != token_ids.numel():

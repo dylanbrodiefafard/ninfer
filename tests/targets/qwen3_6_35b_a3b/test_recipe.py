@@ -28,9 +28,9 @@ def test_attention_recipe_materializes_q_k_gate_v_row_order() -> None:
         ),
     )
 
-    query_rows = torch.cat(
-        [torch.arange(head * 512, head * 512 + 256) for head in range(16)]
-    ).to(torch.int32)
+    query_rows = torch.cat([torch.arange(head * 512, head * 512 + 256) for head in range(16)]).to(
+        torch.int32
+    )
     gate_rows = torch.cat(
         [torch.arange(head * 512 + 256, head * 512 + 512) for head in range(16)]
     ).to(torch.int32)
@@ -44,9 +44,7 @@ def test_attention_recipe_materializes_q_k_gate_v_row_order() -> None:
 def test_moe_recipe_preserves_expert_major_half_split_rows() -> None:
     prefix = "model.language_model.layers.0.mlp."
     gate_up_rows = (
-        torch.arange(256 * 1024, dtype=torch.int32)
-        .reshape(256, 1024, 1)
-        .expand(-1, -1, 2048)
+        torch.arange(256 * 1024, dtype=torch.int32).reshape(256, 1024, 1).expand(-1, -1, 2048)
     )
     routed_gate_up = recipe.materialize_recipe(
         recipe.RECIPES_BY_NAME["text/layers/0/moe/routed_gate_up"],
@@ -63,9 +61,7 @@ def test_moe_recipe_preserves_expert_major_half_split_rows() -> None:
         assert int(routed_gate_up[physical_row, -1]) == physical_row
 
     down_rows = (
-        torch.arange(256 * 2048, dtype=torch.int32)
-        .reshape(256, 2048, 1)
-        .expand(-1, -1, 512)
+        torch.arange(256 * 2048, dtype=torch.int32).reshape(256, 2048, 1).expand(-1, -1, 512)
     )
     routed_down = recipe.materialize_recipe(
         recipe.RECIPES_BY_NAME["text/layers/0/moe/routed_down"],
@@ -113,9 +109,7 @@ def test_dflash_recipe_materializes_q_k_v_and_gate_up_row_order() -> None:
     key = torch.full((1024, 1), 2, dtype=torch.uint8).expand(-1, 2048)
     value = torch.full((1024, 1), 3, dtype=torch.uint8).expand(-1, 2048)
     qkv = recipe.materialize_recipe(
-        recipe.DFLASH_RECIPES_BY_NAME[
-            "dflash/layers/0/attention/query_key_value"
-        ],
+        recipe.DFLASH_RECIPES_BY_NAME["dflash/layers/0/attention/query_key_value"],
         TensorReader(
             {
                 prefix + "self_attn.q_proj.weight": query,

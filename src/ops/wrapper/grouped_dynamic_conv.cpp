@@ -26,8 +26,7 @@ void require_hidden_layout(const Tensor& hidden, const char* label) {
                                     " must be BF16 [5120,T] or [5120,T,B]");
     }
     if (hidden.ne[2] > 1 && hidden.ne[1] > kGroupedDynamicConvMaxWidthWhenBatched) {
-        throw std::invalid_argument(
-            "grouped_dynamic_conv: B=2..8 admits T=1..16");
+        throw std::invalid_argument("grouped_dynamic_conv: B=2..8 admits T=1..16");
     }
     if (!hidden.is_contiguous() || hidden.data == nullptr) {
         throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
@@ -64,9 +63,8 @@ void require_finish_dynamic(const Tensor& hidden, const Tensor& finish_dynamic, 
     }
     if (finish_dynamic.ne[0] != kGroupedDynamicConvGroups || finish_dynamic.ne[1] != 2 ||
         finish_dynamic.ne[2] != hidden.ne[1] || finish_dynamic.ne[3] != hidden.ne[2]) {
-        throw std::invalid_argument(
-            std::string("grouped_dynamic_conv: ") + label +
-            " must be BF16 [320,2,T] or [320,2,T,B]");
+        throw std::invalid_argument(std::string("grouped_dynamic_conv: ") + label +
+                                    " must be BF16 [320,2,T] or [320,2,T,B]");
     }
 }
 
@@ -144,13 +142,12 @@ void grouped_dynamic_conv_prepare(const Tensor& hidden, const Tensor& base_kerne
     require_disjoint(prepared, base_kernel,
                      "grouped_dynamic_conv: prepared must not alias base_kernel");
 
-    const std::int32_t tokens = hidden.ne[1];
-    const std::int32_t batch  = hidden.ne[2];
-    auto scratch_scope        = workspace.scope();
+    const std::int32_t tokens    = hidden.ne[1];
+    const std::int32_t batch     = hidden.ne[2];
+    auto scratch_scope           = workspace.scope();
     const std::size_t proj_bytes = projection_bytes(tokens, batch);
     const DeviceSpan proj_span   = workspace.alloc_bytes(proj_bytes);
-    Tensor projection(proj_span.data, DType::BF16,
-                      {kGroupedDynamicConvProjRows, tokens * batch});
+    Tensor projection(proj_span.data, DType::BF16, {kGroupedDynamicConvProjRows, tokens * batch});
 
     Tensor hidden_flat = hidden.view({kGroupedDynamicConvHidden, tokens * batch});
     if (kernel_projection.qtype == QType::BF16_CTRL) {
@@ -174,7 +171,8 @@ void grouped_dynamic_conv_finish(const Tensor& hidden, const Tensor& base_kernel
     require_base_kernel(base_kernel);
     require_finish_dynamic(hidden, finish_dynamic, "finish_dynamic");
     require_disjoint(hidden, out, "grouped_dynamic_conv: out must not alias hidden");
-    require_disjoint(out, finish_dynamic, "grouped_dynamic_conv: out must not alias finish_dynamic");
+    require_disjoint(out, finish_dynamic,
+                     "grouped_dynamic_conv: out must not alias finish_dynamic");
     require_disjoint(out, base_kernel, "grouped_dynamic_conv: out must not alias base_kernel");
     detail::grouped_dynamic_conv_finish_launch(hidden, base_kernel, finish_dynamic, out, stream);
 }

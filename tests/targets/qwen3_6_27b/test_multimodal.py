@@ -11,9 +11,7 @@ from tools.reference.qwen3_6.common.multimodal import (
 def test_mrope_and_chunked_visual_embedding_alignment():
     # Two image items and a two-frame video.  Timestamp text separates the
     # video frames exactly as the library processor emits them.
-    types = torch.tensor(
-        [0, 1, 1, 1, 1, 0, 2, 2, 0, 2, 2, 0, 1, 0], dtype=torch.long
-    )
+    types = torch.tensor([0, 1, 1, 1, 1, 0, 2, 2, 0, 2, 2, 0, 1, 0], dtype=torch.long)
     image_grid = torch.tensor([[1, 4, 4], [1, 2, 2]], dtype=torch.long)
     video_grid = torch.tensor([[2, 2, 4]], dtype=torch.long)
     positions, delta = build_mrope_positions(types, image_grid, video_grid)

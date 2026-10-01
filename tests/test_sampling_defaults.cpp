@@ -88,20 +88,19 @@ int main() {
         qwen3_8, ninfer::SamplingMode::Thinking, ninfer::SamplingOverrides{});
     const ninfer::ResolvedSamplingParameters non_thinking = ninfer::runtime::resolve_sampling(
         qwen3_8, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
-    failures += check(thinking.p_less && thinking.temperature == 2.0F &&
-                          thinking.top_k == 0 && thinking.top_p == 1.0F &&
-                          thinking.min_p == 0.0F && thinking.presence_penalty == 0.0F &&
-                          thinking.frequency_penalty == 0.0F && thinking.seed == 0,
+    failures += check(thinking.p_less && thinking.temperature == 2.0F && thinking.top_k == 0 &&
+                          thinking.top_p == 1.0F && thinking.min_p == 0.0F &&
+                          thinking.presence_penalty == 0.0F && thinking.frequency_penalty == 0.0F &&
+                          thinking.seed == 0,
                       "omitted overrides did not select default p-less thinking");
-    failures += check(non_thinking.p_less && non_thinking.temperature == 2.0F &&
-                          non_thinking.top_k == 0 && non_thinking.top_p == 1.0F &&
-                          non_thinking.min_p == 0.0F &&
-                          non_thinking.presence_penalty == 0.0F &&
-                          non_thinking.frequency_penalty == 0.0F,
-                      "omitted overrides did not select default p-less non-thinking");
+    failures +=
+        check(non_thinking.p_less && non_thinking.temperature == 2.0F && non_thinking.top_k == 0 &&
+                  non_thinking.top_p == 1.0F && non_thinking.min_p == 0.0F &&
+                  non_thinking.presence_penalty == 0.0F && non_thinking.frequency_penalty == 0.0F,
+              "omitted overrides did not select default p-less non-thinking");
 
     ninfer::SamplingOverrides overrides;
-    overrides.p_less           = false;
+    overrides.p_less            = false;
     overrides.temperature       = 0.0F;
     overrides.top_k             = 0;
     overrides.top_p             = 0.0F;
@@ -111,21 +110,21 @@ int main() {
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
         ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingMode::NonThinking, overrides);
-    failures += check(overridden.temperature == 0.0F && overridden.top_k == 0 &&
-                          overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
-                          overridden.frequency_penalty == -1.0F && overridden.seed == 123 &&
-                          !overridden.p_less,
-                      "explicit zero sampling overrides were lost");
+    failures +=
+        check(overridden.temperature == 0.0F && overridden.top_k == 0 && overridden.top_p == 0.0F &&
+                  overridden.presence_penalty == 0.0F && overridden.frequency_penalty == -1.0F &&
+                  overridden.seed == 123 && !overridden.p_less,
+              "explicit zero sampling overrides were lost");
 
     ninfer::SamplingOverrides p_less_overrides;
-    p_less_overrides.p_less            = true;
-    p_less_overrides.temperature       = 1.5F;
-    p_less_overrides.top_k             = 5;
-    p_less_overrides.top_p             = 0.5F;
-    p_less_overrides.min_p             = 0.2F;
-    p_less_overrides.presence_penalty  = 1.5F;
-    p_less_overrides.frequency_penalty = 0.5F;
-    p_less_overrides.seed              = 99;
+    p_less_overrides.p_less                         = true;
+    p_less_overrides.temperature                    = 1.5F;
+    p_less_overrides.top_k                          = 5;
+    p_less_overrides.top_p                          = 0.5F;
+    p_less_overrides.min_p                          = 0.2F;
+    p_less_overrides.presence_penalty               = 1.5F;
+    p_less_overrides.frequency_penalty              = 0.5F;
+    p_less_overrides.seed                           = 99;
     const ninfer::ResolvedSamplingParameters p_less = ninfer::runtime::resolve_sampling(
         qwen3_8, ninfer::SamplingMode::Thinking, p_less_overrides);
     failures += check(p_less.p_less && p_less.temperature == 1.5F && p_less.seed == 99 &&

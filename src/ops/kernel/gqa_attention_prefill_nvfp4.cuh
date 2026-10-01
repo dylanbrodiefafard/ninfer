@@ -13,22 +13,21 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kGqaPrefillNvfp4Warps    = 16;
-inline constexpr int kGqaPrefillNvfp4Threads  = kGqaPrefillNvfp4Warps * 32;
+inline constexpr int kGqaPrefillNvfp4Warps   = 16;
+inline constexpr int kGqaPrefillNvfp4Threads = kGqaPrefillNvfp4Warps * 32;
 // 128 query rows halves K/V reread versus Br=64: each CTA still streams the
 // full key history once, but the grid has half as many tiles.
-inline constexpr int kGqaPrefillNvfp4Br       = 128;
-inline constexpr int kGqaPrefillNvfp4Bc       = 64;
-inline constexpr int kGqaPrefillNvfp4Groups   = kGqaNvfp4Groups;
-inline constexpr int kGqaPrefillNvfp4CodeW    = kGqaNvfp4CodeWidth;
-inline constexpr int kGqaPrefillNvfp4RowTiles = kGqaPrefillNvfp4Br / 16;
-inline constexpr int kGqaPrefillNvfp4DConsumers =
-    kGqaPrefillNvfp4Warps / kGqaPrefillNvfp4RowTiles;
+inline constexpr int kGqaPrefillNvfp4Br         = 128;
+inline constexpr int kGqaPrefillNvfp4Bc         = 64;
+inline constexpr int kGqaPrefillNvfp4Groups     = kGqaNvfp4Groups;
+inline constexpr int kGqaPrefillNvfp4CodeW      = kGqaNvfp4CodeWidth;
+inline constexpr int kGqaPrefillNvfp4RowTiles   = kGqaPrefillNvfp4Br / 16;
+inline constexpr int kGqaPrefillNvfp4DConsumers = kGqaPrefillNvfp4Warps / kGqaPrefillNvfp4RowTiles;
 
-inline constexpr int kGqaPrefillNvfp4QBytes     = kGqaPrefillNvfp4Br * kGqaPrefillNvfp4CodeW;
+inline constexpr int kGqaPrefillNvfp4QBytes      = kGqaPrefillNvfp4Br * kGqaPrefillNvfp4CodeW;
 inline constexpr int kGqaPrefillNvfp4QScaleBytes = kGqaPrefillNvfp4Br * kGqaPrefillNvfp4Groups;
-inline constexpr int kGqaPrefillNvfp4KBytes     = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
-inline constexpr int kGqaPrefillNvfp4VBytes     = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
+inline constexpr int kGqaPrefillNvfp4KBytes      = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
+inline constexpr int kGqaPrefillNvfp4VBytes      = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
 inline constexpr int kGqaPrefillNvfp4VStageBytes =
     kGqaPrefillNvfp4Bc * kGqaPrefillHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
 inline constexpr int kGqaPrefillNvfp4PBytes =
@@ -46,26 +45,21 @@ static_assert(kGqaPrefillNvfp4DConsumers == 2);
 static_assert(kGqaPrefillNvfp4SmemBytes == 87040);
 
 template <typename Geometry, typename Metadata>
-__launch_bounds__(256) __global__
-    void gqa_attention_prefill_fill_nvfp4_kernel(const __nv_bfloat16* __restrict__ k,
-                                                 const __nv_bfloat16* __restrict__ v,
-                                                 const std::int32_t* __restrict__ positions,
-                                                 Metadata metadata,
-                                                 std::uint8_t* __restrict__ cache_k,
-                                                 std::uint8_t* __restrict__ cache_v,
-                                                 std::uint8_t* __restrict__ scale_k,
-                                                 std::uint8_t* __restrict__ scale_v,
-                                                 std::int32_t width) {
+__launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, std::int32_t width) {
     const int tokens = metadata.valid_tokens(width);
     const int tid    = static_cast<int>(threadIdx.x);
     const int unit   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
     const int units  = tokens * Geometry::KVHeads * kGqaPrefillNvfp4Groups;
     if (unit >= units) { return; }
 
-    const int grp     = unit % kGqaPrefillNvfp4Groups;
-    const int tmp     = unit / kGqaPrefillNvfp4Groups;
-    const int kv_head = tmp % Geometry::KVHeads;
-    const int token   = tmp / Geometry::KVHeads;
+    const int grp                   = unit % kGqaPrefillNvfp4Groups;
+    const int tmp                   = unit / kGqaPrefillNvfp4Groups;
+    const int kv_head               = tmp % Geometry::KVHeads;
+    const int token                 = tmp / Geometry::KVHeads;
     const int position              = positions[0] + token;
     const std::int32_t* block_table = metadata.block_table();
     const int physical_page         = paged_kv_physical_page(block_table, position);
@@ -80,10 +74,10 @@ __launch_bounds__(256) __global__
                                v_sc);
     const std::int64_t code =
         gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_off);
-    *reinterpret_cast<std::uint32_t*>(cache_k + code)     = k_lo;
-    *reinterpret_cast<std::uint32_t*>(cache_k + code + 4) = k_hi;
-    *reinterpret_cast<std::uint32_t*>(cache_v + code)     = v_lo;
-    *reinterpret_cast<std::uint32_t*>(cache_v + code + 4) = v_hi;
+    *reinterpret_cast<std::uint32_t*>(cache_k + code)                               = k_lo;
+    *reinterpret_cast<std::uint32_t*>(cache_k + code + 4)                           = k_hi;
+    *reinterpret_cast<std::uint32_t*>(cache_v + code)                               = v_lo;
+    *reinterpret_cast<std::uint32_t*>(cache_v + code + 4)                           = v_hi;
     scale_k[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)] = k_sc;
     scale_v[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)] = v_sc;
 }
@@ -127,10 +121,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4_page_ker
                                v_sc);
     const std::int64_t code =
         gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_off);
-    *reinterpret_cast<std::uint32_t*>(cache_k + code)     = k_lo;
-    *reinterpret_cast<std::uint32_t*>(cache_k + code + 4) = k_hi;
-    *reinterpret_cast<std::uint32_t*>(cache_v + code)     = v_lo;
-    *reinterpret_cast<std::uint32_t*>(cache_v + code + 4) = v_hi;
+    *reinterpret_cast<std::uint32_t*>(cache_k + code)                               = k_lo;
+    *reinterpret_cast<std::uint32_t*>(cache_k + code + 4)                           = k_hi;
+    *reinterpret_cast<std::uint32_t*>(cache_v + code)                               = v_lo;
+    *reinterpret_cast<std::uint32_t*>(cache_v + code + 4)                           = v_hi;
     scale_k[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)] = k_sc;
     scale_v[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)] = v_sc;
 }
@@ -138,24 +132,26 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4_page_ker
 // Per-page dequantized K mean for Sparge meansim. Indexed by physical page:
 // k_mean[d] lives at paged_kv_element_offset<4,KVHeads>(page, kv_head, d>>2, d&3).
 template <typename Geometry, typename Metadata>
-__launch_bounds__(256) __global__ void gqa_attention_prefill_kmean_nvfp4_kernel(
-    const std::uint8_t* __restrict__ cache_k, const std::uint8_t* __restrict__ scale_k,
-    Metadata metadata, const std::int32_t* __restrict__ positions, float* __restrict__ k_mean,
-    std::int32_t width) {
+__launch_bounds__(256) __global__
+    void gqa_attention_prefill_kmean_nvfp4_kernel(const std::uint8_t* __restrict__ cache_k,
+                                                  const std::uint8_t* __restrict__ scale_k,
+                                                  Metadata metadata,
+                                                  const std::int32_t* __restrict__ positions,
+                                                  float* __restrict__ k_mean, std::int32_t width) {
     const int tokens = metadata.valid_tokens(width);
     const int d      = static_cast<int>(threadIdx.x);
     if (d >= kGqaPrefillHeadDim) { return; }
-    const int kv_head  = static_cast<int>(blockIdx.y);
-    const int page_l   = static_cast<int>(blockIdx.x);
-    const int base_pos = positions[0];
+    const int kv_head    = static_cast<int>(blockIdx.y);
+    const int page_l     = static_cast<int>(blockIdx.x);
+    const int base_pos   = positions[0];
     const int first_page = base_pos >> kPagedKVPageShift;
     const int page       = first_page + page_l;
     const int page_lo    = page << kPagedKVPageShift;
     // Full-page mean over keys already in cache, not only this fill window. A
     // straddled first page or a 1-token append would otherwise collapse the
     // Sparge q_mean·k_mean proxy onto a partial-page sample.
-    const int lo         = page_lo;
-    const int hi         = min(page_lo + kPagedKVPageSize, base_pos + tokens);
+    const int lo = page_lo;
+    const int hi = min(page_lo + kPagedKVPageSize, base_pos + tokens);
     if (lo >= hi) { return; }
     const std::int32_t* block_table = metadata.block_table();
     const int physical_page         = paged_kv_physical_page(block_table, page_lo);
@@ -218,11 +214,10 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     std::uint8_t* k_codes = q_scale + kGqaPrefillNvfp4QScaleBytes;
     std::uint8_t* v_codes = k_codes + kGqaPrefillNvfp4KBytes;
     __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(v_codes + kGqaPrefillNvfp4VBytes);
-    __nv_bfloat16* p_s    = reinterpret_cast<__nv_bfloat16*>(
-        reinterpret_cast<unsigned char*>(v_bf16) + kGqaPrefillNvfp4VStageBytes);
-    std::uint8_t* k_scale_s =
-        reinterpret_cast<std::uint8_t*>(reinterpret_cast<unsigned char*>(p_s) +
-                                        kGqaPrefillNvfp4PBytes);
+    __nv_bfloat16* p_s = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<unsigned char*>(v_bf16) +
+                                                          kGqaPrefillNvfp4VStageBytes);
+    std::uint8_t* k_scale_s = reinterpret_cast<std::uint8_t*>(
+        reinterpret_cast<unsigned char*>(p_s) + kGqaPrefillNvfp4PBytes);
     std::uint8_t* v_scale_s = k_scale_s + Bc * Groups;
     float* alpha_s          = reinterpret_cast<float*>(v_scale_s + Bc * Groups);
     float* final_l_s        = alpha_s + Br;
@@ -252,11 +247,11 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     int kb_begin            = 0;
     int kb_end              = max_query_abs / Bc + 1;
     if constexpr (Split) {
-        const int split       = static_cast<int>(blockIdx.z);
-        const int per_split   = (kb_end + static_cast<int>(gridDim.z) - 1) /
-                                static_cast<int>(gridDim.z);
-        kb_begin              = min(kb_end, split * per_split);
-        kb_end                = min(kb_end, kb_begin + per_split);
+        const int split = static_cast<int>(blockIdx.z);
+        const int per_split =
+            (kb_end + static_cast<int>(gridDim.z) - 1) / static_cast<int>(gridDim.z);
+        kb_begin = min(kb_end, split * per_split);
+        kb_end   = min(kb_end, kb_begin + per_split);
         if (kb_begin >= kb_end) {
             for (int row = tid; row < tile_rows; row += kGqaPrefillNvfp4Threads) {
                 const std::int64_t stat =
@@ -274,8 +269,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     __syncthreads();
 
     for (int unit = tid; unit < Br * Groups; unit += kGqaPrefillNvfp4Threads) {
-        const int row = unit / Groups;
-        const int grp = unit - row * Groups;
+        const int row    = unit / Groups;
+        const int grp    = unit - row * Groups;
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
         if (row < tile_rows) {
@@ -377,8 +372,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
                 // lane%4==0; the other lanes duplicate those rows.
                 unsigned sfa = 0;
                 if ((lane & 2) == 0) {
-                    sfa = *reinterpret_cast<const unsigned*>(
-                        &q_scale[scale_row * Groups + k64 * 4]);
+                    sfa =
+                        *reinterpret_cast<const unsigned*>(&q_scale[scale_row * Groups + k64 * 4]);
                 }
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
@@ -425,14 +420,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
             const float nm1        = fmaxf(running_m1, bm1);
             const float nm0_scaled = nm0 * scale_l2;
             const float nm1_scaled = nm1 * scale_l2;
-            const float alpha0     = running_m0 == -CUDART_INF_F
-                                         ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
-            const float alpha1     = running_m1 == -CUDART_INF_F
-                                         ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
-            float bl0              = 0.0f;
-            float bl1              = 0.0f;
+            const float alpha0 = running_m0 == -CUDART_INF_F
+                                     ? 0.0f
+                                     : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
+            const float alpha1 = running_m1 == -CUDART_INF_F
+                                     ? 0.0f
+                                     : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
+            float bl0          = 0.0f;
+            float bl1          = 0.0f;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = nt * 8 + 2 * lid;
@@ -476,9 +471,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
                 const int key      = k0 + key_l;
                 __nv_bfloat16* dst = &v_bf16[key_l * D + gqa_prefill_swz(key_l, d)];
                 if (key <= max_query_abs) {
-                    const int grp = d >> 4;
-                    const float vs =
-                        detail::decode_nvfp4_e4m3(v_scale_s[key_l * Groups + grp]);
+                    const int grp  = d >> 4;
+                    const float vs = detail::decode_nvfp4_e4m3(v_scale_s[key_l * Groups + grp]);
                     store_vec(dst, gqa_nvfp4_dequant_bf16x8(&v_codes[key_l * CodeW + d / 2], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
@@ -588,12 +582,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
 // Stable combine of the context-split partials: one CTA per (token, q head), one thread per
 // output dimension. Columns at or past the valid prefix get exact BF16 zero.
 template <typename Geometry, typename Metadata>
-__launch_bounds__(kGqaPrefillHeadDim) __global__ void gqa_attention_prefill_nvfp4_merge_kernel(
-    GqaPrefillNvfp4SplitPartials partials, Metadata metadata, __nv_bfloat16* __restrict__ out,
-    std::int32_t width, std::int32_t splits) {
-    const int token  = static_cast<int>(blockIdx.x);
-    const int q_head = static_cast<int>(blockIdx.y);
-    const int d      = static_cast<int>(threadIdx.x);
+__launch_bounds__(kGqaPrefillHeadDim) __global__
+    void gqa_attention_prefill_nvfp4_merge_kernel(GqaPrefillNvfp4SplitPartials partials,
+                                                  Metadata metadata,
+                                                  __nv_bfloat16* __restrict__ out,
+                                                  std::int32_t width, std::int32_t splits) {
+    const int token              = static_cast<int>(blockIdx.x);
+    const int q_head             = static_cast<int>(blockIdx.y);
+    const int d                  = static_cast<int>(threadIdx.x);
     const std::int64_t out_index = gqa_prefill_q_index<Geometry>(q_head, d, token);
     if (token >= metadata.valid_tokens(width)) {
         out[out_index] = __float2bfloat16(0.0f);
@@ -601,7 +597,7 @@ __launch_bounds__(kGqaPrefillHeadDim) __global__ void gqa_attention_prefill_nvfp
     }
     const std::int64_t split_stride = static_cast<std::int64_t>(width) * Geometry::QHeads;
     const std::int64_t stat0        = static_cast<std::int64_t>(token) * Geometry::QHeads + q_head;
-    float m = -CUDART_INF_F;
+    float m                         = -CUDART_INF_F;
     for (int z = 0; z < splits; ++z) { m = fmaxf(m, partials.m[stat0 + z * split_stride]); }
     float l   = 0.0f;
     float acc = 0.0f;

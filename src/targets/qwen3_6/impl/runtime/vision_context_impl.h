@@ -263,10 +263,13 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, Workspace
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         const std::string layer_prefix =
-            trace == nullptr ? std::string{} : "block_" + (layer < 10 ? std::string("0") : "") +
-                                                   std::to_string(layer) + "/";
+            trace == nullptr
+                ? std::string{}
+                : "block_" + (layer < 10 ? std::string("0") : "") + std::to_string(layer) + "/";
         const auto capture_layer = [&](std::string_view stage, const Tensor& value) {
-            if (trace != nullptr) { trace->capture(layer_prefix + std::string(stage), value, stream); }
+            if (trace != nullptr) {
+                trace->capture(layer_prefix + std::string(stage), value, stream);
+            }
         };
         {
             Tensor attended = layout.attended.bind(backing);
@@ -429,8 +432,8 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     for (int axis = 0; axis < 2; ++axis) {
         for (const VisionUseSpan& use : plan_.uses) {
             const auto& control = plan_.control->items[use.item_index];
-            const auto begin = control.position_ids.begin() +
-                               static_cast<std::ptrdiff_t>(axis * control.patch_count);
+            const auto begin    = control.position_ids.begin() +
+                                  static_cast<std::ptrdiff_t>(axis * control.patch_count);
             batch_control_.position_ids.insert(
                 batch_control_.position_ids.end(), begin,
                 begin + static_cast<std::ptrdiff_t>(control.patch_count));
@@ -494,7 +497,9 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
     const VisionChunkSelection selected =
         select_vision_prefill_chunk(plan_.uses, begin, end - begin);
-    if (selected.length == 0) { throw std::logic_error("Vision chunk cap made no forward progress"); }
+    if (selected.length == 0) {
+        throw std::logic_error("Vision chunk cap made no forward progress");
+    }
     if (!selected.use_index) {
         return VisionChunk{static_cast<std::int32_t>(selected.length), nullptr, {}};
     }
@@ -513,14 +518,14 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     if (control.merged_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("Vision item output columns exceed int32");
     }
-    const std::size_t output_offset = checked_mul(
-        checked_mul(active->output_begin,
-                    static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
-                    "item output offset elements"),
-        dtype_size(DType::BF16), "item output offset bytes");
-    Tensor output(transient_.data + output_offset, DType::BF16,
-                  {VisionScheduleConfig::out_hidden,
-                   static_cast<std::int32_t>(control.merged_count)});
+    const std::size_t output_offset =
+        checked_mul(checked_mul(active->output_begin,
+                                static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
+                                "item output offset elements"),
+                    dtype_size(DType::BF16), "item output offset bytes");
+    Tensor output(
+        transient_.data + output_offset, DType::BF16,
+        {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(control.merged_count)});
 
     if (!active_item_ || *active_item_ != active->item_index) {
         if (active_item_ && active->item_index <= *active_item_) {

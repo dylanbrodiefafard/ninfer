@@ -61,9 +61,7 @@ class EvalScopeBackendTest(unittest.TestCase):
 
     def test_normalizes_all_needle_haystack_grid_cells(self):
         backend = EvalScopeBackend()
-        job = JobConfig(
-            "needle", "evalscope", "needle_haystack", "api", 1, None, 1, {}, {}
-        )
+        job = JobConfig("needle", "evalscope", "needle_haystack", "api", 1, None, 1, {}, {})
         metrics = [
             {
                 "name": "Context#1000 Depth#0",
@@ -105,9 +103,7 @@ class EvalScopeBackendTest(unittest.TestCase):
                     "metrics": metrics,
                 }
             }
-            result = backend.normalize(
-                context, BackendRun(time.monotonic(), time.monotonic(), raw)
-            )
+            result = backend.normalize(context, BackendRun(time.monotonic(), time.monotonic(), raw))
             self.assertEqual(result.metrics["accuracy"], 0.75)
             self.assertEqual(result.metrics["english_accuracy"], 0.5)
             self.assertEqual(result.metrics["chinese_accuracy"], 1.0)
@@ -123,18 +119,14 @@ class EvalScopeBackendTest(unittest.TestCase):
                 "run", job, job_dir, None, 1, threading.Event(), False, WorkPlan(198)
             )
             raw = {"gpqa_diamond": {"score": 0.625, "num": 198, "metrics": []}}
-            result = backend.normalize(
-                context, BackendRun(time.monotonic(), time.monotonic(), raw)
-            )
+            result = backend.normalize(context, BackendRun(time.monotonic(), time.monotonic(), raw))
             self.assertEqual(result.primary_metric, "accuracy")
             self.assertEqual(result.metrics["accuracy"], 0.625)
             self.assertEqual(result.counts.completed, 198)
 
     def test_normalizes_ifbench_official_metrics(self):
         backend = EvalScopeBackend()
-        job = JobConfig(
-            "ifbench", "evalscope", "ifbench", "api", 2, None, 1, {}, {}
-        )
+        job = JobConfig("ifbench", "evalscope", "ifbench", "api", 2, None, 1, {}, {})
         scores = {
             "prompt_level_strict": 0.51,
             "inst_level_strict": 0.61,
@@ -157,9 +149,7 @@ class EvalScopeBackendTest(unittest.TestCase):
                     ],
                 }
             }
-            result = backend.normalize(
-                context, BackendRun(time.monotonic(), time.monotonic(), raw)
-            )
+            result = backend.normalize(context, BackendRun(time.monotonic(), time.monotonic(), raw))
             self.assertEqual(result.primary_metric, "prompt_level_strict")
             self.assertEqual(result.metrics, scores)
             self.assertEqual(result.counts.completed, 300)
@@ -185,9 +175,7 @@ class EvalScopeBackendTest(unittest.TestCase):
                     "metrics": [{"categories": [{"subsets": subsets}]}],
                 }
             }
-            result = backend.normalize(
-                context, BackendRun(time.monotonic(), time.monotonic(), raw)
-            )
+            result = backend.normalize(context, BackendRun(time.monotonic(), time.monotonic(), raw))
             self.assertEqual(result.primary_metric, "overall")
             self.assertEqual(result.metrics["overall"], 0.45)
             self.assertEqual(result.metrics["agentic"], 0.4)
@@ -229,9 +217,7 @@ class EvalScopeBackendTest(unittest.TestCase):
                     ],
                 }
             }
-            result = backend.normalize(
-                context, BackendRun(time.monotonic(), time.monotonic(), raw)
-            )
+            result = backend.normalize(context, BackendRun(time.monotonic(), time.monotonic(), raw))
             self.assertEqual(result.primary_metric, "accuracy")
             self.assertEqual(result.metrics["accuracy"], 1.0)
             self.assertEqual(result.metrics["multi_turn"], 1.0)
@@ -264,16 +250,12 @@ class EvalScopeBackendTest(unittest.TestCase):
                     "choices": [{"message": {"content": json.dumps(wrapped)}}],
                 }
             }
-            (predictions / "bfcl.jsonl").write_text(
-                json.dumps(record) + "\n", encoding="utf-8"
-            )
+            (predictions / "bfcl.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
             context = RunContext(
                 "run", job, job_dir, None, 1, threading.Event(), False, WorkPlan(1)
             )
             raw = {"bfcl_v4": {"score": 0.0, "num": 1, "metrics": []}}
-            result = backend.normalize(
-                context, BackendRun(time.monotonic(), time.monotonic(), raw)
-            )
+            result = backend.normalize(context, BackendRun(time.monotonic(), time.monotonic(), raw))
             self.assertEqual(result.counts.completed, 1)
             self.assertEqual(result.counts.failed, 1)
 

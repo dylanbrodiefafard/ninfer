@@ -118,10 +118,10 @@ constexpr auto make_splitk_launchers(std::index_sequence<Offsets...>) {
 
 void launch_nvfp4_small_t_splitk(const Tensor& embedding, const Tensor& hidden,
                                  const Weight& weight, Tensor& out, cudaStream_t stream) {
-    static constexpr auto kLaunchers = make_splitk_launchers(
-        std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
+    static constexpr auto kLaunchers =
+        make_splitk_launchers(std::make_index_sequence<kNvfp4LastSmallT - kNvfp4FirstSmallT + 1>{});
     kLaunchers[static_cast<std::size_t>(embedding.ne[1] - kNvfp4FirstSmallT)](embedding, hidden,
-                                                                             weight, out, stream);
+                                                                              weight, out, stream);
 }
 
 } // namespace ninfer::ops::detail

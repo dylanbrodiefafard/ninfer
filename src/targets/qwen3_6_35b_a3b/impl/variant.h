@@ -36,8 +36,7 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
-    [[nodiscard]] static constexpr bool supports_dflash_vision(
-        std::string_view, std::string_view) {
+    [[nodiscard]] static constexpr bool supports_dflash_vision(std::string_view, std::string_view) {
         return false;
     }
 
@@ -71,9 +70,9 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
-                       Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
-                       std::int32_t route_tokens = 0);
+    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                       const Weight& weight, Tensor& residual, WorkspaceArena& workspace,
+                       cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_attention_output(const Tensor& attention, const Weight& weight,
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream, std::int32_t route_tokens = 0);
@@ -104,8 +103,8 @@ struct Variant {
     // Normalize the raw residual for the post-mixer; hidden is caller-owned scratch.
     static void post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
                            const PostMixerWeights& weights, Tensor& residual,
-                           qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream, std::int32_t route_tokens = 0);
+                           qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
+                           std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
                                std::int32_t route_tokens = 0);

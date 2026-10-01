@@ -33,20 +33,20 @@
 
 namespace {
 
-constexpr int kInner    = 16;
-constexpr int kDefaultIters = 8192;
-constexpr int kWarmup   = 5;
-constexpr int kTrials   = 7;
+constexpr int kInner             = 16;
+constexpr int kDefaultIters      = 8192;
+constexpr int kWarmup            = 5;
+constexpr int kTrials            = 7;
 constexpr double kDenseFp4TflopS = 1676.0;
 
 enum class Atom : int { Nvfp4, Bf16, Fp8, Fp8K16, S8 };
 
 struct Options {
-    Atom atom      = Atom::Nvfp4;
-    bool all       = true;
-    bool json      = false;
-    int iters      = kDefaultIters;
-    int warps      = 8;
+    Atom atom         = Atom::Nvfp4;
+    bool all          = true;
+    bool json         = false;
+    int iters         = kDefaultIters;
+    int warps         = 8;
     int blocks_per_sm = 2;
 };
 
@@ -67,7 +67,9 @@ __device__ __forceinline__ void issue_bf16(int iters, float& c0, float& c1, floa
     unsigned b0 = 0x3c003c00u, b1 = 0x3c003c00u;
     for (int i = 0; i < iters; ++i) {
 #pragma unroll
-        for (int u = 0; u < kInner; ++u) { ninfer::ops::mma_bf16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1); }
+        for (int u = 0; u < kInner; ++u) {
+            ninfer::ops::mma_bf16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+        }
     }
 }
 
@@ -77,7 +79,9 @@ __device__ __forceinline__ void issue_s8(int iters, float& c0, float& c1, float&
     unsigned b0 = 0x55555555u, b1 = 0x66666666u;
     for (int i = 0; i < iters; ++i) {
 #pragma unroll
-        for (int u = 0; u < kInner; ++u) { ninfer::ops::mma_s8(ic0, ic1, ic2, ic3, a0, a1, a2, a3, b0, b1); }
+        for (int u = 0; u < kInner; ++u) {
+            ninfer::ops::mma_s8(ic0, ic1, ic2, ic3, a0, a1, a2, a3, b0, b1);
+        }
     }
     c0 = static_cast<float>(ic0);
     c1 = static_cast<float>(ic1);
@@ -112,7 +116,10 @@ __global__ void mma_issue_kernel(float* sink, int iters) {
                 ninfer::ops::mma_fp8_e4m3_k16(d, 0x38383838U, 0x38383838U, 0x38383838U);
             }
         }
-        c0 = d[0]; c1 = d[1]; c2 = d[2]; c3 = d[3];
+        c0 = d[0];
+        c1 = d[1];
+        c2 = d[2];
+        c3 = d[3];
     } else {
         issue_s8(iters, c0, c1, c2, c3);
     }
@@ -259,8 +266,12 @@ int main(int argc, char** argv) {
         results.push_back(run_atom<Atom::Bf16>("bf16", 16, 8, 16, opt, sm_count));
     }
     if (want(Atom::S8)) { results.push_back(run_atom<Atom::S8>("s8", 16, 8, 32, opt, sm_count)); }
-    if (want(Atom::Fp8)) { results.push_back(run_atom<Atom::Fp8>("fp8", 16, 8, 32, opt, sm_count)); }
-    if (want(Atom::Fp8K16)) { results.push_back(run_atom<Atom::Fp8K16>("fp8_k16", 16, 8, 16, opt, sm_count)); }
+    if (want(Atom::Fp8)) {
+        results.push_back(run_atom<Atom::Fp8>("fp8", 16, 8, 32, opt, sm_count));
+    }
+    if (want(Atom::Fp8K16)) {
+        results.push_back(run_atom<Atom::Fp8K16>("fp8_k16", 16, 8, 16, opt, sm_count));
+    }
 
     if (opt.json) {
         std::printf("{\n");
@@ -274,8 +285,8 @@ int main(int argc, char** argv) {
             std::printf("  \"%s\": {\"m\": %d, \"n\": %d, \"k\": %d, \"mma_per_s\": %.6e, "
                         "\"tflop_s\": %.3f, \"median_ms\": %.4f, \"warps_per_block\": %d, "
                         "\"blocks\": %d}%s\n",
-                        r.name, r.m, r.n, r.k, r.mma_per_s, r.tflop_s, r.median_ms, r.warps, r.blocks,
-                        i + 1 == results.size() ? "" : ",");
+                        r.name, r.m, r.n, r.k, r.mma_per_s, r.tflop_s, r.median_ms, r.warps,
+                        r.blocks, i + 1 == results.size() ? "" : ",");
         }
         std::printf("}\n");
         return 0;

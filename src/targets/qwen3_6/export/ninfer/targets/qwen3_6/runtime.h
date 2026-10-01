@@ -18,7 +18,7 @@
 namespace ninfer {
 struct DeviceContext;
 class HostPinnedArena;
-}
+} // namespace ninfer
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -164,15 +164,13 @@ public:
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                            const RequestPlan<Variant>& plan) const noexcept;
-    [[nodiscard]] bool can_admit_lane_after_releasing(
-        std::uint32_t lane, const RequestPlan<Variant>& plan,
-        std::span<const std::uint32_t> release_lanes) const noexcept;
+    [[nodiscard]] bool
+    can_admit_lane_after_releasing(std::uint32_t lane, const RequestPlan<Variant>& plan,
+                                   std::span<const std::uint32_t> release_lanes) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
-    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPrompt&& prompt,
-                                                                RequestPlan<Variant>&& plan,
-                                                                runtime::TransientRegion transient,
-                                                                const OutputSession* output = nullptr);
+    [[nodiscard]] runtime::PrefillStepResult
+    start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+                       runtime::TransientRegion transient, const OutputSession* output = nullptr);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
@@ -227,7 +225,8 @@ public:
     void request_idle_spill();
     [[nodiscard]] qwen3_6::detail::KvRamSnapshot kv_ram_snapshot() const noexcept;
     qwen3_6::detail::KvRamCopySeconds harvest_kv_ram_copy_seconds();
-    [[nodiscard]] std::optional<qwen3_6::detail::KvDiskSnapshot> try_kv_disk_snapshot() const noexcept;
+    [[nodiscard]] std::optional<qwen3_6::detail::KvDiskSnapshot>
+    try_kv_disk_snapshot() const noexcept;
     qwen3_6::detail::KvDiskCopySeconds harvest_kv_disk_copy_seconds();
     [[nodiscard]] qwen3_6::detail::KvGpuSnapshot kv_gpu_snapshot() const noexcept;
     [[nodiscard]] bool kv_ram_copies_ready() const;
@@ -260,10 +259,9 @@ private:
     std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
 
     template <class V>
-    friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
-                                                      typename V::WeightsProfile, SequencePlan<V>&&,
-                                                      DeviceContext&,
-                                                      std::unique_ptr<HostPinnedArena>);
+    friend std::unique_ptr<Program<V>>
+    create_program(const typename V::ModelView&, typename V::WeightsProfile, SequencePlan<V>&&,
+                   DeviceContext&, std::unique_ptr<HostPinnedArena>);
 };
 
 template <class Variant>

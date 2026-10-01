@@ -149,11 +149,11 @@ void CyclicKVCache::copy_lane_to_host(std::int32_t lane, void* dst, cudaStream_t
     for (std::size_t layer = 0; layer < k_.size(); ++layer) {
         Tensor source_k = k_[layer].slice(3, lane, 1);
         Tensor source_v = v_[layer].slice(3, lane, 1);
-        CUDA_CHECK(cudaMemcpyAsync(out, source_k.data, source_k.bytes(), cudaMemcpyDeviceToHost,
-                                   stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(out, source_k.data, source_k.bytes(), cudaMemcpyDeviceToHost, stream));
         out += source_k.bytes();
-        CUDA_CHECK(cudaMemcpyAsync(out, source_v.data, source_v.bytes(), cudaMemcpyDeviceToHost,
-                                   stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(out, source_v.data, source_v.bytes(), cudaMemcpyDeviceToHost, stream));
         out += source_v.bytes();
     }
 }

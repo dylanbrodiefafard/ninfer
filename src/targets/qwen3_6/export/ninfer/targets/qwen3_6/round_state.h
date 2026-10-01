@@ -18,15 +18,15 @@ inline constexpr std::uint32_t kDFlashDecodeMaximumDrafts = 15;
 inline constexpr std::uint32_t kDFlashDecodeMaximumWidth  = kDFlashDecodeMaximumDrafts + 1;
 
 struct RoundStateSpec {
-    std::int32_t hidden            = 0;
-    std::int32_t output_rows       = 0;
-    std::uint32_t batch_capacity   = 1;
-    std::uint32_t draft_window     = 0;
+    std::int32_t hidden          = 0;
+    std::int32_t output_rows     = 0;
+    std::uint32_t batch_capacity = 1;
+    std::uint32_t draft_window   = 0;
     // Packed DFlash verify width. 0 means draft_window+1 (chain). Tree verify sets this to the
     // packed N, which may be smaller than the expand width.
     std::uint32_t dflash_verify_width = 0;
-    bool enable_mtp                = false;
-    bool enable_dflash             = false;
+    bool enable_mtp                   = false;
+    bool enable_dflash                = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied

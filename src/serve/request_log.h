@@ -144,11 +144,11 @@ struct ThroughputReport {
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
     ninfer::RuntimeStats scheduler;
-    std::size_t kv_ram_capacity_bytes = 0;
-    std::size_t kv_ram_used_bytes     = 0;
-    std::size_t kv_ram_entry_count    = 0;
-    double kv_ram_save_seconds        = 0;
-    double kv_ram_load_seconds        = 0;
+    std::size_t kv_ram_capacity_bytes  = 0;
+    std::size_t kv_ram_used_bytes      = 0;
+    std::size_t kv_ram_entry_count     = 0;
+    double kv_ram_save_seconds         = 0;
+    double kv_ram_load_seconds         = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::size_t kv_disk_used_bytes     = 0;
     std::size_t kv_disk_entry_count    = 0;

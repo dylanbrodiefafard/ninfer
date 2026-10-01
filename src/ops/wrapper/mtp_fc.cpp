@@ -16,8 +16,8 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
 
 void require_bf16_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t tokens,
                          const char* name) {
-    if (tensor.dtype != DType::BF16 || !tensor.is_contiguous() ||
-        tensor.ne[0] != rows || tensor.ne[1] != tokens || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
+    if (tensor.dtype != DType::BF16 || !tensor.is_contiguous() || tensor.ne[0] != rows ||
+        tensor.ne[1] != tokens || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("mtp_fc: invalid ") + name);
     }
     if (!aligned_to(tensor.data, 16)) {

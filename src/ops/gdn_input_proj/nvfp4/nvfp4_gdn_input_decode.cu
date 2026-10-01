@@ -16,11 +16,11 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule>
         <<<dim3(kBlocks, x.ne[1]), Schedule::kThreads, 0, stream>>>(
-        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)});
+            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+            Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
+                                static_cast<__nv_bfloat16*>(z.data)});
     CUDA_CHECK(cudaGetLastError());
 }
 

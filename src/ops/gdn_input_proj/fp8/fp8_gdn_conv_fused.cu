@@ -20,8 +20,8 @@ using SnapshotLaunch = void (*)(const Tensor&, const Weight&, const Tensor&, Ten
                                 const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
                                 cudaStream_t);
 using RecordLaunch   = void (*)(const Tensor&, const Weight&, const Tensor&, const Tensor&,
-                              const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                              Tensor&, cudaStream_t, const std::int32_t*);
+                                const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
+                                Tensor&, cudaStream_t, const std::int32_t*);
 
 template <int ActiveTokens, bool Tree = false, class Publish>
 void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
@@ -39,8 +39,9 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const __nv_bfloat16*>(weight.scales),
-            make_gdn_conv_output<ActiveTokens, Publish, Tree>(conv_weight, conv_states, valid_columns,
-                                               initial_slot, query, key, value, z, publish, parent_index));
+            make_gdn_conv_output<ActiveTokens, Publish, Tree>(
+                conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
+                publish, parent_index));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -64,11 +65,11 @@ void launch_record_small_t(const Tensor& x, const Weight& weight, const Tensor& 
                            const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                            Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream,
                            const std::int32_t* parent_index) {
-    launch_small_t<ActiveTokens, Tree>(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                                 query, key, value, z,
-                                 RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data),
-                                                     kGdnChannels, ActiveTokens},
-                                 stream, parent_index);
+    launch_small_t<ActiveTokens, Tree>(
+        x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
+        RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data), kGdnChannels,
+                            ActiveTokens},
+        stream, parent_index);
 }
 
 void launch_snapshot_decode(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
@@ -136,8 +137,8 @@ void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Te
     if (x.ne[2] != 1 || x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LinearSmallTMax<Geometry>) {
         throw std::invalid_argument("fp8 GDN record fused: unsupported B/W");
     }
-    const auto* parents = parent_index == nullptr ? nullptr :
-        static_cast<const std::int32_t*>(parent_index->data);
+    const auto* parents =
+        parent_index == nullptr ? nullptr : static_cast<const std::int32_t*>(parent_index->data);
     const auto& launchers = parents == nullptr ? kRecordLaunchers : kTreeRecordLaunchers;
     launchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, conv_record, query, key,

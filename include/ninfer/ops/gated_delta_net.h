@@ -106,8 +106,9 @@ void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
  * snapshot overlay that stores every column state in scratch and loads each column's parent (or
  * checkpoint) state; without workspace the tree record kernel uses the 1-warp shared-memory tile.
  */
-[[nodiscard]] std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(
-    std::int32_t value_heads, std::int32_t batch, std::int32_t width);
+[[nodiscard]] std::size_t
+gated_delta_net_replay_record_workspace_capacity_bytes(std::int32_t value_heads, std::int32_t batch,
+                                                       std::int32_t width);
 
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,

@@ -34,17 +34,13 @@ class TargetReservations:
         self._available = dict(capacities)
         self._condition = threading.Condition()
 
-    def acquire(
-        self, target: str | None, requested: int, cancel: threading.Event
-    ) -> int:
+    def acquire(self, target: str | None, requested: int, cancel: threading.Event) -> int:
         if target is None:
             return requested
         with self._condition:
             while self._available[target] <= 0:
                 if cancel.is_set():
-                    raise InterruptedError(
-                        "run cancelled while waiting for target capacity"
-                    )
+                    raise InterruptedError("run cancelled while waiting for target capacity")
                 self._condition.wait(timeout=0.2)
             grant = min(requested, self._available[target])
             self._available[target] -= grant
@@ -107,20 +103,14 @@ def validate_suite(config: AppConfig, suite_name: str, for_run: bool = False) ->
         )
         backend = get_backend(job.backend)
         backend.validate(job, target, for_run=for_run)
-        if (
-            target_cfg
-            and job.max_concurrency
-            and job.max_concurrency > target_cfg.max_concurrency
-        ):
+        if target_cfg and job.max_concurrency and job.max_concurrency > target_cfg.max_concurrency:
             raise ConfigError(
                 f"job {job.id} max_concurrency {job.max_concurrency} exceeds target "
                 f"{target_cfg.name} capacity {target_cfg.max_concurrency}"
             )
 
 
-def plan_suite(
-    config: AppConfig, suite_name: str, for_run: bool = False
-) -> list[dict[str, Any]]:
+def plan_suite(config: AppConfig, suite_name: str, for_run: bool = False) -> list[dict[str, Any]]:
     validate_suite(config, suite_name, for_run=for_run)
     plans = []
     for job in config.suite(suite_name).jobs:
@@ -131,9 +121,7 @@ def plan_suite(
             else (ResolvedTarget(target_cfg, None) if target_cfg is not None else None)
         )
         plan = get_backend(job.backend).plan(job, target)
-        requested = job.max_concurrency or (
-            target_cfg.max_concurrency if target_cfg else 1
-        )
+        requested = job.max_concurrency or (target_cfg.max_concurrency if target_cfg else 1)
         plans.append(
             {
                 "job_id": job.id,
@@ -183,34 +171,25 @@ class Coordinator:
             _atomic_json(run_dir / "manifest.json", manifest)
         else:
             run_dir = resume_dir.resolve()
-            manifest = json.loads(
-                (run_dir / "manifest.json").read_text(encoding="utf-8")
-            )
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             if manifest.get("config_fingerprint") != fingerprint:
                 raise ConfigError(
                     "resume configuration fingerprint mismatch: "
                     f"stored={manifest.get('config_fingerprint')} current={fingerprint}"
                 )
             run_id = manifest["run_id"]
-            state_existing = json.loads(
-                (run_dir / "state.json").read_text(encoding="utf-8")
-            )
+            state_existing = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
             state_existing["status"] = "running"
 
         jobs_dir = run_dir / "backends"
         jobs_dir.mkdir(exist_ok=True)
         logger = create_run_logger(run_dir)
-        used_target_names = {
-            job.target for job in self.suite.jobs if job.target is not None
-        }
+        used_target_names = {job.target for job in self.suite.jobs if job.target is not None}
         resolved_targets = {
-            name: resolve_target(self.config.targets[name])
-            for name in used_target_names
+            name: resolve_target(self.config.targets[name]) for name in used_target_names
         }
         secrets = [
-            target.api_key
-            for target in resolved_targets.values()
-            if target and target.api_key
+            target.api_key for target in resolved_targets.values() if target and target.api_key
         ]
         secrets.extend(_configured_backend_secrets(self.suite.jobs))
         renderer = ProgressRenderer(
@@ -219,14 +198,9 @@ class Coordinator:
             refresh_seconds=self.config.runtime.progress.refresh_seconds,
         )
         events = EventSink(run_dir / "events.jsonl", logger, renderer, secrets)
-        state = RunState(
-            run_dir / "state.json", run_id, self.suite.jobs, state_existing
-        )
+        state = RunState(run_dir / "state.json", run_id, self.suite.jobs, state_existing)
         reservations = TargetReservations(
-            {
-                name: target.max_concurrency
-                for name, target in self.config.targets.items()
-            }
+            {name: target.max_concurrency for name, target in self.config.targets.items()}
         )
         events.emit(
             RunEvent(
@@ -260,9 +234,7 @@ class Coordinator:
                 runnable.append(job)
 
         try:
-            with ThreadPoolExecutor(
-                max_workers=self.config.runtime.max_parallel_jobs
-            ) as pool:
+            with ThreadPoolExecutor(max_workers=self.config.runtime.max_parallel_jobs) as pool:
                 futures = {
                     pool.submit(
                         self._run_job,
@@ -283,13 +255,9 @@ class Coordinator:
                         results_by_id[job.id] = future.result()
                     except InterruptedError as exc:
                         self.cancel_event.set()
-                        results_by_id[job.id] = self._failed_result(
-                            job, "cancelled", str(exc)
-                        )
+                        results_by_id[job.id] = self._failed_result(job, "cancelled", str(exc))
                     except Exception as exc:
-                        results_by_id[job.id] = self._failed_result(
-                            job, "failed", str(exc)
-                        )
+                        results_by_id[job.id] = self._failed_result(job, "failed", str(exc))
             ordered = [results_by_id[job.id] for job in self.suite.jobs]
             if self.cancel_event.is_set():
                 final_status = "cancelled"
@@ -300,9 +268,7 @@ class Coordinator:
             else:
                 final_status = "failed"
             write_summary(run_dir, run_id, final_status, ordered)
-            state.update_run(
-                status=final_status, finished_at=datetime.now(UTC).isoformat()
-            )
+            state.update_run(status=final_status, finished_at=datetime.now(UTC).isoformat())
             events.emit(
                 RunEvent(
                     kind="run_end",
@@ -332,9 +298,7 @@ class Coordinator:
         backend = get_backend(job.backend)
         plan = backend.plan(job, target)
         target_cfg = target.config if target else None
-        requested = job.max_concurrency or (
-            target_cfg.max_concurrency if target_cfg else 1
-        )
+        requested = job.max_concurrency or (target_cfg.max_concurrency if target_cfg else 1)
         granted = reservations.acquire(job.target, requested, self.cancel_event)
         job_dir = jobs_dir / job.id
         job_dir.mkdir(parents=True, exist_ok=True)

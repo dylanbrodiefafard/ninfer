@@ -104,9 +104,7 @@ def test_fused_text_attention_dispatch_does_not_capture_mtp_parent():
 def test_input_divisor_materialization_preserves_positive_fp32_word():
     class Reader:
         def __init__(self, word: int):
-            self.tensor = torch.frombuffer(
-                bytearray(struct.pack("<I", word)), dtype=torch.float32
-            )
+            self.tensor = torch.frombuffer(bytearray(struct.pack("<I", word)), dtype=torch.float32)
 
         def get(self, _name: str) -> torch.Tensor:
             return self.tensor

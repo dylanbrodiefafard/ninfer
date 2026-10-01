@@ -23,11 +23,11 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
-    resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
-    resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.requested_output_tokens    = options.execution.requested_output_tokens;
+    resolved.execution.allow_prefix_reuse         = options.execution.allow_prefix_reuse;
     resolved.execution.capture_context_checkpoint = options.execution.capture_context_checkpoint;
-    resolved.stop                              = std::move(options.stop);
-    resolved.output                            = options.output;
+    resolved.stop                                 = std::move(options.stop);
+    resolved.output                               = options.output;
     return resolved;
 }
 
@@ -312,10 +312,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
-                                                   prepare_seconds, std::move(resolved_options),
-                                                   delivery, pending_deadline,
-                                                   std::move(host_input));
+                auto submission = executor->submit(
+                    std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
+                    std::move(resolved_options), delivery, pending_deadline, std::move(host_input));
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }

@@ -37,9 +37,7 @@ from tools.convert.qwen3_6.common.recipe import (
 from . import inventory
 
 DRAFT_ROWS = 131072
-DRAFT_RANKING_PATH = (
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
-)
+DRAFT_RANKING_PATH = "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
 
 
 def _attention_part(source_name: str, *, gate: bool) -> Expression:
@@ -340,9 +338,7 @@ def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
         ),
     ]
     recipes.extend(_moe_recipes(source_prefix + "mlp.", object_prefix + "moe/"))
-    recipes.append(
-        TensorRecipe("mtp/final_norm", source("mtp.norm.weight", (2048,)))
-    )
+    recipes.append(TensorRecipe("mtp/final_norm", source("mtp.norm.weight", (2048,))))
     return tuple(recipes)
 
 
@@ -433,9 +429,7 @@ def _build_dflash_recipes() -> tuple[TensorRecipe, ...]:
                 ),
             )
         )
-    recipes.append(
-        TensorRecipe("dflash/final_norm", source("norm.weight", (2048,)))
-    )
+    recipes.append(TensorRecipe("dflash/final_norm", source("norm.weight", (2048,))))
     return tuple(recipes)
 
 
@@ -448,9 +442,7 @@ BASE_RECIPE_SPECS = (
 DFLASH_RECIPE_SPECS = _build_dflash_recipes()
 RECIPE_SPECS = BASE_RECIPE_SPECS + DFLASH_RECIPE_SPECS
 BASE_RECIPES_BY_NAME = {item.object_name: item for item in BASE_RECIPE_SPECS}
-DFLASH_RECIPES_BY_NAME = {
-    item.object_name: item for item in DFLASH_RECIPE_SPECS
-}
+DFLASH_RECIPES_BY_NAME = {item.object_name: item for item in DFLASH_RECIPE_SPECS}
 RECIPES_BY_NAME = {item.object_name: item for item in RECIPE_SPECS}
 
 
@@ -463,19 +455,16 @@ def validate_recipe_coverage() -> None:
     base_requirements = base_source_requirements()
     if len(base_requirements) != 1045:
         raise ValueError(
-            f"35B base recipe covers {len(base_requirements)} unique sources, "
-            "expected 1045"
+            f"35B base recipe covers {len(base_requirements)} unique sources, expected 1045"
         )
     dflash_requirements = dflash_source_requirements()
     if len(dflash_requirements) != 69:
         raise ValueError(
-            f"35B DFlash recipe covers {len(dflash_requirements)} unique sources, "
-            "expected 69"
+            f"35B DFlash recipe covers {len(dflash_requirements)} unique sources, expected 69"
         )
-    if {
-        item.dtype
-        for item in (*base_requirements.values(), *dflash_requirements.values())
-    } != {SOURCE_DTYPE}:
+    if {item.dtype for item in (*base_requirements.values(), *dflash_requirements.values())} != {
+        SOURCE_DTYPE
+    }:
         raise ValueError("35B source recipes must contain only BF16 tensors")
 
 

@@ -51,9 +51,7 @@ std::vector<ninfer::TokenId> concat(std::vector<ninfer::TokenId> prefix,
 std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
                                            const std::vector<ninfer::TokenId>& generated) {
     std::vector<ninfer::TokenId> prefix = keep;
-    if (!generated.empty()) {
-        prefix.insert(prefix.end(), generated.begin(), generated.end() - 1);
-    }
+    if (!generated.empty()) { prefix.insert(prefix.end(), generated.begin(), generated.end() - 1); }
     return prefix;
 }
 
@@ -71,8 +69,8 @@ std::vector<ninfer::TokenId> pad_tokens(std::vector<ninfer::TokenId> seed, std::
 int expect_ram_hit(const ninfer::GenerationResult& result, std::uint32_t history_tokens,
                    const char* label) {
     if (result.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
-        std::cerr << label << " reuse_source is "
-                  << static_cast<int>(result.prefix_reuse_source) << ", expected HostRam\n";
+        std::cerr << label << " reuse_source is " << static_cast<int>(result.prefix_reuse_source)
+                  << ", expected HostRam\n";
         return 1;
     }
     if (result.prefix_reuse_path == ninfer::PrefixReusePath::FullReset) {
@@ -111,10 +109,10 @@ ninfer::EngineOptions pooled_c3_options(const char* artifact) {
 }
 
 ninfer::EngineOptions mtp_options(const char* artifact) {
-    ninfer::EngineOptions options     = ordinary_options(artifact, 1, 4096, kRamHitBytes);
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 5;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    ninfer::EngineOptions options      = ordinary_options(artifact, 1, 4096, kRamHitBytes);
+    options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens   = 5;
+    options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
     options.speculative.adaptive_draft = true;
     return options;
 }
@@ -159,7 +157,8 @@ int expect_suffix_hit(const ninfer::GenerationResult& result, ninfer::PrefixReus
 
 int expect_exact_hit(const ninfer::GenerationResult& result, std::uint32_t prompt_tokens,
                      const char* label) {
-    if (result.prompt.prompt_tokens != prompt_tokens || result.reused_prompt_tokens != prompt_tokens) {
+    if (result.prompt.prompt_tokens != prompt_tokens ||
+        result.reused_prompt_tokens != prompt_tokens) {
         std::cerr << label << " exact hit reused " << result.reused_prompt_tokens << " of prompt "
                   << result.prompt.prompt_tokens << ", expected " << prompt_tokens << '\n';
         return 1;
@@ -174,12 +173,12 @@ int expect_exact_hit(const ninfer::GenerationResult& result, std::uint32_t promp
     return 0;
 }
 
-bool wait_scheduler(ninfer::Engine& engine, std::uint32_t* max_prefilling,
-                    const auto& predicate, const char* label) {
+bool wait_scheduler(ninfer::Engine& engine, std::uint32_t* max_prefilling, const auto& predicate,
+                    const char* label) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
     while (std::chrono::steady_clock::now() < deadline) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
-        *max_prefilling = std::max(*max_prefilling, stats.prefilling_requests);
+        *max_prefilling                  = std::max(*max_prefilling, stats.prefilling_requests);
         if (stats.prefilling_requests > 1) {
             std::cerr << label << " observed prefilling_requests=" << stats.prefilling_requests
                       << '\n';
@@ -198,7 +197,8 @@ bool wait_scheduler(ninfer::Engine& engine, std::uint32_t* max_prefilling,
 
 int capture_then_hit(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& keep,
                      const std::vector<ninfer::TokenId>& evictor, const char* label) {
-    const ninfer::GenerationResult first = engine.generate(engine.prepare_tokens(keep), greedy(8, false));
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
     if (first.generated_token_ids.size() != 8) {
         return fail("source request did not generate eight tokens");
     }
@@ -228,9 +228,8 @@ int capture_then_hit(ninfer::Engine& engine, const std::vector<ninfer::TokenId>&
                   << ", expected " << restores_before + 1 << '\n';
         return 1;
     }
-    const auto restores_after_hit              = engine.runtime_stats().kv_ram_restores;
-    const std::vector<ninfer::TokenId> after_hit =
-        resume_prefix(history, hit.generated_token_ids);
+    const auto restores_after_hit                = engine.runtime_stats().kv_ram_restores;
+    const std::vector<ninfer::TokenId> after_hit = resume_prefix(history, hit.generated_token_ids);
     const ninfer::GenerationResult resident =
         engine.generate(engine.prepare_tokens(after_hit), greedy(2, true));
     if (resident.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
@@ -277,14 +276,15 @@ int exercise_exclusive_occupancy(const char* artifact) {
     const ninfer::MemorySummary after_capture = engine.memory_summary();
     if (after_capture.kv_ram_entry_count != 1 || after_capture.kv_ram_used_bytes == 0) {
         std::cerr << "exclusive occupancy after capture: entries="
-                  << after_capture.kv_ram_entry_count
-                  << " used=" << after_capture.kv_ram_used_bytes << '\n';
+                  << after_capture.kv_ram_entry_count << " used=" << after_capture.kv_ram_used_bytes
+                  << '\n';
         return 1;
     }
 
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
-    const auto captures_before_hit               = engine.runtime_stats().kv_ram_captures;
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
+    const auto restores_before     = engine.runtime_stats().kv_ram_restores;
+    const auto captures_before_hit = engine.runtime_stats().kv_ram_captures;
     const ninfer::GenerationResult hit_a =
         engine.generate(engine.prepare_tokens(history_a), greedy(4, true));
     if (const int rc = expect_ram_hit(hit_a, static_cast<std::uint32_t>(history_a.size()),
@@ -396,10 +396,11 @@ int exercise_checkpoint(ninfer::Engine& engine) {
         return fail("checkpoint source request did not complete");
     }
     (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(2, false));
-    ninfer::PromptInput replay = input();
+    ninfer::PromptInput replay       = input();
     replay.options.preserve_thinking = false;
     const auto restores_before       = engine.runtime_stats().kv_ram_restores;
-    const ninfer::GenerationResult hit = engine.generate(engine.prepare(std::move(replay)), greedy(4, true));
+    const ninfer::GenerationResult hit =
+        engine.generate(engine.prepare(std::move(replay)), greedy(4, true));
     if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
         (hit.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint &&
          hit.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnCheckpoint) ||
@@ -418,7 +419,8 @@ int exercise_checkpoint(ninfer::Engine& engine) {
 
 int exercise_partial_prefill(ninfer::Engine& engine) {
     const std::vector<ninfer::TokenId> keep{200, 201, 202, 203, 204, 205};
-    const ninfer::GenerationResult first = engine.generate(engine.prepare_tokens(keep), greedy(4, false));
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(4, false));
     if (first.generated_token_ids.size() != 4) {
         return fail("partial-prefill source did not complete");
     }
@@ -451,13 +453,16 @@ int exercise_partial_prefill(ninfer::Engine& engine) {
 
 int exercise_cancel_continue_ram(ninfer::Engine& engine) {
     const auto keep = tokens_a();
+
     struct CancelAfterPublish : ninfer::OutputSink {
         std::atomic<int> published{0};
         std::atomic<bool> stop{false};
+
         void publish(ninfer::OutputDelta) override {
             if (published.fetch_add(1) + 1 >= 2) { stop.store(true); }
         }
     } sink;
+
     ninfer::CancellationView cancel([&] { return sink.stop.load(); });
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(keep), greedy(32, false), &sink, cancel);
@@ -520,7 +525,7 @@ int exercise_prefill_cancel_capture_ram(ninfer::Engine& engine) {
     long_user.reserve(3500 * 9);
     for (int index = 0; index < 3500; ++index) { long_user += "continue "; }
 
-    ninfer::PromptInput followup = first_input;
+    ninfer::PromptInput followup  = first_input;
     ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, first.content);
     assistant.reasoning_content   = first.reasoning;
     followup.messages.push_back(std::move(assistant));
@@ -573,10 +578,11 @@ int exercise_prefill_cancel_capture_ram(ninfer::Engine& engine) {
 int exercise_site1(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 2, 256, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
-    const auto keep                          = tokens_a();
-    const ninfer::GenerationResult first     = engine.generate(engine.prepare_tokens(keep), greedy(8, false));
+    const auto keep = tokens_a();
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
     if (first.generated_token_ids.size() != 8) { return fail("site 1 source did not complete"); }
-    const auto captures_before               = engine.runtime_stats().kv_ram_captures;
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
     const ninfer::GenerationResult other =
         engine.generate(engine.prepare_tokens(tokens_b(200)), greedy(8, false));
     if (other.generated_token_ids.size() != 8) { return fail("site 1 evictor did not complete"); }
@@ -608,9 +614,7 @@ int exercise_vram_wins(const char* artifact) {
     const auto keep = tokens_a();
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(keep), greedy(8, false));
-    if (first.generated_token_ids.size() != 8) {
-        return fail("VRAM-wins source did not complete");
-    }
+    if (first.generated_token_ids.size() != 8) { return fail("VRAM-wins source did not complete"); }
     (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
     const ninfer::GenerationResult again =
         engine.generate(engine.prepare_tokens(keep), greedy(8, false));
@@ -628,8 +632,8 @@ int exercise_vram_wins(const char* artifact) {
         std::cerr << "equal reuse did not keep VRAM: source="
                   << static_cast<int>(hit.prefix_reuse_source)
                   << " path=" << static_cast<int>(hit.prefix_reuse_path)
-                  << " reused=" << hit.reused_prompt_tokens << " restores="
-                  << engine.runtime_stats().kv_ram_restores << '\n';
+                  << " reused=" << hit.reused_prompt_tokens
+                  << " restores=" << engine.runtime_stats().kv_ram_restores << '\n';
         return 1;
     }
     return 0;
@@ -684,19 +688,21 @@ int exercise_site3_victim(const char* artifact) {
     if (first_a.generated_token_ids.size() != 4 || first_b.generated_token_ids.size() != 4) {
         return fail("site-3 sources did not complete");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
-    const auto captures_before                   = engine.runtime_stats().kv_ram_captures;
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
+    const auto captures_before = engine.runtime_stats().kv_ram_captures;
     const ninfer::GenerationResult ram_a =
         engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
-    if (const int rc = expect_ram_hit(ram_a, static_cast<std::uint32_t>(history_a.size()),
-                                      "site 3 victim");
+    if (const int rc =
+            expect_ram_hit(ram_a, static_cast<std::uint32_t>(history_a.size()), "site 3 victim");
         rc != 0) {
         return rc;
     }
     if (engine.runtime_stats().kv_ram_captures != captures_before + 1) {
         return fail("site 3 RAM restore did not capture the covered dirty lane");
     }
-    const std::vector<ninfer::TokenId> history_b = resume_prefix(keep_b, first_b.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(keep_b, first_b.generated_token_ids);
     const ninfer::GenerationResult ram_b =
         engine.generate(engine.prepare_tokens(history_b), greedy(2, true));
     if (const int rc = expect_ram_hit(ram_b, static_cast<std::uint32_t>(history_b.size()),
@@ -747,10 +753,9 @@ int exercise_suffix_prefill(const char* artifact) {
     const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(continued), greedy(4, true));
-    if (const int rc =
-            expect_suffix_hit(hit, ninfer::PrefixReuseSource::HostRam,
-                              static_cast<std::uint32_t>(history.size()),
-                              static_cast<std::uint32_t>(continued.size()), "suffix RAM restore");
+    if (const int rc = expect_suffix_hit(
+            hit, ninfer::PrefixReuseSource::HostRam, static_cast<std::uint32_t>(history.size()),
+            static_cast<std::uint32_t>(continued.size()), "suffix RAM restore");
         rc != 0) {
         return rc;
     }
@@ -815,8 +820,8 @@ int exercise_queued_ram_hit(const char* artifact) {
     if (other.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
         return fail("queued evictor did not FullReset");
     }
-    if (const int rc = expect_ram_hit(hit, static_cast<std::uint32_t>(history.size()),
-                                      "queued matcher");
+    if (const int rc =
+            expect_ram_hit(hit, static_cast<std::uint32_t>(history.size()), "queued matcher");
         rc != 0) {
         return rc;
     }
@@ -841,10 +846,12 @@ int exercise_c2_keeps_first_vram(const char* artifact) {
         return fail("C=2 sequential second chat did not FullReset alone");
     }
     if (engine.runtime_stats().kv_ram_captures != captures_before) {
-        return fail("C=2 sequential second chat captured the first retained lane instead of the empty lane");
+        return fail("C=2 sequential second chat captured the first retained lane instead of the "
+                    "empty lane");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult exact_a =
         engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
     if (const int rc = expect_exact_hit(exact_a, static_cast<std::uint32_t>(history_a.size()),
@@ -874,7 +881,8 @@ int exercise_c2_continue_refreshes_recency(const char* artifact) {
         engine.runtime_stats().kv_ram_captures != 0) {
         return fail("C=2 continue-A setup did not keep A and B in VRAM");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
     const std::vector<ninfer::TokenId> history_b =
         resume_prefix(tokens_c(), first_b.generated_token_ids);
     const ninfer::GenerationResult exact_a =
@@ -888,10 +896,10 @@ int exercise_c2_continue_refreshes_recency(const char* artifact) {
         concat(resume_prefix(history_a, exact_a.generated_token_ids), {198, 198, 198, 198});
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(continued_a), greedy(4, true));
-    if (const int rc = expect_suffix_hit(
-            hit, ninfer::PrefixReuseSource::VramResident,
-            static_cast<std::uint32_t>(continued_a.size() - 4),
-            static_cast<std::uint32_t>(continued_a.size()), "C=2 continue-A new message");
+    if (const int rc = expect_suffix_hit(hit, ninfer::PrefixReuseSource::VramResident,
+                                         static_cast<std::uint32_t>(continued_a.size() - 4),
+                                         static_cast<std::uint32_t>(continued_a.size()),
+                                         "C=2 continue-A new message");
         rc != 0) {
         return rc;
     }
@@ -937,7 +945,8 @@ int exercise_c2_lru_covers_oldest(const char* artifact) {
         engine.runtime_stats().kv_ram_captures != 0) {
         return fail("C=2 LRU oldest setup did not keep A and B in VRAM");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
     const std::vector<ninfer::TokenId> history_b =
         resume_prefix(tokens_c(), first_b.generated_token_ids);
     const auto captures_before = engine.runtime_stats().kv_ram_captures;
@@ -985,7 +994,8 @@ int exercise_c2_ram_covers_lru_dirty(const char* artifact) {
         engine.runtime_stats().kv_ram_captures == 0) {
         return fail("C=2 RAM LRU did not spill A behind B and D");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
     const std::vector<ninfer::TokenId> history_b =
         resume_prefix(tokens_c(), first_b.generated_token_ids);
     const std::vector<ninfer::TokenId> history_d =
@@ -1049,9 +1059,11 @@ int exercise_c3_keeps_empty_lane(const char* artifact) {
     if (engine.runtime_stats().kv_ram_captures != captures_before) {
         return fail("C=3 sequential third chat captured a retained lane instead of the empty lane");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
-    const std::vector<ninfer::TokenId> history_b = resume_prefix(keep_b, first_b.generated_token_ids);
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(keep_b, first_b.generated_token_ids);
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult hit_a =
         engine.generate(engine.prepare_tokens(concat(history_a, {198, 198})), greedy(2, true));
     const ninfer::GenerationResult hit_b =
@@ -1060,8 +1072,8 @@ int exercise_c3_keeps_empty_lane(const char* artifact) {
         hit_b.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
         engine.runtime_stats().kv_ram_restores != restores_before) {
         std::cerr << "C=3 sequential resume left VRAM: A source="
-                  << static_cast<int>(hit_a.prefix_reuse_source) << " B source="
-                  << static_cast<int>(hit_b.prefix_reuse_source)
+                  << static_cast<int>(hit_a.prefix_reuse_source)
+                  << " B source=" << static_cast<int>(hit_b.prefix_reuse_source)
                   << " restores=" << engine.runtime_stats().kv_ram_restores << '\n';
         return 1;
     }
@@ -1071,10 +1083,12 @@ int exercise_c3_keeps_empty_lane(const char* artifact) {
 int exercise_site3_and_pass1(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 2, 4096, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
-    const auto keep_a                        = tokens_a();
-    const auto keep_b                        = tokens_c();
-    const ninfer::GenerationResult first_a   = engine.generate(engine.prepare_tokens(keep_a), greedy(4, false));
-    const ninfer::GenerationResult first_b   = engine.generate(engine.prepare_tokens(keep_b), greedy(4, false));
+    const auto keep_a = tokens_a();
+    const auto keep_b = tokens_c();
+    const ninfer::GenerationResult first_a =
+        engine.generate(engine.prepare_tokens(keep_a), greedy(4, false));
+    const ninfer::GenerationResult first_b =
+        engine.generate(engine.prepare_tokens(keep_b), greedy(4, false));
     if (first_a.generated_token_ids.size() != 4 || first_b.generated_token_ids.size() != 4) {
         return fail("pass-1 sources did not complete");
     }
@@ -1085,7 +1099,7 @@ int exercise_site3_and_pass1(const char* artifact) {
     }
     const std::vector<ninfer::TokenId> history_a =
         resume_prefix(keep_a, first_a.generated_token_ids);
-    const auto restores_before                   = engine.runtime_stats().kv_ram_restores;
+    const auto restores_before = engine.runtime_stats().kv_ram_restores;
     const ninfer::GenerationResult ram_hit =
         engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
     if (const int rc = expect_ram_hit(ram_hit, static_cast<std::uint32_t>(history_a.size()),
@@ -1111,9 +1125,8 @@ int exercise_site3_and_pass1(const char* artifact) {
         return 1;
     }
 
-    const auto overlap_captures = engine.runtime_stats().kv_ram_captures;
-    const std::vector<ninfer::TokenId> retained_a =
-        concat(history_a, ram_hit.generated_token_ids);
+    const auto overlap_captures                   = engine.runtime_stats().kv_ram_captures;
+    const std::vector<ninfer::TokenId> retained_a = concat(history_a, ram_hit.generated_token_ids);
     const std::vector<ninfer::TokenId> retained_b =
         concat(history_b, other_hit.generated_token_ids);
     ninfer::GenerationHandle first_inflight =
@@ -1139,17 +1152,15 @@ int exercise_site3_and_pass1(const char* artifact) {
     if (ram_a.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
         ram_a.reused_prompt_tokens == 0 ||
         ram_a.prefix_reuse_path == ninfer::PrefixReusePath::FullReset) {
-        std::cerr << "overlap A reuse_source is "
-                  << static_cast<int>(ram_a.prefix_reuse_source) << " reused "
-                  << ram_a.reused_prompt_tokens << '\n';
+        std::cerr << "overlap A reuse_source is " << static_cast<int>(ram_a.prefix_reuse_source)
+                  << " reused " << ram_a.reused_prompt_tokens << '\n';
         return 1;
     }
     if (ram_b.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
         ram_b.reused_prompt_tokens == 0 ||
         ram_b.prefix_reuse_path == ninfer::PrefixReusePath::FullReset) {
-        std::cerr << "overlap B reuse_source is "
-                  << static_cast<int>(ram_b.prefix_reuse_source) << " reused "
-                  << ram_b.reused_prompt_tokens << '\n';
+        std::cerr << "overlap B reuse_source is " << static_cast<int>(ram_b.prefix_reuse_source)
+                  << " reused " << ram_b.reused_prompt_tokens << '\n';
         return 1;
     }
     if (engine.runtime_stats().kv_ram_restores != overlap_restores + 2) {
@@ -1161,8 +1172,9 @@ int exercise_site3_and_pass1(const char* artifact) {
 int exercise_duplicate_ram_submit(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 2, 256, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
-    const auto keep                      = tokens_a();
-    const ninfer::GenerationResult first = engine.generate(engine.prepare_tokens(keep), greedy(8, false));
+    const auto keep = tokens_a();
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
     if (first.generated_token_ids.size() != 8) {
         return fail("duplicate-submit source did not complete");
     }
@@ -1186,8 +1198,9 @@ int exercise_duplicate_ram_submit(const char* artifact) {
 int exercise_oversize_drop(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 1, 4096, kRamDropBytes));
     if (const int rc = verify_ram_tier(engine, kRamDropBytes); rc != 0) { return rc; }
-    const auto keep                          = tokens_a();
-    const ninfer::GenerationResult first     = engine.generate(engine.prepare_tokens(keep), greedy(4, false));
+    const auto keep = tokens_a();
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(4, false));
     (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(2, false));
     if (engine.runtime_stats().kv_ram_drops == 0) {
         return fail("1 MiB RAM budget did not drop the captured bundle");
@@ -1222,7 +1235,7 @@ int exercise_mtp(const char* artifact) {
                   << " window=" << source.speculative.draft_window << '\n';
         return fail("MTP source did not execute speculative rounds with the configured window");
     }
-    const std::vector<ninfer::TokenId> history = resume_prefix(keep, source.generated_token_ids);
+    const std::vector<ninfer::TokenId> history   = resume_prefix(keep, source.generated_token_ids);
     const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
     const ninfer::GenerationResult vram =
         engine.generate(engine.prepare_tokens(continued), greedy(4, true));
@@ -1290,7 +1303,7 @@ int exercise_checkpoint_dirty_lane(const char* artifact) {
     if (occupant.generated_token_ids.size() != 4) {
         return fail("dirty-lane checkpoint occupant did not complete");
     }
-    ninfer::PromptInput replay = input();
+    ninfer::PromptInput replay       = input();
     replay.options.preserve_thinking = false;
     const auto captures_before       = engine.runtime_stats().kv_ram_captures;
     const auto restores_before       = engine.runtime_stats().kv_ram_restores;
@@ -1326,14 +1339,15 @@ int exercise_spill_drop(const char* artifact) {
     if (first_a.generated_token_ids.size() != 4 || first_b.generated_token_ids.size() != 4) {
         return fail("spill-drop sources did not complete");
     }
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(keep_a, first_a.generated_token_ids);
-    const ninfer::MemorySummary memory            = engine.memory_summary();
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(keep_a, first_a.generated_token_ids);
+    const ninfer::MemorySummary memory = engine.memory_summary();
     if (memory.kv_ram_used_bytes == 0 || memory.kv_ram_used_bytes * 2 <= kOneEntryBytes) {
-        std::cerr << "spill-drop budget still fits two entries: used="
-                  << memory.kv_ram_used_bytes << " cap=" << kOneEntryBytes << '\n';
+        std::cerr << "spill-drop budget still fits two entries: used=" << memory.kv_ram_used_bytes
+                  << " cap=" << kOneEntryBytes << '\n';
         return 1;
     }
-    const auto drops_before                      = engine.runtime_stats().kv_ram_drops;
+    const auto drops_before = engine.runtime_stats().kv_ram_drops;
     const ninfer::GenerationResult ram_a =
         engine.generate(engine.prepare_tokens(history_a), greedy(2, true));
     if (const int rc = expect_ram_hit(ram_a, static_cast<std::uint32_t>(history_a.size()),
@@ -1344,7 +1358,8 @@ int exercise_spill_drop(const char* artifact) {
     if (engine.runtime_stats().kv_ram_drops <= drops_before) {
         return fail("dirty-lane spill that did not fit still stored the occupant");
     }
-    const std::vector<ninfer::TokenId> history_b = resume_prefix(keep_b, first_b.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(keep_b, first_b.generated_token_ids);
     const ninfer::GenerationResult miss_b =
         engine.generate(engine.prepare_tokens(history_b), greedy(2, true));
     if (miss_b.prefix_reuse_source != ninfer::PrefixReuseSource::None ||
@@ -1363,9 +1378,7 @@ int exercise_teardown_after_restore(const char* artifact) {
     const auto keep = tokens_a();
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(keep), greedy(4, false));
-    if (first.generated_token_ids.size() != 4) {
-        return fail("teardown source did not complete");
-    }
+    if (first.generated_token_ids.size() != 4) { return fail("teardown source did not complete"); }
     (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(2, false));
     const std::vector<ninfer::TokenId> history = resume_prefix(keep, first.generated_token_ids);
     const ninfer::GenerationResult hit =
@@ -1395,10 +1408,13 @@ int exercise_shared_pool_c3(const char* artifact) {
     const auto tiny_d  = pad_tokens(tokens_d(), 64);
     const auto extra_f = pad_tokens({700, 701, 702, 703, 704, 705}, 200);
 
-    ninfer::GenerationHandle wave1_a = engine.submit(engine.prepare_tokens(small_a), greedy(8, false));
-    ninfer::GenerationHandle wave1_b = engine.submit(engine.prepare_tokens(small_b), greedy(8, false));
-    ninfer::GenerationHandle wave1_c = engine.submit(engine.prepare_tokens(small_c), greedy(8, false));
-    std::uint32_t max_prefilling     = 0;
+    ninfer::GenerationHandle wave1_a =
+        engine.submit(engine.prepare_tokens(small_a), greedy(8, false));
+    ninfer::GenerationHandle wave1_b =
+        engine.submit(engine.prepare_tokens(small_b), greedy(8, false));
+    ninfer::GenerationHandle wave1_c =
+        engine.submit(engine.prepare_tokens(small_c), greedy(8, false));
+    std::uint32_t max_prefilling = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
             [](const ninfer::RuntimeStats& stats) { return stats.running_requests == 3; },
@@ -1419,17 +1435,21 @@ int exercise_shared_pool_c3(const char* artifact) {
         first_c.reused_prompt_tokens != 0) {
         return fail("C=3 wave 1 reused a prefix");
     }
-    if (engine.runtime_stats().kv_ram_captures != 0 || engine.runtime_stats().kv_ram_restores != 0) {
+    if (engine.runtime_stats().kv_ram_captures != 0 ||
+        engine.runtime_stats().kv_ram_restores != 0) {
         return fail("C=3 wave 1 captured or restored while three 3-page chats still fit");
     }
     if (max_prefilling > 1) { return fail("C=3 wave 1 ran more than one prefill owner"); }
 
-    const std::vector<ninfer::TokenId> history_a = resume_prefix(small_a, first_a.generated_token_ids);
-    const std::vector<ninfer::TokenId> history_b = resume_prefix(small_b, first_b.generated_token_ids);
-    const std::vector<ninfer::TokenId> history_c = resume_prefix(small_c, first_c.generated_token_ids);
-    const auto continued_a                       = pad_tokens(history_a, 200);
-    const auto continued_b                       = pad_tokens(history_b, 200);
-    const auto continued_c                       = pad_tokens(history_c, 200);
+    const std::vector<ninfer::TokenId> history_a =
+        resume_prefix(small_a, first_a.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_b =
+        resume_prefix(small_b, first_b.generated_token_ids);
+    const std::vector<ninfer::TokenId> history_c =
+        resume_prefix(small_c, first_c.generated_token_ids);
+    const auto continued_a = pad_tokens(history_a, 200);
+    const auto continued_b = pad_tokens(history_b, 200);
+    const auto continued_c = pad_tokens(history_c, 200);
     if (history_a.size() >= continued_a.size() || history_b.size() >= continued_b.size() ||
         history_c.size() >= continued_c.size()) {
         return fail("C=3 continuation fixtures are not suffix prompts");
@@ -1483,10 +1503,10 @@ int exercise_shared_pool_c3(const char* artifact) {
     if (max_prefilling > 1) { return fail("C=3 wave 2 ran more than one prefill owner"); }
 
     const ninfer::GenerationResult restored = large_c.wait();
-    if (const int rc = expect_suffix_hit(restored, ninfer::PrefixReuseSource::HostRam,
-                                         static_cast<std::uint32_t>(history_c.size()),
-                                         static_cast<std::uint32_t>(continued_c.size()),
-                                         "C=3 RAM suffix");
+    if (const int rc =
+            expect_suffix_hit(restored, ninfer::PrefixReuseSource::HostRam,
+                              static_cast<std::uint32_t>(history_c.size()),
+                              static_cast<std::uint32_t>(continued_c.size()), "C=3 RAM suffix");
         rc != 0) {
         return rc;
     }
@@ -1499,17 +1519,17 @@ int exercise_shared_pool_c3(const char* artifact) {
     const ninfer::GenerationResult vram_a = large_a.wait();
     const ninfer::GenerationResult vram_b = large_b.wait();
     const ninfer::GenerationResult late_f = blocked_f.wait();
-    if (const int rc = expect_suffix_hit(vram_a, ninfer::PrefixReuseSource::VramResident,
-                                         static_cast<std::uint32_t>(history_a.size()),
-                                         static_cast<std::uint32_t>(continued_a.size()),
-                                         "C=3 VRAM suffix A");
+    if (const int rc =
+            expect_suffix_hit(vram_a, ninfer::PrefixReuseSource::VramResident,
+                              static_cast<std::uint32_t>(history_a.size()),
+                              static_cast<std::uint32_t>(continued_a.size()), "C=3 VRAM suffix A");
         rc != 0) {
         return rc;
     }
-    if (const int rc = expect_suffix_hit(vram_b, ninfer::PrefixReuseSource::VramResident,
-                                         static_cast<std::uint32_t>(history_b.size()),
-                                         static_cast<std::uint32_t>(continued_b.size()),
-                                         "C=3 VRAM suffix B");
+    if (const int rc =
+            expect_suffix_hit(vram_b, ninfer::PrefixReuseSource::VramResident,
+                              static_cast<std::uint32_t>(history_b.size()),
+                              static_cast<std::uint32_t>(continued_b.size()), "C=3 VRAM suffix B");
         rc != 0) {
         return rc;
     }
@@ -1519,8 +1539,8 @@ int exercise_shared_pool_c3(const char* artifact) {
     }
     if (restored.timings.first_token_seconds >= late_f.timings.first_token_seconds) {
         std::cerr << "C=3 blocked request first_token=" << late_f.timings.first_token_seconds
-                  << " preceded protected head first_token="
-                  << restored.timings.first_token_seconds << '\n';
+                  << " preceded protected head first_token=" << restored.timings.first_token_seconds
+                  << '\n';
         return 1;
     }
     if (tiny.timings.first_token_seconds >= restored.timings.first_token_seconds) {
@@ -1551,30 +1571,35 @@ int exercise_shared_pool_c3(const char* artifact) {
 int exercise_restore_allocation_fallback(const char* artifact, bool dflash = false,
                                          bool planning = false) {
     using Disk = ninfer::targets::qwen3_6::detail::KVDiskCache;
-    using Ram = ninfer::targets::qwen3_6::detail::KVRamCache;
+    using Ram  = ninfer::targets::qwen3_6::detail::KVRamCache;
     for (bool disk : {false, true}) {
         for (std::uint32_t concurrency : {1U, 2U, 3U, 4U}) {
             struct Directory {
                 std::filesystem::path path;
-                ~Directory() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+
+                ~Directory() {
+                    std::error_code ec;
+                    std::filesystem::remove_all(path, ec);
+                }
             } directory{std::filesystem::temp_directory_path() /
                         ("ninfer-ram-fallback-" + std::to_string(::getpid()) + "-" +
                          std::to_string(concurrency) + "-" + std::to_string(disk))};
-            auto options = ordinary_options(artifact, concurrency, 4096, 4ULL << 30);
+
+            auto options               = ordinary_options(artifact, concurrency, 4096, 4ULL << 30);
             options.pending_timeout_ms = 120000;
-            options.kv_cache = ninfer::KvCacheStorage::Nvfp4;
+            options.kv_cache           = ninfer::KvCacheStorage::Nvfp4;
             if (disk) {
                 options.kv_disk_capacity_bytes = 8ULL << 30;
-                options.kv_disk_location = directory.path;
+                options.kv_disk_location       = directory.path;
             }
             if (dflash) {
-                options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
-                options.speculative.draft_tokens = 4;
+                options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+                options.speculative.draft_tokens  = 4;
                 options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
             }
             ninfer::Engine engine(options);
-            const auto source = pad_tokens(tokens_a(), 128);
-            const auto seed = engine.generate(engine.prepare_tokens(source), greedy(8, false));
+            const auto source  = pad_tokens(tokens_a(), 128);
+            const auto seed    = engine.generate(engine.prepare_tokens(source), greedy(8, false));
             const auto history = resume_prefix(source, seed.generated_token_ids);
             for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
                 auto occupant = tokens_c();
@@ -1605,7 +1630,7 @@ int exercise_restore_allocation_fallback(const char* artifact, bool dflash = fal
             } else {
                 Ram::test_fail_next_restore_metadata_allocation();
             }
-            auto recovery_options = greedy(1, true);
+            auto recovery_options                                 = greedy(1, true);
             recovery_options.execution.capture_context_checkpoint = dflash;
             const auto restored = engine.generate(engine.prepare_tokens(history), recovery_options);
             if (Ram::test_restore_metadata_failure_pending() ||
@@ -1695,7 +1720,9 @@ int exercise_artifact(const char* artifact) {
     std::cerr << "ram_real: teardown after restore\n";
     if (const int rc = exercise_teardown_after_restore(artifact); rc != 0) { return rc; }
     if (const int rc = exercise_restore_allocation_fallback(artifact); rc != 0) { return rc; }
-    if (const int rc = exercise_restore_allocation_fallback(artifact, false, true); rc != 0) { return rc; }
+    if (const int rc = exercise_restore_allocation_fallback(artifact, false, true); rc != 0) {
+        return rc;
+    }
     std::cerr << "ram_real: MTP\n";
     if (const int rc = exercise_mtp(artifact); rc != 0) { return rc; }
     return 0;
@@ -1704,25 +1731,25 @@ int exercise_artifact(const char* artifact) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool mtp_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                          std::string(argv[2]) == "mtp";
-    const bool fallback_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                               std::string(argv[2]) == "fallback";
-    const bool planning_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                               std::string(argv[2]) == "planning";
+    const bool mtp_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "mtp";
+    const bool fallback_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "fallback";
+    const bool planning_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "planning";
     if (argc != 1 && !mtp_only && !fallback_only && !planning_only) {
         std::cerr << "usage: " << argv[0] << " [--case mtp|fallback|planning]\n";
         return 2;
     }
     const auto run = [mtp_only, fallback_only, planning_only](const char* artifact) {
-        return mtp_only ? exercise_mtp(artifact)
-             : planning_only ? exercise_restore_allocation_fallback(artifact, false, true)
-             : fallback_only ? exercise_restore_allocation_fallback(artifact)
-                             : exercise_artifact(artifact);
+        return mtp_only        ? exercise_mtp(artifact)
+               : planning_only ? exercise_restore_allocation_fallback(artifact, false, true)
+               : fallback_only ? exercise_restore_allocation_fallback(artifact)
+                               : exercise_artifact(artifact);
     };
     const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
     if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
         (dflash == nullptr || *dflash == '\0')) {
         std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
@@ -1738,9 +1765,15 @@ int main(int argc, char** argv) {
         if (const int result = run(nvfp4); result != 0) { return result; }
     }
     if (dflash != nullptr && *dflash != '\0' && !mtp_only) {
-        if (const int result = exercise_restore_allocation_fallback(dflash, true, planning_only); result != 0) { return result; }
+        if (const int result = exercise_restore_allocation_fallback(dflash, true, planning_only);
+            result != 0) {
+            return result;
+        }
         if (!planning_only && !fallback_only) {
-            if (const int result = exercise_restore_allocation_fallback(dflash, true, true); result != 0) { return result; }
+            if (const int result = exercise_restore_allocation_fallback(dflash, true, true);
+                result != 0) {
+                return result;
+            }
         }
     }
     std::cout << "ok\n";

@@ -50,16 +50,17 @@ std::string describe_graph_node(cudaGraphNode_t node) {
             const char* name = nullptr;
             (void)cudaFuncGetName(&name, params.func);
             out << " kernel=" << (name != nullptr ? name : "unknown")
-                << " grid=" << params.gridDim.x << ',' << params.gridDim.y << ',' << params.gridDim.z
-                << " block=" << params.blockDim.x << ',' << params.blockDim.y << ',' << params.blockDim.z
-                << " shared_bytes=" << params.sharedMemBytes;
+                << " grid=" << params.gridDim.x << ',' << params.gridDim.y << ','
+                << params.gridDim.z << " block=" << params.blockDim.x << ',' << params.blockDim.y
+                << ',' << params.blockDim.z << " shared_bytes=" << params.sharedMemBytes;
         }
     } else if (type == cudaGraphNodeTypeMemcpy) {
         cudaMemcpy3DParms params{};
         if (cudaGraphMemcpyNodeGetParams(node, &params) == cudaSuccess) {
             out << " memcpy_kind=" << static_cast<int>(params.kind)
-                << " extent=" << params.extent.width << ',' << params.extent.height << ',' << params.extent.depth
-                << " src_pitch=" << params.srcPtr.pitch << " dst_pitch=" << params.dstPtr.pitch;
+                << " extent=" << params.extent.width << ',' << params.extent.height << ','
+                << params.extent.depth << " src_pitch=" << params.srcPtr.pitch
+                << " dst_pitch=" << params.dstPtr.pitch;
         }
     } else if (type == cudaGraphNodeTypeMemset) {
         cudaMemsetParams params{};
@@ -159,8 +160,8 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
         throw std::runtime_error(
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
             " (update result " + std::to_string(static_cast<int>(result.result)) +
-            "); error_node={" + describe_graph_node(result.errorNode) +
-            "}; error_from_node={" + describe_graph_node(result.errorFromNode) + "}");
+            "); error_node={" + describe_graph_node(result.errorNode) + "}; error_from_node={" +
+            describe_graph_node(result.errorFromNode) + "}");
     }
 }
 

@@ -70,31 +70,31 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr bool supported        = true;
+    static constexpr bool supported           = true;
     static constexpr qwen3_6::DFlashKind kind = qwen3_6::DFlashKind::V1;
-    static constexpr int layers            = 6;
-    static constexpr int local_layers      = 5;
-    static constexpr int full_layers       = 1;
-    static constexpr int feature_layers    = 8;
-    static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
-    static constexpr int hidden            = TextConfig::hidden;
-    static constexpr int intermediate      = 6144;
-    static constexpr int query_heads       = 32;
-    static constexpr int kv_heads          = 8;
-    static constexpr int head_dim          = 128;
-    static constexpr int query_size        = query_heads * head_dim;
-    static constexpr int kv_size           = kv_heads * head_dim;
-    static constexpr int local_capacity    = 4096;
-    static constexpr int mask_token        = 248077;
-    static constexpr float rms_epsilon     = 1.0e-6F;
-    static constexpr float rope_theta      = 1.0e7F;
-    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr int layers               = 6;
+    static constexpr int local_layers         = 5;
+    static constexpr int full_layers          = 1;
+    static constexpr int feature_layers       = 8;
+    static constexpr int feature_rows         = feature_layers * TextConfig::hidden;
+    static constexpr int hidden               = TextConfig::hidden;
+    static constexpr int intermediate         = 6144;
+    static constexpr int query_heads          = 32;
+    static constexpr int kv_heads             = 8;
+    static constexpr int head_dim             = 128;
+    static constexpr int query_size           = query_heads * head_dim;
+    static constexpr int kv_size              = kv_heads * head_dim;
+    static constexpr int local_capacity       = 4096;
+    static constexpr int mask_token           = 248077;
+    static constexpr float rms_epsilon        = 1.0e-6F;
+    static constexpr float rope_theta         = 1.0e7F;
+    static constexpr float attention_scale    = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
-    static constexpr bool tree_verify  = false;
-    static constexpr int tree_frontier = 1;
-    static constexpr int verify_width  = 0;
-    static constexpr int unmask_refine = 0;
+    static constexpr bool tree_verify    = false;
+    static constexpr int tree_frontier   = 1;
+    static constexpr int verify_width    = 0;
+    static constexpr int unmask_refine   = 0;
     static constexpr int two_block_first = 0;
 };
 

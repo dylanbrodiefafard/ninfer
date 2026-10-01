@@ -35,27 +35,26 @@ int main() {
 
     const ninfer::cli::Options off =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--context-checkpoints", "off"});
-    failures += check(off.context_checkpoint_marks.has_value() &&
-                          off.context_checkpoint_marks->empty(),
-                      "--context-checkpoints off did not disable the ladder");
+    failures +=
+        check(off.context_checkpoint_marks.has_value() && off.context_checkpoint_marks->empty(),
+              "--context-checkpoints off did not disable the ladder");
 
-    const ninfer::cli::Options custom = parse(
-        {"ninfer", "model.ninfer", "--prompt", "hi", "--context-checkpoints", "8192,16384"});
-    failures += check(custom.context_checkpoint_marks ==
-                          std::optional<std::vector<std::uint32_t>>(
-                              std::vector<std::uint32_t>{8192u, 16384u}),
-                      "--context-checkpoints custom list was not parsed");
+    const ninfer::cli::Options custom =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--context-checkpoints", "8192,16384"});
+    failures +=
+        check(custom.context_checkpoint_marks == std::optional<std::vector<std::uint32_t>>(
+                                                     std::vector<std::uint32_t>{8192u, 16384u}),
+              "--context-checkpoints custom list was not parsed");
 
     failures += check(ninfer::cli::usage_text("ninfer").find("--capture-context-checkpoint") !=
                           std::string::npos,
                       "CLI help omits --capture-context-checkpoint");
-    failures += check(ninfer::cli::usage_text("ninfer").find("--no-p-less-sampling") !=
-                          std::string::npos,
-                      "CLI help omits --no-p-less-sampling");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer").find("--no-p-less-sampling") != std::string::npos,
+              "CLI help omits --no-p-less-sampling");
 
     const ninfer::cli::Options defaults = parse({"ninfer", "model.ninfer", "--prompt", "hi"});
-    failures += check(defaults.prefill_chunk == 4096,
-                      "CLI prefill chunk default is not 4096");
+    failures += check(defaults.prefill_chunk == 4096, "CLI prefill chunk default is not 4096");
     failures += check(defaults.sampling.p_less, "CLI did not enable p-less by default");
     const ninfer::cli::Options production = parse(
         {"ninfer", "model.ninfer", "--prompt", "hi", "--no-p-less-sampling", "--top-p", "0.5"});
@@ -71,11 +70,10 @@ int main() {
                       "--dflash-p-less-draft-temperature did not set SpeculativeOptions");
 
     const ninfer::cli::Options dflash_vision =
-        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "dflash",
-               "--draft-tokens", "3", "--vision"});
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "dflash", "--draft-tokens",
+               "3", "--vision"});
     failures += check(dflash_vision.enable_vision &&
-                          dflash_vision.speculative.backend ==
-                              ninfer::SpeculativeBackend::DFlash,
+                          dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash,
                       "CLI did not accept DFlash and Vision together");
 
     if (failures == 0) { std::cout << "ok\n"; }

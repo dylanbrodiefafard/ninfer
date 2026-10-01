@@ -159,16 +159,8 @@ def _sampling_config(frontend: Frontend, args: argparse.Namespace) -> SamplingCo
         if args.temperature is not None
         else float(getattr(generation, "temperature", 0.6))
     )
-    top_p = (
-        args.top_p
-        if args.top_p is not None
-        else float(getattr(generation, "top_p", 0.95))
-    )
-    top_k = (
-        args.top_k
-        if args.top_k is not None
-        else int(getattr(generation, "top_k", 20))
-    )
+    top_p = args.top_p if args.top_p is not None else float(getattr(generation, "top_p", 0.95))
+    top_k = args.top_k if args.top_k is not None else int(getattr(generation, "top_k", 20))
     return SamplingConfig(
         temperature=0.0 if args.greedy else temperature,
         top_p=top_p,
@@ -204,16 +196,12 @@ def _print_result(
         print("SAMPLING:", sampler.summary())
     if model is not None and model.mtp_draft_tokens:
         stats = model.mtp_stats
-        acceptance = (
-            stats.accepted_tokens / stats.draft_tokens
-            if stats.draft_tokens
-            else 0.0
-        )
+        acceptance = stats.accepted_tokens / stats.draft_tokens if stats.draft_tokens else 0.0
         print(
             f"MTP: k={model.mtp_draft_tokens} rounds={stats.rounds} "
             f"fallback_steps={stats.fallback_steps} drafts={stats.draft_tokens} "
             f"accepted={stats.accepted_tokens} acceptance={acceptance:.4f} "
-            f"accepted_per_pos={stats.accepted_per_pos[:model.mtp_draft_tokens]}"
+            f"accepted_per_pos={stats.accepted_per_pos[: model.mtp_draft_tokens]}"
         )
     decode_tokens = max(0, len(generated) - 1)
     decode_tps = decode_tokens / timings.decode if timings.decode > 0.0 else 0.0
@@ -292,17 +280,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     tap = FileTap(args.activation_dump, args.dump_level) if args.activation_dump else None
     compile_codec = args.decode >= COMPILED_CODEC_MIN_TOKENS
     load_started = time.perf_counter()
-    with RefModel(
-        args.weights,
-        device=args.device,
-        memory_bytes=memory_bytes,
-        headroom_bytes=headroom_bytes,
-        kv_dtype=args.kv_dtype,
-        prefill_chunk=args.prefill_chunk,
-        mtp_draft_tokens=args.mtp_draft_tokens,
-        draft_head=args.draft_head,
-        compile_codec=compile_codec,
-    ) as model, torch.inference_mode():
+    with (
+        RefModel(
+            args.weights,
+            device=args.device,
+            memory_bytes=memory_bytes,
+            headroom_bytes=headroom_bytes,
+            kv_dtype=args.kv_dtype,
+            prefill_chunk=args.prefill_chunk,
+            mtp_draft_tokens=args.mtp_draft_tokens,
+            draft_head=args.draft_head,
+            compile_codec=compile_codec,
+        ) as model,
+        torch.inference_mode(),
+    ):
         frontend = Frontend(model.binding)
         load_seconds = time.perf_counter() - load_started
 
@@ -337,9 +328,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         decode_seconds = 0.0
         if args.decode > 0:
             try:
-                sampler = Sampler(
-                    _sampling_config(frontend, args), CFG.token_domain, model.device
-                )
+                sampler = Sampler(_sampling_config(frontend, args), CFG.token_domain, model.device)
             except ValueError as exc:
                 parser.error(str(exc))
             prepare_started = time.perf_counter()

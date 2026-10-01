@@ -183,18 +183,18 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
-    failures += verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048,
-                                            parent.host, 0, activation, kHidden, tokens, criterion,
-                                            sample_count);
+    failures +=
+        verify_output_range_sampled("gdn query" + suffix, qkv, kQkvRows, 0, 2048, parent.host, 0,
+                                    activation, kHidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn key" + suffix, qkv, kQkvRows, 2048, 2048, parent.host,
                                     2048, activation, kHidden, tokens, criterion, sample_count);
     failures +=
         verify_output_range_sampled("gdn value" + suffix, qkv, kQkvRows, 4096, 6144, parent.host,
                                     4096, activation, kHidden, tokens, criterion, sample_count);
-    failures += verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host,
-                                            kQkvRows, activation, kHidden, tokens, criterion,
-                                            sample_count);
+    failures +=
+        verify_output_range_sampled("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
+                                    activation, kHidden, tokens, criterion, sample_count);
     if (workspace.peak_used() != capacity) {
         std::cerr << "gdn workspace" << suffix << ": query/execution high-water mismatch\n";
         ++failures;
@@ -205,10 +205,10 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 }
 
 int run_nvfp4_packed_column0(DevicePackedWeight& parent, std::int32_t tokens) {
-    constexpr std::int32_t kHidden  = 5120;
-    constexpr std::int32_t kQkvRows = 10240;
-    constexpr std::int32_t kZRows   = 6144;
-    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQkvRows     = 10240;
+    constexpr std::int32_t kZRows       = 6144;
+    constexpr std::int32_t kRows        = kQkvRows + kZRows;
     const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
     const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
     DeviceBuffer device_activation                   = to_device(activation_bits);
@@ -218,10 +218,10 @@ int run_nvfp4_packed_column0(DevicePackedWeight& parent, std::int32_t tokens) {
     GuardedBf16Tensor decode_z(kZRows, 1);
     Tensor packed_x(device_activation.p, DType::BF16, {kHidden, tokens});
     Tensor decode_x(device_activation.p, DType::BF16, {kHidden, 1});
-    Tensor pqkv = packed_qkv.tensor();
-    Tensor pz   = packed_z.tensor();
-    Tensor dqkv = decode_qkv.tensor();
-    Tensor dz   = decode_z.tensor();
+    Tensor pqkv                       = packed_qkv.tensor();
+    Tensor pz                         = packed_z.tensor();
+    Tensor dqkv                       = decode_qkv.tensor();
+    Tensor dz                         = decode_z.tensor();
     const std::size_t packed_capacity = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, tokens, tokens);
     const std::size_t decode_capacity = ops::gdn_input_proj_workspace_capacity_bytes(
@@ -233,9 +233,8 @@ int run_nvfp4_packed_column0(DevicePackedWeight& parent, std::int32_t tokens) {
     ops::gdn_input_proj(decode_x, parent.view(), dqkv, dz, ops::LinearPolicy::A16Only,
                         decode_workspace, nullptr);
     cuda_synchronize();
-    const std::string suffix =
-        std::string(" NVFP4 A4 packed-col0 T=") + std::to_string(tokens);
-    int failures = 0;
+    const std::string suffix = std::string(" NVFP4 A4 packed-col0 T=") + std::to_string(tokens);
+    int failures             = 0;
     failures += compare_column0("gdn qkv" + suffix, packed_qkv, decode_qkv, kQkvRows,
                                 kGdnInputProjA16Tolerance);
     failures +=
@@ -254,19 +253,18 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    for (const std::int32_t tokens :
-         {1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 24, 36, 255, 256, 257, 777, 1024, 1025, 1279, 2048, 4096}) {
+    for (const std::int32_t tokens : {1,  2,  3,   4,   5,   6,   8,    10,   12,   15,   18,
+                                      24, 36, 255, 256, 257, 777, 1024, 1025, 1279, 2048, 4096}) {
         failures += run_nvfp4_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
-    for (const std::int32_t tokens : {2}) {
-        failures += run_nvfp4_packed_column0(parent, tokens);
-    }
+    for (const std::int32_t tokens : {2}) { failures += run_nvfp4_packed_column0(parent, tokens); }
     return failures;
 }
 
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr int kA8SampleRows = 31;
+
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
                  bool convenience = false) {
     constexpr std::int32_t kHidden  = 5120;
@@ -329,7 +327,7 @@ int run_fp8() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 613U));
 
-    int failures          = 0;
+    int failures = 0;
     for (int columns : {5, 8, 16, 24, 32, 33, 64, 65, 96, 97, 128, 129}) {
         failures += run_fp8_case(parent, columns, ops::LinearPolicy::A16Only);
     }

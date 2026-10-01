@@ -118,7 +118,7 @@ public:
     // and no generation prompt. Assistants are rendered as a suffix after the
     // conversation's last user query.
     [[nodiscard]] RenderedFragment render_fragment(const std::vector<ChatMessage>& messages,
-                                              ChatRenderOptions options = {}) const;
+                                                   ChatRenderOptions options = {}) const;
 
 private:
     explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept

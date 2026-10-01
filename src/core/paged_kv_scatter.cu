@@ -10,9 +10,8 @@ namespace ninfer {
 namespace {
 
 __global__ void scatter_paged_kv_page(const unsigned char* packed,
-                                      const PagedKVScatterPlane* planes,
-                                      std::size_t plane_count, std::int32_t page_id,
-                                      std::size_t max_plane_bytes) {
+                                      const PagedKVScatterPlane* planes, std::size_t plane_count,
+                                      std::int32_t page_id, std::size_t max_plane_bytes) {
     const std::size_t plane_index = blockIdx.y;
     if (plane_index >= plane_count) { return; }
     // Every thread reads the same descriptor, so the load is a broadcast. A __shared__ copy is
@@ -59,29 +58,30 @@ PagedKVScatterPlan make_paged_kv_scatter_plan(const PagedKVPool& pool) {
             plane.rows         = static_cast<std::uint32_t>(tensor.ne[3]);
         }
         out.page_bytes += static_cast<std::size_t>(plane.packed_bytes);
-        out.max_plane_bytes = std::max(out.max_plane_bytes,
-                                       static_cast<std::size_t>(plane.packed_bytes));
+        out.max_plane_bytes =
+            std::max(out.max_plane_bytes, static_cast<std::size_t>(plane.packed_bytes));
         out.planes.push_back(plane);
     }
     return out;
 }
 
-void scatter_paged_kv_logical_page_from_device(
-    PagedKVAllocation& allocation, const PagedKVPool& pool, const void* device_staging,
-    const PagedKVScatterPlane* device_planes, std::size_t plane_count,
-    std::size_t max_plane_bytes, std::uint32_t logical_index, cudaStream_t stream) {
+void scatter_paged_kv_logical_page_from_device(PagedKVAllocation& allocation,
+                                               const PagedKVPool& pool, const void* device_staging,
+                                               const PagedKVScatterPlane* device_planes,
+                                               std::size_t plane_count, std::size_t max_plane_bytes,
+                                               std::uint32_t logical_index, cudaStream_t stream) {
     if (!allocation.valid() || !allocation.belongs_to(pool)) {
         throw std::invalid_argument("Paged KV scatter requires an allocation from the named pool");
     }
     if (logical_index >= allocation.mapped_page_count()) {
         throw std::logic_error("Paged KV scatter logical index exceeds mapped pages");
     }
-    if (device_staging == nullptr || device_planes == nullptr || plane_count != pool.plane_count() ||
-        max_plane_bytes == 0) {
+    if (device_staging == nullptr || device_planes == nullptr ||
+        plane_count != pool.plane_count() || max_plane_bytes == 0) {
         throw std::invalid_argument("Paged KV scatter staging or geometry is invalid");
     }
     constexpr unsigned threads = 256;
-    const unsigned blocks = static_cast<unsigned>((max_plane_bytes + threads - 1) / threads);
+    const unsigned blocks      = static_cast<unsigned>((max_plane_bytes + threads - 1) / threads);
     const dim3 grid(blocks, static_cast<unsigned>(plane_count));
     scatter_paged_kv_page<<<grid, threads, 0, stream>>>(
         static_cast<const unsigned char*>(device_staging), device_planes, plane_count,

@@ -54,9 +54,7 @@ def _canonical_scale_words(
 
     reciprocal = np.zeros(host_max.shape, dtype=np.float32)
     positive = scale > 0
-    reciprocal[positive] = (
-        1.0 / scale[positive].astype(np.float64)
-    ).astype(np.float32)
+    reciprocal[positive] = (1.0 / scale[positive].astype(np.float64)).astype(np.float32)
     return torch.from_numpy(scale), torch.from_numpy(reciprocal)
 
 
@@ -92,22 +90,18 @@ def quantize_matrix(
     target = pick_device() if device is None else pick_device(device)
     logical = weight.detach().to(device=target, dtype=torch.float32)
     if geometry.k_pad != geometry.k:
-        physical = torch.zeros(
-            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
-        )
+        physical = torch.zeros((geometry.n, geometry.k_pad), dtype=torch.float32, device=target)
         physical[:, : geometry.k].copy_(logical)
         logical = physical
 
-    grouped = logical.reshape(
-        geometry.n, geometry.groups_per_row, spec.group_size
-    )
+    grouped = logical.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
     max_abs = grouped.abs().amax(dim=2)
     host_scales, host_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
     scales = host_scales.to(target)
     reciprocal = host_reciprocal.to(target)
-    codes = torch.clamp(
-        torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
-    ).to(torch.int8)
+    codes = torch.clamp(torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax).to(
+        torch.int8
+    )
     return QuantizedMatrix(codes=codes, scales=scales)
 
 

@@ -63,9 +63,8 @@ int q4_a16_conformance() {
                           {34816, 5120, 113U, Comparison::Sampled, false, kN34816K5120});
 
     constexpr std::array kN131072K5120{
-        a16(1),  a16(2),  a16(3),  a16(4),  a16(5),  a16(6),  a16(7), a16(8),
-        a16(9),  a16(12), a16(16), a16(17), a16(20), a16(24), a16(25), a16(30), a16(32),
-        a16(33), a16(128),
+        a16(1),  a16(2),  a16(3),  a16(4),  a16(5),  a16(6),  a16(7),  a16(8),  a16(9),   a16(12),
+        a16(16), a16(17), a16(20), a16(24), a16(25), a16(30), a16(32), a16(33), a16(128),
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {131072, 5120, 127U, Comparison::Sampled, false, kN131072K5120});
@@ -105,16 +104,15 @@ int q4_a16_conformance() {
                           {5120, 25600, 167U, Comparison::Sampled, false, kN5120K25600});
 
     constexpr std::array kN3456K1152{
-        a16(4),   a16(20),  a16(36),  a16(40),   a16(44),     a16(128),
-        a16(320), a16(324), a16(328), a16(1024), a16(1536),   a16(131072),
+        a16(4),   a16(20),  a16(36),  a16(40),   a16(44),   a16(128),
+        a16(320), a16(324), a16(328), a16(1024), a16(1536), a16(131072),
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {3456, 1152, 137U, Comparison::Sampled, false, kN3456K1152});
 
     constexpr std::array kN4304K1152{
-        a16(4),  a16(8),   a16(12),  a16(16),  a16(20),  a16(24),   a16(28),
-        a16(32), a16(128), a16(320), a16(324), a16(328), a16(1024), a16(1536),
-        a16(131072),
+        a16(4),   a16(8),   a16(12),  a16(16),  a16(20),   a16(24),   a16(28),     a16(32),
+        a16(128), a16(320), a16(324), a16(328), a16(1024), a16(1536), a16(131072),
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {4304, 1152, 139U, Comparison::Sampled, false, kN4304K1152});

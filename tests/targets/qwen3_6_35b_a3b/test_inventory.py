@@ -31,10 +31,7 @@ def test_key_dense_moe_mtp_and_vision_signatures() -> None:
         9216,
         2048,
     )
-    assert (
-        tensors["text/layers/3/attention/query_key_gate_value"].format
-        == inventory.W8
-    )
+    assert tensors["text/layers/3/attention/query_key_gate_value"].format == inventory.W8
     assert tensors["text/layers/0/gdn/a_b_projection"] == inventory.TensorSpec(
         "text/layers/0/gdn/a_b_projection",
         (64, 2048),

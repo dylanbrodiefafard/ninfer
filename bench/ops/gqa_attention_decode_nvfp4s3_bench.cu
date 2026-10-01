@@ -43,14 +43,14 @@ using namespace ninfer::ops;
 using namespace ninfer::bench;
 
 namespace {
-using Geom = Gqa27Geometry;
-constexpr int kQHeads    = Geom::QHeads;         // 24
-constexpr int kKVHeads   = Geom::KVHeads;       // 4
-constexpr int kHeadDim   = kGqaNvfp4HeadDim;    // 256
-constexpr int kCodeW     = kGqaNvfp4CodeWidth;  // 128 bytes/key
-constexpr int kGroups    = kGqaNvfp4Groups;     // 16 e4m3 scales/key
-constexpr int kPageSize  = kPagedKVPageSize;    // 64
-constexpr float kScale   = 0.0625f;  // 1/sqrt(head_dim) = 1/16
+using Geom              = Gqa27Geometry;
+constexpr int kQHeads   = Geom::QHeads;       // 24
+constexpr int kKVHeads  = Geom::KVHeads;      // 4
+constexpr int kHeadDim  = kGqaNvfp4HeadDim;   // 256
+constexpr int kCodeW    = kGqaNvfp4CodeWidth; // 128 bytes/key
+constexpr int kGroups   = kGqaNvfp4Groups;    // 16 e4m3 scales/key
+constexpr int kPageSize = kPagedKVPageSize;   // 64
+constexpr float kScale  = 0.0625f;            // 1/sqrt(head_dim) = 1/16
 
 // Owns the U8 cache planes + the PagedKVLayerView that the launchers consume.
 struct Nvfp4s3Cache {
@@ -62,22 +62,24 @@ struct Nvfp4s3Cache {
 };
 
 Nvfp4s3Cache make_cache(int context) {
-    const int cap = ((context + 127) / 128) * 128;  // pad to whole 128-key (2-page) units
+    const int cap            = ((context + 127) / 128) * 128; // pad to whole 128-key (2-page) units
     const int logical_pages  = cap / kPageSize;
-    const int physical_pages = (cap + kPageSize - 1) / kPageSize;  // identity page map
-    const std::size_t code_bytes  = static_cast<std::size_t>(kCodeW) * kPageSize * kKVHeads * physical_pages;
-    const std::size_t scale_bytes = static_cast<std::size_t>(kGroups) * kPageSize * kKVHeads * physical_pages;
+    const int physical_pages = (cap + kPageSize - 1) / kPageSize; // identity page map
+    const std::size_t code_bytes =
+        static_cast<std::size_t>(kCodeW) * kPageSize * kKVHeads * physical_pages;
+    const std::size_t scale_bytes =
+        static_cast<std::size_t>(kGroups) * kPageSize * kKVHeads * physical_pages;
     const std::size_t table_bytes = static_cast<std::size_t>(logical_pages) * sizeof(std::int32_t);
 
     Nvfp4s3Cache cache;
     cache.logical_pages  = logical_pages;
     cache.physical_pages = physical_pages;
     cache.capacity       = cap;
-    cache.k_pages     = DeviceBuffer(code_bytes);
-    cache.v_pages = DeviceBuffer(code_bytes);
-    cache.k_scale = DeviceBuffer(scale_bytes);
-    cache.v_scale = DeviceBuffer(scale_bytes);
-    cache.block_table = DeviceBuffer(table_bytes);
+    cache.k_pages        = DeviceBuffer(code_bytes);
+    cache.v_pages        = DeviceBuffer(code_bytes);
+    cache.k_scale        = DeviceBuffer(scale_bytes);
+    cache.v_scale        = DeviceBuffer(scale_bytes);
+    cache.block_table    = DeviceBuffer(table_bytes);
     cache.k_pages.fill(0);
     cache.v_pages.fill(0);
     cache.k_scale.fill(0);
@@ -90,9 +92,8 @@ Nvfp4s3Cache make_cache(int context) {
     // Sage meansim proxy plane (the rank kernel's input): [4][64][kv_heads][pages].
     // A deterministic per-page gradient gives the rank a real scattered keep set
     // (the perf A/B only needs a valid keep fraction, not physically-true K sums).
-    const std::size_t kmean_elems =
-        4u * kPageSize * kKVHeads * physical_pages;
-    cache.k_mean = DeviceBuffer(kmean_elems * sizeof(float));
+    const std::size_t kmean_elems = 4u * kPageSize * kKVHeads * physical_pages;
+    cache.k_mean                  = DeviceBuffer(kmean_elems * sizeof(float));
     std::vector<float> h_kmean(kmean_elems);
     for (std::size_t p = 0; p < static_cast<std::size_t>(physical_pages); ++p) {
         const float v = static_cast<float>(p % 97);
@@ -103,17 +104,22 @@ Nvfp4s3Cache make_cache(int context) {
     cache.k_mean.copy_from_host(h_kmean.data(), kmean_elems * sizeof(float));
 
     cache.view = PagedKVLayerView{};
-    cache.view.k_pages       = Tensor(cache.k_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
-    cache.view.v_pages       = Tensor(cache.v_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
-    cache.view.k_scale_pages = Tensor(cache.k_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
-    cache.view.v_scale_pages = Tensor(cache.v_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
-    cache.view.block_table   = Tensor(cache.block_table.p, DType::I32, {logical_pages});
-    cache.view.k_mean_pages  = Tensor(cache.k_mean.p, DType::FP32, {4, kPageSize, kKVHeads, physical_pages});
-    cache.view.head_dim      = kHeadDim;
-    cache.view.num_kv_heads  = kKVHeads;
-    cache.view.dtype         = DType::U8;
-    cache.view.quant_group   = kGroups;
-    cache.view.sage_pv       = true;
+    cache.view.k_pages =
+        Tensor(cache.k_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
+    cache.view.v_pages =
+        Tensor(cache.v_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
+    cache.view.k_scale_pages =
+        Tensor(cache.k_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
+    cache.view.v_scale_pages =
+        Tensor(cache.v_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
+    cache.view.block_table = Tensor(cache.block_table.p, DType::I32, {logical_pages});
+    cache.view.k_mean_pages =
+        Tensor(cache.k_mean.p, DType::FP32, {4, kPageSize, kKVHeads, physical_pages});
+    cache.view.head_dim     = kHeadDim;
+    cache.view.num_kv_heads = kKVHeads;
+    cache.view.dtype        = DType::U8;
+    cache.view.quant_group  = kGroups;
+    cache.view.sage_pv      = true;
     return cache;
 }
 
@@ -127,19 +133,21 @@ int main(int argc, char** argv) {
     // (for NCU); default is the full sweep.
     const std::vector<int> contexts =
         (argc > 1) ? std::vector<int>{std::atoi(argv[1])}
-                   : std::vector<int>{128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-                                      65536, 98304, 153600};
+                   : std::vector<int>{128,  256,   512,   1024,  2048,  4096,
+                                      8192, 16384, 32768, 65536, 98304, 153600};
     const std::vector<int> tokens_list =
         (argc > 2) ? std::vector<int>{std::atoi(argv[2])} : std::vector<int>{1, 2, 4, 6};
     // keep_frac: the sparge-decode tile-skip fraction (1.0 = exact/no-skip, the default).
     // Only engages on the T=1 cached step; width > 1 (MTP verify) ignores it.
     const float keep_frac = (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 1.0f;
-    std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d keep_frac=%.2f)\n",
-                 kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, keep_frac);
+    std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d "
+                "keep_frac=%.2f)\n",
+                kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, keep_frac);
     print_device_caps("gqa-nvfp4s3-decode");
-    std::printf("%-8s %6s %12s %14s %12s %10s %10s\n", "context", "tokens", "fill(us)", "dec median(us)",
-                 "dec p95(us)", "dec GB/s", "dec TF/s");
-    std::printf("--------------------------------------------------------------------------------\n");
+    std::printf("%-8s %6s %12s %14s %12s %10s %10s\n", "context", "tokens", "fill(us)",
+                "dec median(us)", "dec p95(us)", "dec GB/s", "dec TF/s");
+    std::printf(
+        "--------------------------------------------------------------------------------\n");
 
     for (int context : contexts) {
         Nvfp4s3Cache cache = make_cache(context);
@@ -150,12 +158,13 @@ int main(int argc, char** argv) {
         std::vector<std::int32_t> h_pos(context);
         for (int i = 0; i < context; ++i) h_pos[i] = i;
         DeviceBuffer pos_fill(static_cast<std::size_t>(context) * sizeof(std::int32_t));
-        pos_fill.copy_from_host(h_pos.data(), static_cast<std::size_t>(context) * sizeof(std::int32_t));
+        pos_fill.copy_from_host(h_pos.data(),
+                                static_cast<std::size_t>(context) * sizeof(std::int32_t));
 
-        Tensor k_fill = Tensor(k_src.p, DType::BF16, {kHeadDim, kKVHeads, context});
-        Tensor v_fill = Tensor(v_src.p, DType::BF16, {kHeadDim, kKVHeads, context});
+        Tensor k_fill     = Tensor(k_src.p, DType::BF16, {kHeadDim, kKVHeads, context});
+        Tensor v_fill     = Tensor(v_src.p, DType::BF16, {kHeadDim, kKVHeads, context});
         Tensor pos_fill_t = Tensor(pos_fill.p, DType::I32, {context});
-        auto fill_launch = [&](cudaStream_t s) {
+        auto fill_launch  = [&](cudaStream_t s) {
             detail::gqa_kv_append_launch(k_fill, v_fill, pos_fill_t, cache.view, s);
         };
         const ColdTiming fill_timing = measure_launch(fill_launch, stream, 2, 8);
@@ -163,18 +172,20 @@ int main(int argc, char** argv) {
         for (int tokens : tokens_list) {
             // Query token(s) at the tail of the context (the decode attention window).
             DeviceBuffer q_src = make_bf16(static_cast<std::size_t>(tokens) * kQHeads * kHeadDim);
-            DeviceBuffer out_buf = DeviceBuffer(static_cast<std::size_t>(tokens) * kQHeads * kHeadDim * 2);
+            DeviceBuffer out_buf =
+                DeviceBuffer(static_cast<std::size_t>(tokens) * kQHeads * kHeadDim * 2);
             std::vector<std::int32_t> h_pos_q(tokens);
             for (int i = 0; i < tokens; ++i) h_pos_q[i] = (context - tokens) + i;
             DeviceBuffer pos_q(static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
-            pos_q.copy_from_host(h_pos_q.data(), static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
+            pos_q.copy_from_host(h_pos_q.data(),
+                                 static_cast<std::size_t>(tokens) * sizeof(std::int32_t));
 
-            Tensor q_t = Tensor(q_src.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+            Tensor q_t     = Tensor(q_src.p, DType::BF16, {kHeadDim, kQHeads, tokens});
             Tensor pos_q_t = Tensor(pos_q.p, DType::I32, {tokens});
-            Tensor out_t = Tensor(out_buf.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+            Tensor out_t   = Tensor(out_buf.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
             const GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
-                                                 static_cast<std::uint32_t>(context)};
+                                                static_cast<std::uint32_t>(context)};
             const std::size_t ws_bytes = gqa_attention_workspace_capacity_bytes(
                 kQHeads, DType::U8, envelope, 1, tokens, tokens, keep_frac);
             DeviceBuffer ws(std::max<std::size_t>(ws_bytes, 256));
@@ -188,18 +199,20 @@ int main(int argc, char** argv) {
 
             // GB/s moved by the decode kernel: read the K+V codes + scales for `context` keys
             // (per query token) and the tiny q/out traffic. (Informational; ncu is the real gate.)
-        // The tile-skip loads only the kept tiles' K/V (keep_frac of them); q/out are
-        // unaffected (the rank also streams the small k_mean plane, negligible here).
-        const double kv_frac = (keep_frac < 1.0f) ? static_cast<double>(keep_frac) : 1.0;
-        const double bytes_moved =
-            static_cast<double>(context) * tokens * (2 * (kCodeW + kGroups)) * kv_frac +
-            2 * static_cast<double>(tokens) * kQHeads * kHeadDim * 2.0;  // q in + out (bf16)
-        // Useful tensor-core FLOPs: QK^T + PV mma (2 mma x 2 FLOP/MAC x QHeads x tokens x context x hdim).
-        const double useful_flops = 4.0 * static_cast<double>(kQHeads) * tokens * context * kHeadDim;
-        const double tflops = useful_flops / (dec.median_us * 1e-6) / 1.0e12;
-        std::printf("%-8d %6d %12.1f %12.1f %14.1f %10.1f %10.1f\n",
-                     context, tokens, fill_timing.median_us,
-                     dec.median_us, dec.p95_us, bytes_moved / (dec.median_us * 1e-6) / 1e9, tflops);
+            // The tile-skip loads only the kept tiles' K/V (keep_frac of them); q/out are
+            // unaffected (the rank also streams the small k_mean plane, negligible here).
+            const double kv_frac = (keep_frac < 1.0f) ? static_cast<double>(keep_frac) : 1.0;
+            const double bytes_moved =
+                static_cast<double>(context) * tokens * (2 * (kCodeW + kGroups)) * kv_frac +
+                2 * static_cast<double>(tokens) * kQHeads * kHeadDim * 2.0; // q in + out (bf16)
+            // Useful tensor-core FLOPs: QK^T + PV mma (2 mma x 2 FLOP/MAC x QHeads x tokens x
+            // context x hdim).
+            const double useful_flops =
+                4.0 * static_cast<double>(kQHeads) * tokens * context * kHeadDim;
+            const double tflops = useful_flops / (dec.median_us * 1e-6) / 1.0e12;
+            std::printf("%-8d %6d %12.1f %12.1f %14.1f %10.1f %10.1f\n", context, tokens,
+                        fill_timing.median_us, dec.median_us, dec.p95_us,
+                        bytes_moved / (dec.median_us * 1e-6) / 1e9, tflops);
         }
     }
     return 0;

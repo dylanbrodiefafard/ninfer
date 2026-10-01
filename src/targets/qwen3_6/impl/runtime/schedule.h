@@ -140,11 +140,11 @@ struct TargetVerifyFrameView {
     Tensor fold_path;
     Tensor draft_selector_ids;
     Tensor draft_selector_q;
-    bool tree_verify = false;
+    bool tree_verify                       = false;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    qwen3_6::ToolMaskExchange* tool_masks  = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -216,7 +216,7 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  DecodeGraphDefinition& definition);
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          std::uint32_t verify_width, DFlashEnvelopes envelopes,
-                         ops::GqaExecutionEnvelope target_envelope,
-                         bool exact_sequence_envelopes, DecodeGraphExecutable* executable);
+                         ops::GqaExecutionEnvelope target_envelope, bool exact_sequence_envelopes,
+                         DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

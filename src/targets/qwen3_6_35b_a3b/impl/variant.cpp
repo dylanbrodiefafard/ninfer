@@ -117,9 +117,9 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
     std::vector<GraphExecutionProfile> profiles = dflash_base_profiles(capacity, draft_window);
     const std::uint32_t width = verify_width != 0 ? verify_width : draft_window + 1U;
     for (GraphExecutionProfile& profile : profiles) {
-        const std::uint32_t target_max = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(profile.max) + width));
-        const bool split_swa           = profile.max > 96U;
+        const std::uint32_t target_max = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(capacity, static_cast<std::uint64_t>(profile.max) + width));
+        const bool split_swa = profile.max > 96U;
         const bool chunked_target =
             dflash_target_uses_chunked_small_t(width, batch_size, target_max);
         profile.topology_class = (chunked_target ? 2U : 0U) | (split_swa ? 1U : 0U);
@@ -143,8 +143,8 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                       Tensor& gate, Tensor& key, Tensor& value,
-                                       WorkspaceArena&, cudaStream_t stream) {
+                                       Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena&,
+                                       cudaStream_t stream) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
@@ -245,9 +245,8 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
-                         const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream,
-                          std::int32_t) {
+                         const PostMixerWeights& weights, Tensor& residual, qwen3_6::TextPhase,
+                         WorkspaceArena& workspace, cudaStream_t stream, std::int32_t) {
     ops::rmsnorm(residual, norm_weight, norm_eps, true, hidden, stream);
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }

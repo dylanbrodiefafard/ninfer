@@ -69,7 +69,7 @@ __device__ __forceinline__ unsigned long long l2_evict_first_policy() {
 }
 
 __device__ __forceinline__ void cp_async_evict_first_16(void* smem_dst, const void* gmem_src,
-                                                       unsigned long long pol) {
+                                                        unsigned long long pol) {
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
                  :
                  : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(pol));

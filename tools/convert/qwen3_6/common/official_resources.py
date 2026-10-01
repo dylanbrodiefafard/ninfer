@@ -15,9 +15,7 @@ from .conversion import ResourcePayload, load_resources
 from .inventory import ResourceSpec
 
 OFFICIAL_RESOURCE_SHA256 = {
-    "frontend/tokenizer.json": (
-        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
-    ),
+    "frontend/tokenizer.json": ("5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"),
     "frontend/tokenizer_config.json": (
         "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b"
     ),
@@ -61,10 +59,7 @@ def validate_official_resource_hashes(
 def validate_official_resources(resources: Sequence[ResourcePayload]) -> None:
     """Hash and validate already loaded resource payloads."""
 
-    hashes = {
-        resource.name: hashlib.sha256(resource.data).hexdigest()
-        for resource in resources
-    }
+    hashes = {resource.name: hashlib.sha256(resource.data).hexdigest() for resource in resources}
     if len(hashes) != len(resources):
         raise ValueError("Qwen3.6 frontend resource set contains duplicate names")
     validate_official_resource_hashes(hashes)

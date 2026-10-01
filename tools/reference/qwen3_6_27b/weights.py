@@ -47,6 +47,7 @@ class MemoryPlan:
     def summary(self) -> str:
         def gib(value):
             return value / GIB
+
         return (
             f"free={gib(self.free_bytes):.2f}GiB "
             f"headroom={gib(self.headroom_bytes):.2f}GiB "
@@ -79,9 +80,7 @@ def estimate_fixed_bytes(
     if kv_dtype == "bf16":
         kv_per_layer_token = 2 * CFG.kv_heads * CFG.head_dim * 2
     elif kv_dtype == "int8":
-        kv_per_layer_token = 2 * CFG.kv_heads * (
-            CFG.head_dim + CFG.head_dim // 64 * 2
-        )
+        kv_per_layer_token = 2 * CFG.kv_heads * (CFG.head_dim + CFG.head_dim // 64 * 2)
     else:
         raise ValueError(f"unsupported KV dtype: {kv_dtype!r}")
     kv = capacity * kv_layers * kv_per_layer_token
@@ -260,9 +259,7 @@ class WeightStore:
         if cached is not None:
             return cached
         if self.device.type == "cpu":
-            host = torch.frombuffer(
-                bytearray(self.binding.payload(block)), dtype=torch.uint8
-            )
+            host = torch.frombuffer(bytearray(self.binding.payload(block)), dtype=torch.uint8)
             payload = host
         else:
             payload = self._stream_tensor(block)
@@ -277,13 +274,9 @@ class WeightStore:
         representation = self.representation(block)
         if block.layout == "contiguous-le-v1":
             source = (
-                self._upload(block)
-                if representation == "decoded"
-                else self._stream_tensor(block)
+                self._upload(block) if representation == "decoded" else self._stream_tensor(block)
             )
-            decoded = decode_direct(
-                source, block.format, block.shape, device=self.device
-            )
+            decoded = decode_direct(source, block.format, block.shape, device=self.device)
             # A streamed CPU direct tensor would otherwise retain the mmap
             # through torch.frombuffer after this call.  The decoded words are
             # the result, so give that result independent storage.
@@ -291,9 +284,7 @@ class WeightStore:
                 decoded = decoded.clone()
         else:
             source = (
-                self._upload(block)
-                if representation == "packed"
-                else self._stream_tensor(block)
+                self._upload(block) if representation == "packed" else self._stream_tensor(block)
             )
             decoded = dequantize_row_split(
                 source,
@@ -331,9 +322,7 @@ class WeightStore:
             if self.representation(block) == "packed"
             else self.binding.payload(block)
         )
-        planes = split_row_planes(
-            source, geometry, value.row_begin, value.row_count
-        )
+        planes = split_row_planes(source, geometry, value.row_begin, value.row_count)
         return dequantize_row_split(
             planes,
             block.format,
@@ -391,9 +380,7 @@ class WeightStore:
             absolute = tuple(row_begin + row for row in relative)
 
         if self.representation(block) == "decoded":
-            indices = torch.as_tensor(
-                absolute, dtype=torch.long, device=self.device
-            )
+            indices = torch.as_tensor(absolute, dtype=torch.long, device=self.device)
             return self._decode_block(block).index_select(0, indices)
         source = (
             self._upload(block)
@@ -427,9 +414,7 @@ class WeightStore:
                 yield (
                     local_begin,
                     local_end,
-                    decoded[
-                        row_begin + local_begin : row_begin + local_end
-                    ],
+                    decoded[row_begin + local_begin : row_begin + local_end],
                 )
             return
 
@@ -442,9 +427,7 @@ class WeightStore:
         for local_begin in range(0, row_count, rows):
             local_end = min(row_count, local_begin + rows)
             count = local_end - local_begin
-            planes = split_row_planes(
-                source, geometry, row_begin + local_begin, count
-            )
+            planes = split_row_planes(source, geometry, row_begin + local_begin, count)
             decoded = dequantize_row_split(
                 planes,
                 block.format,

@@ -55,13 +55,13 @@ struct Probe {
     std::uint64_t depth_hits[kMaxDrafts]{};
     std::uint64_t depth_top16[kMaxDrafts]{};
     std::uint64_t depth_top256[kMaxDrafts]{};
-    std::uint64_t rejects             = 0;
-    std::uint64_t reject_in_tree      = 0;
-    std::uint64_t reject_top16        = 0;
-    std::uint64_t reject_top64        = 0;
-    std::uint64_t reject_top256       = 0;
-    std::uint64_t reject_in_head      = 0;
-    std::uint64_t reject_absent_head  = 0;
+    std::uint64_t rejects            = 0;
+    std::uint64_t reject_in_tree     = 0;
+    std::uint64_t reject_top16       = 0;
+    std::uint64_t reject_top64       = 0;
+    std::uint64_t reject_top256      = 0;
+    std::uint64_t reject_in_head     = 0;
+    std::uint64_t reject_absent_head = 0;
     std::uint64_t reject_depth[kMaxDrafts]{};
     bool printed       = false;
     bool logged_health = false;
@@ -81,14 +81,13 @@ inline float bf16_f32(std::uint16_t bits) {
 
 inline void print_report(Probe& p) {
     if (p.printed || p.hops == 0) { return; }
-    p.printed          = true;
-    const auto pct     = [&](std::uint64_t n) {
+    p.printed      = true;
+    const auto pct = [&](std::uint64_t n) {
         return 100.0 * static_cast<double>(n) / static_cast<double>(p.hops);
     };
     const auto rpct = [&](std::uint64_t n) {
-        return p.rejects == 0
-                   ? 0.0
-                   : 100.0 * static_cast<double>(n) / static_cast<double>(p.rejects);
+        return p.rejects == 0 ? 0.0
+                              : 100.0 * static_cast<double>(n) / static_cast<double>(p.rejects);
     };
     std::fprintf(stderr,
                  "dflash_candidate_stats hops=%llu hit=%.1f%% in_tree=%.1f%% top16=%.1f%% "
@@ -131,9 +130,9 @@ inline int rank_in_column(const Probe& p, int token, int depth) {
     const float target =
         bf16_f32(p.logits[static_cast<std::size_t>(depth) * static_cast<std::size_t>(p.rows) +
                           static_cast<std::size_t>(row)]);
-    int better               = 0;
-    const std::uint16_t* col = p.logits.data() +
-                               static_cast<std::size_t>(depth) * static_cast<std::size_t>(p.rows);
+    int better = 0;
+    const std::uint16_t* col =
+        p.logits.data() + static_cast<std::size_t>(depth) * static_cast<std::size_t>(p.rows);
     for (int r = 0; r < p.rows; ++r) {
         const float v = bf16_f32(col[r]);
         if (v > target || (v == target && r < row)) { ++better; }
@@ -153,8 +152,8 @@ inline void capture_logits(const Tensor& logits, const Tensor* logit_token_ids, 
     if (logits.dtype != DType::BF16) { return; }
     Probe& p = probe();
     std::lock_guard<std::mutex> lock(p.mu);
-    p.rows   = logits.ne[0];
-    p.drafts = drafts;
+    p.rows              = logits.ne[0];
+    p.drafts            = drafts;
     const std::size_t n = static_cast<std::size_t>(p.rows) * static_cast<std::size_t>(drafts);
     p.logits.resize(n);
     CUDA_CHECK(cudaMemcpyAsync(p.logits.data(), logits.data, n * sizeof(std::uint16_t),
@@ -167,7 +166,7 @@ inline void capture_logits(const Tensor& logits, const Tensor* logit_token_ids, 
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (!p.logged_health) {
-        p.logged_health = true;
+        p.logged_health    = true;
         std::uint64_t nans = 0;
         std::uint64_t infs = 0;
         float mn           = std::numeric_limits<float>::infinity();
@@ -188,8 +187,7 @@ inline void capture_logits(const Tensor& logits, const Tensor* logit_token_ids, 
         std::fprintf(stderr,
                      "dflash_candidate_stats logits rows=%d drafts=%d n=%zu nan=%llu inf=%llu "
                      "finite_min=%.4g finite_max=%.4g\n",
-                     p.rows, p.drafts, p.logits.size(),
-                     static_cast<unsigned long long>(nans),
+                     p.rows, p.drafts, p.logits.size(), static_cast<unsigned long long>(nans),
                      static_cast<unsigned long long>(infs), mn, mx);
     }
     if (p.token_row.empty()) {
@@ -201,16 +199,15 @@ inline void capture_logits(const Tensor& logits, const Tensor* logit_token_ids, 
         } else {
             for (int r = 0; r < p.rows; ++r) {
                 const int tok = p.token_ids[static_cast<std::size_t>(r)];
-                if (tok >= 0 && tok < kVocabCap) {
-                    p.token_row[static_cast<std::size_t>(tok)] = r;
-                }
+                if (tok >= 0 && tok < kVocabCap) { p.token_row[static_cast<std::size_t>(tok)] = r; }
             }
         }
     }
 }
 
 inline void capture_activation(const char* name, const Tensor& tensor, cudaStream_t stream) {
-    if (!dflash_candidate_stats_enabled() || tensor.data == nullptr || tensor.dtype != DType::BF16) {
+    if (!dflash_candidate_stats_enabled() || tensor.data == nullptr ||
+        tensor.dtype != DType::BF16) {
         return;
     }
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
@@ -221,8 +218,8 @@ inline void capture_activation(const char* name, const Tensor& tensor, cudaStrea
     CUDA_CHECK(cudaMemcpyAsync(bits.data(), tensor.data, n * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::uint64_t nans = 0;
-    std::uint64_t infs = 0;
+    std::uint64_t nans  = 0;
+    std::uint64_t infs  = 0;
     std::uint64_t zeros = 0;
     float mn            = std::numeric_limits<float>::infinity();
     float mx            = -std::numeric_limits<float>::infinity();
@@ -251,8 +248,7 @@ inline void capture_activation(const char* name, const Tensor& tensor, cudaStrea
 }
 
 inline void record_round(const std::int32_t* verify_ids, const std::int32_t* parents,
-                         const std::int32_t* licensed, int licensed_count, int width,
-                         int drafts) {
+                         const std::int32_t* licensed, int licensed_count, int width, int drafts) {
     if (!dflash_candidate_stats_enabled() || licensed_count <= 0) { return; }
     Probe& p = probe();
     std::lock_guard<std::mutex> lock(p.mu);

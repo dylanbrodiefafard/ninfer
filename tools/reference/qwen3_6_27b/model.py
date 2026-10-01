@@ -162,9 +162,7 @@ class RefModel:
 
     def _positions(self, start: int, count: int) -> torch.Tensor:
         _, state = self._ready()
-        values = torch.arange(
-            start, start + count, device=self.device, dtype=torch.int32
-        )
+        values = torch.arange(start, start + count, device=self.device, dtype=torch.int32)
         if state.mrope:
             values = values + state.rope_delta
             return values.unsqueeze(0).expand(3, -1)
@@ -592,9 +590,7 @@ class RefModel:
                 update_mtp=False,
             )
             target_hiddens.append(hidden)
-            accept, correction = self._verify_choice(
-                logits, draft, outputs, sampler
-            )
+            accept, correction = self._verify_choice(logits, draft, outputs, sampler)
             if not accept:
                 outputs.append(correction)
                 rejected = True
@@ -682,9 +678,7 @@ class RefModel:
         tap,
     ) -> list[int]:
         output = [token]
-        while len(output) < max_new_tokens and not (
-            stop_token_ids and token in stop_token_ids
-        ):
+        while len(output) < max_new_tokens and not (stop_token_ids and token in stop_token_ids):
             remaining = max_new_tokens - len(output)
             _, state = self._ready()
             window = min(self.mtp_draft_tokens, remaining - 1)
@@ -715,9 +709,7 @@ class RefModel:
                     step=len(output) - 1,
                     tap=tap,
                 )
-                round_output = mtp_schedule.truncate_at_stop(
-                    round_output, stop_token_ids
-                )
+                round_output = mtp_schedule.truncate_at_stop(round_output, stop_token_ids)
             output.extend(round_output)
             token = round_output[-1]
         return output

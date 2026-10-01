@@ -113,9 +113,12 @@ def test_all_finite_signed_codes_against_independent_scalar_oracle():
     for scale in (1.0, 0.5):
         for word in words:
             exponent, fraction = (word >> 3) & 15, word & 7
-            magnitude = (fraction / 512.0 if exponent == 0 else
-                         math.ldexp(1.0 + fraction / 8.0, exponent - 7))
+            magnitude = (
+                fraction / 512.0
+                if exponent == 0
+                else math.ldexp(1.0 + fraction / 8.0, exponent - 7)
+            )
             value = math.copysign(magnitude, -1.0 if word & 128 else 1.0) * scale
-            expected.append(struct.pack('<f', value))
+            expected.append(struct.pack("<f", value))
     # Compare bits, not float equality: negative zero must remain negative zero.
-    assert values.numpy().tobytes() == b''.join(expected)
+    assert values.numpy().tobytes() == b"".join(expected)

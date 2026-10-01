@@ -99,10 +99,10 @@ std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) 
         output << "p-less temp=" << sampling.temperature << " seed=" << sampling.seed;
         return output.str();
     }
-    output << "temp=" << sampling.temperature
-           << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k
-           << " min_p=" << sampling.min_p << " presence=" << sampling.presence_penalty
-           << " freq=" << sampling.frequency_penalty << " seed=" << sampling.seed;
+    output << "temp=" << sampling.temperature << " top_p=" << sampling.top_p
+           << " top_k=" << sampling.top_k << " min_p=" << sampling.min_p
+           << " presence=" << sampling.presence_penalty << " freq=" << sampling.frequency_penalty
+           << " seed=" << sampling.seed;
     return output.str();
 }
 
@@ -245,10 +245,10 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     }
     print_stage("generate", "total", result.timings.total_seconds);
 
-    const std::size_t generated = result.generated_token_ids.size();
+    const std::size_t generated       = result.generated_token_ids.size();
     const std::size_t prefill_samples = 1 + result.recovery.prefill_samples;
-    const std::size_t decoded = generated > prefill_samples ? generated - prefill_samples : 0;
-    const double model_seconds  = result.timings.vision_seconds + result.timings.prefill_seconds +
+    const std::size_t decoded  = generated > prefill_samples ? generated - prefill_samples : 0;
+    const double model_seconds = result.timings.vision_seconds + result.timings.prefill_seconds +
                                  result.timings.decode_seconds + result.recovery.prefill_seconds;
     print_metric("sampling", format_sampling(sampling));
     print_metric("finish reason", format_finish(result.finish_reason));
@@ -285,13 +285,12 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                     ? "off"
                                     : format_kv_ram_size(memory.kv_ram_used_bytes) + " / " +
                                           std::to_string(memory.kv_ram_entry_count) + " entries");
-    print_metric("KV RAM events",
-                 "captures=" + std::to_string(stats.kv_ram_captures) +
-                     " restores=" + std::to_string(stats.kv_ram_restores) +
-                     " evicts=" + std::to_string(stats.kv_ram_evictions) +
-                     " drops=" + std::to_string(stats.kv_ram_drops) +
-                     " save=" + format_ms(result.kv_ram_save_seconds) +
-                     " load=" + format_ms(result.kv_ram_load_seconds));
+    print_metric("KV RAM events", "captures=" + std::to_string(stats.kv_ram_captures) +
+                                      " restores=" + std::to_string(stats.kv_ram_restores) +
+                                      " evicts=" + std::to_string(stats.kv_ram_evictions) +
+                                      " drops=" + std::to_string(stats.kv_ram_drops) +
+                                      " save=" + format_ms(result.kv_ram_save_seconds) +
+                                      " load=" + format_ms(result.kv_ram_load_seconds));
     print_metric("KV disk capacity", memory.kv_disk_capacity_bytes == 0
                                          ? "off"
                                          : format_kv_ram_size(memory.kv_disk_capacity_bytes));
@@ -299,14 +298,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                                      ? "off"
                                      : format_kv_ram_size(memory.kv_disk_used_bytes) + " / " +
                                            std::to_string(memory.kv_disk_entry_count) + " entries");
-    print_metric("KV disk events",
-                 "captures=" + std::to_string(stats.kv_disk_captures) +
-                     " restores=" + std::to_string(stats.kv_disk_restores) +
-                     " evicts=" + std::to_string(stats.kv_disk_evictions) +
-                     " drops=" + std::to_string(stats.kv_disk_drops) +
-                     " save=" + format_ms(result.kv_disk_save_seconds) +
-                     " load=" + format_ms(result.kv_disk_load_seconds) +
-                     " h2d=" + format_ms(result.kv_disk_h2d_seconds));
+    print_metric("KV disk events", "captures=" + std::to_string(stats.kv_disk_captures) +
+                                       " restores=" + std::to_string(stats.kv_disk_restores) +
+                                       " evicts=" + std::to_string(stats.kv_disk_evictions) +
+                                       " drops=" + std::to_string(stats.kv_disk_drops) +
+                                       " save=" + format_ms(result.kv_disk_save_seconds) +
+                                       " load=" + format_ms(result.kv_disk_load_seconds) +
+                                       " h2d=" + format_ms(result.kv_disk_h2d_seconds));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
@@ -373,35 +371,35 @@ int main(int argc, char** argv) {
         input.options.reasoning_effort = cli.reasoning_effort;
 
         ninfer::RequestOptions request;
-        request.execution.sampling                = cli.sampling;
-        request.execution.requested_output_tokens = cli.max_new;
+        request.execution.sampling                   = cli.sampling;
+        request.execution.requested_output_tokens    = cli.max_new;
         request.execution.capture_context_checkpoint = cli.capture_context_checkpoint;
-        request.stop.token_ids                    = cli.stop_token_ids;
-        request.stop.strings                      = cli.stop_strings;
-        request.output.raw                        = cli.raw_output;
+        request.stop.token_ids                       = cli.stop_token_ids;
+        request.stop.strings                         = cli.stop_strings;
+        request.output.raw                           = cli.raw_output;
 
         std::cerr << "phase       detail                      elapsed/progress\n";
         ninfer::product::LoadProgressRenderer load_progress(
             std::cerr, ninfer::product::stderr_load_progress_options());
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path  = cli.artifact_path;
-        engine_options.device         = cli.device;
-        engine_options.max_context    = cli.max_context;
-        engine_options.kv_capacity    = cli.kv_capacity;
-        engine_options.kv_ram_capacity_bytes = cli.kv_ram_capacity_bytes;
-        engine_options.kv_disk_capacity_bytes = cli.kv_disk_capacity_bytes;
-        engine_options.kv_disk_location = cli.kv_disk_location;
-        engine_options.kv_disk_compress = cli.kv_disk_compress;
+        engine_options.artifact_path            = cli.artifact_path;
+        engine_options.device                   = cli.device;
+        engine_options.max_context              = cli.max_context;
+        engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.kv_ram_capacity_bytes    = cli.kv_ram_capacity_bytes;
+        engine_options.kv_disk_capacity_bytes   = cli.kv_disk_capacity_bytes;
+        engine_options.kv_disk_location         = cli.kv_disk_location;
+        engine_options.kv_disk_compress         = cli.kv_disk_compress;
         engine_options.context_checkpoint_marks = cli.context_checkpoint_marks;
-        engine_options.prefill_chunk  = cli.prefill_chunk;
-        engine_options.kv_cache       = cli.kv_cache;
-        engine_options.sage_attn      = cli.sage_attn;
-        engine_options.keep_frac      = cli.keep_frac;
-        engine_options.xattn_tau      = cli.xattn_tau;
-        engine_options.speculative    = cli.speculative;
-        engine_options.enable_vision  = cli.enable_vision;
-        engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.load_progress  = load_progress.callback();
+        engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.sage_attn                = cli.sage_attn;
+        engine_options.keep_frac                = cli.keep_frac;
+        engine_options.xattn_tau                = cli.xattn_tau;
+        engine_options.speculative              = cli.speculative;
+        engine_options.enable_vision            = cli.enable_vision;
+        engine_options.use_cuda_graph           = cli.use_cuda_graph;
+        engine_options.load_progress            = load_progress.callback();
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
@@ -412,17 +410,18 @@ int main(int argc, char** argv) {
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(
-            std::move(prompt), std::move(request), ninfer::OutputDelivery::Streaming);
+        ninfer::GenerationHandle generation =
+            engine.submit(std::move(prompt), std::move(request), ninfer::OutputDelivery::Streaming);
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
         const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();
         if (!result.tool_calls.empty()) {
             auto calls = nlohmann::ordered_json::array();
             for (const auto& call : result.tool_calls) {
-                calls.push_back({{"id", call.id}, {"type", "function"},
-                                 {"function", {{"name", call.name},
-                                               {"arguments", call.arguments_json}}}});
+                calls.push_back(
+                    {{"id", call.id},
+                     {"type", "function"},
+                     {"function", {{"name", call.name}, {"arguments", call.arguments_json}}}});
             }
             std::cout << nlohmann::ordered_json{{"tool_calls", std::move(calls)}}.dump() << '\n';
         }
@@ -435,8 +434,7 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, sampling, engine.memory_summary(),
-                                 engine.runtime_stats());
+        print_generation_summary(result, sampling, engine.memory_summary(), engine.runtime_stats());
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

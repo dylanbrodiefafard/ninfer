@@ -28,17 +28,17 @@ void expect_near(float got, float want, float tol, std::string_view message) {
     expect(err <= tol, message);
 }
 
-void plant_r(q36::AdaptiveDraftState& state, std::uint32_t live_k,
-             std::initializer_list<float> rs, std::uint32_t n = 256) {
+void plant_r(q36::AdaptiveDraftState& state, std::uint32_t live_k, std::initializer_list<float> rs,
+             std::uint32_t n = 256) {
     q36::seed_adaptive_draft_state(state, live_k);
     state.observed    = n;
     state.rounds_at_k = 32;
     std::uint32_t i   = 0;
     for (float r : rs) {
         if (i >= 5) { break; }
-        const float nn   = static_cast<float>(n);
-        state.alpha[i]   = r * nn + 1.0f;
-        state.beta[i]    = (1.0f - r) * nn + 1.0f;
+        const float nn = static_cast<float>(n);
+        state.alpha[i] = r * nn + 1.0f;
+        state.beta[i]  = (1.0f - r) * nn + 1.0f;
         state.r_seen |= static_cast<std::uint8_t>(1U << i);
         ++i;
     }
@@ -88,7 +88,8 @@ void test_seed_is_captured_min() {
     const auto mt = q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true);
     expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 3,
            "seed fallback is captured.front()");
-    expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3, "MTP seed is also the smallest k");
+    expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3,
+           "MTP seed is also the smallest k");
     const std::uint32_t frozen[] = {7};
     expect(q36::adaptive_seed_k(frozen, SpeculativeBackend::DFlash) == 7, "frozen |K|=1 seeds N");
 }
@@ -106,8 +107,8 @@ void test_y_is_one_plus_product_of_r() {
     const float q0 = 0.80f;
     const float q1 = 0.80f * 0.625f;
     const float q2 = q1 * 0.60f;
-    expect_near(q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept), 1.0f + q0 + q1 + q2, 0.02f,
-                "Y(3) = 1 + r0 + r0 r1 + r0 r1 r2");
+    expect_near(q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept), 1.0f + q0 + q1 + q2,
+                0.02f, "Y(3) = 1 + r0 + r0 r1 + r0 r1 r2");
 }
 
 void test_unseen_r_counts_as_certain_accept() {
@@ -115,8 +116,8 @@ void test_unseen_r_counts_as_certain_accept() {
     plant_r(state, 3, {0.80f, 0.625f, 0.60f});
     const float y3 = q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept);
     const float q2 = 0.80f * 0.625f * 0.60f;
-    expect_near(q36::detail::expected_tokens(state, 5, q36::UnseenHop::Accept), y3 + 2.0f * q2, 0.02f,
-                "unseen r3,r4 extend the seen prefix product q2 at r=1");
+    expect_near(q36::detail::expected_tokens(state, 5, q36::UnseenHop::Accept), y3 + 2.0f * q2,
+                0.02f, "unseen r3,r4 extend the seen prefix product q2 at r=1");
 }
 
 void test_r_updates_only_when_prefix_reached() {
@@ -310,9 +311,7 @@ void test_stationary_late_hop_does_not_force_k5() {
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
     cfg.switch_seconds       = 0.0f;
-    for (int i = 0; i < 80; ++i) {
-        (void)q36::adaptive_draft_next(cfg, state, 3, 4, 5, 4);
-    }
+    for (int i = 0; i < 80; ++i) { (void)q36::adaptive_draft_next(cfg, state, 3, 4, 5, 4); }
     expect(state.live_k == 4, "stationary hop-3 failures do not inject k=5");
     expect((state.r_seen & 0x10U) == 0, "k=4 rounds never observe r4");
 }
@@ -356,10 +355,11 @@ void test_batch_sum_e_over_t() {
     const std::uint32_t rows[]           = {5, 5};
     const std::uint32_t picked =
         q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, q36::UnseenHop::Accept);
-    float best_s               = -1.0f;
-    std::uint32_t want         = 3;
+    float best_s       = -1.0f;
+    std::uint32_t want = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e  = q36::detail::expected_tokens(hot, k, q36::UnseenHop::Accept) + q36::detail::expected_tokens(cold, k, q36::UnseenHop::Accept);
+        const float e  = q36::detail::expected_tokens(hot, k, q36::UnseenHop::Accept) +
+                         q36::detail::expected_tokens(cold, k, q36::UnseenHop::Accept);
         const float tk = q36::adaptive_t_hat(t, k, 512);
         const float sc = e / tk;
         if (sc > best_s) {
@@ -382,8 +382,8 @@ void test_batch_row_budget_clips_expected_tokens() {
     const std::uint32_t rows[]           = {5, 3};
     const std::uint32_t picked =
         q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, q36::UnseenHop::Accept);
-    float best_s               = -1.0f;
-    std::uint32_t want         = 3;
+    float best_s       = -1.0f;
+    std::uint32_t want = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
         const float e = q36::detail::expected_tokens(hot, std::min(k, 5U), q36::UnseenHop::Accept) +
                         q36::detail::expected_tokens(hot, std::min(k, 3U), q36::UnseenHop::Accept);

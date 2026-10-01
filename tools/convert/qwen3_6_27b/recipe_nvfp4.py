@@ -15,9 +15,7 @@ from . import inventory_nvfp4 as inventory
 
 BASE_REPOSITORY = "Qwen/Qwen3.6-27B"
 BASE_REVISION = "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
-NVFP4_REPOSITORY = (
-    "rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm"
-)
+NVFP4_REPOSITORY = "rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm"
 NVFP4_REVISION = "9b5389d4a1e207daab2d47732efea57d7e946dcf"
 
 
@@ -86,10 +84,7 @@ def _q_part(source: Nvfp4Source, gate: bool) -> Nvfp4Part:
     begin = 256 if gate else 0
     return Nvfp4Part(
         source,
-        tuple(
-            RowRange(head * 512 + begin, head * 512 + begin + 256)
-            for head in range(24)
-        ),
+        tuple(RowRange(head * 512 + begin, head * 512 + begin + 256) for head in range(24)),
     )
 
 
@@ -124,12 +119,9 @@ def _build_recipes() -> tuple[
                 )
                 inputs.append(
                     InputDivisorRecipe(
-                        object_prefix
-                        + "attention/input_projection/input_scale_divisor",
+                        object_prefix + "attention/input_projection/input_scale_divisor",
                         group,
-                        (
-                            object_prefix + "attention/query_key_gate_value",
-                        ),
+                        (object_prefix + "attention/query_key_gate_value",),
                     )
                 )
             if layer in inventory.NVFP4_ATTENTION_OUTPUT_LAYERS:
@@ -143,16 +135,13 @@ def _build_recipes() -> tuple[
                 )
                 inputs.append(
                     InputDivisorRecipe(
-                        object_prefix
-                        + "attention/output_projection/input_scale_divisor",
+                        object_prefix + "attention/output_projection/input_scale_divisor",
                         (o,),
                         (object_prefix + "attention/output",),
                     )
                 )
         else:
-            qkv = _source(
-                source_prefix + "linear_attn.in_proj_qkv", 10240, 5120
-            )
+            qkv = _source(source_prefix + "linear_attn.in_proj_qkv", 10240, 5120)
             z = _source(source_prefix + "linear_attn.in_proj_z", 6144, 5120)
             out = _source(source_prefix + "linear_attn.out_proj", 5120, 6144)
             group = (qkv, z)
@@ -169,9 +158,7 @@ def _build_recipes() -> tuple[
                 InputDivisorRecipe(
                     object_prefix + "gdn/input_projection/input_scale_divisor",
                     group,
-                    (
-                        object_prefix + "gdn/query_key_value_z",
-                    ),
+                    (object_prefix + "gdn/query_key_value_z",),
                 )
             )
             if layer in inventory.NVFP4_GDN_OUTPUT_LAYERS:
@@ -245,11 +232,7 @@ def _build_bf16_comparisons() -> tuple[Bf16Comparison, ...]:
                     )
                 )
             if layer in inventory.BF16_ATTENTION_OUTPUT_LAYERS:
-                result.append(
-                    Bf16Comparison(
-                        _source(prefix + "self_attn.o_proj", 5120, 6144)
-                    )
-                )
+                result.append(Bf16Comparison(_source(prefix + "self_attn.o_proj", 5120, 6144)))
         else:
             result.extend(
                 Bf16Comparison(source)
@@ -259,31 +242,17 @@ def _build_bf16_comparisons() -> tuple[Bf16Comparison, ...]:
                 )
             )
             if layer in inventory.BF16_GDN_OUTPUT_LAYERS:
-                result.append(
-                    Bf16Comparison(
-                        _source(prefix + "linear_attn.out_proj", 5120, 6144)
-                    )
-                )
+                result.append(Bf16Comparison(_source(prefix + "linear_attn.out_proj", 5120, 6144)))
     return tuple(result)
 
 
-NVFP4_WEIGHT_RECIPES, INPUT_DIVISOR_RECIPES, WEIGHT_DIVISOR_GROUPS = (
-    _build_recipes()
-)
-NVFP4_WEIGHTS_BY_NAME = {
-    item.object_name: item for item in NVFP4_WEIGHT_RECIPES
-}
-INPUT_DIVISORS_BY_NAME = {
-    item.object_name: item for item in INPUT_DIVISOR_RECIPES
-}
+NVFP4_WEIGHT_RECIPES, INPUT_DIVISOR_RECIPES, WEIGHT_DIVISOR_GROUPS = _build_recipes()
+NVFP4_WEIGHTS_BY_NAME = {item.object_name: item for item in NVFP4_WEIGHT_RECIPES}
+INPUT_DIVISORS_BY_NAME = {item.object_name: item for item in INPUT_DIVISOR_RECIPES}
 BF16_COMPARISONS = _build_bf16_comparisons()
 
 NVFP4_SOURCES = tuple(
-    dict.fromkeys(
-        part.source
-        for recipe in NVFP4_WEIGHT_RECIPES
-        for part in recipe.parts
-    )
+    dict.fromkeys(part.source for recipe in NVFP4_WEIGHT_RECIPES for part in recipe.parts)
 )
 
 
@@ -296,9 +265,7 @@ def validate_recipe() -> None:
         len(BF16_COMPARISONS),
     ) != (247, 247, 122, 379, 117):
         raise ValueError("NVFP4 source recipe is incomplete")
-    if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(
-        spec.name for spec in inventory.NVFP4_TENSOR_SPECS
-    ):
+    if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(spec.name for spec in inventory.NVFP4_TENSOR_SPECS):
         raise ValueError("NVFP4 weight recipe order does not match inventory")
     if tuple(INPUT_DIVISORS_BY_NAME) != tuple(
         spec.name for spec in inventory.INPUT_SCALE_DIVISOR_SPECS
@@ -310,9 +277,7 @@ def validate_recipe() -> None:
             raise ValueError(f"{recipe.object_name}: invalid fused row geometry")
         if any(part.source.shape[1] != recipe.shape[1] for part in recipe.parts):
             raise ValueError(f"{recipe.object_name}: incompatible source K")
-    bound_weights = tuple(
-        name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names
-    )
+    bound_weights = tuple(name for site in INPUT_DIVISOR_RECIPES for name in site.weight_names)
     if (
         len(bound_weights) != 247
         or len(set(bound_weights)) != 247
@@ -374,8 +339,7 @@ def preflight_metadata(reader: ShardReader) -> dict[str, int]:
         actual = metadata[name]
         if actual.shape != shape or actual.dtype != dtype:
             raise ValueError(
-                f"{name}: source signature {(actual.shape, actual.dtype)} "
-                f"!= {(shape, dtype)}"
+                f"{name}: source signature {(actual.shape, actual.dtype)} != {(shape, dtype)}"
             )
         dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
     return dtype_counts
@@ -397,14 +361,9 @@ def _same_divisor(
     suffix: str,
 ) -> int:
     items = tuple(sources)
-    words = tuple(
-        _word(reader.get(source.field(suffix)), source.field(suffix))
-        for source in items
-    )
+    words = tuple(_word(reader.get(source.field(suffix)), source.field(suffix)) for source in items)
     if len(set(words)) != 1:
-        raise ValueError(
-            f"{items[0].name}: fused {suffix} words do not match"
-        )
+        raise ValueError(f"{items[0].name}: fused {suffix} words do not match")
     return words[0]
 
 
@@ -413,9 +372,7 @@ def validate_nvfp4_words(reader: ShardReader) -> None:
         scales = reader.get(source.field("weight_scale")).view(torch.uint8)
         invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
         if bool(invalid.any()):
-            raise ValueError(
-                f"{source.field('weight_scale')}: invalid E4M3FN scale word"
-            )
+            raise ValueError(f"{source.field('weight_scale')}: invalid E4M3FN scale word")
         _word(
             reader.get(source.field("weight_global_scale")),
             source.field("weight_global_scale"),
@@ -450,10 +407,7 @@ def compare_bf16_sources(
 
 
 def _select_rows(tensor: torch.Tensor, part: Nvfp4Part) -> torch.Tensor:
-    pieces = [
-        tensor.narrow(0, row_range.begin, row_range.rows)
-        for row_range in part.rows
-    ]
+    pieces = [tensor.narrow(0, row_range.begin, row_range.rows) for row_range in part.rows]
     if len(pieces) == 1:
         return pieces[0]
     return torch.cat(pieces, dim=0)
@@ -466,9 +420,7 @@ def materialize_nvfp4_weight(
     packed_parts: list[torch.Tensor] = []
     scale_parts: list[torch.Tensor] = []
     for part in recipe.parts:
-        packed_parts.append(
-            _select_rows(reader.get(part.source.field("weight_packed")), part)
-        )
+        packed_parts.append(_select_rows(reader.get(part.source.field("weight_packed")), part))
         scale_parts.append(
             _select_rows(
                 reader.get(part.source.field("weight_scale")).view(torch.uint8),
@@ -476,18 +428,10 @@ def materialize_nvfp4_weight(
             )
         )
     packed = (
-        packed_parts[0].contiguous()
-        if len(packed_parts) == 1
-        else torch.cat(packed_parts, dim=0)
+        packed_parts[0].contiguous() if len(packed_parts) == 1 else torch.cat(packed_parts, dim=0)
     )
-    scales = (
-        scale_parts[0].contiguous()
-        if len(scale_parts) == 1
-        else torch.cat(scale_parts, dim=0)
-    )
-    word = _same_divisor(
-        reader, recipe.divisor_sources, "weight_global_scale"
-    )
+    scales = scale_parts[0].contiguous() if len(scale_parts) == 1 else torch.cat(scale_parts, dim=0)
+    word = _same_divisor(reader, recipe.divisor_sources, "weight_global_scale")
     return packed, scales, struct.pack("<I", word)
 
 
@@ -496,9 +440,7 @@ def materialize_input_divisor(
     reader: ShardReader,
 ) -> torch.Tensor:
     word = _same_divisor(reader, recipe.sources, "input_global_scale")
-    return torch.frombuffer(
-        bytearray(struct.pack("<I", word)), dtype=torch.float32
-    ).reshape(())
+    return torch.frombuffer(bytearray(struct.pack("<I", word)), dtype=torch.float32).reshape(())
 
 
 validate_recipe()

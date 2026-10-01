@@ -83,7 +83,7 @@ public:
     // independently from GPU execution.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
-           OutputDelivery delivery = OutputDelivery::TerminalOnly,
+           OutputDelivery delivery                                = OutputDelivery::TerminalOnly,
            std::chrono::steady_clock::time_point pending_deadline = {},
            HostInputLease host_input                              = {});
 

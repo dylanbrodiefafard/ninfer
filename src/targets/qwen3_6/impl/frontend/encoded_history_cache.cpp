@@ -16,11 +16,11 @@ bool asan_build() noexcept {
 #if defined(__SANITIZE_ADDRESS__)
     return true;
 #elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
+#    if __has_feature(address_sanitizer)
     return true;
-#else
+#    else
     return false;
-#endif
+#    endif
 #else
     return false;
 #endif
@@ -61,7 +61,8 @@ std::vector<ByteSpan> spans_before(std::span<const ByteSpan> spans, std::size_t 
 
 bool ids_end_with(std::span<const int> ids, std::span<const int> tail) noexcept {
     if (tail.size() > ids.size()) { return false; }
-    return std::equal(tail.begin(), tail.end(), ids.end() - static_cast<std::ptrdiff_t>(tail.size()));
+    return std::equal(tail.begin(), tail.end(),
+                      ids.end() - static_cast<std::ptrdiff_t>(tail.size()));
 }
 
 bool try_committed_ids_from_full(const Tokenizer& tokenizer, std::string_view committed,
@@ -75,18 +76,17 @@ bool try_committed_ids_from_full(const Tokenizer& tokenizer, std::string_view co
     if (!tokenizer.is_encode_loop_pos(full, n, {}, full_spans)) { return false; }
 
     if (hit && hit->bytes.size() <= n && bytes_equal_prefix(hit->bytes, committed)) {
-        std::vector<int> extra =
-            tokenizer.encode(committed.substr(hit->bytes.size()), {},
-                             spans_after(committed_spans, hit->bytes.size()));
+        std::vector<int> extra = tokenizer.encode(committed.substr(hit->bytes.size()), {},
+                                                  spans_after(committed_spans, hit->bytes.size()));
         out.clear();
         out.reserve(hit->ids.size() + extra.size());
         out.insert(out.end(), hit->ids.begin(), hit->ids.end());
         out.insert(out.end(), extra.begin(), extra.end());
     } else {
-        const std::vector<int> tail = tokenizer.encode(full.substr(n), {}, spans_after(full_spans, n));
+        const std::vector<int> tail =
+            tokenizer.encode(full.substr(n), {}, spans_after(full_spans, n));
         if (!ids_end_with(full_ids, tail)) { return false; }
-        out.assign(full_ids.begin(),
-                   full_ids.end() - static_cast<std::ptrdiff_t>(tail.size()));
+        out.assign(full_ids.begin(), full_ids.end() - static_cast<std::ptrdiff_t>(tail.size()));
     }
     if (out.empty() || out.size() > kHostEncodeCacheMaxIds) { return false; }
     return true;
@@ -114,7 +114,7 @@ EncodedHistoryCache::copy_longest_prefix(std::string_view full, const Tokenizer&
     std::size_t best_index = entries_.size();
     std::size_t best_n     = 0;
     for (std::size_t i = 0; i < entries_.size(); ++i) {
-        const Entry& entry = entries_[i];
+        const Entry& entry  = entries_[i];
         const std::size_t n = entry.bytes.size();
         if (n == 0 || n > full.size() || n <= best_n) { continue; }
         if (std::memcmp(entry.bytes.data(), full.data(), n) != 0) { continue; }
@@ -250,9 +250,7 @@ EncodedChat encode_chat_with_cache(const Tokenizer& tokenizer,
     const RenderedChat full =
         options.add_generation_prompt ? chat_template.render(messages, options) : committed;
 
-    if (!full.text.starts_with(committed.text)) {
-        return encode_rendered_chat(tokenizer, full);
-    }
+    if (!full.text.starts_with(committed.text)) { return encode_rendered_chat(tokenizer, full); }
 
     std::optional<std::size_t> checkpoint_offset;
     if (full.rewrite_checkpoint) { checkpoint_offset = full.rewrite_checkpoint->offset; }
@@ -263,13 +261,16 @@ EncodedChat encode_chat_with_cache(const Tokenizer& tokenizer,
     if (hit) {
         last_host_encode_observation.attempted_prefix = true;
         last_host_encode_observation.prefix_bytes     = hit->bytes.size();
-        if (auto spliced = try_splice_encoded_chat(tokenizer, hit->ids, full.text, hit->bytes.size(),
-                                                   full.rewrite_checkpoint, full.literal_spans)) {
-            encoded                              = std::move(*spliced);
+        if (auto spliced =
+                try_splice_encoded_chat(tokenizer, hit->ids, full.text, hit->bytes.size(),
+                                        full.rewrite_checkpoint, full.literal_spans)) {
+            encoded                                = std::move(*spliced);
             last_host_encode_observation.cache_hit = true;
         }
     }
-    if (!last_host_encode_observation.cache_hit) { encoded = encode_rendered_chat(tokenizer, full); }
+    if (!last_host_encode_observation.cache_hit) {
+        encoded = encode_rendered_chat(tokenizer, full);
+    }
 
     if (last_host_encode_observation.cache_hit && host_encode_verify_enabled()) {
         const EncodedChat cold = encode_rendered_chat(tokenizer, full);

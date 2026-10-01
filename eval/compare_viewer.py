@@ -287,7 +287,11 @@ def job_status(run_dir: Path, job_id: str) -> dict[str, Any]:
     status = "unknown"
     if state_path.exists():
         state = load_json(state_path)
-        status = str(((state.get("jobs") or {}).get(job_id) or {}).get("status") or state.get("status") or "unknown")
+        status = str(
+            ((state.get("jobs") or {}).get(job_id) or {}).get("status")
+            or state.get("status")
+            or "unknown"
+        )
     progress_path = run_dir / "backends" / job_id / "progress.json"
     processed = None
     planned = None
@@ -402,10 +406,7 @@ def side_payload(run_dir: Path, job_id: str, cache: JsonlCache) -> dict[str, Any
     info["items"] = items
     info["n"] = sum(len(item["samples"]) for item in items)
     scored = [
-        sample
-        for item in items
-        for sample in item["samples"]
-        if sample.get("acc") is not None
+        sample for item in items for sample in item["samples"] if sample.get("acc") is not None
     ]
     info["correct"] = sum(1 for sample in scored if sample["acc"])
     info["scored"] = len(scored)
@@ -442,7 +443,9 @@ def read_full_record(record: dict[str, Any]) -> dict[str, Any] | None:
     return parsed
 
 
-def full_sample(run_dir: Path, job_id: str, index: str, sample: int, cache: JsonlCache) -> dict[str, Any] | None:
+def full_sample(
+    run_dir: Path, job_id: str, index: str, sample: int, cache: JsonlCache
+) -> dict[str, Any] | None:
     grouped = merge_job_records(run_dir / "backends" / job_id, cache)
     records = grouped.get(str(index)) or grouped.get(index)
     if not records or sample < 0 or sample >= len(records):
@@ -480,11 +483,11 @@ class ViewerApp:
         pless_dir = resolve_run(self.runs_dir, pless_id) if pless_id else None
         job_ids = list(JOB_TEMP)
         if prod_dir and (prod_dir / "state.json").exists():
-            for job_id in (load_json(prod_dir / "state.json").get("jobs") or {}):
+            for job_id in load_json(prod_dir / "state.json").get("jobs") or {}:
                 if job_id not in job_ids:
                     job_ids.append(job_id)
         if pless_dir and (pless_dir / "state.json").exists():
-            for job_id in (load_json(pless_dir / "state.json").get("jobs") or {}):
+            for job_id in load_json(pless_dir / "state.json").get("jobs") or {}:
                 if job_id not in job_ids:
                     job_ids.append(job_id)
         for job_id in job_ids:
@@ -494,8 +497,12 @@ class ViewerApp:
                     "id": job_id,
                     "dataset": dataset,
                     "temperature": temp,
-                    "production": side_payload(prod_dir, job_id, self.cache) if prod_dir else {"items": []},
-                    "p_less": side_payload(pless_dir, job_id, self.cache) if pless_dir else {"items": []},
+                    "production": side_payload(prod_dir, job_id, self.cache)
+                    if prod_dir
+                    else {"items": []},
+                    "p_less": side_payload(pless_dir, job_id, self.cache)
+                    if pless_dir
+                    else {"items": []},
                 }
             )
         return {
@@ -510,7 +517,9 @@ def send_json(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) 
     try:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
     except (TypeError, ValueError, UnicodeEncodeError):
-        body = json.dumps({"error": "failed to encode transcript"}, ensure_ascii=True).encode("utf-8")
+        body = json.dumps({"error": "failed to encode transcript"}, ensure_ascii=True).encode(
+            "utf-8"
+        )
         status = 500
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
@@ -521,7 +530,9 @@ def send_json(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) 
     handler.wfile.write(body)
 
 
-def send_bytes(handler: BaseHTTPRequestHandler, body: bytes, content_type: str, status: int = 200) -> None:
+def send_bytes(
+    handler: BaseHTTPRequestHandler, body: bytes, content_type: str, status: int = 200
+) -> None:
     handler.send_response(status)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(body)))
@@ -610,7 +621,10 @@ def main() -> int:
     server = ViewerServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"AIME compare viewer: {url}", flush=True)
-    print("Reads eval/runs JSONL live. Refresh the page or click Refresh after new items finish.", flush=True)
+    print(
+        "Reads eval/runs JSONL live. Refresh the page or click Refresh after new items finish.",
+        flush=True,
+    )
     if args.open:
         webbrowser.open(url)
     try:

@@ -36,9 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--config", required=True)
     validate.add_argument("--suite")
 
-    plan = sub.add_parser(
-        "plan", help="show work, prerequisites, and expected sample counts"
-    )
+    plan = sub.add_parser("plan", help="show work, prerequisites, and expected sample counts")
     plan.add_argument("--config", required=True)
     plan.add_argument("--suite", required=True)
     plan.add_argument(

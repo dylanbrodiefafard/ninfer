@@ -25,7 +25,7 @@ int main() {
         auto head = bench::make_row_split_weight(QType::W8G32_F16S, 248320, 5120, 5120);
         WorkspaceArena ws_sw(std::max<std::size_t>(
             ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, 34816, 5120,
-                                                       ops::LinearPolicy::AllowA4, kT, kT),
+                                                        ops::LinearPolicy::AllowA4, kT, kT),
             256));
         WorkspaceArena ws_dn(std::max<std::size_t>(
             ops::linear_workspace_capacity_bytes(QType::NVFP4, 5120, 17408,
@@ -42,9 +42,7 @@ int main() {
         for (int i = 0; i < 2; ++i) pair();
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (int i = 0; i < 2; ++i) pair();
-        for (int i = 0; i < 2; ++i) {
-            ops::linear(x, head.weight, h, stream);
-        }
+        for (int i = 0; i < 2; ++i) { ops::linear(x, head.weight, h, stream); }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::printf("OK ncu pair+lmhead T=4\n");
         CUDA_CHECK(cudaStreamDestroy(stream));

@@ -161,8 +161,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
     require_vector(accepted, DType::I32, batch, op, "accepted");
     if ((selector_ids == nullptr) != (selector_q == nullptr)) {
-        throw std::invalid_argument(
-            "speculative_accept_greedy_drafts: selector_ids and selector_q must both be null or both set");
+        throw std::invalid_argument("speculative_accept_greedy_drafts: selector_ids and selector_q "
+                                    "must both be null or both set");
     }
     if (selector_ids != nullptr) { require_selector_q(*selector_ids, *selector_q, k, batch, op); }
     if (configs == nullptr) {
@@ -215,10 +215,9 @@ void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& l
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
         throw std::invalid_argument("speculative_accept_tree_drafts: token_domain out of range");
     }
-    auto scratch_scope = workspace.scope();
-    const std::size_t bytes =
-        speculative_accept_tree_drafts_workspace_capacity_bytes(token_domain, width, width, batch,
-                                                                batch);
+    auto scratch_scope      = workspace.scope();
+    const std::size_t bytes = speculative_accept_tree_drafts_workspace_capacity_bytes(
+        token_domain, width, width, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_tree_drafts_launch(
         target_tokens, logits, verify_ids, parent_index, valid_columns, current_extents, lengths,

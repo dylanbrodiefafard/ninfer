@@ -16,15 +16,15 @@
 
 namespace {
 
-using Tokens = std::vector<ninfer::TokenId>;
+using Tokens                    = std::vector<ninfer::TokenId>;
 constexpr std::size_t kRamBytes = 2ULL << 30;
 
 ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
-    options.execution.sampling.temperature = 0.0F;
-    options.execution.allow_prefix_reuse = reuse;
-    options.stop.include_model_defaults = false;
+    options.execution.sampling.temperature    = 0.0F;
+    options.execution.allow_prefix_reuse      = reuse;
+    options.stop.include_model_defaults       = false;
     return options;
 }
 
@@ -42,7 +42,8 @@ Tokens history(Tokens input, const ninfer::GenerationResult& result) {
     return input;
 }
 
-void equal_slice(const Tokens& actual, const Tokens& reference, std::size_t offset, const char* stage) {
+void equal_slice(const Tokens& actual, const Tokens& reference, std::size_t offset,
+                 const char* stage) {
     if (offset + actual.size() > reference.size() ||
         !std::equal(actual.begin(), actual.end(), reference.begin() + offset)) {
         std::cerr << stage << " offset=" << offset << " actual=";
@@ -64,10 +65,12 @@ struct DiskDirectory {
         std::filesystem::remove_all(path);
         std::filesystem::create_directories(path);
     }
+
     ~DiskDirectory() {
         std::error_code error;
         std::filesystem::remove_all(path, error);
     }
+
     std::filesystem::path path;
 };
 
@@ -75,21 +78,21 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
               ninfer::SpeculativeBackend backend, bool early_cancel = false) {
     DiskDirectory disk(concurrency);
     ninfer::EngineOptions options;
-    options.artifact_path = artifact;
-    options.max_concurrency = concurrency;
-    options.max_context = 256;
-    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(concurrency * 256);
-    options.prefill_chunk = 128;
+    options.artifact_path         = artifact;
+    options.max_concurrency       = concurrency;
+    options.max_context           = 256;
+    options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(concurrency * 256);
+    options.prefill_chunk         = 128;
     options.kv_ram_capacity_bytes = kRamBytes;
-    options.enable_vision = false;
-    options.speculative.backend = backend;
+    options.enable_vision         = false;
+    options.speculative.backend   = backend;
     if (backend != ninfer::SpeculativeBackend::None) {
-        options.speculative.draft_tokens = 4;
+        options.speculative.draft_tokens  = 4;
         options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     }
     if (disk_enabled) {
         options.kv_disk_capacity_bytes = 4ULL << 30;
-        options.kv_disk_location = disk.path;
+        options.kv_disk_location       = disk.path;
     }
     ninfer::Engine engine(options);
     // Ordinary cancellation follows the first publication; speculative cancellation
@@ -101,7 +104,8 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
     for (std::uint32_t mask = 0; mask < (1U << concurrency); ++mask) {
         std::array<Tokens, 4> inputs;
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
-            const auto seed = engine.generate(engine.prepare_tokens(prompt(lane)), greedy(8, false));
+            const auto seed =
+                engine.generate(engine.prepare_tokens(prompt(lane)), greedy(8, false));
             if (seed.generated_token_ids.size() != 8 ||
                 (backend != ninfer::SpeculativeBackend::None && seed.speculative.rounds == 0)) {
                 throw std::runtime_error("cache matrix seed did not complete");
@@ -132,9 +136,7 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
                 });
                 try {
                     results[lane] = handle.wait(&sink, cancel);
-                } catch (...) {
-                    errors[lane] = std::current_exception();
-                }
+                } catch (...) { errors[lane] = std::current_exception(); }
             });
         }
         consumers.clear(); // Join every consumer before reading its result or the mask.
@@ -149,7 +151,8 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
             const auto& result = results[lane];
             if (result.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
                 result.reused_prompt_tokens != inputs[lane].size()) {
-                throw std::runtime_error("cancellation matrix did not restore the requested RAM source");
+                throw std::runtime_error(
+                    "cancellation matrix did not restore the requested RAM source");
             }
             const bool cancelled = (mask & (1U << lane)) != 0;
             if (backend != ninfer::SpeculativeBackend::None && !early_cancel &&
@@ -158,7 +161,8 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
             }
             if (cancelled ? result.finish_reason != ninfer::FinishReason::Cancelled
                           : result.generated_token_ids.size() != 32) {
-                throw std::runtime_error("cancellation matrix did not reach its assigned terminal state");
+                throw std::runtime_error(
+                    "cancellation matrix did not reach its assigned terminal state");
             }
         }
 
@@ -174,13 +178,15 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
             // Compare one next-token decision for the exact same represented
             // history. This does not assert multi-token equivalence between
             // fresh prefill and cached decode arithmetic routes.
-            const auto resumed = engine.generate(engine.prepare_tokens(resumed_input), greedy(1, true));
+            const auto resumed =
+                engine.generate(engine.prepare_tokens(resumed_input), greedy(1, true));
             if ((mask & (1U << lane)) == 0 &&
                 (resumed.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
                  resumed.reused_prompt_tokens != resumed_input.size())) {
                 throw std::runtime_error("completed peer did not survive RAM eviction/restore");
             }
-            const auto fresh = engine.generate(engine.prepare_tokens(resumed_input), greedy(1, false));
+            const auto fresh =
+                engine.generate(engine.prepare_tokens(resumed_input), greedy(1, false));
             if (resumed.generated_token_ids.size() != 1 || fresh.generated_token_ids.size() != 1) {
                 throw std::runtime_error("next-token continuation did not produce one token");
             }
@@ -211,33 +217,33 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        std::cerr << "cache interleavings first disk capture after "
-                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
-                  << " s idle\n";
+        std::cerr
+            << "cache interleavings first disk capture after "
+            << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+            << " s idle\n";
     }
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    const std::string selected = argc == 3 && std::string(argv[1]) == "--backend"
-                                     ? argv[2] : "ordinary";
-    if ((argc != 1 && argc != 3) ||
-        (argc == 3 && std::string(argv[1]) != "--backend") ||
+    const std::string selected =
+        argc == 3 && std::string(argv[1]) == "--backend" ? argv[2] : "ordinary";
+    if ((argc != 1 && argc != 3) || (argc == 3 && std::string(argv[1]) != "--backend") ||
         (selected != "ordinary" && selected != "mtp" && selected != "dflash")) {
         std::cerr << "usage: cache_interleavings_real [--backend ordinary|mtp|dflash]\n";
         return 1;
     }
     const auto backend = selected == "dflash" ? ninfer::SpeculativeBackend::DFlash
-                         : selected == "mtp" ? ninfer::SpeculativeBackend::Mtp
+                         : selected == "mtp"  ? ninfer::SpeculativeBackend::Mtp
                                               : ninfer::SpeculativeBackend::None;
-    const char* artifact = std::getenv(selected == "dflash"
-        ? "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"
-        : "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    const char* artifact =
+        std::getenv(selected == "dflash" ? "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"
+                                         : "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: set "
                   << (selected == "dflash" ? "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"
-                                            : "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS")
+                                           : "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS")
                   << " to the Qwen3.8 NVFP4 artifact with the selected backend\n";
         return 77;
     }
@@ -246,9 +252,7 @@ int main(int argc, char** argv) {
             // A first-publication cancellation can leave an invalid-tail image
             // at the same frontier as a later fresh capture. It must not shadow
             // that usable entry during the next wave's RAM/disk matching.
-            for (const bool disk : {false, true}) {
-                exercise(artifact, 2, disk, backend, true);
-            }
+            for (const bool disk : {false, true}) { exercise(artifact, 2, disk, backend, true); }
         }
         for (const bool disk : {false, true}) {
             for (std::uint32_t concurrency = 1; concurrency <= 4; ++concurrency) {

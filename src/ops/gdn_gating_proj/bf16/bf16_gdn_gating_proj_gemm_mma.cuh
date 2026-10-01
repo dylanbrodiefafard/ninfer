@@ -301,7 +301,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
                                  static_cast<int>(blockIdx.x);
         const int grid_threads = static_cast<int>(gridDim.x) * static_cast<int>(gridDim.y) *
                                  static_cast<int>(gridDim.z) * kThreads;
-        const int elems = kBf16GdnHeads * t;
+        const int elems        = kBf16GdnHeads * t;
         if constexpr (NormalizeInput) {
             const float* norm_partial =
                 partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;

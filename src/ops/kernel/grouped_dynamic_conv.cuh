@@ -11,8 +11,8 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kGroupedDynamicConvGemmBlock  = 256;
-inline constexpr int kGroupedDynamicConvConvBlock  = 256;
+inline constexpr int kGroupedDynamicConvGemmBlock = 256;
+inline constexpr int kGroupedDynamicConvConvBlock = 256;
 
 __device__ __forceinline__ float grouped_dynamic_conv_block_sum(float value) {
     __shared__ float partial[kGroupedDynamicConvGemmBlock];
@@ -34,10 +34,10 @@ __global__ void grouped_dynamic_conv_bf16_gemv_kernel(const __nv_bfloat16* x,
     const std::int32_t col = static_cast<std::int32_t>(blockIdx.y);
     if (row >= n_rows) { return; }
 
-    const std::int64_t k64   = static_cast<std::int64_t>(k_rows);
-    const __nv_bfloat16* w   = weight + static_cast<std::int64_t>(row) * k64;
+    const std::int64_t k64     = static_cast<std::int64_t>(k_rows);
+    const __nv_bfloat16* w     = weight + static_cast<std::int64_t>(row) * k64;
     const __nv_bfloat16* col_x = x + static_cast<std::int64_t>(col) * k64;
-    float acc                = 0.0f;
+    float acc                  = 0.0f;
     for (std::int32_t k = static_cast<std::int32_t>(threadIdx.x); k < k_rows;
          k += kGroupedDynamicConvGemmBlock) {
         acc += __bfloat162float(w[k]) * __bfloat162float(col_x[k]);
@@ -59,9 +59,9 @@ __global__ void grouped_dynamic_conv_kernel(const __nv_bfloat16* hidden,
     constexpr std::int32_t kGroup  = 16;
     constexpr std::int32_t kProj   = 1280;
 
-    const std::int32_t d   = static_cast<std::int32_t>(blockIdx.x) * blockDim.x +
-                           static_cast<std::int32_t>(threadIdx.x);
-    const std::int32_t col = static_cast<std::int32_t>(blockIdx.y);
+    const std::int32_t d =
+        static_cast<std::int32_t>(blockIdx.x) * blockDim.x + static_cast<std::int32_t>(threadIdx.x);
+    const std::int32_t col     = static_cast<std::int32_t>(blockIdx.y);
     const std::int32_t columns = tokens * batch;
     if (d >= kD || col >= columns) { return; }
 
@@ -69,9 +69,8 @@ __global__ void grouped_dynamic_conv_kernel(const __nv_bfloat16* hidden,
     const std::int32_t group = d / kGroup;
     const std::int64_t hid   = static_cast<std::int64_t>(col) * kD + d;
     const float x0           = __bfloat162float(hidden[hid]);
-    const float x1           = (t == 0)
-                                   ? 0.0f
-                                   : __bfloat162float(hidden[hid - static_cast<std::int64_t>(kD)]);
+    const float x1 =
+        (t == 0) ? 0.0f : __bfloat162float(hidden[hid - static_cast<std::int64_t>(kD)]);
 
     const std::int32_t phase = kPrepare ? 0 : 1;
     const float base0 =
@@ -83,8 +82,8 @@ __global__ void grouped_dynamic_conv_kernel(const __nv_bfloat16* hidden,
     float dyn1 = 0.0f;
     if constexpr (kPrepare) {
         const std::int64_t proj_col = static_cast<std::int64_t>(col) * kProj;
-        dyn0 = __bfloat162float(dynamic_src[proj_col + group]);
-        dyn1 = __bfloat162float(dynamic_src[proj_col + kGroups + group]);
+        dyn0                        = __bfloat162float(dynamic_src[proj_col + group]);
+        dyn1                        = __bfloat162float(dynamic_src[proj_col + kGroups + group]);
         if ((d % kGroup) == 0) {
             finish_dynamic[static_cast<std::int64_t>(col) * (kGroups * 2) + group] =
                 dynamic_src[proj_col + 2 * kGroups + group];

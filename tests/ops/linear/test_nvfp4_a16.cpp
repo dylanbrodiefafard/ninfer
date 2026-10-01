@@ -58,19 +58,18 @@ int run_nvfp4_a16() {
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
     // W=1 must remain GEMV panels; widths 2..6 share the same MMA reduction.
     for (const std::int32_t width : {1, 2, 3, 4, 5, 6}) {
-        failures += run_packed_sequences_matches_panels(
-            "NVFP4_A16 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 727U, width,
-            dflash_batches);
-        failures += run_packed_sequences_matches_panels(
-            "NVFP4_A16 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 729U, width,
-            dflash_batches);
-        failures += run_packed_sequences_matches_panels(
-            "NVFP4_A16 DFlash feature packed", make_nvfp4_weight, 5120, 25600, 739U, width,
-            dflash_batches, ops::LinearPolicy::AllowA4);
+        failures +=
+            run_packed_sequences_matches_panels("NVFP4_A16 DFlash QKV packed", make_nvfp4_weight,
+                                                6144, 5120, 727U, width, dflash_batches);
+        failures += run_packed_sequences_matches_panels("NVFP4_A16 DFlash attention-output packed",
+                                                        make_nvfp4_weight, 5120, 4096, 729U, width,
+                                                        dflash_batches);
+        failures += run_packed_sequences_matches_panels("NVFP4_A16 DFlash feature packed",
+                                                        make_nvfp4_weight, 5120, 25600, 739U, width,
+                                                        dflash_batches, ops::LinearPolicy::AllowA4);
     }
     failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5,
-        dflash_batches);
+        "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5, dflash_batches);
     return failures;
 }
 

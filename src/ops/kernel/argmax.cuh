@@ -26,17 +26,15 @@ __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, f
     return value > best_value || (value == best_value && index < best_index);
 }
 
-__device__ __forceinline__ bool argmax_token_suppressed(std::int32_t token,
-                                                        const SamplingConfig* config,
-                                                        std::int32_t column) {
+__device__ __forceinline__ bool
+argmax_token_suppressed(std::int32_t token, const SamplingConfig* config, std::int32_t column) {
     if (config == nullptr) { return false; }
     if (config->allowed_token_words) {
         const auto* words = config->allowed_token_words +
-            static_cast<std::int64_t>(column) * config->allowed_token_column_stride;
+                            static_cast<std::int64_t>(column) * config->allowed_token_column_stride;
         if (!(words[token >> 5] & (std::uint32_t{1} << (token & 31)))) { return true; }
     }
-    const int count = min(config->suppressed_token_count,
-                          SamplingConfig::kMaximumSuppressedTokens);
+    const int count = min(config->suppressed_token_count, SamplingConfig::kMaximumSuppressedTokens);
     for (int i = 0; i < count; ++i) {
         if (config->suppressed_tokens[i] == token) { return true; }
     }
@@ -77,10 +75,9 @@ __launch_bounds__(kArgmaxBlock) __global__
     void argmax_kernel(const __nv_bfloat16* logits, std::int32_t* out, std::int32_t valid_rows,
                        std::int32_t physical_rows, const SamplingConfig* configs,
                        std::int32_t columns_per_config) {
-    const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
-    const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
-    const SamplingConfig* config =
-        configs == nullptr ? nullptr : configs + t / columns_per_config;
+    const std::int32_t t         = static_cast<std::int32_t>(blockIdx.x);
+    const std::int64_t base      = static_cast<std::int64_t>(t) * physical_rows;
+    const SamplingConfig* config = configs == nullptr ? nullptr : configs + t / columns_per_config;
 
     float best_value        = -CUDART_INF_F;
     std::int32_t best_index = INT32_MAX;
@@ -118,8 +115,7 @@ __launch_bounds__(kArgmaxBlock) __global__
 __launch_bounds__(kArgmaxBlock) __global__
     void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows,
-                                    const SamplingConfig* configs,
-                                    std::int32_t columns_per_config,
+                                    const SamplingConfig* configs, std::int32_t columns_per_config,
                                     std::int32_t column_offset) {
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
@@ -135,7 +131,7 @@ __launch_bounds__(kArgmaxBlock) __global__
         const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
         if (v < valid_rows &&
             !argmax_token_suppressed(v, config,
-                                    config ? (column_offset + t) % columns_per_config : 0)) {
+                                     config ? (column_offset + t) % columns_per_config : 0)) {
             const float value = __bfloat162float(logits[base + v]);
             if (argmax_better(value, v, best_value, best_index)) {
                 best_value = value;

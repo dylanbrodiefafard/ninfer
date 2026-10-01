@@ -56,8 +56,8 @@ void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& beta, float scale, const Tensor& ssm_states,
                               const Tensor& valid_columns, const Tensor& initial_state_slots,
                               Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                              Tensor& out, float* overlay_states,
-                              const std::int32_t* parent_index, cudaStream_t stream);
+                              Tensor& out, float* overlay_states, const std::int32_t* parent_index,
+                              cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

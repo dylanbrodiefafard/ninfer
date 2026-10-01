@@ -69,9 +69,7 @@ std::vector<ninfer::TokenId> concat(std::vector<ninfer::TokenId> prefix,
 std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
                                            const std::vector<ninfer::TokenId>& generated) {
     std::vector<ninfer::TokenId> prefix = keep;
-    if (!generated.empty()) {
-        prefix.insert(prefix.end(), generated.begin(), generated.end() - 1);
-    }
+    if (!generated.empty()) { prefix.insert(prefix.end(), generated.begin(), generated.end() - 1); }
     return prefix;
 }
 
@@ -88,14 +86,17 @@ public:
         std::filesystem::remove_all(path_);
         std::filesystem::create_directories(path_);
     }
+
     ~ScopedDiskDir() {
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
     }
-    ScopedDiskDir(const ScopedDiskDir&) = delete;
+
+    ScopedDiskDir(const ScopedDiskDir&)            = delete;
     ScopedDiskDir& operator=(const ScopedDiskDir&) = delete;
-    ScopedDiskDir(ScopedDiskDir&&) = delete;
-    ScopedDiskDir& operator=(ScopedDiskDir&&) = delete;
+    ScopedDiskDir(ScopedDiskDir&&)                 = delete;
+    ScopedDiskDir& operator=(ScopedDiskDir&&)      = delete;
+
     operator const std::filesystem::path&() const noexcept { return path_; }
 
 private:
@@ -147,7 +148,7 @@ int verify_disk_tier(const ninfer::Engine& engine, std::size_t ram_bytes) {
 }
 
 int expect_hit(const ninfer::GenerationResult& result, ninfer::PrefixReuseSource source,
-                std::uint32_t history_tokens, const char* label) {
+               std::uint32_t history_tokens, const char* label) {
     if (result.prefix_reuse_source != source) {
         std::cerr << label << " reuse_source is " << source_name(result.prefix_reuse_source)
                   << ", expected " << source_name(source) << '\n';
@@ -180,11 +181,11 @@ int expect_suffix_hit(const ninfer::GenerationResult& result, ninfer::PrefixReus
 }
 
 bool wait_scheduler(ninfer::Engine& engine, std::uint32_t* max_prefilling, const auto& predicate,
-                     const char* label) {
+                    const char* label) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
     while (std::chrono::steady_clock::now() < deadline) {
         const ninfer::RuntimeStats stats = engine.runtime_stats();
-        *max_prefilling = std::max(*max_prefilling, stats.prefilling_requests);
+        *max_prefilling                  = std::max(*max_prefilling, stats.prefilling_requests);
         if (stats.prefilling_requests > 1) {
             std::cerr << label << " observed prefilling_requests=" << stats.prefilling_requests
                       << '\n';
@@ -221,16 +222,16 @@ bool wait_disk_captures(ninfer::Engine& engine, std::uint64_t minimum, const cha
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     const auto stats = engine.runtime_stats();
-    std::cerr << label << " timed out waiting for kv_disk_captures>=" << minimum
-              << " (have " << stats.kv_disk_captures << " drops=" << stats.kv_disk_drops
+    std::cerr << label << " timed out waiting for kv_disk_captures>=" << minimum << " (have "
+              << stats.kv_disk_captures << " drops=" << stats.kv_disk_drops
               << " ram_entries=" << stats.kv_ram_entry_count
               << " disk_entries=" << stats.kv_disk_entry_count << ")\n";
     return false;
 }
 
 int capture_to_ram(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& keep,
-                     const std::vector<ninfer::TokenId>& evictor,
-                     std::vector<ninfer::TokenId>* generated, const char* label) {
+                   const std::vector<ninfer::TokenId>& evictor,
+                   std::vector<ninfer::TokenId>* generated, const char* label) {
     const auto ram_before = engine.runtime_stats().kv_ram_captures;
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(keep), greedy(8, false));
@@ -257,8 +258,8 @@ int capture_to_ram(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& k
 
 int land_on_disk(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& keep,
                  const std::vector<ninfer::TokenId>& evictor,
-                 const std::vector<ninfer::TokenId>& force,
-                 std::vector<ninfer::TokenId>* generated, const char* label) {
+                 const std::vector<ninfer::TokenId>& force, std::vector<ninfer::TokenId>* generated,
+                 const char* label) {
     const auto captures_before = engine.runtime_stats().kv_disk_captures;
     if (const int rc = capture_to_ram(engine, keep, evictor, generated, label); rc != 0) {
         return rc;
@@ -312,7 +313,7 @@ int seed_disk_chats(const char* artifact, const std::filesystem::path& disk,
 }
 
 int fill_lanes(ninfer::Engine& engine, const std::vector<std::vector<ninfer::TokenId>>& keeps,
-                std::vector<ninfer::GenerationResult>* results, const char* label) {
+               std::vector<ninfer::GenerationResult>* results, const char* label) {
     results->clear();
     for (const auto& keep : keeps) {
         const ninfer::GenerationResult first =
@@ -328,7 +329,7 @@ int fill_lanes(ninfer::Engine& engine, const std::vector<std::vector<ninfer::Tok
 }
 
 int expect_greedy_match(const ninfer::GenerationResult& hit,
-                         const ninfer::GenerationResult& baseline, const char* label) {
+                        const ninfer::GenerationResult& baseline, const char* label) {
     if (hit.generated_token_ids != baseline.generated_token_ids) {
         std::cerr << label << " disk reuse changed greedy output\n";
         return 1;
@@ -338,7 +339,7 @@ int expect_greedy_match(const ninfer::GenerationResult& hit,
 
 int exercise_construction(const char* artifact) {
     {
-        const auto bad_dir = make_disk_dir("noram");
+        const auto bad_dir        = make_disk_dir("noram");
         ninfer::EngineOptions bad = disk_options(artifact, bad_dir, 1, 0);
         bool threw                = false;
         try {
@@ -353,7 +354,9 @@ int exercise_construction(const char* artifact) {
         try {
             ninfer::Engine engine(bad);
         } catch (const std::invalid_argument&) { threw = true; }
-        if (!threw) { return fail("disk capacity without location did not fail Engine construction"); }
+        if (!threw) {
+            return fail("disk capacity without location did not fail Engine construction");
+        }
     }
     return 0;
 }
@@ -364,7 +367,8 @@ int exercise_restart_host_disk(const char* artifact) {
     {
         ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kRamBytes));
         if (const int rc = verify_disk_tier(engine, kRamBytes); rc != 0) { return rc; }
-        if (const int rc = capture_to_ram(engine, tokens_a(), tokens_b(), &generated, "restart land");
+        if (const int rc =
+                capture_to_ram(engine, tokens_a(), tokens_b(), &generated, "restart land");
             rc != 0) {
             return rc;
         }
@@ -372,10 +376,11 @@ int exercise_restart_host_disk(const char* artifact) {
     const auto history = static_cast<std::uint32_t>(resume_prefix(tokens_a(), generated).size());
 
     ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kRamBytes));
-    const auto prefix = resume_prefix(tokens_a(), generated);
+    const auto prefix          = resume_prefix(tokens_a(), generated);
     const auto restores_before = engine.runtime_stats().kv_disk_restores;
-    const auto hit = engine.generate(engine.prepare_tokens(prefix), greedy(4, true));
-    if (const int rc = expect_hit(hit, ninfer::PrefixReuseSource::HostDisk, history, "restart HostDisk");
+    const auto hit             = engine.generate(engine.prepare_tokens(prefix), greedy(4, true));
+    if (const int rc =
+            expect_hit(hit, ninfer::PrefixReuseSource::HostDisk, history, "restart HostDisk");
         rc != 0) {
         return rc;
     }
@@ -393,8 +398,7 @@ int exercise_restart_host_disk(const char* artifact) {
 int exercise_no_prefix_reuse(const char* artifact) {
     const auto disk_dir = make_disk_dir("noreuse");
     ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kRamBytes));
-    if (const int rc =
-            capture_to_ram(engine, tokens_a(), tokens_b(), nullptr, "no-reuse land");
+    if (const int rc = capture_to_ram(engine, tokens_a(), tokens_b(), nullptr, "no-reuse land");
         rc != 0) {
         return rc;
     }
@@ -419,7 +423,7 @@ int exercise_inclusive_after_ram_consume(const char* artifact) {
         }
         wait_idle(engine);
         const auto disk_before_consume = engine.memory_summary().kv_disk_entry_count;
-        history = resume_prefix(tokens_a(), generated);
+        history                        = resume_prefix(tokens_a(), generated);
         const auto ram_hit = engine.generate(engine.prepare_tokens(history), greedy(4, true));
         if (const int rc =
                 expect_hit(ram_hit, ninfer::PrefixReuseSource::HostRam,
@@ -439,11 +443,10 @@ int exercise_inclusive_after_ram_consume(const char* artifact) {
     }
     ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kRamBytes));
     const auto restores_before = engine.runtime_stats().kv_disk_restores;
-    const auto disk_hit = engine.generate(engine.prepare_tokens(history), greedy(4, true));
-    if (const int rc =
-            expect_hit(disk_hit, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(history.size()),
-                       "inclusive HostDisk after RAM consume");
+    const auto disk_hit        = engine.generate(engine.prepare_tokens(history), greedy(4, true));
+    if (const int rc = expect_hit(disk_hit, ninfer::PrefixReuseSource::HostDisk,
+                                  static_cast<std::uint32_t>(history.size()),
+                                  "inclusive HostDisk after RAM consume");
         rc != 0) {
         return rc;
     }
@@ -491,12 +494,11 @@ int exercise_ram_wins_equal_disk(const char* artifact) {
     const auto disk_dir = make_disk_dir("ram-wins");
     ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kRamBytes));
     std::vector<ninfer::TokenId> generated;
-    if (const int rc =
-            capture_to_ram(engine, tokens_a(), tokens_b(), &generated, "RAM-wins land");
+    if (const int rc = capture_to_ram(engine, tokens_a(), tokens_b(), &generated, "RAM-wins land");
         rc != 0) {
         return rc;
     }
-    const auto history      = resume_prefix(tokens_a(), generated);
+    const auto history     = resume_prefix(tokens_a(), generated);
     const auto disk_before = engine.runtime_stats().kv_disk_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(history), greedy(4, true));
@@ -531,9 +533,9 @@ int exercise_longer_disk_beats_vram(const char* artifact) {
     const auto restores_before = engine.runtime_stats().kv_disk_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(history), greedy(4, true));
-    if (const int rc =
-            expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(history.size()), "longer disk beats shorter VRAM");
+    if (const int rc = expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
+                                  static_cast<std::uint32_t>(history.size()),
+                                  "longer disk beats shorter VRAM");
         rc != 0) {
         return rc;
     }
@@ -589,10 +591,9 @@ int exercise_suffix_prefill(const char* artifact) {
     const auto restores_before = engine.runtime_stats().kv_disk_restores;
     const ninfer::GenerationResult hit =
         engine.generate(engine.prepare_tokens(continued), greedy(4, true));
-    if (const int rc =
-            expect_suffix_hit(hit, ninfer::PrefixReuseSource::HostDisk,
-                             static_cast<std::uint32_t>(history.size()),
-                             static_cast<std::uint32_t>(continued.size()), "suffix disk restore");
+    if (const int rc = expect_suffix_hit(
+            hit, ninfer::PrefixReuseSource::HostDisk, static_cast<std::uint32_t>(history.size()),
+            static_cast<std::uint32_t>(continued.size()), "suffix disk restore");
         rc != 0) {
         return rc;
     }
@@ -632,7 +633,7 @@ int exercise_ram_hit_during_idle_spill(const char* artifact) {
 }
 
 int exercise_c1_dirty_lane(const char* artifact) {
-    const auto disk_dir            = make_disk_dir("c1-dirty");
+    const auto disk_dir             = make_disk_dir("c1-dirty");
     constexpr std::size_t kTightRam = 256ULL * 1024ULL * 1024ULL;
     ninfer::Engine engine(disk_options(artifact, disk_dir, 1, kTightRam));
     const auto a = engine.generate(engine.prepare_tokens(tokens_a()), greedy(8, false));
@@ -641,11 +642,7 @@ int exercise_c1_dirty_lane(const char* artifact) {
     const auto a_hist   = static_cast<std::uint32_t>(a_prefix.size());
     wait_idle(engine);
     const std::vector<std::vector<ninfer::TokenId>> evictors = {
-        tokens_b(),
-        tokens_c(),
-        tokens_d(),
-        tokens_e(),
-        {248045, 846, 198, 222, 248046, 198},
+        tokens_b(), tokens_c(), tokens_d(), tokens_e(), {248045, 846, 198, 222, 248046, 198},
     };
     for (const auto& prompt : evictors) {
         if (engine.generate(engine.prepare_tokens(prompt), greedy(8, false))
@@ -663,7 +660,7 @@ int exercise_c1_dirty_lane(const char* artifact) {
         return 1;
     }
     if (const int rc = expect_hit(dirty, ninfer::PrefixReuseSource::HostDisk, a_hist,
-                                    "C=1 dirty-lane HostDisk");
+                                  "C=1 dirty-lane HostDisk");
         rc != 0) {
         return rc;
     }
@@ -745,9 +742,9 @@ int exercise_empty_lane_loses_to_disk(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    const auto occupant_again =
-        engine.generate(engine.prepare_tokens(resume_prefix(tokens_c(), occupant.generated_token_ids)),
-                        greedy(2, true));
+    const auto occupant_again = engine.generate(
+        engine.prepare_tokens(resume_prefix(tokens_c(), occupant.generated_token_ids)),
+        greedy(2, true));
     if (occupant_again.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
         return fail("empty-lane disk restore covered the unrelated VRAM occupant");
     }
@@ -790,9 +787,12 @@ int exercise_c3_overlapping_empty_lanes(const char* artifact) {
     const auto disk_dir = make_disk_dir("c3-empty");
     ninfer::Engine engine(disk_options(artifact, disk_dir, 3, kRamBytes));
     if (const int rc = verify_disk_tier(engine, kRamBytes); rc != 0) { return rc; }
-    ninfer::GenerationHandle ha = engine.submit(engine.prepare_tokens(tokens_f()), greedy(16, false));
-    ninfer::GenerationHandle hb = engine.submit(engine.prepare_tokens(tokens_g()), greedy(16, false));
-    ninfer::GenerationHandle hc = engine.submit(engine.prepare_tokens(tokens_h()), greedy(16, false));
+    ninfer::GenerationHandle ha =
+        engine.submit(engine.prepare_tokens(tokens_f()), greedy(16, false));
+    ninfer::GenerationHandle hb =
+        engine.submit(engine.prepare_tokens(tokens_g()), greedy(16, false));
+    ninfer::GenerationHandle hc =
+        engine.submit(engine.prepare_tokens(tokens_h()), greedy(16, false));
     std::uint32_t max_prefilling = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
@@ -809,9 +809,8 @@ int exercise_c3_overlapping_empty_lanes(const char* artifact) {
     }
     if (a.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
         b.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
-        c.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
-        a.reused_prompt_tokens != 0 || b.reused_prompt_tokens != 0 ||
-        c.reused_prompt_tokens != 0) {
+        c.prefix_reuse_path != ninfer::PrefixReusePath::FullReset || a.reused_prompt_tokens != 0 ||
+        b.reused_prompt_tokens != 0 || c.reused_prompt_tokens != 0) {
         return fail("C=3 empty overlapping wave reused a prefix");
     }
     if (engine.runtime_stats().kv_ram_captures != 0 ||
@@ -833,14 +832,14 @@ int exercise_c3_empty_lane_loses_to_disk(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    const auto hist_f = resume_prefix(tokens_f(), occupants[0].generated_token_ids);
-    const auto hist_g = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
+    const auto hist_f          = resume_prefix(tokens_f(), occupants[0].generated_token_ids);
+    const auto hist_g          = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
     const auto restores_before = engine.runtime_stats().kv_disk_restores;
     ninfer::GenerationHandle disk_a =
         engine.submit(engine.prepare_tokens(seeded[0].history), greedy(8, true));
     ninfer::GenerationHandle cont_f = engine.submit(engine.prepare_tokens(hist_f), greedy(8, true));
     ninfer::GenerationHandle cont_g = engine.submit(engine.prepare_tokens(hist_g), greedy(8, true));
-    std::uint32_t max_prefilling = 0;
+    std::uint32_t max_prefilling    = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
             [](const ninfer::RuntimeStats& stats) { return stats.running_requests == 3; },
@@ -850,10 +849,9 @@ int exercise_c3_empty_lane_loses_to_disk(const char* artifact) {
     const auto hit_a = disk_a.wait();
     const auto hit_f = cont_f.wait();
     const auto hit_g = cont_g.wait();
-    if (const int rc =
-            expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(seeded[0].history.size()),
-                       "C=3 empty-lane HostDisk");
+    if (const int rc = expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
+                                  static_cast<std::uint32_t>(seeded[0].history.size()),
+                                  "C=3 empty-lane HostDisk");
         rc != 0) {
         return rc;
     }
@@ -906,21 +904,21 @@ int exercise_c3_triple_disk_cover(const char* artifact) {
     const auto hit_a = ha.wait();
     const auto hit_b = hb.wait();
     const auto hit_c = hc.wait();
-    if (const int rc = expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                                       static_cast<std::uint32_t>(seeded[0].history.size()),
-                                       "C=3 triple A");
+    if (const int rc =
+            expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
+                       static_cast<std::uint32_t>(seeded[0].history.size()), "C=3 triple A");
         rc != 0) {
         return rc;
     }
-    if (const int rc = expect_hit(hit_b, ninfer::PrefixReuseSource::HostDisk,
-                                       static_cast<std::uint32_t>(seeded[1].history.size()),
-                                       "C=3 triple B");
+    if (const int rc =
+            expect_hit(hit_b, ninfer::PrefixReuseSource::HostDisk,
+                       static_cast<std::uint32_t>(seeded[1].history.size()), "C=3 triple B");
         rc != 0) {
         return rc;
     }
-    if (const int rc = expect_hit(hit_c, ninfer::PrefixReuseSource::HostDisk,
-                                       static_cast<std::uint32_t>(seeded[2].history.size()),
-                                       "C=3 triple C");
+    if (const int rc =
+            expect_hit(hit_c, ninfer::PrefixReuseSource::HostDisk,
+                       static_cast<std::uint32_t>(seeded[2].history.size()), "C=3 triple C");
         rc != 0) {
         return rc;
     }
@@ -958,21 +956,22 @@ int exercise_c3_disk_plus_vram_continues(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    const auto hist_g = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
-    const auto hist_h = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
-    const auto hist_f = resume_prefix(tokens_f(), occupants[0].generated_token_ids);
-    const auto continue_g =
-        engine.generate(engine.prepare_tokens(hist_g), greedy(2, true));
+    const auto hist_g     = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
+    const auto hist_h     = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
+    const auto hist_f     = resume_prefix(tokens_f(), occupants[0].generated_token_ids);
+    const auto continue_g = engine.generate(engine.prepare_tokens(hist_g), greedy(2, true));
     if (continue_g.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
         return fail("C=3 mix setup did not keep G in VRAM");
     }
-    const auto hist_g2 = resume_prefix(hist_g, continue_g.generated_token_ids);
+    const auto hist_g2     = resume_prefix(hist_g, continue_g.generated_token_ids);
     const auto ram_before  = engine.runtime_stats().kv_ram_captures;
     const auto disk_before = engine.runtime_stats().kv_disk_restores;
     ninfer::GenerationHandle disk_a =
         engine.submit(engine.prepare_tokens(seeded[0].history), greedy(12, true));
-    ninfer::GenerationHandle cont_g = engine.submit(engine.prepare_tokens(hist_g2), greedy(12, true));
-    ninfer::GenerationHandle cont_h = engine.submit(engine.prepare_tokens(hist_h), greedy(12, true));
+    ninfer::GenerationHandle cont_g =
+        engine.submit(engine.prepare_tokens(hist_g2), greedy(12, true));
+    ninfer::GenerationHandle cont_h =
+        engine.submit(engine.prepare_tokens(hist_h), greedy(12, true));
     std::uint32_t max_prefilling = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
@@ -985,8 +984,7 @@ int exercise_c3_disk_plus_vram_continues(const char* artifact) {
     const auto hit_h = cont_h.wait();
     if (const int rc =
             expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(seeded[0].history.size()),
-                       "C=3 mix HostDisk A");
+                       static_cast<std::uint32_t>(seeded[0].history.size()), "C=3 mix HostDisk A");
         rc != 0) {
         return rc;
     }
@@ -1039,8 +1037,8 @@ int exercise_c3_duplicate_disk_submit(const char* artifact) {
             "C=3 duplicate overlapping disk submits")) {
         return 1;
     }
-    const auto hit_a = first.wait();
-    const auto hit_b = second.wait();
+    const auto hit_a       = first.wait();
+    const auto hit_b       = second.wait();
     const bool first_disk  = hit_a.prefix_reuse_source == ninfer::PrefixReuseSource::HostDisk;
     const bool second_disk = hit_b.prefix_reuse_source == ninfer::PrefixReuseSource::HostDisk;
     if (!first_disk && !second_disk) {
@@ -1051,7 +1049,8 @@ int exercise_c3_duplicate_disk_submit(const char* artifact) {
         hit_a.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
         hit_b.prefix_reuse_path == ninfer::PrefixReusePath::FullReset) {
         std::cerr << "C=3 duplicate disk submit dropped a prefix: A source="
-                  << source_name(hit_a.prefix_reuse_source) << " reused=" << hit_a.reused_prompt_tokens
+                  << source_name(hit_a.prefix_reuse_source)
+                  << " reused=" << hit_a.reused_prompt_tokens
                   << " B source=" << source_name(hit_b.prefix_reuse_source)
                   << " reused=" << hit_b.reused_prompt_tokens << '\n';
         return 1;
@@ -1066,9 +1065,12 @@ int exercise_c3_queued_disk_matcher(const char* artifact) {
         return rc;
     }
     ninfer::Engine engine(disk_options(artifact, disk_dir, 3, kRamBytes));
-    ninfer::GenerationHandle hf = engine.submit(engine.prepare_tokens(tokens_f()), greedy(48, false));
-    ninfer::GenerationHandle hg = engine.submit(engine.prepare_tokens(tokens_g()), greedy(48, false));
-    ninfer::GenerationHandle hh = engine.submit(engine.prepare_tokens(tokens_h()), greedy(48, false));
+    ninfer::GenerationHandle hf =
+        engine.submit(engine.prepare_tokens(tokens_f()), greedy(48, false));
+    ninfer::GenerationHandle hg =
+        engine.submit(engine.prepare_tokens(tokens_g()), greedy(48, false));
+    ninfer::GenerationHandle hh =
+        engine.submit(engine.prepare_tokens(tokens_h()), greedy(48, false));
     ninfer::GenerationHandle ha =
         engine.submit(engine.prepare_tokens(seeded[0].history), greedy(8, true));
     std::uint32_t max_prefilling = 0;
@@ -1086,8 +1088,7 @@ int exercise_c3_queued_disk_matcher(const char* artifact) {
     const auto hit = ha.wait();
     if (const int rc =
             expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(seeded[0].history.size()),
-                       "C=3 queued HostDisk");
+                       static_cast<std::uint32_t>(seeded[0].history.size()), "C=3 queued HostDisk");
         rc != 0) {
         return rc;
     }
@@ -1107,25 +1108,30 @@ int exercise_c3_cancel_disk_restore(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    const auto hist_g = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
-    const auto hist_h = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
+    const auto hist_g      = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
+    const auto hist_h      = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
     const auto disk_before = engine->runtime_stats().kv_disk_restores;
     ninfer::GenerationHandle disk_a =
         engine->submit(engine->prepare_tokens(seeded[0].history), greedy(32, true),
                        ninfer::OutputDelivery::Streaming);
-    ninfer::GenerationHandle cont_g = engine->submit(engine->prepare_tokens(hist_g), greedy(12, true));
-    ninfer::GenerationHandle cont_h = engine->submit(engine->prepare_tokens(hist_h), greedy(12, true));
+    ninfer::GenerationHandle cont_g =
+        engine->submit(engine->prepare_tokens(hist_g), greedy(12, true));
+    ninfer::GenerationHandle cont_h =
+        engine->submit(engine->prepare_tokens(hist_h), greedy(12, true));
+
     struct CancelAfterPublish : ninfer::OutputSink {
         std::atomic<int> published{0};
         std::atomic<bool> stop{false};
+
         void publish(ninfer::OutputDelta) override {
             if (published.fetch_add(1) + 1 >= 2) { stop.store(true); }
         }
     } sink;
+
     ninfer::CancellationView cancel([&] { return sink.stop.load(); });
     const auto cancelled = disk_a.wait(&sink, cancel);
-    const auto hit_g    = cont_g.wait();
-    const auto hit_h    = cont_h.wait();
+    const auto hit_g     = cont_g.wait();
+    const auto hit_h     = cont_h.wait();
     if (cancelled.finish_reason != ninfer::FinishReason::Cancelled &&
         cancelled.generated_token_ids.size() == 32) {
         return fail("C=3 cancelled disk restore ran to the output limit");
@@ -1168,13 +1174,13 @@ int exercise_c3_suffix_disk_with_occupants(const char* artifact) {
         return rc;
     }
     const auto continued = concat(seeded[0].history, {198, 198, 198, 198});
-    const auto hist_g     = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
-    const auto hist_h     = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
+    const auto hist_g    = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
+    const auto hist_h    = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
     ninfer::GenerationHandle disk_a =
         engine.submit(engine.prepare_tokens(continued), greedy(8, true));
     ninfer::GenerationHandle cont_g = engine.submit(engine.prepare_tokens(hist_g), greedy(8, true));
     ninfer::GenerationHandle cont_h = engine.submit(engine.prepare_tokens(hist_h), greedy(8, true));
-    std::uint32_t max_prefilling = 0;
+    std::uint32_t max_prefilling    = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
             [](const ninfer::RuntimeStats& stats) { return stats.running_requests == 3; },
@@ -1186,9 +1192,8 @@ int exercise_c3_suffix_disk_with_occupants(const char* artifact) {
     const auto hit_h = cont_h.wait();
     if (const int rc =
             expect_suffix_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                             static_cast<std::uint32_t>(seeded[0].history.size()),
-                             static_cast<std::uint32_t>(continued.size()),
-                             "C=3 suffix HostDisk");
+                              static_cast<std::uint32_t>(seeded[0].history.size()),
+                              static_cast<std::uint32_t>(continued.size()), "C=3 suffix HostDisk");
         rc != 0) {
         return rc;
     }
@@ -1216,16 +1221,17 @@ int exercise_c3_two_disk_one_vram(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    const auto hist_h = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
-    const auto hist_f = resume_prefix(tokens_f(), occupants[0].generated_token_ids);
-    const auto hist_g = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
+    const auto hist_h      = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
+    const auto hist_f      = resume_prefix(tokens_f(), occupants[0].generated_token_ids);
+    const auto hist_g      = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
     const auto ram_before  = engine.runtime_stats().kv_ram_captures;
     const auto disk_before = engine.runtime_stats().kv_disk_restores;
     ninfer::GenerationHandle disk_a =
         engine.submit(engine.prepare_tokens(seeded[0].history), greedy(12, true));
     ninfer::GenerationHandle disk_b =
         engine.submit(engine.prepare_tokens(seeded[1].history), greedy(12, true));
-    ninfer::GenerationHandle cont_h = engine.submit(engine.prepare_tokens(hist_h), greedy(12, true));
+    ninfer::GenerationHandle cont_h =
+        engine.submit(engine.prepare_tokens(hist_h), greedy(12, true));
     std::uint32_t max_prefilling = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
@@ -1239,15 +1245,15 @@ int exercise_c3_two_disk_one_vram(const char* artifact) {
     const auto hit_a = disk_a.wait();
     const auto hit_b = disk_b.wait();
     const auto hit_h = cont_h.wait();
-    if (const int rc = expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                                    static_cast<std::uint32_t>(seeded[0].history.size()),
-                                    "C=3 two-disk A");
+    if (const int rc =
+            expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
+                       static_cast<std::uint32_t>(seeded[0].history.size()), "C=3 two-disk A");
         rc != 0) {
         return rc;
     }
-    if (const int rc = expect_hit(hit_b, ninfer::PrefixReuseSource::HostDisk,
-                                    static_cast<std::uint32_t>(seeded[1].history.size()),
-                                    "C=3 two-disk B");
+    if (const int rc =
+            expect_hit(hit_b, ninfer::PrefixReuseSource::HostDisk,
+                       static_cast<std::uint32_t>(seeded[1].history.size()), "C=3 two-disk B");
         rc != 0) {
         return rc;
     }
@@ -1272,7 +1278,8 @@ int exercise_c3_two_disk_one_vram(const char* artifact) {
          ram_f.prefix_reuse_source != ninfer::PrefixReuseSource::HostDisk) ||
         (ram_g.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam &&
          ram_g.prefix_reuse_source != ninfer::PrefixReuseSource::HostDisk)) {
-        std::cerr << "C=3 two-disk lost a covered occupant: F=" << source_name(ram_f.prefix_reuse_source)
+        std::cerr << "C=3 two-disk lost a covered occupant: F="
+                  << source_name(ram_f.prefix_reuse_source)
                   << " G=" << source_name(ram_g.prefix_reuse_source) << '\n';
         return 1;
     }
@@ -1287,15 +1294,17 @@ int exercise_c3_disk_after_vram_inflight(const char* artifact) {
     }
     ninfer::Engine engine(disk_options(artifact, disk_dir, 3, kRamBytes));
     std::vector<ninfer::GenerationResult> occupants;
-    if (const int rc =
-            fill_lanes(engine, {tokens_f(), tokens_g(), tokens_h()}, &occupants, "C=3 after-inflight");
+    if (const int rc = fill_lanes(engine, {tokens_f(), tokens_g(), tokens_h()}, &occupants,
+                                  "C=3 after-inflight");
         rc != 0) {
         return rc;
     }
     const auto hist_g = resume_prefix(tokens_g(), occupants[1].generated_token_ids);
     const auto hist_h = resume_prefix(tokens_h(), occupants[2].generated_token_ids);
-    ninfer::GenerationHandle cont_g = engine.submit(engine.prepare_tokens(hist_g), greedy(48, true));
-    ninfer::GenerationHandle cont_h = engine.submit(engine.prepare_tokens(hist_h), greedy(48, true));
+    ninfer::GenerationHandle cont_g =
+        engine.submit(engine.prepare_tokens(hist_g), greedy(48, true));
+    ninfer::GenerationHandle cont_h =
+        engine.submit(engine.prepare_tokens(hist_h), greedy(48, true));
     std::uint32_t max_prefilling = 0;
     if (!wait_scheduler(
             engine, &max_prefilling,
@@ -1317,10 +1326,9 @@ int exercise_c3_disk_after_vram_inflight(const char* artifact) {
     const auto hit_a = disk_a.wait();
     const auto hit_g = cont_g.wait();
     const auto hit_h = cont_h.wait();
-    if (const int rc =
-            expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(seeded[0].history.size()),
-                       "C=3 disk after in-flight VRAM");
+    if (const int rc = expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
+                                  static_cast<std::uint32_t>(seeded[0].history.size()),
+                                  "C=3 disk after in-flight VRAM");
         rc != 0) {
         return rc;
     }
@@ -1345,7 +1353,9 @@ bool truncate_first_main_object(const std::filesystem::path& disk) {
     const auto root = disk / "packs";
     if (!std::filesystem::exists(root)) { return false; }
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
-        if (!entry.is_regular_file() || entry.path().parent_path().filename() != "main") { continue; }
+        if (!entry.is_regular_file() || entry.path().parent_path().filename() != "main") {
+            continue;
+        }
         if (entry.file_size() > 32) {
             std::filesystem::resize_file(entry.path(), 8);
             return true;
@@ -1372,7 +1382,7 @@ int exercise_cancel_then_ram_continue(const char* artifact) {
     (void)disk_a.wait(nullptr, cancel);
     wait_idle(engine);
     const auto hist_b = resume_prefix(tokens_b(), occupants[0].generated_token_ids);
-    const auto hit_b = engine.generate(engine.prepare_tokens(hist_b), greedy(4, true));
+    const auto hit_b  = engine.generate(engine.prepare_tokens(hist_b), greedy(4, true));
     if (hit_b.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
         hit_b.prefix_reuse_source == ninfer::PrefixReuseSource::None) {
         std::cerr << "cancel-then-RAM occupant reused nothing: source="
@@ -1384,10 +1394,9 @@ int exercise_cancel_then_ram_continue(const char* artifact) {
     }
     const auto hit_a = engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, true));
     if (hit_a.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
-        if (const int rc =
-                expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                           static_cast<std::uint32_t>(seeded[0].history.size()),
-                           "cancel-then-RAM A");
+        if (const int rc = expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
+                                      static_cast<std::uint32_t>(seeded[0].history.size()),
+                                      "cancel-then-RAM A");
             rc != 0) {
             return rc;
         }
@@ -1442,29 +1451,27 @@ int exercise_capture_drop_during_disk_restore(const char* artifact) {
         return rc;
     }
     constexpr std::size_t kTinyRam = 1ULL << 20;
-    const std::vector<std::vector<ninfer::TokenId>> keeps{
-        tokens_b(), tokens_c(), tokens_d(), tokens_e()};
+    const std::vector<std::vector<ninfer::TokenId>> keeps{tokens_b(), tokens_c(), tokens_d(),
+                                                          tokens_e()};
     for (std::uint32_t concurrency = 1; concurrency <= 4; ++concurrency) {
         std::cerr << "disk_real: capture-drop C=" << concurrency << '\n';
         ninfer::Engine engine(disk_options(artifact, disk_dir, concurrency, kTinyRam));
         std::vector<ninfer::GenerationResult> occupants;
-        if (const int rc = fill_lanes(
-                engine, {keeps.begin(), keeps.begin() + concurrency}, &occupants,
-                "capture-drop occupants"); rc != 0) {
+        if (const int rc = fill_lanes(engine, {keeps.begin(), keeps.begin() + concurrency},
+                                      &occupants, "capture-drop occupants");
+            rc != 0) {
             return rc;
         }
         const auto before = engine.runtime_stats();
-        const auto hit =
-            engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, true));
-        if (const int rc = expect_hit(
-                hit, ninfer::PrefixReuseSource::HostDisk,
-                static_cast<std::uint32_t>(seeded[0].history.size()), "capture-drop restore");
+        const auto hit = engine.generate(engine.prepare_tokens(seeded[0].history), greedy(4, true));
+        if (const int rc = expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
+                                      static_cast<std::uint32_t>(seeded[0].history.size()),
+                                      "capture-drop restore");
             rc != 0) {
             return rc;
         }
         const auto after = engine.runtime_stats();
-        if (hit.generated_token_ids.size() != 4 ||
-            after.kv_ram_drops != before.kv_ram_drops + 1 ||
+        if (hit.generated_token_ids.size() != 4 || after.kv_ram_drops != before.kv_ram_drops + 1 ||
             after.kv_ram_captures != before.kv_ram_captures ||
             after.kv_ram_evictions != before.kv_ram_evictions) {
             return fail("disk restore did not drop exactly its uncapturable dirty victim");
@@ -1475,7 +1482,8 @@ int exercise_capture_drop_during_disk_restore(const char* artifact) {
             if (sibling.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
                 sibling.reused_prompt_tokens != history.size() ||
                 sibling.generated_token_ids.size() != 4 || sibling.kv_disk_load_seconds > 0.0) {
-                return fail("capture-drop restore damaged a retained sibling or leaked copy timing");
+                return fail(
+                    "capture-drop restore damaged a retained sibling or leaked copy timing");
             }
         }
         // The covered oldest occupant has no RAM snapshot. Its fresh replay
@@ -1497,17 +1505,17 @@ int exercise_capture_drop_during_disk_restore(const char* artifact) {
 enum class RestoreFault { CorruptPage, HostMetadata, SetupMetadata, CheckpointMetadata, CopyEvent };
 
 int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = false,
-                                      RestoreFault fault = RestoreFault::CorruptPage) {
+                                        RestoreFault fault = RestoreFault::CorruptPage) {
     using Disk = ninfer::targets::qwen3_6::detail::KVDiskCache;
     for (std::uint32_t concurrency : {1U, 2U, 3U, 4U}) {
         const auto disk_dir = make_disk_dir("corrupt-restore");
-        auto options = [&](std::uint32_t lanes) {
+        auto options        = [&](std::uint32_t lanes) {
             auto result = dflash ? dflash_disk_options(artifact, disk_dir, lanes, kRamBytes)
                                  : disk_options(artifact, disk_dir, lanes, kRamBytes);
             if (fault == RestoreFault::CheckpointMetadata) {
                 result.context_checkpoint_marks = std::vector<std::uint32_t>{64};
                 if (!dflash) {
-                    result.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+                    result.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
                     result.speculative.draft_tokens = 4;
                 }
             }
@@ -1522,11 +1530,13 @@ int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = fals
             ninfer::Engine seed(options(concurrency));
             const auto first = seed.generate(seed.prepare_tokens(source),
                                              greedy(8, fault == RestoreFault::CheckpointMetadata));
-            generated = first.generated_token_ids;
-            if (fault == RestoreFault::CheckpointMetadata && first.captured_context_checkpoint_tokens == 0) {
+            generated        = first.generated_token_ids;
+            if (fault == RestoreFault::CheckpointMetadata &&
+                first.captured_context_checkpoint_tokens == 0) {
                 return fail("metadata fixture did not capture a real checkpoint image");
             }
-            if ((dflash || fault == RestoreFault::CheckpointMetadata) && first.speculative.rounds == 0) {
+            if ((dflash || fault == RestoreFault::CheckpointMetadata) &&
+                first.speculative.rounds == 0) {
                 return fail("cache fallback seed did not execute its speculative backend");
             }
             for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
@@ -1548,30 +1558,44 @@ int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = fals
             for (std::uint32_t lane = 1; lane < concurrency; ++lane) {
                 auto peer_prompt = tokens_g();
                 peer_prompt.push_back(static_cast<ninfer::TokenId>(728 + lane));
-                peers.push_back(engine.submit(engine.prepare_tokens(peer_prompt), greedy(128, false)));
+                peers.push_back(
+                    engine.submit(engine.prepare_tokens(peer_prompt), greedy(128, false)));
             }
             std::uint32_t prefilling = 0;
-            if (!wait_scheduler(engine, &prefilling, [&](const auto& stats) {
-                    return stats.decode_ready_requests == concurrency - 1;
-                }, "corrupt fallback peer decode")) { return 1; }
+            if (!wait_scheduler(
+                    engine, &prefilling,
+                    [&](const auto& stats) {
+                        return stats.decode_ready_requests == concurrency - 1;
+                    },
+                    "corrupt fallback peer decode")) {
+                return 1;
+            }
         }
         const auto before = engine.runtime_stats();
         if (fault == RestoreFault::CopyEvent) { Disk::test_fail_next_restore_event_allocation(); }
         if (fault == RestoreFault::HostMetadata) { Disk::test_fail_next_load_host_allocation(); }
-        if (fault == RestoreFault::SetupMetadata) { Disk::test_fail_next_restore_setup_allocation(); }
-        if (fault == RestoreFault::CheckpointMetadata) { Disk::test_fail_next_checkpoint_metadata_allocation(); }
-        auto recovery_options = greedy(1, true);
+        if (fault == RestoreFault::SetupMetadata) {
+            Disk::test_fail_next_restore_setup_allocation();
+        }
+        if (fault == RestoreFault::CheckpointMetadata) {
+            Disk::test_fail_next_checkpoint_metadata_allocation();
+        }
+        auto recovery_options                                 = greedy(1, true);
         recovery_options.execution.capture_context_checkpoint = dflash;
         const auto restored = engine.generate(engine.prepare_tokens(history), recovery_options);
-        const auto after = engine.runtime_stats();
+        const auto after    = engine.runtime_stats();
         if (restored.prefix_reuse_source != ninfer::PrefixReuseSource::None ||
             restored.generated_token_ids.size() != 1 ||
-            (fault == RestoreFault::CheckpointMetadata && restored.captured_context_checkpoint_tokens == 0) ||
+            (fault == RestoreFault::CheckpointMetadata &&
+             restored.captured_context_checkpoint_tokens == 0) ||
             (fault == RestoreFault::CorruptPage && after.kv_disk_drops <= before.kv_disk_drops) ||
             (fault == RestoreFault::CopyEvent && Disk::test_restore_event_allocation_pending()) ||
-            (fault == RestoreFault::HostMetadata && Disk::test_load_host_allocation_failure_pending()) ||
-            (fault == RestoreFault::SetupMetadata && Disk::test_restore_setup_allocation_failure_pending()) ||
-            (fault == RestoreFault::CheckpointMetadata && Disk::test_checkpoint_metadata_allocation_failure_pending())) {
+            (fault == RestoreFault::HostMetadata &&
+             Disk::test_load_host_allocation_failure_pending()) ||
+            (fault == RestoreFault::SetupMetadata &&
+             Disk::test_restore_setup_allocation_failure_pending()) ||
+            (fault == RestoreFault::CheckpointMetadata &&
+             Disk::test_checkpoint_metadata_allocation_failure_pending())) {
             return fail("corrupt disk restore did not transparently fall back to cold prefill");
         }
         for (auto& peer : peers) {
@@ -1587,17 +1611,20 @@ int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = fals
         if (next.generated_token_ids.size() != 4) {
             return fail("Engine did not accept a later request after cache fallback");
         }
-        std::cout << "corrupt disk fallback C=" << concurrency << " dflash=" << dflash << " fault=" << static_cast<int>(fault) << " passed\n";
+        std::cout << "corrupt disk fallback C=" << concurrency << " dflash=" << dflash
+                  << " fault=" << static_cast<int>(fault) << " passed\n";
     }
     return 0;
 }
 
 int exercise_disk_metadata_fallback(const char* artifact, bool dflash = false) {
     for (RestoreFault fault : {RestoreFault::HostMetadata, RestoreFault::SetupMetadata,
-                              RestoreFault::CheckpointMetadata, RestoreFault::CopyEvent}) {
+                               RestoreFault::CheckpointMetadata, RestoreFault::CopyEvent}) {
         try {
             if (const int result = exercise_corrupt_restore_falls_back(artifact, dflash, fault);
-                result != 0) { return result; }
+                result != 0) {
+                return result;
+            }
         } catch (const std::exception& error) {
             if (!dflash && fault == RestoreFault::CheckpointMetadata &&
                 std::string(error.what()).find("mtp/") != std::string::npos) {
@@ -1661,8 +1688,7 @@ int exercise_dflash_cancel_then_continue(const char* artifact) {
     if (hit_a.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
         if (const int rc =
                 expect_hit(hit_a, ninfer::PrefixReuseSource::HostDisk,
-                           static_cast<std::uint32_t>(history_a.size()),
-                           "DFlash cancel A");
+                           static_cast<std::uint32_t>(history_a.size()), "DFlash cancel A");
             rc != 0) {
             return rc;
         }
@@ -1674,8 +1700,8 @@ int exercise_dflash_fingerprint(const char* artifact) {
     const auto disk_dir = make_disk_dir("fp-dflash");
     {
         ninfer::Engine greedy_engine(disk_options(artifact, disk_dir, 1, kRamBytes));
-        if (const int rc = capture_to_ram(greedy_engine, tokens_a(), tokens_b(), nullptr,
-                                           "fingerprint land");
+        if (const int rc =
+                capture_to_ram(greedy_engine, tokens_a(), tokens_b(), nullptr, "fingerprint land");
             rc != 0) {
             return rc;
         }
@@ -1693,14 +1719,12 @@ int exercise_dflash_fingerprint(const char* artifact) {
         threw = true;
         if (message.find("fingerprint") == std::string::npos &&
             message.find("speculative") == std::string::npos) {
-            std::cerr << "DFlash reopen of greedy directory failed for the wrong reason: " << message
-                      << '\n';
+            std::cerr << "DFlash reopen of greedy directory failed for the wrong reason: "
+                      << message << '\n';
             return 1;
         }
     }
-    if (!threw) {
-        return fail("DFlash Engine accepted a greedy (spec=off) disk directory");
-    }
+    if (!threw) { return fail("DFlash Engine accepted a greedy (spec=off) disk directory"); }
     return 0;
 }
 
@@ -1727,7 +1751,7 @@ int exercise_dflash_three_tier(const char* artifact) {
 
     ninfer::Engine engine(dflash_disk_options(artifact, disk_dir, 1, kRamBytes));
     const auto history = resume_prefix(tokens_a(), generated);
-    const auto hit      = engine.generate(engine.prepare_tokens(history), greedy(4, true));
+    const auto hit     = engine.generate(engine.prepare_tokens(history), greedy(4, true));
     if (const int rc =
             expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
                        static_cast<std::uint32_t>(history.size()), "DFlash restart HostDisk");
@@ -1757,7 +1781,8 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("restart HostDisk", [&] { return exercise_restart_host_disk(artifact); });
+    if (const int rc =
+            run("restart HostDisk", [&] { return exercise_restart_host_disk(artifact); });
         rc != 0) {
         return rc;
     }
@@ -1770,12 +1795,13 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("VRAM wins equal disk",
-                           [&] { return exercise_vram_wins_equal_disk(artifact); });
+    if (const int rc =
+            run("VRAM wins equal disk", [&] { return exercise_vram_wins_equal_disk(artifact); });
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("RAM wins equal disk", [&] { return exercise_ram_wins_equal_disk(artifact); });
+    if (const int rc =
+            run("RAM wins equal disk", [&] { return exercise_ram_wins_equal_disk(artifact); });
         rc != 0) {
         return rc;
     }
@@ -1794,8 +1820,8 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("C=1 dirty-lane HostDisk",
-                           [&] { return exercise_c1_dirty_lane(artifact); });
+    if (const int rc =
+            run("C=1 dirty-lane HostDisk", [&] { return exercise_c1_dirty_lane(artifact); });
         rc != 0) {
         return rc;
     }
@@ -1809,8 +1835,8 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("C=2 dirty-only HostDisk",
-                           [&] { return exercise_c2_dirty_disk_hit(artifact); });
+    if (const int rc =
+            run("C=2 dirty-only HostDisk", [&] { return exercise_c2_dirty_disk_hit(artifact); });
         rc != 0) {
         return rc;
     }
@@ -1905,16 +1931,16 @@ int exercise_artifact(const char* artifact) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool corrupt_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                              std::string(argv[2]) == "corrupt";
-    const bool metadata_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                               std::string(argv[2]) == "metadata";
-    const bool event_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                            std::string(argv[2]) == "event";
-    const bool dflash_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                             std::string(argv[2]) == "dflash";
-    const bool suffix_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                             std::string(argv[2]) == "suffix";
+    const bool corrupt_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "corrupt";
+    const bool metadata_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "metadata";
+    const bool event_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "event";
+    const bool dflash_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "dflash";
+    const bool suffix_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "suffix";
     if (argc != 1 && !corrupt_only && !metadata_only && !event_only && !dflash_only &&
         !suffix_only) {
         return fail("usage: disk_real [--case corrupt|metadata|event|dflash|suffix]");
@@ -1936,17 +1962,44 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (groupwise != nullptr && *groupwise != '\0') {
-        if (const int result = (suffix_only ? exercise_suffix_prefill(groupwise) : event_only ? exercise_corrupt_restore_falls_back(groupwise, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(groupwise) : corrupt_only ? exercise_corrupt_restore_falls_back(groupwise) : exercise_artifact(groupwise)); result != 0) { return result; }
+        if (const int result = (suffix_only     ? exercise_suffix_prefill(groupwise)
+                                : event_only    ? exercise_corrupt_restore_falls_back(
+                                                      groupwise, false, RestoreFault::CopyEvent)
+                                : metadata_only ? exercise_disk_metadata_fallback(groupwise)
+                                : corrupt_only  ? exercise_corrupt_restore_falls_back(groupwise)
+                                                : exercise_artifact(groupwise));
+            result != 0) {
+            return result;
+        }
     }
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (const int result = (suffix_only ? exercise_suffix_prefill(nvfp4) : event_only ? exercise_corrupt_restore_falls_back(nvfp4, false, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(nvfp4) : corrupt_only ? exercise_corrupt_restore_falls_back(nvfp4) : exercise_artifact(nvfp4)); result != 0) { return result; }
+        if (const int result = (suffix_only     ? exercise_suffix_prefill(nvfp4)
+                                : event_only    ? exercise_corrupt_restore_falls_back(
+                                                      nvfp4, false, RestoreFault::CopyEvent)
+                                : metadata_only ? exercise_disk_metadata_fallback(nvfp4)
+                                : corrupt_only  ? exercise_corrupt_restore_falls_back(nvfp4)
+                                                : exercise_artifact(nvfp4));
+            result != 0) {
+            return result;
+        }
     }
     if (dflash != nullptr && *dflash != '\0' &&
         (nvfp4 == nullptr || *nvfp4 == '\0' || std::string(dflash) != nvfp4)) {
-        if (const int result = (suffix_only ? exercise_suffix_prefill(dflash) : event_only ? exercise_corrupt_restore_falls_back(dflash, true, RestoreFault::CopyEvent) : metadata_only ? exercise_disk_metadata_fallback(dflash, true) : corrupt_only ? exercise_corrupt_restore_falls_back(dflash, true) : exercise_artifact(dflash)); result != 0) { return result; }
+        if (const int result = (suffix_only     ? exercise_suffix_prefill(dflash)
+                                : event_only    ? exercise_corrupt_restore_falls_back(
+                                                      dflash, true, RestoreFault::CopyEvent)
+                                : metadata_only ? exercise_disk_metadata_fallback(dflash, true)
+                                : corrupt_only  ? exercise_corrupt_restore_falls_back(dflash, true)
+                                                : exercise_artifact(dflash));
+            result != 0) {
+            return result;
+        }
     }
-    if (!corrupt_only && !metadata_only && !event_only && !suffix_only && dflash != nullptr && *dflash != '\0') {
-        if (const int result = exercise_corrupt_restore_falls_back(dflash, true); result != 0) { return result; }
+    if (!corrupt_only && !metadata_only && !event_only && !suffix_only && dflash != nullptr &&
+        *dflash != '\0') {
+        if (const int result = exercise_corrupt_restore_falls_back(dflash, true); result != 0) {
+            return result;
+        }
     }
     std::cout << "ok\n";
     return 0;

@@ -345,8 +345,8 @@ int partition_case(const Case& test_case, std::initializer_list<std::int32_t> ch
                                   ref.final_state, gated_delta_net_state_fp32_criterion());
     failures += verify_recurrence(label + " output delta", partition_output, full_output,
                                   gated_delta_net_output_bf16_criterion());
-    failures += verify_recurrence(label + " state delta", partition_state_values,
-                                  full_state_values, gated_delta_net_state_fp32_criterion());
+    failures += verify_recurrence(label + " state delta", partition_state_values, full_state_values,
+                                  gated_delta_net_state_fp32_criterion());
     failures += full_state.verify_guards((label + " full state").c_str());
     failures += partition_state.verify_guards((label + " partition state").c_str());
     failures += full_out.verify_guards((label + " full out").c_str());
@@ -520,9 +520,9 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
                                   valid_tensor, initial_tensor, bases_tensor, out_tensor, nullptr);
     cuda_synchronize();
 
-    const std::string label = std::string(test_case.name) +
-                              " batched snapshot B=" + std::to_string(batch) +
-                              (masked ? " masked" : " dense");
+    const std::string label              = std::string(test_case.name) +
+                                           " batched snapshot B=" + std::to_string(batch) +
+                                           (masked ? " masked" : " dense");
     int failures                         = 0;
     const std::vector<double> got_output = from_device_bf16(out.data(), aggregate.v.size());
     failures += verify_recurrence(label + " out", got_output, expected_output,
@@ -673,8 +673,8 @@ int main() {
     failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
-    failures += distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true},
-                                    15404u);
+    failures +=
+        distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true}, 15404u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);

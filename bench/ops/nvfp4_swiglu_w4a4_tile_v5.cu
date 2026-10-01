@@ -25,14 +25,14 @@ using namespace ninfer::ops::detail;
 
 namespace {
 
-constexpr int kT                   = 4;
-constexpr std::int32_t kGateUp     = 34816;
-constexpr std::int32_t kInter      = 17408;
-constexpr std::int32_t kHidden     = 5120;
-constexpr std::int32_t kDownOut    = 5120;
-constexpr std::size_t kFlushBytes  = 256ULL << 20;
-constexpr double kWeightBytes      = 34816.0 * 5120.0 * 0.5625;
-constexpr double kDramFloorUs      = kWeightBytes / (bench::kRooflineGBs * 1.0e3);
+constexpr int kT                  = 4;
+constexpr std::int32_t kGateUp    = 34816;
+constexpr std::int32_t kInter     = 17408;
+constexpr std::int32_t kHidden    = 5120;
+constexpr std::int32_t kDownOut   = 5120;
+constexpr std::size_t kFlushBytes = 256ULL << 20;
+constexpr double kWeightBytes     = 34816.0 * 5120.0 * 0.5625;
+constexpr double kDramFloorUs     = kWeightBytes / (bench::kRooflineGBs * 1.0e3);
 
 using Geometry = Nvfp4MlpGateUpGeometry;
 using Prod     = Nvfp4W4a4MmaSchedule<48, 64, 256, 3, 4, 2, 2>;
@@ -96,11 +96,10 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
     nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, SwiGluOutput,
                           SwiGluRows<Schedule>, true, WeightCache>
-        <<<grid, Schedule::kThreads, 0, stream>>>(activation,
-                                                   static_cast<const std::uint8_t*>(weight.qdata),
-                                                   static_cast<const std::uint8_t*>(weight.scales),
-                                                   kT, alpha, Nvfp4IdentityEpilogue{}, output,
-                                                   row_policy);
+        <<<grid, Schedule::kThreads, 0, stream>>>(
+            activation, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), kT, alpha, Nvfp4IdentityEpilogue{},
+            output, row_policy);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -153,10 +152,10 @@ int main() {
         WorkspaceArena ws_prod(std::max(
             nvfp4_linear_swiglu_workspace_capacity_bytes(ops::LinearPolicy::AllowA4, kT, kT),
             static_cast<std::size_t>(256)));
-        WorkspaceArena ws_dn(std::max(
-            ops::linear_workspace_capacity_bytes(QType::NVFP4, kDownOut, kInter,
-                                                 ops::LinearPolicy::A16Only, kT, kT),
-            static_cast<std::size_t>(256)));
+        WorkspaceArena ws_dn(
+            std::max(ops::linear_workspace_capacity_bytes(QType::NVFP4, kDownOut, kInter,
+                                                          ops::LinearPolicy::A16Only, kT, kT),
+                     static_cast<std::size_t>(256)));
 
         Tensor x(xin.p, DType::BF16, {kHidden, kT});
         Tensor m(mid.p, DType::BF16, {kInter, kT});
@@ -167,6 +166,7 @@ int main() {
             bool production_ef;
             LaunchFn gemm;
         };
+
         const Cand cands[] = {
             {"prod_M48N64_s2_ef", true, nullptr},
             {"M48N64_s2_cg", false, &launch_named<Prod>},
@@ -182,8 +182,8 @@ int main() {
 
         std::printf("W4A4 SwiGLU T=4 tile/stage sweep  (DRAM floor %.1f us, %.0f MB)\n",
                     kDramFloorUs, kWeightBytes / 1.0e6);
-        std::printf("%-20s %9s %9s %8s %8s %9s %9s %8s %8s\n", "variant", "sw_c", "sw_w",
-                    "sw_c%", "sw_w%", "pair_c", "pair_w", "p_c%", "p_w%");
+        std::printf("%-20s %9s %9s %8s %8s %9s %9s %8s %8s\n", "variant", "sw_c", "sw_w", "sw_c%",
+                    "sw_w%", "pair_c", "pair_w", "p_c%", "p_w%");
 
         double base_sw_c = 0, base_sw_w = 0, base_p_c = 0, base_p_w = 0;
         for (const auto& c : cands) {

@@ -17,6 +17,7 @@ struct StreamCopyGate {
     bool released = false;
     bool finished = false;
     bool launched = false;
+
     static void CUDART_CB callback(void* pointer) {
         auto& gate = *static_cast<StreamCopyGate*>(pointer);
         std::unique_lock lock(gate.mutex);
@@ -24,15 +25,18 @@ struct StreamCopyGate {
         gate.finished = true;
         gate.cv.notify_all();
     }
+
     void launch(cudaStream_t stream) {
         CUDA_CHECK(cudaLaunchHostFunc(stream, callback, this));
         launched = true;
     }
+
     void release() {
         std::lock_guard lock(mutex);
         released = true;
         cv.notify_all();
     }
+
     ~StreamCopyGate() {
         release();
         if (launched) {

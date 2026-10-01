@@ -175,10 +175,10 @@ __launch_bounds__(64, 16) __global__
     const int row  = static_cast<int>(blockIdx.x);
     if (row >= n) { return; }
 
-    const int kg_padded          = padded_k / Q5RowSplitStorage::kGroupK;
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
-    const std::uint8_t* high_row = high + static_cast<std::int64_t>(row) * kg_padded *
-                                              Q5RowSplitSimtSchedule::kHighBytesPerGroup;
+    const int kg_padded           = padded_k / Q5RowSplitStorage::kGroupK;
+    const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
+    const std::uint8_t* high_row  = high + static_cast<std::int64_t>(row) * kg_padded *
+                                               Q5RowSplitSimtSchedule::kHighBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
 
     float acc[kTt];
@@ -307,10 +307,10 @@ __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
     const int row   = static_cast<int>(blockIdx.x);
     if (row >= n) { return; }
 
-    const int kg_padded          = padded_k / Q5RowSplitStorage::kGroupK;
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
-    const std::uint8_t* high_row = high + static_cast<std::int64_t>(row) * kg_padded *
-                                              Q5RowSplitSimtSchedule::kHighBytesPerGroup;
+    const int kg_padded           = padded_k / Q5RowSplitStorage::kGroupK;
+    const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
+    const std::uint8_t* high_row  = high + static_cast<std::int64_t>(row) * kg_padded *
+                                               Q5RowSplitSimtSchedule::kHighBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
 
     float acc[kTt];

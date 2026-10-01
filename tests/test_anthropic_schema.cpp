@@ -110,11 +110,11 @@ Json parse_sse(const std::string& event, std::string* out_type = nullptr) {
 }
 
 int test_parse_basic_and_system() {
-    int failures                = 0;
-    const Json body             = {{"model", "claude-sonnet-4-5"},
-                                   {"max_tokens", 256},
-                                   {"system", "be terse"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+    int failures    = 0;
+    const Json body = {{"model", "claude-sonnet-4-5"},
+                       {"max_tokens", 256},
+                       {"system", "be terse"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.model == "claude-sonnet-4-5", "model echoed verbatim");
     failures += check(req.max_tokens == 256 && req.max_tokens_set, "max_tokens parsed");
@@ -224,15 +224,15 @@ int test_ordered_system_messages() {
                       }) == "invalid_message_order",
                       "system section followed by user was not rejected by the Anthropic schema");
 
-    const Json tool_use          = Json{{"role", "assistant"},
-                                        {"content", Json::array({Json{{"type", "tool_use"},
-                                                                      {"id", "toolu_1"},
-                                                                      {"name", "inspect"},
-                                                                      {"input", Json::object()}}})}};
-    const Json tool_result       = Json{{"role", "user"},
-                                        {"content", Json::array({Json{{"type", "tool_result"},
-                                                                      {"tool_use_id", "toolu_1"},
-                                                                      {"content", "done"}}})}};
+    const Json tool_use    = Json{{"role", "assistant"},
+                                  {"content", Json::array({Json{{"type", "tool_use"},
+                                                                {"id", "toolu_1"},
+                                                                {"name", "inspect"},
+                                                                {"input", Json::object()}}})}};
+    const Json tool_result = Json{{"role", "user"},
+                                  {"content", Json::array({Json{{"type", "tool_result"},
+                                                                {"tool_use_id", "toolu_1"},
+                                                                {"content", "done"}}})}};
     const Json after_tool_result = {
         {"model", "m"},
         {"max_tokens", 16},
@@ -308,8 +308,8 @@ int test_missing_and_bad_fields() {
                       "non-positive max_tokens rejected");
 
     // Omitting max_tokens falls back to the server default (lenient vs the API).
-    const Json no_max           = {{"model", "m"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const Json no_max = {{"model", "m"},
+                         {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     const GenerationRequest req = parse_messages_request(no_max, default_limits());
     failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens default applied");
 
@@ -318,8 +318,7 @@ int test_missing_and_bad_fields() {
                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
                    {"ninfer", Json{{"capture_context_checkpoint", true}}}};
     const GenerationRequest ignored = parse_messages_request(ninfer, default_limits());
-    failures += check(!ignored.capture_context_checkpoint,
-                      "Anthropic ninfer object does not pin");
+    failures += check(!ignored.capture_context_checkpoint, "Anthropic ninfer object does not pin");
     return failures;
 }
 
@@ -479,15 +478,15 @@ int test_tool_use_result_roundtrip() {
 }
 
 int test_thinking_and_sampling() {
-    int failures                = 0;
-    Json body                   = {{"model", "m"},
-                                   {"max_tokens", 8},
-                                   {"temperature", 0.3},
-                                   {"top_p", 0.8},
-                                   {"top_k", 40},
-                                   {"stop_sequences", Json::array({"STOP", "END"})},
-                                   {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    int failures = 0;
+    Json body    = {{"model", "m"},
+                    {"max_tokens", 8},
+                    {"temperature", 0.3},
+                    {"top_p", 0.8},
+                    {"top_k", 40},
+                    {"stop_sequences", Json::array({"STOP", "END"})},
+                    {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
+                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.3,
                       "temperature parsed");
@@ -794,16 +793,14 @@ int test_system_prepend() {
               Json::array(
                   {Json{{"role", "user"}, {"content", "weather?"}},
                    Json{{"role", "assistant"},
-                        {"content",
-                         Json::array({Json{{"type", "tool_use"},
-                                           {"id", "toolu_1"},
-                                           {"name", "get_weather"},
-                                           {"input", Json{{"city", "Paris"}}}}})}},
+                        {"content", Json::array({Json{{"type", "tool_use"},
+                                                      {"id", "toolu_1"},
+                                                      {"name", "get_weather"},
+                                                      {"input", Json{{"city", "Paris"}}}}})}},
                    Json{{"role", "user"},
-                        {"content",
-                         Json::array({Json{{"type", "tool_result"},
-                                           {"tool_use_id", "toolu_1"},
-                                           {"content", "20"}}})}}})}},
+                        {"content", Json::array({Json{{"type", "tool_result"},
+                                                      {"tool_use_id", "toolu_1"},
+                                                      {"content", "20"}}})}}})}},
         default_limits());
     const ninfer::PromptInput looped = translate(tool_loop, "P");
     failures += check(!looped.options.tool_jsons.empty(), "Anthropic tool-loop tools were dropped");

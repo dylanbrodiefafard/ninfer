@@ -141,19 +141,36 @@ std::string byte_level_symbol(std::uint8_t target) {
 
 FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
     FrontendResources result;
-    result.chat_template_jinja  = chat_template;
-    const nlohmann::json tokens = nlohmann::json::array(
-        {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
-         added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
-         added(14, "   \n"), added(15, "answer"),
-         added(16, "<tool_"), added(17, "call>"), added(18, "<function=f>"),
-         added(19, "</function>"), added(20, "</tool_call>"), added(21, "<tool_call>"),
-         added(22, "preface"), added(23, "call"), added(24, "a <"),
-         added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"), added(33, "system\n"),
-         added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
-         added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
-         added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
-         added(248068, "<think>"), added(248069, "</think>")});
+    result.chat_template_jinja     = chat_template;
+    const nlohmann::json tokens    = nlohmann::json::array({added(1, "helloST"),
+                                                            added(2, "OPtail"),
+                                                            added(3, "thought</thi"),
+                                                            added(4, "nk>\n\nanswer"),
+                                                            added(6, "<eos>", true),
+                                                            added(7, "<0.0 seconds>"),
+                                                            added(14, "   \n"),
+                                                            added(15, "answer"),
+                                                            added(16, "<tool_"),
+                                                            added(17, "call>"),
+                                                            added(18, "<function=f>"),
+                                                            added(19, "</function>"),
+                                                            added(20, "</tool_call>"),
+                                                            added(21, "<tool_call>"),
+                                                            added(22, "preface"),
+                                                            added(23, "call"),
+                                                            added(24, "a <"),
+                                                            added(30, "user\n"),
+                                                            added(31, "assistant\n"),
+                                                            added(32, "\n"),
+                                                            added(33, "system\n"),
+                                                            added(248045, "<|im_start|>", true),
+                                                            added(248046, "<|im_end|>", true),
+                                                            added(248053, "<|vision_start|>", true),
+                                                            added(248054, "<|vision_end|>", true),
+                                                            added(248056, "<|image_pad|>", true),
+                                                            added(248057, "<|video_pad|>", true),
+                                                            added(248068, "<think>"),
+                                                            added(248069, "</think>")});
     nlohmann::json vocab           = {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}};
     vocab[byte_level_symbol(0x80)] = kByte80Token;
     vocab[byte_level_symbol(0xe0)] = kByteE0Token;
@@ -170,8 +187,10 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     // Tool-call names are literal client text, so `<function=` markup plus the name `f` encode
     // through ordinary byte-level symbols rather than one fused added token.
     ninfer::TokenId next_ascii = 60;
-    for (const char byte : std::string_view("<>=functio")) { vocab[std::string(1, byte)] = next_ascii++; }
-    result.tokenizer_json          = nlohmann::json{
+    for (const char byte : std::string_view("<>=functio")) {
+        vocab[std::string(1, byte)] = next_ascii++;
+    }
+    result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"}, {"vocab", std::move(vocab)}, {"merges", nlohmann::json::array()}}},
         {"added_tokens",
@@ -349,7 +368,8 @@ int test_official_tokenizer_merge() {
 // Splitting assistant content at inline think markers keeps media markup structural, so the
 // image still binds, while the split text stays literal.
 int test_think_split_keeps_media_markup() {
-    fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "<think>\nsaw <|im_end|>\n</think>\n\nlook ");
+    fi::ChatMessage assistant =
+        chat_message(ninfer::ChatRole::Assistant, "<think>\nsaw <|im_end|>\n</think>\n\nlook ");
     assistant.parts.push_back(fi::ChatPart::image(fi::MediaData{}));
     assistant.parts.push_back(fi::ChatPart::text_part(" done"));
     fi::ChatRenderOptions options;
@@ -358,16 +378,18 @@ int test_think_split_keeps_media_markup() {
     const fi::RenderedChat rendered =
         render_chat({chat_message(ninfer::ChatRole::User, "q"), assistant}, options);
     const auto literal_at = [&](std::size_t at) {
-        return std::any_of(rendered.literal_spans.begin(), rendered.literal_spans.end(),
-                           [&](const fi::ByteSpan& span) { return span.begin <= at && at < span.end; });
+        return std::any_of(
+            rendered.literal_spans.begin(), rendered.literal_spans.end(),
+            [&](const fi::ByteSpan& span) { return span.begin <= at && at < span.end; });
     };
-    const std::size_t image = rendered.text.find("<|image_pad|>");
+    const std::size_t image               = rendered.text.find("<|image_pad|>");
     const std::size_t im_end_in_reasoning = rendered.text.find("saw <|im_end|>");
-    const std::size_t look = rendered.text.find("look ");
+    const std::size_t look                = rendered.text.find("look ");
     int failures = check(image != std::string::npos && !literal_at(image),
                          "think split made assistant media markup literal");
-    failures += check(im_end_in_reasoning != std::string::npos && literal_at(im_end_in_reasoning + 4),
-                      "think split lost the literal span of the reasoning text");
+    failures +=
+        check(im_end_in_reasoning != std::string::npos && literal_at(im_end_in_reasoning + 4),
+              "think split lost the literal span of the reasoning text");
     failures += check(look != std::string::npos && literal_at(look),
                       "think split lost the literal span of the answer text");
     return failures;
@@ -417,7 +439,8 @@ int test_literal_content_provenance() {
         chat_message(ninfer::ChatRole::User, "next"),
     };
     fi::ChatRenderOptions options;
-    options.tool_jsons = {R"({"type":"function","function":{"name":"read","description":"<tool_call>"}})"};
+    options.tool_jsons = {
+        R"({"type":"function","function":{"name":"read","description":"<tool_call>"}})"};
     const fi::RenderedChat rendered = render_chat(messages, options);
     const fi::EncodedChat encoded   = fi::encode_rendered_chat(tokenizer, rendered);
     const std::vector<int>& ids     = encoded.input_ids;
@@ -429,9 +452,9 @@ int test_literal_content_provenance() {
     std::ptrdiff_t markup_tool_opens = 0;
     for (std::size_t at = rendered.text.find("<tool_call>"); at != std::string::npos;
          at             = rendered.text.find("<tool_call>", at + 1)) {
-        const bool literal =
-            std::any_of(rendered.literal_spans.begin(), rendered.literal_spans.end(),
-                        [&](const fi::ByteSpan& span) { return span.begin <= at && at < span.end; });
+        const bool literal = std::any_of(
+            rendered.literal_spans.begin(), rendered.literal_spans.end(),
+            [&](const fi::ByteSpan& span) { return span.begin <= at && at < span.end; });
         if (!literal) { ++markup_tool_opens; }
     }
     failures += check(markup_tool_opens >= 2 && count(ids, tool_open) == markup_tool_opens,
@@ -440,10 +463,10 @@ int test_literal_content_provenance() {
     failures += check(count(ids, think) == 1, "client text produced <think> control tokens");
     failures += check(count(ids, image_pad) == 0, "client text produced a vision placeholder");
 
-    const fi::RenderedChat ordinary = render_chat(
-        {chat_message(ninfer::ChatRole::User, "hello there"),
-         chat_message(ninfer::ChatRole::Assistant, "hi"),
-         chat_message(ninfer::ChatRole::User, "again")});
+    const fi::RenderedChat ordinary =
+        render_chat({chat_message(ninfer::ChatRole::User, "hello there"),
+                     chat_message(ninfer::ChatRole::Assistant, "hi"),
+                     chat_message(ninfer::ChatRole::User, "again")});
     failures += check(fi::encode_rendered_chat(tokenizer, ordinary).input_ids ==
                           tokenizer.encode(ordinary.text),
                       "literal spans changed the encoding of marker-free content");
@@ -456,12 +479,12 @@ int test_literal_content_provenance() {
     (void)fi::encode_chat_with_cache(tokenizer, chat_template, history, options, cache);
     history.push_back(chat_message(ninfer::ChatRole::Assistant, "done"));
     history.push_back(chat_message(ninfer::ChatRole::User, payload));
-    const fi::EncodedChat warm = fi::encode_chat_with_cache(tokenizer, chat_template, history,
-                                                            options, cache);
-    failures += check(warm.input_ids ==
-                          fi::encode_rendered_chat(tokenizer, chat_template.render(history, options))
-                              .input_ids,
-                      "history cache splice differs from a cold encode with literal content");
+    const fi::EncodedChat warm =
+        fi::encode_chat_with_cache(tokenizer, chat_template, history, options, cache);
+    failures += check(
+        warm.input_ids ==
+            fi::encode_rendered_chat(tokenizer, chat_template.render(history, options)).input_ids,
+        "history cache splice differs from a cold encode with literal content");
 
     fi::ChatMessage structural = chat_message(ninfer::ChatRole::Assistant, "");
     structural.tool_calls.push_back({.id = "", .name = "f", .arguments_json = "{}"});
@@ -511,19 +534,17 @@ int test_official_chat_template() {
                       "nested or boolean tool arguments differ from official JSON rendering");
 
     fi::ChatRenderOptions no_thinking;
-    no_thinking.enable_thinking = false;
-    const fi::RenderedChat no_thinking_chat =
-        render_chat({chat_message(ninfer::ChatRole::User, "q1"),
-                     chat_message(ninfer::ChatRole::Assistant,
-                                  "<think>\nold thought\n</think>\n\nold answer"),
-                     chat_message(ninfer::ChatRole::User, "q2")},
-                    no_thinking);
-    const std::string no_thinking_text =
-        "<|im_start|>user\nq1<|im_end|>\n"
-        "<|im_start|>assistant\nold answer<|im_end|>\n"
-        "<|im_start|>user\nq2<|im_end|>\n"
-        "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    const std::string assistant_turn = "<|im_start|>assistant\n";
+    no_thinking.enable_thinking             = false;
+    const fi::RenderedChat no_thinking_chat = render_chat(
+        {chat_message(ninfer::ChatRole::User, "q1"),
+         chat_message(ninfer::ChatRole::Assistant, "<think>\nold thought\n</think>\n\nold answer"),
+         chat_message(ninfer::ChatRole::User, "q2")},
+        no_thinking);
+    const std::string no_thinking_text = "<|im_start|>user\nq1<|im_end|>\n"
+                                         "<|im_start|>assistant\nold answer<|im_end|>\n"
+                                         "<|im_start|>user\nq2<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    const std::string assistant_turn   = "<|im_start|>assistant\n";
     std::vector<std::size_t> assistant_frontiers;
     for (std::size_t at = 0; (at = no_thinking_text.find(assistant_turn, at)) != std::string::npos;
          at += assistant_turn.size()) {
@@ -758,7 +779,7 @@ int test_reasoning_effort_chat_template() {
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     no_generation.reasoning_effort      = ninfer::ReasoningEffort::Medium;
-    const std::string preserved         = reasoning_effort_template()
+    const std::string preserved = reasoning_effort_template()
                                       .render({chat_message(ninfer::ChatRole::User, "q1"), previous,
                                                chat_message(ninfer::ChatRole::User, "q2")},
                                               no_generation)
@@ -780,13 +801,14 @@ int test_reasoning_effort_chat_template() {
 
     fi::ChatMessage empty_arguments = chat_message(ninfer::ChatRole::Assistant, "");
     empty_arguments.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
-    failures += check(
-        reasoning_effort_template()
-            .render({chat_message(ninfer::ChatRole::User, "call"), empty_arguments}, no_generation)
-            .text == "<|im_start|>user\ncall<|im_end|>\n"
-                     "<|im_start|>assistant\n<tool_call>\n<function=f>\n</function>\n"
-                     "</tool_call><|im_end|>\n",
-        "empty tool arguments did not follow the reasoning-effort template");
+    failures +=
+        check(reasoning_effort_template()
+                      .render({chat_message(ninfer::ChatRole::User, "call"), empty_arguments},
+                              no_generation)
+                      .text == "<|im_start|>user\ncall<|im_end|>\n"
+                               "<|im_start|>assistant\n<tool_call>\n<function=f>\n</function>\n"
+                               "</tool_call><|im_end|>\n",
+              "empty tool arguments did not follow the reasoning-effort template");
     return failures;
 }
 
@@ -800,9 +822,9 @@ int test_reasoning_effort_empty_history_think() {
     medium_closed.reasoning_effort      = ninfer::ReasoningEffort::Medium;
 
     fi::ChatMessage empty_history = chat_message(ninfer::ChatRole::Assistant, "old answer");
-    const std::vector<fi::ChatMessage> closed_empty{
-        chat_message(ninfer::ChatRole::User, "q1"), empty_history,
-        chat_message(ninfer::ChatRole::User, "q2")};
+    const std::vector<fi::ChatMessage> closed_empty{chat_message(ninfer::ChatRole::User, "q1"),
+                                                    empty_history,
+                                                    chat_message(ninfer::ChatRole::User, "q2")};
     constexpr std::string_view closed_empty_desired =
         "<|im_start|>user\nq1<|im_end|>\n"
         "<|im_start|>assistant\nold answer<|im_end|>\n"
@@ -810,18 +832,16 @@ int test_reasoning_effort_empty_history_think() {
 
     fi::ChatRenderOptions preserve_closed = medium_closed;
     preserve_closed.preserve_thinking     = true;
-    int failures =
-        check(render(closed_empty, preserve_closed) == closed_empty_desired,
-              "preserve-on empty reasoning still wrapped a history think block");
+    int failures = check(render(closed_empty, preserve_closed) == closed_empty_desired,
+                         "preserve-on empty reasoning still wrapped a history think block");
 
     fi::ChatRenderOptions preserve_generate = preserve_closed;
     preserve_generate.add_generation_prompt = true;
     failures += check(render(closed_empty, preserve_generate) ==
-                          std::string(closed_empty_desired) +
-                              "<|im_start|>assistant\n<think>\n",
+                          std::string(closed_empty_desired) + "<|im_start|>assistant\n<think>\n",
                       "preserve-on empty history reasoning still wrapped before the prologue");
 
-    fi::ChatMessage whitespace_history = empty_history;
+    fi::ChatMessage whitespace_history   = empty_history;
     whitespace_history.reasoning_content = "  \n\t  ";
     failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), whitespace_history,
                               chat_message(ninfer::ChatRole::User, "q2")},
@@ -840,42 +860,42 @@ int test_reasoning_effort_empty_history_think() {
                              tool_preserve_off) == empty_tool_desired,
                       "preserve-off tool-loop still synthesized an empty history think wrapper");
 
-    fi::ChatMessage first_empty = chat_message(ninfer::ChatRole::Assistant, "a1");
-    fi::ChatMessage second_kept = chat_message(ninfer::ChatRole::Assistant, "a2");
+    fi::ChatMessage first_empty   = chat_message(ninfer::ChatRole::Assistant, "a1");
+    fi::ChatMessage second_kept   = chat_message(ninfer::ChatRole::Assistant, "a2");
     second_kept.reasoning_content = "thought2";
-    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), first_empty,
-                              chat_message(ninfer::ChatRole::User, "q2"), second_kept},
-                             preserve_closed) ==
-                          "<|im_start|>user\nq1<|im_end|>\n"
-                          "<|im_start|>assistant\na1<|im_end|>\n"
-                          "<|im_start|>user\nq2<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\nthought2\n</think>\n\n"
-                          "a2<|im_end|>\n",
-                      "empty-history skip was conversation-global or dropped real thoughts");
+    failures +=
+        check(render({chat_message(ninfer::ChatRole::User, "q1"), first_empty,
+                      chat_message(ninfer::ChatRole::User, "q2"), second_kept},
+                     preserve_closed) == "<|im_start|>user\nq1<|im_end|>\n"
+                                         "<|im_start|>assistant\na1<|im_end|>\n"
+                                         "<|im_start|>user\nq2<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\nthought2\n</think>\n\n"
+                                         "a2<|im_end|>\n",
+              "empty-history skip was conversation-global or dropped real thoughts");
 
-    fi::ChatMessage stuffed = chat_message(ninfer::ChatRole::Assistant,
-                                           "<think>\nstuffed\n</think>\n\nbody");
-    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), stuffed,
-                              chat_message(ninfer::ChatRole::User, "q2")},
-                             preserve_closed) ==
-                          "<|im_start|>user\nq1<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\nstuffed\n</think>\n\n"
-                          "body<|im_end|>\n"
-                          "<|im_start|>user\nq2<|im_end|>\n",
-                      "effort template scraped or prepended an empty wrapper around stuffed think");
+    fi::ChatMessage stuffed =
+        chat_message(ninfer::ChatRole::Assistant, "<think>\nstuffed\n</think>\n\nbody");
+    failures +=
+        check(render({chat_message(ninfer::ChatRole::User, "q1"), stuffed,
+                      chat_message(ninfer::ChatRole::User, "q2")},
+                     preserve_closed) == "<|im_start|>user\nq1<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\nstuffed\n</think>\n\n"
+                                         "body<|im_end|>\n"
+                                         "<|im_start|>user\nq2<|im_end|>\n",
+              "effort template scraped or prepended an empty wrapper around stuffed think");
 
-    fi::ChatMessage padded_thought = chat_message(ninfer::ChatRole::Assistant, "old answer");
+    fi::ChatMessage padded_thought   = chat_message(ninfer::ChatRole::Assistant, "old answer");
     padded_thought.reasoning_content = "  thought  ";
-    failures += check(render({chat_message(ninfer::ChatRole::User, "q1"), padded_thought,
-                              chat_message(ninfer::ChatRole::User, "q2")},
-                             preserve_closed) ==
-                          "<|im_start|>user\nq1<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
-                          "old answer<|im_end|>\n"
-                          "<|im_start|>user\nq2<|im_end|>\n",
-                      "trimmed non-empty reasoning_content was dropped as empty");
+    failures +=
+        check(render({chat_message(ninfer::ChatRole::User, "q1"), padded_thought,
+                      chat_message(ninfer::ChatRole::User, "q2")},
+                     preserve_closed) == "<|im_start|>user\nq1<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
+                                         "old answer<|im_end|>\n"
+                                         "<|im_start|>user\nq2<|im_end|>\n",
+              "trimmed non-empty reasoning_content was dropped as empty");
 
-    fi::ChatMessage reasoned_tool = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage reasoned_tool   = chat_message(ninfer::ChatRole::Assistant, "");
     reasoned_tool.reasoning_content = "thought";
     reasoned_tool.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
     constexpr std::string_view reasoned_tool_desired =
@@ -889,15 +909,15 @@ int test_reasoning_effort_empty_history_think() {
                              tool_preserve_on) == reasoned_tool_desired,
                       "empty-body tool turn dropped a real history think wrapper");
 
-    fi::ChatMessage reasoned_note = reasoned_tool;
+    fi::ChatMessage reasoned_note    = reasoned_tool;
     reasoned_note.parts.front().text = "note";
-    failures += check(render({chat_message(ninfer::ChatRole::User, "call"), reasoned_note},
-                             tool_preserve_on) ==
-                          "<|im_start|>user\ncall<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
-                          "note\n\n<tool_call>\n<function=f>\n</function>\n"
-                          "</tool_call><|im_end|>\n",
-                      "body-then-tool spacing lost the extra blank line before tool XML");
+    failures +=
+        check(render({chat_message(ninfer::ChatRole::User, "call"), reasoned_note},
+                     tool_preserve_on) == "<|im_start|>user\ncall<|im_end|>\n"
+                                          "<|im_start|>assistant\n<think>\nthought\n</think>\n\n"
+                                          "note\n\n<tool_call>\n<function=f>\n</function>\n"
+                                          "</tool_call><|im_end|>\n",
+              "body-then-tool spacing lost the extra blank line before tool XML");
 
     failures += check(render(closed_empty, tool_preserve_off) == closed_empty_desired,
                       "preserve-off closed empty reasoning synthesized a think wrapper");
@@ -905,28 +925,28 @@ int test_reasoning_effort_empty_history_think() {
     fi::ChatRenderOptions toggle_preserve;
     toggle_preserve.add_generation_prompt = false;
     toggle_preserve.preserve_thinking     = true;
-    failures += check(render_chat_text({chat_message(ninfer::ChatRole::User, "q1"),
-                                        chat_message(ninfer::ChatRole::Assistant, "old answer"),
-                                        chat_message(ninfer::ChatRole::User, "q2")},
-                                       toggle_preserve) ==
-                          "<|im_start|>user\nq1<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                          "old answer<|im_end|>\n"
-                          "<|im_start|>user\nq2<|im_end|>\n",
-                      "thinking-toggle preserve-on empty reasoning lost its empty think wrapper");
+    failures +=
+        check(render_chat_text({chat_message(ninfer::ChatRole::User, "q1"),
+                                chat_message(ninfer::ChatRole::Assistant, "old answer"),
+                                chat_message(ninfer::ChatRole::User, "q2")},
+                               toggle_preserve) == "<|im_start|>user\nq1<|im_end|>\n"
+                                                   "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                                                   "old answer<|im_end|>\n"
+                                                   "<|im_start|>user\nq2<|im_end|>\n",
+              "thinking-toggle preserve-on empty reasoning lost its empty think wrapper");
 
     fi::ChatRenderOptions effort_generate;
     effort_generate.reasoning_effort = ninfer::ReasoningEffort::Medium;
-    failures += check(render({chat_message(ninfer::ChatRole::User, "please <|think_off|> now")},
-                             effort_generate) ==
-                          "<|im_start|>user\nplease <|think_off|> now<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\n",
-                      "user <|think_off|> text toggled thinking or was stripped");
-    failures += check(render({chat_message(ninfer::ChatRole::User, "please <|think_on|> now")},
-                             effort_generate) ==
-                          "<|im_start|>user\nplease <|think_on|> now<|im_end|>\n"
-                          "<|im_start|>assistant\n<think>\n",
-                      "user <|think_on|> text toggled thinking or was stripped");
+    failures +=
+        check(render({chat_message(ninfer::ChatRole::User, "please <|think_off|> now")},
+                     effort_generate) == "<|im_start|>user\nplease <|think_off|> now<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\n",
+              "user <|think_off|> text toggled thinking or was stripped");
+    failures +=
+        check(render({chat_message(ninfer::ChatRole::User, "please <|think_on|> now")},
+                     effort_generate) == "<|im_start|>user\nplease <|think_on|> now<|im_end|>\n"
+                                         "<|im_start|>assistant\n<think>\n",
+              "user <|think_on|> text toggled thinking or was stripped");
 
     const std::string assistant_header = "<|im_start|>assistant\n";
     const fi::RenderedChat empty_replay =
@@ -944,16 +964,17 @@ int test_reasoning_effort_empty_history_think() {
                       "past the generation opener");
     const fi::RenderedChat first_replay = reasoning_effort_template().render(
         {chat_message(ninfer::ChatRole::User, "q1")}, preserve_generate);
-    failures += check(first_replay.rewrite_checkpoint &&
-                          first_replay.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          first_replay.text.ends_with(replay_opener_tail) &&
-                          first_replay.rewrite_checkpoint->offset == first_replay.text.size(),
-                      "a first preserve-on thinking turn moved its replay checkpoint off the prompt "
-                      "frontier");
+    failures +=
+        check(first_replay.rewrite_checkpoint &&
+                  first_replay.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                  first_replay.text.ends_with(replay_opener_tail) &&
+                  first_replay.rewrite_checkpoint->offset == first_replay.text.size(),
+              "a first preserve-on thinking turn moved its replay checkpoint off the prompt "
+              "frontier");
 
-    fi::ChatMessage kept_history = empty_history;
-    kept_history.reasoning_content = "old thought";
+    fi::ChatMessage kept_history       = empty_history;
+    kept_history.reasoning_content     = "old thought";
     const fi::RenderedChat kept_replay = reasoning_effort_template().render(
         {chat_message(ninfer::ChatRole::User, "q1"), kept_history,
          chat_message(ninfer::ChatRole::User, "q2")},
@@ -970,24 +991,25 @@ int test_reasoning_effort_empty_history_think() {
     preserve_nothinking.reasoning_effort.reset();
     const fi::RenderedChat off_replay =
         reasoning_effort_template().render(closed_empty, preserve_nothinking);
-    failures += check(off_replay.rewrite_checkpoint &&
-                          off_replay.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          off_replay.rewrite_checkpoint->offset == off_replay.text.size() &&
-                          off_replay.text.ends_with("<think>\n\n</think>\n\n"),
-                      "empty history reasoning moved the preserve-on no-thinking replay checkpoint");
+    failures +=
+        check(off_replay.rewrite_checkpoint &&
+                  off_replay.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                  off_replay.rewrite_checkpoint->offset == off_replay.text.size() &&
+                  off_replay.text.ends_with("<think>\n\n</think>\n\n"),
+              "empty history reasoning moved the preserve-on no-thinking replay checkpoint");
 
     fi::ChatRenderOptions tool_generate = tool_preserve_off;
     tool_generate.add_generation_prompt = true;
     const fi::RenderedChat tool_closure = reasoning_effort_template().render(
         {chat_message(ninfer::ChatRole::User, "call"), empty_arguments}, tool_generate);
     const std::size_t first_header = tool_closure.text.find(assistant_header);
-    failures += check(first_header != std::string::npos && tool_closure.rewrite_checkpoint &&
-                          tool_closure.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
-                          tool_closure.rewrite_checkpoint->offset ==
-                              first_header + assistant_header.size(),
-                      "preserve-off tool-loop did not keep TurnClosure at the first assistant header");
+    failures +=
+        check(first_header != std::string::npos && tool_closure.rewrite_checkpoint &&
+                  tool_closure.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                  tool_closure.rewrite_checkpoint->offset == first_header + assistant_header.size(),
+              "preserve-off tool-loop did not keep TurnClosure at the first assistant header");
 
     failures += check(render({chat_message(ninfer::ChatRole::User, "call"), reasoned_tool},
                              tool_preserve_off) == reasoned_tool_desired,
@@ -1114,18 +1136,19 @@ int test_turn_closure_token_frontiers() {
     const auto verify = [](const fi::Tokenizer& tokenizer, const fi::CompiledChatTemplate& chat,
                            const std::vector<fi::ChatMessage>& messages,
                            fi::ChatRenderOptions options) {
-        int failures = 0;
+        int failures              = 0;
         options.preserve_thinking = false;
         for (const bool generation : {false, true}) {
             options.add_generation_prompt = generation;
-            const auto rendered = chat.render(messages, options);
-            const auto encoded  = fi::encode_rendered_chat(tokenizer, rendered);
+            const auto rendered           = chat.render(messages, options);
+            const auto encoded            = fi::encode_rendered_chat(tokenizer, rendered);
             // Independent references encode with the rendered literal spans, as the product does.
             const auto spans_before = [&](std::size_t end) {
                 std::vector<fi::ByteSpan> out;
                 for (const fi::ByteSpan span : rendered.literal_spans) {
                     if (span.begin >= end) { break; }
-                    out.push_back(fi::ByteSpan{.begin = span.begin, .end = std::min(span.end, end)});
+                    out.push_back(
+                        fi::ByteSpan{.begin = span.begin, .end = std::min(span.end, end)});
                 }
                 return out;
             };
@@ -1134,21 +1157,23 @@ int test_turn_closure_token_frontiers() {
                               "historical turn boundaries changed the complete prompt tokens");
             std::vector<std::uint32_t> expected;
             for (const std::size_t offset : rendered.turn_closure_offsets) {
-                const auto prefix = tokenizer.encode(std::string_view(rendered.text).substr(0, offset),
-                                                     {}, spans_before(offset));
-                failures += check(prefix.size() <= encoded.input_ids.size() &&
-                                      std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin()),
-                                  "independent turn prefix is not a prefix of the complete encoding");
+                const auto prefix = tokenizer.encode(
+                    std::string_view(rendered.text).substr(0, offset), {}, spans_before(offset));
+                failures +=
+                    check(prefix.size() <= encoded.input_ids.size() &&
+                              std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin()),
+                          "independent turn prefix is not a prefix of the complete encoding");
                 if (prefix.size() < encoded.input_ids.size()) {
                     expected.push_back(static_cast<std::uint32_t>(prefix.size()));
                 }
             }
-            failures += check(encoded.turn_closure_frontiers == expected && expected.size() >= 24,
-                              "historical assistant frontiers differ from independent prefix encodings");
+            failures +=
+                check(encoded.turn_closure_frontiers == expected && expected.size() >= 24,
+                      "historical assistant frontiers differ from independent prefix encodings");
             if (rendered.rewrite_checkpoint) {
                 const auto prefix = tokenizer.encode(
-                    std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset), {},
-                    spans_before(rendered.rewrite_checkpoint->offset));
+                    std::string_view(rendered.text).substr(0, rendered.rewrite_checkpoint->offset),
+                    {}, spans_before(rendered.rewrite_checkpoint->offset));
                 failures += check(encoded.rewrite_checkpoint &&
                                       encoded.rewrite_checkpoint->frontier == prefix.size(),
                                   "historical turn encoding changed the rewrite checkpoint");
@@ -1165,16 +1190,17 @@ int test_turn_closure_token_frontiers() {
     messages.push_back(chat_message(ninfer::ChatRole::User, "x"));
     const auto owned = resources();
     const fi::Tokenizer synthetic({.tokenizer_json         = owned.tokenizer_json,
-                                    .tokenizer_config_json  = owned.tokenizer_config_json,
-                                    .generation_config_json = owned.generation_config_json});
+                                   .tokenizer_config_json  = owned.tokenizer_config_json,
+                                   .generation_config_json = owned.generation_config_json});
     int failures = verify(synthetic, thinking_toggle_template(), messages, {});
     if (skip_without_official_tokenizer("test_turn_closure_token_frontiers official")) {
         return failures;
     }
     for (auto& message : messages) {
         message.parts.front().text = message.role == ninfer::ChatRole::User
-            ? "Resume cafe\u0301 investigation. 中文 context."
-            : "### Result\nUnicode cafe\u0301, punctuation, and <think>literal markers</think>.";
+                                         ? "Resume cafe\u0301 investigation. 中文 context."
+                                         : "### Result\nUnicode cafe\u0301, punctuation, and "
+                                           "<think>literal markers</think>.";
     }
     failures += verify(official_tokenizer(), thinking_toggle_template(), messages, {});
     fi::ChatRenderOptions effort;
@@ -1453,14 +1479,13 @@ int test_reasoning_split(const Frontend& frontend) {
     (void)split_session.commit_preview();
     failures += check(!split_session.reasoning_cycle_exclusion_allowed(4),
                       "reasoning recovery could suppress a split-token terminator");
-    auto raw_session =
-        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.raw = true});
+    auto raw_session = frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.raw = true});
     failures += check(!raw_session.in_reasoning(), "raw output session entered reasoning state");
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
     const auto decision = session.preview(tokens, 3, ninfer::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == 2 && !decision.finished(),
                       "reasoning close unexpectedly made a nonterminal preview terminal");
-    const auto output   = session.commit_preview();
+    const auto output = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
     failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
@@ -1495,11 +1520,11 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     ninfer::PromptInput thinking_input;
     thinking_input.messages.push_back(std::move(message));
     thinking_input.options.enable_thinking = true;
-    auto thinking_prompt = frontend.prepare(std::move(thinking_input));
-    auto thinking        = frontend.make_output_session(thinking_prompt, {});
+    auto thinking_prompt                   = frontend.prepare(std::move(thinking_input));
+    auto thinking                          = frontend.make_output_session(thinking_prompt, {});
 
-    int failures = check(!thinking.model_stop_tokens_allowed(),
-                         "model stop was eligible during reasoning");
+    int failures =
+        check(!thinking.model_stop_tokens_allowed(), "model stop was eligible during reasoning");
     auto decision = thinking.preview(std::array<ninfer::TokenId, 1>{248069}, 8,
                                      ninfer::FinishReason::OutputLimit);
     failures += check(!decision.finished() && !decision.reject_generated_round,
@@ -1508,14 +1533,14 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     failures += check(!thinking.in_reasoning() && !thinking.model_stop_tokens_allowed(),
                       "model stop was eligible before post-reasoning content");
 
-    decision = thinking.preview(std::array<ninfer::TokenId, 1>{14}, 7,
-                                ninfer::FinishReason::OutputLimit);
+    decision =
+        thinking.preview(std::array<ninfer::TokenId, 1>{14}, 7, ninfer::FinishReason::OutputLimit);
     (void)thinking.commit_preview();
     failures += check(!thinking.model_stop_tokens_allowed(),
                       "whitespace made the post-reasoning model stop eligible");
 
-    decision = thinking.preview(std::array<ninfer::TokenId, 1>{6}, 6,
-                                ninfer::FinishReason::OutputLimit);
+    decision =
+        thinking.preview(std::array<ninfer::TokenId, 1>{6}, 6, ninfer::FinishReason::OutputLimit);
     failures += check(decision.reject_generated_round && decision.accepted_tokens == 0 &&
                           !decision.finished(),
                       "invalid empty-answer model stop was not rejected");
@@ -1523,17 +1548,17 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     failures += check(!thinking.model_stop_tokens_allowed(),
                       "discarding an invalid stop changed output state");
 
-    decision = thinking.preview(std::array<ninfer::TokenId, 1>{15}, 6,
-                                ninfer::FinishReason::OutputLimit);
+    decision =
+        thinking.preview(std::array<ninfer::TokenId, 1>{15}, 6, ninfer::FinishReason::OutputLimit);
     (void)thinking.commit_preview();
     failures += check(thinking.model_stop_tokens_allowed(),
                       "answer content did not make the model stop eligible");
-    decision = thinking.preview(std::array<ninfer::TokenId, 1>{6}, 5,
-                                ninfer::FinishReason::OutputLimit);
-    failures += check(decision.finished() &&
-                          decision.finish_reason == ninfer::FinishReason::StopToken &&
-                          !decision.reject_generated_round,
-                      "established answer did not stop normally");
+    decision =
+        thinking.preview(std::array<ninfer::TokenId, 1>{6}, 5, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(decision.finished() && decision.finish_reason == ninfer::FinishReason::StopToken &&
+                  !decision.reject_generated_round,
+              "established answer did not stop normally");
     (void)thinking.commit_preview();
 
     ninfer::ChatMessage tool_message;
@@ -1555,10 +1580,10 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     tool_input.messages.push_back(std::move(assistant_call));
     tool_input.messages.push_back(std::move(next_message));
     tool_input.options.enable_thinking = false;
-    auto tool_prompt = frontend.prepare(std::move(tool_input));
-    auto tool = frontend.make_output_session(tool_prompt, {});
-    failures += check(!tool.model_stop_tokens_allowed(),
-                      "tools-enabled empty output allowed a model stop");
+    auto tool_prompt                   = frontend.prepare(std::move(tool_input));
+    auto tool                          = frontend.make_output_session(tool_prompt, {});
+    failures +=
+        check(!tool.model_stop_tokens_allowed(), "tools-enabled empty output allowed a model stop");
 
     ninfer::ChatMessage ignored_user_call;
     ignored_user_call.role = ninfer::ChatRole::User;
@@ -1574,8 +1599,8 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     failures += check(ignored_user_call_output.model_stop_tokens_allowed(),
                       "ignored non-assistant tool_calls enabled structured tool output");
 
-    decision = tool.preview(std::array<ninfer::TokenId, 1>{22}, 16,
-                            ninfer::FinishReason::OutputLimit);
+    decision =
+        tool.preview(std::array<ninfer::TokenId, 1>{22}, 16, ninfer::FinishReason::OutputLimit);
     (void)tool.commit_preview();
     failures += check(tool.model_stop_tokens_allowed(),
                       "ordinary pre-tool content did not allow a model stop");
@@ -1585,29 +1610,28 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     failures += check(decision.reject_generated_round && decision.accepted_tokens == 0,
                       "same-round partial tool opener did not reject its model stop");
     tool.discard_preview();
-    failures += check(tool.model_stop_tokens_allowed(),
-                      "rejected tool round changed committed structure");
+    failures +=
+        check(tool.model_stop_tokens_allowed(), "rejected tool round changed committed structure");
 
-    decision = tool.preview(std::array<ninfer::TokenId, 1>{16}, 15,
-                            ninfer::FinishReason::OutputLimit);
+    decision =
+        tool.preview(std::array<ninfer::TokenId, 1>{16}, 15, ninfer::FinishReason::OutputLimit);
     (void)tool.commit_preview();
-    failures += check(!tool.model_stop_tokens_allowed(),
-                      "ambiguous tool opener allowed a model stop");
-    decision = tool.preview(std::array<ninfer::TokenId, 1>{17}, 14,
-                            ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(!tool.model_stop_tokens_allowed(), "ambiguous tool opener allowed a model stop");
+    decision =
+        tool.preview(std::array<ninfer::TokenId, 1>{17}, 14, ninfer::FinishReason::OutputLimit);
     (void)tool.commit_preview();
-    failures += check(!tool.model_stop_tokens_allowed(),
-                      "open tool call allowed a model stop");
-    decision = tool.preview(std::array<ninfer::TokenId, 2>{18, 19}, 13,
-                            ninfer::FinishReason::OutputLimit);
+    failures += check(!tool.model_stop_tokens_allowed(), "open tool call allowed a model stop");
+    decision =
+        tool.preview(std::array<ninfer::TokenId, 2>{18, 19}, 13, ninfer::FinishReason::OutputLimit);
     (void)tool.commit_preview();
-    failures += check(!tool.model_stop_tokens_allowed(),
-                      "incomplete tool call allowed a model stop");
-    decision = tool.preview(std::array<ninfer::TokenId, 1>{20}, 11,
-                            ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(!tool.model_stop_tokens_allowed(), "incomplete tool call allowed a model stop");
+    decision =
+        tool.preview(std::array<ninfer::TokenId, 1>{20}, 11, ninfer::FinishReason::OutputLimit);
     (void)tool.commit_preview();
-    failures += check(tool.model_stop_tokens_allowed(),
-                      "complete tool call did not allow a model stop");
+    failures +=
+        check(tool.model_stop_tokens_allowed(), "complete tool call did not allow a model stop");
 
     ninfer::ChatMessage think_tools_user;
     think_tools_user.role = ninfer::ChatRole::User;
@@ -1628,8 +1652,8 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     think_tools_input.messages.push_back(std::move(think_tools_assistant));
     think_tools_input.messages.push_back(std::move(think_tools_next));
     think_tools_input.options.enable_thinking = true;
-    auto think_tools_prompt = frontend.prepare(std::move(think_tools_input));
-    auto think_tools        = frontend.make_output_session(think_tools_prompt, {});
+    auto think_tools_prompt                   = frontend.prepare(std::move(think_tools_input));
+    auto think_tools = frontend.make_output_session(think_tools_prompt, {});
     failures += check(!think_tools.model_stop_tokens_allowed(),
                       "thinking tools session allowed a model stop before content");
     const std::array<ninfer::TokenId, 6> close_then_repeat{248069, 21, 18, 19, 20, 21};
@@ -1642,8 +1666,8 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
                       "truncated tool-call round did not make the model stop eligible");
 
     auto open_call = frontend.make_output_session(tool_prompt, {});
-    decision = open_call.preview(std::array<ninfer::TokenId, 3>{21, 18, 19}, 8,
-                                 ninfer::FinishReason::OutputLimit);
+    decision       = open_call.preview(std::array<ninfer::TokenId, 3>{21, 18, 19}, 8,
+                                       ninfer::FinishReason::OutputLimit);
     (void)open_call.commit_preview();
     failures += check(!open_call.model_stop_tokens_allowed(),
                       "open tool-call session allowed a model stop");
@@ -1672,8 +1696,8 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     ninfer::StopPolicy no_model_defaults;
     no_model_defaults.include_model_defaults = false;
     auto no_defaults = frontend.make_output_session(tool_prompt, no_model_defaults);
-    decision = no_defaults.preview(std::array<ninfer::TokenId, 1>{22}, 4,
-                                   ninfer::FinishReason::OutputLimit);
+    decision         = no_defaults.preview(std::array<ninfer::TokenId, 1>{22}, 4,
+                                           ninfer::FinishReason::OutputLimit);
     (void)no_defaults.commit_preview();
     decision = no_defaults.preview(partial_and_stop, 3, ninfer::FinishReason::OutputLimit);
     failures += check(decision.reject_generated_round && decision.accepted_tokens == 0,
@@ -1681,12 +1705,10 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     no_defaults.discard_preview();
 
     auto raw = frontend.make_output_session(
-        tool_prompt, {},
-        ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
+        tool_prompt, {}, ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
     failures += check(raw.model_stop_tokens_allowed(),
                       "raw output unexpectedly applied structured stop eligibility");
-    decision = raw.preview(std::array<ninfer::TokenId, 1>{6}, 1,
-                           ninfer::FinishReason::OutputLimit);
+    decision = raw.preview(std::array<ninfer::TokenId, 1>{6}, 1, ninfer::FinishReason::OutputLimit);
     failures += check(decision.finished() && !decision.reject_generated_round,
                       "raw output rejected its model stop");
     (void)raw.commit_preview();
@@ -1723,8 +1745,9 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
         std::uint32_t budget = static_cast<std::uint32_t>(tokens.size());
         if (one_token_per_round) {
             for (const ninfer::TokenId token : tokens) {
-                const auto decision = generated_session.preview(
-                    std::array<ninfer::TokenId, 1>{token}, budget, ninfer::FinishReason::OutputLimit);
+                const auto decision =
+                    generated_session.preview(std::array<ninfer::TokenId, 1>{token}, budget,
+                                              ninfer::FinishReason::OutputLimit);
                 budget -= decision.accepted_tokens;
                 text += channel_text(generated_session.commit_preview(),
                                      ninfer::OutputChannel::Content);
@@ -1741,6 +1764,7 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
         std::string expected;
         const char* label;
     };
+
     const std::string replacement(kUtf8Replacement);
     const std::vector<Utf8Case> utf8_cases = {
         {{10, 1}, replacement + "helloST", "invalid continuation after leading byte"},
@@ -1758,7 +1782,8 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
          "out-of-range codepoint"},
         {{kByteF5Token, 1}, replacement + "helloST", "invalid leading byte"},
         {{kByteC2Token, kByteA2Token}, "¢", "valid two-byte codepoint"},
-        {{kByteF0Token, kByte9FToken, kByte98Token, kByte80Token}, "😀",
+        {{kByteF0Token, kByte9FToken, kByte98Token, kByte80Token},
+         "😀",
          "valid four-byte codepoint"},
     };
     for (const Utf8Case& test : utf8_cases) {
@@ -1858,17 +1883,17 @@ int run_encode_bench() {
         std::vector<std::string> tools;
         tools.reserve(static_cast<std::size_t>(count));
         for (int i = 0; i < count; ++i) {
-            tools.push_back(nlohmann::json{{"type", "function"},
-                                           {"function",
-                                            {{"name", "read_file_" + std::to_string(i)},
-                                             {"description", "Read a workspace file"},
-                                             {"parameters",
-                                              {{"type", "object"},
-                                               {"properties",
-                                                {{"path", {{"type", "string"}}},
-                                                 {"content", {{"type", "string"}}}}},
-                                               {"required", nlohmann::json::array({"path"})}}}}}}
-                               .dump());
+            tools.push_back(nlohmann::json{
+                {"type", "function"},
+                {"function",
+                 {{"name", "read_file_" + std::to_string(i)},
+                  {"description", "Read a workspace file"},
+                  {"parameters",
+                   {{"type", "object"},
+                    {"properties",
+                     {{"path", {{"type", "string"}}}, {"content", {{"type", "string"}}}}},
+                    {"required", nlohmann::json::array({"path"})}}}}}}
+                                .dump());
         }
         return tools;
     };
@@ -1899,7 +1924,8 @@ int run_encode_bench() {
             for (int i = 0; i < calls; ++i) {
                 messages.push_back(chat_message(ninfer::ChatRole::Tool, blob(content_bytes / 4)));
             }
-            messages.push_back(chat_message(ninfer::ChatRole::User, "Continue with the next batch."));
+            messages.push_back(
+                chat_message(ninfer::ChatRole::User, "Continue with the next batch."));
         }
         return messages;
     };
@@ -1910,6 +1936,7 @@ int run_encode_bench() {
         fi::ChatRenderOptions options;
         int repeats;
     };
+
     std::vector<Case> cases;
     fi::ChatRenderOptions with_tools;
     with_tools.tool_jsons = tool_schema(16);
@@ -1943,11 +1970,10 @@ int run_encode_bench() {
             return 1;
         }
         const std::size_t checkpoint = rendered.rewrite_checkpoint->offset;
-        const double full_ms = time_ms([&] { return tokenizer.encode(rendered.text); }, test.repeats);
+        const double full_ms =
+            time_ms([&] { return tokenizer.encode(rendered.text); }, test.repeats);
         const double prefix_ms = time_ms(
-            [&] {
-                return tokenizer.encode(std::string_view(rendered.text).substr(0, checkpoint));
-            },
+            [&] { return tokenizer.encode(std::string_view(rendered.text).substr(0, checkpoint)); },
             test.repeats);
         const fi::EncodedChat encoded = fi::encode_rendered_chat(tokenizer, rendered);
         const double decode_ms =
@@ -1970,7 +1996,7 @@ int run_encode_bench() {
 }
 
 int test_declared_tool_publication() {
-    auto owned = resources();
+    auto owned     = resources();
     auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
     // This component tokenizer must encode the rendered tool declaration, which is literal client
     // text, so every printable ASCII byte needs an ordinary byte-level vocabulary symbol.
@@ -1981,7 +2007,7 @@ int test_declared_tool_publication() {
         if (!vocab.contains(symbol)) { vocab[symbol] = 1000 + c; }
         ascii_ids[static_cast<std::size_t>(c)] = vocab[symbol].get<ninfer::TokenId>();
     }
-    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_json    = tokenizer.dump();
     const Frontend frontend = FrontendFactory::create_component(owned);
     ninfer::PromptInput input;
     ninfer::ChatMessage user;
@@ -1991,8 +2017,8 @@ int test_declared_tool_publication() {
     input.options.enable_thinking = false;
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}})");
-    auto prompt = frontend.prepare(std::move(input));
-    auto output = frontend.make_output_session(prompt, {});
+    auto prompt  = frontend.prepare(std::move(input));
+    auto output  = frontend.make_output_session(prompt, {});
     int failures = check(output.has_tool_grammar(), "declared tools did not attach a grammar");
     const std::vector<ninfer::TokenId> tokens{22, 16, 17, 32, 18, 32, 32, 19, 32, 20};
     std::string visible;
@@ -2027,9 +2053,7 @@ int test_declared_tool_publication() {
         std::string partial_visible;
         (void)partial.preview(std::array<ninfer::TokenId, 1>{22}, 100,
                               ninfer::FinishReason::OutputLimit);
-        for (const auto& delta : partial.commit_preview()) {
-            partial_visible += delta.text;
-        }
+        for (const auto& delta : partial.commit_preview()) { partial_visible += delta.text; }
         (void)partial.preview(std::array<ninfer::TokenId, 2>{16, 23}, between_rounds ? 100 : 2,
                               ninfer::FinishReason::OutputLimit);
         for (const auto& delta : partial.commit_preview()) { partial_visible += delta.text; }
@@ -2046,63 +2070,75 @@ int test_declared_tool_publication() {
     for (const auto& delta : prose.commit_preview()) { prose_visible += delta.text; }
     failures += check(prose_visible == "a <", "terminal output swallowed ambiguous ordinary prose");
     ninfer::StopPolicy opener_stop;
-    opener_stop.strings = {{.text = ">"}};
-    auto stopped_opener = frontend.make_output_session(prompt, opener_stop);
-    const auto opener_decision = stopped_opener.preview(std::array<ninfer::TokenId, 2>{16, 17},
-                                                        100, ninfer::FinishReason::OutputLimit);
-    failures += check(opener_decision.finish_reason == ninfer::FinishReason::StopString &&
-                          stopped_opener.commit_preview().empty() && stopped_opener.tool_calls().empty(),
-                      "caller stop leaked a confirmed partial tool trigger");
+    opener_stop.strings        = {{.text = ">"}};
+    auto stopped_opener        = frontend.make_output_session(prompt, opener_stop);
+    const auto opener_decision = stopped_opener.preview(std::array<ninfer::TokenId, 2>{16, 17}, 100,
+                                                        ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(opener_decision.finish_reason == ninfer::FinishReason::StopString &&
+                  stopped_opener.commit_preview().empty() && stopped_opener.tool_calls().empty(),
+              "caller stop leaked a confirmed partial tool trigger");
     ninfer::StopPolicy after_call_stop;
     after_call_stop.strings = {{.text = "preface"}};
-    auto stopped_call = frontend.make_output_session(prompt, after_call_stop);
+    auto stopped_call       = frontend.make_output_session(prompt, after_call_stop);
     for (auto token : std::span(tokens).subspan(1)) {
         (void)stopped_call.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
                                    ninfer::FinishReason::OutputLimit);
         (void)stopped_call.commit_preview();
     }
     const auto call_decision = stopped_call.preview(std::array<ninfer::TokenId, 1>{22}, 100,
-                                                     ninfer::FinishReason::OutputLimit);
-    failures += check(call_decision.finish_reason == ninfer::FinishReason::StopString &&
-                          stopped_call.commit_preview().empty() && stopped_call.tool_calls().size() == 1,
-                      "caller stop lost a preceding complete tool call");
+                                                    ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(call_decision.finish_reason == ninfer::FinishReason::StopString &&
+                  stopped_call.commit_preview().empty() && stopped_call.tool_calls().size() == 1,
+              "caller stop lost a preceding complete tool call");
     const std::string literal = "<tool_call>\n</invoke>\n</parameter>\n</function>\n</tool_call>";
     ninfer::PromptInput embedded_input;
     ninfer::ChatMessage embedded_user;
     embedded_user.role = ninfer::ChatRole::User;
-    embedded_user.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x"});
+    embedded_user.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x"});
     embedded_input.messages.push_back(std::move(embedded_user));
     embedded_input.options.enable_thinking = false;
     embedded_input.options.tool_jsons.push_back(nlohmann::json{
-        {"type", "function"}, {"function", {{"name", "f"}, {"parameters", {
-            {"type", "object"}, {"properties", {{"value", {{"const", literal}}}}},
-            {"required", {"value"}}, {"additionalProperties", false}}}}}}.dump());
-    auto embedded_prompt = frontend.prepare(std::move(embedded_input));
-    auto embedded_output = frontend.make_output_session(embedded_prompt, {});
+        {"type", "function"},
+        {"function",
+         {{"name", "f"},
+          {"parameters",
+           {{"type", "object"},
+            {"properties", {{"value", {{"const", literal}}}}},
+            {"required", {"value"}},
+            {"additionalProperties", false}}}}}}.dump());
+    auto embedded_prompt     = frontend.prepare(std::move(embedded_input));
+    auto embedded_output     = frontend.make_output_session(embedded_prompt, {});
     const auto embedded_text = "<tool_call>\n<function=f>\n<parameter=value>\n" + literal +
                                "\n</parameter>\n</function>\n</tool_call>";
     for (const unsigned char c : embedded_text) {
         const ninfer::TokenId token = c == '\n' ? 32 : ascii_ids[c];
         (void)embedded_output.preview(std::span<const ninfer::TokenId>(&token, 1), 1000,
                                       ninfer::FinishReason::OutputLimit);
-        failures += check(embedded_output.commit_preview().empty(), "literal tool close leaked as prose");
+        failures +=
+            check(embedded_output.commit_preview().empty(), "literal tool close leaked as prose");
     }
     failures += check(embedded_output.tool_calls().size() == 1 &&
-                          nlohmann::json::parse(embedded_output.tool_calls()[0].arguments_json)["value"] == literal,
+                          nlohmann::json::parse(
+                              embedded_output.tool_calls()[0].arguments_json)["value"] == literal,
                       "streamed XML-looking string was lost or split into another call");
     failures += check(ninfer::targets::qwen3_6::unconstrained_tool_call_names(
                           "prefix<tool_call><function=f><parameter=x>true</parameter>"
-                          "</function></tool_call>", 64) == std::vector<std::string>{"f"},
+                          "</function></tool_call>",
+                          64) == std::vector<std::string>{"f"},
                       "undeclared complete envelope lost its diagnostic name");
     failures += check(ninfer::targets::qwen3_6::unconstrained_tool_call_names(
-                          "<tool_call><function=f></function></tool_call", 64).empty(),
+                          "<tool_call><function=f></function></tool_call", 64)
+                          .empty(),
                       "malformed envelope produced an undeclared-tool diagnostic");
     return failures;
 }
 
 int test_recovery_fragment(const fi::CompiledChatTemplate& chat, bool effort) {
     fi::ChatRenderOptions closed;
-    closed.add_generation_prompt = false;
+    closed.add_generation_prompt               = false;
     const std::vector<fi::ChatMessage> history = {chat_message(ninfer::ChatRole::User, "task")};
     const std::string base                     = chat.render(history, closed).text;
     auto equals_fragment = [&](const std::vector<fi::ChatMessage>& insert, const char* label) {
@@ -2121,26 +2157,28 @@ int test_recovery_fragment(const fi::CompiledChatTemplate& chat, bool effort) {
         {.id = "ninfer_rejected_1_0", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
     fi::ChatMessage sunny = chat_message(ninfer::ChatRole::Tool, "sunny");
     sunny.tool_call_id    = "ninfer_rejected_1_0";
-    failures += equals_fragment({assistant, sunny},
-                                "one rejected call was not the closed-history suffix");
+    failures +=
+        equals_fragment({assistant, sunny}, "one rejected call was not the closed-history suffix");
 
     fi::ChatMessage cooler = chat_message(ninfer::ChatRole::Tool, "20C");
     cooler.tool_call_id    = "ninfer_rejected_1_1";
     failures += equals_fragment({assistant, sunny, cooler},
                                 "two tool results were not the closed-history suffix");
-    const std::string two = chat.render_fragment({assistant, sunny, cooler}, closed).text;
+    const std::string two        = chat.render_fragment({assistant, sunny, cooler}, closed).text;
     const std::string user_group = "<|im_start|>user";
     const std::size_t first_user = two.find(user_group);
-    failures += check(first_user != std::string::npos &&
-                          two.find(user_group, first_user + user_group.size()) == std::string::npos &&
-                          two.find("</tool_response><|im_end|>\n") != std::string::npos &&
-                          two.find("</tool_response>\n<|im_end|>") == std::string::npos,
-                      "two tool results were not one user group closed against </tool_response>");
+    failures +=
+        check(first_user != std::string::npos &&
+                  two.find(user_group, first_user + user_group.size()) == std::string::npos &&
+                  two.find("</tool_response><|im_end|>\n") != std::string::npos &&
+                  two.find("</tool_response>\n<|im_end|>") == std::string::npos,
+              "two tool results were not one user group closed against </tool_response>");
 
-    failures += check(chat.render_fragment(
-                          {chat_message(ninfer::ChatRole::System, "  current diagnostics  ")},
-                          closed).text == "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
-                      "a trimmed system fragment did not use the system branch");
+    failures +=
+        check(chat.render_fragment(
+                      {chat_message(ninfer::ChatRole::System, "  current diagnostics  ")}, closed)
+                      .text == "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
+              "a trimmed system fragment did not use the system branch");
 
     const std::string call = chat.render_fragment({assistant}, closed).text;
     if (effort) {
@@ -2174,9 +2212,8 @@ int test_recovery_prompt_splice(const Frontend& frontend) {
     notice.parts.push_back(
         ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
     const std::span<const ninfer::ChatMessage> insert(&notice, 1);
-    const auto spliced =
-        frontend.splice_recovery_prompt(prefix, source, insert, recovery);
-    int failures = check(spliced.has_value(), "a prologue-terminated prefix was not spliced");
+    const auto spliced = frontend.splice_recovery_prompt(prefix, source, insert, recovery);
+    int failures       = check(spliced.has_value(), "a prologue-terminated prefix was not spliced");
     if (!spliced) { return failures; }
 
     const auto& data = FrontendFactory::inspect(*spliced);
@@ -2186,39 +2223,44 @@ int test_recovery_prompt_splice(const Frontend& frontend) {
         thinking_toggle_template()
             .render_fragment({chat_message(ninfer::ChatRole::System, "x")}, closed)
             .text;
-    const std::string tail_text =
-        std::string(ninfer::targets::qwen3_6::kRecoveryTurnClose) + fragment +
-        std::string(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
-    auto encode = [&](std::string_view text) {
+    const std::string tail_text = std::string(ninfer::targets::qwen3_6::kRecoveryTurnClose) +
+                                  fragment +
+                                  std::string(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
+    auto encode                 = [&](std::string_view text) {
         std::vector<ninfer::TokenId> ids;
-        for (const int id : tokenizer.encode(text)) { ids.push_back(static_cast<ninfer::TokenId>(id)); }
+        for (const int id : tokenizer.encode(text)) {
+            ids.push_back(static_cast<ninfer::TokenId>(id));
+        }
         return ids;
     };
-    const auto prologue_ids = encode(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
-    const auto close_ids    = encode(ninfer::targets::qwen3_6::kRecoveryTurnClose);
-    const auto fragment_ids = encode(fragment);
+    const auto prologue_ids           = encode(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
+    const auto close_ids              = encode(ninfer::targets::qwen3_6::kRecoveryTurnClose);
+    const auto fragment_ids           = encode(fragment);
     std::vector<ninfer::TokenId> tail = close_ids;
     tail.insert(tail.end(), fragment_ids.begin(), fragment_ids.end());
     tail.insert(tail.end(), prologue_ids.begin(), prologue_ids.end());
-    failures += check(data.token_ids.size() == prefix.size() + tail.size() &&
-                          std::equal(prefix.begin(), prefix.end(), data.token_ids.begin()) &&
-                          std::equal(tail.begin(), tail.end(), data.token_ids.begin() + prefix.size()),
-                      "the splice did not append close, fragment, and a copy of the prologue ids");
+    failures +=
+        check(data.token_ids.size() == prefix.size() + tail.size() &&
+                  std::equal(prefix.begin(), prefix.end(), data.token_ids.begin()) &&
+                  std::equal(tail.begin(), tail.end(), data.token_ids.begin() + prefix.size()),
+              "the splice did not append close, fragment, and a copy of the prologue ids");
     std::vector<int> tail_ids(data.token_ids.begin() + static_cast<std::ptrdiff_t>(prefix.size()),
                               data.token_ids.end());
     failures += check(tokenizer.decode(tail_ids) == tail_text,
                       "the spliced tail did not decode to close, fragment, then prologue");
-    failures += check(!prologue_ids.empty() && prefix.size() >= prologue_ids.size() &&
-                          std::equal(prologue_ids.begin(), prologue_ids.end(),
-                                     prefix.end() - static_cast<std::ptrdiff_t>(prologue_ids.size())),
-                      "the resident prefix did not end with the encoded prologue");
-    bool positions = data.rope_delta == 0 && data.vision_items.empty() && data.token_types.size() ==
-                                                                               data.token_ids.size();
+    failures +=
+        check(!prologue_ids.empty() && prefix.size() >= prologue_ids.size() &&
+                  std::equal(prologue_ids.begin(), prologue_ids.end(),
+                             prefix.end() - static_cast<std::ptrdiff_t>(prologue_ids.size())),
+              "the resident prefix did not end with the encoded prologue");
+    bool positions = data.rope_delta == 0 && data.vision_items.empty() &&
+                     data.token_types.size() == data.token_ids.size();
     for (std::size_t i = 0; positions && i < data.token_ids.size(); ++i) {
-        positions = data.token_types[i] == 0 && data.position_axis(0)[static_cast<std::ptrdiff_t>(i)] ==
-                                                     static_cast<std::int32_t>(i) &&
-                    data.position_axis(1)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i) &&
-                    data.position_axis(2)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i);
+        positions =
+            data.token_types[i] == 0 &&
+            data.position_axis(0)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i) &&
+            data.position_axis(1)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i) &&
+            data.position_axis(2)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i);
     }
     failures += check(positions && data.starts_in_reasoning && data.identity.reusable &&
                           !data.tool_grammar && data.identity.rewrite_checkpoint &&
@@ -2227,23 +2269,23 @@ int test_recovery_prompt_splice(const Frontend& frontend) {
                           data.identity.rewrite_checkpoint->frontier == data.token_ids.size(),
                       "the spliced prompt did not record a reusable response replay");
 
-    auto bad = prefix;
+    auto bad   = prefix;
     bad.back() = 0;
     failures += check(!frontend.splice_recovery_prompt(std::move(bad), source, insert, recovery),
                       "a prefix that does not end with the prologue was spliced");
 
     const auto first_ids = data.token_ids;
-    const auto stacked =
-        frontend.splice_recovery_prompt(first_ids, source, insert, recovery);
+    const auto stacked   = frontend.splice_recovery_prompt(first_ids, source, insert, recovery);
     failures += check(stacked.has_value(), "attempt 2 did not splice onto the previous prompt");
     if (stacked) {
         const auto& again = FrontendFactory::inspect(*stacked);
-        failures += check(again.token_ids.size() > first_ids.size() &&
-                              std::equal(prefix.begin(), prefix.end(), again.token_ids.begin()) &&
-                              std::equal(first_ids.begin(), first_ids.end(), again.token_ids.begin()) &&
-                              again.identity.rewrite_checkpoint &&
-                              again.identity.rewrite_checkpoint->frontier == again.token_ids.size(),
-                          "attempt 2 did not keep the previous prompt and move the rewrite frontier");
+        failures +=
+            check(again.token_ids.size() > first_ids.size() &&
+                      std::equal(prefix.begin(), prefix.end(), again.token_ids.begin()) &&
+                      std::equal(first_ids.begin(), first_ids.end(), again.token_ids.begin()) &&
+                      again.identity.rewrite_checkpoint &&
+                      again.identity.rewrite_checkpoint->frontier == again.token_ids.size(),
+                  "attempt 2 did not keep the previous prompt and move the rewrite frontier");
     }
 
     ninfer::PromptInput tools = source;
@@ -2258,13 +2300,13 @@ int test_recovery_prompt_splice(const Frontend& frontend) {
 int test_official_recovery_splice() {
     if (skip_without_official_tokenizer("test_official_recovery_splice")) { return 0; }
     const auto& tokenizer_dir = official_tokenizer_dir();
-    FrontendResources owned    = resources(reasoning_effort_template_source());
-    owned.tokenizer_json       = read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
-    nlohmann::json config      = nlohmann::json::parse(
+    FrontendResources owned   = resources(reasoning_effort_template_source());
+    owned.tokenizer_json      = read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
+    nlohmann::json config     = nlohmann::json::parse(
         read_file((tokenizer_dir.value() + "/tokenizer_config.json").c_str()));
-    config["chat_template"]       = owned.chat_template_jinja;
-    owned.tokenizer_config_json   = config.dump();
-    owned.generation_config_json  =
+    config["chat_template"]     = owned.chat_template_jinja;
+    owned.tokenizer_config_json = config.dump();
+    owned.generation_config_json =
         read_file((tokenizer_dir.value() + "/generation_config.json").c_str());
     const Frontend frontend = FrontendFactory::create_component(owned, false);
     const fi::Tokenizer tokenizer({.tokenizer_json         = owned.tokenizer_json,
@@ -2285,33 +2327,32 @@ int test_official_recovery_splice() {
         ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "answer", .media = {}});
     input.messages.push_back(std::move(user));
     input.messages.push_back(std::move(assistant));
-    const auto recovery = ninfer::targets::qwen3_6::GenerationRecoveryContext::analyze(input);
-    const auto prepared = frontend.prepare(recovery->input());
+    const auto recovery       = ninfer::targets::qwen3_6::GenerationRecoveryContext::analyze(input);
+    const auto prepared       = frontend.prepare(recovery->input());
     const auto& prepared_data = FrontendFactory::inspect(prepared);
-    const auto prologue_ids   = tokenizer.encode(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
-    int failures              = check(recovery && !prologue_ids.empty() &&
-                                 prepared_data.token_ids.size() >= prologue_ids.size() &&
-                                 std::equal(prologue_ids.begin(), prologue_ids.end(),
-                                            prepared_data.token_ids.end() -
-                                                static_cast<std::ptrdiff_t>(prologue_ids.size())),
-                             "the prepared thinking prompt did not end with the recovery prologue");
+    const auto prologue_ids = tokenizer.encode(ninfer::targets::qwen3_6::kRecoveryThinkingPrologue);
+    int failures = check(recovery && !prologue_ids.empty() &&
+                             prepared_data.token_ids.size() >= prologue_ids.size() &&
+                             std::equal(prologue_ids.begin(), prologue_ids.end(),
+                                        prepared_data.token_ids.end() -
+                                            static_cast<std::ptrdiff_t>(prologue_ids.size())),
+                         "the prepared thinking prompt did not end with the recovery prologue");
     std::vector<int> prepared_ids(prepared_data.token_ids.begin(), prepared_data.token_ids.end());
     failures += check(tokenizer.decode(prepared_ids).find("historical reasoning stays") !=
                           std::string::npos,
                       "historical reasoning was absent from the prepared prompt");
 
     auto accept = [&](std::span<const ninfer::ChatMessage> insert, const char* label) {
-        const auto spliced = frontend.splice_recovery_prompt(
-            prepared_data.token_ids, recovery->input(), insert, recovery);
+        const auto spliced = frontend.splice_recovery_prompt(prepared_data.token_ids,
+                                                             recovery->input(), insert, recovery);
         if (!spliced) {
             std::cerr << label << '\n';
             return 1;
         }
-        const auto& data = FrontendFactory::inspect(*spliced);
-        const bool prefix =
-            data.token_ids.size() > prepared_data.token_ids.size() &&
-            std::equal(prepared_data.token_ids.begin(), prepared_data.token_ids.end(),
-                       data.token_ids.begin());
+        const auto& data    = FrontendFactory::inspect(*spliced);
+        const bool prefix   = data.token_ids.size() > prepared_data.token_ids.size() &&
+                              std::equal(prepared_data.token_ids.begin(),
+                                         prepared_data.token_ids.end(), data.token_ids.begin());
         const bool frontier = data.identity.rewrite_checkpoint &&
                               data.identity.rewrite_checkpoint->kind ==
                                   ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&

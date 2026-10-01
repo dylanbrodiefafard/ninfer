@@ -32,13 +32,12 @@ void grouped_dynamic_conv_prepare_launch(const Tensor& hidden, const Tensor& bas
     const std::int32_t cols   = tokens * batch;
     const int channel_blocks  = div_up(kGroupedDynamicConvHidden, kGroupedDynamicConvConvBlock);
     const dim3 grid(static_cast<unsigned int>(channel_blocks), static_cast<unsigned int>(cols));
-    grouped_dynamic_conv_kernel<true>
-        <<<grid, kGroupedDynamicConvConvBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(hidden.data),
-            static_cast<const __nv_bfloat16*>(base_kernel.data),
-            static_cast<const __nv_bfloat16*>(projection.data),
-            static_cast<__nv_bfloat16*>(prepared.data),
-            static_cast<__nv_bfloat16*>(finish_dynamic.data), tokens, batch);
+    grouped_dynamic_conv_kernel<true><<<grid, kGroupedDynamicConvConvBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const __nv_bfloat16*>(base_kernel.data),
+        static_cast<const __nv_bfloat16*>(projection.data),
+        static_cast<__nv_bfloat16*>(prepared.data),
+        static_cast<__nv_bfloat16*>(finish_dynamic.data), tokens, batch);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -50,12 +49,11 @@ void grouped_dynamic_conv_finish_launch(const Tensor& hidden, const Tensor& base
     const std::int32_t cols   = tokens * batch;
     const int channel_blocks  = div_up(kGroupedDynamicConvHidden, kGroupedDynamicConvConvBlock);
     const dim3 grid(static_cast<unsigned int>(channel_blocks), static_cast<unsigned int>(cols));
-    grouped_dynamic_conv_kernel<false>
-        <<<grid, kGroupedDynamicConvConvBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(hidden.data),
-            static_cast<const __nv_bfloat16*>(base_kernel.data),
-            static_cast<const __nv_bfloat16*>(finish_dynamic.data),
-            static_cast<__nv_bfloat16*>(out.data), nullptr, tokens, batch);
+    grouped_dynamic_conv_kernel<false><<<grid, kGroupedDynamicConvConvBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const __nv_bfloat16*>(base_kernel.data),
+        static_cast<const __nv_bfloat16*>(finish_dynamic.data),
+        static_cast<__nv_bfloat16*>(out.data), nullptr, tokens, batch);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -32,14 +32,14 @@ void require_bf16_weight(const Weight& w, std::int32_t rows, std::int32_t input_
 Weight bf16_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
     const std::size_t row_bytes = static_cast<std::size_t>(parent.k) * sizeof(std::uint16_t);
     const auto* data            = static_cast<const std::uint8_t*>(parent.qdata) +
-                       static_cast<std::size_t>(row_begin) * row_bytes;
-    Weight view          = parent;
-    view.payload         = data;
-    view.payload_bytes   = static_cast<std::uint64_t>(rows) * row_bytes;
-    view.qdata           = data;
-    view.shape[0]        = rows;
-    view.padded_shape[0] = rows;
-    view.n               = rows;
+                                  static_cast<std::size_t>(row_begin) * row_bytes;
+    Weight view                 = parent;
+    view.payload                = data;
+    view.payload_bytes          = static_cast<std::uint64_t>(rows) * row_bytes;
+    view.qdata                  = data;
+    view.shape[0]               = rows;
+    view.padded_shape[0]        = rows;
+    view.n                      = rows;
     return view;
 }
 
@@ -146,10 +146,11 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                                           dt_bias, ws, g, beta, stream);
 }
 
-void gdn_norm_gating_proj_packed_sequences(
-    const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& h, Tensor& g, Tensor& beta, cudaStream_t stream, std::int32_t sequence_width) {
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width) {
     constexpr const char* op = "gdn_norm_gating_proj_packed_sequences";
     if (x.ne[1] <= 0 || sequence_width <= 0 || x.ne[1] % sequence_width != 0) {
         throw std::invalid_argument(
@@ -159,14 +160,13 @@ void gdn_norm_gating_proj_packed_sequences(
                             op);
 
     const std::int32_t tokens = x.ne[1];
-    const std::int32_t batch = tokens / sequence_width;
+    const std::int32_t batch  = tokens / sequence_width;
     if (batch <= 0 || batch > detail::kBf16GdnGatingPackedMaxBatch) {
-        throw std::invalid_argument(
-            "gdn_norm_gating_proj_packed_sequences: batch must be in 1..6");
+        throw std::invalid_argument("gdn_norm_gating_proj_packed_sequences: batch must be in 1..6");
     }
     if (detail::bf16_gdn_gating_packed_aggregates(sequence_width, batch)) {
-        detail::bf16_gdn_norm_gating_packed_dispatch(
-            x, norm_weight, eps, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+        detail::bf16_gdn_norm_gating_packed_dispatch(x, norm_weight, eps, h, a_weight, b_weight,
+                                                     A_log, dt_bias, ws, g, beta, stream);
         return;
     }
 

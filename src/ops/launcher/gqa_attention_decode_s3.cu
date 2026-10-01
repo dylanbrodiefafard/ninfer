@@ -29,10 +29,10 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
         // split boundary, the fused per-split fill races across CTAs. Run the
         // block-aligned fill first (stream-ordered), so the tc kernel reads settled
         // codes/scales.
-        const int fill_units = invocation.batch_size *
-                               (TokenTile * Geometry::KVHeads * kGqaNvfp4Groups +
-                                (div_up(TokenTile, 16) + 1) * Geometry::KVHeads *
-                                    (kGqaHeadDim / 2));
+        const int fill_units =
+            invocation.batch_size *
+            (TokenTile * Geometry::KVHeads * kGqaNvfp4Groups +
+             (div_up(TokenTile, 16) + 1) * Geometry::KVHeads * (kGqaHeadDim / 2));
         gqa_attention_decode_fill_nvfp4s3_kernel<Geometry, TokenTile, MultiBatch, Masked>
             <<<div_up(fill_units, 256), 256, 0, stream>>>(
                 input.k, input.v, static_cast<const std::int32_t*>(pos.data),
@@ -71,31 +71,30 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
         constexpr std::size_t kDynamicBytes =
             DynamicArena
                 ? (Strict
-                        ? static_cast<std::size_t>(4 * KeyBlock * kGqaNvfp4CodeWidth +
-                                                    2 * kGqaHeadDim * 4 + KeyBlock * kGqaNvfp4Groups +
-                                                    kBr * KeyBlock * 2)
-                        : static_cast<std::size_t>(2 * KeyBlock * kGqaNvfp4CodeWidth +
-                                                   kBr * kP4Row + kBr * kPBlk + kGqaHeadDim * kP4Row +
-                                                   kGqaHeadDim * 4 + KeyBlock * kGqaNvfp4Groups))
+                       ? static_cast<std::size_t>(4 * KeyBlock * kGqaNvfp4CodeWidth +
+                                                  2 * kGqaHeadDim * 4 + KeyBlock * kGqaNvfp4Groups +
+                                                  kBr * KeyBlock * 2)
+                       : static_cast<std::size_t>(2 * KeyBlock * kGqaNvfp4CodeWidth + kBr * kP4Row +
+                                                  kBr * kPBlk + kGqaHeadDim * kP4Row +
+                                                  kGqaHeadDim * 4 + KeyBlock * kGqaNvfp4Groups))
                 : 0u;
         if constexpr (DynamicArena) {
             static const cudaError_t attr = cudaFuncSetAttribute(
-                gqa_attention_decode_nvfp4s3_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                           MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                           MultiBatch, Masked, CacheInput,
-                                                           false, Strict, TileSkip>,
+                gqa_attention_decode_nvfp4s3_tiled_kernel<
+                    Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
+                    MultiBatch, Masked, CacheInput, false, Strict, TileSkip>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         if constexpr (TileSkip) {
             // Rank the tier's Bc-key tiles before the partial kernel; the partial
             // walks its per-split keep-list slice (keep_tiles/split_off).
-            std::int32_t rank_tiles_pow2 = 1;
+            std::int32_t rank_tiles_pow2  = 1;
             const std::int32_t rank_tiles = div_up(implementation_window, KeyBlock);
             while (rank_tiles_pow2 < rank_tiles) { rank_tiles_pow2 <<= 1; }
             gqa_attention_decode_rank_nvfp4s3_kernel<Geometry, KeyBlock, MultiBatch>
                 <<<dim3(Geometry::KVHeads, 1, MultiBatch ? invocation.batch_size : 1), 256,
-                    gqa_s3_decode_rank_smem_bytes(rank_tiles_pow2), stream>>>(
+                   gqa_s3_decode_rank_smem_bytes(rank_tiles_pow2), stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const std::int32_t*>(pos.data),
                     static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -106,13 +105,12 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
                     splits, keep_frac, static_cast<const float*>(cache.k_mean_pages.data),
                     static_cast<std::int32_t*>(keep_tiles.data),
                     static_cast<std::int32_t*>(keep_count.data),
-                    static_cast<std::int32_t*>(split_off.data), rank_tiles_pow2,
-                    keep_stride);
+                    static_cast<std::int32_t*>(split_off.data), rank_tiles_pow2, keep_stride);
             CUDA_CHECK(cudaGetLastError());
         }
         gqa_attention_decode_nvfp4s3_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                                   KeyBlock, DynamicArena, MultiBatch, Masked,
-                                                   CacheInput, false, Strict, TileSkip>
+                                                  KeyBlock, DynamicArena, MultiBatch, Masked,
+                                                  CacheInput, false, Strict, TileSkip>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data),
@@ -135,19 +133,19 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
     auto launch_tier = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         if (tile_skip) {
             if (strict_pv) {
-                launch.template operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
-                                           true, true>();
+                launch.template
+                operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, true, true>();
             } else {
-                launch.template operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
-                                           false, true>();
+                launch.template
+                operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, false, true>();
             }
         } else {
             if (strict_pv) {
-                launch.template operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
-                                           true, false>();
+                launch.template
+                operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, true, false>();
             } else {
-                launch.template operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
-                                           false, false>();
+                launch.template
+                operator()<WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena, false, false>();
             }
         }
     };
@@ -196,17 +194,17 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
 #define NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, MB, Mask, In)                                     \
     template void launch_tc_partial_nvfp4s3<Geom, T, MB, Mask, In>(                                \
         const Tensor&, In, const Tensor&, float, PagedKVBatchLayerView,                            \
-        const GqaSmallTInvocation&, std::int32_t, std::int32_t, std::int32_t, Tensor&, Tensor&,     \
+        const GqaSmallTInvocation&, std::int32_t, std::int32_t, std::int32_t, Tensor&, Tensor&,    \
         Tensor&, cudaStream_t, float, const Tensor&, const Tensor&, const Tensor&, std::int32_t)
 
 #define NINFER_S3_DECODE_INSTANTIATE_T(Geom, T)                                                    \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, false, GqaAppendInput);                         \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, true, GqaAppendInput);                          \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, false, GqaAppendInput);                          \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, true, GqaAppendInput);                           \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, false, GqaCachedInput);                         \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, true, GqaCachedInput);                          \
-    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, false, GqaCachedInput);                          \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, false, GqaAppendInput);                        \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, true, GqaAppendInput);                         \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, false, GqaAppendInput);                         \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, true, GqaAppendInput);                          \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, false, GqaCachedInput);                        \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, false, true, GqaCachedInput);                         \
+    NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, false, GqaCachedInput);                         \
     NINFER_S3_DECODE_INSTANTIATE_IN(Geom, T, true, true, GqaCachedInput)
 
 #define NINFER_S3_DECODE_INSTANTIATE(Geom)                                                         \

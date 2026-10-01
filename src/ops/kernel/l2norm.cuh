@@ -39,11 +39,14 @@ __launch_bounds__(Block) __global__
         }
     }
 
-    sum = warp_reduce_sum(sum);
+    sum       = warp_reduce_sum(sum);
     float inv = 0.0f;
     if (lane == 0) {
         inv = rsqrtf(sum + eps);
-        if (dump) { dump->sumsq[row] = sum; dump->inv_r[row] = inv; } // op_dump side-band
+        if (dump) {
+            dump->sumsq[row] = sum;
+            dump->inv_r[row] = inv;
+        } // op_dump side-band
     }
     inv = __shfl_sync(kFullWarpMask, inv, 0);
 
@@ -74,11 +77,14 @@ __launch_bounds__(512) __global__
         sum += value * value;
     }
 
-    sum = warp_reduce_sum(sum);
+    sum       = warp_reduce_sum(sum);
     float inv = 0.0f;
     if (lane == 0) {
         inv = rsqrtf(sum + eps);
-        if (dump) { dump->sumsq[row] = sum; dump->inv_r[row] = inv; } // op_dump side-band
+        if (dump) {
+            dump->sumsq[row] = sum;
+            dump->inv_r[row] = inv;
+        } // op_dump side-band
     }
     inv = __shfl_sync(kFullWarpMask, inv, 0);
     for (std::int64_t i = lane; i < static_cast<std::int64_t>(d); i += kWarpSize) {

@@ -17,8 +17,8 @@ using namespace ninfer::ops::detail;
 
 namespace {
 
-constexpr int kT = 4;
-using Geometry   = Nvfp4Residual17408Geometry;
+constexpr int kT                  = 4;
+using Geometry                    = Nvfp4Residual17408Geometry;
 constexpr std::size_t kFlushBytes = 256ULL << 20;
 
 using Prod = typename Nvfp4LinearSmallTProductionSchedule<Geometry, kT>::Type;
@@ -28,63 +28,51 @@ void launch_sched(const __nv_bfloat16* x, const std::uint8_t* codes, const std::
                   float inverse, __nv_bfloat16* out, cudaStream_t stream) {
     constexpr int kTokenTiles = (kT + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
-    nvfp4_small_t_kernel<Geometry, kT, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(Nvfp4PackedActivation<Geometry>{x}, codes,
-                                                    scales, inverse, Nvfp4IdentityEpilogue{},
-                                                    Nvfp4ContiguousOutput{out, Geometry::kOutputRows});
+    nvfp4_small_t_kernel<Geometry, kT, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        Nvfp4PackedActivation<Geometry>{x}, codes, scales, inverse, Nvfp4IdentityEpilogue{},
+        Nvfp4ContiguousOutput{out, Geometry::kOutputRows});
     CUDA_CHECK(cudaGetLastError());
 }
 
-using ProdMb2 =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 2>;
-using ProdStream =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Streaming, 1,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+using ProdMb2    = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                       Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                       Nvfp4SmallTBlockOrder::RowsContiguous, 2>;
+using ProdStream = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                       Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Streaming, 1,
+                                       Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 using ProdUnroll4 =
     Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
                         Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
                         Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-using Warps8 =
-    Nvfp4SmallTSchedule<8, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-using Chains2 =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 2, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
-using SharedPh =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::SharedPhase,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+using Warps8   = Nvfp4SmallTSchedule<8, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+using Chains2  = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 2, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+using SharedPh = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::SharedPhase,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 // Register-cap sweep on the production schedule (PhaseUnroll=4, 128 thr): MinBlocksPerSm
 // caps regs at 65536/(128*mb) -> 4/5/6/8/10/12 blocks per SM (33/42/50/67/83/100% warp occ).
-using ProdMb4  =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 4>;
-using ProdMb5  =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 5>;
-using ProdMb6  =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 6>;
-using ProdMb8  =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 8>;
-using ProdMb10 =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 10>;
-using ProdMb12 =
-    Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
-                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
-                        Nvfp4SmallTBlockOrder::RowsContiguous, 12>;
+using ProdMb4  = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 4>;
+using ProdMb5  = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 5>;
+using ProdMb6  = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 6>;
+using ProdMb8  = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 8>;
+using ProdMb10 = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 10>;
+using ProdMb12 = Nvfp4SmallTSchedule<4, 1, 2, 16, kT, 1, Nvfp4SmallTActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 12>;
 
 using LaunchFn = void (*)(const __nv_bfloat16*, const std::uint8_t*, const std::uint8_t*, float,
                           __nv_bfloat16*, cudaStream_t);
@@ -100,24 +88,17 @@ using Chains2Unroll4 =
                         Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 
 const Candidate kCandidates[] = {
-    {"prod", &launch_sched<Prod>},
-    {"mb2", &launch_sched<ProdMb2>},
-    {"stream", &launch_sched<ProdStream>},
-    {"unroll4", &launch_sched<ProdUnroll4>},
-    {"warps8", &launch_sched<Warps8>},
-    {"chains2", &launch_sched<Chains2>},
-    {"shared", &launch_sched<SharedPh>},
-    {"ch2_u4", &launch_sched<Chains2Unroll4>},
-    {"mb4", &launch_sched<ProdMb4>},
-    {"mb5", &launch_sched<ProdMb5>},
-    {"mb6", &launch_sched<ProdMb6>},
-    {"mb8", &launch_sched<ProdMb8>},
-    {"mb10", &launch_sched<ProdMb10>},
-    {"mb12", &launch_sched<ProdMb12>},
+    {"prod", &launch_sched<Prod>},         {"mb2", &launch_sched<ProdMb2>},
+    {"stream", &launch_sched<ProdStream>}, {"unroll4", &launch_sched<ProdUnroll4>},
+    {"warps8", &launch_sched<Warps8>},     {"chains2", &launch_sched<Chains2>},
+    {"shared", &launch_sched<SharedPh>},   {"ch2_u4", &launch_sched<Chains2Unroll4>},
+    {"mb4", &launch_sched<ProdMb4>},       {"mb5", &launch_sched<ProdMb5>},
+    {"mb6", &launch_sched<ProdMb6>},       {"mb8", &launch_sched<ProdMb8>},
+    {"mb10", &launch_sched<ProdMb10>},     {"mb12", &launch_sched<ProdMb12>},
 };
 
 struct Cmp {
-    int bit_mism = 0;
+    int bit_mism  = 0;
     float max_abs = 0.f;
 };
 
@@ -205,8 +186,7 @@ int main() {
                 const auto run = [&](cudaStream_t s) {
                     cand.fn(x, codes, scales, inverse, out, s);
                 };
-                cold_us =
-                    bench::measure_cold_launch(run, flush, stream, 8, 40).median_us;
+                cold_us = bench::measure_cold_launch(run, flush, stream, 8, 40).median_us;
                 warm_us = measure_warm(cand.fn, x, codes, scales, inverse, out, stream).median_us;
                 if (std::string_view(cand.name) == "prod") {
                     prod_cold = cold_us;

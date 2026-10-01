@@ -26,14 +26,10 @@ class MockBackend:
         del target, for_run
         unknown = sorted(set(job.backend_args) - self._ALLOWED)
         if unknown:
-            raise ConfigError(
-                f"mock job {job.id} has unknown backend_args: {', '.join(unknown)}"
-            )
+            raise ConfigError(f"mock job {job.id} has unknown backend_args: {', '.join(unknown)}")
         items = job.backend_args.get("items", 10)
         if isinstance(items, bool) or not isinstance(items, int) or items <= 0:
-            raise ConfigError(
-                f"mock job {job.id} backend_args.items must be a positive integer"
-            )
+            raise ConfigError(f"mock job {job.id} backend_args.items must be a positive integer")
 
     def plan(self, job: JobConfig, target: ResolvedTarget | None) -> WorkPlan:
         del target
@@ -126,12 +122,9 @@ class MockBackend:
                 "accuracy": correct / total if total else 0.0,
                 "max_in_flight": run.raw_result["max_in_flight"],
             },
-            counts=ResultCounts(
-                planned=context.plan.total, completed=total, scored=total
-            ),
+            counts=ResultCounts(planned=context.plan.total, completed=total, scored=total),
             duration_seconds=run.duration_seconds,
             artifacts=[
-                str(path.relative_to(context.job_dir.parent.parent))
-                for path in run.artifacts
+                str(path.relative_to(context.job_dir.parent.parent)) for path in run.artifacts
             ],
         )

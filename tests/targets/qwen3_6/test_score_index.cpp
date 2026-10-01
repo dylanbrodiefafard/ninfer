@@ -51,15 +51,13 @@ void test_chunk_targets() {
            "full sequence scores n-1 next-token ids");
 
     const std::vector<std::int32_t> half = ninfer::prefill_chunk_targets(ids, 0, 8, 4);
-    expect(half.size() == 3 && half[0] == 15 && half[2] == 17,
-           "skip n/2 scores positions 4..6");
+    expect(half.size() == 3 && half[0] == 15 && half[2] == 17, "skip n/2 scores positions 4..6");
 
     const std::vector<std::int32_t> first = ninfer::prefill_chunk_targets(ids, 0, 4, 4);
     expect(first.empty(), "warmup chunk contributes no targets");
 
     const std::vector<std::int32_t> second = ninfer::prefill_chunk_targets(ids, 4, 4, 4);
-    expect(second.size() == 3 && second[0] == 15,
-           "second chunk starts scoring at skip");
+    expect(second.size() == 3 && second[0] == 15, "second chunk starts scoring at skip");
 
     const std::vector<std::int32_t> cross = ninfer::prefill_chunk_targets(ids, 0, 4, 0);
     expect(cross.size() == 4 && cross.back() == 14,

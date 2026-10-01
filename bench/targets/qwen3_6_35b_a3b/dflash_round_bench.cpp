@@ -189,9 +189,9 @@ int run(const Options& options) {
     const std::uint64_t per_request_capacity =
         options.context_tokens + (measured_rounds + 1ULL) * block;
     const std::uint64_t aligned_request_capacity = (per_request_capacity + 63ULL) & ~63ULL;
-    const std::uint64_t capacity                 = options.batch_size == 1
-                                                       ? per_request_capacity
-                                                       : aligned_request_capacity * options.batch_size;
+    const std::uint64_t capacity = options.batch_size == 1
+                                       ? per_request_capacity
+                                       : aligned_request_capacity * options.batch_size;
     if (per_request_capacity > 262144 || capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
@@ -214,7 +214,7 @@ int run(const Options& options) {
     ninfer::artifact::Reader reader(options.artifact);
     ninfer::artifact::Binder binder(reader);
     const auto weights_profile = target::Package::resolve_weights(reader.identity(), binder);
-    auto load_plan        = target::Package::plan_load(binder, engine, weights_profile);
+    auto load_plan             = target::Package::plan_load(binder, engine, weights_profile);
     auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
     const auto resolution = ninfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());

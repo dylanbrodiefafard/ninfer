@@ -3,7 +3,7 @@
 #include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
-#define NINFER_QWEN36_VARIANT ::ninfer::targets::qwen3_6_27b::detail::Variant
+#define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
 #include "targets/qwen3_6/impl/runtime/program.h"
 
@@ -18,10 +18,10 @@
 #include <vector>
 
 namespace {
-namespace target = ninfer::targets::qwen3_6_27b::detail;
-namespace family = ninfer::targets::qwen3_6;
+namespace target    = ninfer::targets::qwen3_6_27b::detail;
+namespace family    = ninfer::targets::qwen3_6;
 namespace execution = family::detail::qwen3_6_27b_runtime;
-using Package = ninfer::targets::qwen3_6_27b::Package;
+using Package       = ninfer::targets::qwen3_6_27b::Package;
 
 constexpr std::size_t kRamBytes = 1024ULL * 1024ULL * 1024ULL;
 
@@ -50,7 +50,7 @@ struct CommittedState {
 };
 
 CommittedState committed_state(execution::ProgramImplCore& program) {
-    const auto& state = program.decoder->linear_attention;
+    const auto& state  = program.decoder->linear_attention;
     const auto& hidden = program.sequences[0].tail_hidden;
     CommittedState result{std::vector<std::byte>(state.conv_host_image_bytes()),
                           std::vector<std::byte>(state.recurrent_host_image_bytes()),
@@ -81,7 +81,7 @@ std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, 
 PrefillRun finish_prefill(execution::ProgramImplCore& program, family::PreparedPromptData prompt,
                           execution::RequestPlan plan) {
     PrefillRun run;
-    auto step = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {});
+    auto step     = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {});
     run.summary   = step.summary;
     run.processed = step.processed_prompt_tokens;
     while (!step.complete) {
@@ -100,15 +100,16 @@ bool prefix_equals(const std::vector<ninfer::TokenId>& tokens,
 }
 
 void exercise_decoded_retries(execution::ProgramImplCore& program, family::Frontend& frontend,
-                               const ninfer::PromptInput& input,
-                               ninfer::runtime::ResolvedExecutionOptions options) {
+                              const ninfer::PromptInput& input,
+                              ninfer::runtime::ResolvedExecutionOptions options) {
     options.requested_output_tokens = 32;
-    auto prompt = family::PreparedPromptAccess::take(frontend.prepare(input));
-    const auto recovery = family::GenerationRecoveryContext::analyze(input);
+    auto prompt                     = family::PreparedPromptAccess::take(frontend.prepare(input));
+    const auto recovery             = family::GenerationRecoveryContext::analyze(input);
     for (std::uint32_t attempt = 1; attempt <= 2; ++attempt) {
         const auto prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
-        const auto insert = recovery->recovery_insert({}, attempt);
-        auto prepared_retry = frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery);
+        const auto insert        = recovery->recovery_insert({}, attempt);
+        auto prepared_retry =
+            frontend.splice_recovery_prompt(prompt.token_ids, input, insert, recovery);
         require(prepared_retry.has_value(), "decoded retry splice was rejected");
         auto retry = family::PreparedPromptAccess::take(std::move(*prepared_retry));
 
@@ -136,14 +137,14 @@ void exercise_decoded_retries(execution::ProgramImplCore& program, family::Front
                         ? execution::is_complete_checkpoint_restore(retry_plan.impl_->reuse)
                         : retry_plan.impl_->reuse == execution::ReusePath::AppendAtFrontier,
                     "fixture did not exercise append and checkpoint restore separately");
-            const auto run = finish_prefill(program, family::PreparedPromptData(retry),
-                                            std::move(retry_plan));
+            const auto run =
+                finish_prefill(program, family::PreparedPromptData(retry), std::move(retry_plan));
             require(run.processed == retry.token_ids.size() - prompt_tokens,
                     "decoded retry recomputed tokens before its checkpoint");
             const auto actual = committed_state(program);
             auto continuation = decode_rounds(program, 2);
             if (!failed_decode) {
-                expected = actual;
+                expected              = actual;
                 expected_continuation = std::move(continuation);
             } else {
                 require(actual == expected,
@@ -153,8 +154,8 @@ void exercise_decoded_retries(execution::ProgramImplCore& program, family::Front
             }
         }
         prompt = std::move(retry);
-        std::cout << "decoded retry attempt=" << attempt
-                  << " restored=" << prompt_tokens << " state and continuation matched\n";
+        std::cout << "decoded retry attempt=" << attempt << " restored=" << prompt_tokens
+                  << " state and continuation matched\n";
     }
 }
 
@@ -174,42 +175,42 @@ void require_empty_lane(const execution::ProgramImplCore& program, const char* w
 void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     ninfer::DeviceContext device;
     ninfer::EngineOptions options;
-    options.artifact_path              = artifact;
-    options.max_context                = 4096;
-    options.max_concurrency            = 1;
-    options.kv_capacity                = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-    options.prefill_chunk              = 1024;
-    options.kv_cache                   = ninfer::KvCacheStorage::Nvfp4;
-    options.kv_ram_capacity_bytes      = kRamBytes;
-    options.enable_vision              = false;
+    options.artifact_path         = artifact;
+    options.max_context           = 4096;
+    options.max_concurrency       = 1;
+    options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk         = 1024;
+    options.kv_cache              = ninfer::KvCacheStorage::Nvfp4;
+    options.kv_ram_capacity_bytes = kRamBytes;
+    options.enable_vision         = false;
     // Decode-graph capture is measured by its own real tests. This run is the
     // retain/copy/abort/restore sequence, and the graph allowance check is a
     // device-wide free-memory delta that moves when another allocation lands.
-    options.use_cuda_graph             = false;
-    options.speculative.backend        = backend;
-    options.speculative.draft_tokens   = 3;
-    options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
+    options.use_cuda_graph            = false;
+    options.speculative.backend       = backend;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     // Fixed draft width keeps the restoration control independent of round-time
     // estimates learned during the deliberately discarded decode.
     options.speculative.adaptive_draft = false;
 
     ninfer::artifact::Reader reader(artifact);
     ninfer::artifact::Binder binder(reader);
-    options.model_id                = reader.identity().model_id;
-    options.weights_id              = reader.identity().weights_id;
-    options.artifact_file_identity  = reader.file_identity();
-    const auto profile = Package::resolve_weights(reader.identity(), binder);
-    auto load = target::bind_artifact(binder, profile, family::startup_features(options));
+    options.model_id               = reader.identity().model_id;
+    options.weights_id             = reader.identity().weights_id;
+    options.artifact_file_identity = reader.file_identity();
+    const auto profile             = Package::resolve_weights(reader.identity(), binder);
+    auto load         = target::bind_artifact(binder, profile, family::startup_features(options));
     auto materialized = ninfer::artifact::materialize(reader, load.materialization, device);
     target::LoadedModelData model(std::move(load.bindings), std::move(materialized));
     auto frontend = family::make_frontend(model.frontend, false);
     device.synchronize();
 
-    auto planner = Package::make_sequence_planner(device, options, profile);
-    const auto pages = planner.capacity_curve().minimum_main_page_groups;
+    auto planner       = Package::make_sequence_planner(device, options, profile);
+    const auto pages   = planner.capacity_curve().minimum_main_page_groups;
     auto sequence_plan = std::move(planner).finalize(pages);
-    execution::ProgramImplCore program(
-        model.runtime, *sequence_plan.impl_, device, std::make_unique<ninfer::HostPinnedArena>(kRamBytes));
+    execution::ProgramImplCore program(model.runtime, *sequence_plan.impl_, device,
+                                       std::make_unique<ninfer::HostPinnedArena>(kRamBytes));
     device.synchronize();
 
     ninfer::PromptInput input;
@@ -218,22 +219,22 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     message.parts.push_back(ninfer::MessagePart{
         .kind = ninfer::MessagePartKind::Text, .text = "Say hello in one sentence.", .media = {}});
     input.messages.push_back(std::move(message));
-    input.options.enable_thinking = true;
+    input.options.enable_thinking   = true;
     input.options.preserve_thinking = true;
 
     ninfer::runtime::ResolvedExecutionOptions execution;
-    execution.requested_output_tokens       = 8;
-    execution.sampling.temperature          = 0.0F;
-    execution.allow_prefix_reuse            = true;
-    execution.force_cold_prefill            = false;
-    execution.capture_context_checkpoint    = false;
+    execution.requested_output_tokens    = 8;
+    execution.sampling.temperature       = 0.0F;
+    execution.allow_prefix_reuse         = true;
+    execution.force_cold_prefill         = false;
+    execution.capture_context_checkpoint = false;
 
     auto prepared = family::PreparedPromptAccess::take(frontend.prepare(input));
     const std::vector<ninfer::TokenId> prompt_ids = prepared.token_ids;
-    const auto prompt_tokens = static_cast<std::uint32_t>(prompt_ids.size());
+    const auto prompt_tokens                      = static_cast<std::uint32_t>(prompt_ids.size());
     require(prompt_tokens > 1, "thinking prompt was empty");
 
-    auto base = program.plan_request_base(prepared, execution);
+    auto base       = program.plan_request_base(prepared, execution);
     auto first_plan = program.plan_request_for_lane(0, prepared, base);
     require(first_plan.summary().transient_bytes == 0, "text prompt requested transient storage");
     const PrefillRun first = finish_prefill(program, std::move(prepared), std::move(first_plan));
@@ -256,7 +257,8 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     std::uint32_t copied_frontier = 0;
     require(program.copy_reusable_prompt(0, prompt_tokens, copied, copied_frontier),
             "retain left no prompt to copy");
-    require(copied == prompt_ids, "copied prefix included generated tokens or dropped prompt tokens");
+    require(copied == prompt_ids,
+            "copied prefix included generated tokens or dropped prompt tokens");
     require(copied_frontier == program.sequences[0].rewrite_checkpoint.frontier,
             "copied rewrite frontier does not match the resident checkpoint");
 
@@ -266,11 +268,11 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     require(spliced_prompt.has_value(), "live thinking prompt refused the recovery splice");
     auto spliced = family::PreparedPromptAccess::take(std::move(*spliced_prompt));
     const std::vector<ninfer::TokenId> spliced_ids = spliced.token_ids;
-    const auto spliced_tokens = static_cast<std::uint32_t>(spliced_ids.size());
+    const auto spliced_tokens                      = static_cast<std::uint32_t>(spliced_ids.size());
     require(spliced_tokens > prompt_tokens && prefix_equals(spliced_ids, prompt_ids),
             "splice did not append to the copied prompt");
 
-    auto retry_base = program.plan_request_base(spliced, execution);
+    auto retry_base    = program.plan_request_base(spliced, execution);
     auto resident_plan = program.plan_request_for_lane(0, spliced, retry_base);
     // The live frontier is the prompt. The splice starts at the next token, so the
     // whole prompt is the hit. A shorter rewrite checkpoint must not win.
@@ -357,11 +359,11 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
 } // namespace
 
 int main() {
-    const char* nvfp4  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    const char* group  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    const char* mtp = std::getenv("NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS");
-    const char* artifact = nullptr;
+    const char* nvfp4                  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    const char* group                  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
+    const char* dflash                 = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    const char* mtp                    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS");
+    const char* artifact               = nullptr;
     ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::Mtp;
     if (mtp != nullptr && *mtp != '\0') {
         artifact = mtp;

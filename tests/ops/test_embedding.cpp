@@ -399,8 +399,9 @@ double decode_e4m3fn(std::uint8_t word) {
     const unsigned exponent = (word >> 3) & 15;
     const unsigned fraction = word & 7;
     if (exponent == 15 && fraction == 7) throw std::invalid_argument("FP8 NaN code");
-    const double magnitude = exponent == 0 ? fraction / 512.0 :
-        std::ldexp(1.0 + fraction / 8.0, static_cast<int>(exponent) - 7);
+    const double magnitude = exponent == 0
+                                 ? fraction / 512.0
+                                 : std::ldexp(1.0 + fraction / 8.0, static_cast<int>(exponent) - 7);
     return (word & 128) ? -magnitude : magnitude;
 }
 
@@ -554,9 +555,8 @@ int test_fp8() {
         cuda_synchronize();
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
-        definition.capture(device.stream, [&] {
-            ops::embedding(input, weight, result, device.stream);
-        });
+        definition.capture(device.stream,
+                           [&] { ops::embedding(input, weight, result, device.stream); });
         graph.instantiate(definition);
         for (int replay = 0; replay < 2; ++replay) {
             if (replay) std::reverse(ids.begin(), ids.end());

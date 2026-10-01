@@ -196,8 +196,7 @@ std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std:
     return elements * sizeof(float);
 }
 
-Bf16GdnGatingPlan make_plan(Bf16GdnGatingScheduleId schedule,
-                            const Bf16GdnGatingProblem& problem) {
+Bf16GdnGatingPlan make_plan(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem) {
     Bf16GdnGatingTokenVariant variant = Bf16GdnGatingTokenVariant::None;
     if (schedule_uses_mma(schedule)) {
         variant = schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit40 ||
@@ -221,8 +220,8 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
 
     switch (plan.schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
-        bf16_gdn_gating_proj_mma_split40_launch(x, a_weight, b_weight, A_log, dt_bias,
-                                               scratch.data, g, beta, stream);
+        bf16_gdn_gating_proj_mma_split40_launch(x, a_weight, b_weight, A_log, dt_bias, scratch.data,
+                                                g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         bf16_gdn_gating_proj_35_simt_c4_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
@@ -421,18 +420,18 @@ std::size_t bf16_gdn_norm_gating_packed_sequences_capacity_workspace_bytes(
     if (sequence_width <= 0 || min_batch <= 0 || max_batch < min_batch ||
         max_batch > kBf16GdnGatingPackedMaxBatch ||
         sequence_width > std::numeric_limits<std::int32_t>::max() / max_batch) {
-        throw std::invalid_argument("BF16 GDN packed norm/control: invalid width or batch interval");
+        throw std::invalid_argument(
+            "BF16 GDN packed norm/control: invalid width or batch interval");
     }
     std::size_t maximum = 0;
     for (std::int32_t batch = min_batch; batch <= max_batch; ++batch) {
         if (bf16_gdn_gating_packed_aggregates(sequence_width, batch)) {
-            maximum = std::max(maximum,
-                               bf16_gdn_gating_resolve_packed_plan(
-                                   {48, 5120, sequence_width * batch})
-                                   .workspace_bytes);
+            maximum = std::max(
+                maximum, bf16_gdn_gating_resolve_packed_plan({48, 5120, sequence_width * batch})
+                             .workspace_bytes);
         } else {
             maximum = std::max(maximum, bf16_gdn_norm_gating_capacity_workspace_bytes(
-                                                48, 5120, sequence_width, sequence_width));
+                                            48, 5120, sequence_width, sequence_width));
         }
     }
     return maximum;
@@ -489,10 +488,11 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                                     scratch.data, g, beta, stream);
 }
 
-void bf16_gdn_norm_gating_packed_dispatch(
-    const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& g, Tensor& beta, cudaStream_t stream) {
+void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& A_log, const Tensor& dt_bias,
+                                          WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                                          cudaStream_t stream) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_packed_plan(problem);
     rmsnorm(x, norm_weight, eps, true, h, stream);

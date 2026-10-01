@@ -21,17 +21,17 @@ inline double round_persistent_bf16(double value) {
     // Pick the nearest represented BF16 directly in FP64, avoiding a private
     // FP32 double-rounding boundary in the mathematical state oracle.
     const std::uint16_t center = f32_to_bf16(static_cast<float>(value));
-    std::uint16_t best = center;
-    double distance = std::abs(value - static_cast<double>(bf16_to_f32(center)));
+    std::uint16_t best         = center;
+    double distance            = std::abs(value - static_cast<double>(bf16_to_f32(center)));
     for (int delta = -2; delta <= 2; ++delta) {
         const int candidate = static_cast<int>(center) + delta;
         if (candidate < 0 || candidate > 65535) { continue; }
-        const auto bits = static_cast<std::uint16_t>(candidate);
+        const auto bits          = static_cast<std::uint16_t>(candidate);
         const double represented = bf16_to_f32(bits);
         if (!std::isfinite(represented)) { continue; }
         const double next = std::abs(value - represented);
         if (next < distance || (next == distance && !(bits & 1U) && (best & 1U))) {
-            best = bits;
+            best     = bits;
             distance = next;
         }
     }
@@ -210,8 +210,8 @@ inline int compare_packed_column_to_decode(std::string_view label, const Guarded
     const std::size_t need = offset + static_cast<std::size_t>(rows);
     if (decode_vals.size() != static_cast<std::size_t>(rows) || packed_vals.size() < need) {
         std::cerr << label << ": column " << packed_column
-                  << " size mismatch packed=" << packed_vals.size() << " decode=" << decode_vals.size()
-                  << " rows=" << rows << '\n';
+                  << " size mismatch packed=" << packed_vals.size()
+                  << " decode=" << decode_vals.size() << " rows=" << rows << '\n';
         return 1;
     }
     return compare(label,

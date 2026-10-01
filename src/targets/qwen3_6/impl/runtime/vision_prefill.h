@@ -34,8 +34,9 @@ struct VisionChunkSelection {
 // prefix. Its preceding chunk still needs the image's embeddings for MTP's
 // shifted final input. Between items, cap at the next shifted consumer because
 // a chunk can reference only one item's embeddings.
-[[nodiscard]] inline VisionChunkSelection select_vision_prefill_chunk(
-    std::span<const VisionUseSpan> uses, std::uint32_t begin, std::uint32_t length) noexcept {
+[[nodiscard]] inline VisionChunkSelection
+select_vision_prefill_chunk(std::span<const VisionUseSpan> uses, std::uint32_t begin,
+                            std::uint32_t length) noexcept {
     std::uint32_t end = begin + length;
     std::optional<std::size_t> active;
     for (std::size_t index = 0; index < uses.size(); ++index) {

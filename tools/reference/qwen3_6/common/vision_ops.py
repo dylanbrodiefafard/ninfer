@@ -87,7 +87,9 @@ def bilinear_indices_and_weights(grid_thw: torch.Tensor) -> tuple[torch.Tensor, 
         ]
         hi = torch.arange(h, device=device).view(h // merge, merge)
         wi = torch.arange(w, device=device).view(w // merge, merge)
-        reorder = (hi[:, :, None, None] * w + wi[None, None, :, :]).transpose(1, 2).flatten().repeat(t)
+        reorder = (
+            (hi[:, :, None, None] * w + wi[None, None, :, :]).transpose(1, 2).flatten().repeat(t)
+        )
         for corner in range(4):
             index_parts[corner].append(indices[corner][reorder])
             weight_parts[corner].append(weights[corner][reorder])
@@ -173,9 +175,9 @@ def vision_attention(
             batch: int = batch,
             length: int = length,
         ) -> torch.Tensor:
-            return x[begin:end].reshape(
-                batch, length, VISION_HEADS, VISION_HEAD_DIM
-            ).transpose(1, 2)
+            return (
+                x[begin:end].reshape(batch, length, VISION_HEADS, VISION_HEAD_DIM).transpose(1, 2)
+            )
 
         attended = _sdpa(heads(q), heads(k), heads(v))
         out[begin:end] = attended.transpose(1, 2).reshape(

@@ -29,12 +29,12 @@ int main() {
     };
     int failures = 0;
     for (const auto& shape : {
-        ShapeCase{14336, 5120, 719U, Comparison::Sampled, true, invocations},
-        ShapeCase{16384, 5120, 721U, Comparison::Sampled, true, invocations},
-        ShapeCase{34816, 5120, 722U, Comparison::Sampled, true, invocations},
-        ShapeCase{5120, 6144, 723U, Comparison::Sampled, true, invocations},
-        ShapeCase{5120, 17408, 725U, Comparison::Sampled, true, invocations},
-    }) {
+             ShapeCase{14336, 5120, 719U, Comparison::Sampled, true, invocations},
+             ShapeCase{16384, 5120, 721U, Comparison::Sampled, true, invocations},
+             ShapeCase{34816, 5120, 722U, Comparison::Sampled, true, invocations},
+             ShapeCase{5120, 6144, 723U, Comparison::Sampled, true, invocations},
+             ShapeCase{5120, 17408, 725U, Comparison::Sampled, true, invocations},
+         }) {
         failures += run_shape("NVFP4_A8", ActivationCompute::A8, make_nvfp4_weight, shape);
     }
     std::cout << (failures ? "FAIL" : "OK") << " NVFP4_A8 Linear\n";

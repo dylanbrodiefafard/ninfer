@@ -31,18 +31,15 @@ FULL_ATTENTION_LAYERS = base.FULL_ATTENTION_LAYERS
 GDN_LAYERS = base.GDN_LAYERS
 EARLY_ATTENTION_INPUT_LAYERS = (3, 7, 11, 15, 19, 23)
 NVFP4_ATTENTION_INPUT_LAYERS = tuple(
-    layer for layer in FULL_ATTENTION_LAYERS
-    if layer not in EARLY_ATTENTION_INPUT_LAYERS
+    layer for layer in FULL_ATTENTION_LAYERS if layer not in EARLY_ATTENTION_INPUT_LAYERS
 )
 BF16_ATTENTION_OUTPUT_LAYERS = (3, 7)
 NVFP4_ATTENTION_OUTPUT_LAYERS = tuple(
-    layer for layer in FULL_ATTENTION_LAYERS
-    if layer not in BF16_ATTENTION_OUTPUT_LAYERS
+    layer for layer in FULL_ATTENTION_LAYERS if layer not in BF16_ATTENTION_OUTPUT_LAYERS
 )
 BF16_GDN_OUTPUT_LAYERS = (4,)
 NVFP4_GDN_OUTPUT_LAYERS = tuple(
-    layer for layer in GDN_LAYERS
-    if layer not in BF16_GDN_OUTPUT_LAYERS
+    layer for layer in GDN_LAYERS if layer not in BF16_GDN_OUTPUT_LAYERS
 )
 
 
@@ -55,11 +52,7 @@ def _replacement_format(name: str, original: str) -> str:
     layer = int(parts[2])
     suffix = "/".join(parts[3:])
     if suffix == "attention/query_key_gate_value":
-        return (
-            BF16
-            if layer in EARLY_ATTENTION_INPUT_LAYERS
-            else NVFP4
-        )
+        return BF16 if layer in EARLY_ATTENTION_INPUT_LAYERS else NVFP4
     if suffix == "attention/output":
         return BF16 if layer in BF16_ATTENTION_OUTPUT_LAYERS else NVFP4
     if suffix == "gdn/query_key_value_z":
@@ -119,8 +112,7 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
             specs.append(spec)
             specs.append(
                 _tensor(
-                    name.removesuffix("query_key_value_z")
-                    + "input_projection/input_scale_divisor",
+                    name.removesuffix("query_key_value_z") + "input_projection/input_scale_divisor",
                     (),
                     FP32,
                 )
@@ -143,10 +135,7 @@ MTP_TENSOR_SPECS = base.MTP_TENSOR_SPECS
 VISION_TENSOR_SPECS = base.VISION_TENSOR_SPECS
 
 TENSOR_SPECS = (
-    TEXT_CORE_TENSOR_SPECS
-    + DRAFT_HEAD_TENSOR_SPECS
-    + MTP_TENSOR_SPECS
-    + VISION_TENSOR_SPECS
+    TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + MTP_TENSOR_SPECS + VISION_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
@@ -157,8 +146,7 @@ FORMAT_COUNTS = {
     for numeric_format in FORMAT_NAMES
 }
 LAYOUT_COUNTS = {
-    layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
-    for layout in LAYOUT_NAMES
+    layout: sum(spec.layout == layout for spec in TENSOR_SPECS) for layout in LAYOUT_NAMES
 }
 
 LOGICAL_ROW_VIEW_SPECS = (
@@ -230,11 +218,10 @@ LOGICAL_ROW_VIEW_SPECS = (
 )
 ALIAS_SPECS = base.ALIAS_SPECS
 
-NVFP4_TENSOR_SPECS = tuple(
-    spec for spec in TENSOR_SPECS if spec.format == NVFP4
-)
+NVFP4_TENSOR_SPECS = tuple(spec for spec in TENSOR_SPECS if spec.format == NVFP4)
 INPUT_SCALE_DIVISOR_SPECS = tuple(
-    spec for spec in TENSOR_SPECS
+    spec
+    for spec in TENSOR_SPECS
     if spec.format == FP32 and spec.name.endswith("/input_scale_divisor")
 )
 

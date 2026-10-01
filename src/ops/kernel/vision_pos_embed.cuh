@@ -100,7 +100,7 @@ __global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const st
             }
         }
         const __nv_bfloat16 staged_position = __float2bfloat16_rn(position);
-        x[linear]                         = __hadd_rn(x[linear], staged_position);
+        x[linear]                           = __hadd_rn(x[linear], staged_position);
     }
 }
 

@@ -92,9 +92,10 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                                    Tensor& g, Tensor& beta, cudaStream_t stream);
-void bf16_gdn_norm_gating_packed_dispatch(
-    const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& g, Tensor& beta, cudaStream_t stream);
+void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& A_log, const Tensor& dt_bias,
+                                          WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                                          cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

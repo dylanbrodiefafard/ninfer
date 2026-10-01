@@ -26,10 +26,10 @@ namespace ninfer::ops {
 
 /**
  * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=20 and
- * AllowA4/AllowA8 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the private
- * resolver selects across the requested interval.
- * NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4 and A16 below that;
- * its separately scaled K16 partials preserve the represented weight values.
+ * AllowA4/AllowA8 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the
+ * private resolver selects across the requested interval. NVFP4 AllowA8 selects row-scaled E4M3
+ * activation compute at T>=4 and A16 below that; its separately scaled K16 partials preserve the
+ * represented weight values.
  */
 [[nodiscard]] std::size_t
 linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -64,9 +64,9 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. W8 and fused NVFP4 A16 require zero bytes; W4A4/W4A8 routes use caller-owned
- *   activation and, where selected, private projection storage. There is no persistent state side
- *   effect.
+ *   scoped to the call. W8 and fused NVFP4 A16 require zero bytes; W4A4/W4A8 routes use
+ * caller-owned activation and, where selected, private projection storage. There is no persistent
+ * state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);

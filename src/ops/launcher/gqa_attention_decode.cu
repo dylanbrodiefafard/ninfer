@@ -249,21 +249,19 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
-    auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool Pipelined,
-                      bool DynamicArena>() {
+    auto launch           = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool Pipelined,
+                                bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
-            DynamicArena
-                ? static_cast<std::size_t>((Pipelined ? 2 : 1) *
-                                           (2 * KeyBlock * kGqaNvfp4CodeWidth +
-                                            2 * KeyBlock * kGqaHeadDim))
-                : 0u;
+            DynamicArena ? static_cast<std::size_t>(
+                               (Pipelined ? 2 : 1) *
+                               (2 * KeyBlock * kGqaNvfp4CodeWidth + 2 * KeyBlock * kGqaHeadDim))
+                         : 0u;
         if constexpr (DynamicArena) {
             static const cudaError_t attr = cudaFuncSetAttribute(
-                gqa_attention_decode_nvfp4_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                        MinBlocksPerSm, KeyBlock, Pipelined,
-                                                        DynamicArena,
-                                                        MultiBatch, Masked, TreeMasked, CacheInput>,
+                gqa_attention_decode_nvfp4_tiled_kernel<
+                    Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, Pipelined,
+                    DynamicArena, MultiBatch, Masked, TreeMasked, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
@@ -272,8 +270,8 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
                                                 Masked, TreeMasked, CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
-                static_cast<const std::int32_t*>(pos.data), static_cast<std::uint8_t*>(cache_k.data),
-                static_cast<std::uint8_t*>(cache_v.data),
+                static_cast<const std::int32_t*>(pos.data),
+                static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
                 static_cast<std::uint8_t*>(cache_k_scale.data),
                 static_cast<std::uint8_t*>(cache_v_scale.data),
                 static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -375,12 +373,12 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
 
 template <typename Geometry, typename CacheInput>
 void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const Tensor& pos,
-                                       float scale, PagedKVBatchLayerView cache,
-                                       const GqaSmallTInvocation& invocation,
-                                       GqaExecutionEnvelope envelope, Tensor& partial_acc,
-                                       Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                       cudaStream_t stream, float keep_frac,
-                                       const GqaSmallTKeepScratch& keep) {
+                                      float scale, PagedKVBatchLayerView cache,
+                                      const GqaSmallTInvocation& invocation,
+                                      GqaExecutionEnvelope envelope, Tensor& partial_acc,
+                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                      cudaStream_t stream, float keep_frac,
+                                      const GqaSmallTKeepScratch& keep) {
     if (keep_frac <= 0.0f || keep_frac > 1.0f) {
         throw std::invalid_argument("gqa_attention_small_t_launch: keep_frac must be in (0, 1]");
     }
@@ -405,25 +403,26 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
             } else if (cache.dtype == DType::U8) {                                                 \
-                if (cache.sage_pv) {                                                                \
-                    launch_tc_partial_nvfp4s3<Geometry, (TOKENS), MultiBatch, Masked>(                \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                   \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream,     \
-                        keep_frac, keep.keep_tiles, keep.keep_count, keep.split_off, keep.max_keep); \
-                } else {                                                                             \
-                    launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked, TreeMasked>(      \
-                        q, input, pos, scale, cache, invocation, logical_capacity,                   \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream);   \
-                }                                                                                     \
+                if (cache.sage_pv) {                                                               \
+                    launch_tc_partial_nvfp4s3<Geometry, (TOKENS), MultiBatch, Masked>(             \
+                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
+                        implementation_window, splits, partial_acc, partial_m, partial_l, stream,  \
+                        keep_frac, keep.keep_tiles, keep.keep_count, keep.split_off,               \
+                        keep.max_keep);                                                            \
+                } else {                                                                           \
+                    launch_tc_partial_nvfp4<Geometry, (TOKENS), MultiBatch, Masked, TreeMasked>(   \
+                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
+                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                }                                                                                  \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked,            \
-                                       TreeMasked>(                                                \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
-                    partial_acc, partial_m, partial_l, stream);                                    \
+                                       TreeMasked>(q, input, pos, scale, cache, invocation,        \
+                                                   logical_capacity, splits, partial_acc,          \
+                                                   partial_m, partial_l, stream);                  \
             }                                                                                      \
         };                                                                                         \
-        const bool masked = invocation.valid_columns != nullptr;                                   \
-        const bool tree   = invocation.ancestor_mask != nullptr;                                   \
+        const bool masked       = invocation.valid_columns != nullptr;                             \
+        const bool tree         = invocation.ancestor_mask != nullptr;                             \
         const auto launch_batch = [&]<bool TreeMasked>() {                                         \
             if (invocation.batch_size == 1) {                                                      \
                 if (masked) {                                                                      \
@@ -491,16 +490,16 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 2 * sizeof(float) * splits + 16 + static_cast<std::size_t>(DChunk) * 2 * splits;
             gqa_attention_small_t_reduce_output_kernel<Geometry, DChunk, Int8, MultiBatch, Masked,
                                                        Offset>
-                <<<reduce_grid, kReduceBlock, reduce_smem_bytes, stream>>>
-                    (static_cast<const __nv_bfloat16*>(partial_acc.data),
-                     static_cast<const float*>(partial_m.data),
-                     static_cast<const float*>(partial_l.data),
-                     static_cast<const std::int32_t*>(pos.data),
-                     invocation.valid_columns == nullptr
-                         ? nullptr
-                         : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                     invocation.width, invocation.full_width, invocation.column_begin,
-                     invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+                <<<reduce_grid, kReduceBlock, reduce_smem_bytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(partial_acc.data),
+                    static_cast<const float*>(partial_m.data),
+                    static_cast<const float*>(partial_l.data),
+                    static_cast<const std::int32_t*>(pos.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.width, invocation.full_width, invocation.column_begin,
+                    invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
         };
         switch (reduce_dchunk) {
         case 8:
@@ -569,8 +568,8 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m,
-                                                        partial_l, out, stream, keep_frac, keep);
+                                                        envelope, partial_acc, partial_m, partial_l,
+                                                        out, stream, keep_frac, keep);
         return;
     }
     gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
@@ -579,12 +578,12 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
 }
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
-                                          const PagedKVLayerView& cache,
-                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
-                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                          cudaStream_t stream, float keep_frac,
-                                          const GqaSmallTKeepScratch& keep,
-                                          GqaS3DecodeRankDump* rank_dump) {
+                                         const PagedKVLayerView& cache,
+                                         GqaExecutionEnvelope envelope, Tensor& partial_acc,
+                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                         cudaStream_t stream, float keep_frac,
+                                         const GqaSmallTKeepScratch& keep,
+                                         GqaS3DecodeRankDump* rank_dump) {
     const GqaCachedInput input{};
     const GqaSmallTInvocation invocation{
         .valid_columns = nullptr,
@@ -598,10 +597,9 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
     const std::int32_t splits =
         detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
-                                                        invocation, envelope, partial_acc,
-                                                        partial_m, partial_l, out, stream,
-                                                        keep_frac, keep);
+        gqa_attention_small_t_launch_for<Gqa27Geometry>(
+            q, input, pos, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
+            partial_l, out, stream, keep_frac, keep);
         if (rank_dump != nullptr && keep.keep_tiles.data != nullptr) {
             // Copy the rank's keep set into the caller's dump arrays (stream-
             // ordered; the dump arrays outlive the workspace arena).
@@ -615,10 +613,10 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
                                        cudaMemcpyDeviceToDevice, stream));
             rank_dump->splits = splits;
             if (rank_dump->split_off != nullptr) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    rank_dump->split_off, keep.split_off.data,
-                    static_cast<std::size_t>(kv_rows) * (splits + 1) * sizeof(std::int32_t),
-                    cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(rank_dump->split_off, keep.split_off.data,
+                                           static_cast<std::size_t>(kv_rows) * (splits + 1) *
+                                               sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToDevice, stream));
             }
         }
         return;
@@ -637,10 +635,10 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
                                    cudaMemcpyDeviceToDevice, stream));
         rank_dump->splits = splits;
         if (rank_dump->split_off != nullptr) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                rank_dump->split_off, keep.split_off.data,
-                static_cast<std::size_t>(kv_rows) * (splits + 1) * sizeof(std::int32_t),
-                cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(rank_dump->split_off, keep.split_off.data,
+                                       static_cast<std::size_t>(kv_rows) * (splits + 1) *
+                                           sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToDevice, stream));
         }
     }
 }

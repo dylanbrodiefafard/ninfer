@@ -97,22 +97,16 @@ def build_object_plan(
     object_specs: Sequence[StoredObjectSpec],
     resources: Mapping[str, bytes],
 ) -> ObjectPlan:
-    expected_resources = tuple(
-        spec.name for spec in object_specs if isinstance(spec, ResourceSpec)
-    )
+    expected_resources = tuple(spec.name for spec in object_specs if isinstance(spec, ResourceSpec))
     if tuple(resources) != expected_resources:
         raise ValueError("resource mapping does not match canonical inventory order")
 
     specs: list[ObjectSpec] = []
     for spec in object_specs:
         if isinstance(spec, ResourceSpec):
-            specs.append(
-                ArtifactResourceSpec(spec.name, spec.encoding, len(resources[spec.name]))
-            )
+            specs.append(ArtifactResourceSpec(spec.name, spec.encoding, len(resources[spec.name])))
         elif isinstance(spec, TensorSpec):
-            specs.append(
-                ArtifactTensorSpec(spec.name, spec.shape, spec.format, spec.layout)
-            )
+            specs.append(ArtifactTensorSpec(spec.name, spec.shape, spec.format, spec.layout))
         else:
             raise TypeError(f"unsupported inventory spec: {type(spec).__name__}")
     frozen_specs = tuple(specs)
@@ -140,9 +134,7 @@ def object_statistics(objects: Sequence[ArtifactObject]) -> dict[str, object]:
         "resources": len(resources),
         "formats": dict(sorted(Counter(obj.format for obj in tensors).items())),
         "layouts": dict(sorted(Counter(obj.layout for obj in tensors).items())),
-        "encodings": dict(
-            sorted(Counter(obj.encoding for obj in resources).items())
-        ),
+        "encodings": dict(sorted(Counter(obj.encoding for obj in resources).items())),
         "tensor_bytes": sum(obj.bytes for obj in tensors),
         "resource_bytes": sum(obj.bytes for obj in resources),
         "object_bytes": object_bytes,
@@ -152,9 +144,7 @@ def object_statistics(objects: Sequence[ArtifactObject]) -> dict[str, object]:
 
 
 def tensor_payload_bytes(tensor_specs: Sequence[TensorSpec]) -> int:
-    return sum(
-        encoded_size(spec.layout, spec.format, spec.shape) for spec in tensor_specs
-    )
+    return sum(encoded_size(spec.layout, spec.format, spec.shape) for spec in tensor_specs)
 
 
 def device_arena_bytes(tensor_specs: Sequence[TensorSpec], alignment: int = 256) -> int:
@@ -229,13 +219,9 @@ def build_conversion_report(
             "dtypes": dict(source_preflight.source_dtype_counts),
         },
         "converter": {
-            "revision": (
-                converter_revision(repo_root) if revision is None else revision
-            ),
+            "revision": (converter_revision(repo_root) if revision is None else revision),
             "environment": dict(
-                environment(device)
-                if environment_summary is None
-                else environment_summary
+                environment(device) if environment_summary is None else environment_summary
             ),
         },
         "objects": object_statistics(objects),
