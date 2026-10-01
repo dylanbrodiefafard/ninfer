@@ -29,22 +29,21 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kGqaPrefillNvfp4Warps    = 16;
-inline constexpr int kGqaPrefillNvfp4Threads  = kGqaPrefillNvfp4Warps * 32;
+inline constexpr int kGqaPrefillNvfp4Warps   = 16;
+inline constexpr int kGqaPrefillNvfp4Threads = kGqaPrefillNvfp4Warps * 32;
 // 128 query rows halves K/V reread versus Br=64: each CTA still streams the
 // full key history once, but the grid has half as many tiles.
-inline constexpr int kGqaPrefillNvfp4Br       = 128;
-inline constexpr int kGqaPrefillNvfp4Bc       = 64;
-inline constexpr int kGqaPrefillNvfp4Groups   = kGqaNvfp4Groups;
-inline constexpr int kGqaPrefillNvfp4CodeW    = kGqaNvfp4CodeWidth;
-inline constexpr int kGqaPrefillNvfp4RowTiles = kGqaPrefillNvfp4Br / 16;
-inline constexpr int kGqaPrefillNvfp4DConsumers =
-    kGqaPrefillNvfp4Warps / kGqaPrefillNvfp4RowTiles;
+inline constexpr int kGqaPrefillNvfp4Br         = 128;
+inline constexpr int kGqaPrefillNvfp4Bc         = 64;
+inline constexpr int kGqaPrefillNvfp4Groups     = kGqaNvfp4Groups;
+inline constexpr int kGqaPrefillNvfp4CodeW      = kGqaNvfp4CodeWidth;
+inline constexpr int kGqaPrefillNvfp4RowTiles   = kGqaPrefillNvfp4Br / 16;
+inline constexpr int kGqaPrefillNvfp4DConsumers = kGqaPrefillNvfp4Warps / kGqaPrefillNvfp4RowTiles;
 
-inline constexpr int kGqaPrefillNvfp4QBytes     = kGqaPrefillNvfp4Br * kGqaPrefillNvfp4CodeW;
+inline constexpr int kGqaPrefillNvfp4QBytes      = kGqaPrefillNvfp4Br * kGqaPrefillNvfp4CodeW;
 inline constexpr int kGqaPrefillNvfp4QScaleBytes = kGqaPrefillNvfp4Br * kGqaPrefillNvfp4Groups;
-inline constexpr int kGqaPrefillNvfp4KBytes     = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
-inline constexpr int kGqaPrefillNvfp4VBytes     = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
+inline constexpr int kGqaPrefillNvfp4KBytes      = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
+inline constexpr int kGqaPrefillNvfp4VBytes      = kGqaPrefillNvfp4Bc * kGqaPrefillNvfp4CodeW;
 inline constexpr int kGqaPrefillNvfp4VStageBytes =
     kGqaPrefillNvfp4Bc * kGqaPrefillHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
 inline constexpr int kGqaPrefillNvfp4PBytes =
@@ -72,22 +71,21 @@ inline constexpr int kXAttnPackWarps   = 4;
 inline constexpr int kXAttnPackThreads = kXAttnPackWarps * 32;
 // Eight inverse-stride planes fill four m16n8 MMAs while sharing each B tile.
 // The 48 KiB double buffer admits two CTAs/SM; grid z walks n_j / BN.
-inline constexpr int kXAttnScoreBM      = 64;
-inline constexpr int kXAttnScoreBN      = 128;
-inline constexpr int kXAttnScoreBK      = 64;
-inline constexpr int kXAttnScoreK       = kXAttnStride * kGqaPrefillHeadDim;
-inline constexpr int kXAttnScoreStages  = 2;
-inline constexpr int kXAttnScoreWarpsN  = 8;
-inline constexpr int kXAttnScoreWarps   = kXAttnScoreWarpsN;
-inline constexpr int kXAttnScoreThreads = kXAttnScoreWarps * 32;
-inline constexpr int kXAttnScoreWN       = kXAttnScoreBN / kXAttnScoreWarpsN;
-inline constexpr int kXAttnScoreBrPerCta = 8;
-inline constexpr int kXAttnScoreMmaM     = kXAttnScoreBM / 16;
+inline constexpr int kXAttnScoreBM        = 64;
+inline constexpr int kXAttnScoreBN        = 128;
+inline constexpr int kXAttnScoreBK        = 64;
+inline constexpr int kXAttnScoreK         = kXAttnStride * kGqaPrefillHeadDim;
+inline constexpr int kXAttnScoreStages    = 2;
+inline constexpr int kXAttnScoreWarpsN    = 8;
+inline constexpr int kXAttnScoreWarps     = kXAttnScoreWarpsN;
+inline constexpr int kXAttnScoreThreads   = kXAttnScoreWarps * 32;
+inline constexpr int kXAttnScoreWN        = kXAttnScoreBN / kXAttnScoreWarpsN;
+inline constexpr int kXAttnScoreBrPerCta  = 8;
+inline constexpr int kXAttnScoreMmaM      = kXAttnScoreBM / 16;
 inline constexpr int kXAttnPageCodeBytes  = kGqaPrefillNvfp4Bc * kGqaNvfp4CodeWidth;
 inline constexpr int kXAttnPageScaleBytes = kGqaPrefillNvfp4Bc * kGqaNvfp4Groups;
-inline constexpr int kXAttnScoreSmemBytes =
-    kXAttnScoreStages * (kXAttnScoreBM + kXAttnScoreBN) * kXAttnScoreBK *
-    static_cast<int>(sizeof(__nv_bfloat16));
+inline constexpr int kXAttnScoreSmemBytes = kXAttnScoreStages * (kXAttnScoreBM + kXAttnScoreBN) *
+                                            kXAttnScoreBK * static_cast<int>(sizeof(__nv_bfloat16));
 
 static_assert(kXAttnBlock == kGqaPrefillNvfp4Br);
 static_assert(kGqaPrefillNvfp4Br == kGqaXattnPrefillBr);
@@ -118,19 +116,19 @@ struct GqaXattnScratchView {
 };
 
 inline GqaXattnScratchView gqa_xattn_bind_scratch(void* p, int q_heads, int kv_heads, int n_br,
-                                                 int n_kb) {
-    const int n_j = n_kb * (kGqaPrefillNvfp4Bc / kXAttnStride);
-    auto align256 = [](std::uintptr_t x) { return (x + 255u) & ~std::uintptr_t{255}; };
-    auto* u                 = static_cast<std::uint8_t*>(p);
-    std::uintptr_t o        = 0;
+                                                  int n_kb) {
+    const int n_j    = n_kb * (kGqaPrefillNvfp4Bc / kXAttnStride);
+    auto align256    = [](std::uintptr_t x) { return (x + 255u) & ~std::uintptr_t{255}; };
+    auto* u          = static_cast<std::uint8_t*>(p);
+    std::uintptr_t o = 0;
     GqaXattnScratchView v{};
-    v.q_heads      = q_heads;
-    v.n_br         = n_br;
-    v.n_kb         = n_kb;
-    v.n_j          = n_j;
-    v.keep_stride  = n_kb;
-    auto take      = [&](std::size_t n) {
-        o              = align256(o);
+    v.q_heads     = q_heads;
+    v.n_br        = n_br;
+    v.n_kb        = n_kb;
+    v.n_j         = n_j;
+    v.keep_stride = n_kb;
+    auto take     = [&](std::size_t n) {
+        o               = align256(o);
         std::uint8_t* r = u + o;
         o += n;
         return r;
@@ -140,11 +138,11 @@ inline GqaXattnScratchView gqa_xattn_bind_scratch(void* p, int q_heads, int kv_h
              kGqaPrefillHeadDim));
     v.logits = reinterpret_cast<float*>(
         take(sizeof(float) * static_cast<std::size_t>(q_heads) * n_br * kXAttnIRows * n_j));
-    v.mass   = reinterpret_cast<float*>(
+    v.mass = reinterpret_cast<float*>(
         take(sizeof(float) * static_cast<std::size_t>(q_heads) * n_br * n_kb));
-    v.keep   = reinterpret_cast<std::uint16_t*>(
+    v.keep = reinterpret_cast<std::uint16_t*>(
         take(sizeof(std::uint16_t) * static_cast<std::size_t>(q_heads) * n_br * n_kb));
-    v.count  = reinterpret_cast<int*>(take(sizeof(int) * static_cast<std::size_t>(q_heads) * n_br));
+    v.count = reinterpret_cast<int*>(take(sizeof(int) * static_cast<std::size_t>(q_heads) * n_br));
     return v;
 }
 
@@ -187,11 +185,12 @@ __device__ __forceinline__ int gqa_xattn_n_i_rows(int q_rows) {
 }
 
 __device__ __forceinline__ int gqa_xattn_logit_index(int q_head, int n_br, int br, int i, int n_j,
-                                                    int j) {
+                                                     int j) {
     return (((q_head * n_br + br) * kXAttnIRows + i) * n_j) + j;
 }
 
-__device__ __forceinline__ int gqa_xattn_mass_index(int q_head, int n_br, int br, int n_kb, int kb) {
+__device__ __forceinline__ int gqa_xattn_mass_index(int q_head, int n_br, int br, int n_kb,
+                                                    int kb) {
     return (q_head * n_br + br) * n_kb + kb;
 }
 
@@ -212,9 +211,9 @@ __global__ __launch_bounds__(kXAttnPackThreads, 8) void gqa_xattn_pack_kernel(
     const std::uint8_t* __restrict__ cache_k, const std::uint8_t* __restrict__ cache_k_scale,
     Metadata metadata, const std::int32_t* __restrict__ positions, std::int32_t width,
     std::int32_t xattn_min_len, int n_kb_cap, int n_j_cap, __nv_bfloat16* __restrict__ packed) {
-    constexpr int D     = kGqaPrefillHeadDim;
-    constexpr int Bc    = kGqaPrefillNvfp4Bc;
-    constexpr int CodeW = kGqaNvfp4CodeWidth;
+    constexpr int D      = kGqaPrefillHeadDim;
+    constexpr int Bc     = kGqaPrefillNvfp4Bc;
+    constexpr int CodeW  = kGqaNvfp4CodeWidth;
     constexpr int Groups = kGqaNvfp4Groups;
 
     __shared__ __align__(16) std::uint8_t k_codes[kXAttnPageCodeBytes];
@@ -288,19 +287,19 @@ __global__ __launch_bounds__(kXAttnPackThreads, 8) void gqa_xattn_pack_kernel(
 // both halves of one m16n8k16 MMA and shares the packed-K tile across the group.
 template <typename Geometry, typename Metadata>
 __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ packed, Metadata metadata,
-    const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ packed,
+    Metadata metadata, const std::int32_t* __restrict__ positions, float scale, std::int32_t width,
     std::int32_t xattn_min_len, int n_br, int n_j_cap, float* __restrict__ logits) {
-    constexpr int BM         = kXAttnScoreBM;
-    constexpr int BN         = kXAttnScoreBN;
-    constexpr int BK         = kXAttnScoreBK;
-    constexpr int K          = kXAttnScoreK;
-    constexpr int S          = kXAttnScoreStages;
-    constexpr int WN         = kXAttnScoreWN;
-    constexpr int NT         = WN / 8;
-    constexpr int KSUB       = BK / 16;
-    constexpr int THREADS    = kXAttnScoreThreads;
-    constexpr int kTiles     = K / BK;
+    constexpr int BM      = kXAttnScoreBM;
+    constexpr int BN      = kXAttnScoreBN;
+    constexpr int BK      = kXAttnScoreBK;
+    constexpr int K       = kXAttnScoreK;
+    constexpr int S       = kXAttnScoreStages;
+    constexpr int WN      = kXAttnScoreWN;
+    constexpr int NT      = WN / 8;
+    constexpr int KSUB    = BK / 16;
+    constexpr int THREADS = kXAttnScoreThreads;
+    constexpr int kTiles  = K / BK;
 
     extern __shared__ __align__(16) unsigned char xattn_score_smem[];
     auto* As = reinterpret_cast<__nv_bfloat16*>(xattn_score_smem);
@@ -327,8 +326,8 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
     const int q_start_last = br_last * kXAttnBlock;
     const int q_rows_last  = min(kXAttnBlock, tokens - q_start_last);
     const int q_abs_max    = base_pos + q_start_last + q_rows_last - 1;
-    const int n_j = min(n_j_cap, q_abs_max / kXAttnStride + 1);
-    const int n0  = tile_n * BN;
+    const int n_j          = min(n_j_cap, q_abs_max / kXAttnStride + 1);
+    const int n0           = tile_n * BN;
     if (n0 >= n_j) { return; }
 
     const int gid          = lane >> 2;
@@ -340,8 +339,8 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
     const int b_inner_row  = lane & 7;
     const int b_k_offset   = ((lane >> 3) & 1) << 3;
 
-    const __nv_bfloat16* b_base  = packed + gqa_xattn_packed_row(kv_head, n_j_cap, 0, 0);
-    const float inv_s            = scale / static_cast<float>(kXAttnStride);
+    const __nv_bfloat16* b_base = packed + gqa_xattn_packed_row(kv_head, n_j_cap, 0, 0);
+    const float inv_s           = scale / static_cast<float>(kXAttnStride);
 
     float accum[kXAttnScoreMmaM][NT][4] = {};
 
@@ -350,9 +349,9 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
         auto* a_stage = As + stage * BM * BK;
         auto* b_stage = Bs + stage * BN * BK;
         for (int item = tid; item < BM * (BK / 8); item += THREADS) {
-            const int row = item / (BK / 8);
-            const int kk  = (item - row * (BK / 8)) * 8;
-            auto* dst     = &a_stage[row * BK + gqa_xattn_gemm_swz(row, kk)];
+            const int row      = item / (BK / 8);
+            const int kk       = (item - row * (BK / 8)) * 8;
+            auto* dst          = &a_stage[row * BK + gqa_xattn_gemm_swz(row, kk)];
             const int br_delta = row / kXAttnIRows;
             const int i        = row - br_delta * kXAttnIRows;
             const int br       = br_base + br_delta;
@@ -406,24 +405,22 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
 
         unsigned a_frag[2][kXAttnScoreMmaM][4];
         unsigned b_frag[2][NT][2];
-        auto load_frags = [&](int k_step, unsigned(&a)[kXAttnScoreMmaM][4],
-                              unsigned(&b)[NT][2]) {
+        auto load_frags = [&](int k_step, unsigned (&a)[kXAttnScoreMmaM][4], unsigned (&b)[NT][2]) {
             const int acol = k_step * 16 + a_col_offset;
 #pragma unroll
             for (int mma_m = 0; mma_m < kXAttnScoreMmaM; ++mma_m) {
                 const int arow = mma_m * 16 + a_row_offset;
                 ldmatrix_x4(
                     a[mma_m][0], a[mma_m][1], a[mma_m][2], a[mma_m][3],
-                    smem_addr(&As[stage * BM * BK + arow * BK +
-                                  gqa_xattn_gemm_swz(arow, acol)]));
+                    smem_addr(&As[stage * BM * BK + arow * BK + gqa_xattn_gemm_swz(arow, acol)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_inner_row;
                 const int bcol = k_step * 16 + b_k_offset;
-                ldmatrix_x2(b[ni][0], b[ni][1],
-                            smem_addr(
-                                &Bs[stage * BN * BK + brow * BK + gqa_xattn_gemm_swz(brow, bcol)]));
+                ldmatrix_x2(
+                    b[ni][0], b[ni][1],
+                    smem_addr(&Bs[stage * BN * BK + brow * BK + gqa_xattn_gemm_swz(brow, bcol)]));
             }
         };
         load_frags(0, a_frag[0], b_frag[0]);
@@ -435,11 +432,10 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
             for (int mma_m = 0; mma_m < kXAttnScoreMmaM; ++mma_m) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(accum[mma_m][ni][0], accum[mma_m][ni][1],
-                             accum[mma_m][ni][2], accum[mma_m][ni][3],
-                             a_frag[slot][mma_m][0], a_frag[slot][mma_m][1],
-                             a_frag[slot][mma_m][2], a_frag[slot][mma_m][3],
-                             b_frag[slot][ni][0], b_frag[slot][ni][1]);
+                    mma_bf16(accum[mma_m][ni][0], accum[mma_m][ni][1], accum[mma_m][ni][2],
+                             accum[mma_m][ni][3], a_frag[slot][mma_m][0], a_frag[slot][mma_m][1],
+                             a_frag[slot][mma_m][2], a_frag[slot][mma_m][3], b_frag[slot][ni][0],
+                             b_frag[slot][ni][1]);
                 }
             }
         }
@@ -468,7 +464,7 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
             const int half  = br_delta & 1;
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
-                const int j = t == 0 ? j0 : j1;
+                const int j           = t == 0 ? j0 : j1;
                 const int accumulator = 2 * half + t;
                 const float raw       = accum[mma_m][ni][accumulator];
                 if (j >= n_j) { continue; }
@@ -487,12 +483,11 @@ __global__ __launch_bounds__(kXAttnScoreThreads, 2) void gqa_xattn_score_kernel(
 }
 
 template <typename Geometry, typename Metadata>
-__global__ void gqa_xattn_softmax_mass_kernel(Metadata metadata,
-                                              const std::int32_t* __restrict__ positions,
-                                              std::int32_t width, std::int32_t xattn_min_len,
-                                              int n_br, int n_j_cap, int n_kb_cap,
-                                              const float* __restrict__ logits,
-                                              float* __restrict__ mass) {
+__global__ void
+gqa_xattn_softmax_mass_kernel(Metadata metadata, const std::int32_t* __restrict__ positions,
+                              std::int32_t width, std::int32_t xattn_min_len, int n_br, int n_j_cap,
+                              int n_kb_cap, const float* __restrict__ logits,
+                              float* __restrict__ mass) {
     constexpr int Bc            = kGqaPrefillNvfp4Bc;
     constexpr unsigned FullMask = 0xffffffffu;
     __shared__ float red[kGqaPrefillNvfp4Warps];
@@ -556,7 +551,7 @@ __global__ void gqa_xattn_softmax_mass_kernel(Metadata metadata,
         for (int j = tid; j < n_j; j += kGqaPrefillNvfp4Threads) {
             mx = fmaxf(mx, logits[gqa_xattn_logit_index(q_head, n_br, br, i, n_j_cap, j)]);
         }
-        mx = block_max(mx);
+        mx      = block_max(mx);
         float z = 0.0f;
         for (int j = tid; j < n_j; j += kGqaPrefillNvfp4Threads) {
             const float v = logits[gqa_xattn_logit_index(q_head, n_br, br, i, n_j_cap, j)];
@@ -578,11 +573,11 @@ __global__ void gqa_xattn_softmax_mass_kernel(Metadata metadata,
 }
 
 template <typename Geometry, typename Metadata>
-__global__ void gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* __restrict__ positions,
-                                        std::int32_t width, float xattn_tau,
-                                        std::int32_t xattn_min_len, int n_br, int n_kb_cap,
-                                        const float* __restrict__ mass, std::uint16_t* __restrict__ keep,
-                                        int* __restrict__ count) {
+__global__ void
+gqa_xattn_finish_kernel(Metadata metadata, const std::int32_t* __restrict__ positions,
+                        std::int32_t width, float xattn_tau, std::int32_t xattn_min_len, int n_br,
+                        int n_kb_cap, const float* __restrict__ mass,
+                        std::uint16_t* __restrict__ keep, int* __restrict__ count) {
     constexpr int Bc = kGqaPrefillNvfp4Bc;
 
     extern __shared__ __align__(16) unsigned char xattn_finish_smem[];
@@ -711,27 +706,25 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_sparse_kernel(
     std::uint8_t* k_codes = q_scale + kGqaPrefillNvfp4QScaleBytes;
     std::uint8_t* v_codes = k_codes + kGqaPrefillNvfp4KBytes;
     __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(v_codes + kGqaPrefillNvfp4VBytes);
-    __nv_bfloat16* p_s    = reinterpret_cast<__nv_bfloat16*>(
-        reinterpret_cast<unsigned char*>(v_bf16) + kGqaPrefillNvfp4VStageBytes);
-    std::uint8_t* k_scale_s =
-        reinterpret_cast<std::uint8_t*>(reinterpret_cast<unsigned char*>(p_s) +
-                                        kGqaPrefillNvfp4PBytes);
+    __nv_bfloat16* p_s = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<unsigned char*>(v_bf16) +
+                                                          kGqaPrefillNvfp4VStageBytes);
+    std::uint8_t* k_scale_s = reinterpret_cast<std::uint8_t*>(
+        reinterpret_cast<unsigned char*>(p_s) + kGqaPrefillNvfp4PBytes);
     std::uint8_t* v_scale_s = k_scale_s + Bc * Groups;
     float* alpha_s          = reinterpret_cast<float*>(v_scale_s + Bc * Groups);
     float* final_l_s        = alpha_s + Br;
     // Ranking overlay (scores/marks/q_mean) occupies the MMA arena before Q is
     // quantized. The compacted keep-list survives in the tail past MMA smem.
-    float* proxy_scores = reinterpret_cast<float*>(smem_raw);
+    float* proxy_scores  = reinterpret_cast<float*>(smem_raw);
     float* xattn_scores1 = proxy_scores + kGqaPrefillNvfp4RankTiles;
     int* sort_ids        = reinterpret_cast<int*>(xattn_scores1 + kGqaPrefillNvfp4RankTiles);
     unsigned char* keep_mark =
         reinterpret_cast<unsigned char*>(sort_ids + kGqaPrefillNvfp4RankTiles);
     // Sparge q_mean (D). XAttn overlays Q bf16 + tile masses later in the branch.
-    float* q_mean_s = reinterpret_cast<float*>(keep_mark + kGqaPrefillNvfp4RankTiles);
-    unsigned char* keep_tail =
-        smem_raw + ((kGqaPrefillNvfp4MmaSmemBytes + 15) & ~15);
-    std::uint16_t* keep_u16 = reinterpret_cast<std::uint16_t*>(keep_tail);
-    int* k_keep_count       = reinterpret_cast<int*>(keep_u16 + kGqaPrefillNvfp4RankTiles);
+    float* q_mean_s          = reinterpret_cast<float*>(keep_mark + kGqaPrefillNvfp4RankTiles);
+    unsigned char* keep_tail = smem_raw + ((kGqaPrefillNvfp4MmaSmemBytes + 15) & ~15);
+    std::uint16_t* keep_u16  = reinterpret_cast<std::uint16_t*>(keep_tail);
+    int* k_keep_count        = reinterpret_cast<int*>(keep_u16 + kGqaPrefillNvfp4RankTiles);
     // Block-reduce scratch in the keep-list tail (overwritten by compact after ranking).
     float* red_score = reinterpret_cast<float*>(keep_tail);
     int* red_kb      = reinterpret_cast<int*>(keep_tail + 16 * sizeof(float));
@@ -862,7 +855,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_sparse_kernel(
     __syncthreads();
 
     if (xattn_keep_list != nullptr && xattn_keep_count != nullptr && xattn_n_br > 0) {
-        const int slot = q_head * xattn_n_br + q_block;
+        const int slot  = q_head * xattn_n_br + q_block;
         const int nkeep = min(xattn_keep_count[slot], key_blocks);
         const std::uint16_t* src =
             xattn_keep_list + static_cast<std::int64_t>(slot) * xattn_keep_stride;
@@ -927,8 +920,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_sparse_kernel(
     for (int i = tid; i < Br * Groups; i += kGqaPrefillNvfp4Threads) { q_scale[i] = 0; }
     __syncthreads();
     for (int unit = tid; unit < Br * Groups; unit += kGqaPrefillNvfp4Threads) {
-        const int row = unit / Groups;
-        const int grp = unit - row * Groups;
+        const int row    = unit / Groups;
+        const int grp    = unit - row * Groups;
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
         if (row < tile_rows) {
@@ -997,8 +990,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_sparse_kernel(
                 // lane%4==0; the other lanes duplicate those rows.
                 unsigned sfa = 0;
                 if ((lane & 2) == 0) {
-                    sfa = *reinterpret_cast<const unsigned*>(
-                        &q_scale[scale_row * Groups + k64 * 4]);
+                    sfa =
+                        *reinterpret_cast<const unsigned*>(&q_scale[scale_row * Groups + k64 * 4]);
                 }
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
@@ -1045,14 +1038,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_sparse_kernel(
             const float nm1        = fmaxf(running_m1, bm1);
             const float nm0_scaled = nm0 * scale_l2;
             const float nm1_scaled = nm1 * scale_l2;
-            const float alpha0     = running_m0 == -CUDART_INF_F
-                                         ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
-            const float alpha1     = running_m1 == -CUDART_INF_F
-                                         ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
-            float bl0              = 0.0f;
-            float bl1              = 0.0f;
+            const float alpha0 = running_m0 == -CUDART_INF_F
+                                     ? 0.0f
+                                     : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
+            const float alpha1 = running_m1 == -CUDART_INF_F
+                                     ? 0.0f
+                                     : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
+            float bl0          = 0.0f;
+            float bl1          = 0.0f;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = nt * 8 + 2 * lid;
@@ -1096,9 +1089,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_sparse_kernel(
                 const int key      = k0 + key_l;
                 __nv_bfloat16* dst = &v_bf16[key_l * D + gqa_prefill_swz(key_l, d)];
                 if (key <= max_query_abs) {
-                    const int grp = d >> 4;
-                    const float vs =
-                        detail::decode_nvfp4_e4m3(v_scale_s[key_l * Groups + grp]);
+                    const int grp  = d >> 4;
+                    const float vs = detail::decode_nvfp4_e4m3(v_scale_s[key_l * Groups + grp]);
                     store_vec(dst, gqa_nvfp4_dequant_bf16x8(&v_codes[key_l * CodeW + d / 2], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

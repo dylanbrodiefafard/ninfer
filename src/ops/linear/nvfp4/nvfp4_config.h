@@ -28,23 +28,21 @@ enum class Nvfp4ScaleLayout : std::uint8_t {
 // - 5120x6144 and 5120x17408 (residual linear_add): MMA is within a few percent at T=256..384
 //   and faster at T=512 (45 vs 57, 111 vs 133 us); TMA wins above 512 (T768 70->63, 174->143).
 // Unmeasured shapes keep kNvfp4W4a4TmaMinTokens.
-[[nodiscard]] constexpr bool nvfp4_w4a4_tma_route(std::int32_t output_rows,
-                                                  std::int32_t input_rows,
+[[nodiscard]] constexpr bool nvfp4_w4a4_tma_route(std::int32_t output_rows, std::int32_t input_rows,
                                                   std::int32_t tokens) noexcept {
     if (input_rows == 5120 && (output_rows == 34816 || output_rows == 16384)) {
         return tokens >= 256;
     }
     if (input_rows == 5120 && output_rows == 14336) { return tokens == 256 || tokens > 384; }
-    if (output_rows == 5120 && (input_rows == 6144 || input_rows == 17408)) {
-        return tokens > 512;
-    }
+    if (output_rows == 5120 && (input_rows == 6144 || input_rows == 17408)) { return tokens > 512; }
     return tokens >= kNvfp4W4a4TmaMinTokens;
 }
 
-[[nodiscard]] constexpr Nvfp4ScaleLayout nvfp4_w4a4_projection_scale_layout(
-    std::int32_t output_rows, std::int32_t input_rows, std::int32_t tokens) noexcept {
+[[nodiscard]] constexpr Nvfp4ScaleLayout
+nvfp4_w4a4_projection_scale_layout(std::int32_t output_rows, std::int32_t input_rows,
+                                   std::int32_t tokens) noexcept {
     return nvfp4_w4a4_tma_route(output_rows, input_rows, tokens) ? Nvfp4ScaleLayout::Tiled
-                                                                  : Nvfp4ScaleLayout::RowMajor;
+                                                                 : Nvfp4ScaleLayout::RowMajor;
 }
 
 // Token extent of the tiled plane: whole tiles, padding zero-filled by the quantizer.
@@ -153,17 +151,17 @@ struct Nvfp4SmallTSchedule {
     static constexpr int kPairsPerLane      = ValuesPerLane / 2;
 };
 
-using Nvfp4AttnInputGeometry     = Nvfp4GemvGeometry<14336, 5120>;
-using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
-using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
-using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
-using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
-using Nvfp4DflashFeatureGeometry = Nvfp4GemvGeometry<5120, 25600>;
-using Nvfp4DflashQkvGeometry     = Nvfp4GemvGeometry<6144, 5120>;
-using Nvfp4DflashAttnOutGeometry = Nvfp4GemvGeometry<5120, 4096>;
+using Nvfp4AttnInputGeometry      = Nvfp4GemvGeometry<14336, 5120>;
+using Nvfp4GdnInputGeometry       = Nvfp4GemvGeometry<16384, 5120>;
+using Nvfp4MlpGateUpGeometry      = Nvfp4GemvGeometry<34816, 5120>;
+using Nvfp4Residual6144Geometry   = Nvfp4GemvGeometry<5120, 6144>;
+using Nvfp4Residual17408Geometry  = Nvfp4GemvGeometry<5120, 17408>;
+using Nvfp4DflashFeatureGeometry  = Nvfp4GemvGeometry<5120, 25600>;
+using Nvfp4DflashQkvGeometry      = Nvfp4GemvGeometry<6144, 5120>;
+using Nvfp4DflashAttnOutGeometry  = Nvfp4GemvGeometry<5120, 4096>;
 using Nvfp4DflashConvProjGeometry = Nvfp4GemvGeometry<1280, 5120>;
 using Nvfp4DflashSelectorGeometry = Nvfp4GemvGeometry<256, 5120>;
-using Nvfp4MtpFcGeometry         = Nvfp4GemvGeometry<5120, 10240>;
+using Nvfp4MtpFcGeometry          = Nvfp4GemvGeometry<5120, 10240>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
@@ -338,9 +336,9 @@ template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual6144Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
     static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta   = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
+    static constexpr int kWarpsPerCta = ActiveTokens <= 16 ? (ActiveTokens >= 14 ? 16 : 4) : 4;
     // T=20 is the W=5 C=4 aggregate and must retain the T=5 panel reduction association.
-    static constexpr int kValuesPerLane = ActiveTokens >= 17 && ActiveTokens <= 19 ? 8 : 16;
+    static constexpr int kValuesPerLane     = ActiveTokens >= 17 && ActiveTokens <= 19 ? 8 : 16;
     static constexpr auto kActivationAccess = Nvfp4SmallTActivationAccess::TokenPacked;
     static constexpr int kPhaseUnroll       = ActiveTokens <= 4 ? 4 : 1;
     using Type =
@@ -356,7 +354,7 @@ template <int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);
     static_assert(ActiveTokens <= kNvfp4LastSmallT);
-    static constexpr int kWarpsPerCta       = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
+    static constexpr int kWarpsPerCta = ActiveTokens <= 16 ? (ActiveTokens >= 8 ? 16 : 4) : 4;
     // T=18/20 are W=6 C=3 / W=5 C=4 aggregates and retain their panel reduction association.
     static constexpr int kValuesPerLane =
         ActiveTokens >= 17 && ActiveTokens <= 19 && ActiveTokens != 18 ? 8 : 16;

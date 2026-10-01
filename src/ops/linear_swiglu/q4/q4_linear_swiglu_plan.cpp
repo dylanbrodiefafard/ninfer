@@ -139,9 +139,9 @@ std::size_t q4_linear_swiglu_capacity_workspace_bytes(std::int32_t gate_up_rows,
     for (const RouteSpec& route : kRoutes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
         const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(maximum, q4_linear_swiglu_resolve_plan(
+        maximum = std::max(maximum, q4_linear_swiglu_resolve_plan(
                                         {gate_up_rows, output_rows, k, padded_k, endpoint})
-                                                            .workspace_bytes);
+                                        .workspace_bytes);
     }
     return maximum;
 }

@@ -55,28 +55,16 @@ class RequestConfig:
         )
         timeout = data.get("timeout_seconds", 600.0)
         interval = data.get("retry_interval_seconds", 10.0)
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or timeout <= 0
-        ):
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ConfigError(f"{where}.timeout_seconds must be positive")
-        if (
-            isinstance(interval, bool)
-            or not isinstance(interval, (int, float))
-            or interval < 0
-        ):
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0:
             raise ConfigError(f"{where}.retry_interval_seconds must be non-negative")
         headers = _mapping(data.get("headers", {}), f"{where}.headers")
-        if not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
-        ):
+        if not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
             raise ConfigError(f"{where}.headers must contain string keys and values")
         lowered = {k.lower() for k in headers}
         if "authorization" in lowered or "x-api-key" in lowered:
-            raise ConfigError(
-                f"{where}.headers must not contain credentials; use api_key_env"
-            )
+            raise ConfigError(f"{where}.headers must not contain credentials; use api_key_env")
         return cls(
             timeout_seconds=float(timeout),
             retries=_nonnegative_int(data.get("retries", 5), f"{where}.retries"),
@@ -119,12 +107,8 @@ class TargetConfig:
         if not data["base_url"].startswith(("http://", "https://")):
             raise ConfigError(f"{where}.base_url must use http:// or https://")
         key_env = data.get("api_key_env")
-        if key_env is not None and (
-            not isinstance(key_env, str) or not key_env.strip()
-        ):
-            raise ConfigError(
-                f"{where}.api_key_env must be a non-empty environment variable name"
-            )
+        if key_env is not None and (not isinstance(key_env, str) or not key_env.strip()):
+            raise ConfigError(f"{where}.api_key_env must be a non-empty environment variable name")
         return cls(
             name=name,
             protocol=data["protocol"],
@@ -134,9 +118,7 @@ class TargetConfig:
             max_concurrency=_positive_int(
                 data.get("max_concurrency", 1), f"{where}.max_concurrency"
             ),
-            request=RequestConfig.from_dict(
-                data.get("request", {}), f"{where}.request"
-            ),
+            request=RequestConfig.from_dict(data.get("request", {}), f"{where}.request"),
             provenance=_mapping(data.get("provenance", {}), f"{where}.provenance"),
         )
 
@@ -182,14 +164,8 @@ class JobConfig:
             concurrency = _positive_int(concurrency, f"{where}.max_concurrency")
         limit = data.get("limit")
         if limit is not None:
-            if (
-                isinstance(limit, bool)
-                or not isinstance(limit, (int, float))
-                or limit <= 0
-            ):
-                raise ConfigError(
-                    f"{where}.limit must be a positive integer or fraction"
-                )
+            if isinstance(limit, bool) or not isinstance(limit, (int, float)) or limit <= 0:
+                raise ConfigError(f"{where}.limit must be a positive integer or fraction")
             if isinstance(limit, float) and limit > 1:
                 raise ConfigError(f"{where}.limit as a float must be in (0, 1]")
         generation = _mapping(data.get("generation", {}), f"{where}.generation")
@@ -216,9 +192,7 @@ class JobConfig:
             limit=limit,
             repeats=_positive_int(data.get("repeats", 1), f"{where}.repeats"),
             generation=generation,
-            backend_args=_mapping(
-                data.get("backend_args", {}), f"{where}.backend_args"
-            ),
+            backend_args=_mapping(data.get("backend_args", {}), f"{where}.backend_args"),
         )
 
 
@@ -236,8 +210,7 @@ class SuiteConfig:
         if not isinstance(jobs_raw, list) or not jobs_raw:
             raise ConfigError(f"{where}.jobs must be a non-empty list")
         jobs = tuple(
-            JobConfig.from_dict(item, f"{where}.jobs[{i}]")
-            for i, item in enumerate(jobs_raw)
+            JobConfig.from_dict(item, f"{where}.jobs[{i}]") for i, item in enumerate(jobs_raw)
         )
         ids = [job.id for job in jobs]
         if len(ids) != len(set(ids)):
@@ -254,9 +227,7 @@ class ProgressConfig:
     @classmethod
     def from_dict(cls, raw: Any, where: str) -> ProgressConfig:
         data = _mapping(raw or {}, where)
-        _reject_unknown(
-            data, {"enabled", "refresh_seconds", "heartbeat_seconds"}, where
-        )
+        _reject_unknown(data, {"enabled", "refresh_seconds", "heartbeat_seconds"}, where)
         enabled = data.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ConfigError(f"{where}.enabled must be boolean")
@@ -266,11 +237,7 @@ class ProgressConfig:
             ("refresh_seconds", refresh),
             ("heartbeat_seconds", heartbeat),
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or value <= 0
-            ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
                 raise ConfigError(f"{where}.{key} must be positive")
         return cls(
             enabled=enabled,
@@ -290,9 +257,7 @@ class RuntimeConfig:
     def from_dict(cls, raw: Any) -> RuntimeConfig:
         where = "runtime"
         data = _mapping(raw or {}, where)
-        _reject_unknown(
-            data, {"max_parallel_jobs", "runs_dir", "progress", "samples"}, where
-        )
+        _reject_unknown(data, {"max_parallel_jobs", "runs_dir", "progress", "samples"}, where)
         runs_dir = data.get("runs_dir", "eval/runs")
         if not isinstance(runs_dir, str) or not runs_dir.strip():
             raise ConfigError("runtime.runs_dir must be a non-empty string")
@@ -306,9 +271,7 @@ class RuntimeConfig:
                 data.get("max_parallel_jobs", 1), "runtime.max_parallel_jobs"
             ),
             runs_dir=runs_dir,
-            progress=ProgressConfig.from_dict(
-                data.get("progress", {}), "runtime.progress"
-            ),
+            progress=ProgressConfig.from_dict(data.get("progress", {}), "runtime.progress"),
             sample_retention=retention,
         )
 
@@ -338,9 +301,7 @@ class AppConfig:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data.pop("source_path", None)
-        data["targets"] = {
-            name: _target_to_dict(target) for name, target in self.targets.items()
-        }
+        data["targets"] = {name: _target_to_dict(target) for name, target in self.targets.items()}
         data["suites"] = {
             name: {"jobs": [_job_to_dict(job) for job in suite.jobs]}
             for name, suite in self.suites.items()
@@ -358,9 +319,7 @@ class AppConfig:
         used_targets = {job.target for job in suite.jobs if job.target is not None}
         relevant = {
             "schema_version": self.schema_version,
-            "targets": {
-                name: self.to_dict()["targets"][name] for name in sorted(used_targets)
-            },
+            "targets": {name: self.to_dict()["targets"][name] for name in sorted(used_targets)},
             "suite": self.to_dict()["suites"][suite_name],
             "runtime": self.to_dict()["runtime"],
         }
@@ -410,9 +369,7 @@ def load_config(path: str | Path) -> AppConfig:
     except yaml.YAMLError as exc:
         raise ConfigError(f"invalid YAML in {source}: {exc}") from exc
     data = _mapping(raw, "configuration")
-    _reject_unknown(
-        data, {"schema_version", "targets", "suites", "runtime"}, "configuration"
-    )
+    _reject_unknown(data, {"schema_version", "targets", "suites", "runtime"}, "configuration")
     version = data.get("schema_version")
     if version != 1:
         raise ConfigError(f"unsupported schema_version: {version!r}; expected 1")
@@ -420,12 +377,8 @@ def load_config(path: str | Path) -> AppConfig:
     suites_raw = _mapping(data.get("suites", {}), "suites")
     if not suites_raw:
         raise ConfigError("suites must not be empty")
-    targets = {
-        name: TargetConfig.from_dict(name, value) for name, value in targets_raw.items()
-    }
-    suites = {
-        name: SuiteConfig.from_dict(name, value) for name, value in suites_raw.items()
-    }
+    targets = {name: TargetConfig.from_dict(name, value) for name, value in targets_raw.items()}
+    suites = {name: SuiteConfig.from_dict(name, value) for name, value in suites_raw.items()}
     config = AppConfig(
         schema_version=1,
         targets=targets,

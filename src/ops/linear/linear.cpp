@@ -82,8 +82,8 @@ std::int32_t w8_vocabulary_group_width(const Tensor& x, const Weight& w,
                                        std::int32_t sequence_width, LinearPolicy policy) {
     constexpr std::int32_t kSameReductionTokens = 32;
     if (policy != LinearPolicy::A16Only || w.qtype != QType::W8G32_F16S ||
-        !detail::is_w8_vocabulary_problem(w.n, w.k) || sequence_width < 2 ||
-        sequence_width > 6 || x.ne[1] <= sequence_width) {
+        !detail::is_w8_vocabulary_problem(w.n, w.k) || sequence_width < 2 || sequence_width > 6 ||
+        x.ne[1] <= sequence_width) {
         return 0;
     }
     return std::min(x.ne[1], kSameReductionTokens / sequence_width * sequence_width);
@@ -183,14 +183,15 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return 0;
     case QType::NVFP4:
         if (!detail::is_nvfp4_linear_problem(output_rows, input_rows) ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8)) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+             policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                          min_tokens, max_tokens);
+                                                           min_tokens, max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

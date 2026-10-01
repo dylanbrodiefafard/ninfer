@@ -63,20 +63,19 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
     return result;
 }
 
-std::vector<std::uint16_t> make_reduction_sensitive_activation(std::int32_t rows,
-                                                                std::int32_t tokens,
-                                                                std::uint32_t seed) {
+std::vector<std::uint16_t>
+make_reduction_sensitive_activation(std::int32_t rows, std::int32_t tokens, std::uint32_t seed) {
     std::vector<std::uint16_t> result(static_cast<std::size_t>(rows) * tokens);
     for (std::size_t index = 0; index < result.size(); ++index) {
         std::uint32_t value = seed ^ (static_cast<std::uint32_t>(index) * 0x9e3779b9U);
         value ^= value >> 16;
         value *= 0x7feb352dU;
         value ^= value >> 15;
-        const std::uint16_t sign = (value & 1U) == 0 ? 0U : 0x8000U;
-        const std::uint16_t exponent =
-            static_cast<std::uint16_t>(120U + ((value >> 24U) % 9U)) << 7U;
+        const std::uint16_t sign     = (value & 1U) == 0 ? 0U : 0x8000U;
+        const std::uint16_t exponent = static_cast<std::uint16_t>(120U + ((value >> 24U) % 9U))
+                                       << 7U;
         const std::uint16_t mantissa = static_cast<std::uint16_t>((value >> 8U) & 0x7fU);
-        result[index] = static_cast<std::uint16_t>(sign | exponent | mantissa);
+        result[index]                = static_cast<std::uint16_t>(sign | exponent | mantissa);
     }
     return result;
 }
@@ -107,60 +106,33 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::array invocations{
-        Invocation{4, ops::LinearPolicy::AllowA8},
-        Invocation{8, ops::LinearPolicy::AllowA8},
-        Invocation{16, ops::LinearPolicy::AllowA8},
-        Invocation{5, ops::LinearPolicy::AllowA8},
-        Invocation{6, ops::LinearPolicy::AllowA8},
-        Invocation{10, ops::LinearPolicy::AllowA8},
-        Invocation{12, ops::LinearPolicy::AllowA8},
-        Invocation{15, ops::LinearPolicy::AllowA8},
-        Invocation{18, ops::LinearPolicy::AllowA8},
-        Invocation{20, ops::LinearPolicy::AllowA8},
-        Invocation{24, ops::LinearPolicy::AllowA8},
-        Invocation{1, ops::LinearPolicy::A16Only},
-        Invocation{2, ops::LinearPolicy::A16Only},
-        Invocation{4, ops::LinearPolicy::A16Only},
-        Invocation{5, ops::LinearPolicy::A16Only},
-        Invocation{6, ops::LinearPolicy::A16Only},
-        Invocation{8, ops::LinearPolicy::A16Only},
-        Invocation{10, ops::LinearPolicy::A16Only},
-        Invocation{12, ops::LinearPolicy::A16Only},
-        Invocation{14, ops::LinearPolicy::A16Only},
-        Invocation{15, ops::LinearPolicy::A16Only},
-        Invocation{16, ops::LinearPolicy::A16Only},
-        Invocation{17, ops::LinearPolicy::A16Only},
-        Invocation{20, ops::LinearPolicy::A16Only},
-        Invocation{24, ops::LinearPolicy::A16Only},
-        Invocation{28, ops::LinearPolicy::A16Only},
-        Invocation{32, ops::LinearPolicy::A16Only},
-        Invocation{33, ops::LinearPolicy::A16Only},
-        Invocation{36, ops::LinearPolicy::A16Only},
-        Invocation{44, ops::LinearPolicy::A16Only},
-        Invocation{48, ops::LinearPolicy::A16Only},
-        Invocation{52, ops::LinearPolicy::A16Only},
-        Invocation{60, ops::LinearPolicy::A16Only},
-        Invocation{64, ops::LinearPolicy::A16Only},
-        Invocation{1, ops::LinearPolicy::AllowA4},
-        Invocation{2, ops::LinearPolicy::AllowA4},
-        Invocation{3, ops::LinearPolicy::AllowA4},
-        Invocation{4, ops::LinearPolicy::AllowA4},
-        Invocation{5, ops::LinearPolicy::AllowA4},
-        Invocation{6, ops::LinearPolicy::AllowA4},
-        Invocation{8, ops::LinearPolicy::AllowA4},
-        Invocation{10, ops::LinearPolicy::AllowA4},
-        Invocation{12, ops::LinearPolicy::AllowA4},
-        Invocation{15, ops::LinearPolicy::AllowA4},
-        Invocation{18, ops::LinearPolicy::AllowA4},
-        Invocation{24, ops::LinearPolicy::AllowA4},
-        Invocation{36, ops::LinearPolicy::AllowA4},
-        Invocation{512, ops::LinearPolicy::AllowA4},
-        Invocation{513, ops::LinearPolicy::AllowA4},
-        Invocation{777, ops::LinearPolicy::AllowA4},
-        Invocation{1024, ops::LinearPolicy::AllowA4},
-        Invocation{1025, ops::LinearPolicy::AllowA4},
-        Invocation{1279, ops::LinearPolicy::AllowA4},
-        Invocation{2048, ops::LinearPolicy::AllowA4},
+        Invocation{4, ops::LinearPolicy::AllowA8},    Invocation{8, ops::LinearPolicy::AllowA8},
+        Invocation{16, ops::LinearPolicy::AllowA8},   Invocation{5, ops::LinearPolicy::AllowA8},
+        Invocation{6, ops::LinearPolicy::AllowA8},    Invocation{10, ops::LinearPolicy::AllowA8},
+        Invocation{12, ops::LinearPolicy::AllowA8},   Invocation{15, ops::LinearPolicy::AllowA8},
+        Invocation{18, ops::LinearPolicy::AllowA8},   Invocation{20, ops::LinearPolicy::AllowA8},
+        Invocation{24, ops::LinearPolicy::AllowA8},   Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{2, ops::LinearPolicy::A16Only},    Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{5, ops::LinearPolicy::A16Only},    Invocation{6, ops::LinearPolicy::A16Only},
+        Invocation{8, ops::LinearPolicy::A16Only},    Invocation{10, ops::LinearPolicy::A16Only},
+        Invocation{12, ops::LinearPolicy::A16Only},   Invocation{14, ops::LinearPolicy::A16Only},
+        Invocation{15, ops::LinearPolicy::A16Only},   Invocation{16, ops::LinearPolicy::A16Only},
+        Invocation{17, ops::LinearPolicy::A16Only},   Invocation{20, ops::LinearPolicy::A16Only},
+        Invocation{24, ops::LinearPolicy::A16Only},   Invocation{28, ops::LinearPolicy::A16Only},
+        Invocation{32, ops::LinearPolicy::A16Only},   Invocation{33, ops::LinearPolicy::A16Only},
+        Invocation{36, ops::LinearPolicy::A16Only},   Invocation{44, ops::LinearPolicy::A16Only},
+        Invocation{48, ops::LinearPolicy::A16Only},   Invocation{52, ops::LinearPolicy::A16Only},
+        Invocation{60, ops::LinearPolicy::A16Only},   Invocation{64, ops::LinearPolicy::A16Only},
+        Invocation{1, ops::LinearPolicy::AllowA4},    Invocation{2, ops::LinearPolicy::AllowA4},
+        Invocation{3, ops::LinearPolicy::AllowA4},    Invocation{4, ops::LinearPolicy::AllowA4},
+        Invocation{5, ops::LinearPolicy::AllowA4},    Invocation{6, ops::LinearPolicy::AllowA4},
+        Invocation{8, ops::LinearPolicy::AllowA4},    Invocation{10, ops::LinearPolicy::AllowA4},
+        Invocation{12, ops::LinearPolicy::AllowA4},   Invocation{15, ops::LinearPolicy::AllowA4},
+        Invocation{18, ops::LinearPolicy::AllowA4},   Invocation{24, ops::LinearPolicy::AllowA4},
+        Invocation{36, ops::LinearPolicy::AllowA4},   Invocation{512, ops::LinearPolicy::AllowA4},
+        Invocation{513, ops::LinearPolicy::AllowA4},  Invocation{777, ops::LinearPolicy::AllowA4},
+        Invocation{1024, ops::LinearPolicy::AllowA4}, Invocation{1025, ops::LinearPolicy::AllowA4},
+        Invocation{1279, ops::LinearPolicy::AllowA4}, Invocation{2048, ops::LinearPolicy::AllowA4},
         Invocation{4096, ops::LinearPolicy::AllowA4},
     };
     constexpr std::int32_t kMaximumTokens = 4096;
@@ -194,10 +166,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
-        const bool a4 = invocation.policy == ops::LinearPolicy::AllowA4 &&
-                        ((k == 6144 && invocation.tokens >= 5) ||
-                          (k == 17408 && invocation.tokens >= 3));
-        const bool a8 = invocation.policy == ops::LinearPolicy::AllowA8;
+        const bool a4 =
+            invocation.policy == ops::LinearPolicy::AllowA4 &&
+            ((k == 6144 && invocation.tokens >= 5) || (k == 17408 && invocation.tokens >= 3));
+        const bool a8           = invocation.policy == ops::LinearPolicy::AllowA8;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " + (a8 ? "A8" : (a4 ? "A4" : "A16")) +
                                   " T=" + std::to_string(invocation.tokens);
@@ -231,7 +203,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a8 ? kA8Tolerance : (a4 ? kA4Tolerance : kA16Tolerance));
+        failures += verify_reduction(label, actual, expected,
+                                     a8 ? kA8Tolerance : (a4 ? kA4Tolerance : kA16Tolerance));
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");
@@ -317,7 +290,7 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
 
     int failures = 0;
     for (std::int32_t batch = 2; batch <= max_batch; ++batch) {
-        const std::int32_t tokens       = width * batch;
+        const std::int32_t tokens      = width * batch;
         const std::size_t output_words = static_cast<std::size_t>(n) * tokens;
         const std::size_t output_bytes = output_words * sizeof(std::uint16_t);
         GuardedDeviceBuffer aggregate(output_bytes);
@@ -331,8 +304,8 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
         Tensor aggregate_y(aggregate.data(), DType::BF16, {n, tokens});
         ops::linear_add(aggregate_x, weight, aggregate_y, policy, workspace, nullptr);
         for (std::int32_t row = 0; row < batch; ++row) {
-            auto* input = static_cast<std::uint8_t*>(device_activation.data()) +
-                          static_cast<std::int64_t>(row) * width * k * sizeof(std::uint16_t);
+            auto* input  = static_cast<std::uint8_t*>(device_activation.data()) +
+                           static_cast<std::int64_t>(row) * width * k * sizeof(std::uint16_t);
             auto* output = static_cast<std::uint8_t*>(panels.data()) +
                            static_cast<std::int64_t>(row) * width * n * sizeof(std::uint16_t);
             Tensor panel_x(input, DType::BF16, {k, width});
@@ -345,14 +318,13 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
         std::vector<std::uint16_t> panel_bits(output_words);
         aggregate.copy_to_host(aggregate_bits.data(), output_bytes);
         panels.copy_to_host(panel_bits.data(), output_bytes);
-        const std::string label = "NVFP4 linear_add W" + std::to_string(width) + " policy=" +
-                                  std::to_string(static_cast<int>(policy)) +
-                                  " aggregate parity [" +
-                                  std::to_string(n) + "," + std::to_string(k) + "] C=" +
-                                  std::to_string(batch);
+        const std::string label = "NVFP4 linear_add W" + std::to_string(width) +
+                                  " policy=" + std::to_string(static_cast<int>(policy)) +
+                                  " aggregate parity [" + std::to_string(n) + "," +
+                                  std::to_string(k) + "] C=" + std::to_string(batch);
         if (aggregate_bits != panel_bits) {
-            const auto mismatch = std::mismatch(aggregate_bits.begin(), aggregate_bits.end(),
-                                                panel_bits.begin());
+            const auto mismatch =
+                std::mismatch(aggregate_bits.begin(), aggregate_bits.end(), panel_bits.begin());
             std::cerr << label << ": first BF16 mismatch at "
                       << std::distance(aggregate_bits.begin(), mismatch.first) << '\n';
             ++failures;

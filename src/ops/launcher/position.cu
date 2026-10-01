@@ -35,8 +35,8 @@ void offset_i32_position_rows_launch(const Tensor& source, const Tensor& deltas,
                     static_cast<unsigned>(source.ne[1]));
     offset_i32_position_rows_kernel<<<grid, block, 0, stream>>>(
         static_cast<const std::int32_t*>(source.data),
-        static_cast<const std::int32_t*>(deltas.data),
-        static_cast<std::int32_t*>(destination.data), source.ne[0]);
+        static_cast<const std::int32_t*>(deltas.data), static_cast<std::int32_t*>(destination.data),
+        source.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

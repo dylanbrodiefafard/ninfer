@@ -50,11 +50,11 @@ std::string format_bytes(std::uint64_t bytes) {
 
 std::string format_line(std::string_view phase, std::uint64_t done, std::uint64_t total,
                         double seconds) {
-    std::string_view category = "load";
-    std::string_view detail   = phase;
+    std::string_view category              = "load";
+    std::string_view detail                = phase;
     constexpr std::string_view kDiskPrefix = "kv-disk ";
-    const bool disk_counts = phase.size() > kDiskPrefix.size() &&
-                              phase.substr(0, kDiskPrefix.size()) == kDiskPrefix;
+    const bool disk_counts =
+        phase.size() > kDiskPrefix.size() && phase.substr(0, kDiskPrefix.size()) == kDiskPrefix;
     if (disk_counts) {
         category = "kv-disk";
         detail   = phase.substr(kDiskPrefix.size());
@@ -124,11 +124,10 @@ void LoadProgressRenderer::update(std::string_view phase, std::uint64_t done, st
         return;
     }
 
-    last_done_       = done;
-    last_total_      = total;
-    const bool final = total != 0 && done >= total;
-    const bool disk_counts =
-        phase.size() > 8 && phase.substr(0, 8) == std::string_view{"kv-disk "};
+    last_done_             = done;
+    last_total_            = total;
+    const bool final       = total != 0 && done >= total;
+    const bool disk_counts = phase.size() > 8 && phase.substr(0, 8) == std::string_view{"kv-disk "};
     if (!new_phase && !final && !disk_counts &&
         now - last_rendered_ < options_.min_refresh_interval) {
         return;

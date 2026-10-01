@@ -34,8 +34,7 @@ from . import draft_head, inventory, recipe
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
 ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
 GGUF_EVIDENCE_PATH = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/"
-    "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 )
 
 _ROOT_CONFIG = {
@@ -179,16 +178,12 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
     family_conversion.check_members("text_config", text, _TEXT_CONFIG)
 
     expected_layer_types = tuple(
-        "full_attention"
-        if layer in inventory.FULL_ATTENTION_LAYERS
-        else "linear_attention"
+        "full_attention" if layer in inventory.FULL_ATTENTION_LAYERS else "linear_attention"
         for layer in range(40)
     )
     layer_types = text.get("layer_types")
     if not isinstance(layer_types, list) or tuple(layer_types) != expected_layer_types:
-        raise ValueError(
-            "text_config.layer_types does not match the target 40-layer schedule"
-        )
+        raise ValueError("text_config.layer_types does not match the target 40-layer schedule")
 
     rope = text.get("rope_parameters")
     if not isinstance(rope, Mapping):
@@ -226,9 +221,7 @@ def validate_dflash_config(config: Mapping[str, object]) -> dict[str, object]:
     rope = config.get("rope_parameters")
     draft = config.get("dflash_config")
     if not isinstance(rope, Mapping) or not isinstance(draft, Mapping):
-        raise ValueError(
-            "DFlash config.json must contain rope_parameters and dflash_config"
-        )
+        raise ValueError("DFlash config.json must contain rope_parameters and dflash_config")
     family_conversion.check_members(
         "dflash config.rope_parameters",
         rope,
@@ -239,15 +232,9 @@ def validate_dflash_config(config: Mapping[str, object]) -> dict[str, object]:
         draft,
         _DFLASH_DRAFT_CONFIG,
     )
-    return {
-        name: config[name] for name in _DFLASH_CONFIG
-    } | {
-        "rope_parameters": {
-            name: rope[name] for name in _DFLASH_ROPE_CONFIG
-        },
-        "dflash_config": {
-            name: draft[name] for name in _DFLASH_DRAFT_CONFIG
-        },
+    return {name: config[name] for name in _DFLASH_CONFIG} | {
+        "rope_parameters": {name: rope[name] for name in _DFLASH_ROPE_CONFIG},
+        "dflash_config": {name: draft[name] for name in _DFLASH_DRAFT_CONFIG},
     }
 
 
@@ -283,32 +270,20 @@ def preflight_inventory() -> None:
         raise ValueError(f"target layout counts drifted: {inventory.LAYOUT_COUNTS}")
     if family_conversion.tensor_payload_bytes(inventory.TENSOR_SPECS) != EXPECTED_TENSOR_BYTES:
         raise ValueError("target tensor payload byte total drifted")
-    if (
-        family_conversion.device_arena_bytes(inventory.TENSOR_SPECS)
-        != EXPECTED_DEVICE_ARENA_BYTES
-    ):
+    if family_conversion.device_arena_bytes(inventory.TENSOR_SPECS) != EXPECTED_DEVICE_ARENA_BYTES:
         raise ValueError("target device-arena byte total drifted")
     component_bytes = {
-        "main_text": family_conversion.tensor_payload_bytes(
-            inventory.TEXT_CORE_TENSOR_SPECS
-        ),
-        "draft_head": family_conversion.tensor_payload_bytes(
-            inventory.DRAFT_HEAD_TENSOR_SPECS
-        ),
+        "main_text": family_conversion.tensor_payload_bytes(inventory.TEXT_CORE_TENSOR_SPECS),
+        "draft_head": family_conversion.tensor_payload_bytes(inventory.DRAFT_HEAD_TENSOR_SPECS),
         "mtp": family_conversion.tensor_payload_bytes(inventory.MTP_TENSOR_SPECS),
-        "vision": family_conversion.tensor_payload_bytes(
-            inventory.VISION_TENSOR_SPECS
-        ),
-        "dflash": family_conversion.tensor_payload_bytes(
-            inventory.DFLASH_TENSOR_SPECS
-        ),
+        "vision": family_conversion.tensor_payload_bytes(inventory.VISION_TENSOR_SPECS),
+        "dflash": family_conversion.tensor_payload_bytes(inventory.DFLASH_TENSOR_SPECS),
     }
     if component_bytes != EXPECTED_COMPONENT_BYTES:
         raise ValueError(f"target component byte totals drifted: {component_bytes}")
     resident_specs = inventory.TENSOR_SPECS[: -len(inventory.DFLASH_TENSOR_SPECS)]
     if (
-        family_conversion.tensor_payload_bytes(resident_specs)
-        != EXPECTED_RESIDENT_TENSOR_BYTES
+        family_conversion.tensor_payload_bytes(resident_specs) != EXPECTED_RESIDENT_TENSOR_BYTES
         or family_conversion.device_arena_bytes(resident_specs)
         != EXPECTED_RESIDENT_DEVICE_ARENA_BYTES
     ):
@@ -317,9 +292,7 @@ def preflight_inventory() -> None:
 
 
 def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
-    return official_resources.load_official_resources(
-        model_dir, inventory.RESOURCE_SPECS
-    )
+    return official_resources.load_official_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
 def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
@@ -334,9 +307,7 @@ def preflight_conversion(
 
     model = Path(model_dir)
     dflash_model = Path(dflash_model_dir)
-    base_config_summary = validate_config(
-        family_conversion.load_json(model / "config.json")
-    )
+    base_config_summary = validate_config(family_conversion.load_json(model / "config.json"))
     dflash_config_summary = validate_dflash_config(
         family_conversion.load_json(dflash_model / "config.json")
     )
@@ -413,17 +384,12 @@ def build_conversion_report(
     environment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     combined_source = recipe.SourcePreflight(
-        recipe_count=(
-            base_source_preflight.recipe_count
-            + dflash_source_preflight.recipe_count
-        ),
+        recipe_count=(base_source_preflight.recipe_count + dflash_source_preflight.recipe_count),
         source_tensor_count=(
-            base_source_preflight.source_tensor_count
-            + dflash_source_preflight.source_tensor_count
+            base_source_preflight.source_tensor_count + dflash_source_preflight.source_tensor_count
         ),
         source_shard_count=(
-            base_source_preflight.source_shard_count
-            + dflash_source_preflight.source_shard_count
+            base_source_preflight.source_shard_count + dflash_source_preflight.source_shard_count
         ),
         source_dtype_counts={
             "BF16": (
@@ -454,9 +420,7 @@ def build_conversion_report(
         environment_summary=environment,
     )
     report["source"]["base_model_path"] = report["source"].pop("model_path")
-    report["source"]["dflash_model_path"] = str(
-        Path(dflash_model_dir).resolve()
-    )
+    report["source"]["dflash_model_path"] = str(Path(dflash_model_dir).resolve())
     report["source_preflight"] = {
         "base": {
             "recipes": base_source_preflight.recipe_count,
@@ -491,9 +455,7 @@ def build_conversion_report(
             "total": EXPECTED_TENSOR_BYTES,
             "all_tensor_device_arena": EXPECTED_DEVICE_ARENA_BYTES,
             "default_resident": EXPECTED_RESIDENT_TENSOR_BYTES,
-            "default_resident_device_arena": (
-                EXPECTED_RESIDENT_DEVICE_ARENA_BYTES
-            ),
+            "default_resident_device_arena": (EXPECTED_RESIDENT_DEVICE_ARENA_BYTES),
         },
     }
     return report
@@ -544,12 +506,8 @@ def convert(
         for spec in inventory.RESOURCE_SPECS:
             write_payload(spec, resources[spec.name])
 
-        base_specs = inventory.TENSOR_SPECS[
-            : -len(inventory.DFLASH_TENSOR_SPECS)
-        ]
-        with ShardReader.from_index(
-            model / "model.safetensors.index.json"
-        ) as reader:
+        base_specs = inventory.TENSOR_SPECS[: -len(inventory.DFLASH_TENSOR_SPECS)]
+        with ShardReader.from_index(model / "model.safetensors.index.json") as reader:
             for spec in base_specs:
                 tensor = materialize_tensor(
                     spec,
@@ -562,9 +520,7 @@ def convert(
                 write_payload(spec, payload)
                 del payload
 
-        with ShardReader.from_file(
-            dflash_model / "model.safetensors"
-        ) as reader:
+        with ShardReader.from_file(dflash_model / "model.safetensors") as reader:
             for spec in inventory.DFLASH_TENSOR_SPECS:
                 tensor = materialize_tensor(
                     spec,

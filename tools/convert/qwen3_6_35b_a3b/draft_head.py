@@ -24,9 +24,7 @@ DRAFT_HEAD_N = 131072
 
 DRAFT_HEAD_OBJECT = "text/draft_head"
 DRAFT_HEAD_TOKEN_IDS_OBJECT = "text/draft_head_token_ids"
-DEFAULT_RANKING = Path(
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
-)
+DEFAULT_RANKING = Path("tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64")
 RANKING_SOURCE_TARGET = "qwen3_6_27b"
 
 
@@ -40,9 +38,7 @@ def compute_shortlist(
     """Build the fixed shortlist over the shared 27B/35B token-id domain."""
 
     domain = (
-        min(TOKENIZER_VOCAB_SIZE, vocab)
-        if tokenizer_vocab_size is None
-        else tokenizer_vocab_size
+        min(TOKENIZER_VOCAB_SIZE, vocab) if tokenizer_vocab_size is None else tokenizer_vocab_size
     )
     return _compute_shortlist(
         ranking_path,

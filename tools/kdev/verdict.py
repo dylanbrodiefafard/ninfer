@@ -18,8 +18,7 @@ from . import oracle as oracle_mod
 _PROFILE_DIR = os.path.join(os.getcwd(), "profiles", "kdev")
 
 
-def assemble(op, tier, oracle, bench=None, profile=None, san=None,
-             git=None, build=None) -> dict:
+def assemble(op, tier, oracle, bench=None, profile=None, san=None, git=None, build=None) -> dict:
     kpi = oracle_mod.oracle_kpi(oracle.get("stats", [])) if oracle else None
     perf_valid = bool(oracle and oracle.get("passed"))
     verdict = {
@@ -89,14 +88,18 @@ def render(verdict: dict) -> str:
     kpi_s = f"{kpi:.4f}" if isinstance(kpi, (int, float)) else "-"
     cases = ", ".join(o.get("cases") or []) or "-"
     lines = [
-        (f"[kdev] {verdict['op']} ({verdict['tier']}) oracle={flag} kpi={kpi_s}"
-        f"{perf}  git@{verdict['git']}"),
+        (
+            f"[kdev] {verdict['op']} ({verdict['tier']}) oracle={flag} kpi={kpi_s}"
+            f"{perf}  git@{verdict['git']}"
+        ),
         f"       cases: {cases}",
     ]
     san = verdict.get("sanitizer")
     if san:
-        lines.append(f"       san({san['tool']}): {'clean' if san['clean'] else str(san['findings']) + ' finding(s)'}")
+        lines.append(
+            f"       san({san['tool']}): {'clean' if san['clean'] else str(san['findings']) + ' finding(s)'}"
+        )
     prof = verdict.get("profile")
     if prof:
-        lines.append(f"       ncu: {prof.get('report','')}")
+        lines.append(f"       ncu: {prof.get('report', '')}")
     return "\n".join(lines)

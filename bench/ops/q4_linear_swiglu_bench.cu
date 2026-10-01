@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
             const double seconds = timing.median_us * 1.0e-6;
             const double flops   = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
-                                 2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
+                                   2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             std::printf("T=%-3d median=%8.3f us %7.1f GB/s %7.2f TFLOP/s workspace=%zu\n", tokens,
                         timing.median_us, bytes / seconds / 1.0e9, flops / seconds / 1.0e12,
                         workspace_capacity);

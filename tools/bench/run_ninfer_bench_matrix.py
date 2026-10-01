@@ -84,7 +84,9 @@ def count_corpus_tokens(path: Path) -> int:
 
 
 def add_repetition_args(
-    base_args: list[str], case: BenchCase, repetitions_override: int | None,
+    base_args: list[str],
+    case: BenchCase,
+    repetitions_override: int | None,
     warmup_override: int | None,
 ) -> list[str]:
     repetitions = repetitions_override if repetitions_override is not None else case.repetitions
@@ -216,7 +218,9 @@ def build_cases(preset: str) -> list[BenchCase]:
     return cases
 
 
-def filtered_cases(cases: list[BenchCase], suites: Sequence[str], limit: int | None) -> list[BenchCase]:
+def filtered_cases(
+    cases: list[BenchCase], suites: Sequence[str], limit: int | None
+) -> list[BenchCase]:
     selected = cases
     if suites:
         allowed = set(suites)
@@ -356,9 +360,10 @@ def write_summary(rows: Sequence[dict[str, Any]], out_dir: Path) -> None:
 
 
 def run_command(command: Sequence[str], stdout_path: Path, stderr_path: Path) -> int:
-    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-        "w", encoding="utf-8"
-    ) as stderr:
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout,
+        stderr_path.open("w", encoding="utf-8") as stderr,
+    ):
         process = subprocess.run(
             list(command),
             cwd=REPO_ROOT,
@@ -412,11 +417,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--suite", action="append", default=[], help="suite to run; repeatable")
-    parser.add_argument("--limit", type=int, default=None, help="run only the first N selected cases")
-    parser.add_argument("--repetitions", type=int, default=None, help="override all case repetitions")
-    parser.add_argument("--warmup", type=int, default=None, help="override all case warmup repetitions")
+    parser.add_argument(
+        "--limit", type=int, default=None, help="run only the first N selected cases"
+    )
+    parser.add_argument(
+        "--repetitions", type=int, default=None, help="override all case repetitions"
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=None, help="override all case warmup repetitions"
+    )
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
-    parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
+    parser.add_argument(
+        "--resume", action="store_true", help="skip cases with an existing valid JSON report"
+    )
     parser.add_argument(
         "--no-build", action="store_true", help="do not build build/bench/ninfer_bench"
     )

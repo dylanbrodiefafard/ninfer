@@ -468,7 +468,7 @@ public:
             const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
             auto gate_up       = quantized_weight::pack_row_split_lowbit(
                 make_gate_up(kExpertGateRows, kHidden, 100U + static_cast<std::uint32_t>(expert),
-                                   factor),
+                             factor),
                 kExpertGateRows, kHidden, profile.routed_gate_up);
             auto down = quantized_weight::pack_row_split_lowbit(
                 make_down(kHidden, kIntermediate, 300U + static_cast<std::uint32_t>(expert),

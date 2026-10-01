@@ -238,9 +238,7 @@ def _vision_weight_report(binding: VisionArtifactBinding, model) -> dict[str, ob
             name = block.descriptor.name
             if block.layout == "contiguous-le-v1":
                 if actual.dtype != torch.bfloat16 or expected.dtype != torch.bfloat16:
-                    raise RuntimeError(
-                        f"direct Vision weight {name} is not represented as BF16"
-                    )
+                    raise RuntimeError(f"direct Vision weight {name} is not represented as BF16")
                 direct.append(
                     {
                         "name": name,
@@ -272,14 +270,10 @@ def _vision_weight_report(binding: VisionArtifactBinding, model) -> dict[str, ob
                 and value["cosine"] >= criterion["cosine"]
                 and value["rows"]["worst_scaled_rmse"] <= criterion["row"]
                 and value["columns"]["worst_scaled_rmse"] <= criterion["column"]
-                and value["stored_groups"]["worst_scaled_rmse"]
-                <= criterion["stored_group"]
-                and value["stored_groups"]["worst_cosine"]
-                >= criterion["stored_group_cosine"]
+                and value["stored_groups"]["worst_scaled_rmse"] <= criterion["stored_group"]
+                and value["stored_groups"]["worst_cosine"] >= criterion["stored_group_cosine"]
             )
-            quantized.append(
-                {"name": name, "format": block.format, **value}
-            )
+            quantized.append({"name": name, "format": block.format, **value})
     finally:
         store.close()
 
@@ -296,9 +290,7 @@ def _vision_weight_report(binding: VisionArtifactBinding, model) -> dict[str, ob
                 "relative_rmse"
             ],
             "worst_cosine": min(values, key=lambda value: value["cosine"])["cosine"],
-            "worst_row_scaled_rmse": max(
-                value["rows"]["worst_scaled_rmse"] for value in values
-            ),
+            "worst_row_scaled_rmse": max(value["rows"]["worst_scaled_rmse"] for value in values),
             "worst_column_scaled_rmse": max(
                 value["columns"]["worst_scaled_rmse"] for value in values
             ),
@@ -341,11 +333,15 @@ def stored_weight_group_metrics(
         padding = padded_k - k
         actual = torch.nn.functional.pad(actual, (0, padding))
         expected = torch.nn.functional.pad(expected, (0, padding))
-    af = actual.detach().to(device="cpu", dtype=torch.float64).reshape(
-        rows, padded_k // group_size, group_size
+    af = (
+        actual.detach()
+        .to(device="cpu", dtype=torch.float64)
+        .reshape(rows, padded_k // group_size, group_size)
     )
-    ef = expected.detach().to(device="cpu", dtype=torch.float64).reshape(
-        rows, padded_k // group_size, group_size
+    ef = (
+        expected.detach()
+        .to(device="cpu", dtype=torch.float64)
+        .reshape(rows, padded_k // group_size, group_size)
     )
     diff = af - ef
     group_rmse = diff.square().mean(dim=2).sqrt()
@@ -362,9 +358,7 @@ def stored_weight_group_metrics(
     reference_active = group_reference_rms > activity_floor
     actual_active = group_actual_rms > torch.finfo(torch.float64).tiny
     active = reference_active & actual_active
-    group_cosine[active] = torch.clamp(
-        dot[active] / group_denominator[active], -1.0, 1.0
-    )
+    group_cosine[active] = torch.clamp(dot[active] / group_denominator[active], -1.0, 1.0)
     group_cosine[reference_active & ~actual_active] = 0.0
     flat_rmse = int(torch.argmax(scaled_rmse))
     flat_cosine = int(torch.argmin(group_cosine))
@@ -380,15 +374,11 @@ def stored_weight_group_metrics(
         "count": rows * groups_per_row,
         "worst_scaled_rmse": float(scaled_rmse.flatten()[flat_rmse]),
         "worst_scaled_rmse_location": location(flat_rmse),
-        "worst_scaled_rmse_reference_rms": float(
-            group_reference_rms.flatten()[flat_rmse]
-        ),
+        "worst_scaled_rmse_reference_rms": float(group_reference_rms.flatten()[flat_rmse]),
         "worst_scaled_rmse_actual_rms": float(group_actual_rms.flatten()[flat_rmse]),
         "worst_cosine": float(group_cosine.flatten()[flat_cosine]),
         "worst_cosine_location": location(flat_cosine),
-        "worst_cosine_reference_rms": float(
-            group_reference_rms.flatten()[flat_cosine]
-        ),
+        "worst_cosine_reference_rms": float(group_reference_rms.flatten()[flat_cosine]),
         "worst_cosine_actual_rms": float(group_actual_rms.flatten()[flat_cosine]),
     }
 
@@ -437,9 +427,7 @@ def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, object]:
         reference_active = reference_group_norm > norm_floor
         active = reference_active & (actual_group_norm > torch.finfo(torch.float64).tiny)
         missing = reference_active & ~active
-        group_cosine[active] = torch.clamp(
-            dot[active] / group_denominator[active], -1.0, 1.0
-        )
+        group_cosine[active] = torch.clamp(dot[active] / group_denominator[active], -1.0, 1.0)
         group_cosine[missing] = 0.0
         worst_rmse = int(torch.argmax(scaled_rmse))
         worst_cosine = int(torch.argmin(group_cosine))
@@ -601,14 +589,10 @@ def _artifact_local_oracles(
         return actual
 
     vision = encoder.binding.vision
-    actual_pixels = check(
-        "input/patch_f32", pixels.to(device=device, dtype=torch.float32)
-    )
+    actual_pixels = check("input/patch_f32", pixels.to(device=device, dtype=torch.float32))
     x = check("input/patch_bf16", actual_pixels.to(torch.bfloat16))
     x = check("patch/linear", linear(x, encoder._weight(vision.patch_embedding)))
-    x = check(
-        "patch/bias", add_bias(x, encoder._weight(vision.patch_embedding_bias))
-    )
+    x = check("patch/bias", add_bias(x, encoder._weight(vision.patch_embedding_bias)))
     patch_count = pixels.shape[0]
     position_indices = torch.tensor(
         control["position_table_indices"], device=device, dtype=torch.long
@@ -622,9 +606,11 @@ def _artifact_local_oracles(
     )
     position = (gathered.float() * position_weights[:, :, None]).sum(1).to(torch.bfloat16)
     x = check("patch/position", residual_add(x, position))
-    pos_ids = torch.tensor(control["position_ids"], device=device, dtype=torch.long).reshape(
-        2, patch_count
-    ).t()
+    pos_ids = (
+        torch.tensor(control["position_ids"], device=device, dtype=torch.long)
+        .reshape(2, patch_count)
+        .t()
+    )
     cu_seqlens = torch.tensor(control["cu_seqlens"], device=device, dtype=torch.int32)
 
     for layer in vision.layers:
@@ -637,9 +623,7 @@ def _artifact_local_oracles(
                 encoder._weight(layer.norm1_bias),
             ),
         )
-        qkv = check(
-            prefix + "qkv_linear", linear(h, encoder._weight(layer.attention_qkv))
-        )
+        qkv = check(prefix + "qkv_linear", linear(h, encoder._weight(layer.attention_qkv)))
         qkv = check(
             prefix + "qkv_bias",
             add_bias(qkv, encoder._weight(layer.attention_qkv_bias)),
@@ -672,14 +656,10 @@ def _artifact_local_oracles(
             ),
         )
         h = check(prefix + "fc1_linear", linear(h, encoder._weight(layer.mlp_fc1)))
-        h = check(
-            prefix + "fc1_bias", add_bias(h, encoder._weight(layer.mlp_fc1_bias))
-        )
+        h = check(prefix + "fc1_bias", add_bias(h, encoder._weight(layer.mlp_fc1_bias)))
         h = check(prefix + "gelu", gelu(h, approximate=True))
         h = check(prefix + "fc2_linear", linear(h, encoder._weight(layer.mlp_fc2)))
-        h = check(
-            prefix + "fc2_bias", add_bias(h, encoder._weight(layer.mlp_fc2_bias))
-        )
+        h = check(prefix + "fc2_bias", add_bias(h, encoder._weight(layer.mlp_fc2_bias)))
         x = check(prefix + "mlp_residual", residual_add(x, h))
 
     merger = vision.merger
@@ -877,23 +857,13 @@ def _preprocessing_report(
     }, encoded_inputs
 
 
-def _summarize(
-    comparisons: list[dict[str, object]], *, profile: str
-) -> dict[str, object]:
+def _summarize(comparisons: list[dict[str, object]], *, profile: str) -> dict[str, object]:
     worst_relative = max(comparisons, key=lambda value: value["relative_rmse"])
     worst_cosine = min(comparisons, key=lambda value: value["cosine"])
-    worst_token_rmse = max(
-        comparisons, key=lambda value: value["tokens"]["worst_scaled_rmse"]
-    )
-    worst_token_cosine = min(
-        comparisons, key=lambda value: value["tokens"]["worst_cosine"]
-    )
-    worst_feature_rmse = max(
-        comparisons, key=lambda value: value["features"]["worst_scaled_rmse"]
-    )
-    worst_feature_cosine = min(
-        comparisons, key=lambda value: value["features"]["worst_cosine"]
-    )
+    worst_token_rmse = max(comparisons, key=lambda value: value["tokens"]["worst_scaled_rmse"])
+    worst_token_cosine = min(comparisons, key=lambda value: value["tokens"]["worst_cosine"])
+    worst_feature_rmse = max(comparisons, key=lambda value: value["features"]["worst_scaled_rmse"])
+    worst_feature_cosine = min(comparisons, key=lambda value: value["features"]["worst_cosine"])
     nonfinite = [
         value["name"]
         for value in comparisons
@@ -955,11 +925,7 @@ def _summarize(
             if value["relative_rmse"] > SOURCE_FINAL_RELATIVE_RMSE_LIMIT
             or value["cosine"] < SOURCE_FINAL_COSINE_MINIMUM
         ]
-        result["passed"] = (
-            not nonfinite
-            and not failures
-            and not final_failures
-        )
+        result["passed"] = not nonfinite and not failures and not final_failures
         result["criterion_failures"] = [
             {"item": value["item"], "name": value["name"], "criterion": "source_general"}
             for value in failures
@@ -998,11 +964,7 @@ def _summarize(
             for value in finals
             if value["relative_rmse"] > PRODUCTION_FINAL_RELATIVE_RMSE_LIMIT
         ]
-        result["passed"] = (
-            not nonfinite
-            and not failures
-            and not final_failures
-        )
+        result["passed"] = not nonfinite and not failures and not final_failures
         result["criterion_failures"] = [
             {
                 "item": value["item"],
@@ -1039,9 +1001,7 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
         )
     item_count = len(manifest["items"])
     captures = manifest["captures"]
-    expected_keys = {
-        (item, name) for item in range(item_count) for name in EXPECTED_TRACE_NAMES
-    }
+    expected_keys = {(item, name) for item in range(item_count) for name in EXPECTED_TRACE_NAMES}
     records: dict[tuple[int, str], dict[str, object]] = {}
     for record in captures:
         key = (int(record["item"]), str(record["name"]))
@@ -1063,9 +1023,10 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
         local_oracle_comparisons: list[dict[str, object]] = []
         with tempfile.TemporaryDirectory(prefix="ninfer-vision-artifact-") as artifact_tmp:
             artifact_root = Path(artifact_tmp)
-            with VisionEncoder(
-                binding, args.device, compile_codec=True
-            ) as encoder, torch.inference_mode():
+            with (
+                VisionEncoder(binding, args.device, compile_codec=True) as encoder,
+                torch.inference_mode(),
+            ):
                 for item, (pixels, grid) in enumerate(item_inputs):
                     modality = manifest["items"][item]["modality"]
                     artifact_names: list[str] = []
@@ -1084,9 +1045,7 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
                         production_comparisons.append(
                             {"item": item, "name": name, **metrics(cpp, value)}
                         )
-                        _write_bf16(
-                            artifact_root / f"item_{item:02d}" / (name + ".bf16"), value
-                        )
+                        _write_bf16(artifact_root / f"item_{item:02d}" / (name + ".bf16"), value)
 
                     encoder.encode(
                         pixels if modality == "image" else None,
@@ -1095,9 +1054,7 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
                         grid if modality == "video" else None,
                         tap=artifact_tap,
                     )
-                    _finish_ordered_taps(
-                        artifact_names, item=item, label="artifact schedule"
-                    )
+                    _finish_ordered_taps(artifact_names, item=item, label="artifact schedule")
                     local_oracle_comparisons.extend(
                         _artifact_local_oracles(
                             encoder,
@@ -1127,9 +1084,7 @@ def run_campaign(args: argparse.Namespace, trace_root: Path) -> dict[str, object
                         item=item,
                         source_names: list[str] = source_names,
                     ) -> None:
-                        _record_ordered_tap(
-                            source_names, name, item=item, label="source schedule"
-                        )
+                        _record_ordered_tap(source_names, name, item=item, label="source schedule")
                         artifact = _read_bf16(
                             artifact_root / f"item_{item:02d}" / (name + ".bf16"), value.shape
                         )

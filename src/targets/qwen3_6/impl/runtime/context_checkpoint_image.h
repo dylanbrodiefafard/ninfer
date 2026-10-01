@@ -22,32 +22,37 @@ struct ContextCheckpointHead {
     std::shared_ptr<PinnedHostBuffer> dflash;
     cudaEvent_t copies_done = nullptr;
 
-    ContextCheckpointHead() = default;
+    ContextCheckpointHead()                                        = default;
     ContextCheckpointHead(const ContextCheckpointHead&)            = delete;
     ContextCheckpointHead& operator=(const ContextCheckpointHead&) = delete;
+
     ContextCheckpointHead(ContextCheckpointHead&& other) noexcept { *this = std::move(other); }
+
     ContextCheckpointHead& operator=(ContextCheckpointHead&& other) noexcept {
         if (this == &other) { return *this; }
         release();
-        frontier     = other.frontier;
-        hash         = other.hash;
-        kind         = other.kind;
-        conv         = std::move(other.conv);
-        recurrent    = std::move(other.recurrent);
-        hidden       = std::move(other.hidden);
-        dflash       = std::move(other.dflash);
-        copies_done  = other.copies_done;
+        frontier          = other.frontier;
+        hash              = other.hash;
+        kind              = other.kind;
+        conv              = std::move(other.conv);
+        recurrent         = std::move(other.recurrent);
+        hidden            = std::move(other.hidden);
+        dflash            = std::move(other.dflash);
+        copies_done       = other.copies_done;
         other.copies_done = nullptr;
         other.frontier    = 0;
         other.kind        = ContextCheckpointKind::Ladder;
         return *this;
     }
+
     ~ContextCheckpointHead() { release(); }
 
     inline static std::atomic<bool> fail_next_event_allocation{false};
+
     static void test_fail_next_copy_event_allocation() noexcept {
         fail_next_event_allocation.store(true, std::memory_order_release);
     }
+
     static bool test_copy_event_allocation_pending() noexcept {
         return fail_next_event_allocation.load(std::memory_order_acquire);
     }
@@ -87,8 +92,8 @@ inline void recycle_checkpoint_image(std::vector<ContextCheckpointHead>& pool,
         return;
     }
     head.frontier = 0;
-    head.hash = {};
-    head.kind = ContextCheckpointKind::Ladder;
+    head.hash     = {};
+    head.kind     = ContextCheckpointKind::Ladder;
     pool.push_back(std::move(head));
 }
 

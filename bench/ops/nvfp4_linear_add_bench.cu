@@ -194,11 +194,11 @@ int main(int argc, char** argv) {
             const auto launch = make_launch(tokens);
             const bench::ColdTiming timing =
                 bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
-            const double seconds      = timing.median_us * 1.0e-6;
-            const double useful_flops = 2.0 * static_cast<double>(options.n) * options.k * tokens;
-            const double model_bytes  = static_cast<double>(packed.model_weight_bytes()) +
-                                       2.0 * static_cast<double>(options.k) * tokens +
-                                       4.0 * static_cast<double>(options.n) * tokens;
+            const double seconds       = timing.median_us * 1.0e-6;
+            const double useful_flops  = 2.0 * static_cast<double>(options.n) * options.k * tokens;
+            const double model_bytes   = static_cast<double>(packed.model_weight_bytes()) +
+                                         2.0 * static_cast<double>(options.k) * tokens +
+                                         4.0 * static_cast<double>(options.n) * tokens;
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
             std::printf("%-11s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n", "linear_add",

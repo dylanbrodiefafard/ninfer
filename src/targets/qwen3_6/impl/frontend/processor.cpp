@@ -354,10 +354,10 @@ std::string placeholder(const VisionItem& item) {
 std::size_t find_markup(const RenderedChat& rendered, std::string_view needle, std::size_t from) {
     std::size_t position = rendered.text.find(needle, from);
     while (position != std::string::npos) {
-        const std::size_t end = position + needle.size();
-        const auto overlapping =
-            std::find_if(rendered.literal_spans.begin(), rendered.literal_spans.end(),
-                         [&](const ByteSpan& span) { return span.begin < end && position < span.end; });
+        const std::size_t end  = position + needle.size();
+        const auto overlapping = std::find_if(
+            rendered.literal_spans.begin(), rendered.literal_spans.end(),
+            [&](const ByteSpan& span) { return span.begin < end && position < span.end; });
         if (overlapping == rendered.literal_spans.end()) { return position; }
         position = rendered.text.find(needle, overlapping->end);
     }
@@ -385,7 +385,8 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             return boundary;
         };
         if (rendered.rewrite_checkpoint) {
-            rendered.rewrite_checkpoint->offset = shift_boundary(rendered.rewrite_checkpoint->offset);
+            rendered.rewrite_checkpoint->offset =
+                shift_boundary(rendered.rewrite_checkpoint->offset);
         }
         for (std::size_t& offset : rendered.turn_closure_offsets) {
             offset = shift_boundary(offset);
@@ -616,10 +617,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         *tokens.prefix_tokens <= encoded.input_ids.size()) {
         frontier = *tokens.prefix_tokens;
     } else {
-        const std::size_t offset      = rendered.rewrite_checkpoint->offset;
-        const std::vector<int> prefix = tokenizer.encode(
-            std::string_view(rendered.text).substr(0, offset), {},
-            literal_spans_between(rendered.literal_spans, 0, offset));
+        const std::size_t offset = rendered.rewrite_checkpoint->offset;
+        const std::vector<int> prefix =
+            tokenizer.encode(std::string_view(rendered.text).substr(0, offset), {},
+                             literal_spans_between(rendered.literal_spans, 0, offset));
         if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
             !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
             throw std::logic_error("rewrite checkpoint is not an exact token prefix");
@@ -700,11 +701,11 @@ ProcessedInput Processor::process(const std::vector<ChatMessage>& messages,
         throw std::logic_error("preprocessed patch count does not match processor budget");
     }
 
-    rendered                  = expand_placeholders(std::move(rendered), items);
-    EncodedChat encoded       = encode_rendered_chat(tokenizer_, rendered);
-    output.input_ids               = std::move(encoded.input_ids);
-    output.rewrite_checkpoint      = encoded.rewrite_checkpoint;
-    output.turn_closure_frontiers  = std::move(encoded.turn_closure_frontiers);
+    rendered                      = expand_placeholders(std::move(rendered), items);
+    EncodedChat encoded           = encode_rendered_chat(tokenizer_, rendered);
+    output.input_ids              = std::move(encoded.input_ids);
+    output.rewrite_checkpoint     = encoded.rewrite_checkpoint;
+    output.turn_closure_frontiers = std::move(encoded.turn_closure_frontiers);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

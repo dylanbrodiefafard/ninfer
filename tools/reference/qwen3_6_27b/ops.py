@@ -86,9 +86,9 @@ def apply_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     sin = torch.sin(angle)[:, None, :]
     out = x.clone()
     x1 = x[:, :, :half].float()
-    x2 = x[:, :, half:CFG.rotary_dim].float()
+    x2 = x[:, :, half : CFG.rotary_dim].float()
     out[:, :, :half] = bf16(x1 * cos - x2 * sin)
-    out[:, :, half:CFG.rotary_dim] = bf16(x2 * cos + x1 * sin)
+    out[:, :, half : CFG.rotary_dim] = bf16(x2 * cos + x1 * sin)
     return out
 
 
@@ -125,12 +125,16 @@ def causal_conv1d(
     w = weight.contiguous().float()
     width = w.shape[1]
     sequence = torch.cat((state.float().t(), x.float()), dim=0)
-    out = F.conv1d(
-        sequence.t().unsqueeze(0),
-        w.unsqueeze(1),
-        groups=x.shape[1],
-    ).squeeze(0).t()
-    return bf16(F.silu(out)), sequence[-(width - 1):].t().contiguous()
+    out = (
+        F.conv1d(
+            sequence.t().unsqueeze(0),
+            w.unsqueeze(1),
+            groups=x.shape[1],
+        )
+        .squeeze(0)
+        .t()
+    )
+    return bf16(F.silu(out)), sequence[-(width - 1) :].t().contiguous()
 
 
 def gdn_gating(
@@ -165,9 +169,9 @@ def gated_delta_net(
         next_state = state.float() * torch.exp(g[0].float()).view(1, CFG.gdn_v_heads, 1, 1)
         prediction = torch.einsum("bhkv,hk->bhv", next_state, kt)
         delta = beta[0].float().view(1, CFG.gdn_v_heads, 1) * (v[0].float() - prediction)
-        next_state = next_state + kt.view(
-            1, CFG.gdn_v_heads, CFG.gdn_k_dim, 1
-        ) * delta.unsqueeze(-2)
+        next_state = next_state + kt.view(1, CFG.gdn_v_heads, CFG.gdn_k_dim, 1) * delta.unsqueeze(
+            -2
+        )
         out = torch.einsum("bhkv,hk->bhv", next_state, qt) * GDN_SCALE
         return bf16(out.squeeze(0).unsqueeze(0)), next_state
     try:
@@ -176,8 +180,7 @@ def gated_delta_net(
         )
     except ImportError as exc:
         raise RuntimeError(
-            "Qwen3.6-27B reference requires flash-linear-attention>=0.5.1 "
-            "for prefill GDN"
+            "Qwen3.6-27B reference requires flash-linear-attention>=0.5.1 for prefill GDN"
         ) from exc
     # FLA's Triton kernels require independent aligned base pointers. Several
     # model tensors are contiguous slices with a non-zero storage offset; a

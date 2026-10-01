@@ -94,6 +94,7 @@ void require_split_nonoverlap(const Tensor& x, const Tensor& weight, const Tenso
         const Tensor* tensor;
         const char* label;
     };
+
     const std::array<Range, 6> ranges{{
         {&x, "x"},
         {&weight, "weight"},
@@ -224,9 +225,8 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
 
 void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, Tensor& conv_state,
                               Tensor& query, Tensor& key, Tensor& value, cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
-        conv_state.dtype != DType::BF16 || query.dtype != DType::BF16 ||
-        key.dtype != DType::BF16 || value.dtype != DType::BF16) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_state.dtype != DType::BF16 ||
+        query.dtype != DType::BF16 || key.dtype != DType::BF16 || value.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: split tensors must be BF16");
     }
 
@@ -242,8 +242,8 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, Tensor& con
     require_split_output_shape(query, x.ne[1], "query");
     require_split_output_shape(key, x.ne[1], "key");
     require_split_output_shape(value, x.ne[1], "value");
-    const std::int64_t output_channels = static_cast<std::int64_t>(query.ne[0]) + key.ne[0] +
-                                         value.ne[0];
+    const std::int64_t output_channels =
+        static_cast<std::int64_t>(query.ne[0]) + key.ne[0] + value.ne[0];
     if (output_channels != x.ne[0]) {
         throw std::invalid_argument("causal_conv1d: split output channels must sum to C");
     }

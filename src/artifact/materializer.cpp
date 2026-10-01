@@ -40,13 +40,11 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 
 class Slot {
 public:
-    explicit Slot(std::size_t bytes)
-        : buffer(bytes + Reader::direct_io_alignment - 1) {
+    explicit Slot(std::size_t bytes) : buffer(bytes + Reader::direct_io_alignment - 1) {
         const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
-        const auto aligned =
-            (address + Reader::direct_io_alignment - 1) / Reader::direct_io_alignment *
-            Reader::direct_io_alignment;
-        data_ = reinterpret_cast<std::byte*>(aligned);
+        const auto aligned = (address + Reader::direct_io_alignment - 1) /
+                             Reader::direct_io_alignment * Reader::direct_io_alignment;
+        data_              = reinterpret_cast<std::byte*>(aligned);
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
 
@@ -146,9 +144,7 @@ private:
                     CUDA_CHECK(cudaEventSynchronize(task.reusable_after));
                 }
                 task.result.set_value(task.reader->read_direct(task.source, task.destination));
-            } catch (...) {
-                task.result.set_exception(std::current_exception());
-            }
+            } catch (...) { task.result.set_exception(std::current_exception()); }
         }
     }
 
@@ -329,8 +325,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     const std::size_t chunk_bytes =
         static_cast<std::size_t>(std::min<std::uint64_t>(kSlotBytes, aligned_read_bytes));
     std::vector<ReadChunk> chunks;
-    chunks.reserve(static_cast<std::size_t>(
-        1 + (aligned_read_bytes - 1) / static_cast<std::uint64_t>(chunk_bytes)));
+    chunks.reserve(static_cast<std::size_t>(1 + (aligned_read_bytes - 1) /
+                                                    static_cast<std::uint64_t>(chunk_bytes)));
     std::size_t largest_request = 0;
     for (const ReadSpan& span : read_spans) {
         for (std::uint64_t source = span.begin; source < span.end; source += chunk_bytes) {
@@ -369,8 +365,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (std::size_t i = 0; i < slot_count; ++i) { submit_read(i); }
 
     for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-        const ReadChunk& chunk = chunks[chunk_index];
-        Slot& slot             = *slots[chunk_index % slot_count];
+        const ReadChunk& chunk       = chunks[chunk_index];
+        Slot& slot                   = *slots[chunk_index % slot_count];
         const std::size_t bytes_read = reads[chunk_index % slot_count].get();
         if (bytes_read < chunk.required) {
             throw ArtifactError("direct artifact read ended before the planned tensor range");
@@ -392,8 +388,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
                 CUDA_CHECK(cudaMemcpyAsync(
                     range.destination + static_cast<std::size_t>(copy_begin - range.source_begin),
-                    slot.data() + static_cast<std::size_t>(copy_begin - chunk.source),
-                    amount, cudaMemcpyHostToDevice, device.load_stream));
+                    slot.data() + static_cast<std::size_t>(copy_begin - chunk.source), amount,
+                    cudaMemcpyHostToDevice, device.load_stream));
                 copied = checked_add(copied, amount, "artifact copied byte count overflows u64");
             }
             if (range.source_end <= chunk_end) {

@@ -23,7 +23,7 @@ constexpr int kFirstExactT = 2;
 constexpr int kLastExactT  = 32;
 using PairOutput           = W8SplitOutput2<kRows, kRows>;
 using PairLauncher         = void (*)(const Tensor&, const Weight&, const Weight&, Tensor&, Tensor&,
-                              cudaStream_t);
+                                      cudaStream_t);
 
 struct W8PairExactTRows {
     static constexpr int kOutputRowsPerCta = kRowsPerCta;

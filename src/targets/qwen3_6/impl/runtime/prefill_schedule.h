@@ -36,9 +36,9 @@ inline constexpr std::uint32_t kIrregularPrefillSplit = 4096;
     return count;
 }
 
-[[nodiscard]] inline std::uint32_t cap_prefill_at_frontiers(
-    std::uint32_t begin, std::uint32_t length,
-    std::span<const std::uint32_t> frontiers) noexcept {
+[[nodiscard]] inline std::uint32_t
+cap_prefill_at_frontiers(std::uint32_t begin, std::uint32_t length,
+                         std::span<const std::uint32_t> frontiers) noexcept {
     // PreparedPrompt stores these in rendered turn order, hence token order.
     const auto next = std::upper_bound(frontiers.begin(), frontiers.end(), begin);
     return next == frontiers.end() ? length : std::min(length, *next - begin);
@@ -47,10 +47,10 @@ inline constexpr std::uint32_t kIrregularPrefillSplit = 4096;
 // Admission uses the execution chunk policy, including the irregular-tail rule.
 // Adding one quantum per split is insufficient: splitting an aligned 8192-token
 // prompt at 100 produces 100 + 4096 + 3996, rather than two execution steps.
-[[nodiscard]] inline std::uint64_t projected_prefill_work(
-    const PreparedPromptData& prompt, std::uint32_t reuse_base, std::uint32_t maximum,
-    std::span<const VisionUseSpan> vision_uses,
-    std::optional<std::uint32_t> rewrite_frontier) noexcept {
+[[nodiscard]] inline std::uint64_t
+projected_prefill_work(const PreparedPromptData& prompt, std::uint32_t reuse_base,
+                       std::uint32_t maximum, std::span<const VisionUseSpan> vision_uses,
+                       std::optional<std::uint32_t> rewrite_frontier) noexcept {
     const auto tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (tokens == reuse_base) { return 1; }
     std::uint64_t result = 0;

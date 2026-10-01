@@ -77,14 +77,7 @@ class GatherRows:
 
 
 Expression = (
-    SourceTensor
-    | Slice
-    | Reshape
-    | Transpose
-    | Concat
-    | Cast
-    | DraftHeadTokenIds
-    | GatherRows
+    SourceTensor | Slice | Reshape | Transpose | Concat | Cast | DraftHeadTokenIds | GatherRows
 )
 
 
@@ -188,11 +181,7 @@ def expression_sources(expression: Expression) -> tuple[SourceTensor, ...]:
     if isinstance(expression, (Slice, Reshape, Transpose, Cast)):
         return expression_sources(expression.source)
     if isinstance(expression, Concat):
-        return tuple(
-            item
-            for part in expression.sources
-            for item in expression_sources(part)
-        )
+        return tuple(item for part in expression.sources for item in expression_sources(part))
     if isinstance(expression, GatherRows):
         return (expression.source,)
     if isinstance(expression, DraftHeadTokenIds):
@@ -278,9 +267,7 @@ def validate_recipe_coverage(
         expected = inventory_by_name[recipe.object_name].shape
         actual = expression_shape(recipe.expression)
         if actual != expected:
-            raise ValueError(
-                f"{recipe.object_name}: recipe shape {actual} != inventory {expected}"
-            )
+            raise ValueError(f"{recipe.object_name}: recipe shape {actual} != inventory {expected}")
 
 
 def source_requirements(
@@ -356,8 +343,7 @@ def materialize_expression(
 
     if isinstance(expression, Concat):
         tensors = [
-            materialize_expression(part, reader, derived_tensors)
-            for part in expression.sources
+            materialize_expression(part, reader, derived_tensors) for part in expression.sources
         ]
         return torch.cat(tensors, dim=expression.axis)
 

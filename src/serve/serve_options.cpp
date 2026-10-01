@@ -137,14 +137,18 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --kv-capacity auto sizes KV from all free GPU memory except --kv-capacity-headroom "
+           "       --kv-capacity auto sizes KV from all free GPU memory except "
+           "--kv-capacity-headroom "
            "MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); raise it when a desktop or other process shares the GPU\n"
-           "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off)\n"
-           "       --kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB (default off)\n"
+           "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default "
+           "off)\n"
+           "       --kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB "
+           "(default off)\n"
            "       --kv-disk-location is required iff --kv-disk-capacity is enabled\n"
-           "       --kv-disk-compress applies zstd-1 to new GDN/hidden/cyclic writes (default off)\n"
+           "       --kv-disk-compress applies zstd-1 to new GDN/hidden/cyclic writes (default "
+           "off)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --context-checkpoints off disables the automatic prefill ladder; a,b,c replaces "
            "the default marks (requires --spec mtp or dflash). Marks at or above --max-context "
@@ -217,8 +221,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-disk-location") {
             options.kv_disk_location = require_value("--kv-disk-location");
         } else if (arg == "--kv-disk-compress") {
-            options.kv_disk_compress =
-                parse_kv_disk_compress(require_value("--kv-disk-compress"));
+            options.kv_disk_compress = parse_kv_disk_compress(require_value("--kv-disk-compress"));
         } else if (arg == "--no-generation-recovery") {
             options.generation_recovery = false;
         } else if (arg == "--max-concurrency") {
@@ -269,9 +272,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--sage") {
             options.sage_attn = true;
         } else if (arg == "--keep-frac") {
-            options.keep_frac = parse_unit_interval_flag(require_value("--keep-frac"), "--keep-frac");
+            options.keep_frac =
+                parse_unit_interval_flag(require_value("--keep-frac"), "--keep-frac");
         } else if (arg == "--xattn-tau") {
-            options.xattn_tau = parse_unit_interval_flag(require_value("--xattn-tau"), "--xattn-tau");
+            options.xattn_tau =
+                parse_unit_interval_flag(require_value("--xattn-tau"), "--xattn-tau");
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -281,9 +286,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--adaptive-draft") {
             options.speculative.adaptive_draft = true;
         } else if (arg == "--dflash-verify-width") {
-            options.speculative.dflash_verify_width = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--dflash-verify-width"),
-                                      "dflash-verify-width"));
+            options.speculative.dflash_verify_width =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--dflash-verify-width"), "dflash-verify-width"));
         } else if (arg == "--dflash-p-less-draft-temperature") {
             options.speculative.dflash_p_less_draft_temperature =
                 parse_float_in(require_value("--dflash-p-less-draft-temperature"),

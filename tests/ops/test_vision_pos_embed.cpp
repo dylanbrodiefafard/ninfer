@@ -44,7 +44,7 @@ std::uint16_t f64_to_bf16(double value) {
         if (candidate_int < 0 || candidate_int > std::numeric_limits<std::uint16_t>::max()) {
             continue;
         }
-        const auto candidate = static_cast<std::uint16_t>(candidate_int);
+        const auto candidate     = static_cast<std::uint16_t>(candidate_int);
         const double represented = static_cast<double>(bf16_to_f32(candidate));
         if (!std::isfinite(represented)) { continue; }
         const double distance = std::abs(value - represented);
@@ -96,10 +96,10 @@ int run_case(std::int32_t dimensions, std::int32_t table_rows, std::int32_t patc
                                      dimension]) *
                     static_cast<double>(weights[control]);
             }
-            const std::size_t output = static_cast<std::size_t>(patch) * dimensions + dimension;
+            const std::size_t output    = static_cast<std::size_t>(patch) * dimensions + dimension;
             const float staged_position = bf16_to_f32(f64_to_bf16(position));
-            reference[output] = static_cast<double>(
-                bf16_to_f32(f32_to_bf16(x_values[output] + staged_position)));
+            reference[output] =
+                static_cast<double>(bf16_to_f32(f32_to_bf16(x_values[output] + staged_position)));
         }
     }
 
@@ -122,8 +122,7 @@ int run_case(std::int32_t dimensions, std::int32_t table_rows, std::int32_t patc
     cuda_synchronize();
 
     const std::string label = "vision_pos_embed D=" + std::to_string(dimensions) +
-                              " R=" + std::to_string(table_rows) +
-                              " P=" + std::to_string(patches);
+                              " R=" + std::to_string(table_rows) + " P=" + std::to_string(patches);
     int failures = verify_pointwise(label.c_str(), from_device_bf16(device_x.data(), x_bits.size()),
                                     reference, kVisionPositionEmbeddingTolerance);
     failures += verify_exact((label + " preserves table").c_str(),
@@ -142,9 +141,9 @@ int run_case(std::int32_t dimensions, std::int32_t table_rows, std::int32_t patc
 }
 
 int run_staging_boundary_case(std::int32_t dimensions, std::int32_t patches) {
-    constexpr float kTableValue = -1.8125f;
-    constexpr float kWeight     = -0.7315477728843689f;
-    constexpr float kResidual   = -0.02685546875f;
+    constexpr float kTableValue       = -1.8125f;
+    constexpr float kWeight           = -0.7315477728843689f;
+    constexpr float kResidual         = -0.02685546875f;
     constexpr std::uint16_t kExpected = 0x3fa7; // 1.3046875
     constexpr std::uint16_t kOldFused = 0x3fa6; // 1.296875
 
@@ -180,12 +179,12 @@ int run_staging_boundary_case(std::int32_t dimensions, std::int32_t patches) {
     cuda_synchronize();
 
     const auto output = from_device<std::uint16_t>(device_x.data(), x.size());
-    int failures = 0;
+    int failures      = 0;
     for (std::size_t i = 0; i < output.size(); ++i) {
         if (output[i] != kExpected) {
-            std::cerr << "FAIL: position staging boundary D=" << dimensions
-                      << " P=" << patches << " element " << i << " expected 0x" << std::hex
-                      << kExpected << " got 0x" << output[i] << std::dec << '\n';
+            std::cerr << "FAIL: position staging boundary D=" << dimensions << " P=" << patches
+                      << " element " << i << " expected 0x" << std::hex << kExpected << " got 0x"
+                      << output[i] << std::dec << '\n';
             ++failures;
             break;
         }

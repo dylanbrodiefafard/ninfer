@@ -236,8 +236,8 @@ __global__ __launch_bounds__(
     const int stages =
         kFull ? groups / kGroupsPerStage : (groups + kGroupsPerStage - 1) / kGroupsPerStage;
 
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * padded_groups *
-                                               Q4RowSplitStorage::kCodeBytesPerGroup;
+    const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * padded_groups *
+                                                Q4RowSplitStorage::kCodeBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * padded_groups *
                                                  Q4RowSplitStorage::kScaleBytesPerGroup;
 

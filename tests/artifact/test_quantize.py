@@ -19,17 +19,13 @@ def test_quantization_uses_stored_fp16_scale_and_zero_padding() -> None:
     assert quantized.scales[0, 1] == 0
 
     payload = quantize_and_encode(weight, "Q4G64_F16S", device="cpu")
-    scales, codes = decode_row_split_codes(
-        payload, "Q4G64_F16S", tuple(weight.shape)
-    )
+    scales, codes = decode_row_split_codes(payload, "Q4G64_F16S", tuple(weight.shape))
     assert torch.equal(scales, quantized.scales)
     assert torch.equal(codes, quantized.codes)
-    decoded = dequantize_row_split(
-        payload, "Q4G64_F16S", tuple(weight.shape), dtype=torch.float32
-    )
-    expected = (
-        quantized.codes.float() * quantized.scales.float().unsqueeze(-1)
-    ).reshape(1, 128)[:, :65]
+    decoded = dequantize_row_split(payload, "Q4G64_F16S", tuple(weight.shape), dtype=torch.float32)
+    expected = (quantized.codes.float() * quantized.scales.float().unsqueeze(-1)).reshape(1, 128)[
+        :, :65
+    ]
     assert torch.equal(decoded, expected)
 
 
@@ -48,9 +44,7 @@ def test_quantization_uses_canonical_scale_rounding_on_cuda() -> None:
 
 
 def test_quantization_uses_reciprocal_multiply_and_ties_to_even() -> None:
-    words = torch.tensor([0x41A0B334, 0x417C7BFF], dtype=torch.int32).view(
-        torch.float32
-    )
+    words = torch.tensor([0x41A0B334, 0x417C7BFF], dtype=torch.int32).view(torch.float32)
     weight = torch.zeros((1, 64), dtype=torch.float32)
     weight[0, :2] = words
     quantized = quantize_matrix(weight, "Q4G64_F16S", device="cpu")
@@ -62,9 +56,7 @@ def test_quantization_uses_reciprocal_multiply_and_ties_to_even() -> None:
         assert torch.equal(cuda.codes.cpu(), quantized.codes)
 
     tie_weight = torch.zeros((1, 64), dtype=torch.float32)
-    tie_weight[0, :7] = torch.tensor(
-        [7.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5]
-    )
+    tie_weight[0, :7] = torch.tensor([7.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5])
     ties = quantize_matrix(tie_weight, "Q4G64_F16S", device="cpu")
     assert ties.codes[0, 0, :7].tolist() == [7, 0, 2, 2, 0, -2, -2]
 

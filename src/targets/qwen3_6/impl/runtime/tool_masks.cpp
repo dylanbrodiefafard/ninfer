@@ -12,15 +12,15 @@ constexpr std::size_t kWords = (kTokenDomain + 31) / 32;
 }
 
 ToolMaskExchange::ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes)
-    : masks_(masks), sampling_(sampling), nodes_(nodes), width_(masks.ne[1]), capacity_(masks.ne[2]),
-      host_masks_(masks.bytes()), host_sampling_(sampling.bytes()),
+    : masks_(masks), sampling_(sampling), nodes_(nodes), width_(masks.ne[1]),
+      capacity_(masks.ne[2]), host_masks_(masks.bytes()), host_sampling_(sampling.bytes()),
       host_ids_(width_ * capacity_ * sizeof(TokenId)),
       host_parents_(width_ * capacity_ * sizeof(std::int32_t)),
       host_counts_(capacity_ * sizeof(std::int32_t)) {
-    if (masks.dtype != DType::I32 || masks.ne[0] != kWords ||
-        !masks.is_contiguous() || width_ == 0 || capacity_ == 0 ||
-        sampling.bytes() < capacity_ * sizeof(ops::SamplingConfig) ||
-        nodes.dtype != DType::I32 || nodes.ne[0] != static_cast<std::int64_t>(width_) ||
+    if (masks.dtype != DType::I32 || masks.ne[0] != kWords || !masks.is_contiguous() ||
+        width_ == 0 || capacity_ == 0 ||
+        sampling.bytes() < capacity_ * sizeof(ops::SamplingConfig) || nodes.dtype != DType::I32 ||
+        nodes.ne[0] != static_cast<std::int64_t>(width_) ||
         nodes.ne[1] != static_cast<std::int64_t>(capacity_) || nodes.ne[2] != 2 ||
         !nodes.is_contiguous()) {
         throw std::invalid_argument("invalid tool mask exchange storage");
@@ -59,8 +59,8 @@ const std::uint32_t* ToolMaskExchange::device_mask(std::size_t row) const {
 }
 
 ops::SamplingConfig ToolMaskExchange::root(std::size_t row, cudaStream_t stream) {
-    auto config = configs_.at(row);
-    config.allowed_token_words = nullptr;
+    auto config                        = configs_.at(row);
+    config.allowed_token_words         = nullptr;
     config.allowed_token_column_stride = 0;
     if (outputs_[row] && outputs_[row]->has_tool_grammar()) {
         const std::array<TokenId, 1> token{0};
@@ -73,12 +73,12 @@ ops::SamplingConfig ToolMaskExchange::root(std::size_t row, cudaStream_t stream)
     return config;
 }
 
-ToolMaskExchange::Submission ToolMaskExchange::enqueue(
-    const Tensor& ids, const Tensor* parents, const Tensor& valid_columns, cudaStream_t compute,
-    cudaStream_t host) {
+ToolMaskExchange::Submission ToolMaskExchange::enqueue(const Tensor& ids, const Tensor* parents,
+                                                       const Tensor& valid_columns,
+                                                       cudaStream_t compute, cudaStream_t host) {
     const cudaStream_t stream = host;
-    const auto batch = static_cast<std::size_t>(ids.ne[1]);
-    const auto width = static_cast<std::size_t>(ids.ne[0]);
+    const auto batch          = static_cast<std::size_t>(ids.ne[1]);
+    const auto width          = static_cast<std::size_t>(ids.ne[0]);
     if (width > width_ || batch > capacity_ || ids.dtype != DType::I32 ||
         valid_columns.dtype != DType::I32 || valid_columns.ne[0] != ids.ne[1]) {
         throw std::invalid_argument("invalid speculative tool mask inputs");
@@ -96,15 +96,17 @@ ToolMaskExchange::Submission ToolMaskExchange::enqueue(
     // Batch and width are fixed within each graph topology.
     for (std::size_t row = 0; row < batch; ++row) {
         CUDA_CHECK(cudaMemcpyAsync(staged_ids + row * width_ * sizeof(TokenId),
-                                    static_cast<const std::uint8_t*>(ids.data) + row * ids.nb[1],
-                                    width * sizeof(TokenId), cudaMemcpyDeviceToDevice, stream));
+                                   static_cast<const std::uint8_t*>(ids.data) + row * ids.nb[1],
+                                   width * sizeof(TokenId), cudaMemcpyDeviceToDevice, stream));
     }
-    CUDA_CHECK(cudaMemcpyAsync(host_ids_.data(), staged_ids, plane, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(host_ids_.data(), staged_ids, plane, cudaMemcpyDeviceToHost, stream));
     if (parents) {
         for (std::size_t row = 0; row < batch; ++row) {
-            CUDA_CHECK(cudaMemcpyAsync(staged_ids + plane + row * width_ * sizeof(std::int32_t),
-                                        static_cast<const std::uint8_t*>(parents->data) + row * parents->nb[1],
-                                        width * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                staged_ids + plane + row * width_ * sizeof(std::int32_t),
+                static_cast<const std::uint8_t*>(parents->data) + row * parents->nb[1],
+                width * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, stream));
         }
         CUDA_CHECK(cudaMemcpyAsync(host_parents_.data(), staged_ids + plane, plane,
                                    cudaMemcpyDeviceToHost, stream));
@@ -138,30 +140,30 @@ ToolMaskExchange::Submission ToolMaskExchange::enqueue(
 
 void CUDART_CB ToolMaskExchange::match(void* opaque) noexcept {
     auto& self = *static_cast<ToolMaskExchange*>(opaque);
-    try { self.fill(); }
-    catch (...) {
+    try {
+        self.fill();
+    } catch (...) {
         self.error_ = std::current_exception();
         // CUDA cannot be aborted from a host node. Finish the round safely with
         // nonempty domains, then fail before any candidate can be published.
         auto* configs = static_cast<ops::SamplingConfig*>(self.host_sampling_.data());
         for (std::size_t row = 0; row < self.configs_.size(); ++row) {
-            configs[row] = self.configs_[row];
-            configs[row].allowed_token_words = nullptr;
+            configs[row]                             = self.configs_[row];
+            configs[row].allowed_token_words         = nullptr;
             configs[row].allowed_token_column_stride = 0;
         }
     }
 }
 
 void ToolMaskExchange::fill() {
-    nvtx::ScopedRange range(nvtx::Name::ToolGrammarMasks, nvtx::Category::Control,
-                            outputs_.size());
-    auto* configs = static_cast<ops::SamplingConfig*>(host_sampling_.data());
+    nvtx::ScopedRange range(nvtx::Name::ToolGrammarMasks, nvtx::Category::Control, outputs_.size());
+    auto* configs      = static_cast<ops::SamplingConfig*>(host_sampling_.data());
     const auto* counts = static_cast<const std::int32_t*>(host_counts_.data());
-    const auto* ids = static_cast<const TokenId*>(host_ids_.data());
-    auto* parents = static_cast<std::int32_t*>(host_parents_.data());
+    const auto* ids    = static_cast<const TokenId*>(host_ids_.data());
+    auto* parents      = static_cast<std::int32_t*>(host_parents_.data());
     for (std::size_t row = 0; row < outputs_.size(); ++row) {
-        configs[row] = configs_[row];
-        configs[row].allowed_token_words = nullptr;
+        configs[row]                             = configs_[row];
+        configs[row].allowed_token_words         = nullptr;
         configs[row].allowed_token_column_stride = 0;
         if (!outputs_[row] || !outputs_[row]->has_tool_grammar()) { continue; }
         if (counts[row] < 1 || static_cast<std::size_t>(counts[row]) > width_) {
@@ -174,10 +176,9 @@ void ToolMaskExchange::fill() {
             }
         }
         std::fill_n(host_mask(row), width_ * kWords, ~std::uint32_t{0});
-        outputs_[row]->fill_tool_masks({ids + row * width_, count},
-                                       {parents + row * width_, count},
+        outputs_[row]->fill_tool_masks({ids + row * width_, count}, {parents + row * width_, count},
                                        {host_mask(row), count * kWords});
-        configs[row].allowed_token_words = device_mask(row);
+        configs[row].allowed_token_words         = device_mask(row);
         configs[row].allowed_token_column_stride = kWords;
     }
 }

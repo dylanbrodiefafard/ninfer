@@ -21,11 +21,12 @@ namespace ninfer::runtime {
 // scale is independent of p_max so extending the observable cycle length does not change the
 // already-qualified decision boundary for shorter periods.
 // Cost: early-out after budget+1 mismatches; worst case sum_{p=p_min}^{p_max} p compares.
-inline constexpr std::size_t kTypicalCyclePeriodMin = 32;
-inline constexpr std::size_t kTypicalCyclePeriodMax = 2048;
+inline constexpr std::size_t kTypicalCyclePeriodMin    = 32;
+inline constexpr std::size_t kTypicalCyclePeriodMax    = 2048;
 inline constexpr std::size_t kTypicalCycleHammingScale = 512;
+
 struct TypicalCycle {
-    std::size_t period     = 0;
+    std::size_t period   = 0;
     TokenId continuation = -1;
 };
 
@@ -51,8 +52,7 @@ struct TypicalCycle {
 // Least p in [p_min, p_max] with 2p <= n such that the last 2p generated ids are a
 // Hamming-near square. Returns nullopt when no such period exists (including n < 2*p_min).
 [[nodiscard]] inline std::optional<TypicalCycle>
-least_square_period(std::span<const TokenId> generated,
-                    std::size_t p_min = kTypicalCyclePeriodMin,
+least_square_period(std::span<const TokenId> generated, std::size_t p_min = kTypicalCyclePeriodMin,
                     std::size_t p_max = kTypicalCyclePeriodMax) {
     const std::size_t n = generated.size();
     if (p_min == 0 || p_min > p_max || n < 2 * p_min) { return std::nullopt; }

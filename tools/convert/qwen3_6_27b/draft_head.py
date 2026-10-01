@@ -31,9 +31,7 @@ DRAFT_HEAD_WIDTH = 5120
 
 DRAFT_HEAD_OBJECT = "text/draft_head"
 DRAFT_HEAD_TOKEN_IDS_OBJECT = "text/draft_head_token_ids"
-DEFAULT_RANKING = Path(
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
-)
+DEFAULT_RANKING = Path("tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64")
 
 
 def load_total_counts(path: str | Path, vocab: int = VOCAB_SIZE) -> np.ndarray:
@@ -48,9 +46,7 @@ def compute_shortlist(
     tokenizer_vocab_size: int | None = None,
 ) -> DraftHeadContext:
     domain = (
-        min(TOKENIZER_VOCAB_SIZE, vocab)
-        if tokenizer_vocab_size is None
-        else tokenizer_vocab_size
+        min(TOKENIZER_VOCAB_SIZE, vocab) if tokenizer_vocab_size is None else tokenizer_vocab_size
     )
     return _compute_shortlist(
         ranking_path,

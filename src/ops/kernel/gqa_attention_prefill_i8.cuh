@@ -467,14 +467,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             const float nm1        = fmaxf(running_m1, bm1);
             const float nm0_scaled = nm0 * scale_l2;
             const float nm1_scaled = nm1 * scale_l2;
-            const float alpha0     = running_m0 == -CUDART_INF_F
-                                         ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
-            const float alpha1     = running_m1 == -CUDART_INF_F
-                                         ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
-            float bl0              = 0.0f;
-            float bl1              = 0.0f;
+            const float alpha0 = running_m0 == -CUDART_INF_F
+                                     ? 0.0f
+                                     : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
+            const float alpha1 = running_m1 == -CUDART_INF_F
+                                     ? 0.0f
+                                     : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
+            float bl0          = 0.0f;
+            float bl1          = 0.0f;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = nt * 8 + 2 * lid;

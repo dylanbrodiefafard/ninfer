@@ -188,11 +188,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             builder.add(sizeof(DFlashDecodeEgress), kArenaAlign, "DFlash decode egress");
         const auto batch = checked_i32(layout.spec.batch_capacity,
                                        "RoundState DFlash batch capacity exceeds int32");
-        const std::uint32_t resolved_width =
-            layout.spec.dflash_verify_width == 0 ? layout.spec.draft_window + 1U
-                                                : layout.spec.dflash_verify_width;
-        const auto dflash_width = checked_i32(resolved_width,
-                                              "RoundState DFlash verify width exceeds int32");
+        const std::uint32_t resolved_width = layout.spec.dflash_verify_width == 0
+                                                 ? layout.spec.draft_window + 1U
+                                                 : layout.spec.dflash_verify_width;
+        const auto dflash_width =
+            checked_i32(resolved_width, "RoundState DFlash verify width exceeds int32");
         decode.proposal_ids =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash proposal ids");
         decode.proposal_positions =
@@ -202,15 +202,13 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.append_positions =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash append positions");
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
-        decode.draft_tokens =
-            add_tensor(builder, DType::I32, {dflash_width - 1, batch}, "DFlash proposal draft tokens");
+        decode.draft_tokens  = add_tensor(builder, DType::I32, {dflash_width - 1, batch},
+                                          "DFlash proposal draft tokens");
         decode.selector_ids =
-            add_tensor(builder, DType::I32,
-                       {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
+            add_tensor(builder, DType::I32, {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
                        "DFlash chain selector ids");
         decode.selector_q =
-            add_tensor(builder, DType::FP32,
-                       {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
+            add_tensor(builder, DType::FP32, {ops::kDflash2PathSelectTopK, dflash_width - 1, batch},
                        "DFlash chain selector q");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target verify ids");
@@ -225,8 +223,9 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.target_logits =
             add_tensor(builder, DType::BF16, {layout.spec.output_rows, dflash_width, batch},
                        "DFlash target logits");
-        decode.target_hidden = add_tensor(
-            builder, DType::BF16, {layout.spec.hidden, dflash_width, batch}, "DFlash target hidden");
+        decode.target_hidden =
+            add_tensor(builder, DType::BF16, {layout.spec.hidden, dflash_width, batch},
+                       "DFlash target hidden");
         decode.target_continuation_hidden = add_tensor(
             builder, DType::BF16, {layout.spec.hidden, batch}, "DFlash target continuation hidden");
     }
@@ -355,10 +354,9 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
-    lanes = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
-    rope_deltas =
-        ingress_tensor(offsetof(DFlashDecodeIngress, rope_deltas), DType::I32, {batch});
-    sampling = reinterpret_cast<const ops::SamplingConfig*>(
+    lanes       = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
+    rope_deltas = ingress_tensor(offsetof(DFlashDecodeIngress, rope_deltas), DType::I32, {batch});
+    sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     licensed_tokens =
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_tokens), DType::I32, {width, batch});

@@ -229,9 +229,9 @@ int main() {
         }
         host.free(whole);
 
-        void* left = host.try_alloc(256, 256);
+        void* left   = host.try_alloc(256, 256);
         void* middle = host.try_alloc(256, 256);
-        void* right = host.try_alloc(256, 256);
+        void* right  = host.try_alloc(256, 256);
         if (left == nullptr || middle == nullptr || right == nullptr) {
             ++failures;
             std::cerr << "three 256-byte host allocations failed\n";
@@ -262,7 +262,7 @@ int main() {
         // for cache retirement. Every surviving block must keep its contents and
         // releasing all blocks must recover the complete pinned region.
         constexpr std::size_t block_count = 64;
-        constexpr std::size_t bytes = 256;
+        constexpr std::size_t bytes       = 256;
         ninfer::HostPinnedArena host(block_count * bytes);
         std::array<void*, block_count> blocks{};
         for (std::size_t i = 0; i < block_count; ++i) {
@@ -293,12 +293,12 @@ int main() {
     }
 
     {
-        auto future = std::async(std::launch::async, [] {
+        auto future                                   = std::async(std::launch::async, [] {
             CUDA_CHECK(cudaSetDevice(0));
             return std::make_unique<ninfer::HostPinnedArena>(1024);
         });
         std::unique_ptr<ninfer::HostPinnedArena> host = future.get();
-        void* allocation = host->try_alloc(1024, 256);
+        void* allocation                              = host->try_alloc(1024, 256);
         if (allocation == nullptr) {
             ++failures;
             std::cerr << "cross-thread host arena allocation failed\n";

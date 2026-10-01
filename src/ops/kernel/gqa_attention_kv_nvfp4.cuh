@@ -18,8 +18,8 @@ inline constexpr int kGqaNvfp4CodeRowBytes = kGqaNvfp4CodeWidth;
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_nvfp4_code_index(int physical_page, int kv_head,
                                                              int code_byte, int page_offset) {
-    return paged_kv_element_offset<kGqaNvfp4CodeWidth, Geometry::KVHeads>(
-        physical_page, kv_head, page_offset, code_byte);
+    return paged_kv_element_offset<kGqaNvfp4CodeWidth, Geometry::KVHeads>(physical_page, kv_head,
+                                                                          page_offset, code_byte);
 }
 
 template <typename Geometry>

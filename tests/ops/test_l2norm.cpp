@@ -103,7 +103,7 @@ int dump_case(const char* label, const Shape& shape, std::uint32_t seed, float s
     fill_uniform(x, seed, -scale, scale);
     round_to_bf16(x);
 
-    const std::int64_t rows = static_cast<std::int64_t>(shape.heads) * shape.tokens;
+    const std::int64_t rows    = static_cast<std::int64_t>(shape.heads) * shape.tokens;
     norm::DeviceInput device_x = norm::make_input(x, bf16x2_unaligned);
     const std::size_t leading  = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
     GuardedDeviceBuffer output(leading + n * sizeof(std::uint16_t));
@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
         float scale;
         bool unaligned;
     };
+
     // Q/K normalization uses D=128 with 16 heads in both registered text targets.
     const std::vector<Case> cases = {
         {"l2norm [128,16,1]", {128, 16, 1}, 2101U, 4.0F, false},
@@ -200,7 +201,7 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
-    int ran = 0;
+    int ran      = 0;
     for (const auto& c : cases) {
         if (fast && ran != 0) break;
         if (!only.empty() && std::string(c.label).find(only) == std::string::npos) continue;

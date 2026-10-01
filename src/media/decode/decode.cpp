@@ -283,8 +283,8 @@ public:
         out.height = height;
         const AVPixFmtDescriptor* descriptor =
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-        const bool alpha = composite_alpha && descriptor != nullptr &&
-                           (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool alpha                       = composite_alpha && descriptor != nullptr &&
+                                                 (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
         const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
         sws_ = sws_getCachedContext(sws_, width, height, static_cast<AVPixelFormat>(frame->format),
@@ -473,7 +473,7 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     Decoder probe(bytes, policy.max_decoded_pixels);
     const double fps      = fps_of(probe.stream());
     int total             = probe.stream()->nb_frames > 0 &&
-                        probe.stream()->nb_frames <= std::numeric_limits<int>::max()
+                                    probe.stream()->nb_frames <= std::numeric_limits<int>::max()
                                 ? static_cast<int>(probe.stream()->nb_frames)
                                 : 0;
     const double duration = probe.duration_seconds();

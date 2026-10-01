@@ -108,9 +108,9 @@ __global__ __launch_bounds__(
                 // scales cover two K tiles: fetch the box on the even tile into a scale slot
                 // and let the odd tile expect that many bytes fewer.
                 const bool load_scales = (k_tile & 1) == 0;
-                nvfp4_mbarrier_arrive_expect_tx(
-                    &shared.full[stage],
-                    load_scales ? kTransactionBytes : kTransactionBytes - kScaleBytes);
+                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage],
+                                                load_scales ? kTransactionBytes
+                                                            : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
@@ -213,8 +213,8 @@ __global__ __launch_bounds__(
 
                 const int scale_pair_row = pair_mod128 + warp_n * (kPairN / Schedule::kWarpsN) +
                                            pair_fragment * 8 + sfb_row;
-                const int row_mod32    = scale_pair_row & 31;
-                const int row_quartile = scale_pair_row >> 5;
+                const int row_mod32      = scale_pair_row & 31;
+                const int row_quartile   = scale_pair_row >> 5;
                 b_scales[mma_n] =
                     load_vec<unsigned>(tensors.b_scales[stage][branch] +
                                        (local_k64 * 32 + row_mod32) * 16 + row_quartile * 4);

@@ -106,9 +106,9 @@ stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
             const int source_token = valid ? token : 0;
             auto* destination      = &shared.a_scale4[stage][row * Schedule::kK64PerStage];
             const auto* input      = source.scales + (static_cast<std::int64_t>(source_token) *
-                                                     Geometry::kScaleTilesPerRow +
-                                                 k_tile * Schedule::kK64PerStage) *
-                                                    4;
+                                                          Geometry::kScaleTilesPerRow +
+                                                      k_tile * Schedule::kK64PerStage) *
+                                                         4;
             cp_async_zfill<kScaleBytes>(destination, input, valid ? kScaleBytes : 0);
         }
     } else {
@@ -138,9 +138,8 @@ template <class Geometry, class Schedule, class RowPolicy, Cache WeightCache = C
           class Storage>
 __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __restrict__ codes,
                                                         const std::uint8_t* __restrict__ scales,
-                                                        Storage& shared,
-                                                        int stage, int k_tile, int row_begin,
-                                                        RowPolicy row_policy) {
+                                                        Storage& shared, int stage, int k_tile,
+                                                        int row_begin, RowPolicy row_policy) {
     constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
     if constexpr (WeightCache == Cache::EvictFirst) {
         for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks;
@@ -148,8 +147,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
             const int row             = task / Schedule::kSegmentsPerRow;
             const int logical_segment = task - row * Schedule::kSegmentsPerRow;
             const int weight_row      = row_policy.weight_row(row_begin, row);
-            const int physical_byte =
-                nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
+            const int physical_byte = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
             auto* destination =
                 shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
             const auto* input = codes +
@@ -163,8 +161,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
             const int row             = task / Schedule::kSegmentsPerRow;
             const int logical_segment = task - row * Schedule::kSegmentsPerRow;
             const int weight_row      = row_policy.weight_row(row_begin, row);
-            const int physical_byte =
-                nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
+            const int physical_byte = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
             auto* destination =
                 shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
             const auto* input = codes +
@@ -194,7 +191,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
             const int global_row_begin = row_begin + row_tile * 128;
             const int persistent_tile  = global_row_begin / 128;
             const int first_quartile   = (global_row_begin & 127) / 32;
-            auto* destination          = shared.b_scales[stage] +
+            auto* destination = shared.b_scales[stage] +
                                 ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) *
                                     kScaleBytesPerTask;
             const auto* input = scales +
@@ -354,8 +351,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         cp_commit();
     }
 
-    const int accumulator_row   = lane >> 2;
-    const int accumulator_col   = 2 * (lane & 3);
+    const int accumulator_row = lane >> 2;
+    const int accumulator_col = 2 * (lane & 3);
     // Fused GDN convolution consumes FP32 projection accumulators. Its output policy
     // bypasses the BF16 shared epilogue; all existing BF16 policies retain that path.
     constexpr bool kFp32Output = requires { output.store_fp32(0, 0, 0.0F); };
@@ -418,8 +415,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 const uint4 values =
                     load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
                 if constexpr (PairRows) {
-                    const uint4 paired = load_vec<uint4>(shared_output + token_local * kOutputStride +
-                                                         kStoredRows + row_vector * 8);
+                    const uint4 paired = load_vec<uint4>(
+                        shared_output + token_local * kOutputStride + kStoredRows + row_vector * 8);
                     output.store_pair_vector(row_begin + row_vector * 8, token, values, paired);
                 } else {
                     output.store_vector(row_begin + row_vector * 8, token, values);
@@ -435,9 +432,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
 template <class Geometry>
 __device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int group) {
     constexpr int kTilesPerRow = (Geometry::kInputRows / 16) / kNvfp4ScaleTileGroups;
-    const std::int64_t tile =
-        static_cast<std::int64_t>(token / kNvfp4TmaBlockM) * kTilesPerRow +
-        group / kNvfp4ScaleTileGroups;
+    const std::int64_t tile    = static_cast<std::int64_t>(token / kNvfp4TmaBlockM) * kTilesPerRow +
+                                 group / kNvfp4ScaleTileGroups;
     return tile * (kNvfp4TmaBlockM * kNvfp4ScaleTileGroups) +
            (token % kNvfp4TmaBlockM) * kNvfp4ScaleTileGroups + group % kNvfp4ScaleTileGroups;
 }

@@ -12,9 +12,9 @@ std::uint32_t page_count(std::uint32_t capacity) {
 }
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
-                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
-                               std::int32_t quant_group, std::int32_t table_rows,
-                               std::uint32_t physical_page_groups, bool sage_pv, float keep_frac) {
+                              std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
+                              std::int32_t quant_group, std::int32_t table_rows,
+                              std::uint32_t physical_page_groups, bool sage_pv, float keep_frac) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -24,8 +24,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     const bool nvfp4 = dtype == DType::U8;
     if ((!int8 && !nvfp4 && (dtype != DType::BF16 || quant_group != 0)) ||
         (int8 && (quant_group != kKvQuantGroup || head_dim % quant_group != 0)) ||
-        (nvfp4 && (quant_group != kKvNvfp4Group || head_dim % quant_group != 0 ||
-                   (head_dim % 2) != 0))) {
+        (nvfp4 &&
+         (quant_group != kKvNvfp4Group || head_dim % quant_group != 0 || (head_dim % 2) != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
 
@@ -38,11 +38,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.page_group_count      = physical_page_groups;
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
-    const bool quantized = int8 || nvfp4;
+    const bool quantized            = int8 || nvfp4;
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) *
                              (nvfp4 && (sage_pv || keep_frac < 1.0f) ? 5ULL
-                              : quantized                             ? 4ULL
-                                                                      : 2ULL));
+                              : quantized                            ? 4ULL
+                                                                     : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const std::int32_t code_extent = nvfp4 ? head_dim / 2 : head_dim;
         pool_spec.planes.push_back({dtype, code_extent, kv_heads, 256});
@@ -78,10 +78,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
-    layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
-                                spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups,
-                                spec.sage_attn, spec.keep_frac);
+    layout.text_kv =
+        plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
+                   spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group, spec.kv_table_rows,
+                   spec.text_physical_page_groups, spec.sage_attn, spec.keep_frac);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
@@ -118,7 +118,7 @@ PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocatio
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
-    const bool quantized     = dtype_ == DType::I8 || dtype_ == DType::U8;
+    const bool quantized = dtype_ == DType::I8 || dtype_ == DType::U8;
     // NVFP4 with k_mean (sage fill or Sparge keep_frac<1) stores 5 planes per layer;
     // other quantized layouts store 4; BF16 stores 2. Stride the flat pool by the
     // per-layer plane count.

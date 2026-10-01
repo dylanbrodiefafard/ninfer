@@ -263,9 +263,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("duplicate --suite value")
 
 
-def build_points(
-    artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace
-) -> list[Point]:
+def build_points(artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace) -> list[Point]:
     mode_names = args.mode or list(corpus.DEFAULT_MODES)
     if len(mode_names) != len(set(mode_names)):
         raise corpus.CampaignError("duplicate --mode value")
@@ -319,7 +317,8 @@ def saturation_job_fixtures(
             tools = loaded.get("tools") or None
         if not isinstance(messages, list) or not messages:
             raise corpus.CampaignError(
-                "--saturation-messages must be a non-empty message list or {messages, tools}")
+                "--saturation-messages must be a non-empty message list or {messages, tools}"
+            )
         one = corpus.Fixture(
             name=path.stem,
             messages=messages,
@@ -502,22 +501,20 @@ def validate_server_start(
         "max_pending_requests": 1,
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
-        "log_stats_interval_ms": getattr(
-            args, "log_stats_interval_ms", DEFAULT_STATS_INTERVAL_MS
-        ),
+        "log_stats_interval_ms": getattr(args, "log_stats_interval_ms", DEFAULT_STATS_INTERVAL_MS),
         "kv_cache": corpus.KV_CACHE_LOG_NAMES[args.kv_dtype],
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
         "speculative_draft_window": point.draft_tokens,
-        "proposal_head": getattr(args, "proposal_head", "optimized") if point.draft_tokens else "full",
+        "proposal_head": getattr(args, "proposal_head", "optimized")
+        if point.draft_tokens
+        else "full",
     }
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
-    if event.get("sampling_defaults", {}).get("greedy") != (
-        point.sampling_mode == "greedy"
-    ):
+    if event.get("sampling_defaults", {}).get("greedy") != (point.sampling_mode == "greedy"):
         raise corpus.CampaignError("server_start sampling mode does not match the point")
     p_less = event.get("sampling_defaults", {}).get("server_overrides", {}).get("p_less")
     if p_less != (point.sampling_mode == "p-less"):
@@ -620,8 +617,7 @@ def receive_stream(
                 if not isinstance(delta, dict):
                     raise corpus.CampaignError("SSE delta is not a JSON object")
                 if any(
-                    delta.get(name) not in (None, "")
-                    for name in ("content", "reasoning_content")
+                    delta.get(name) not in (None, "") for name in ("content", "reasoning_content")
                 ):
                     now = time.monotonic()
                     if first_output_at is None:
@@ -641,7 +637,14 @@ def receive_stream(
                     if not isinstance(reasoning, str):
                         raise TypeError("streamed reasoning is not text")
                     reasoning_parts.append(reasoning)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise corpus.CampaignError(f"invalid Chat Completions SSE response: {exc}") from exc
 
     finished_at = time.monotonic()
@@ -862,9 +865,7 @@ def sum_throughput(events: Sequence[dict[str, Any]]) -> dict[str, int | float | 
         "committed_decode_tokens": committed_decode_tokens,
         "decode_rounds": decode_rounds,
         "decode_row_rounds": decode_row_rounds,
-        "average_decode_batch": (
-            decode_row_rounds / decode_rounds if decode_rounds > 0 else None
-        ),
+        "average_decode_batch": (decode_row_rounds / decode_rounds if decode_rounds > 0 else None),
     }
 
 
@@ -942,9 +943,7 @@ def steady_or_request_done_metrics(
         return fallback
 
 
-def steady_metrics(
-    events: Sequence[dict[str, Any]], concurrency: int
-) -> dict[str, int | float]:
+def steady_metrics(events: Sequence[dict[str, Any]], concurrency: int) -> dict[str, int | float]:
     selected = [event for event in events if is_steady_interval(event, concurrency)]
     if not selected:
         raise corpus.CampaignError(
@@ -968,9 +967,7 @@ def steady_metrics(
     }
 
 
-def client_records(
-    results: Sequence[ClientResult], campaign_start: float
-) -> list[dict[str, Any]]:
+def client_records(results: Sequence[ClientResult], campaign_start: float) -> list[dict[str, Any]]:
     return [
         {
             "index": result.job.index,
@@ -1026,9 +1023,10 @@ def analyze_point(
     runtime_totals = sum_throughput(throughput)
     client_prompt = sum(result.prompt_tokens for result in results)
     client_completion = sum(result.completion_tokens for result in results)
-    if client_prompt != done_totals["prompt_tokens"] or client_completion != done_totals[
-        "completion_tokens"
-    ]:
+    if (
+        client_prompt != done_totals["prompt_tokens"]
+        or client_completion != done_totals["completion_tokens"]
+    ):
         raise corpus.CampaignError("client usage and request_done token totals differ")
     if runtime_totals["computed_prefill_tokens"] != done_totals["computed_prefill_tokens"]:
         raise corpus.CampaignError("throughput and request_done prefill token totals differ")
@@ -1041,12 +1039,9 @@ def analyze_point(
     metrics: dict[str, Any]
     if point.suite == "decode-saturation":
         if any(
-            event.get("result", {}).get("finish_reason") != "output_limit"
-            for event in request_done
+            event.get("result", {}).get("finish_reason") != "output_limit" for event in request_done
         ):
-            raise corpus.CampaignError(
-                "decode-saturation request stopped before its output limit"
-            )
+            raise corpus.CampaignError("decode-saturation request stopped before its output limit")
         metrics = {
             "wave_makespan_seconds": makespan,
             "steady": steady_or_request_done_metrics(
@@ -1252,9 +1247,7 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         row["workload_prefill_tokens_per_second"] = report["metrics"][
             "computed_prefill_tokens_per_second"
         ]
-        row["workload_decode_tokens_per_second"] = report["metrics"][
-            "decode_tokens_per_second"
-        ]
+        row["workload_decode_tokens_per_second"] = report["metrics"]["decode_tokens_per_second"]
     return row
 
 
@@ -1363,9 +1356,7 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
         "configured concurrency. Corpus makespan spans simultaneous client release through the "
-        f"last complete HTTP response.{corpus_order_note}\n\n"
-        + "\n\n".join(sections)
-        + "\n"
+        f"last complete HTTP response.{corpus_order_note}\n\n" + "\n\n".join(sections) + "\n"
     )
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
@@ -1391,10 +1382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for point in points:
             log_path = output_dir / "server" / f"{point.key}.jsonl"
             jobs = build_jobs(point, fixtures, args)
-            print(
-                f"# {point.key}: {len(jobs)} request(s), "
-                f"order={workload_order_label(point)}"
-            )
+            print(f"# {point.key}: {len(jobs)} request(s), order={workload_order_label(point)}")
             print(shlex.join(server_command(serve, point, log_path, args)))
         return 0
 

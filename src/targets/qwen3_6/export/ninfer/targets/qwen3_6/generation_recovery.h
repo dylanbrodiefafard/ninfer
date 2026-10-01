@@ -17,10 +17,17 @@ namespace ninfer::targets::qwen3_6 {
 class GenerationRecoveryContext {
 public:
     static constexpr std::uint32_t maximum_attempts = 2;
-    [[nodiscard]] static std::shared_ptr<const GenerationRecoveryContext> analyze(const PromptInput& input);
-    [[nodiscard]] bool has_repeated_tool_history() const noexcept { return !repeated_call_.name.empty(); }
+    [[nodiscard]] static std::shared_ptr<const GenerationRecoveryContext>
+    analyze(const PromptInput& input);
+
+    [[nodiscard]] bool has_repeated_tool_history() const noexcept {
+        return !repeated_call_.name.empty();
+    }
+
     [[nodiscard]] bool repeats(std::span<const ToolCall> calls, std::string_view reasoning) const;
+
     [[nodiscard]] const PromptInput& input() const noexcept { return input_; }
+
     // Only the new messages. Empty calls are one system notice. Calls are one
     // assistant message plus one tool message per call. History is not copied
     // and reasoning_content is not cleared.
@@ -42,21 +49,16 @@ inline constexpr std::string_view kRecoveryPrologueExhausted =
     "open generation is not the thinking prologue";
 inline constexpr std::string_view kRecoveryBudgetExhausted =
     "repaired request cannot preserve its admitted output budget";
-inline constexpr std::string_view kRecoveryLaneExhausted =
-    "reserved lane cannot be rebuilt safely";
+inline constexpr std::string_view kRecoveryLaneExhausted = "reserved lane cannot be rebuilt safely";
 
 // False when any piece is empty, the prefix does not end with the prologue ids,
 // or a piece's decoded text differs from the text that was encoded.
-[[nodiscard]] bool recovery_suffix_tokens_ok(std::span<const TokenId> prefix,
-                                              std::span<const TokenId> prologue,
-                                              std::span<const TokenId> turn_close,
-                                              std::span<const TokenId> insert,
-                                              std::string_view prologue_text,
-                                              std::string_view prologue_decoded,
-                                              std::string_view turn_close_text,
-                                              std::string_view turn_close_decoded,
-                                              std::string_view insert_text,
-                                              std::string_view insert_decoded) noexcept;
+[[nodiscard]] bool
+recovery_suffix_tokens_ok(std::span<const TokenId> prefix, std::span<const TokenId> prologue,
+                          std::span<const TokenId> turn_close, std::span<const TokenId> insert,
+                          std::string_view prologue_text, std::string_view prologue_decoded,
+                          std::string_view turn_close_text, std::string_view turn_close_decoded,
+                          std::string_view insert_text, std::string_view insert_decoded) noexcept;
 
 // False when the spliced prompt cannot keep `remaining` output tokens inside `capacity`.
 [[nodiscard]] bool recovery_output_budget_preserved(std::uint32_t spliced, std::uint32_t capacity,
@@ -76,26 +78,28 @@ struct RecoveryPrefillDecision {
 };
 
 struct RecoveryPrefillInput {
-    bool splice_accepted                 = false;
-    bool allow_prefix_reuse              = false;
-    bool force_cold_prefill              = false;
-    bool lane_retained                   = false;
+    bool splice_accepted                   = false;
+    bool allow_prefix_reuse                = false;
+    bool force_cold_prefill                = false;
+    bool lane_retained                     = false;
     std::uint32_t resident_reusable_tokens = 0;
-    bool can_admit_lane                  = false;
-    bool output_budget_preserved         = false;
-    bool pages_fit                       = false;
-    std::uint32_t ram_reusable_tokens    = 0;
-    std::uint32_t disk_reusable_tokens   = 0;
-    bool host_restore_failed             = false;
+    bool can_admit_lane                    = false;
+    bool output_budget_preserved           = false;
+    bool pages_fit                         = false;
+    std::uint32_t ram_reusable_tokens      = 0;
+    std::uint32_t disk_reusable_tokens     = 0;
+    bool host_restore_failed               = false;
 };
 
 // The only recovery prefill branch. A positive resident reuse does not consult
 // the host counts. Host counts are used only after the resident plan reused nothing.
-[[nodiscard]] RecoveryPrefillDecision route_recovery_prefill(const RecoveryPrefillInput& input) noexcept;
+[[nodiscard]] RecoveryPrefillDecision
+route_recovery_prefill(const RecoveryPrefillInput& input) noexcept;
 
 // The splice prefix. A non-empty resident ledger copy wins. The original prompt
 // is the prefix only when that copy is empty.
-[[nodiscard]] std::span<const TokenId> recovery_splice_prefix(
-    std::span<const TokenId> resident_prefix, std::span<const TokenId> original_prompt) noexcept;
+[[nodiscard]] std::span<const TokenId>
+recovery_splice_prefix(std::span<const TokenId> resident_prefix,
+                       std::span<const TokenId> original_prompt) noexcept;
 
 } // namespace ninfer::targets::qwen3_6

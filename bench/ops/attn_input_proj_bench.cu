@@ -41,9 +41,9 @@ struct Options {
     ops::LinearPolicy nvfp4_policy = ops::LinearPolicy::AllowA4;
     CacheMode cache                = CacheMode::Cold;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 12, 16, 32, 64, 128, 256, 512, 1024};
-    int warmup   = 5;
-    int repeat   = 30;
-    bool profile = false;
+    int warmup               = 5;
+    int repeat               = 30;
+    bool profile             = false;
     std::int32_t panel_width = 0;
     std::string csv_out;
 };
@@ -270,7 +270,7 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
         const std::uint64_t logical = qk.model_weight_bytes() + gv.model_weight_bytes() +
                                       tensor_bytes(hidden, tokens) +
                                       tensor_bytes(2 * q_rows + 2 * kv_rows, tokens);
-        const double flops = 4.0 * parent_rows * hidden * static_cast<double>(tokens);
+        const double flops          = 4.0 * parent_rows * hidden * static_cast<double>(tokens);
         for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
@@ -341,7 +341,7 @@ void run_four_output(const Options& options, const char* format, QType qtype,
         const std::uint64_t logical = fixture.model_weight_bytes() * weight_reads +
                                       tensor_bytes(hidden, tokens) +
                                       tensor_bytes(2 * q_rows + 2 * kv_rows, tokens);
-        const double flops = 2.0 * parent_rows * hidden * static_cast<double>(tokens);
+        const double flops          = 2.0 * parent_rows * hidden * static_cast<double>(tokens);
         for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
@@ -383,7 +383,7 @@ void run_w8_qkv(const Options& options, DeviceBuffer& flush, cudaStream_t stream
         }
         const std::uint64_t logical = weight.model_weight_bytes() + tensor_bytes(hidden, tokens) +
                                       tensor_bytes(q_rows + 2 * kv_rows, tokens);
-        const double flops = 2.0 * parent_rows * hidden * static_cast<double>(tokens);
+        const double flops          = 2.0 * parent_rows * hidden * static_cast<double>(tokens);
         for (const CacheState cache : {CacheState::Cold, CacheState::Warm}) {
             if ((options.cache == CacheMode::Cold && cache != CacheState::Cold) ||
                 (options.cache == CacheMode::Warm && cache != CacheState::Warm))
@@ -407,9 +407,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
         output << "attn_input_proj," << result.format << ',' << result.policy << ','
                << cache_name(result.cache) << ',' << result.tokens << ',' << options.panel_width
                << ',' << result.workspace_bytes << ',' << result.logical_bytes << ','
-               << result.useful_flops << ','
-               << result.timing.median_us << ',' << result.timing.min_us << ','
-               << result.timing.p95_us << '\n';
+               << result.useful_flops << ',' << result.timing.median_us << ','
+               << result.timing.min_us << ',' << result.timing.p95_us << '\n';
     }
 }
 

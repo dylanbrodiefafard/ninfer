@@ -18,9 +18,8 @@ __device__ void gqa_xattn_bitonic_sort_desc(float* keys, int* ids, int tid) {
                 if (ixj > i) {
                     const bool want_i_better = (i & k) == 0;
                     const bool i_better =
-                        keys[i] > keys[ixj] ||
-                        (keys[i] == keys[ixj] && ids[i] >= 0 &&
-                         (ids[ixj] < 0 || ids[i] < ids[ixj]));
+                        keys[i] > keys[ixj] || (keys[i] == keys[ixj] && ids[i] >= 0 &&
+                                                (ids[ixj] < 0 || ids[i] < ids[ixj]));
                     if (i_better != want_i_better) {
                         const float tk = keys[i];
                         keys[i]        = keys[ixj];

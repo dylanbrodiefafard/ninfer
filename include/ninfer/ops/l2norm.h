@@ -29,6 +29,7 @@ struct L2NormDump {
     float* sumsq; // [rows] sum of x[d]^2 over D, before eps
     float* inv_r; // [rows] 1 / sqrt(sumsq + eps)
 };
+
 void l2norm_dump(const Tensor& x, float eps, Tensor& out, cudaStream_t stream, L2NormDump& dump);
 
 } // namespace ninfer::ops

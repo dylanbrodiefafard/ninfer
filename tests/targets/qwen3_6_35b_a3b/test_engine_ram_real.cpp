@@ -23,14 +23,13 @@ ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse) {
 }
 
 std::vector<ninfer::TokenId> tokens_a() { return {248045, 846, 198, 5834, 248046, 198}; }
+
 std::vector<ninfer::TokenId> tokens_c() { return {248045, 846, 198, 9906, 248046, 198}; }
 
 std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
                                            const std::vector<ninfer::TokenId>& generated) {
     std::vector<ninfer::TokenId> prefix = keep;
-    if (!generated.empty()) {
-        prefix.insert(prefix.end(), generated.begin(), generated.end() - 1);
-    }
+    if (!generated.empty()) { prefix.insert(prefix.end(), generated.begin(), generated.end() - 1); }
     return prefix;
 }
 
@@ -49,8 +48,9 @@ ninfer::EngineOptions engine_options(const char* artifact) {
 }
 
 int exercise_site2(ninfer::Engine& engine) {
-    const auto keep                          = tokens_a();
-    const ninfer::GenerationResult first     = engine.generate(engine.prepare_tokens(keep), greedy(8, false));
+    const auto keep = tokens_a();
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
     if (first.generated_token_ids.size() != 8) {
         std::cerr << "35B RAM source request did not generate eight tokens\n";
         return 1;

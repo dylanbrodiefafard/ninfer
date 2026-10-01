@@ -282,8 +282,8 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const unsigned v_sbase     = smem_addr(v_s);
     const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 8 * RowBytes) +
                                  static_cast<unsigned>(b_rin * RowBytes);
-    const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
-    const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
+    const unsigned v_as        = static_cast<unsigned>((lane >> 4) << 4);
+    const unsigned v_r         = static_cast<unsigned>(b_rin << 4);
 
     auto tile_metadata = [&](int iteration, bool& is_query, int& key0, int& valid_keys) {
         is_query = iteration >= context_tile_count;
@@ -369,28 +369,24 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             const int col1       = col0 + 1;
             const bool row0_live = row0 < RowCount && row0 / kBidirectionalGqaGroup < valid;
             const bool row1_live = row1 < RowCount && row1 / kBidirectionalGqaGroup < valid;
-            const bool allow00 =
-                row0_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query ||
-                 current_key0 + col0 >= q_position0 - (window - 1));
-            const bool allow01 =
-                row0_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query ||
-                 current_key0 + col1 >= q_position0 - (window - 1));
-            const bool allow10 =
-                row1_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query ||
-                 current_key0 + col0 >= q_position1 - (window - 1));
-            const bool allow11 =
-                row1_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query ||
-                 current_key0 + col1 >= q_position1 - (window - 1));
-            score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
-            score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
-            score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
-            score[nt][3] = allow11 ? score[nt][3] * scale : -CUDART_INF_F;
-            block_m0     = fmaxf(block_m0, fmaxf(score[nt][0], score[nt][1]));
-            block_m1     = fmaxf(block_m1, fmaxf(score[nt][2], score[nt][3]));
+            const bool allow00   = row0_live && col0 < current_valid &&
+                                   (!CyclicSwa || current_is_query ||
+                                    current_key0 + col0 >= q_position0 - (window - 1));
+            const bool allow01   = row0_live && col1 < current_valid &&
+                                   (!CyclicSwa || current_is_query ||
+                                    current_key0 + col1 >= q_position0 - (window - 1));
+            const bool allow10   = row1_live && col0 < current_valid &&
+                                   (!CyclicSwa || current_is_query ||
+                                    current_key0 + col0 >= q_position1 - (window - 1));
+            const bool allow11   = row1_live && col1 < current_valid &&
+                                   (!CyclicSwa || current_is_query ||
+                                    current_key0 + col1 >= q_position1 - (window - 1));
+            score[nt][0]         = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
+            score[nt][1]         = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
+            score[nt][2]         = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
+            score[nt][3]         = allow11 ? score[nt][3] * scale : -CUDART_INF_F;
+            block_m0             = fmaxf(block_m0, fmaxf(score[nt][0], score[nt][1]));
+            block_m1             = fmaxf(block_m1, fmaxf(score[nt][2], score[nt][3]));
         }
         block_m0 = warp_max<4>(block_m0, FullMask);
         block_m1 = warp_max<4>(block_m1, FullMask);
@@ -555,13 +551,11 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
 }
 
 template <bool CyclicSwa, int Tokens, int KeyBlock>
-__device__ __forceinline__ void
-noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
-                          const float* __restrict__ partial_m, const float* __restrict__ partial_l,
-                          const std::int32_t* __restrict__ context_state,
-                          const std::int32_t* __restrict__ valid_columns, int max_context,
-                          [[maybe_unused]] int window, int split_capacity,
-                          __nv_bfloat16* __restrict__ out) {
+__device__ __forceinline__ void noncausal_gqa_reduce_body(
+    const __nv_bfloat16* __restrict__ partial_acc, const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l, const std::int32_t* __restrict__ context_state,
+    const std::int32_t* __restrict__ valid_columns, int max_context, [[maybe_unused]] int window,
+    int split_capacity, __nv_bfloat16* __restrict__ out) {
     const int q_head = static_cast<int>(blockIdx.x);
     const int token  = static_cast<int>(blockIdx.y);
     const int batch  = static_cast<int>(blockIdx.z);

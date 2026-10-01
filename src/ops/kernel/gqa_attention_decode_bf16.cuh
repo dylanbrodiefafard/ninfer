@@ -284,8 +284,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
         gqa_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
         gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
-        const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
-        const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
+        const int qabs0   = (row0 < row_count) ? pos[token0] : -1;
+        const int qabs1   = (row1 < row_count) ? pos[token1] : -1;
         int prefix_length = 0;
         int bits0         = 0;
         int bits1         = 0;

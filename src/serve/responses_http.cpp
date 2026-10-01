@@ -281,8 +281,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     stream->request          = std::move(request);
     stream->previous_context = std::move(previous_context);
     stream->log_context      = log_context;
-    stream->encoder          = std::make_unique<ResponsesEventStream>(id, created, stream->request,
-                                                                      runtime_values(stream->prepared));
+    stream->encoder = std::make_unique<ResponsesEventStream>(id, created, stream->request,
+                                                             runtime_values(stream->prepared));
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
@@ -331,7 +331,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 return true;
             } catch (const ClientDisconnected& exception) {
                 ApiError error;
-                error.code = "client_disconnected";
+                error.code    = "client_disconnected";
                 error.message = exception.what();
                 record_failure(stream->log_context, generation_tools, generation_capture,
                                generation_media, exception.what(), &error);

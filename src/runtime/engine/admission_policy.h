@@ -56,6 +56,7 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> remaining_budget() const noexcept {
         return remaining_budget_;
     }
+
     [[nodiscard]] std::uint32_t admissions() const noexcept { return admissions_; }
 
 private:

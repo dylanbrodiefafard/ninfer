@@ -96,8 +96,10 @@ def load_messages(path: str | Path) -> list[dict[str, Any]]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(value, Mapping) and "messages" in value:
         value = value["messages"]
-    if not isinstance(value, list) or not value or not all(
-        isinstance(item, dict) for item in value
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, dict) for item in value)
     ):
         raise ValueError(
             "messages JSON must be a non-empty message array or an object containing it"
@@ -105,9 +107,7 @@ def load_messages(path: str | Path) -> list[dict[str, Any]]:
     return value
 
 
-def _vision_position_ids(
-    start: int, grid: Sequence[int], device: torch.device
-) -> torch.Tensor:
+def _vision_position_ids(start: int, grid: Sequence[int], device: torch.device) -> torch.Tensor:
     t, h, w = (int(value) for value in grid)
     merge = VISION_SPATIAL_MERGE
     if t <= 0 or h <= 0 or w <= 0 or h % merge or w % merge:
@@ -164,8 +164,10 @@ def build_mrope_positions(
                 label = "image" if modality == 1 else "video"
                 raise ValueError(f"more {label} placeholder runs than grid entries") from exc
             consumed[modality] += 1
-            expected = int(grid[0]) * (int(grid[1]) // VISION_SPATIAL_MERGE) * (
-                int(grid[2]) // VISION_SPATIAL_MERGE
+            expected = (
+                int(grid[0])
+                * (int(grid[1]) // VISION_SPATIAL_MERGE)
+                * (int(grid[2]) // VISION_SPATIAL_MERGE)
             )
             if length != expected:
                 label = "image" if modality == 1 else "video"
@@ -204,8 +206,7 @@ def batch_from_processor_output(output: Mapping[str, Any]) -> MultimodalBatch:
         raise ValueError("processor did not return mm_token_type_ids matching input_ids")
     attention_mask = output.get("attention_mask")
     if attention_mask is not None and (
-        attention_mask.shape != input_ids.shape
-        or not bool(torch.all(attention_mask == 1))
+        attention_mask.shape != input_ids.shape or not bool(torch.all(attention_mask == 1))
     ):
         raise ValueError("reference inference requires one unpadded prompt")
 

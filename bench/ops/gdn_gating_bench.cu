@@ -48,7 +48,7 @@ static void run(int t, const char* tag) {
     // The tiny 48-element A_log/dt_bias vectors are intentionally excluded.
     const double bytes = 2.0 * static_cast<double>(kHeads) * static_cast<double>(t) * 2.0 +
                          2.0 * static_cast<double>(kHeads) * static_cast<double>(t) * 4.0;
-    const Result r = bench_loop(
+    const Result r     = bench_loop(
         [&](cudaStream_t s) { ops::gdn_gating(ta, tb, tA_log, tdt_bias, tg, tbeta, s); }, bytes);
     print_result(tag, r);
 }

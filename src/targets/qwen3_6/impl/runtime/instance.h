@@ -47,7 +47,8 @@ inline constexpr std::uint32_t kDFlashExchangeVariants =
 
 // Auto verify width from k when --dflash-verify-width is omitted. Product DFlash is chain W=k+1.
 // A tree-capable package may still select a wider default for a native draft window.
-[[nodiscard]] inline constexpr std::uint32_t dflash_default_verify_width(std::uint32_t draft_window) {
+[[nodiscard]] inline constexpr std::uint32_t
+dflash_default_verify_width(std::uint32_t draft_window) {
     if constexpr (!DFlashConfig::tree_verify) {
         return draft_window + 1U;
     } else {
@@ -62,24 +63,20 @@ inline constexpr std::uint32_t kDFlashExchangeVariants =
 }
 
 [[nodiscard]] inline constexpr std::uint32_t dflash_verify_width(std::uint32_t draft_window,
-                                                                std::uint32_t override_width = 0) {
+                                                                 std::uint32_t override_width = 0) {
     return override_width != 0 ? override_width : dflash_default_verify_width(draft_window);
 }
 
 // Packed-tree verify and GDN/KV path fold for a tree-capable package. W == k+1 is chain.
 [[nodiscard]] inline constexpr bool dflash_uses_tree_verify(std::uint32_t draft_window,
                                                             std::uint32_t verify_width) {
-    if constexpr (!DFlashConfig::tree_verify) {
-        return false;
-    }
+    if constexpr (!DFlashConfig::tree_verify) { return false; }
     if constexpr (DFlashConfig::two_block_first > 0) {
         if (draft_window > static_cast<std::uint32_t>(DFlashConfig::two_block_first)) {
             return false;
         }
     }
-    if (verify_width == draft_window + 1U) {
-        return false;
-    }
+    if (verify_width == draft_window + 1U) { return false; }
     return true;
 }
 
@@ -92,11 +89,9 @@ dflash_captured_verify_width(std::uint32_t k, std::uint32_t storage_ceil) {
 // Storage / ReplaySSM / pending-features width. Adaptive DFlash `{3,4,5}` is chain W<=6.
 // An explicit --dflash-verify-width still wins; chain-only packages require W=k+1.
 [[nodiscard]] inline std::uint32_t
-dflash_storage_verify_width(std::span<const std::uint32_t> captured_ks,
-                            std::uint32_t draft_window, std::uint32_t override_width) {
-    if (override_width != 0) {
-        return dflash_verify_width(draft_window, override_width);
-    }
+dflash_storage_verify_width(std::span<const std::uint32_t> captured_ks, std::uint32_t draft_window,
+                            std::uint32_t override_width) {
+    if (override_width != 0) { return dflash_verify_width(draft_window, override_width); }
     std::uint32_t ceil = 0;
     for (const std::uint32_t k : captured_ks) {
         const std::uint32_t w = dflash_default_verify_width(k);

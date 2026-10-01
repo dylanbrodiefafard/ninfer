@@ -40,4 +40,11 @@ SCHEMES: dict[str, Scheme] = {
 
 # Baseline first. Additional attention schemes append after the KV codecs.
 ORDER: tuple[str, ...] = (
-    "kv-bf16", "kv-int8", "kv-nvfp4", "attn-sage", "attn-topk", "attn-xattn", "attn-tma")
+    "kv-bf16",
+    "kv-int8",
+    "kv-nvfp4",
+    "attn-sage",
+    "attn-topk",
+    "attn-xattn",
+    "attn-tma",
+)

@@ -247,7 +247,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
         __nv_bfloat16* data         = is_q ? q : k;
         const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
         const std::int64_t base     = static_cast<std::int64_t>(token) * stride_t +
-                                  static_cast<std::int64_t>(head) * head_dim;
+                                      static_cast<std::int64_t>(head) * head_dim;
         for (int pair = lane; pair < half; pair += 32) {
             const float first        = __bfloat162float(data[base + pair]);
             const float second       = __bfloat162float(data[base + pair + half]);

@@ -166,12 +166,11 @@ struct GdnConvEpilogue<Publish, true> {
 
         const float checkpoint0 = __bfloat162float(state_read[initial_base + row]);
         const float checkpoint1 = __bfloat162float(state_read[initial_base + channels + row]);
-        const float checkpoint2 =
-            __bfloat162float(state_read[initial_base + 2LL * channels + row]);
-        const float w0 = __bfloat162float(conv_weight[row]);
-        const float w1 = __bfloat162float(conv_weight[channels + row]);
-        const float w2 = __bfloat162float(conv_weight[2LL * channels + row]);
-        const float w3 = __bfloat162float(conv_weight[3LL * channels + row]);
+        const float checkpoint2 = __bfloat162float(state_read[initial_base + 2LL * channels + row]);
+        const float w0          = __bfloat162float(conv_weight[row]);
+        const float w1          = __bfloat162float(conv_weight[channels + row]);
+        const float w2          = __bfloat162float(conv_weight[2LL * channels + row]);
+        const float w3          = __bfloat162float(conv_weight[3LL * channels + row]);
 
         float saved0[Tokens];
         float saved1[Tokens];

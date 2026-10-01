@@ -170,8 +170,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     // col = n*8 + (lane>>4)*8.
     const unsigned v_lane_base = v_sbase + static_cast<unsigned>(((lane >> 3) & 1) * 4096) +
                                  static_cast<unsigned>(b_rin * 512);
-    const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
-    const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
+    const unsigned v_as        = static_cast<unsigned>((lane >> 4) << 4);
+    const unsigned v_r         = static_cast<unsigned>(b_rin << 4);
 
     // Stage Q into smem once via cp.async (overlaps with the K(0) prologue load
     // below); it stays resident for the whole key loop. Global Q rows are 256 bf16

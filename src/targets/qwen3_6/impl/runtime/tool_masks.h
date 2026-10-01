@@ -21,12 +21,13 @@ class ToolMaskExchange {
 public:
     ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes);
     ~ToolMaskExchange();
-    ToolMaskExchange(const ToolMaskExchange&) = delete;
+    ToolMaskExchange(const ToolMaskExchange&)            = delete;
     ToolMaskExchange& operator=(const ToolMaskExchange&) = delete;
     void bind(std::span<const OutputSession* const> outputs,
               std::span<const ops::SamplingConfig> sampling);
     // Ordinary/prefill root sampling; called at a synchronized CPU boundary.
     [[nodiscard]] ops::SamplingConfig root(std::size_t row, cudaStream_t stream);
+
     // Called inside the speculative graph after ids/parents are constructed and
     // before target compute. The exchange forks onto `host`; the caller joins the
     // returned ready event before target sampling. The returned configs are
@@ -35,9 +36,10 @@ public:
         const ops::SamplingConfig* sampling;
         cudaEvent_t ready;
     };
-    [[nodiscard]] Submission enqueue(
-        const Tensor& ids, const Tensor* parents, const Tensor& valid_columns,
-        cudaStream_t compute, cudaStream_t host);
+
+    [[nodiscard]] Submission enqueue(const Tensor& ids, const Tensor* parents,
+                                     const Tensor& valid_columns, cudaStream_t compute,
+                                     cudaStream_t host);
     void rethrow_error() const;
 
 private:
@@ -47,7 +49,7 @@ private:
     [[nodiscard]] const std::uint32_t* device_mask(std::size_t row) const;
 
     cudaEvent_t candidates_ready_ = nullptr;
-    cudaEvent_t masks_ready_ = nullptr;
+    cudaEvent_t masks_ready_      = nullptr;
     Tensor masks_;
     Tensor sampling_;
     Tensor nodes_;

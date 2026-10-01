@@ -7,7 +7,6 @@ final OK/FAIL line. The oracle tier only picks which cases run (fast = cheapest,
 full = representative matrix) — it never edits source.
 """
 
-
 import contextlib
 
 from . import harness
@@ -18,8 +17,7 @@ def run_op_test(op, tier: str) -> dict:
     args = list(op.fast_test_args if tier == "fast" else op.full_test_args)
     argv = " ".join(args)
     cmd = (
-        f"cd {harness.BUILD} && NINFER_OP_REPORT_STATS=1 "
-        f"{harness.test_binary(op)} {argv}".rstrip()
+        f"cd {harness.BUILD} && NINFER_OP_REPORT_STATS=1 {harness.test_binary(op)} {argv}".rstrip()
     )
     result = harness.run(cmd, check=False)
     output = result.output

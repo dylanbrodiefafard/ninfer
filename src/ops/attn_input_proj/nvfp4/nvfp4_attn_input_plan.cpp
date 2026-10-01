@@ -25,7 +25,8 @@ Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 attn_input_proj: unsupported policy");
     }
-    return tokens >= kNvfp4FirstW4a4AttnInput ? Nvfp4AttnInputRoute::W4A4 : Nvfp4AttnInputRoute::A16;
+    return tokens >= kNvfp4FirstW4a4AttnInput ? Nvfp4AttnInputRoute::W4A4
+                                              : Nvfp4AttnInputRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
@@ -35,14 +36,14 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
     constexpr std::int32_t kKvRows = 1024;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
+        auto* input = static_cast<std::uint8_t*>(x.data) +
                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* query = static_cast<std::uint8_t*>(q.data) +
                       static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
         auto* output_gate = static_cast<std::uint8_t*>(gate.data) +
                             static_cast<std::int64_t>(token_begin) * kQRows * sizeof(std::uint16_t);
-        auto* key = static_cast<std::uint8_t*>(k.data) +
-                    static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
+        auto* key   = static_cast<std::uint8_t*>(k.data) +
+                      static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
         auto* value = static_cast<std::uint8_t*>(v.data) +
                       static_cast<std::int64_t>(token_begin) * kKvRows * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
@@ -86,7 +87,7 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 attn_input_proj requires caller workspace");
     }
-    auto scope                       = workspace->scope();
+    auto scope = workspace->scope();
     if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::W4A8) {
         const auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
         nvfp4_attn_input_w4a8_launch(x, weight, q, gate, k, v, scratch, stream);

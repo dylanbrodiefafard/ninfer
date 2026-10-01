@@ -17,16 +17,15 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
-    return dflash_feature_sink(
-        state, [&state](const Tensor& features, const Tensor& positions) {
-            auto& frame  = *state.execution.io.dflash_decode;
-            Tensor count = frame.append_counts.slice(0, 0, 1);
-            Tensor lane  = frame.lanes.slice(0, 0, 1);
-            Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
-            ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
-            const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-            dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
-        });
+    return dflash_feature_sink(state, [&state](const Tensor& features, const Tensor& positions) {
+        auto& frame  = *state.execution.io.dflash_decode;
+        Tensor count = frame.append_counts.slice(0, 0, 1);
+        Tensor lane  = frame.lanes.slice(0, 0, 1);
+        Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
+        ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
+        const auto exact = static_cast<std::uint32_t>(features.ne[1]);
+        dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
+    });
 }
 
 } // namespace

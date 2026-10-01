@@ -467,8 +467,8 @@ void q4_rowsplit_gemv_kernel(
         group_end               = pair_end * 2;
     }
 
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * groups_per_row *
-                                               Q4RowSplitStorage::kCodeBytesPerGroup;
+    const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * groups_per_row *
+                                                Q4RowSplitStorage::kCodeBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * groups_per_row *
                                                  Q4RowSplitStorage::kScaleBytesPerGroup;
     const __nv_bfloat16* activation =

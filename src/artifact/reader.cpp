@@ -186,7 +186,7 @@ public:
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
         }
 
-        struct stat status {};
+        struct stat status{};
 
         if (::fstat(fd, &status) != 0) {
             const int error = errno;
@@ -209,9 +209,9 @@ public:
                 throw std::system_error(error, std::generic_category(), "mmap " + path.string());
             }
         }
-        fd_   = fd;
-        data_ = static_cast<const std::byte*>(mapping);
-        size_ = size;
+        fd_     = fd;
+        data_   = static_cast<const std::byte*>(mapping);
+        size_   = size;
         status_ = status;
     }
 
@@ -262,7 +262,7 @@ private:
     int fd_                = -1;
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
-    struct stat status_ {};
+    struct stat status_{};
 };
 
 } // namespace

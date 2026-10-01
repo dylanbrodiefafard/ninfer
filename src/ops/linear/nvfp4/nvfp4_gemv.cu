@@ -26,10 +26,10 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
     nvfp4_gemv_kernel<Geometry, Schedule>
         <<<dim3(kBlocks, x.ne[1]), Schedule::kThreads, 0, stream>>>(
-        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-        Nvfp4IdentityEpilogue{}, output);
+            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+            Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -79,8 +79,8 @@ void launch_nvfp4_decode_splitk(const Tensor& embedding, const Tensor& hidden, c
     using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
     if (embedding.ne[0] != Geometry::kInputRows / 2 || embedding.ne[1] != 1 ||
         hidden.ne[0] != Geometry::kInputRows / 2 || hidden.ne[1] != 1 ||
-        out.ne[0] != Geometry::kOutputRows || out.ne[1] != 1 ||
-        weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {
+        out.ne[0] != Geometry::kOutputRows || out.ne[1] != 1 || weight.n != Geometry::kOutputRows ||
+        weight.k != Geometry::kInputRows) {
         throw std::invalid_argument("nvfp4 mtp_fc decode: invalid exact problem");
     }
     constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;

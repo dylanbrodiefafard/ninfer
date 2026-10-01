@@ -33,11 +33,11 @@ constexpr std::size_t kFlushBytes  = 256ULL << 20;
 struct Options {
     ops::LinearPolicy policy = ops::LinearPolicy::A16Only;
     std::vector<std::int32_t> t_sweep{1, 4, 8, 16};
-    int warmup   = 5;
-    int repeat   = 30;
-    bool profile = false;
-    bool rmsnorm = false;
-    bool rmsnorm_fused = false;
+    int warmup               = 5;
+    int repeat               = 30;
+    bool profile             = false;
+    bool rmsnorm             = false;
+    bool rmsnorm_fused       = false;
     std::int32_t panel_width = 0;
     std::string csv_out;
 };
@@ -85,7 +85,7 @@ Options parse_options(int argc, char** argv) {
                 options.policy  = ops::LinearPolicy::AllowA4;
                 options.t_sweep = {17, 128, 1024};
             } else if (value == "a8") {
-                options.policy = ops::LinearPolicy::AllowA8;
+                options.policy  = ops::LinearPolicy::AllowA8;
                 options.t_sweep = {4, 5, 6, 16, 20, 24};
             } else {
                 throw std::invalid_argument("--policy must be a16, a4 or a8");
@@ -107,7 +107,8 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s --policy a16|a4|a8 [--rmsnorm|--rmsnorm-fused] [--t-sweep 1,4,...] [--panel-width N] "
+            std::printf("Usage: %s --policy a16|a4|a8 [--rmsnorm|--rmsnorm-fused] [--t-sweep "
+                        "1,4,...] [--panel-width N] "
                         "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -118,8 +119,10 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    if (options.rmsnorm_fused && (options.rmsnorm || options.policy != ops::LinearPolicy::AllowA8 || options.panel_width != 0)) {
-        throw std::invalid_argument("--rmsnorm-fused requires a8 without panel splitting or --rmsnorm");
+    if (options.rmsnorm_fused && (options.rmsnorm || options.policy != ops::LinearPolicy::AllowA8 ||
+                                  options.panel_width != 0)) {
+        throw std::invalid_argument(
+            "--rmsnorm-fused requires a8 without panel splitting or --rmsnorm");
     }
     if (options.panel_width < 0) {
         throw std::invalid_argument("--panel-width must be nonnegative");
@@ -135,10 +138,13 @@ Options parse_options(int argc, char** argv) {
 }
 
 const char* policy_name(ops::LinearPolicy policy) {
-    return policy == ops::LinearPolicy::AllowA8 ? "A8" : policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
+    return policy == ops::LinearPolicy::AllowA8   ? "A8"
+           : policy == ops::LinearPolicy::AllowA4 ? "A4"
+                                                  : "A16";
 }
 
-std::uint64_t modeled_bytes(const Options& options, std::int32_t tokens, std::uint64_t weight_bytes) {
+std::uint64_t modeled_bytes(const Options& options, std::int32_t tokens,
+                            std::uint64_t weight_bytes) {
     const std::int32_t reads = options.panel_width == 0 ? 1 : tokens / options.panel_width;
     const std::uint64_t normalization =
         (options.rmsnorm || options.rmsnorm_fused ? 2ULL * kHidden : 0) +
@@ -158,10 +164,13 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     for (const Result& result : results) {
         const std::int32_t weight_reads =
             options.panel_width == 0 ? 1 : result.tokens / options.panel_width;
-        out << (options.rmsnorm_fused ? "rmsnorm_swiglu_fused" : options.rmsnorm ? "rmsnorm_swiglu" : options.panel_width ? "linear_swiglu_panels" : "linear_swiglu")
-            << ",NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ','
-            << kHidden << ',' << result.tokens << ',' << options.panel_width << ',' << weight_reads
-            << ',' << weight_bytes << ',' << modeled_bytes(options, result.tokens, weight_bytes) << ','
+        out << (options.rmsnorm_fused ? "rmsnorm_swiglu_fused"
+                : options.rmsnorm     ? "rmsnorm_swiglu"
+                : options.panel_width ? "linear_swiglu_panels"
+                                      : "linear_swiglu")
+            << ",NVFP4," << policy_name(options.policy) << ',' << kGateUpRows << ',' << kHidden
+            << ',' << result.tokens << ',' << options.panel_width << ',' << weight_reads << ','
+            << weight_bytes << ',' << modeled_bytes(options, result.tokens, weight_bytes) << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ',' << options.warmup
             << ',' << options.repeat << ',' << kFlushBytes << '\n';
@@ -187,15 +196,16 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
-        DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        DeviceBuffer input       = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         DeviceBuffer norm_weight = bench::make_bf16(kHidden);
         DeviceBuffer normalized(static_cast<std::size_t>(kHidden) * max_t * sizeof(std::uint16_t));
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
-        bench::PackedQuantizedWeight packed  = bench::make_nvfp4_weight(kGateUpRows, kHidden);
-        const std::size_t workspace_capacity = options.rmsnorm_fused
-            ? ops::rmsnorm_linear_swiglu_workspace_capacity_bytes(max_t)
-            : ops::linear_swiglu_workspace_capacity_bytes(
-                QType::NVFP4, kGateUpRows, kHidden, options.policy, min_t, max_t);
+        bench::PackedQuantizedWeight packed = bench::make_nvfp4_weight(kGateUpRows, kHidden);
+        const std::size_t workspace_capacity =
+            options.rmsnorm_fused
+                ? ops::rmsnorm_linear_swiglu_workspace_capacity_bytes(max_t)
+                : ops::linear_swiglu_workspace_capacity_bytes(QType::NVFP4, kGateUpRows, kHidden,
+                                                              options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto make_launch = [&](std::int32_t tokens) {
@@ -210,7 +220,8 @@ int main(int argc, char** argv) {
                 Tensor out(output.p, DType::BF16, {kOutputRows, tokens});
                 if (options.rmsnorm_fused) {
                     const Tensor norm(norm_weight.p, DType::BF16, {kHidden});
-                    ops::rmsnorm_linear_swiglu(x, norm, 1e-6F, packed.weight, out, workspace, launch_stream);
+                    ops::rmsnorm_linear_swiglu(x, norm, 1e-6F, packed.weight, out, workspace,
+                                               launch_stream);
                     return;
                 }
                 if (options.panel_width == 0) {
@@ -219,7 +230,7 @@ int main(int argc, char** argv) {
                     return;
                 }
                 for (std::int32_t offset = 0; offset < tokens; offset += options.panel_width) {
-                    Tensor panel_x = x.slice(1, offset, options.panel_width);
+                    Tensor panel_x   = x.slice(1, offset, options.panel_width);
                     Tensor panel_out = out.slice(1, offset, options.panel_width);
                     ops::linear_swiglu(panel_x, packed.weight, panel_out, options.policy, workspace,
                                        launch_stream);
@@ -258,14 +269,17 @@ int main(int argc, char** argv) {
                 bench::measure_cold_launch(launch, flush, stream, options.warmup, options.repeat);
             const double seconds      = timing.median_us * 1.0e-6;
             const double useful_flops = 2.0 * static_cast<double>(kGateUpRows) * kHidden * tokens;
-            const double model_bytes = static_cast<double>(modeled_bytes(options, tokens, packed.model_weight_bytes()));
+            const double model_bytes =
+                static_cast<double>(modeled_bytes(options, tokens, packed.model_weight_bytes()));
             const double useful_tflops = useful_flops / seconds / 1.0e12;
             const double effective_gbs = model_bytes / seconds / 1.0e9;
             std::printf("%-14s %3s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f\n",
-                        options.rmsnorm_fused ? "rmsnorm_fused" : options.rmsnorm ? "rmsnorm_swiglu" : options.panel_width ? "swiglu_panels" : "linear_swiglu",
-                        policy_name(options.policy), kGateUpRows, kHidden, tokens,
-                        timing.median_us, timing.min_us, timing.p95_us, effective_gbs,
-                        useful_tflops);
+                        options.rmsnorm_fused ? "rmsnorm_fused"
+                        : options.rmsnorm     ? "rmsnorm_swiglu"
+                        : options.panel_width ? "swiglu_panels"
+                                              : "linear_swiglu",
+                        policy_name(options.policy), kGateUpRows, kHidden, tokens, timing.median_us,
+                        timing.min_us, timing.p95_us, effective_gbs, useful_tflops);
             results.push_back({tokens, timing, effective_gbs, useful_tflops});
         }
         write_csv(options, results, packed.model_weight_bytes());

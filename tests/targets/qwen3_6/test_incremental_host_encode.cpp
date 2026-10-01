@@ -33,11 +33,11 @@
 
 namespace {
 
-using Frontend          = ninfer::targets::qwen3_6::Frontend;
-using FrontendFactory   = ninfer::targets::qwen3_6::FrontendTestAccess;
-using FrontendResources = ninfer::targets::qwen3_6::FrontendResources;
+using Frontend              = ninfer::targets::qwen3_6::Frontend;
+using FrontendFactory       = ninfer::targets::qwen3_6::FrontendTestAccess;
+using FrontendResources     = ninfer::targets::qwen3_6::FrontendResources;
 using EncodedHistoryPrepare = ninfer::targets::qwen3_6::EncodedHistoryPrepare;
-namespace fi            = ninfer::targets::qwen3_6::frontend_internal;
+namespace fi                = ninfer::targets::qwen3_6::frontend_internal;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -165,9 +165,9 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
 FrontendResources official_frontend_resources(const std::string& chat_template) {
     const auto& tokenizer_dir = official_tokenizer_dir();
     if (!tokenizer_dir) { throw std::runtime_error("official tokenizer.json was not found"); }
-    FrontendResources result     = resources(chat_template);
-    result.tokenizer_json        = read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
-    nlohmann::json config        = nlohmann::json::parse(
+    FrontendResources result = resources(chat_template);
+    result.tokenizer_json    = read_file((tokenizer_dir.value() + "/tokenizer.json").c_str());
+    nlohmann::json config    = nlohmann::json::parse(
         read_file((tokenizer_dir.value() + "/tokenizer_config.json").c_str()));
     config["chat_template"]      = chat_template;
     result.tokenizer_config_json = config.dump();
@@ -289,8 +289,8 @@ int check_every_byte_boundary(const fi::Tokenizer& tokenizer, std::string_view t
         ++legal_cuts;
         std::vector<int> prefix_ids;
         if (oracle) {
-            prefix_ids.assign(marked.ids.begin(),
-                              marked.ids.begin() + static_cast<std::ptrdiff_t>(*marked.prefix_tokens));
+            prefix_ids.assign(marked.ids.begin(), marked.ids.begin() + static_cast<std::ptrdiff_t>(
+                                                                           *marked.prefix_tokens));
         }
         if (n > 0) {
             const std::vector<int> as_own = tokenizer.encode(text.substr(0, n));
@@ -312,7 +312,8 @@ int check_every_byte_boundary(const fi::Tokenizer& tokenizer, std::string_view t
             }
         } else {
             if (!spliced) {
-                boundary_fail(failures, label, n, text.size(), "legal tokenizer cut refused splice");
+                boundary_fail(failures, label, n, text.size(),
+                              "legal tokenizer cut refused splice");
                 return failures;
             }
             if (spliced->input_ids != cold.input_ids) {
@@ -400,8 +401,9 @@ int check_splice_matches_cold(const fi::Tokenizer& tokenizer, const fi::Rendered
     if (!spliced) { return failures; }
     failures += check(spliced->input_ids == cold.input_ids,
                       (std::string(message) + ": spliced ids differ from cold encode").c_str());
-    failures += check(spliced->rewrite_checkpoint == cold.rewrite_checkpoint,
-                      (std::string(message) + ": spliced frontier differs from cold encode").c_str());
+    failures +=
+        check(spliced->rewrite_checkpoint == cold.rewrite_checkpoint,
+              (std::string(message) + ": spliced frontier differs from cold encode").c_str());
     return failures;
 }
 
@@ -413,39 +415,43 @@ int test_loop_pos_and_splice() {
     const std::vector<fi::ChatMessage> user_only{chat_message(ninfer::ChatRole::User, "hello")};
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
-    const fi::RenderedChat committed    = thinking_toggle_template().render(user_only, no_generation);
-    const fi::RenderedChat full         = thinking_toggle_template().render(user_only, {});
-    failures += check(full.text.starts_with(committed.text) &&
-                          full.text.substr(committed.text.size()) ==
-                              "<|im_start|>assistant\n<think>\n",
-                      "thinking-toggle generation suffix is not only the opener");
+    const fi::RenderedChat committed = thinking_toggle_template().render(user_only, no_generation);
+    const fi::RenderedChat full      = thinking_toggle_template().render(user_only, {});
+    failures +=
+        check(full.text.starts_with(committed.text) &&
+                  full.text.substr(committed.text.size()) == "<|im_start|>assistant\n<think>\n",
+              "thinking-toggle generation suffix is not only the opener");
     failures += check_loop_pos_oracle(tokenizer, full.text, "thinking-toggle full loop-pos");
-    failures += check_splice_matches_cold(tokenizer, committed, full, "P1-H1/H2/H5 thinking toggle");
+    failures +=
+        check_splice_matches_cold(tokenizer, committed, full, "P1-H1/H2/H5 thinking toggle");
 
     fi::ChatRenderOptions no_think_gen;
-    no_think_gen.enable_thinking        = false;
-    const fi::RenderedChat no_think_full = thinking_toggle_template().render(user_only, no_think_gen);
+    no_think_gen.enable_thinking = false;
+    const fi::RenderedChat no_think_full =
+        thinking_toggle_template().render(user_only, no_think_gen);
     failures += check(no_think_full.text.starts_with(committed.text) &&
                           no_think_full.text.substr(committed.text.size()) ==
                               "<|im_start|>assistant\n<think>\n\n</think>\n\n",
                       "thinking-toggle disable suffix is not only the opener");
-    failures +=
-        check_splice_matches_cold(tokenizer, committed, no_think_full, "P1-H8 thinking toggle flip");
+    failures += check_splice_matches_cold(tokenizer, committed, no_think_full,
+                                          "P1-H8 thinking toggle flip");
 
     const std::vector<fi::ChatMessage> effort_user{chat_message(ninfer::ChatRole::User, "hello")};
     fi::ChatRenderOptions effort_medium;
-    effort_medium.reasoning_effort      = ninfer::ReasoningEffort::Medium;
+    effort_medium.reasoning_effort         = ninfer::ReasoningEffort::Medium;
     fi::ChatRenderOptions effort_committed = effort_medium;
     effort_committed.add_generation_prompt = false;
     const fi::RenderedChat effort_c =
         reasoning_effort_template().render(effort_user, effort_committed);
-    const fi::RenderedChat effort_f = reasoning_effort_template().render(effort_user, effort_medium);
+    const fi::RenderedChat effort_f =
+        reasoning_effort_template().render(effort_user, effort_medium);
     failures += check(effort_f.text.starts_with(effort_c.text),
                       "reasoning-effort medium full does not start with committed");
-    failures += check_splice_matches_cold(tokenizer, effort_c, effort_f, "P1-H6/P1-T2 effort medium");
+    failures +=
+        check_splice_matches_cold(tokenizer, effort_c, effort_f, "P1-H6/P1-T2 effort medium");
 
     fi::ChatRenderOptions effort_xhigh;
-    effort_xhigh.reasoning_effort              = ninfer::ReasoningEffort::XHigh;
+    effort_xhigh.reasoning_effort                = ninfer::ReasoningEffort::XHigh;
     fi::ChatRenderOptions effort_xhigh_committed = effort_xhigh;
     effort_xhigh_committed.add_generation_prompt = false;
     const fi::RenderedChat xhigh_c =
@@ -466,34 +472,34 @@ int test_loop_pos_and_splice() {
     const fi::RenderedChat late_c   = thinking_toggle_template().render(late, no_generation);
     failures += check_splice_matches_cold(tokenizer, stable_c, late_c, "P1-H3 late system");
 
-    const std::vector<fi::ChatMessage> cjk{chat_message(
-        ninfer::ChatRole::User, "缓存复用 cafe\u0301 and NFC")};
+    const std::vector<fi::ChatMessage> cjk{
+        chat_message(ninfer::ChatRole::User, "缓存复用 cafe\u0301 and NFC")};
     const fi::RenderedChat cjk_c = thinking_toggle_template().render(cjk, no_generation);
     const fi::RenderedChat cjk_f = thinking_toggle_template().render(cjk, {});
     failures += check_splice_matches_cold(tokenizer, cjk_c, cjk_f, "P1-H4 CJK/NFC after im_end");
 
     failures += check(tokenizer.is_encode_loop_pos(committed.text, committed.text.size()),
                       "P1-H7 replay n==size is not a loop-pos");
-    const auto replay = fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text),
-                                                    committed.text, committed.text.size(),
-                                                    committed.rewrite_checkpoint);
+    const auto replay =
+        fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text), committed.text,
+                                    committed.text.size(), committed.rewrite_checkpoint);
     failures += check(replay && replay->input_ids == tokenizer.encode(committed.text) &&
                           !replay->rewrite_checkpoint,
                       "P1-H7 empty suffix replay failed");
 
     fi::RewriteCheckpointByteSpec at_committed{
-        .kind = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
+        .kind   = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
         .offset = committed.text.size()};
     const auto rel0 = fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text),
                                                   full.text, committed.text.size(), at_committed);
-    failures += check(rel0 && rel0->rewrite_checkpoint &&
-                          rel0->rewrite_checkpoint->frontier ==
-                              tokenizer.encode(committed.text).size(),
-                      "P1-H9 rel==0 frontier is not committed id count");
+    failures +=
+        check(rel0 && rel0->rewrite_checkpoint &&
+                  rel0->rewrite_checkpoint->frontier == tokenizer.encode(committed.text).size(),
+              "P1-H9 rel==0 frontier is not committed id count");
 
     const std::string hello = "hello";
     failures += check(!tokenizer.is_encode_loop_pos(hello, 2), "P1-R1 mid-word is a loop-pos");
-    const std::vector<int> he = tokenizer.encode("he");
+    const std::vector<int> he  = tokenizer.encode("he");
     const std::vector<int> llo = tokenizer.encode("llo");
     std::vector<int> concat    = he;
     concat.insert(concat.end(), llo.begin(), llo.end());
@@ -525,20 +531,20 @@ int test_loop_pos_and_splice() {
     fi::ChatMessage lookup = chat_message(ninfer::ChatRole::Assistant, "");
     lookup.tool_calls.push_back(
         {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
-    const fi::RenderedChat one_tool = thinking_toggle_template().render(
-        {chat_message(ninfer::ChatRole::User, "weather?"), lookup,
-         chat_message(ninfer::ChatRole::Tool, "sunny")},
-        no_generation);
-    const fi::RenderedChat two_tools = thinking_toggle_template().render(
-        {chat_message(ninfer::ChatRole::User, "weather?"), lookup,
-         chat_message(ninfer::ChatRole::Tool, "sunny"),
-         chat_message(ninfer::ChatRole::Tool, "20C")},
-        no_generation);
+    const fi::RenderedChat one_tool =
+        thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "weather?"), lookup,
+                                           chat_message(ninfer::ChatRole::Tool, "sunny")},
+                                          no_generation);
+    const fi::RenderedChat two_tools =
+        thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "weather?"), lookup,
+                                           chat_message(ninfer::ChatRole::Tool, "sunny"),
+                                           chat_message(ninfer::ChatRole::Tool, "20C")},
+                                          no_generation);
     failures += check(!two_tools.text.starts_with(one_tool.text),
                       "P1-R7 tool-group growth is still a byte prefix");
 
     fi::ChatRenderOptions effort_off;
-    effort_off.enable_thinking = false;
+    effort_off.enable_thinking         = false;
     fi::ChatRenderOptions effort_off_c = effort_off;
     effort_off_c.add_generation_prompt = false;
     const fi::RenderedChat effort_on_c =
@@ -552,8 +558,8 @@ int test_loop_pos_and_splice() {
     const fi::Tokenizer toy_tok({.tokenizer_json         = resources().tokenizer_json,
                                  .tokenizer_config_json  = resources().tokenizer_config_json,
                                  .generation_config_json = resources().generation_config_json});
-    failures += check(!toy_tok.is_encode_loop_pos("ABC", 1),
-                      "P1-R3 local BC start at n=1 is a loop-pos");
+    failures +=
+        check(!toy_tok.is_encode_loop_pos("ABC", 1), "P1-R3 local BC start at n=1 is a loop-pos");
     const std::vector<int> ab = toy_tok.encode("AB");
     failures += check(!fi::try_splice_encoded_chat(toy_tok, ab, "ABC", 1, std::nullopt),
                       "P1-R3 local special probe splice was accepted");
@@ -577,22 +583,23 @@ int test_loop_pos_and_splice() {
                       "P1-R4 interior of longer added token is a loop-pos");
     failures += check(longer_first.is_encode_loop_pos("abcd", 3),
                       "P1-R4 end of winning abc is not a loop-pos");
-    failures += check(!fi::try_splice_encoded_chat(longer_first, std::vector<int>{14}, "abcd", 2,
-                                                   std::nullopt),
-                      "P1-R4 splice at interior of abc was accepted");
+    failures += check(
+        !fi::try_splice_encoded_chat(longer_first, std::vector<int>{14}, "abcd", 2, std::nullopt),
+        "P1-R4 splice at interior of abc was accepted");
     const fi::Tokenizer shorter_first = toy_with_added({{13, "ab"}, {14, "abc"}});
     failures += check(!shorter_first.is_encode_loop_pos("abcd", 3),
                       "P1-R4 leftover-BPE offset after shorter added token is a loop-pos");
-    failures += check(!fi::try_splice_encoded_chat(shorter_first, std::vector<int>{13}, "abcd", 3,
-                                                   std::nullopt),
-                      "P1-R4 splice in leftover BPE was accepted");
+    failures += check(
+        !fi::try_splice_encoded_chat(shorter_first, std::vector<int>{13}, "abcd", 3, std::nullopt),
+        "P1-R4 splice in leftover BPE was accepted");
 
     fi::EncodeOptions no_added;
     no_added.parse_added_tokens = false;
-    failures += check(tokenizer.is_encode_loop_pos(full.text, 0, no_added) &&
-                          tokenizer.is_encode_loop_pos(full.text, full.text.size(), no_added) &&
-                          !tokenizer.is_encode_loop_pos(full.text, committed.text.size(), no_added),
-                      "P1-R8 parse_added_tokens=false treated an interior added-token cut as legal");
+    failures +=
+        check(tokenizer.is_encode_loop_pos(full.text, 0, no_added) &&
+                  tokenizer.is_encode_loop_pos(full.text, full.text.size(), no_added) &&
+                  !tokenizer.is_encode_loop_pos(full.text, committed.text.size(), no_added),
+              "P1-R8 parse_added_tokens=false treated an interior added-token cut as legal");
 
     const std::string cjk_char = "复";
     failures += check(cjk_char.size() > 1 && !tokenizer.is_encode_loop_pos(cjk_char, 1),
@@ -602,21 +609,19 @@ int test_loop_pos_and_splice() {
                       "P1-R9 mid NFC combining sequence is a loop-pos");
 
     fi::RewriteCheckpointByteSpec before_committed{
-        .kind   = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
-        .offset = 1};
-    failures += check(committed.text.size() > 1 &&
-                          !fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text),
-                                                       full.text, committed.text.size(),
-                                                       before_committed),
-                      "P1-R12 checkpoint offset < n was accepted");
+        .kind = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure, .offset = 1};
+    failures +=
+        check(committed.text.size() > 1 &&
+                  !fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text),
+                                               full.text, committed.text.size(), before_committed),
+              "P1-R12 checkpoint offset < n was accepted");
 
     fi::RewriteCheckpointByteSpec inside_opener{
         .kind   = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure,
         .offset = committed.text.size() + 1};
-    failures +=
-        check(!fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text), full.text,
-                                           committed.text.size(), inside_opener),
-              "E-M11 rel>0 missing prefix_tokens splice was accepted");
+    failures += check(!fi::try_splice_encoded_chat(tokenizer, tokenizer.encode(committed.text),
+                                                   full.text, committed.text.size(), inside_opener),
+                      "E-M11 rel>0 missing prefix_tokens splice was accepted");
     (void)toy;
     return failures;
 }
@@ -632,13 +637,13 @@ CachedCall cached_prepare(const Frontend& frontend, fi::EncodedHistoryCache& cac
     return CachedCall{.prompt = std::move(prompt), .observation = fi::last_host_encode_observation};
 }
 
-int expect_match_cold(const Frontend& frontend, const CachedCall& call,
-                      ninfer::PromptInput input, bool expect_hit, const char* message) {
-    const auto& got            = FrontendFactory::inspect(call.prompt);
-    const auto cold            = frontend.prepare(std::move(input));
-    const auto& cold_data      = FrontendFactory::inspect(cold);
-    int failures               = check(call.observation.cache_hit == expect_hit,
-                         (std::string(message) + ": unexpected hit flag").c_str());
+int expect_match_cold(const Frontend& frontend, const CachedCall& call, ninfer::PromptInput input,
+                      bool expect_hit, const char* message) {
+    const auto& got       = FrontendFactory::inspect(call.prompt);
+    const auto cold       = frontend.prepare(std::move(input));
+    const auto& cold_data = FrontendFactory::inspect(cold);
+    int failures          = check(call.observation.cache_hit == expect_hit,
+                                  (std::string(message) + ": unexpected hit flag").c_str());
     failures += check(got.token_ids == cold_data.token_ids,
                       (std::string(message) + ": ids differ from cold Frontend::prepare").c_str());
     failures += check(got.identity.rewrite_checkpoint == cold_data.identity.rewrite_checkpoint,
@@ -656,8 +661,8 @@ bool same_observation(const fi::HostEncodeObservation& a, const fi::HostEncodeOb
 
 int test_engine_shaped_cache() {
     if (skip_without_official_tokenizer("test_engine_shaped_cache")) { return 0; }
-    const Frontend frontend =
-        FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
+    const Frontend frontend = FrontendFactory::create_component(
+        official_frontend_resources(thinking_toggle_template_source()));
     const Frontend effort_frontend = FrontendFactory::create_component(
         official_frontend_resources(reasoning_effort_template_source()));
     const Frontend toy = FrontendFactory::create_component(resources());
@@ -667,37 +672,45 @@ int test_engine_shaped_cache() {
     ninfer::PromptOptions preserve;
     preserve.preserve_thinking = true;
 
-    auto first = cached_prepare(frontend, cache, product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve));
+    auto first =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve));
     failures += expect_match_cold(
-        frontend, first, product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve),
-        false, "E-M8 first prepare");
+        frontend, first,
+        product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve), false,
+        "E-M8 first prepare");
     failures += check(cache.size() == 1, "first prepare did not insert committed");
 
-    auto second = cached_prepare(
-        frontend, cache,
-        product_input({product_message(ninfer::ChatRole::User, "hello"),
-                       product_message(ninfer::ChatRole::Assistant, "hi there"),
-                       product_message(ninfer::ChatRole::User, "and more")},
-                      preserve));
-    failures += expect_match_cold(frontend, second,
-                                  product_input({product_message(ninfer::ChatRole::User, "hello"),
-                                                 product_message(ninfer::ChatRole::Assistant, "hi there"),
-                                                 product_message(ninfer::ChatRole::User, "and more")},
-                                                preserve),
-                                  true, "E-H1 append user");
+    auto second =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "hello"),
+                                      product_message(ninfer::ChatRole::Assistant, "hi there"),
+                                      product_message(ninfer::ChatRole::User, "and more")},
+                                     preserve));
+    failures +=
+        expect_match_cold(frontend, second,
+                          product_input({product_message(ninfer::ChatRole::User, "hello"),
+                                         product_message(ninfer::ChatRole::Assistant, "hi there"),
+                                         product_message(ninfer::ChatRole::User, "and more")},
+                                        preserve),
+                          true, "E-H1 append user");
 
-    auto replay = cached_prepare(
-        frontend, cache, product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve));
+    auto replay =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve));
     failures += expect_match_cold(
-        frontend, replay, product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve),
-        true, "E-H2 same M twice");
+        frontend, replay,
+        product_input({product_message(ninfer::ChatRole::User, "hello")}, preserve), true,
+        "E-H2 same M twice");
 
     ninfer::PromptOptions no_gen = preserve;
     no_gen.add_generation_prompt = false;
     (void)EncodedHistoryPrepare::count_tokens(
-        frontend, product_input({product_message(ninfer::ChatRole::User, "count me")}, no_gen), cache);
+        frontend, product_input({product_message(ninfer::ChatRole::User, "count me")}, no_gen),
+        cache);
     auto after_count = cached_prepare(
-        frontend, cache, product_input({product_message(ninfer::ChatRole::User, "count me")}, preserve));
+        frontend, cache,
+        product_input({product_message(ninfer::ChatRole::User, "count me")}, preserve));
     failures += expect_match_cold(
         frontend, after_count,
         product_input({product_message(ninfer::ChatRole::User, "count me")}, preserve), true,
@@ -711,25 +724,24 @@ int test_engine_shaped_cache() {
                       preserve),
         cache);
     failures += check(fi::last_host_encode_observation.cache_hit &&
-                          counted_ext ==
-                              frontend.count_tokens(product_input(
-                                  {product_message(ninfer::ChatRole::User, "count me"),
-                                   product_message(ninfer::ChatRole::Assistant, "ok"),
-                                   product_message(ninfer::ChatRole::User, "next")},
-                                  preserve)),
+                          counted_ext == frontend.count_tokens(product_input(
+                                             {product_message(ninfer::ChatRole::User, "count me"),
+                                              product_message(ninfer::ChatRole::Assistant, "ok"),
+                                              product_message(ninfer::ChatRole::User, "next")},
+                                             preserve)),
                       "E-H4 prepare then count_tokens of an extension missed or disagreed");
 
-    auto late = cached_prepare(
-        frontend, cache,
-        product_input({product_message(ninfer::ChatRole::System, "stable policy"),
-                       product_message(ninfer::ChatRole::User, "hi")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, late,
-        product_input({product_message(ninfer::ChatRole::System, "stable policy"),
-                       product_message(ninfer::ChatRole::User, "hi")},
-                      preserve),
-        false, "late system first");
+    auto late =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::System, "stable policy"),
+                                      product_message(ninfer::ChatRole::User, "hi")},
+                                     preserve));
+    failures +=
+        expect_match_cold(frontend, late,
+                          product_input({product_message(ninfer::ChatRole::System, "stable policy"),
+                                         product_message(ninfer::ChatRole::User, "hi")},
+                                        preserve),
+                          false, "late system first");
     auto late2 = cached_prepare(
         frontend, cache,
         product_input({product_message(ninfer::ChatRole::System, "stable policy"),
@@ -747,13 +759,16 @@ int test_engine_shaped_cache() {
     ninfer::PromptOptions think_on  = preserve;
     ninfer::PromptOptions think_off = preserve;
     think_off.enable_thinking       = false;
-    (void)cached_prepare(frontend, cache,
-                         product_input({product_message(ninfer::ChatRole::User, "toggle")}, think_on));
+    (void)cached_prepare(
+        frontend, cache,
+        product_input({product_message(ninfer::ChatRole::User, "toggle")}, think_on));
     auto flipped = cached_prepare(
-        frontend, cache, product_input({product_message(ninfer::ChatRole::User, "toggle")}, think_off));
+        frontend, cache,
+        product_input({product_message(ninfer::ChatRole::User, "toggle")}, think_off));
     failures += expect_match_cold(
-        frontend, flipped, product_input({product_message(ninfer::ChatRole::User, "toggle")}, think_off),
-        true, "E-H6 ThinkingToggle enable_thinking flip");
+        frontend, flipped,
+        product_input({product_message(ninfer::ChatRole::User, "toggle")}, think_off), true,
+        "E-H6 ThinkingToggle enable_thinking flip");
     failures += check(FrontendFactory::inspect(flipped.prompt).starts_in_reasoning == false,
                       "E-H6 starts_in_reasoning did not follow this call");
 
@@ -772,10 +787,12 @@ int test_engine_shaped_cache() {
 
     ninfer::PromptOptions turn_closure;
     turn_closure.preserve_thinking = false;
-    auto tc = cached_prepare(frontend, cache,
-                             product_input({product_message(ninfer::ChatRole::User, "x")}, turn_closure));
-    auto tc2 = cached_prepare(
-        frontend, cache, product_input({product_message(ninfer::ChatRole::User, "x")}, turn_closure));
+    auto tc =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "x")}, turn_closure));
+    auto tc2 =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "x")}, turn_closure));
     failures += expect_match_cold(
         frontend, tc2, product_input({product_message(ninfer::ChatRole::User, "x")}, turn_closure),
         true, "E-H8 TurnClosure");
@@ -789,14 +806,15 @@ int test_engine_shaped_cache() {
     auto rr2 = cached_prepare(
         frontend, cache, product_input({product_message(ninfer::ChatRole::User, "rr")}, preserve));
     failures += expect_match_cold(
-        frontend, rr2, product_input({product_message(ninfer::ChatRole::User, "rr")}, preserve), true,
-        "E-H9 ResponseReplay thinking");
-    failures += check(FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint &&
-                          FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
-                          FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint->frontier ==
-                              FrontendFactory::inspect(rr2.prompt).token_ids.size(),
-                      "E-H9 ResponseReplay frontier is not prompt end");
+        frontend, rr2, product_input({product_message(ninfer::ChatRole::User, "rr")}, preserve),
+        true, "E-H9 ResponseReplay thinking");
+    failures +=
+        check(FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint &&
+                  FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint->kind ==
+                      ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                  FrontendFactory::inspect(rr2.prompt).identity.rewrite_checkpoint->frontier ==
+                      FrontendFactory::inspect(rr2.prompt).token_ids.size(),
+              "E-H9 ResponseReplay frontier is not prompt end");
     (void)rr;
     (void)tc;
     (void)empty_suffix;
@@ -817,8 +835,8 @@ int test_engine_shaped_cache() {
     const auto tool_call = [&](bool reasoning) {
         ninfer::ChatMessage message = product_message(ninfer::ChatRole::Assistant, "");
         if (reasoning) { message.reasoning_content = "look it up"; }
-        message.tool_calls.push_back(
-            ninfer::ToolCall{.id = "call_1", .name = "lookup", .arguments_json = "{\"key\":\"a\"}"});
+        message.tool_calls.push_back(ninfer::ToolCall{
+            .id = "call_1", .name = "lookup", .arguments_json = "{\"key\":\"a\"}"});
         return message;
     };
     const auto tool_result = [&] {
@@ -826,6 +844,7 @@ int test_engine_shaped_cache() {
         message.tool_call_id        = "call_1";
         return message;
     };
+
     // History shapes; `latest_dropped` says the latest assistant turn carries no reasoning.
     struct Shape {
         const char* name;
@@ -834,14 +853,21 @@ int test_engine_shaped_cache() {
         bool tool_loop;
         bool latest_dropped;
     };
+
     const std::vector<Shape> shapes{
         {"first turn", {user("q1")}, true, false, false},
         {"kept", {user("q1"), reply(true), user("q2")}, true, false, false},
         {"dropped", {user("q1"), reply(false), user("q2")}, true, false, true},
-        {"earlier kept, latest dropped", {user("q1"), reply(true), user("q2"), reply(false), user("q3")},
-         true, false, true},
-        {"earlier dropped, latest kept", {user("q1"), reply(false), user("q2"), reply(true), user("q3")},
-         true, false, false},
+        {"earlier kept, latest dropped",
+         {user("q1"), reply(true), user("q2"), reply(false), user("q3")},
+         true,
+         false,
+         true},
+        {"earlier dropped, latest kept",
+         {user("q1"), reply(false), user("q2"), reply(true), user("q3")},
+         true,
+         false,
+         false},
         {"tool loop kept", {user("q1"), tool_call(true), tool_result()}, true, true, false},
         {"tool loop dropped", {user("q1"), tool_call(false), tool_result()}, true, true, true},
         {"no generation prompt", {user("q1"), reply(false)}, false, false, true},
@@ -851,10 +877,10 @@ int test_engine_shaped_cache() {
         for (const bool thinking : {true, false}) {
             for (const bool preserve_thinking : {true, false}) {
                 for (const Shape& shape : shapes) {
-                    const std::string label = std::string("E-H13 ") + template_name +
-                                              (thinking ? " thinking" : " no-thinking") +
-                                              (preserve_thinking ? " preserve-on " : " preserve-off ") +
-                                              shape.name;
+                    const std::string label =
+                        std::string("E-H13 ") + template_name +
+                        (thinking ? " thinking" : " no-thinking") +
+                        (preserve_thinking ? " preserve-on " : " preserve-off ") + shape.name;
                     ninfer::PromptOptions options;
                     options.enable_thinking       = thinking;
                     options.preserve_thinking     = preserve_thinking;
@@ -877,32 +903,37 @@ int test_engine_shaped_cache() {
                                                   cached.observation.cache_hit, label.c_str());
                     const auto& data       = FrontendFactory::inspect(cached.prompt);
                     const auto& checkpoint = data.identity.rewrite_checkpoint;
-                    const auto response_replay = ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay;
-                    const auto closure = ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
+                    const auto response_replay =
+                        ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay;
+                    const auto closure =
+                        ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure;
                     if (!shape.generation_prompt) {
-                        failures += check(preserve_thinking ? !checkpoint || checkpoint->kind != response_replay
-                                                   : checkpoint && checkpoint->kind == closure,
-                                          (label + ": wrong checkpoint without a generation prompt").c_str());
+                        failures += check(
+                            preserve_thinking ? !checkpoint || checkpoint->kind != response_replay
+                                              : checkpoint && checkpoint->kind == closure,
+                            (label + ": wrong checkpoint without a generation prompt").c_str());
                         continue;
                     }
                     const std::vector<int> prologue = official_tokenizer().encode(
                         thinking ? "<think>\n" : "<think>\n\n</think>\n\n");
                     const std::size_t opener = data.token_ids.size() - prologue.size();
-                    std::size_t expected = data.token_ids.size();
+                    std::size_t expected     = data.token_ids.size();
                     if (!preserve_thinking) {
                         // First assistant opener after the last user: a tool loop's first turn.
-                        const auto first_turn = template_frontend->prepare(
-                            product_input({user("q1")}, first_options));
-                        expected = shape.tool_loop
-                                       ? FrontendFactory::inspect(first_turn).identity.rewrite_checkpoint->frontier
-                                       : opener;
+                        const auto first_turn =
+                            template_frontend->prepare(product_input({user("q1")}, first_options));
+                        expected = shape.tool_loop ? FrontendFactory::inspect(first_turn)
+                                                         .identity.rewrite_checkpoint->frontier
+                                                   : opener;
                     } else if (thinking && shape.latest_dropped) {
                         expected = opener;
                     }
                     const bool prologue_tail = std::equal(
                         prologue.begin(), prologue.end(),
                         data.token_ids.end() - static_cast<std::ptrdiff_t>(prologue.size()));
-                    failures += check(checkpoint && checkpoint->kind == (preserve_thinking ? response_replay : closure) &&
+                    failures += check(checkpoint &&
+                                          checkpoint->kind ==
+                                              (preserve_thinking ? response_replay : closure) &&
                                           prologue_tail && checkpoint->frontier == expected,
                                       (label + ": checkpoint kind or frontier is wrong").c_str());
                 }
@@ -915,39 +946,36 @@ int test_engine_shaped_cache() {
     auto nt2 = cached_prepare(
         frontend, cache, product_input({product_message(ninfer::ChatRole::User, "nt")}, think_off));
     failures += expect_match_cold(
-        frontend, nt2, product_input({product_message(ninfer::ChatRole::User, "nt")}, think_off), true,
-        "E-H10 ResponseReplay non-thinking");
+        frontend, nt2, product_input({product_message(ninfer::ChatRole::User, "nt")}, think_off),
+        true, "E-H10 ResponseReplay non-thinking");
     (void)nt;
 
     fi::EncodedHistoryCache branch_cache;
-    (void)cached_prepare(frontend, branch_cache,
-                         product_input({product_message(ninfer::ChatRole::User, "root")}, preserve));
-    auto branch_a = cached_prepare(
+    (void)cached_prepare(
         frontend, branch_cache,
-        product_input({product_message(ninfer::ChatRole::User, "root"),
-                       product_message(ninfer::ChatRole::Assistant, "a"),
-                       product_message(ninfer::ChatRole::User, "left")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, branch_a,
-        product_input({product_message(ninfer::ChatRole::User, "root"),
-                       product_message(ninfer::ChatRole::Assistant, "a"),
-                       product_message(ninfer::ChatRole::User, "left")},
-                      preserve),
-        true, "E-H11 long prefix of root+left");
-    auto branch_b = cached_prepare(
-        frontend, branch_cache,
-        product_input({product_message(ninfer::ChatRole::User, "root"),
-                       product_message(ninfer::ChatRole::Assistant, "a"),
-                       product_message(ninfer::ChatRole::User, "right")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, branch_b,
-        product_input({product_message(ninfer::ChatRole::User, "root"),
-                       product_message(ninfer::ChatRole::Assistant, "a"),
-                       product_message(ninfer::ChatRole::User, "right")},
-                      preserve),
-        true, "E-H12 different branch still prefixed by root");
+        product_input({product_message(ninfer::ChatRole::User, "root")}, preserve));
+    auto branch_a = cached_prepare(frontend, branch_cache,
+                                   product_input({product_message(ninfer::ChatRole::User, "root"),
+                                                  product_message(ninfer::ChatRole::Assistant, "a"),
+                                                  product_message(ninfer::ChatRole::User, "left")},
+                                                 preserve));
+    failures += expect_match_cold(frontend, branch_a,
+                                  product_input({product_message(ninfer::ChatRole::User, "root"),
+                                                 product_message(ninfer::ChatRole::Assistant, "a"),
+                                                 product_message(ninfer::ChatRole::User, "left")},
+                                                preserve),
+                                  true, "E-H11 long prefix of root+left");
+    auto branch_b = cached_prepare(frontend, branch_cache,
+                                   product_input({product_message(ninfer::ChatRole::User, "root"),
+                                                  product_message(ninfer::ChatRole::Assistant, "a"),
+                                                  product_message(ninfer::ChatRole::User, "right")},
+                                                 preserve));
+    failures += expect_match_cold(frontend, branch_b,
+                                  product_input({product_message(ninfer::ChatRole::User, "root"),
+                                                 product_message(ninfer::ChatRole::Assistant, "a"),
+                                                 product_message(ninfer::ChatRole::User, "right")},
+                                                preserve),
+                                  true, "E-H12 different branch still prefixed by root");
     failures += check(branch_b.observation.cache_hit && branch_b.observation.prefix_bytes > 0,
                       "E-H12 did not hit the shared root prefix");
 
@@ -983,8 +1011,9 @@ int test_engine_shaped_cache() {
         R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
     (void)cached_prepare(frontend, tool_cache,
                          product_input({product_message(ninfer::ChatRole::User, "hi")}, preserve));
-    auto tools_changed = cached_prepare(
-        frontend, tool_cache, product_input({product_message(ninfer::ChatRole::User, "hi")}, with_tools));
+    auto tools_changed =
+        cached_prepare(frontend, tool_cache,
+                       product_input({product_message(ninfer::ChatRole::User, "hi")}, with_tools));
     failures += expect_match_cold(
         frontend, tools_changed,
         product_input({product_message(ninfer::ChatRole::User, "hi")}, with_tools), false,
@@ -997,24 +1026,23 @@ int test_engine_shaped_cache() {
     lookup.tool_calls.push_back(
         ninfer::ToolCall{.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
     fi::EncodedHistoryCache group_cache;
-    (void)cached_prepare(
-        frontend, group_cache,
-        product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
-                       product_message(ninfer::ChatRole::Tool, "sunny")},
-                      no_gen));
-    auto two_tools = cached_prepare(
-        frontend, group_cache,
-        product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
-                       product_message(ninfer::ChatRole::Tool, "sunny"),
-                       product_message(ninfer::ChatRole::Tool, "20C")},
-                      no_gen));
-    failures += expect_match_cold(
-        frontend, two_tools,
-        product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
-                       product_message(ninfer::ChatRole::Tool, "sunny"),
-                       product_message(ninfer::ChatRole::Tool, "20C")},
-                      no_gen),
-        false, "E-M4 tool-group growth");
+    (void)cached_prepare(frontend, group_cache,
+                         product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
+                                        product_message(ninfer::ChatRole::Tool, "sunny")},
+                                       no_gen));
+    auto two_tools =
+        cached_prepare(frontend, group_cache,
+                       product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
+                                      product_message(ninfer::ChatRole::Tool, "sunny"),
+                                      product_message(ninfer::ChatRole::Tool, "20C")},
+                                     no_gen));
+    failures +=
+        expect_match_cold(frontend, two_tools,
+                          product_input({product_message(ninfer::ChatRole::User, "weather?"),
+                                         lookup, product_message(ninfer::ChatRole::Tool, "sunny"),
+                                         product_message(ninfer::ChatRole::Tool, "20C")},
+                                        no_gen),
+                          false, "E-M4 tool-group growth");
 
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
@@ -1032,7 +1060,7 @@ int test_engine_shaped_cache() {
     failures += check(FrontendFactory::inspect(media.prompt).has_media(),
                       "E-M5 media prepare lost vision items");
 
-    const std::size_t before_tokens                    = cache.size();
+    const std::size_t before_tokens                   = cache.size();
     const fi::HostEncodeObservation before_tokens_obs = fi::last_host_encode_observation;
     const auto sample =
         frontend.prepare(product_input({product_message(ninfer::ChatRole::User, "tok")}));
@@ -1048,23 +1076,25 @@ int test_engine_shaped_cache() {
 
     fi::EncodedHistoryCache a;
     fi::EncodedHistoryCache b;
-    (void)cached_prepare(frontend, a, product_input({product_message(ninfer::ChatRole::User, "iso")}));
-    auto b_first =
-        cached_prepare(frontend, b, product_input({product_message(ninfer::ChatRole::User, "iso"),
-                                                   product_message(ninfer::ChatRole::Assistant, "r"),
-                                                   product_message(ninfer::ChatRole::User, "next")},
-                                                  preserve));
+    (void)cached_prepare(frontend, a,
+                         product_input({product_message(ninfer::ChatRole::User, "iso")}));
+    auto b_first = cached_prepare(frontend, b,
+                                  product_input({product_message(ninfer::ChatRole::User, "iso"),
+                                                 product_message(ninfer::ChatRole::Assistant, "r"),
+                                                 product_message(ninfer::ChatRole::User, "next")},
+                                                preserve));
     failures += check(!b_first.observation.cache_hit, "E-M13 cache B hit cache A's history");
 
     ninfer::PromptOptions effort_on;
-    effort_on.reasoning_effort   = ninfer::ReasoningEffort::XHigh;
-    effort_on.preserve_thinking  = true;
+    effort_on.reasoning_effort  = ninfer::ReasoningEffort::XHigh;
+    effort_on.preserve_thinking = true;
     ninfer::PromptOptions effort_off_opt;
-    effort_off_opt.enable_thinking  = false;
+    effort_off_opt.enable_thinking   = false;
     effort_off_opt.preserve_thinking = true;
     fi::EncodedHistoryCache effort_cache;
-    (void)cached_prepare(effort_frontend, effort_cache,
-                         product_input({product_message(ninfer::ChatRole::User, "effort")}, effort_on));
+    (void)cached_prepare(
+        effort_frontend, effort_cache,
+        product_input({product_message(ninfer::ChatRole::User, "effort")}, effort_on));
     auto effort_flip = cached_prepare(
         effort_frontend, effort_cache,
         product_input({product_message(ninfer::ChatRole::User, "effort")}, effort_off_opt));
@@ -1076,20 +1106,20 @@ int test_engine_shaped_cache() {
     ninfer::PromptOptions low;
     low.reasoning_effort  = ninfer::ReasoningEffort::Low;
     low.preserve_thinking = true;
-    auto effort_level = cached_prepare(
-        effort_frontend, effort_cache,
-        product_input({product_message(ninfer::ChatRole::User, "effort")}, low));
-    failures += expect_match_cold(
-        effort_frontend, effort_level,
-        product_input({product_message(ninfer::ChatRole::User, "effort")}, low), false,
-        "E-M3 reasoning_effort change");
+    auto effort_level =
+        cached_prepare(effort_frontend, effort_cache,
+                       product_input({product_message(ninfer::ChatRole::User, "effort")}, low));
+    failures +=
+        expect_match_cold(effort_frontend, effort_level,
+                          product_input({product_message(ninfer::ChatRole::User, "effort")}, low),
+                          false, "E-M3 reasoning_effort change");
     return failures;
 }
 
 int test_concurrency_and_copy_out() {
     if (skip_without_official_tokenizer("test_concurrency_and_copy_out")) { return 0; }
-    const Frontend frontend =
-        FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
+    const Frontend frontend = FrontendFactory::create_component(
+        official_frontend_resources(thinking_toggle_template_source()));
     ninfer::PromptOptions preserve;
     preserve.preserve_thinking = true;
     int failures               = 0;
@@ -1101,18 +1131,19 @@ int test_concurrency_and_copy_out() {
         threads.emplace_back([&, t] {
             const std::string tag = "hist-" + std::to_string(t);
             auto first            = cached_prepare(
-                frontend, shared, product_input({product_message(ninfer::ChatRole::User, tag)}, preserve));
-            auto second = cached_prepare(
                 frontend, shared,
-                product_input({product_message(ninfer::ChatRole::User, tag),
-                               product_message(ninfer::ChatRole::Assistant, "ok"),
-                               product_message(ninfer::ChatRole::User, "next")},
-                              preserve));
-            const auto cold = frontend.prepare(product_input(
-                {product_message(ninfer::ChatRole::User, tag),
-                 product_message(ninfer::ChatRole::Assistant, "ok"),
-                 product_message(ninfer::ChatRole::User, "next")},
-                preserve));
+                product_input({product_message(ninfer::ChatRole::User, tag)}, preserve));
+            auto second =
+                cached_prepare(frontend, shared,
+                               product_input({product_message(ninfer::ChatRole::User, tag),
+                                              product_message(ninfer::ChatRole::Assistant, "ok"),
+                                              product_message(ninfer::ChatRole::User, "next")},
+                                             preserve));
+            const auto cold =
+                frontend.prepare(product_input({product_message(ninfer::ChatRole::User, tag),
+                                                product_message(ninfer::ChatRole::Assistant, "ok"),
+                                                product_message(ninfer::ChatRole::User, "next")},
+                                               preserve));
             if (first.observation.cache_hit || !second.observation.cache_hit ||
                 FrontendFactory::inspect(second.prompt).token_ids !=
                     FrontendFactory::inspect(cold).token_ids) {
@@ -1131,20 +1162,21 @@ int test_concurrency_and_copy_out() {
             auto first = cached_prepare(
                 frontend, identical,
                 product_input({product_message(ninfer::ChatRole::User, "same")}, preserve));
-            auto second = cached_prepare(
-                frontend, identical,
-                product_input({product_message(ninfer::ChatRole::User, "same"),
-                               product_message(ninfer::ChatRole::Assistant, "ok"),
-                               product_message(ninfer::ChatRole::User, "next")},
-                              preserve));
-            const auto cold = frontend.prepare(product_input(
-                {product_message(ninfer::ChatRole::User, "same"),
-                 product_message(ninfer::ChatRole::Assistant, "ok"),
-                 product_message(ninfer::ChatRole::User, "next")},
-                preserve));
+            auto second =
+                cached_prepare(frontend, identical,
+                               product_input({product_message(ninfer::ChatRole::User, "same"),
+                                              product_message(ninfer::ChatRole::Assistant, "ok"),
+                                              product_message(ninfer::ChatRole::User, "next")},
+                                             preserve));
+            const auto cold =
+                frontend.prepare(product_input({product_message(ninfer::ChatRole::User, "same"),
+                                                product_message(ninfer::ChatRole::Assistant, "ok"),
+                                                product_message(ninfer::ChatRole::User, "next")},
+                                               preserve));
             if (FrontendFactory::inspect(first.prompt).token_ids !=
-                    FrontendFactory::inspect(frontend.prepare(product_input(
-                        {product_message(ninfer::ChatRole::User, "same")}, preserve)))
+                    FrontendFactory::inspect(
+                        frontend.prepare(product_input(
+                            {product_message(ninfer::ChatRole::User, "same")}, preserve)))
                         .token_ids ||
                 !second.observation.cache_hit ||
                 FrontendFactory::inspect(second.prompt).token_ids !=
@@ -1158,36 +1190,38 @@ int test_concurrency_and_copy_out() {
     failures += check(identical.size() <= fi::kHostEncodeCacheEntries, "C2 exceeded cache cap");
 
     fi::EncodedHistoryCache evict;
-    const auto planted = cached_prepare(
-        frontend, evict, product_input({product_message(ninfer::ChatRole::User, "keep")}, preserve));
-    const fi::RenderedChat planted_full = thinking_toggle_template().render(
-        {chat_message(ninfer::ChatRole::User, "keep"), chat_message(ninfer::ChatRole::Assistant, "a"),
-         chat_message(ninfer::ChatRole::User, "next")},
-        [&] {
-            fi::ChatRenderOptions options;
-            options.preserve_thinking = true;
-            return options;
-        }());
+    const auto planted =
+        cached_prepare(frontend, evict,
+                       product_input({product_message(ninfer::ChatRole::User, "keep")}, preserve));
+    const fi::RenderedChat planted_full =
+        thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "keep"),
+                                           chat_message(ninfer::ChatRole::Assistant, "a"),
+                                           chat_message(ninfer::ChatRole::User, "next")},
+                                          [&] {
+                                              fi::ChatRenderOptions options;
+                                              options.preserve_thinking = true;
+                                              return options;
+                                          }());
     fi::ChatRenderOptions committed_opts;
-    committed_opts.add_generation_prompt = false;
-    committed_opts.preserve_thinking     = true;
+    committed_opts.add_generation_prompt     = false;
+    committed_opts.preserve_thinking         = true;
     const fi::RenderedChat planted_committed = thinking_toggle_template().render(
         {chat_message(ninfer::ChatRole::User, "keep")}, committed_opts);
-    auto copied = evict.copy_longest_prefix(planted_full.text, official_tokenizer(),
-                                            planted_full.rewrite_checkpoint
-                                                ? std::optional<std::size_t>{
-                                                      planted_full.rewrite_checkpoint->offset}
-                                                : std::nullopt,
-                                            planted_full.literal_spans);
+    auto copied = evict.copy_longest_prefix(
+        planted_full.text, official_tokenizer(),
+        planted_full.rewrite_checkpoint
+            ? std::optional<std::size_t>{planted_full.rewrite_checkpoint->offset}
+            : std::nullopt,
+        planted_full.literal_spans);
     failures += check(copied.has_value(), "C3 did not copy the planted prefix");
     for (int i = 0; i < 16; ++i) {
         const std::string text = "evict-" + std::to_string(i) + std::string(32, 'x');
         evict.insert_committed(text, official_tokenizer().encode(text));
     }
     if (copied) {
-        const auto spliced = fi::try_splice_encoded_chat(
-            official_tokenizer(), copied->ids, planted_full.text, copied->bytes.size(),
-            planted_full.rewrite_checkpoint);
+        const auto spliced =
+            fi::try_splice_encoded_chat(official_tokenizer(), copied->ids, planted_full.text,
+                                        copied->bytes.size(), planted_full.rewrite_checkpoint);
         const fi::EncodedChat cold = fi::encode_rendered_chat(official_tokenizer(), planted_full);
         failures += check(spliced && spliced->input_ids == cold.input_ids,
                           "C3 copy-out splice disagreed with cold after eviction");
@@ -1199,16 +1233,17 @@ int test_concurrency_and_copy_out() {
 
 int test_verify_poison() {
     if (skip_without_official_tokenizer("test_verify_poison")) { return 0; }
-    const Frontend frontend =
-        FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
+    const Frontend frontend = FrontendFactory::create_component(
+        official_frontend_resources(thinking_toggle_template_source()));
     ninfer::PromptOptions preserve;
     preserve.preserve_thinking = true;
     fi::EncodedHistoryCache cache;
     int failures = 0;
 
     setenv("NINFER_VERIFY_HOST_ENCODE", "1", 1);
-    (void)cached_prepare(frontend, cache,
-                         product_input({product_message(ninfer::ChatRole::User, "poison")}, preserve));
+    (void)cached_prepare(
+        frontend, cache,
+        product_input({product_message(ninfer::ChatRole::User, "poison")}, preserve));
     fi::ChatRenderOptions committed_opts;
     committed_opts.add_generation_prompt = false;
     committed_opts.preserve_thinking     = true;
@@ -1217,41 +1252,42 @@ int test_verify_poison() {
             .render({chat_message(ninfer::ChatRole::User, "poison")}, committed_opts)
             .text;
     cache.poison_committed_ids(committed);
-    auto poisoned = cached_prepare(
-        frontend, cache,
-        product_input({product_message(ninfer::ChatRole::User, "poison"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += check(poisoned.observation.verified_mismatch,
-                      "V3 poison did not trip verify mismatch");
+    auto poisoned =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "poison"),
+                                      product_message(ninfer::ChatRole::Assistant, "ans"),
+                                      product_message(ninfer::ChatRole::User, "next")},
+                                     preserve));
+    failures +=
+        check(poisoned.observation.verified_mismatch, "V3 poison did not trip verify mismatch");
     failures += check(!poisoned.observation.cache_hit, "V3 poison still reported a cache hit");
-    failures += expect_match_cold(
-        frontend, poisoned,
-        product_input({product_message(ninfer::ChatRole::User, "poison"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        false, "V3 poison returned non-cold ids");
+    failures +=
+        expect_match_cold(frontend, poisoned,
+                          product_input({product_message(ninfer::ChatRole::User, "poison"),
+                                         product_message(ninfer::ChatRole::Assistant, "ans"),
+                                         product_message(ninfer::ChatRole::User, "next")},
+                                        preserve),
+                          false, "V3 poison returned non-cold ids");
 
-    auto after_drop = cached_prepare(
-        frontend, cache,
-        product_input({product_message(ninfer::ChatRole::User, "poison"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
+    auto after_drop =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "poison"),
+                                      product_message(ninfer::ChatRole::Assistant, "ans"),
+                                      product_message(ninfer::ChatRole::User, "next")},
+                                     preserve));
     failures += check(!after_drop.observation.verified_mismatch,
                       "V3 second call still saw a poisoned entry");
     setenv("NINFER_VERIFY_HOST_ENCODE", "0", 1);
 
     auto legal = cached_prepare(
-        frontend, cache, product_input({product_message(ninfer::ChatRole::User, "verify-ok")}, preserve));
-    auto legal2 = cached_prepare(
         frontend, cache,
-        product_input({product_message(ninfer::ChatRole::User, "verify-ok"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
+        product_input({product_message(ninfer::ChatRole::User, "verify-ok")}, preserve));
+    auto legal2 =
+        cached_prepare(frontend, cache,
+                       product_input({product_message(ninfer::ChatRole::User, "verify-ok"),
+                                      product_message(ninfer::ChatRole::Assistant, "ans"),
+                                      product_message(ninfer::ChatRole::User, "next")},
+                                     preserve));
     (void)legal;
     if (fi::host_encode_verify_enabled()) {
         failures += check(legal2.observation.cache_hit && !legal2.observation.verified_mismatch,
@@ -1267,7 +1303,7 @@ int test_non_loop_pos_insert_refused() {
     const std::string full = thinking_toggle_template()
                                  .render({chat_message(ninfer::ChatRole::User, "abcdef")}, {})
                                  .text;
-    const std::size_t mid = full.find("bcd");
+    const std::size_t mid  = full.find("bcd");
     int failures = check(mid != std::string::npos && !tokenizer.is_encode_loop_pos(full, mid + 1),
                          "mid-user cut was a loop-pos");
     cache.insert_committed(full.substr(0, mid + 1), tokenizer.encode(full.substr(0, mid + 1)));
@@ -1279,355 +1315,362 @@ int test_non_loop_pos_insert_refused() {
 int test_coverage_gaps() {
     if (skip_without_official_tokenizer("test_coverage_gaps")) { return 0; }
     try {
-    const Frontend frontend =
-        FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
-    const Frontend toy = FrontendFactory::create_component(resources());
-    ninfer::PromptOptions preserve;
-    preserve.preserve_thinking = true;
-    ninfer::PromptOptions no_gen = preserve;
-    no_gen.add_generation_prompt = false;
-    int failures                 = 0;
+        const Frontend frontend = FrontendFactory::create_component(
+            official_frontend_resources(thinking_toggle_template_source()));
+        const Frontend toy = FrontendFactory::create_component(resources());
+        ninfer::PromptOptions preserve;
+        preserve.preserve_thinking   = true;
+        ninfer::PromptOptions no_gen = preserve;
+        no_gen.add_generation_prompt = false;
+        int failures                 = 0;
 
-    ninfer::ChatMessage lookup;
-    lookup.role = ninfer::ChatRole::Assistant;
-    lookup.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "", .media = {}});
-    lookup.tool_calls.push_back(
-        ninfer::ToolCall{.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
-    fi::EncodedHistoryCache tool_hit_cache;
-    (void)cached_prepare(
-        frontend, tool_hit_cache,
-        product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
-                       product_message(ninfer::ChatRole::Tool, "sunny")},
-                      preserve));
-    auto tool_closed = cached_prepare(
-        frontend, tool_hit_cache,
-        product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
-                       product_message(ninfer::ChatRole::Tool, "sunny"),
-                       product_message(ninfer::ChatRole::User, "thanks")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, tool_closed,
-        product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
-                       product_message(ninfer::ChatRole::Tool, "sunny"),
-                       product_message(ninfer::ChatRole::User, "thanks")},
-                      preserve),
-        true, "closed tool history append should hit");
+        ninfer::ChatMessage lookup;
+        lookup.role = ninfer::ChatRole::Assistant;
+        lookup.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "", .media = {}});
+        lookup.tool_calls.push_back(
+            ninfer::ToolCall{.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
+        fi::EncodedHistoryCache tool_hit_cache;
+        (void)cached_prepare(
+            frontend, tool_hit_cache,
+            product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
+                           product_message(ninfer::ChatRole::Tool, "sunny")},
+                          preserve));
+        auto tool_closed =
+            cached_prepare(frontend, tool_hit_cache,
+                           product_input({product_message(ninfer::ChatRole::User, "weather?"),
+                                          lookup, product_message(ninfer::ChatRole::Tool, "sunny"),
+                                          product_message(ninfer::ChatRole::User, "thanks")},
+                                         preserve));
+        failures += expect_match_cold(
+            frontend, tool_closed,
+            product_input({product_message(ninfer::ChatRole::User, "weather?"), lookup,
+                           product_message(ninfer::ChatRole::Tool, "sunny"),
+                           product_message(ninfer::ChatRole::User, "thanks")},
+                          preserve),
+            true, "closed tool history append should hit");
 
-    fi::EncodedHistoryCache turn3;
-    (void)cached_prepare(frontend, turn3,
-                         product_input({product_message(ninfer::ChatRole::User, "t3")}, preserve));
-    auto turn3_second = cached_prepare(
-        frontend, turn3,
-        product_input({product_message(ninfer::ChatRole::User, "t3"),
-                       product_message(ninfer::ChatRole::Assistant, "a1"),
-                       product_message(ninfer::ChatRole::User, "u2")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, turn3_second,
-        product_input({product_message(ninfer::ChatRole::User, "t3"),
-                       product_message(ninfer::ChatRole::Assistant, "a1"),
-                       product_message(ninfer::ChatRole::User, "u2")},
-                      preserve),
-        true, "turn-2 append should hit");
-    auto turn3_third = cached_prepare(
-        frontend, turn3,
-        product_input({product_message(ninfer::ChatRole::User, "t3"),
-                       product_message(ninfer::ChatRole::Assistant, "a1"),
-                       product_message(ninfer::ChatRole::User, "u2"),
-                       product_message(ninfer::ChatRole::Assistant, "a2"),
-                       product_message(ninfer::ChatRole::User, "u3")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, turn3_third,
-        product_input({product_message(ninfer::ChatRole::User, "t3"),
-                       product_message(ninfer::ChatRole::Assistant, "a1"),
-                       product_message(ninfer::ChatRole::User, "u2"),
-                       product_message(ninfer::ChatRole::Assistant, "a2"),
-                       product_message(ninfer::ChatRole::User, "u3")},
-                      preserve),
-        true, "turn-3 append should hit the longer committed");
-    failures +=
-        check(turn3_third.observation.prefix_bytes > turn3_second.observation.prefix_bytes,
-              "turn-3 spliced the first-turn prefix instead of the inserted longer committed");
+        fi::EncodedHistoryCache turn3;
+        (void)cached_prepare(
+            frontend, turn3,
+            product_input({product_message(ninfer::ChatRole::User, "t3")}, preserve));
+        auto turn3_second =
+            cached_prepare(frontend, turn3,
+                           product_input({product_message(ninfer::ChatRole::User, "t3"),
+                                          product_message(ninfer::ChatRole::Assistant, "a1"),
+                                          product_message(ninfer::ChatRole::User, "u2")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, turn3_second,
+                              product_input({product_message(ninfer::ChatRole::User, "t3"),
+                                             product_message(ninfer::ChatRole::Assistant, "a1"),
+                                             product_message(ninfer::ChatRole::User, "u2")},
+                                            preserve),
+                              true, "turn-2 append should hit");
+        auto turn3_third =
+            cached_prepare(frontend, turn3,
+                           product_input({product_message(ninfer::ChatRole::User, "t3"),
+                                          product_message(ninfer::ChatRole::Assistant, "a1"),
+                                          product_message(ninfer::ChatRole::User, "u2"),
+                                          product_message(ninfer::ChatRole::Assistant, "a2"),
+                                          product_message(ninfer::ChatRole::User, "u3")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, turn3_third,
+                              product_input({product_message(ninfer::ChatRole::User, "t3"),
+                                             product_message(ninfer::ChatRole::Assistant, "a1"),
+                                             product_message(ninfer::ChatRole::User, "u2"),
+                                             product_message(ninfer::ChatRole::Assistant, "a2"),
+                                             product_message(ninfer::ChatRole::User, "u3")},
+                                            preserve),
+                              true, "turn-3 append should hit the longer committed");
+        failures +=
+            check(turn3_third.observation.prefix_bytes > turn3_second.observation.prefix_bytes,
+                  "turn-3 spliced the first-turn prefix instead of the inserted longer committed");
 
-    ninfer::ChatMessage product_first;
-    product_first.role              = ninfer::ChatRole::Assistant;
-    product_first.reasoning_content = "first thought";
-    product_first.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "first answer", .media = {}});
-    ninfer::ChatMessage product_second;
-    product_second.role              = ninfer::ChatRole::Assistant;
-    product_second.reasoning_content = "second thought";
-    product_second.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "second answer", .media = {}});
-    fi::EncodedHistoryCache tool_loop_cache;
-    ninfer::PromptOptions closed_loop;
-    closed_loop.preserve_thinking     = false;
-    closed_loop.add_generation_prompt = false;
-    ninfer::PromptOptions turn_closure;
-    turn_closure.preserve_thinking     = false;
-    turn_closure.add_generation_prompt = true;
-    (void)EncodedHistoryPrepare::prepare(
-        frontend,
-        product_input({product_message(ninfer::ChatRole::User, "question"), product_first,
-                       product_message(ninfer::ChatRole::Tool, "result one"), product_second,
-                       product_message(ninfer::ChatRole::Tool, "result two")},
-                      closed_loop),
-        tool_loop_cache);
-    auto open_loop = cached_prepare(
-        frontend, tool_loop_cache,
-        product_input({product_message(ninfer::ChatRole::User, "question"), product_first,
-                       product_message(ninfer::ChatRole::Tool, "result one"), product_second,
-                       product_message(ninfer::ChatRole::Tool, "result two")},
-                      turn_closure));
-    failures += expect_match_cold(
-        frontend, open_loop,
-        product_input({product_message(ninfer::ChatRole::User, "question"), product_first,
-                       product_message(ninfer::ChatRole::Tool, "result one"), product_second,
-                       product_message(ninfer::ChatRole::Tool, "result two")},
-                      turn_closure),
-        false, "E-M10 tool-loop TurnClosure offset < cached committed n");
+        ninfer::ChatMessage product_first;
+        product_first.role              = ninfer::ChatRole::Assistant;
+        product_first.reasoning_content = "first thought";
+        product_first.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "first answer", .media = {}});
+        ninfer::ChatMessage product_second;
+        product_second.role              = ninfer::ChatRole::Assistant;
+        product_second.reasoning_content = "second thought";
+        product_second.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "second answer", .media = {}});
+        fi::EncodedHistoryCache tool_loop_cache;
+        ninfer::PromptOptions closed_loop;
+        closed_loop.preserve_thinking     = false;
+        closed_loop.add_generation_prompt = false;
+        ninfer::PromptOptions turn_closure;
+        turn_closure.preserve_thinking     = false;
+        turn_closure.add_generation_prompt = true;
+        (void)EncodedHistoryPrepare::prepare(
+            frontend,
+            product_input({product_message(ninfer::ChatRole::User, "question"), product_first,
+                           product_message(ninfer::ChatRole::Tool, "result one"), product_second,
+                           product_message(ninfer::ChatRole::Tool, "result two")},
+                          closed_loop),
+            tool_loop_cache);
+        auto open_loop = cached_prepare(
+            frontend, tool_loop_cache,
+            product_input({product_message(ninfer::ChatRole::User, "question"), product_first,
+                           product_message(ninfer::ChatRole::Tool, "result one"), product_second,
+                           product_message(ninfer::ChatRole::Tool, "result two")},
+                          turn_closure));
+        failures += expect_match_cold(
+            frontend, open_loop,
+            product_input({product_message(ninfer::ChatRole::User, "question"), product_first,
+                           product_message(ninfer::ChatRole::Tool, "result one"), product_second,
+                           product_message(ninfer::ChatRole::Tool, "result two")},
+                          turn_closure),
+            false, "E-M10 tool-loop TurnClosure offset < cached committed n");
 
-    ninfer::MessagePart video;
-    video.kind              = ninfer::MessagePartKind::Media;
-    video.media.kind        = ninfer::MediaKind::Video;
-    video.media.bytes       = gradient_ppm();
-    video.media.media_type  = "image/x-portable-pixmap";
-    video.media.source_name = "single-frame.ppm";
-    ninfer::ChatMessage video_message;
-    video_message.role = ninfer::ChatRole::User;
-    video_message.parts.push_back(std::move(video));
-    fi::EncodedHistoryCache media_cache;
-    (void)cached_prepare(toy, media_cache,
-                         product_input({product_message(ninfer::ChatRole::User, "x")}));
-    const std::size_t after_text = media_cache.size();
-    auto video_call = cached_prepare(toy, media_cache, product_input({video_message}));
-    failures += check(!video_call.observation.cache_hit && media_cache.size() == after_text &&
-                          FrontendFactory::inspect(video_call.prompt).has_media(),
-                      "video prepare used or inserted into the text cache");
-    const std::size_t before_video_count = media_cache.size();
-    const std::uint32_t video_count      = EncodedHistoryPrepare::count_tokens(
-        toy, product_input({std::move(video_message)}), media_cache);
-    failures += check(video_count > 0 && media_cache.size() == before_video_count &&
-                          !fi::last_host_encode_observation.cache_hit &&
-                          !fi::last_host_encode_observation.inserted,
-                      "video count_tokens used or inserted into the text cache");
+        ninfer::MessagePart video;
+        video.kind              = ninfer::MessagePartKind::Media;
+        video.media.kind        = ninfer::MediaKind::Video;
+        video.media.bytes       = gradient_ppm();
+        video.media.media_type  = "image/x-portable-pixmap";
+        video.media.source_name = "single-frame.ppm";
+        ninfer::ChatMessage video_message;
+        video_message.role = ninfer::ChatRole::User;
+        video_message.parts.push_back(std::move(video));
+        fi::EncodedHistoryCache media_cache;
+        (void)cached_prepare(toy, media_cache,
+                             product_input({product_message(ninfer::ChatRole::User, "x")}));
+        const std::size_t after_text = media_cache.size();
+        auto video_call = cached_prepare(toy, media_cache, product_input({video_message}));
+        failures += check(!video_call.observation.cache_hit && media_cache.size() == after_text &&
+                              FrontendFactory::inspect(video_call.prompt).has_media(),
+                          "video prepare used or inserted into the text cache");
+        const std::size_t before_video_count = media_cache.size();
+        const std::uint32_t video_count      = EncodedHistoryPrepare::count_tokens(
+            toy, product_input({std::move(video_message)}), media_cache);
+        failures += check(video_count > 0 && media_cache.size() == before_video_count &&
+                              !fi::last_host_encode_observation.cache_hit &&
+                              !fi::last_host_encode_observation.inserted,
+                          "video count_tokens used or inserted into the text cache");
 
-    fi::EncodedHistoryCache cap_cache;
-    cap_cache.insert_committed(std::string(fi::kHostEncodeCacheMaxBytes + 1, 'a'), {1, 2, 3});
-    failures += check(cap_cache.size() == 0, "E-M12 oversized UTF-8 was inserted");
-    cap_cache.insert_committed("ok", std::vector<int>(fi::kHostEncodeCacheMaxIds + 1, 1));
-    failures += check(cap_cache.size() == 0, "E-M12 oversized id vector was inserted");
-    cap_cache.insert_committed("", {1});
-    failures += check(cap_cache.size() == 0, "empty committed was inserted");
+        fi::EncodedHistoryCache cap_cache;
+        cap_cache.insert_committed(std::string(fi::kHostEncodeCacheMaxBytes + 1, 'a'), {1, 2, 3});
+        failures += check(cap_cache.size() == 0, "E-M12 oversized UTF-8 was inserted");
+        cap_cache.insert_committed("ok", std::vector<int>(fi::kHostEncodeCacheMaxIds + 1, 1));
+        failures += check(cap_cache.size() == 0, "E-M12 oversized id vector was inserted");
+        cap_cache.insert_committed("", {1});
+        failures += check(cap_cache.size() == 0, "empty committed was inserted");
 
-    fi::EncodedHistoryCache lru;
-    for (int i = 0; i < 16; ++i) {
+        fi::EncodedHistoryCache lru;
+        for (int i = 0; i < 16; ++i) {
+            (void)cached_prepare(
+                frontend, lru,
+                product_input({product_message(ninfer::ChatRole::User, "lru-" + std::to_string(i))},
+                              preserve));
+        }
+        failures += check(lru.size() == 16, "C6 did not fill 16 entries");
         (void)cached_prepare(
             frontend, lru,
-            product_input({product_message(ninfer::ChatRole::User, "lru-" + std::to_string(i))},
-                          preserve));
-    }
-    failures += check(lru.size() == 16, "C6 did not fill 16 entries");
-    (void)cached_prepare(frontend, lru,
-                         product_input({product_message(ninfer::ChatRole::User, "lru-16")}, preserve));
-    auto evicted = cached_prepare(
-        frontend, lru,
-        product_input({product_message(ninfer::ChatRole::User, "lru-0"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, evicted,
-        product_input({product_message(ninfer::ChatRole::User, "lru-0"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        false, "C6 LRU victim still hit after eviction");
-    auto recent = cached_prepare(
-        frontend, lru,
-        product_input({product_message(ninfer::ChatRole::User, "lru-16"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, recent,
-        product_input({product_message(ninfer::ChatRole::User, "lru-16"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        true, "C6 most recent insert missed");
+            product_input({product_message(ninfer::ChatRole::User, "lru-16")}, preserve));
+        auto evicted =
+            cached_prepare(frontend, lru,
+                           product_input({product_message(ninfer::ChatRole::User, "lru-0"),
+                                          product_message(ninfer::ChatRole::Assistant, "ok"),
+                                          product_message(ninfer::ChatRole::User, "next")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, evicted,
+                              product_input({product_message(ninfer::ChatRole::User, "lru-0"),
+                                             product_message(ninfer::ChatRole::Assistant, "ok"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              false, "C6 LRU victim still hit after eviction");
+        auto recent =
+            cached_prepare(frontend, lru,
+                           product_input({product_message(ninfer::ChatRole::User, "lru-16"),
+                                          product_message(ninfer::ChatRole::Assistant, "ok"),
+                                          product_message(ninfer::ChatRole::User, "next")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, recent,
+                              product_input({product_message(ninfer::ChatRole::User, "lru-16"),
+                                             product_message(ninfer::ChatRole::Assistant, "ok"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              true, "C6 most recent insert missed");
 
-    fi::EncodedHistoryCache lru_hit;
-    for (int i = 0; i < 16; ++i) {
+        fi::EncodedHistoryCache lru_hit;
+        for (int i = 0; i < 16; ++i) {
+            (void)cached_prepare(frontend, lru_hit,
+                                 product_input({product_message(ninfer::ChatRole::User,
+                                                                "touch-" + std::to_string(i))},
+                                               preserve));
+        }
+        auto touched = cached_prepare(
+            frontend, lru_hit,
+            product_input({product_message(ninfer::ChatRole::User, "touch-0")}, preserve));
+        failures += expect_match_cold(
+            frontend, touched,
+            product_input({product_message(ninfer::ChatRole::User, "touch-0")}, preserve), true,
+            "C6 replay of oldest entry missed");
         (void)cached_prepare(
             frontend, lru_hit,
-            product_input({product_message(ninfer::ChatRole::User, "touch-" + std::to_string(i))},
-                          preserve));
-    }
-    auto touched = cached_prepare(
-        frontend, lru_hit,
-        product_input({product_message(ninfer::ChatRole::User, "touch-0")}, preserve));
-    failures += expect_match_cold(
-        frontend, touched, product_input({product_message(ninfer::ChatRole::User, "touch-0")}, preserve),
-        true, "C6 replay of oldest entry missed");
-    (void)cached_prepare(
-        frontend, lru_hit,
-        product_input({product_message(ninfer::ChatRole::User, "touch-16")}, preserve));
-    auto refreshed = cached_prepare(
-        frontend, lru_hit,
-        product_input({product_message(ninfer::ChatRole::User, "touch-0"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, refreshed,
-        product_input({product_message(ninfer::ChatRole::User, "touch-0"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        true, "C6 LRU hit did not refresh the victim");
-    auto stale = cached_prepare(
-        frontend, lru_hit,
-        product_input({product_message(ninfer::ChatRole::User, "touch-1"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, stale,
-        product_input({product_message(ninfer::ChatRole::User, "touch-1"),
-                       product_message(ninfer::ChatRole::Assistant, "ok"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        false, "C6 untouched neighbor survived after a refreshed hit");
+            product_input({product_message(ninfer::ChatRole::User, "touch-16")}, preserve));
+        auto refreshed =
+            cached_prepare(frontend, lru_hit,
+                           product_input({product_message(ninfer::ChatRole::User, "touch-0"),
+                                          product_message(ninfer::ChatRole::Assistant, "ok"),
+                                          product_message(ninfer::ChatRole::User, "next")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, refreshed,
+                              product_input({product_message(ninfer::ChatRole::User, "touch-0"),
+                                             product_message(ninfer::ChatRole::Assistant, "ok"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              true, "C6 LRU hit did not refresh the victim");
+        auto stale =
+            cached_prepare(frontend, lru_hit,
+                           product_input({product_message(ninfer::ChatRole::User, "touch-1"),
+                                          product_message(ninfer::ChatRole::Assistant, "ok"),
+                                          product_message(ninfer::ChatRole::User, "next")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, stale,
+                              product_input({product_message(ninfer::ChatRole::User, "touch-1"),
+                                             product_message(ninfer::ChatRole::Assistant, "ok"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              false, "C6 untouched neighbor survived after a refreshed hit");
 
-    fi::EncodedHistoryCache mixed;
-    (void)cached_prepare(frontend, mixed,
-                         product_input({product_message(ninfer::ChatRole::User, "mix")}, preserve));
-    std::atomic<int> mix_failures{0};
-    std::vector<std::thread> mix_threads;
-    for (int t = 0; t < 8; ++t) {
-        mix_threads.emplace_back([&, t] {
-            if ((t % 2) == 0) {
-                const std::uint32_t count = EncodedHistoryPrepare::count_tokens(
-                    frontend,
-                    product_input({product_message(ninfer::ChatRole::User, "mix"),
-                                   product_message(ninfer::ChatRole::Assistant, "ok"),
-                                   product_message(ninfer::ChatRole::User, "next")},
-                                  preserve),
-                    mixed);
-                const std::uint32_t cold = frontend.count_tokens(product_input(
-                    {product_message(ninfer::ChatRole::User, "mix"),
-                     product_message(ninfer::ChatRole::Assistant, "ok"),
-                     product_message(ninfer::ChatRole::User, "next")},
-                    preserve));
-                if (!fi::last_host_encode_observation.cache_hit || count != cold) {
-                    mix_failures.fetch_add(1);
+        fi::EncodedHistoryCache mixed;
+        (void)cached_prepare(
+            frontend, mixed,
+            product_input({product_message(ninfer::ChatRole::User, "mix")}, preserve));
+        std::atomic<int> mix_failures{0};
+        std::vector<std::thread> mix_threads;
+        for (int t = 0; t < 8; ++t) {
+            mix_threads.emplace_back([&, t] {
+                if ((t % 2) == 0) {
+                    const std::uint32_t count = EncodedHistoryPrepare::count_tokens(
+                        frontend,
+                        product_input({product_message(ninfer::ChatRole::User, "mix"),
+                                       product_message(ninfer::ChatRole::Assistant, "ok"),
+                                       product_message(ninfer::ChatRole::User, "next")},
+                                      preserve),
+                        mixed);
+                    const std::uint32_t cold = frontend.count_tokens(
+                        product_input({product_message(ninfer::ChatRole::User, "mix"),
+                                       product_message(ninfer::ChatRole::Assistant, "ok"),
+                                       product_message(ninfer::ChatRole::User, "next")},
+                                      preserve));
+                    if (!fi::last_host_encode_observation.cache_hit || count != cold) {
+                        mix_failures.fetch_add(1);
+                    }
+                } else {
+                    auto call = cached_prepare(
+                        frontend, mixed,
+                        product_input({product_message(ninfer::ChatRole::User, "mix"),
+                                       product_message(ninfer::ChatRole::Assistant, "ok"),
+                                       product_message(ninfer::ChatRole::User, "next")},
+                                      preserve));
+                    const auto cold = frontend.prepare(
+                        product_input({product_message(ninfer::ChatRole::User, "mix"),
+                                       product_message(ninfer::ChatRole::Assistant, "ok"),
+                                       product_message(ninfer::ChatRole::User, "next")},
+                                      preserve));
+                    if (!call.observation.cache_hit ||
+                        FrontendFactory::inspect(call.prompt).token_ids !=
+                            FrontendFactory::inspect(cold).token_ids) {
+                        mix_failures.fetch_add(1);
+                    }
                 }
-            } else {
-                auto call = cached_prepare(
-                    frontend, mixed,
-                    product_input({product_message(ninfer::ChatRole::User, "mix"),
-                                   product_message(ninfer::ChatRole::Assistant, "ok"),
-                                   product_message(ninfer::ChatRole::User, "next")},
-                                  preserve));
-                const auto cold = frontend.prepare(product_input(
-                    {product_message(ninfer::ChatRole::User, "mix"),
-                     product_message(ninfer::ChatRole::Assistant, "ok"),
-                     product_message(ninfer::ChatRole::User, "next")},
-                    preserve));
-                if (!call.observation.cache_hit ||
-                    FrontendFactory::inspect(call.prompt).token_ids !=
-                        FrontendFactory::inspect(cold).token_ids) {
-                    mix_failures.fetch_add(1);
-                }
-            }
-        });
-    }
-    for (std::thread& thread : mix_threads) { thread.join(); }
-    failures += check(mix_failures.load() == 0, "C8 concurrent count_tokens/prepare failed");
+            });
+        }
+        for (std::thread& thread : mix_threads) { thread.join(); }
+        failures += check(mix_failures.load() == 0, "C8 concurrent count_tokens/prepare failed");
 
-    fi::EncodedHistoryCache byte_poison;
-    (void)cached_prepare(
-        frontend, byte_poison,
-        product_input({product_message(ninfer::ChatRole::User, "keep-bytes")}, preserve));
-    (void)cached_prepare(
-        frontend, byte_poison,
-        product_input({product_message(ninfer::ChatRole::User, "scramble-me")}, preserve));
-    fi::ChatRenderOptions committed_opts;
-    committed_opts.add_generation_prompt = false;
-    committed_opts.preserve_thinking     = true;
-    const std::string scrambled =
-        thinking_toggle_template()
-            .render({chat_message(ninfer::ChatRole::User, "scramble-me")}, committed_opts)
-            .text;
-    byte_poison.scramble_committed_bytes(scrambled);
-    auto scrambled_call = cached_prepare(
-        frontend, byte_poison,
-        product_input({product_message(ninfer::ChatRole::User, "scramble-me"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, scrambled_call,
-        product_input({product_message(ninfer::ChatRole::User, "scramble-me"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        false, "V4 scrambled bytes still hit");
-    failures += check(!scrambled_call.observation.verified_mismatch,
-                      "V4 scrambled bytes went through verify instead of memcmp miss");
-    auto other_still = cached_prepare(
-        frontend, byte_poison,
-        product_input({product_message(ninfer::ChatRole::User, "keep-bytes"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, other_still,
-        product_input({product_message(ninfer::ChatRole::User, "keep-bytes"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        true, "V4 scramble dropped an unrelated entry");
+        fi::EncodedHistoryCache byte_poison;
+        (void)cached_prepare(
+            frontend, byte_poison,
+            product_input({product_message(ninfer::ChatRole::User, "keep-bytes")}, preserve));
+        (void)cached_prepare(
+            frontend, byte_poison,
+            product_input({product_message(ninfer::ChatRole::User, "scramble-me")}, preserve));
+        fi::ChatRenderOptions committed_opts;
+        committed_opts.add_generation_prompt = false;
+        committed_opts.preserve_thinking     = true;
+        const std::string scrambled =
+            thinking_toggle_template()
+                .render({chat_message(ninfer::ChatRole::User, "scramble-me")}, committed_opts)
+                .text;
+        byte_poison.scramble_committed_bytes(scrambled);
+        auto scrambled_call =
+            cached_prepare(frontend, byte_poison,
+                           product_input({product_message(ninfer::ChatRole::User, "scramble-me"),
+                                          product_message(ninfer::ChatRole::Assistant, "ans"),
+                                          product_message(ninfer::ChatRole::User, "next")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, scrambled_call,
+                              product_input({product_message(ninfer::ChatRole::User, "scramble-me"),
+                                             product_message(ninfer::ChatRole::Assistant, "ans"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              false, "V4 scrambled bytes still hit");
+        failures += check(!scrambled_call.observation.verified_mismatch,
+                          "V4 scrambled bytes went through verify instead of memcmp miss");
+        auto other_still =
+            cached_prepare(frontend, byte_poison,
+                           product_input({product_message(ninfer::ChatRole::User, "keep-bytes"),
+                                          product_message(ninfer::ChatRole::Assistant, "ans"),
+                                          product_message(ninfer::ChatRole::User, "next")},
+                                         preserve));
+        failures +=
+            expect_match_cold(frontend, other_still,
+                              product_input({product_message(ninfer::ChatRole::User, "keep-bytes"),
+                                             product_message(ninfer::ChatRole::Assistant, "ans"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              true, "V4 scramble dropped an unrelated entry");
 
-    setenv("NINFER_VERIFY_HOST_ENCODE", "1", 1);
-    fi::EncodedHistoryCache verify_replay;
-    (void)cached_prepare(
-        frontend, verify_replay,
-        product_input({product_message(ninfer::ChatRole::User, "v-replay")}, no_gen));
-    auto replay = cached_prepare(
-        frontend, verify_replay,
-        product_input({product_message(ninfer::ChatRole::User, "v-replay")}, no_gen));
-    failures += expect_match_cold(
-        frontend, replay, product_input({product_message(ninfer::ChatRole::User, "v-replay")}, no_gen),
-        true, "V6 verify empty-suffix replay");
-    failures += check(!replay.observation.verified_mismatch, "V6 verify mismatch on legal replay");
+        setenv("NINFER_VERIFY_HOST_ENCODE", "1", 1);
+        fi::EncodedHistoryCache verify_replay;
+        (void)cached_prepare(
+            frontend, verify_replay,
+            product_input({product_message(ninfer::ChatRole::User, "v-replay")}, no_gen));
+        auto replay = cached_prepare(
+            frontend, verify_replay,
+            product_input({product_message(ninfer::ChatRole::User, "v-replay")}, no_gen));
+        failures += expect_match_cold(
+            frontend, replay,
+            product_input({product_message(ninfer::ChatRole::User, "v-replay")}, no_gen), true,
+            "V6 verify empty-suffix replay");
+        failures +=
+            check(!replay.observation.verified_mismatch, "V6 verify mismatch on legal replay");
 
-    fi::EncodedHistoryCache verify_rr;
-    (void)cached_prepare(frontend, verify_rr,
-                         product_input({product_message(ninfer::ChatRole::User, "v-rr")}, preserve));
-    auto rr = cached_prepare(
-        frontend, verify_rr,
-        product_input({product_message(ninfer::ChatRole::User, "v-rr"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve));
-    failures += expect_match_cold(
-        frontend, rr,
-        product_input({product_message(ninfer::ChatRole::User, "v-rr"),
-                       product_message(ninfer::ChatRole::Assistant, "ans"),
-                       product_message(ninfer::ChatRole::User, "next")},
-                      preserve),
-        true, "V7 verify ResponseReplay append");
-    failures += check(!rr.observation.verified_mismatch &&
-                          FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint &&
-                          FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay,
-                      "V7 verify frontier/kind disagreed");
-    setenv("NINFER_VERIFY_HOST_ENCODE", "0", 1);
-    return failures;
+        fi::EncodedHistoryCache verify_rr;
+        (void)cached_prepare(
+            frontend, verify_rr,
+            product_input({product_message(ninfer::ChatRole::User, "v-rr")}, preserve));
+        auto rr = cached_prepare(frontend, verify_rr,
+                                 product_input({product_message(ninfer::ChatRole::User, "v-rr"),
+                                                product_message(ninfer::ChatRole::Assistant, "ans"),
+                                                product_message(ninfer::ChatRole::User, "next")},
+                                               preserve));
+        failures +=
+            expect_match_cold(frontend, rr,
+                              product_input({product_message(ninfer::ChatRole::User, "v-rr"),
+                                             product_message(ninfer::ChatRole::Assistant, "ans"),
+                                             product_message(ninfer::ChatRole::User, "next")},
+                                            preserve),
+                              true, "V7 verify ResponseReplay append");
+        failures +=
+            check(!rr.observation.verified_mismatch &&
+                      FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint &&
+                      FrontendFactory::inspect(rr.prompt).identity.rewrite_checkpoint->kind ==
+                          ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay,
+                  "V7 verify frontier/kind disagreed");
+        setenv("NINFER_VERIFY_HOST_ENCODE", "0", 1);
+        return failures;
     } catch (const std::exception& error) {
         std::cerr << "test_coverage_gaps exception: " << error.what() << '\n';
         return 1;
@@ -1637,145 +1680,158 @@ int test_coverage_gaps() {
 int test_byte_match_and_boundaries() {
     int failures = 0;
     if (!skip_without_official_tokenizer("test_byte_match_and_boundaries official")) {
-    const fi::Tokenizer& tokenizer = official_tokenizer();
+        const fi::Tokenizer& tokenizer = official_tokenizer();
 
-    fi::ChatRenderOptions no_generation;
-    no_generation.add_generation_prompt = false;
-    fi::ChatRenderOptions preserve;
-    preserve.preserve_thinking = true;
-    fi::ChatRenderOptions no_think;
-    no_think.enable_thinking = false;
-    fi::ChatRenderOptions no_think_committed = no_think;
-    no_think_committed.add_generation_prompt = false;
+        fi::ChatRenderOptions no_generation;
+        no_generation.add_generation_prompt = false;
+        fi::ChatRenderOptions preserve;
+        preserve.preserve_thinking = true;
+        fi::ChatRenderOptions no_think;
+        no_think.enable_thinking                 = false;
+        fi::ChatRenderOptions no_think_committed = no_think;
+        no_think_committed.add_generation_prompt = false;
 
-    fi::ChatMessage lookup = chat_message(ninfer::ChatRole::Assistant, "");
-    lookup.tool_calls.push_back(
-        {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
+        fi::ChatMessage lookup = chat_message(ninfer::ChatRole::Assistant, "");
+        lookup.tool_calls.push_back(
+            {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
 
-    const std::vector<fi::ChatMessage> user_hello{chat_message(ninfer::ChatRole::User, "hello")};
-    const std::vector<fi::ChatMessage> user_cjk{
-        chat_message(ninfer::ChatRole::User, "缓存复用 cafe\u0301 and NFC 0123456789")};
-    const std::vector<fi::ChatMessage> multi{
-        chat_message(ninfer::ChatRole::User, "q1"),
-        chat_message(ninfer::ChatRole::Assistant, "<think>\nold thought\n</think>\n\nold answer"),
-        chat_message(ninfer::ChatRole::User, "q2 punctuation, digits, and CJK: 边界.")};
-    const std::vector<fi::ChatMessage> tools_one{
-        chat_message(ninfer::ChatRole::User, "weather?"), lookup,
-        chat_message(ninfer::ChatRole::Tool, "sunny")};
-    const std::vector<fi::ChatMessage> tools_two{
-        chat_message(ninfer::ChatRole::User, "weather?"), lookup,
-        chat_message(ninfer::ChatRole::Tool, "sunny"),
-        chat_message(ninfer::ChatRole::Tool, "20C")};
-    const std::vector<fi::ChatMessage> late{
-        chat_message(ninfer::ChatRole::System, "stable policy"),
-        chat_message(ninfer::ChatRole::User, "hi"),
-        chat_message(ninfer::ChatRole::System, "current diagnostics")};
-    const std::vector<fi::ChatMessage> effort_user{chat_message(ninfer::ChatRole::User, "hello")};
+        const std::vector<fi::ChatMessage> user_hello{
+            chat_message(ninfer::ChatRole::User, "hello")};
+        const std::vector<fi::ChatMessage> user_cjk{
+            chat_message(ninfer::ChatRole::User, "缓存复用 cafe\u0301 and NFC 0123456789")};
+        const std::vector<fi::ChatMessage> multi{
+            chat_message(ninfer::ChatRole::User, "q1"),
+            chat_message(ninfer::ChatRole::Assistant,
+                         "<think>\nold thought\n</think>\n\nold answer"),
+            chat_message(ninfer::ChatRole::User, "q2 punctuation, digits, and CJK: 边界.")};
+        const std::vector<fi::ChatMessage> tools_one{
+            chat_message(ninfer::ChatRole::User, "weather?"), lookup,
+            chat_message(ninfer::ChatRole::Tool, "sunny")};
+        const std::vector<fi::ChatMessage> tools_two{
+            chat_message(ninfer::ChatRole::User, "weather?"), lookup,
+            chat_message(ninfer::ChatRole::Tool, "sunny"),
+            chat_message(ninfer::ChatRole::Tool, "20C")};
+        const std::vector<fi::ChatMessage> late{
+            chat_message(ninfer::ChatRole::System, "stable policy"),
+            chat_message(ninfer::ChatRole::User, "hi"),
+            chat_message(ninfer::ChatRole::System, "current diagnostics")};
+        const std::vector<fi::ChatMessage> effort_user{
+            chat_message(ninfer::ChatRole::User, "hello")};
 
-    struct Case {
-        fi::RenderedChat rendered;
-        const char* label;
-    };
-    std::vector<Case> cases;
-    auto add = [&](fi::RenderedChat rendered, const char* label) {
-        cases.push_back(Case{std::move(rendered), label});
-    };
-    add(thinking_toggle_template().render(user_hello, {}), "thinking-toggle hello full");
-    add(thinking_toggle_template().render(user_hello, no_generation), "thinking-toggle hello committed");
-    add(thinking_toggle_template().render(user_hello, no_think), "thinking-toggle hello no-think");
-    add(thinking_toggle_template().render(user_cjk, {}), "thinking-toggle CJK/NFC full");
-    add(thinking_toggle_template().render(multi, preserve), "thinking-toggle multi-turn think");
-    add(thinking_toggle_template().render(multi, no_think), "thinking-toggle multi-turn strip");
-    add(thinking_toggle_template().render(tools_one, no_generation), "thinking-toggle one tool");
-    add(thinking_toggle_template().render(tools_two, no_generation), "thinking-toggle two tools");
-    add(thinking_toggle_template().render(late, {}), "thinking-toggle late system");
-    fi::ChatRenderOptions with_tools = preserve;
-    with_tools.tool_jsons.push_back(
-        R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
-    add(thinking_toggle_template().render(user_hello, with_tools), "thinking-toggle tool_jsons");
+        struct Case {
+            fi::RenderedChat rendered;
+            const char* label;
+        };
 
-    fi::ChatRenderOptions effort_medium;
-    effort_medium.reasoning_effort = ninfer::ReasoningEffort::Medium;
-    fi::ChatRenderOptions effort_medium_c = effort_medium;
-    effort_medium_c.add_generation_prompt = false;
-    fi::ChatRenderOptions effort_xhigh;
-    effort_xhigh.reasoning_effort = ninfer::ReasoningEffort::XHigh;
-    add(reasoning_effort_template().render(effort_user, effort_medium), "effort medium full");
-    add(reasoning_effort_template().render(effort_user, effort_medium_c), "effort medium committed");
-    add(reasoning_effort_template().render(effort_user, effort_xhigh), "effort xhigh full");
-    add(reasoning_effort_template().render(effort_user, no_think), "effort enable_thinking off");
+        std::vector<Case> cases;
+        auto add = [&](fi::RenderedChat rendered, const char* label) {
+            cases.push_back(Case{std::move(rendered), label});
+        };
+        add(thinking_toggle_template().render(user_hello, {}), "thinking-toggle hello full");
+        add(thinking_toggle_template().render(user_hello, no_generation),
+            "thinking-toggle hello committed");
+        add(thinking_toggle_template().render(user_hello, no_think),
+            "thinking-toggle hello no-think");
+        add(thinking_toggle_template().render(user_cjk, {}), "thinking-toggle CJK/NFC full");
+        add(thinking_toggle_template().render(multi, preserve), "thinking-toggle multi-turn think");
+        add(thinking_toggle_template().render(multi, no_think), "thinking-toggle multi-turn strip");
+        add(thinking_toggle_template().render(tools_one, no_generation),
+            "thinking-toggle one tool");
+        add(thinking_toggle_template().render(tools_two, no_generation),
+            "thinking-toggle two tools");
+        add(thinking_toggle_template().render(late, {}), "thinking-toggle late system");
+        fi::ChatRenderOptions with_tools = preserve;
+        with_tools.tool_jsons.push_back(
+            R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
+        add(thinking_toggle_template().render(user_hello, with_tools),
+            "thinking-toggle tool_jsons");
 
-    for (const Case& test_case : cases) {
-        failures += check_every_byte_boundary(tokenizer, test_case.rendered.text,
-                                              test_case.rendered.rewrite_checkpoint,
-                                              test_case.label);
-        if (failures != 0) { return failures; }
-    }
+        fi::ChatRenderOptions effort_medium;
+        effort_medium.reasoning_effort        = ninfer::ReasoningEffort::Medium;
+        fi::ChatRenderOptions effort_medium_c = effort_medium;
+        effort_medium_c.add_generation_prompt = false;
+        fi::ChatRenderOptions effort_xhigh;
+        effort_xhigh.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+        add(reasoning_effort_template().render(effort_user, effort_medium), "effort medium full");
+        add(reasoning_effort_template().render(effort_user, effort_medium_c),
+            "effort medium committed");
+        add(reasoning_effort_template().render(effort_user, effort_xhigh), "effort xhigh full");
+        add(reasoning_effort_template().render(effort_user, no_think),
+            "effort enable_thinking off");
 
-    failures += check_special_token_interiors(tokenizer, "<|im_start|>");
-    failures += check_special_token_interiors(tokenizer, "<|im_end|>");
-    failures += check_special_token_interiors(tokenizer, "<think>");
-    failures += check_special_token_interiors(tokenizer, "</think>");
-    failures += check_special_token_interiors(tokenizer, "<|vision_start|>");
-    failures += check_special_token_interiors(tokenizer, "<|image_pad|>");
-    if (failures != 0) { return failures; }
-
-    const fi::RenderedChat alpha =
-        thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "alpha")}, {});
-    const fi::RenderedChat alphabet =
-        thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "alphabet")}, {});
-    std::size_t shared = 0;
-    while (shared < alpha.text.size() && shared < alphabet.text.size() &&
-           alpha.text[shared] == alphabet.text[shared]) {
-        ++shared;
-    }
-    failures += check(shared > 0 && shared < alphabet.text.size(),
-                      "alpha/alphabet rendered chats do not share a proper prefix");
-    failures += check(!tokenizer.is_encode_loop_pos(alphabet.text, shared),
-                      "shared alpha/alphabet cut is a tokenizer boundary of alphabet");
-    if (shared > 0) {
-        fi::EncodedHistoryCache shared_cache;
-        shared_cache.insert_committed(std::string(alphabet.text.substr(0, shared)), {1});
-        failures += check(!shared_cache.copy_longest_prefix(alphabet.text, tokenizer, std::nullopt),
-                          "shared non-boundary bytes were used as a cache hit on alphabet");
-        fi::EncodedHistoryCache alpha_cache;
-        const std::vector<int> alpha_ids = tokenizer.encode(alpha.text);
-        alpha_cache.insert_committed(alpha.text, alpha_ids);
-        failures += check(!alpha_cache.copy_longest_prefix(alphabet.text, tokenizer, std::nullopt),
-                          "alpha committed bytes were used as a hit on alphabet");
-    }
-
-    const fi::RenderedChat word =
-        thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "boundaryword")}, {});
-    std::size_t legal_short   = 0;
-    std::size_t illegal_long  = 0;
-    for (std::size_t n = 1; n < word.text.size(); ++n) {
-        if (tokenizer.is_encode_loop_pos(word.text, n)) {
-            if (legal_short == 0) { legal_short = n; }
-        } else if (legal_short != 0) {
-            illegal_long = n;
-            break;
+        for (const Case& test_case : cases) {
+            failures +=
+                check_every_byte_boundary(tokenizer, test_case.rendered.text,
+                                          test_case.rendered.rewrite_checkpoint, test_case.label);
+            if (failures != 0) { return failures; }
         }
-    }
-    failures += check(legal_short != 0 && illegal_long > legal_short,
-                      "could not find a legal cut followed by an illegal longer prefix");
-    if (legal_short != 0 && illegal_long > legal_short) {
-        const fi::EncodedText marked = tokenizer.encode(word.text, legal_short);
-        std::vector<int> short_ids(marked.ids.begin(),
-                                   marked.ids.begin() +
-                                       static_cast<std::ptrdiff_t>(*marked.prefix_tokens));
-        fi::EncodedHistoryCache mixed;
-        mixed.insert_committed(word.text.substr(0, illegal_long), {1, 2, 3});
-        mixed.insert_committed(word.text.substr(0, legal_short), short_ids);
-        const auto hit = mixed.copy_longest_prefix(word.text, tokenizer, std::nullopt);
-        failures += check(hit && hit->bytes.size() == legal_short && hit->ids == short_ids,
-                          "illegal longer byte prefix beat the shorter legal tokenizer cut");
-    }
 
-    fi::EncodedHistoryCache longer_than_full;
-    longer_than_full.insert_committed(word.text + "x", tokenizer.encode(word.text + "x"));
-    failures += check(!longer_than_full.copy_longest_prefix(word.text, tokenizer, std::nullopt),
-                      "stored bytes longer than full were used as a hit");
+        failures += check_special_token_interiors(tokenizer, "<|im_start|>");
+        failures += check_special_token_interiors(tokenizer, "<|im_end|>");
+        failures += check_special_token_interiors(tokenizer, "<think>");
+        failures += check_special_token_interiors(tokenizer, "</think>");
+        failures += check_special_token_interiors(tokenizer, "<|vision_start|>");
+        failures += check_special_token_interiors(tokenizer, "<|image_pad|>");
+        if (failures != 0) { return failures; }
+
+        const fi::RenderedChat alpha =
+            thinking_toggle_template().render({chat_message(ninfer::ChatRole::User, "alpha")}, {});
+        const fi::RenderedChat alphabet = thinking_toggle_template().render(
+            {chat_message(ninfer::ChatRole::User, "alphabet")}, {});
+        std::size_t shared = 0;
+        while (shared < alpha.text.size() && shared < alphabet.text.size() &&
+               alpha.text[shared] == alphabet.text[shared]) {
+            ++shared;
+        }
+        failures += check(shared > 0 && shared < alphabet.text.size(),
+                          "alpha/alphabet rendered chats do not share a proper prefix");
+        failures += check(!tokenizer.is_encode_loop_pos(alphabet.text, shared),
+                          "shared alpha/alphabet cut is a tokenizer boundary of alphabet");
+        if (shared > 0) {
+            fi::EncodedHistoryCache shared_cache;
+            shared_cache.insert_committed(std::string(alphabet.text.substr(0, shared)), {1});
+            failures +=
+                check(!shared_cache.copy_longest_prefix(alphabet.text, tokenizer, std::nullopt),
+                      "shared non-boundary bytes were used as a cache hit on alphabet");
+            fi::EncodedHistoryCache alpha_cache;
+            const std::vector<int> alpha_ids = tokenizer.encode(alpha.text);
+            alpha_cache.insert_committed(alpha.text, alpha_ids);
+            failures +=
+                check(!alpha_cache.copy_longest_prefix(alphabet.text, tokenizer, std::nullopt),
+                      "alpha committed bytes were used as a hit on alphabet");
+        }
+
+        const fi::RenderedChat word = thinking_toggle_template().render(
+            {chat_message(ninfer::ChatRole::User, "boundaryword")}, {});
+        std::size_t legal_short  = 0;
+        std::size_t illegal_long = 0;
+        for (std::size_t n = 1; n < word.text.size(); ++n) {
+            if (tokenizer.is_encode_loop_pos(word.text, n)) {
+                if (legal_short == 0) { legal_short = n; }
+            } else if (legal_short != 0) {
+                illegal_long = n;
+                break;
+            }
+        }
+        failures += check(legal_short != 0 && illegal_long > legal_short,
+                          "could not find a legal cut followed by an illegal longer prefix");
+        if (legal_short != 0 && illegal_long > legal_short) {
+            const fi::EncodedText marked = tokenizer.encode(word.text, legal_short);
+            std::vector<int> short_ids(marked.ids.begin(),
+                                       marked.ids.begin() +
+                                           static_cast<std::ptrdiff_t>(*marked.prefix_tokens));
+            fi::EncodedHistoryCache mixed;
+            mixed.insert_committed(word.text.substr(0, illegal_long), {1, 2, 3});
+            mixed.insert_committed(word.text.substr(0, legal_short), short_ids);
+            const auto hit = mixed.copy_longest_prefix(word.text, tokenizer, std::nullopt);
+            failures += check(hit && hit->bytes.size() == legal_short && hit->ids == short_ids,
+                              "illegal longer byte prefix beat the shorter legal tokenizer cut");
+        }
+
+        fi::EncodedHistoryCache longer_than_full;
+        longer_than_full.insert_committed(word.text + "x", tokenizer.encode(word.text + "x"));
+        failures += check(!longer_than_full.copy_longest_prefix(word.text, tokenizer, std::nullopt),
+                          "stored bytes longer than full were used as a hit");
     }
 
     const fi::Tokenizer toy_tok({.tokenizer_json         = resources().tokenizer_json,
@@ -1789,15 +1845,16 @@ int test_byte_match_and_boundaries() {
 
 int run_prepare_bench() {
     setenv("NINFER_VERIFY_HOST_ENCODE", "0", 1);
-    const Frontend frontend =
-        FrontendFactory::create_component(official_frontend_resources(thinking_toggle_template_source()));
+    const Frontend frontend = FrontendFactory::create_component(
+        official_frontend_resources(thinking_toggle_template_source()));
     fi::EncodedHistoryCache cache;
     const std::string paragraph =
         "Write a concise systems explanation of paged KV cache reuse, speculative decoding, "
         "and why host-side tokenization can hide under GPU prefill at 32k tokens. Include "
         "ASCII punctuation, numbers 0123456789, and a few Chinese characters: 缓存复用。\n";
     const std::vector<int> unit_ids = official_tokenizer().encode(paragraph);
-    const int copies = (150000 + static_cast<int>(unit_ids.size()) - 1) / static_cast<int>(unit_ids.size());
+    const int copies =
+        (150000 + static_cast<int>(unit_ids.size()) - 1) / static_cast<int>(unit_ids.size());
     std::string body;
     body.reserve(paragraph.size() * static_cast<std::size_t>(copies));
     for (int i = 0; i < copies; ++i) { body += paragraph; }
@@ -1810,7 +1867,7 @@ int run_prepare_bench() {
     const double first_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-    const auto t1 = std::chrono::steady_clock::now();
+    const auto t1            = std::chrono::steady_clock::now();
     const auto second_prompt = EncodedHistoryPrepare::prepare(
         frontend,
         product_input({product_message(ninfer::ChatRole::User, body),
@@ -1821,11 +1878,11 @@ int run_prepare_bench() {
     const double second_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     const fi::HostEncodeObservation second_obs = fi::last_host_encode_observation;
-    const auto cold                            = frontend.prepare(product_input(
-        {product_message(ninfer::ChatRole::User, body),
-         product_message(ninfer::ChatRole::Assistant, "ok"),
-         product_message(ninfer::ChatRole::User, "short follow-up")},
-        preserve));
+    const auto cold =
+        frontend.prepare(product_input({product_message(ninfer::ChatRole::User, body),
+                                        product_message(ninfer::ChatRole::Assistant, "ok"),
+                                        product_message(ninfer::ChatRole::User, "short follow-up")},
+                                       preserve));
     std::cerr << std::fixed << std::setprecision(3);
     std::cerr << "prepare_bench first_ms=" << first_ms << " second_ms=" << second_ms
               << " hit=" << second_obs.cache_hit
@@ -1834,7 +1891,8 @@ int run_prepare_bench() {
         std::cerr << "second prepare was not a cache hit\n";
         return 1;
     }
-    if (FrontendFactory::inspect(second_prompt).token_ids != FrontendFactory::inspect(cold).token_ids) {
+    if (FrontendFactory::inspect(second_prompt).token_ids !=
+        FrontendFactory::inspect(cold).token_ids) {
         std::cerr << "second prepare ids differ from cold\n";
         return 1;
     }

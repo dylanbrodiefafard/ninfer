@@ -119,8 +119,8 @@ void projection_oracle(const Geometry& geometry, const std::vector<float>& x,
             }
             const std::size_t output = sample * geometry.heads + head;
             g[output]                = -std::exp(static_cast<double>(a_log[head])) *
-                        softplus(projected_a + static_cast<double>(dt_bias[head]));
-            beta[output] = sigmoid(projected_b);
+                                       softplus(projected_a + static_cast<double>(dt_bias[head]));
+            beta[output]             = sigmoid(projected_b);
         }
     }
 }
@@ -167,8 +167,8 @@ void norm_projection_oracle(const Geometry& geometry, const std::vector<float>& 
             }
             const std::size_t output = static_cast<std::size_t>(token) * geometry.heads + head;
             g[output]                = -std::exp(static_cast<double>(a_log[head])) *
-                        softplus(projected_a + static_cast<double>(dt_bias[head]));
-            beta[output] = sigmoid(projected_b);
+                                       softplus(projected_a + static_cast<double>(dt_bias[head]));
+            beta[output]             = sigmoid(projected_b);
         }
     }
 }
@@ -315,15 +315,15 @@ int run_packed_column0_matches_decode(const Geometry& geometry, std::int32_t tok
     round_to_bf16(a_weight);
     round_to_bf16(b_weight);
 
-    const std::vector<std::uint16_t> x_bits        = bf16_bits(x);
-    const std::vector<std::uint16_t> a_bits        = bf16_bits(a_weight);
-    const std::vector<std::uint16_t> b_bits        = bf16_bits(b_weight);
-    DeviceBuffer device_x                          = to_device(x_bits);
-    DeviceBuffer device_a                          = to_device(a_bits);
-    DeviceBuffer device_b                          = to_device(b_bits);
-    DeviceBuffer device_a_log                      = to_device(a_log);
-    DeviceBuffer device_dt_bias                    = to_device(dt_bias);
-    const std::size_t packed_elements = static_cast<std::size_t>(geometry.heads) * tokens;
+    const std::vector<std::uint16_t> x_bits = bf16_bits(x);
+    const std::vector<std::uint16_t> a_bits = bf16_bits(a_weight);
+    const std::vector<std::uint16_t> b_bits = bf16_bits(b_weight);
+    DeviceBuffer device_x                   = to_device(x_bits);
+    DeviceBuffer device_a                   = to_device(a_bits);
+    DeviceBuffer device_b                   = to_device(b_bits);
+    DeviceBuffer device_a_log               = to_device(a_log);
+    DeviceBuffer device_dt_bias             = to_device(dt_bias);
+    const std::size_t packed_elements       = static_cast<std::size_t>(geometry.heads) * tokens;
     GuardedDeviceBuffer packed_g(packed_elements * sizeof(float));
     GuardedDeviceBuffer packed_beta(packed_elements * sizeof(float));
     GuardedDeviceBuffer decode_g(static_cast<std::size_t>(geometry.heads) * sizeof(float));
@@ -356,8 +356,7 @@ int run_packed_column0_matches_decode(const Geometry& geometry, std::int32_t tok
                          decode_workspace, tensor_dg, tensor_db, nullptr);
     cuda_synchronize();
 
-    const std::vector<float> packed_g_host =
-        from_device<float>(packed_g.data(), packed_elements);
+    const std::vector<float> packed_g_host = from_device<float>(packed_g.data(), packed_elements);
     const std::vector<float> packed_beta_host =
         from_device<float>(packed_beta.data(), packed_elements);
     const std::vector<float> decode_g_host =
@@ -366,16 +365,14 @@ int run_packed_column0_matches_decode(const Geometry& geometry, std::int32_t tok
         from_device<float>(decode_beta.data(), static_cast<std::size_t>(geometry.heads));
     const std::string label = std::string("gdn_gating_proj packed-col0 ") + geometry.label +
                               " T=" + std::to_string(tokens);
-    int failures = 0;
+    int failures            = 0;
     failures += verify_exact(
         (label + " g").c_str(),
-        std::vector<float>(packed_g_host.begin(),
-                           packed_g_host.begin() + geometry.heads),
+        std::vector<float>(packed_g_host.begin(), packed_g_host.begin() + geometry.heads),
         decode_g_host);
     failures += verify_exact(
         (label + " beta").c_str(),
-        std::vector<float>(packed_beta_host.begin(),
-                           packed_beta_host.begin() + geometry.heads),
+        std::vector<float>(packed_beta_host.begin(), packed_beta_host.begin() + geometry.heads),
         decode_beta_host);
     return failures;
 }
@@ -403,7 +400,7 @@ int run_packed_columns_match_decode(const Geometry& geometry, std::int32_t token
     DeviceBuffer device_b                   = to_device(b_bits);
     DeviceBuffer device_a_log               = to_device(a_log);
     DeviceBuffer device_dt_bias             = to_device(dt_bias);
-    const std::size_t packed_elements = static_cast<std::size_t>(geometry.heads) * tokens;
+    const std::size_t packed_elements       = static_cast<std::size_t>(geometry.heads) * tokens;
     GuardedDeviceBuffer packed_g(packed_elements * sizeof(float));
     GuardedDeviceBuffer packed_beta(packed_elements * sizeof(float));
     packed_g.fill(0xff);
@@ -414,16 +411,15 @@ int run_packed_columns_match_decode(const Geometry& geometry, std::int32_t token
     Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {geometry.heads});
     Tensor tensor_pg(packed_g.data(), DType::FP32, {geometry.heads, tokens});
     Tensor tensor_pb(packed_beta.data(), DType::FP32, {geometry.heads, tokens});
-    Weight weight_a = bf16_weight(device_a.p, geometry.heads, geometry.hidden);
-    Weight weight_b = bf16_weight(device_b.p, geometry.heads, geometry.hidden);
+    Weight weight_a             = bf16_weight(device_a.p, geometry.heads, geometry.hidden);
+    Weight weight_b             = bf16_weight(device_b.p, geometry.heads, geometry.hidden);
     const std::size_t packed_ws = ops::gdn_gating_proj_workspace_capacity_bytes(
         geometry.heads, geometry.hidden, tokens, tokens);
     WorkspaceArena packed_workspace(std::max<std::size_t>(256, packed_ws));
     ops::gdn_gating_proj(tensor_x, weight_a, weight_b, tensor_a_log, tensor_dt_bias,
                          packed_workspace, tensor_pg, tensor_pb, nullptr);
     cuda_synchronize();
-    const std::vector<float> packed_g_host =
-        from_device<float>(packed_g.data(), packed_elements);
+    const std::vector<float> packed_g_host = from_device<float>(packed_g.data(), packed_elements);
     const std::vector<float> packed_beta_host =
         from_device<float>(packed_beta.data(), packed_elements);
 
@@ -435,10 +431,10 @@ int run_packed_columns_match_decode(const Geometry& geometry, std::int32_t token
         GuardedDeviceBuffer decode_beta(static_cast<std::size_t>(geometry.heads) * sizeof(float));
         decode_g.fill(0xff);
         decode_beta.fill(0xff);
-        Tensor tensor_x1(
-            static_cast<std::byte*>(device_x.p) +
-                static_cast<std::size_t>(column) * geometry.hidden * sizeof(std::uint16_t),
-            DType::BF16, {geometry.hidden, 1});
+        Tensor tensor_x1(static_cast<std::byte*>(device_x.p) + static_cast<std::size_t>(column) *
+                                                                   geometry.hidden *
+                                                                   sizeof(std::uint16_t),
+                         DType::BF16, {geometry.hidden, 1});
         Tensor tensor_dg(decode_g.data(), DType::FP32, {geometry.heads, 1});
         Tensor tensor_db(decode_beta.data(), DType::FP32, {geometry.heads, 1});
         WorkspaceArena decode_workspace(std::max<std::size_t>(256, decode_ws));
@@ -450,9 +446,8 @@ int run_packed_columns_match_decode(const Geometry& geometry, std::int32_t token
         const std::vector<float> decode_beta_host =
             from_device<float>(decode_beta.data(), static_cast<std::size_t>(geometry.heads));
         const std::size_t offset = static_cast<std::size_t>(column) * geometry.heads;
-        const std::string label  = std::string("gdn_gating_proj packed-col ") + geometry.label +
-                                  " T=" + std::to_string(tokens) +
-                                  " col=" + std::to_string(column);
+        const std::string label = std::string("gdn_gating_proj packed-col ") + geometry.label +
+                                  " T=" + std::to_string(tokens) + " col=" + std::to_string(column);
         failures += verify_exact(
             (label + " g").c_str(),
             std::vector<float>(packed_g_host.begin() + static_cast<std::ptrdiff_t>(offset),
@@ -471,8 +466,7 @@ int run_packed_columns_match_decode(const Geometry& geometry, std::int32_t token
 }
 
 int run_norm_packed_columns_match_decode(const Geometry& geometry, std::int32_t tokens,
-                                         std::uint32_t seed,
-                                         std::int32_t sequence_width = 5) {
+                                         std::uint32_t seed, std::int32_t sequence_width = 5) {
     constexpr float kEps = 1.0e-6F;
     std::vector<float> x(static_cast<std::size_t>(geometry.hidden) * tokens);
     std::vector<float> norm_weight(static_cast<std::size_t>(geometry.hidden));
@@ -501,8 +495,8 @@ int run_norm_packed_columns_match_decode(const Geometry& geometry, std::int32_t 
     DeviceBuffer device_a_log                         = to_device(a_log);
     DeviceBuffer device_dt_bias                       = to_device(dt_bias);
 
-    const std::size_t packed_h      = static_cast<std::size_t>(geometry.hidden) * tokens;
-    const std::size_t packed_ctrl   = static_cast<std::size_t>(geometry.heads) * tokens;
+    const std::size_t packed_h    = static_cast<std::size_t>(geometry.hidden) * tokens;
+    const std::size_t packed_ctrl = static_cast<std::size_t>(geometry.heads) * tokens;
     GuardedDeviceBuffer packed_h_buf(packed_h * sizeof(std::uint16_t));
     GuardedDeviceBuffer packed_g(packed_ctrl * sizeof(float));
     GuardedDeviceBuffer packed_beta(packed_ctrl * sizeof(float));
@@ -544,24 +538,21 @@ int run_norm_packed_columns_match_decode(const Geometry& geometry, std::int32_t 
         Tensor panel_h_out    = tensor_panel_h.slice(1, offset, sequence_width);
         Tensor panel_g_out    = tensor_panel_g.slice(1, offset, sequence_width);
         Tensor panel_beta_out = tensor_panel_beta.slice(1, offset, sequence_width);
-        ops::gdn_norm_gating_proj(
-            tensor_x.slice(1, offset, sequence_width), tensor_norm, kEps, weight_a, weight_b,
-            tensor_a_log, tensor_dt_bias, panel_workspace, panel_h_out, panel_g_out, panel_beta_out,
-            nullptr);
+        ops::gdn_norm_gating_proj(tensor_x.slice(1, offset, sequence_width), tensor_norm, kEps,
+                                  weight_a, weight_b, tensor_a_log, tensor_dt_bias, panel_workspace,
+                                  panel_h_out, panel_g_out, panel_beta_out, nullptr);
     }
     cuda_synchronize();
 
     const std::vector<std::uint16_t> packed_h_host =
         from_device<std::uint16_t>(packed_h_buf.data(), packed_h);
-    const std::vector<float> packed_g_host = from_device<float>(packed_g.data(), packed_ctrl);
-    const std::vector<float> packed_beta_host =
-        from_device<float>(packed_beta.data(), packed_ctrl);
-    const std::string label = std::string("gdn_norm_gating_proj packed-panels ") +
-                              geometry.label + " T=" + std::to_string(tokens) +
+    const std::vector<float> packed_g_host    = from_device<float>(packed_g.data(), packed_ctrl);
+    const std::vector<float> packed_beta_host = from_device<float>(packed_beta.data(), packed_ctrl);
+    const std::string label = std::string("gdn_norm_gating_proj packed-panels ") + geometry.label +
+                              " T=" + std::to_string(tokens) +
                               " W=" + std::to_string(sequence_width);
-    int failures = verify_exact(
-        (label + " h").c_str(), packed_h_host,
-        from_device<std::uint16_t>(panel_h_buf.data(), packed_h));
+    int failures = verify_exact((label + " h").c_str(), packed_h_host,
+                                from_device<std::uint16_t>(panel_h_buf.data(), packed_h));
     failures += verify_exact((label + " g").c_str(), packed_g_host,
                              from_device<float>(panel_g.data(), packed_ctrl));
     failures += verify_exact((label + " beta").c_str(), packed_beta_host,
@@ -637,11 +628,10 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     Tensor tensor_g(device_g.data(), DType::FP32, {geometry.heads, tokens});
     Tensor tensor_beta(device_beta.data(), DType::FP32, {geometry.heads, tokens});
     const std::size_t workspace_bytes =
-        sequence_width > 0
-            ? ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
-                  sequence_width, tokens / sequence_width, tokens / sequence_width)
-            : ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
-                                                                  tokens, tokens);
+        sequence_width > 0 ? ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
+                                 sequence_width, tokens / sequence_width, tokens / sequence_width)
+                           : ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                                 geometry.heads, geometry.hidden, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (geometry.parent_weight) {
@@ -653,10 +643,10 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
         Weight weight_a = bf16_weight(device_weight.p, geometry.heads, geometry.hidden);
         Weight weight_b = bf16_weight(device_b_weight.p, geometry.heads, geometry.hidden);
         if (sequence_width > 0) {
-            ops::gdn_norm_gating_proj_packed_sequences(
-                tensor_x, tensor_norm_weight, kEps, weight_a, weight_b, tensor_a_log,
-                tensor_dt_bias, workspace, tensor_h, tensor_g, tensor_beta, nullptr,
-                sequence_width);
+            ops::gdn_norm_gating_proj_packed_sequences(tensor_x, tensor_norm_weight, kEps, weight_a,
+                                                       weight_b, tensor_a_log, tensor_dt_bias,
+                                                       workspace, tensor_h, tensor_g, tensor_beta,
+                                                       nullptr, sequence_width);
         } else {
             ops::gdn_norm_gating_proj(tensor_x, tensor_norm_weight, kEps, weight_a, weight_b,
                                       tensor_a_log, tensor_dt_bias, workspace, tensor_h, tensor_g,
@@ -665,11 +655,9 @@ int run_norm_projection_case(const Geometry& geometry, std::int32_t tokens, std:
     }
     cuda_synchronize();
 
-    const std::string label = std::string("gdn_norm_gating_proj ") + geometry.label +
-                              " T=" + std::to_string(tokens) +
-                              (sequence_width > 0 ? " packed-width=" +
-                                                        std::to_string(sequence_width)
-                                                  : "");
+    const std::string label =
+        std::string("gdn_norm_gating_proj ") + geometry.label + " T=" + std::to_string(tokens) +
+        (sequence_width > 0 ? " packed-width=" + std::to_string(sequence_width) : "");
     int failures = 0;
     failures += verify_normwise(label + " h", from_device_bf16(device_h.data(), h_elements),
                                 reference_h, kGdnNormOutputBf16);
@@ -716,11 +704,12 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     }
     const std::size_t norm_interval =
         ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
-    const std::size_t norm_witness = std::max(
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, geometry.heads == 48 ? 36 : 16,
-                                                                geometry.heads == 48 ? 36 : 16),
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
-                                                           64));
+    const std::size_t norm_witness =
+        std::max(ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
+                                                                    geometry.heads == 48 ? 36 : 16,
+                                                                    geometry.heads == 48 ? 36 : 16),
+                 ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
+                                                                    64, 64));
     if (norm_interval != norm_witness) {
         std::cerr << geometry.label << ": GDN norm/control interval missed a route endpoint\n";
         ++failures;
@@ -729,17 +718,15 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
 }
 
 int verify_packed_workspace_rejections() {
-    int failures = 0;
-    const auto expect_invalid = [&](std::int32_t width, std::int32_t first,
-                                    std::int32_t last) {
+    int failures              = 0;
+    const auto expect_invalid = [&](std::int32_t width, std::int32_t first, std::int32_t last) {
         try {
             (void)ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(width, first,
                                                                                       last);
             std::cerr << "gdn packed workspace accepted invalid W=" << width << " B=" << first
                       << ".." << last << '\n';
             ++failures;
-        } catch (const std::invalid_argument&) {
-        }
+        } catch (const std::invalid_argument&) {}
     };
     expect_invalid(0, 1, 1);
     expect_invalid(5, 0, 1);
@@ -763,7 +750,8 @@ int main() {
 
     // Every registered 27B projection route, including predicated and full token tiles.
     // Narrow MMA tile boundaries and the T=36/37 transition to the long-context schedule.
-    for (const std::int32_t tokens : {1, 2, 6, 8, 9, 12, 16, 17, 32, 33, 36, 37, 1024, 1025, 2049, 4097}) {
+    for (const std::int32_t tokens :
+         {1, 2, 6, 8, 9, 12, 16, 17, 32, 33, 36, 37, 1024, 1025, 2049, 4097}) {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }

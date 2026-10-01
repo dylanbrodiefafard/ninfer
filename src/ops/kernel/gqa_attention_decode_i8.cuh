@@ -427,8 +427,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
             gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
             gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
-            const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
-            const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
+            const int qabs0   = (row0 < RowCount) ? pos[token0] : -1;
+            const int qabs1   = (row1 < RowCount) ? pos[token1] : -1;
             int prefix_length = 0;
             int bits0         = 0;
             int bits1         = 0;

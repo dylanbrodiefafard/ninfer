@@ -106,7 +106,9 @@ def useful_flops(tokens: int, context: int) -> float:
     return 4.0 * HEAD_DIM * Q_HEADS * append_prompt_key_sum(tokens, context)
 
 
-def metrics_from_result(tokens: int, context: int, mode: str, result: dict[str, float | int]) -> dict:
+def metrics_from_result(
+    tokens: int, context: int, mode: str, result: dict[str, float | int]
+) -> dict:
     median_us = float(result["median_us"])
     key_sum = append_prompt_key_sum(tokens, context)
     flops = useful_flops(tokens, context)
@@ -156,7 +158,9 @@ def load_ninfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
     return out
 
 
-def attach_ninfer_comparison(rows: list[dict], ninfer_rows: dict[tuple[int, int], dict[str, str]]) -> None:
+def attach_ninfer_comparison(
+    rows: list[dict], ninfer_rows: dict[tuple[int, int], dict[str, str]]
+) -> None:
     for row in rows:
         ninfer = ninfer_rows.get((int(row["T"]), int(row["context"])))
         if ninfer is None:
@@ -166,7 +170,9 @@ def attach_ninfer_comparison(rows: list[dict], ninfer_rows: dict[tuple[int, int]
         ninfer_tflops = float(ninfer["useful_flops"]) / (ninfer_us * 1.0e-6) / 1.0e12
         row["ninfer_ms"] = ninfer_ms
         row["ninfer_tflops"] = ninfer_tflops
-        row["flash_vs_ninfer_speedup"] = ninfer_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
+        row["flash_vs_ninfer_speedup"] = (
+            ninfer_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
+        )
         row["flash_vs_ninfer_tflops_ratio"] = (
             float(row["tflops"]) / ninfer_tflops if ninfer_tflops > 0.0 else None
         )
@@ -356,7 +362,9 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--min-time-ms", type=int, default=500)
-    parser.add_argument("--include-fill", action="store_true", help="also time cache K/V slice fill")
+    parser.add_argument(
+        "--include-fill", action="store_true", help="also time cache K/V slice fill"
+    )
     parser.add_argument("--attention-only", action="store_true", help="only time FlashAttention")
     parser.add_argument(
         "--decode",
@@ -373,7 +381,9 @@ def main() -> int:
         action="store_true",
         help="small-T MTP-verify via flash_attn_with_kvcache (seqlen_q = T)",
     )
-    parser.add_argument("--verify-tokens", default="1,2,3,4", help="comma-separated verify T values")
+    parser.add_argument(
+        "--verify-tokens", default="1,2,3,4", help="comma-separated verify T values"
+    )
     parser.add_argument(
         "--verify-context", default="2048,8192,32768", help="comma-separated verify context values"
     )
@@ -425,7 +435,11 @@ def main() -> int:
             "kv_heads": KV_HEADS,
             "scale": SCALE,
             "mode": "decode",
-            "timing": {"warmup": args.warmup, "repeat": args.repeat, "min_time_ms": args.min_time_ms},
+            "timing": {
+                "warmup": args.warmup,
+                "repeat": args.repeat,
+                "min_time_ms": args.min_time_ms,
+            },
         }
         write_csv(args.csv_out, rows)
         write_json(args.json_out, rows, metadata)
@@ -454,7 +468,11 @@ def main() -> int:
             "kv_heads": KV_HEADS,
             "scale": SCALE,
             "mode": "verify",
-            "timing": {"warmup": args.warmup, "repeat": args.repeat, "min_time_ms": args.min_time_ms},
+            "timing": {
+                "warmup": args.warmup,
+                "repeat": args.repeat,
+                "min_time_ms": args.min_time_ms,
+            },
         }
         write_csv(args.csv_out, rows)
         write_json(args.json_out, rows, metadata)
@@ -477,8 +495,12 @@ def main() -> int:
         for context in contexts:
             end_context = context + tokens
             q = torch.empty((1, tokens, Q_HEADS, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
-            k_full = torch.empty((1, end_context, KV_HEADS, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
-            v_full = torch.empty((1, end_context, KV_HEADS, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+            k_full = torch.empty(
+                (1, end_context, KV_HEADS, HEAD_DIM), device="cuda", dtype=torch.bfloat16
+            )
+            v_full = torch.empty(
+                (1, end_context, KV_HEADS, HEAD_DIM), device="cuda", dtype=torch.bfloat16
+            )
             q.normal_(mean=0.0, std=0.5)
             k_full.normal_(mean=0.0, std=0.5)
             v_full.normal_(mean=0.0, std=0.5)

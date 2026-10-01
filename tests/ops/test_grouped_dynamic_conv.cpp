@@ -17,15 +17,16 @@ using namespace ninfer::test::direct_bf16_weight;
 
 namespace {
 
-constexpr std::int32_t kD = ops::kGroupedDynamicConvHidden;
-constexpr std::int32_t kG = ops::kGroupedDynamicConvGroups;
+constexpr std::int32_t kD     = ops::kGroupedDynamicConvHidden;
+constexpr std::int32_t kG     = ops::kGroupedDynamicConvGroups;
 constexpr std::int32_t kGroup = ops::kGroupedDynamicConvGroupSize;
-constexpr std::int32_t kProj = ops::kGroupedDynamicConvProjRows;
+constexpr std::int32_t kProj  = ops::kGroupedDynamicConvProjRows;
 
 constexpr ReductionCriterion prepare_criterion() {
     return {/*relative_l2*/ 1.0 / 256.0, /*gross_absolute*/ 1.0 / 256.0,
             /*gross_relative_to_max_reference*/ 2.0 / 256.0};
 }
+
 constexpr PointwiseCriterion finish_criterion() {
     return {/*absolute*/ 1.0 / 256.0, /*relative*/ 4.0 / 256.0};
 }
@@ -138,15 +139,15 @@ int run_prepare_case(const char* label, std::int32_t tokens, std::int32_t batch,
     Tensor hidden_t = batch == 1 ? Tensor(device_hidden.data(), DType::BF16, {kD, tokens})
                                  : Tensor(device_hidden.data(), DType::BF16, {kD, tokens, batch});
     Tensor base_t(device_base.data(), DType::BF16, {kD, 2, 2});
-    Tensor prepared_t = batch == 1 ? Tensor(device_prepared.data(), DType::BF16, {kD, tokens})
-                                   : Tensor(device_prepared.data(), DType::BF16, {kD, tokens, batch});
-    Tensor finish_t =
-        batch == 1 ? Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens})
-                   : Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens, batch});
+    Tensor prepared_t = batch == 1
+                            ? Tensor(device_prepared.data(), DType::BF16, {kD, tokens})
+                            : Tensor(device_prepared.data(), DType::BF16, {kD, tokens, batch});
+    Tensor finish_t   = batch == 1
+                            ? Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens})
+                            : Tensor(device_finish.data(), DType::BF16, {kG, 2, tokens, batch});
 
-    const std::size_t workspace_bytes =
-        ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens,
-                                                                   batch);
+    const std::size_t workspace_bytes = ops::grouped_dynamic_conv_prepare_workspace_capacity_bytes(
+        QType::BF16_CTRL, tokens, tokens, batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     ops::grouped_dynamic_conv_prepare(hidden_t, base_t, device_weight.view(), prepared_t, finish_t,
                                       workspace, nullptr);
@@ -216,8 +217,8 @@ int run_nvfp4_prepare_case(const char* label, std::int32_t tokens) {
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 1.0F;
-    input_projection::DevicePackedWeight device_weight(quantized_weight::make_patterned_weight(
-        QType::NVFP4, kProj, kD, 77u, options));
+    input_projection::DevicePackedWeight device_weight(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kProj, kD, 77u, options));
 
     std::vector<float> hidden(static_cast<std::size_t>(kD) * tokens);
     std::vector<float> base(static_cast<std::size_t>(kD) * 4);

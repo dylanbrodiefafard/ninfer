@@ -7,11 +7,11 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kKVCacheAppendPrefixHeadDim = 128;
-inline constexpr int kKVCacheAppendPrefixHeads   = 8;
+inline constexpr int kKVCacheAppendPrefixHeadDim    = 128;
+inline constexpr int kKVCacheAppendPrefixHeads      = 8;
 inline constexpr int kKVCacheAppendPrefixWindow2048 = 2048;
 inline constexpr int kKVCacheAppendPrefixWindow4096 = 4096;
-inline constexpr int kKVCacheAppendPrefixPage    = 64;
+inline constexpr int kKVCacheAppendPrefixPage       = 64;
 
 __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,

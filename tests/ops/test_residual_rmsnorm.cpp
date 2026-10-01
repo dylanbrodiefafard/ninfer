@@ -37,14 +37,14 @@ void fused_oracle(const std::vector<float>& y, const std::vector<float>& x,
         const std::size_t base = static_cast<std::size_t>(row) * shape.d;
         double sum_squares     = 0.0;
         for (std::int32_t column = 0; column < shape.d; ++column) {
-            const double value = static_cast<double>(x[base + column]) +
-                                 static_cast<double>(y[base + column]);
+            const double value =
+                static_cast<double>(x[base + column]) + static_cast<double>(y[base + column]);
             residual[base + column] = value;
             sum_squares += value * value;
         }
         const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + kEps);
         for (std::int32_t column = 0; column < shape.d; ++column) {
-            const double gain = static_cast<double>(weight[column]) + 1.0;
+            const double gain         = static_cast<double>(weight[column]) + 1.0;
             normalized[base + column] = residual[base + column] * inverse * gain;
         }
     }
@@ -78,19 +78,19 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     device_x.copy_from_host(x_bits.data(), device_x.bytes());
     device_out.fill(0xff);
 
-    Tensor y_tensor      = tensor_for(device_y.data, shape);
-    Tensor x_tensor      = tensor_for(device_x.data(), shape);
+    Tensor y_tensor = tensor_for(device_y.data, shape);
+    Tensor x_tensor = tensor_for(device_x.data(), shape);
     Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
-    Tensor out_tensor    = tensor_for(device_out.data(), shape);
+    Tensor out_tensor = tensor_for(device_out.data(), shape);
     ops::residual_rmsnorm(y_tensor, x_tensor, weight_tensor, kEps, out_tensor, nullptr);
     cuda_synchronize();
 
-    int failures = verify_reduction(std::string(label) + " out",
-                                    from_device_bf16(device_out.data(), count), normalized_ref,
-                                    residual_rmsnorm_out_criterion());
-    failures += verify_pointwise(std::string(label) + " residual",
-                                 from_device_bf16(device_x.data(), count), residual_ref,
-                                 residual_stream_criterion());
+    int failures =
+        verify_reduction(std::string(label) + " out", from_device_bf16(device_out.data(), count),
+                         normalized_ref, residual_rmsnorm_out_criterion());
+    failures +=
+        verify_pointwise(std::string(label) + " residual", from_device_bf16(device_x.data(), count),
+                         residual_ref, residual_stream_criterion());
     failures += verify_output_storage(std::string(label) + " out storage", device_out, false);
     failures += device_x.verify_guards((std::string(label) + " residual").c_str());
     failures += verify_preserved(std::string(label) + " preserves y", device_y);

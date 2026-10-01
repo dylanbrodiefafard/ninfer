@@ -31,20 +31,20 @@ VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         VisionLayerPlan& target  = out.layers[layer];
         const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
-        target.qkv               = bind(prefix + "attention/qkv", NumericFormat::Q4G64_F16S,
-                                        {3 * VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
-        target.qkv_bias          = bind(prefix + "attention/qkv_bias", NumericFormat::BF16,
-                                        {3 * VisionBackboneConfig::hidden});
-        target.output            = bind(prefix + "attention/output", NumericFormat::Q5G64_F16S,
-                                        {VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
-        target.output_bias       = bind(prefix + "attention/output_bias", NumericFormat::BF16,
-                                        {VisionBackboneConfig::hidden});
-        target.fc1               = bind(prefix + "mlp/fc1", NumericFormat::Q4G64_F16S,
-                                        {VisionBackboneConfig::intermediate, VisionBackboneConfig::hidden});
-        target.fc1_bias          = bind(prefix + "mlp/fc1_bias", NumericFormat::BF16,
-                                        {VisionBackboneConfig::intermediate});
-        target.fc2               = bind(prefix + "mlp/fc2", NumericFormat::Q5G64_F16S,
-                                        {VisionBackboneConfig::hidden, VisionBackboneConfig::intermediate});
+        target.qkv         = bind(prefix + "attention/qkv", NumericFormat::Q4G64_F16S,
+                                  {3 * VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
+        target.qkv_bias    = bind(prefix + "attention/qkv_bias", NumericFormat::BF16,
+                                  {3 * VisionBackboneConfig::hidden});
+        target.output      = bind(prefix + "attention/output", NumericFormat::Q5G64_F16S,
+                                  {VisionBackboneConfig::hidden, VisionBackboneConfig::hidden});
+        target.output_bias = bind(prefix + "attention/output_bias", NumericFormat::BF16,
+                                  {VisionBackboneConfig::hidden});
+        target.fc1      = bind(prefix + "mlp/fc1", NumericFormat::Q4G64_F16S,
+                               {VisionBackboneConfig::intermediate, VisionBackboneConfig::hidden});
+        target.fc1_bias = bind(prefix + "mlp/fc1_bias", NumericFormat::BF16,
+                               {VisionBackboneConfig::intermediate});
+        target.fc2      = bind(prefix + "mlp/fc2", NumericFormat::Q5G64_F16S,
+                               {VisionBackboneConfig::hidden, VisionBackboneConfig::intermediate});
         target.fc2_bias =
             bind(prefix + "mlp/fc2_bias", NumericFormat::BF16, {VisionBackboneConfig::hidden});
         target.norm1_weight =
@@ -67,8 +67,8 @@ VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
     return VisionMergerInputPlan{
-        .fc1      = bind("vision/merger/fc1", NumericFormat::W8G32_F16S,
-                         {VisionBackboneConfig::merger_hidden, VisionBackboneConfig::merger_hidden}),
+        .fc1 = bind("vision/merger/fc1", NumericFormat::W8G32_F16S,
+                    {VisionBackboneConfig::merger_hidden, VisionBackboneConfig::merger_hidden}),
         .fc1_bias = bind("vision/merger/fc1_bias", NumericFormat::BF16,
                          {VisionBackboneConfig::merger_hidden}),
     };

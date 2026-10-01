@@ -409,8 +409,8 @@ void run_text(int tokens, int axes, bool control, int candidate_block, const cha
     Tensor tpos(positions.p, DType::I32, {tokens, axes});
     Tensor tq(q.p, DType::BF16, {kTextHeadDim, QHeads, tokens});
     Tensor tk(k.p, DType::BF16, {kTextHeadDim, KHeads, tokens});
-    const double bytes = 2.0 * static_cast<double>((QHeads + KHeads) * kTextRotaryDim) * tokens *
-                         sizeof(__nv_bfloat16);
+    const double bytes  = 2.0 * static_cast<double>((QHeads + KHeads) * kTextRotaryDim) * tokens *
+                          sizeof(__nv_bfloat16);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             if (control) {
@@ -428,8 +428,8 @@ void run_text(int tokens, int axes, bool control, int candidate_block, const cha
                                      ? "fixed-b" + std::to_string(production_block)
                                      : "candidate-b" + std::to_string(candidate_block);
     const std::string label    = std::string("rope text ") + geometry +
-                              " axes=" + std::to_string(axes) + " route=" + route +
-                              " T=" + std::to_string(tokens);
+                                 " axes=" + std::to_string(axes) + " route=" + route +
+                                 " T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
 
@@ -448,7 +448,7 @@ void run_dflash(int tokens, bool control, int candidate_block, int candidate_hea
     const double bytes = 2.0 *
                          static_cast<double>((kDflashQHeads + kDflashKHeads) * kDflashRotaryDim) *
                          tokens * sizeof(__nv_bfloat16);
-    const auto launch = [&](cudaStream_t stream) {
+    const auto launch  = [&](cudaStream_t stream) {
         if (control) {
             launch_dflash_control(tpos, tq, tk, stream);
         } else if (candidate_heads != 0) {
@@ -490,8 +490,8 @@ void run_dflash_single_k(int tokens, bool control) {
     DeviceBuffer x             = make_bf16(elements);
     Tensor tpos(positions.p, DType::I32, {tokens});
     Tensor tx(x.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
-    const double bytes = 2.0 * static_cast<double>(kDflashKHeads * kDflashRotaryDim) * tokens *
-                         sizeof(__nv_bfloat16);
+    const double bytes  = 2.0 * static_cast<double>(kDflashKHeads * kDflashRotaryDim) * tokens *
+                          sizeof(__nv_bfloat16);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             if (control) {
@@ -523,8 +523,8 @@ void run_vision(int patches, bool control) {
     Tensor tk = tq;
     tk.data   = static_cast<unsigned char*>(packed.p) + hidden * 2;
     Tensor tpos(positions.p, DType::I32, {patches, 2});
-    const double bytes = 2.0 * static_cast<double>(2 * kVisionHeads * kVisionHeadDim) * patches *
-                         sizeof(__nv_bfloat16);
+    const double bytes  = 2.0 * static_cast<double>(2 * kVisionHeads * kVisionHeadDim) * patches *
+                          sizeof(__nv_bfloat16);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
             if (control) {

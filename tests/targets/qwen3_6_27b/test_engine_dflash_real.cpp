@@ -22,14 +22,13 @@ namespace {
 constexpr std::size_t kIsolationRequests = ninfer::kMaximumConcurrency;
 using IsolationTokens = std::array<std::vector<ninfer::TokenId>, kIsolationRequests>;
 
-
 ninfer::EngineOptions base_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path  = artifact;
-    options.max_context    = 512;
-    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(512);
-    options.prefill_chunk  = 128;
-    options.kv_cache       = ninfer::KvCacheStorage::Nvfp4;
+    options.artifact_path = artifact;
+    options.max_context   = 512;
+    options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(512);
+    options.prefill_chunk = 128;
+    options.kv_cache      = ninfer::KvCacheStorage::Nvfp4;
     if (std::getenv("NINFER_DFLASH_TEST_BF16_KV") != nullptr) {
         options.kv_cache = ninfer::KvCacheStorage::BFloat16;
     }
@@ -71,43 +70,43 @@ ninfer::RequestOptions greedy_options(std::uint32_t outputs) {
 
 ninfer::RequestOptions p_less_options(std::uint32_t outputs, std::uint64_t seed) {
     ninfer::RequestOptions options;
-    options.execution.requested_output_tokens     = outputs;
-    options.execution.sampling.temperature        = 2.0F;
-    options.execution.sampling.top_k              = 1;
-    options.execution.sampling.top_p              = 0.1F;
-    options.execution.sampling.min_p              = 0.9F;
-    options.execution.sampling.presence_penalty   = 2.0F;
-    options.execution.sampling.frequency_penalty  = 2.0F;
-    options.execution.sampling.seed               = seed;
-    options.execution.sampling.p_less             = true;
-    options.execution.allow_prefix_reuse          = false;
-    options.stop.include_model_defaults           = false;
+    options.execution.requested_output_tokens    = outputs;
+    options.execution.sampling.temperature       = 2.0F;
+    options.execution.sampling.top_k             = 1;
+    options.execution.sampling.top_p             = 0.1F;
+    options.execution.sampling.min_p             = 0.9F;
+    options.execution.sampling.presence_penalty  = 2.0F;
+    options.execution.sampling.frequency_penalty = 2.0F;
+    options.execution.sampling.seed              = seed;
+    options.execution.sampling.p_less            = true;
+    options.execution.allow_prefix_reuse         = false;
+    options.stop.include_model_defaults          = false;
     return options;
 }
 
 ninfer::RequestOptions greedy_reuse(std::uint32_t outputs, bool reuse) {
-    ninfer::RequestOptions options          = greedy_options(outputs);
-    options.execution.allow_prefix_reuse    = reuse;
+    ninfer::RequestOptions options       = greedy_options(outputs);
+    options.execution.allow_prefix_reuse = reuse;
     return options;
 }
 
 ninfer::RequestOptions p_less_reuse(std::uint32_t outputs, std::uint64_t seed, bool reuse) {
-    ninfer::RequestOptions options          = p_less_options(outputs, seed);
-    options.execution.allow_prefix_reuse    = reuse;
+    ninfer::RequestOptions options       = p_less_options(outputs, seed);
+    options.execution.allow_prefix_reuse = reuse;
     return options;
 }
 
 ninfer::RequestOptions p_less_chat(std::uint32_t outputs, std::uint64_t seed, bool reuse) {
-    ninfer::RequestOptions options          = p_less_reuse(outputs, seed, reuse);
-    options.stop.include_model_defaults     = true;
+    ninfer::RequestOptions options      = p_less_reuse(outputs, seed, reuse);
+    options.stop.include_model_defaults = true;
     return options;
 }
 
 ninfer::EngineOptions chat_dflash_options(const char* artifact) {
     ninfer::EngineOptions options =
         speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
-    options.max_context = 2048;
-    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.max_context   = 2048;
+    options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.prefill_chunk = 512;
     return options;
 }
@@ -115,9 +114,7 @@ ninfer::EngineOptions chat_dflash_options(const char* artifact) {
 std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
                                            const std::vector<ninfer::TokenId>& generated) {
     std::vector<ninfer::TokenId> prefix = keep;
-    if (!generated.empty()) {
-        prefix.insert(prefix.end(), generated.begin(), generated.end() - 1);
-    }
+    if (!generated.empty()) { prefix.insert(prefix.end(), generated.begin(), generated.end() - 1); }
     return prefix;
 }
 
@@ -135,11 +132,11 @@ void dump_speculative(const char* tag, const ninfer::SpeculativeStats& stats) {
     std::cerr << '\n';
 }
 
-void dump_c2_divergence(const char* label, const char* which,
-                        const ninfer::GenerationResult& seq, const ninfer::GenerationResult& got) {
-    const auto& want = seq.generated_token_ids;
-    const auto& have = got.generated_token_ids;
-    std::size_t index = 0;
+void dump_c2_divergence(const char* label, const char* which, const ninfer::GenerationResult& seq,
+                        const ninfer::GenerationResult& got) {
+    const auto& want    = seq.generated_token_ids;
+    const auto& have    = got.generated_token_ids;
+    std::size_t index   = 0;
     const std::size_t n = std::min(want.size(), have.size());
     for (; index < n && want[index] == have[index]; ++index) {}
     std::cerr << label << ' ' << which
@@ -169,7 +166,7 @@ void dump_score(const char* tag, const ninfer::ScoreResult& score) {
 }
 
 bool looks_like_counting_collapse(const std::string& text) {
-    int run = 0;
+    int run  = 0;
     int best = 0;
     std::string tok;
     const auto flush = [&](bool integer) {
@@ -187,9 +184,9 @@ bool looks_like_counting_collapse(const std::string& text) {
             continue;
         }
         if (c == ' ' || c == '\n' || c == '\t') {
-            flush(!tok.empty() &&
-                  std::all_of(tok.begin(), tok.end(),
-                              [](unsigned char ch) { return std::isdigit(ch) != 0; }));
+            flush(!tok.empty() && std::all_of(tok.begin(), tok.end(), [](unsigned char ch) {
+                return std::isdigit(ch) != 0;
+            }));
             continue;
         }
         flush(false);
@@ -199,7 +196,7 @@ bool looks_like_counting_collapse(const std::string& text) {
 }
 
 bool looks_like_word_salad(const std::string& text) {
-    int run = 0;
+    int run  = 0;
     int best = 0;
     std::string tok;
     const auto flush = [&] {
@@ -227,7 +224,7 @@ bool looks_like_word_salad(const std::string& text) {
 }
 
 bool looks_like_role_token_loop(const std::vector<ninfer::TokenId>& ids) {
-    int run = 0;
+    int run  = 0;
     int best = 0;
     for (ninfer::TokenId token : ids) {
         if (token == 248045 || token == 248046 || token == 198) {
@@ -283,7 +280,9 @@ void dump_turn(const char* tag, const ninfer::GenerationResult& result) {
               << " content_bytes=" << result.content.size()
               << " reasoning_bytes=" << result.reasoning.size() << '\n';
     dump_speculative(tag, result.speculative);
-    if (!result.reasoning.empty()) { std::cerr << tag << "-reasoning: " << result.reasoning << '\n'; }
+    if (!result.reasoning.empty()) {
+        std::cerr << tag << "-reasoning: " << result.reasoning << '\n';
+    }
     std::cerr << tag << "-content: " << result.content << '\n';
 }
 
@@ -303,15 +302,14 @@ ninfer::ChatMessage assistant_from_result(const ninfer::GenerationResult& result
 
 int report_mismatch(const char* label, const ninfer::GenerationResult& result,
                     const std::vector<ninfer::TokenId>& want, const char* want_name) {
-    const auto mismatch =
-        std::mismatch(result.generated_token_ids.begin(), result.generated_token_ids.end(),
-                      want.begin(), want.end());
+    const auto mismatch = std::mismatch(result.generated_token_ids.begin(),
+                                        result.generated_token_ids.end(), want.begin(), want.end());
     std::cerr << label << " diverged at "
               << static_cast<std::size_t>(mismatch.first - result.generated_token_ids.begin())
               << ": dflash="
-              << (mismatch.first == result.generated_token_ids.end() ? -1 : *mismatch.first)
-              << ' ' << want_name << '='
-              << (mismatch.second == want.end() ? -1 : *mismatch.second) << '\n';
+              << (mismatch.first == result.generated_token_ids.end() ? -1 : *mismatch.first) << ' '
+              << want_name << '=' << (mismatch.second == want.end() ? -1 : *mismatch.second)
+              << '\n';
     dump_tokens("  got   ", result.generated_token_ids);
     std::cerr << "  " << want_name << " [" << want.size() << "]:";
     for (ninfer::TokenId token : want) { std::cerr << ' ' << token; }
@@ -322,8 +320,7 @@ int report_mismatch(const char* label, const ninfer::GenerationResult& result,
 
 std::size_t match_prefix_length(const std::vector<ninfer::TokenId>& got,
                                 const std::vector<ninfer::TokenId>& want) {
-    const auto mismatch =
-        std::mismatch(got.begin(), got.end(), want.begin(), want.end());
+    const auto mismatch = std::mismatch(got.begin(), got.end(), want.begin(), want.end());
     return static_cast<std::size_t>(mismatch.first - got.begin());
 }
 
@@ -345,8 +342,8 @@ int check_tokens(const char* label, const ninfer::GenerationResult& result,
     const char* want_name = kind == OracleKind::C1DFlash ? "C=1 DFlash" : "target-only";
     if (check_speculative(result, label) != 0) { return 1; }
     if (result.generated_token_ids.size() != want.size()) {
-        std::cerr << label << " generated " << result.generated_token_ids.size()
-                  << " tokens, " << want_name << ' ' << want.size() << '\n';
+        std::cerr << label << " generated " << result.generated_token_ids.size() << " tokens, "
+                  << want_name << ' ' << want.size() << '\n';
         dump_tokens("  got   ", result.generated_token_ids);
         std::cerr << "  " << want_name << " [" << want.size() << "]:";
         for (ninfer::TokenId token : want) { std::cerr << ' ' << token; }
@@ -366,8 +363,8 @@ int check_tokens(const char* label, const ninfer::GenerationResult& result,
     const bool diagnostic = kind == OracleKind::TargetOnly;
     if (matched != want.size() && !diagnostic) { return 1; }
     if (matched < want.size()) {
-        std::cerr << label << " greedy match " << matched << '/' << want.size()
-                  << " vs " << want_name << " (cross-schedule diagnostic)\n";
+        std::cerr << label << " greedy match " << matched << '/' << want.size() << " vs "
+                  << want_name << " (cross-schedule diagnostic)\n";
     }
     return 0;
 }
@@ -378,15 +375,11 @@ int check_tokens(const char* label, const ninfer::GenerationResult& result,
 // not correctness limits for an intentionally different A4 target distribution.
 // Actual candidate-logit licensing is checked by test_verify_score_real's decode
 // qualification; exact same-profile C=1/C>1 isolation remains enforced here.
-int check_target_margins(const char* artifact,
-                         const IsolationTokens& prompts,
-                         const IsolationTokens& generated,
-                         const IsolationTokens& ordinary,
+int check_target_margins(const char* artifact, const IsolationTokens& prompts,
+                         const IsolationTokens& generated, const IsolationTokens& ordinary,
                          const char* label) {
     bool needs_score = false;
-    for (std::size_t i = 0; i < prompts.size(); ++i) {
-        needs_score |= generated[i] != ordinary[i];
-    }
+    for (std::size_t i = 0; i < prompts.size(); ++i) { needs_score |= generated[i] != ordinary[i]; }
     if (!needs_score) { return 0; }
     ninfer::Engine baseline(base_engine_options(artifact));
     for (std::size_t i = 0; i < prompts.size(); ++i) {
@@ -400,23 +393,23 @@ int check_target_margins(const char* artifact,
             ids.insert(ids.end(), ordinary[i].begin(), ordinary[i].begin() + matched);
             ids.push_back(choice);
             ninfer::ScoreOptions options;
-            options.schedule = ninfer::ScoreSchedule::Decode;
+            options.schedule    = ninfer::ScoreSchedule::Decode;
             options.skip_tokens = static_cast<std::uint32_t>(prompts[i].size());
             return baseline.score(baseline.prepare_tokens(std::move(ids), false), options);
         };
-        const auto target = score_choice(ordinary[i][matched]);
+        const auto target   = score_choice(ordinary[i][matched]);
         const auto proposal = score_choice(generated[i][matched]);
-        if (target.non_finite != 0 || proposal.non_finite != 0 ||
-            target.tokens_scored != matched || proposal.tokens_scored != matched ||
-            target.token_nlls.size() != matched || proposal.token_nlls.size() != matched) {
+        if (target.non_finite != 0 || proposal.non_finite != 0 || target.tokens_scored != matched ||
+            proposal.tokens_scored != matched || target.token_nlls.size() != matched ||
+            proposal.token_nlls.size() != matched) {
             std::cerr << label << " invalid first-divergence score\n";
             return 1;
         }
         const double gap = proposal.token_nlls.back() - target.token_nlls.back();
         std::cout << label << " prompt " << i << " first_divergence=" << matched
                   << " target_nll=" << target.token_nlls.back()
-                  << " dflash_choice_nll=" << proposal.token_nlls.back()
-                  << " nll_gap=" << gap << '\n';
+                  << " dflash_choice_nll=" << proposal.token_nlls.back() << " nll_gap=" << gap
+                  << '\n';
         if (!std::isfinite(gap) || gap < -1.0e-5) {
             std::cerr << label << " invalid shared-prefix greedy margin\n";
             return 1;
@@ -447,7 +440,7 @@ int check_speculative(const ninfer::GenerationResult& result, const char* label)
 
 int exercise_dflash_vision(const char* artifact) {
     constexpr const char* label = "DFlash2 Vision p-less XAttention";
-    const auto read_fixture = [](const char* relative) {
+    const auto read_fixture     = [](const char* relative) {
         const std::string path = std::string(NINFER_SOURCE_DIR) + relative;
         std::ifstream input(path, std::ios::binary);
         return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(input), {});
@@ -479,9 +472,9 @@ int exercise_dflash_vision(const char* artifact) {
         message.parts.push_back(
             media_part(ninfer::MediaKind::Image, image_bytes, "image/png", "visual_chart.png"));
         message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text,
-            .text = "读取图中的标题，数出红色圆形，并判断蓝色方块在绿色三角形的哪一侧。"
-                    "只输出：标题；数量；左侧或右侧。",
+            .kind  = ninfer::MessagePartKind::Text,
+            .text  = "读取图中的标题，数出红色圆形，并判断蓝色方块在绿色三角形的哪一侧。"
+                     "只输出：标题；数量；左侧或右侧。",
             .media = {}});
         ninfer::PromptInput input;
         input.messages.push_back(std::move(message));
@@ -492,34 +485,32 @@ int exercise_dflash_vision(const char* artifact) {
         ninfer::PromptInput input;
         ninfer::ChatMessage system;
         system.role = ninfer::ChatRole::System;
-        system.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text,
-            .text = "准确保留不同轮次媒体中的可见事实。",
-            .media = {}});
+        system.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                   .text  = "准确保留不同轮次媒体中的可见事实。",
+                                                   .media = {}});
         input.messages.push_back(std::move(system));
         ninfer::ChatMessage image_turn;
         image_turn.role = ninfer::ChatRole::User;
         image_turn.parts.push_back(
             media_part(ninfer::MediaKind::Image, natural_bytes, "image/png", "natural_scene.png"));
-        image_turn.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text,
-            .text = "请查看这幅场景，记住邮箱上的数字，暂时不要回答。",
-            .media = {}});
+        image_turn.parts.push_back(
+            ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                .text  = "请查看这幅场景，记住邮箱上的数字，暂时不要回答。",
+                                .media = {}});
         input.messages.push_back(std::move(image_turn));
         ninfer::ChatMessage assistant;
         assistant.role = ninfer::ChatRole::Assistant;
-        assistant.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text,
-            .text = "好的，我会保留图像中的邮箱数字。",
-            .media = {}});
+        assistant.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                      .text  = "好的，我会保留图像中的邮箱数字。",
+                                                      .media = {}});
         input.messages.push_back(std::move(assistant));
         ninfer::ChatMessage video_turn;
         video_turn.role = ninfer::ChatRole::User;
-        video_turn.parts.push_back(media_part(ninfer::MediaKind::Video, video_bytes, "video/mp4",
-                                              "temporal_events.mp4"));
+        video_turn.parts.push_back(
+            media_part(ninfer::MediaKind::Video, video_bytes, "video/mp4", "temporal_events.mp4"));
         video_turn.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text,
-            .text = "把上一轮邮箱数字和视频末尾 END 数字用连字符连接。只输出连接结果。",
+            .kind  = ninfer::MessagePartKind::Text,
+            .text  = "把上一轮邮箱数字和视频末尾 END 数字用连字符连接。只输出连接结果。",
             .media = {}});
         input.messages.push_back(std::move(video_turn));
         input.options.enable_thinking = false;
@@ -529,19 +520,17 @@ int exercise_dflash_vision(const char* artifact) {
         ninfer::ChatMessage message;
         message.role = ninfer::ChatRole::User;
         message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text,
-            .text = "只输出：TEXT-42",
-            .media = {}});
+            .kind = ninfer::MessagePartKind::Text, .text = "只输出：TEXT-42", .media = {}});
         ninfer::PromptInput input;
         input.messages.push_back(std::move(message));
         input.options.enable_thinking = false;
         return input;
     };
 
-    ninfer::RequestOptions chart_greedy_options = greedy_options(24);
+    ninfer::RequestOptions chart_greedy_options      = greedy_options(24);
     chart_greedy_options.stop.include_model_defaults = true;
-    ninfer::RequestOptions mixed_options = greedy_options(16);
-    mixed_options.stop.include_model_defaults = true;
+    ninfer::RequestOptions mixed_options             = greedy_options(16);
+    mixed_options.stop.include_model_defaults        = true;
     std::vector<ninfer::TokenId> target_chart_tokens;
     std::vector<ninfer::TokenId> target_mixed_tokens;
     std::vector<ninfer::TokenId> target_text_tokens;
@@ -549,11 +538,11 @@ int exercise_dflash_vision(const char* artifact) {
         // The independent target-only Engine is deliberately destroyed before DFlash is loaded:
         // both resident models do not fit concurrently on the supported 32 GiB device.
         ninfer::EngineOptions target_options = base_engine_options(artifact);
-        target_options.enable_vision          = true;
-        target_options.max_context            = 2048;
-        target_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2048);
-        target_options.xattn_tau     = 0.9F;
-        target_options.xattn_min_len = 0;
+        target_options.enable_vision         = true;
+        target_options.max_context           = 2048;
+        target_options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+        target_options.xattn_tau             = 0.9F;
+        target_options.xattn_min_len         = 0;
         if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
             target_options.use_cuda_graph = false;
         }
@@ -601,7 +590,7 @@ int exercise_dflash_vision(const char* artifact) {
             return 1;
         }
 
-        ninfer::RequestOptions first_options = p_less_options(24, 12345);
+        ninfer::RequestOptions first_options      = p_less_options(24, 12345);
         first_options.stop.include_model_defaults = true;
         const ninfer::GenerationResult result =
             engine.generate(engine.prepare(make_input()), first_options);
@@ -616,9 +605,9 @@ int exercise_dflash_vision(const char* artifact) {
             return 1;
         }
 
-        ninfer::RequestOptions reuse_options = p_less_options(24, 12345);
+        ninfer::RequestOptions reuse_options       = p_less_options(24, 12345);
         reuse_options.execution.allow_prefix_reuse = true;
-        reuse_options.stop.include_model_defaults   = true;
+        reuse_options.stop.include_model_defaults  = true;
         const ninfer::GenerationResult reused =
             engine.generate(engine.prepare(make_input()), reuse_options);
         if (reused.generated_token_ids != result.generated_token_ids ||
@@ -680,7 +669,7 @@ int exercise_dflash_vision(const char* artifact) {
         ninfer::Engine engine(options);
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
         const ninfer::RequestOptions short_options = greedy_options(5);
-        const ninfer::RuntimeStats before = engine.runtime_stats();
+        const ninfer::RuntimeStats before          = engine.runtime_stats();
         auto chart_handle = engine.submit(engine.prepare(make_input()), short_options);
         auto text_handle  = engine.submit(engine.prepare(make_text_input()), short_options);
         const ninfer::GenerationResult chart = chart_handle.wait();
@@ -724,7 +713,7 @@ int exercise_chain_verify_short_output_entitlement(const char* artifact) {
     options.speculative.dflash_verify_width = 6;
     options.kv_cache                        = ninfer::KvCacheStorage::Nvfp4;
     options.max_context                     = 256;
-    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256);
+    options.kv_capacity                     = ninfer::KvCapacityPolicy::explicit_capacity(256);
     ninfer::Engine engine(options);
     if (const int result = check_dflash_load(engine); result != 0) { return result; }
 
@@ -779,13 +768,13 @@ int greedy_oracle(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& pr
 
 int exercise_p_less_product_tree(ninfer::Engine& engine,
                                  const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 p-less k=4 W=5";
+    constexpr const char* label  = "DFlash2 p-less k=4 W=5";
     constexpr std::uint64_t seed = 0x123456789abcdef0ULL;
     const ninfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(prompt), p_less_options(32, seed));
     const ninfer::GenerationResult replay =
         engine.generate(engine.prepare_tokens(prompt), p_less_options(32, seed));
-    ninfer::RequestOptions top1_options = p_less_options(32, seed);
+    ninfer::RequestOptions top1_options    = p_less_options(32, seed);
     top1_options.execution.sampling.p_less = false;
     const ninfer::GenerationResult top1 =
         engine.generate(engine.prepare_tokens(prompt), top1_options);
@@ -831,8 +820,8 @@ int exercise_p_less_product_tree(ninfer::Engine& engine,
     return 0;
 }
 
-int exercise_p_less_c2_matches_c1(
-    const char* artifact, std::span<const std::vector<ninfer::TokenId>> prompts) {
+int exercise_p_less_c2_matches_c1(const char* artifact,
+                                  std::span<const std::vector<ninfer::TokenId>> prompts) {
     // Live OpenCode salad is one of two concurrent p-less tree decodes collapsing
     // into 248045/248046/198 while the other stays coherent. Greedy C=3 isolation
     // never enters the p-less mass-finalize walk, and B=2 GQA/path-select/accept
@@ -841,9 +830,9 @@ int exercise_p_less_c2_matches_c1(
     // sits on that seam: C=1 continues a 248044 turn with 30097..., C=2 emits
     // role-token salad. Equal-length same prompt, graphs on or off, and submit
     // order do not remove the split.
-    constexpr const char* label = "DFlash2 k=4 W=5 p-less C=2 matches C=1";
-    constexpr std::uint64_t seed_a = 0x9e3779b97f4a7c15ULL;
-    constexpr std::uint64_t seed_b = 0x123456789abcdef0ULL;
+    constexpr const char* label     = "DFlash2 k=4 W=5 p-less C=2 matches C=1";
+    constexpr std::uint64_t seed_a  = 0x9e3779b97f4a7c15ULL;
+    constexpr std::uint64_t seed_b  = 0x123456789abcdef0ULL;
     constexpr std::uint32_t kTokens = 48;
     ninfer::EngineOptions options =
         speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
@@ -875,10 +864,8 @@ int exercise_p_less_c2_matches_c1(
         return 1;
     }
 
-    auto handle_a =
-        engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
-    auto handle_b =
-        engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
+    auto handle_a = engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
+    auto handle_b = engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
     ninfer::GenerationResult conc_a;
     ninfer::GenerationResult conc_b;
     try {
@@ -915,8 +902,8 @@ int exercise_p_less_c2_mixed_frontiers_matches_c1(
     const char* artifact, std::span<const std::vector<ninfer::TokenId>> prompts) {
     constexpr const char* label =
         "DFlash2 k=4 W=5 p-less C=2 mixed frontiers match C=1 without graphs";
-    constexpr std::uint64_t seed_a = 0x9e3779b97f4a7c15ULL;
-    constexpr std::uint64_t seed_b = 0x123456789abcdef0ULL;
+    constexpr std::uint64_t seed_a  = 0x9e3779b97f4a7c15ULL;
+    constexpr std::uint64_t seed_b  = 0x123456789abcdef0ULL;
     constexpr std::uint32_t kTokens = 24;
     ninfer::EngineOptions options =
         speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
@@ -952,10 +939,8 @@ int exercise_p_less_c2_mixed_frontiers_matches_c1(
         return 1;
     }
 
-    auto handle_b =
-        engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
-    auto handle_a =
-        engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
+    auto handle_b = engine.submit(engine.prepare_tokens(prompt_b), p_less_options(kTokens, seed_b));
+    auto handle_a = engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokens, seed_a));
     ninfer::GenerationResult conc_a;
     ninfer::GenerationResult conc_b;
     try {
@@ -985,13 +970,12 @@ int exercise_p_less_c2_mixed_frontiers_matches_c1(
 
 int exercise_p_less_c2_long_context_matches_c1(
     const char* artifact, std::span<const std::vector<ninfer::TokenId>> prompts) {
-    constexpr const char* label =
-        "DFlash2 k=4 W=5 p-less C=2 long context matches C=1";
-    constexpr std::uint64_t seed_a = 14784394741258868421ULL;
-    constexpr std::uint64_t seed_b = 11406468648257731684ULL;
+    constexpr const char* label         = "DFlash2 k=4 W=5 p-less C=2 long context matches C=1";
+    constexpr std::uint64_t seed_a      = 14784394741258868421ULL;
+    constexpr std::uint64_t seed_b      = 11406468648257731684ULL;
     constexpr std::size_t kPromptTokens = 39764;
-    constexpr std::uint32_t kTokensA = 1024;
-    constexpr std::uint32_t kTokensB = 128;
+    constexpr std::uint32_t kTokensA    = 1024;
+    constexpr std::uint32_t kTokensB    = 128;
     ninfer::EngineOptions options =
         speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 2);
     options.max_context   = 65536;
@@ -1005,7 +989,8 @@ int exercise_p_less_c2_long_context_matches_c1(
         while (out.size() < count) {
             const std::size_t remaining = count - out.size();
             out.insert(out.end(), base.begin(),
-                       base.begin() + static_cast<std::ptrdiff_t>(std::min(remaining, base.size())));
+                       base.begin() +
+                           static_cast<std::ptrdiff_t>(std::min(remaining, base.size())));
         }
         return out;
     };
@@ -1047,11 +1032,11 @@ int exercise_p_less_c2_long_context_matches_c1(
         return 1;
     }
 
-    constexpr std::uint64_t reuse_seed = 2101703384980058981ULL;
+    constexpr std::uint64_t reuse_seed   = 2101703384980058981ULL;
     constexpr std::uint32_t kTurn1Tokens = 64;
     constexpr std::uint32_t kTurn2Tokens = 512;
-    constexpr std::size_t kSuffixTokens = 5800;
-    const auto make_follow = [&](const ninfer::GenerationResult& turn1) {
+    constexpr std::size_t kSuffixTokens  = 5800;
+    const auto make_follow               = [&](const ninfer::GenerationResult& turn1) {
         std::vector<ninfer::TokenId> follow = prompt_b;
         follow.insert(follow.end(), turn1.generated_token_ids.begin(),
                       turn1.generated_token_ids.end());
@@ -1063,17 +1048,15 @@ int exercise_p_less_c2_long_context_matches_c1(
     const ninfer::GenerationResult seq_turn1 = engine.generate(
         engine.prepare_tokens(prompt_b), p_less_reuse(kTurn1Tokens, reuse_seed, false));
     const std::vector<ninfer::TokenId> seq_follow = make_follow(seq_turn1);
-    const ninfer::GenerationResult seq_turn2 =
-        engine.generate(engine.prepare_tokens(seq_follow),
-                        p_less_reuse(kTurn2Tokens, reuse_seed + 1, true));
+    const ninfer::GenerationResult seq_turn2      = engine.generate(
+        engine.prepare_tokens(seq_follow), p_less_reuse(kTurn2Tokens, reuse_seed + 1, true));
 
     auto peer = engine.submit(engine.prepare_tokens(prompt_a), p_less_options(kTokensA, seed_a));
     const ninfer::GenerationResult conc_turn1 = engine.generate(
         engine.prepare_tokens(prompt_b), p_less_reuse(kTurn1Tokens, reuse_seed, false));
     const std::vector<ninfer::TokenId> conc_follow = make_follow(conc_turn1);
-    auto follow =
-        engine.submit(engine.prepare_tokens(conc_follow),
-                      p_less_reuse(kTurn2Tokens, reuse_seed + 1, true));
+    auto follow = engine.submit(engine.prepare_tokens(conc_follow),
+                                p_less_reuse(kTurn2Tokens, reuse_seed + 1, true));
     const ninfer::GenerationResult conc_peer  = peer.wait();
     const ninfer::GenerationResult conc_turn2 = follow.wait();
     if (seq_turn1.generated_token_ids.size() != kTurn1Tokens ||
@@ -1106,7 +1089,7 @@ int exercise_p_less_c2_long_context_matches_c1(
 
 int exercise_greedy_tree_matches_ordinary(const char* artifact,
                                           const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 k=4 W=5 greedy matches ordinary";
+    constexpr const char* label     = "DFlash2 k=4 W=5 greedy matches ordinary";
     constexpr std::uint32_t kTokens = 64;
     std::vector<ninfer::TokenId> tree_tokens;
     std::vector<ninfer::TokenId> ordinary_tokens;
@@ -1157,8 +1140,8 @@ int exercise_greedy_tree_matches_ordinary(const char* artifact,
 
 int exercise_p_less_tree_target_likelihood(const char* artifact,
                                            const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 k=4 W=5 p-less target likelihood";
-    constexpr std::uint64_t seed = 7632647173703958409ULL;
+    constexpr const char* label     = "DFlash2 k=4 W=5 p-less target likelihood";
+    constexpr std::uint64_t seed    = 7632647173703958409ULL;
     constexpr std::uint32_t kTokens = 256;
     std::vector<ninfer::TokenId> tree_tokens;
     std::vector<ninfer::TokenId> ordinary_tokens;
@@ -1194,8 +1177,9 @@ int exercise_p_less_tree_target_likelihood(const char* artifact,
         ordinary_text   = generated.content;
     }
     if (tree_tokens.front() != ordinary_tokens.front()) {
-        std::cerr << label << " hop 0 diverged from ordinary p-less sample: tree="
-                  << tree_tokens.front() << " ordinary=" << ordinary_tokens.front() << '\n';
+        std::cerr << label
+                  << " hop 0 diverged from ordinary p-less sample: tree=" << tree_tokens.front()
+                  << " ordinary=" << ordinary_tokens.front() << '\n';
         dump_tokens("  tree", tree_tokens);
         dump_tokens("  ordinary", ordinary_tokens);
         return 1;
@@ -1203,14 +1187,14 @@ int exercise_p_less_tree_target_likelihood(const char* artifact,
 
     ninfer::Engine baseline(base_engine_options(artifact));
     ninfer::ScoreOptions score_options;
-    score_options.schedule = ninfer::ScoreSchedule::Decode;
+    score_options.schedule    = ninfer::ScoreSchedule::Decode;
     score_options.skip_tokens = static_cast<std::uint32_t>(prompt.size() - 1);
-    auto score_ids = [&](const std::vector<ninfer::TokenId>& generated) {
+    auto score_ids            = [&](const std::vector<ninfer::TokenId>& generated) {
         std::vector<ninfer::TokenId> corpus = prompt;
         corpus.insert(corpus.end(), generated.begin(), generated.end());
         return baseline.score(baseline.prepare_tokens(std::move(corpus), false), score_options);
     };
-    const ninfer::ScoreResult tree_score = score_ids(tree_tokens);
+    const ninfer::ScoreResult tree_score     = score_ids(tree_tokens);
     const ninfer::ScoreResult ordinary_score = score_ids(ordinary_tokens);
     dump_score("  tree-nll", tree_score);
     dump_score("  ordinary-nll", ordinary_score);
@@ -1233,10 +1217,10 @@ int exercise_p_less_tree_target_likelihood(const char* artifact,
     return 0;
 }
 
-int exercise_p_less_tree_commit_matches_reconstruction(
-    const char* artifact, const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 k=4 W=5 chain commit matches reconstruction";
-    constexpr std::uint64_t seed = 7632647173703958409ULL;
+int exercise_p_less_tree_commit_matches_reconstruction(const char* artifact,
+                                                       const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label          = "DFlash2 k=4 W=5 chain commit matches reconstruction";
+    constexpr std::uint64_t seed         = 7632647173703958409ULL;
     constexpr std::uint32_t kFirstTokens = 512;
     constexpr std::uint32_t kProbeTokens = 64;
     ninfer::EngineOptions options =
@@ -1273,15 +1257,14 @@ int exercise_p_less_tree_commit_matches_reconstruction(
         dump_c2_divergence(label, "restored state", fresh, restored);
         return 1;
     }
-    std::cout << "ok " << label << " reuse="
-              << static_cast<int>(restored.prefix_reuse_path)
+    std::cout << "ok " << label << " reuse=" << static_cast<int>(restored.prefix_reuse_path)
               << " reused=" << restored.reused_prompt_tokens << '\n';
     return 0;
 }
 
 int exercise_p_less_tree_chat_coherence(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=4 W=5 p-less chat coherence";
-    constexpr std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
+    constexpr const char* label     = "DFlash2 k=4 W=5 p-less chat coherence";
+    constexpr std::uint64_t seed    = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint32_t kTokens = 192;
     ninfer::EngineOptions options =
         speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
@@ -1311,16 +1294,15 @@ int exercise_p_less_tree_chat_coherence(const char* artifact) {
         return 1;
     }
 
-    ninfer::PromptInput second = first;
+    ninfer::PromptInput second    = first;
     ninfer::ChatMessage assistant = text_turn(ninfer::ChatRole::Assistant, turn1.content);
     second.messages.push_back(std::move(assistant));
-    second.messages.push_back(text_turn(
-        ninfer::ChatRole::User,
-        "Show first commits and README intro. Keep using complete sentences."));
-    ninfer::RequestOptions turn2_opts = p_less_options(kTokens, seed + 1);
+    second.messages.push_back(
+        text_turn(ninfer::ChatRole::User,
+                  "Show first commits and README intro. Keep using complete sentences."));
+    ninfer::RequestOptions turn2_opts       = p_less_options(kTokens, seed + 1);
     turn2_opts.execution.allow_prefix_reuse = true;
-    const ninfer::GenerationResult turn2 =
-        engine.generate(engine.prepare(second), turn2_opts);
+    const ninfer::GenerationResult turn2    = engine.generate(engine.prepare(second), turn2_opts);
     std::cerr << label << " turn2 finish=" << static_cast<int>(turn2.finish_reason)
               << " gen=" << turn2.generated_token_ids.size()
               << " content_bytes=" << turn2.content.size() << '\n';
@@ -1341,7 +1323,8 @@ int exercise_p_less_tree_chat_coherence(const char* artifact) {
 
 int fail_if_decohered(const char* label, const char* turn, const ninfer::GenerationResult& result) {
     const std::string visible = result.reasoning + "\n" + result.content;
-    if (!looks_like_decoherence(visible) && !looks_like_role_token_loop(result.generated_token_ids)) {
+    if (!looks_like_decoherence(visible) &&
+        !looks_like_role_token_loop(result.generated_token_ids)) {
         return 0;
     }
     std::cerr << label << " " << turn
@@ -1373,9 +1356,9 @@ int check_reuse_hop0_vs_reset(ninfer::Engine& engine, const ninfer::PromptInput&
     }
     if (reused.generated_token_ids.front() != reset.generated_token_ids.front()) {
         std::cerr << label << " reuse hop 0 diverged from DFlash full-reset hop 0: reuse="
-                  << reused.generated_token_ids.front() << " reset="
-                  << reset.generated_token_ids.front() << " path="
-                  << reuse_path_name(reused.prefix_reuse_path)
+                  << reused.generated_token_ids.front()
+                  << " reset=" << reset.generated_token_ids.front()
+                  << " path=" << reuse_path_name(reused.prefix_reuse_path)
                   << " reused=" << reused.reused_prompt_tokens << '\n';
         dump_tokens("  reuse", reused.generated_token_ids);
         dump_tokens("  reset", reset.generated_token_ids);
@@ -1385,8 +1368,8 @@ int check_reuse_hop0_vs_reset(ninfer::Engine& engine, const ninfer::PromptInput&
 }
 
 int exercise_p_less_thinking_followup(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=4 p-less thinking follow-up";
-    constexpr std::uint64_t seed = 0x9e3779b97f4a7c15ULL;
+    constexpr const char* label    = "DFlash2 k=4 p-less thinking follow-up";
+    constexpr std::uint64_t seed   = 0x9e3779b97f4a7c15ULL;
     constexpr std::uint32_t kTurn1 = 96;
     constexpr std::uint32_t kTurn2 = 192;
     ninfer::Engine engine(chat_dflash_options(artifact));
@@ -1409,9 +1392,9 @@ int exercise_p_less_thinking_followup(const char* artifact) {
 
     ninfer::PromptInput second = first;
     second.messages.push_back(assistant_from_result(turn1));
-    second.messages.push_back(text_turn(
-        ninfer::ChatRole::User,
-        "Show first commits and README intro. Keep using complete sentences."));
+    second.messages.push_back(
+        text_turn(ninfer::ChatRole::User,
+                  "Show first commits and README intro. Keep using complete sentences."));
     const ninfer::GenerationResult turn2 =
         engine.generate(engine.prepare(second), p_less_chat(kTurn2, seed + 1, true));
     dump_turn("  turn2", turn2);
@@ -1429,7 +1412,7 @@ int exercise_p_less_thinking_followup(const char* artifact) {
 }
 
 int exercise_p_less_finished_thinking_followup(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=4 p-less finished-thinking follow-up";
+    constexpr const char* label  = "DFlash2 k=4 p-less finished-thinking follow-up";
     constexpr std::uint64_t seed = 0xa5a5a5a5a5a5a5a5ULL;
     ninfer::Engine engine(chat_dflash_options(artifact));
 
@@ -1506,7 +1489,7 @@ ninfer::PromptInput tool_loop_prompt(int completed_responses, bool preserve_thin
 // never takes that seam, and the C=2 p-less match above uses two cold FullReset
 // prefills with reuse disabled.
 int exercise_p_less_c2_reuse_during_peer_decode(const char* artifact) {
-    constexpr const char* label = "DFlash2 k=4 p-less C=2 reuse during peer decode";
+    constexpr const char* label    = "DFlash2 k=4 p-less C=2 reuse during peer decode";
     constexpr std::uint64_t seed_a = 0xa5a5a5a5a5a5a5a5ULL;
     constexpr std::uint64_t seed_b = 0x243f6a8885a308d3ULL;
     constexpr std::uint32_t kPeer  = 96;
@@ -1605,7 +1588,7 @@ int check_tool_rewrite_hop0_greedy(ninfer::Engine& engine) {
         const std::string label =
             std::string("DFlash2 k=4 greedy tool-loop hop0 preserve_thinking=") +
             (preserve_thinking ? "true" : "false");
-        const ninfer::PromptInput first = tool_loop_prompt(0, preserve_thinking, true);
+        const ninfer::PromptInput first    = tool_loop_prompt(0, preserve_thinking, true);
         const ninfer::PromptInput followup = tool_loop_prompt(1, preserve_thinking, true);
         const ninfer::GenerationResult turn1 =
             engine.generate(engine.prepare(first), greedy_reuse(16, false));
@@ -1631,7 +1614,8 @@ int check_tool_rewrite_hop0_greedy(ninfer::Engine& engine) {
                       << (reused.generated_token_ids.empty() ? -1
                                                              : reused.generated_token_ids.front())
                       << " reset="
-                      << (reset.generated_token_ids.empty() ? -1 : reset.generated_token_ids.front())
+                      << (reset.generated_token_ids.empty() ? -1
+                                                            : reset.generated_token_ids.front())
                       << " path=" << reuse_path_name(reused.prefix_reuse_path)
                       << " reused=" << reused.reused_prompt_tokens << '\n';
             dump_tokens("  reuse", reused.generated_token_ids);
@@ -1645,7 +1629,7 @@ int check_tool_rewrite_hop0_greedy(ninfer::Engine& engine) {
 }
 
 int exercise_p_less_tool_history_reuse(const char* artifact) {
-    constexpr std::uint64_t seed = 0x243f6a8885a308d3ULL;
+    constexpr std::uint64_t seed   = 0x243f6a8885a308d3ULL;
     constexpr std::uint32_t kTurn2 = 192;
     ninfer::Engine engine(chat_dflash_options(artifact));
     if (const int result = check_tool_rewrite_hop0_greedy(engine); result != 0) { return result; }
@@ -1658,7 +1642,7 @@ int exercise_p_less_tool_history_reuse(const char* artifact) {
             std::string("DFlash2 k=4 p-less tool-loop reuse preserve_thinking=") +
             (preserve_thinking ? "true" : "false");
         const std::uint32_t turn1_tokens = preserve_thinking ? 64 : 192;
-        const ninfer::PromptInput first = tool_loop_prompt(0, preserve_thinking, enable_thinking);
+        const ninfer::PromptInput first  = tool_loop_prompt(0, preserve_thinking, enable_thinking);
         const ninfer::GenerationResult turn1 =
             engine.generate(engine.prepare(first), p_less_chat(turn1_tokens, seed, false));
         dump_turn("  turn1", turn1);
@@ -1697,11 +1681,12 @@ int exercise_p_less_tool_history_reuse(const char* artifact) {
             (turn2.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
              turn3.prefix_reuse_path != ninfer::PrefixReusePath::RestoreResponseCheckpoint ||
              turn3.reused_prompt_tokens <= turn2.reused_prompt_tokens)) {
-            std::cerr << label << " response checkpoint did not advance across the tool loop: first="
-                      << turn2.reused_prompt_tokens << " path="
-                      << reuse_path_name(turn2.prefix_reuse_path)
-                      << " second=" << turn3.reused_prompt_tokens << " path="
-                      << reuse_path_name(turn3.prefix_reuse_path) << '\n';
+            std::cerr << label
+                      << " response checkpoint did not advance across the tool loop: first="
+                      << turn2.reused_prompt_tokens
+                      << " path=" << reuse_path_name(turn2.prefix_reuse_path)
+                      << " second=" << turn3.reused_prompt_tokens
+                      << " path=" << reuse_path_name(turn3.prefix_reuse_path) << '\n';
             failed = 1;
         }
         failed |= fail_if_decohered(label.c_str(), "turn3", turn3);
@@ -1717,14 +1702,14 @@ int exercise_p_less_tool_history_reuse(const char* artifact) {
 
 int exercise_p_less_target_likelihood(const char* artifact,
                                       const std::vector<ninfer::TokenId>& prompt) {
-    constexpr const char* label = "DFlash2 adaptive p-less target likelihood";
-    constexpr std::uint64_t seed = 15446143373561885318ULL;
+    constexpr const char* label     = "DFlash2 adaptive p-less target likelihood";
+    constexpr std::uint64_t seed    = 15446143373561885318ULL;
     constexpr std::uint32_t kTokens = 64;
     std::vector<ninfer::TokenId> dflash_tokens;
     std::vector<ninfer::TokenId> ordinary_tokens;
     {
-        ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
+        ninfer::Engine engine(
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
         const ninfer::GenerationResult generated =
             engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
         if (generated.generated_token_ids.size() != kTokens ||
@@ -1746,8 +1731,9 @@ int exercise_p_less_target_likelihood(const char* artifact,
         ordinary_tokens = generated.generated_token_ids;
     }
     if (dflash_tokens.front() != ordinary_tokens.front()) {
-        std::cerr << label << " hop 0 diverged from ordinary p-less sample: dflash="
-                  << dflash_tokens.front() << " ordinary=" << ordinary_tokens.front() << '\n';
+        std::cerr << label
+                  << " hop 0 diverged from ordinary p-less sample: dflash=" << dflash_tokens.front()
+                  << " ordinary=" << ordinary_tokens.front() << '\n';
         dump_tokens("  dflash", dflash_tokens);
         dump_tokens("  ordinary", ordinary_tokens);
         return 1;
@@ -1755,14 +1741,14 @@ int exercise_p_less_target_likelihood(const char* artifact,
 
     ninfer::Engine baseline(base_engine_options(artifact));
     ninfer::ScoreOptions score_options;
-    score_options.schedule = ninfer::ScoreSchedule::Decode;
+    score_options.schedule    = ninfer::ScoreSchedule::Decode;
     score_options.skip_tokens = static_cast<std::uint32_t>(prompt.size() - 1);
-    auto score_ids = [&](const std::vector<ninfer::TokenId>& generated) {
+    auto score_ids            = [&](const std::vector<ninfer::TokenId>& generated) {
         std::vector<ninfer::TokenId> corpus = prompt;
         corpus.insert(corpus.end(), generated.begin(), generated.end());
         return baseline.score(baseline.prepare_tokens(std::move(corpus), false), score_options);
     };
-    const ninfer::ScoreResult dflash_score = score_ids(dflash_tokens);
+    const ninfer::ScoreResult dflash_score   = score_ids(dflash_tokens);
     const ninfer::ScoreResult ordinary_score = score_ids(ordinary_tokens);
     dump_score("  dflash-nll", dflash_score);
     dump_score("  ordinary-nll", ordinary_score);
@@ -1789,8 +1775,7 @@ int exercise_p_less_target_likelihood(const char* artifact,
 std::vector<ninfer::TokenId> token_prefix(const std::vector<ninfer::TokenId>& tokens,
                                           std::uint32_t length, const char* label) {
     if (tokens.size() < length) {
-        std::cerr << label << " oracle has " << tokens.size() << " tokens, need " << length
-                  << '\n';
+        std::cerr << label << " oracle has " << tokens.size() << " tokens, need " << length << '\n';
         return {};
     }
     return std::vector<ninfer::TokenId>(tokens.begin(), tokens.begin() + length);
@@ -1813,8 +1798,10 @@ int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prom
         if (lengths[i] == dflash_oracles[i].size()) {
             same_budget_oracles[i] = dflash_oracles[i];
         } else {
-            const auto result = engine.generate(engine.prepare_tokens(prompts[i]), greedy_options(lengths[i]));
-            if (result.generated_token_ids.size() != lengths[i] || check_speculative(result, label) != 0) {
+            const auto result =
+                engine.generate(engine.prepare_tokens(prompts[i]), greedy_options(lengths[i]));
+            if (result.generated_token_ids.size() != lengths[i] ||
+                check_speculative(result, label) != 0) {
                 return 1;
             }
             same_budget_oracles[i] = result.generated_token_ids;
@@ -1837,7 +1824,7 @@ int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prom
     const char* names[] = {"A", "B", "C", "D", "E", "F"};
     int failed          = 0;
     for (std::size_t i = 0; i < prompts.size(); ++i) {
-        const std::string request = std::string(label) + " request " + names[i];
+        const std::string request      = std::string(label) + " request " + names[i];
         const std::string dflash_label = request + " C=1 DFlash";
         const std::string target_label = request + " target-only";
         const std::vector<ninfer::TokenId> dflash_want =
@@ -1905,28 +1892,112 @@ int main() {
     // DFlash of the same k exactly (row isolation), and the C=6 run below crosses that point.
     const IsolationTokens prompts{
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            3709,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 4120,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            4120,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 5200,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            5200,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 7000,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            7000,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 8100,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            8100,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 9300,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            9300,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
     };
 
@@ -1954,8 +2025,7 @@ int main() {
             }
         }
         if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
-            if (const int result =
-                    exercise_p_less_c2_mixed_frontiers_matches_c1(artifact, prompts);
+            if (const int result = exercise_p_less_c2_mixed_frontiers_matches_c1(artifact, prompts);
                 result != 0) {
                 return result;
             }
@@ -1975,15 +2045,12 @@ int main() {
             return result;
         }
         if (std::getenv("NINFER_DFLASH_TEST_NO_GRAPH") != nullptr) {
-            if (const int result =
-                    exercise_p_less_c2_mixed_frontiers_matches_c1(artifact, prompts);
+            if (const int result = exercise_p_less_c2_mixed_frontiers_matches_c1(artifact, prompts);
                 result != 0) {
                 return result;
             }
         }
-        if (std::getenv("NINFER_DFLASH_TEST_LIKELIHOOD_ONLY") != nullptr) {
-            return 0;
-        }
+        if (std::getenv("NINFER_DFLASH_TEST_LIKELIHOOD_ONLY") != nullptr) { return 0; }
     }
 
     auto run_k = [&](std::uint32_t draft_tokens, const char* label) -> int {
@@ -2008,9 +2075,9 @@ int main() {
             }
         }
 
-        ninfer::EngineOptions dflash_options = speculative_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens,
-            static_cast<std::uint32_t>(kIsolationRequests));
+        ninfer::EngineOptions dflash_options =
+            speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens,
+                                       static_cast<std::uint32_t>(kIsolationRequests));
         if (std::getenv("NINFER_DFLASH_TEST_MAX1") != nullptr) {
             dflash_options.max_concurrency = 1;
         }
@@ -2029,13 +2096,12 @@ int main() {
             if (const int result = check_dflash_load(engine); result != 0) { return result; }
             int failed = 0;
             for (std::size_t i = 0; i < prompts.size(); ++i) {
-                if (only_prompt != nullptr &&
-                    std::string(only_prompt) != std::to_string(i)) {
+                if (only_prompt != nullptr && std::string(only_prompt) != std::to_string(i)) {
                     continue;
                 }
                 ninfer::GenerationResult dflash_result;
-                if (const int result = greedy_oracle(engine, prompts[i], dflash_oracles[i], label,
-                                                     &dflash_result);
+                if (const int result =
+                        greedy_oracle(engine, prompts[i], dflash_oracles[i], label, &dflash_result);
                     result != 0) {
                     return result;
                 }
@@ -2109,8 +2175,8 @@ int main() {
 
     {
         const char* label = "DFlash2 adaptive N=5 {3,4,5}";
-        ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 5, 3));
+        ninfer::Engine engine(
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 3));
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
         // Adaptive selection probes the first unmeasured captured width, k=3. A seven-token
         // request is the short-budget control; the longer request below exercises the retained
@@ -2189,14 +2255,16 @@ int main() {
 
     {
         const char* label = "DFlash2 terminal delivery and queue telemetry";
-        ninfer::Engine engine(adaptive_engine_options(
-            artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
+        ninfer::Engine engine(
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
         if (const int result = check_dflash_load(engine); result != 0) { return result; }
 
         struct DiscardingSink final : ninfer::OutputSink {
             std::size_t output_events = 0;
+
             void publish(ninfer::OutputDelta) override { ++output_events; }
         } sink;
+
         auto terminal = engine.submit(engine.prepare_tokens(prompts[0]), greedy_options(7));
         if (terminal.wait(&sink).generated_token_ids.size() != 7 || sink.output_events != 0) {
             std::cerr << label << " terminal diagnostics sink changed output delivery\n";
@@ -2230,8 +2298,7 @@ int main() {
         }
         const ninfer::GenerationResult first =
             engine.generate(engine.prepare_tokens(prompts[0]), greedy_reuse(8, false));
-        if (first.generated_token_ids.size() != 8 ||
-            check_adaptive_dflash(first, label) != 0) {
+        if (first.generated_token_ids.size() != 8 || check_adaptive_dflash(first, label) != 0) {
             std::cerr << label << " source did not complete adaptive generation\n";
             dump_speculative("  spec", first.speculative);
             return 1;
@@ -2250,8 +2317,8 @@ int main() {
         const ninfer::GenerationResult hit =
             engine.generate(engine.prepare_tokens(history), greedy_reuse(4, true));
         if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
-            std::cerr << label << " restore source is "
-                      << static_cast<int>(hit.prefix_reuse_source) << ", expected HostRam\n";
+            std::cerr << label << " restore source is " << static_cast<int>(hit.prefix_reuse_source)
+                      << ", expected HostRam\n";
             return 1;
         }
         if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
@@ -2300,15 +2367,12 @@ int main() {
             resume_prefix(prompts[0], first.generated_token_ids);
         // Restored exact-prefix generate overlaps a compact speculative request on the other
         // lane while copy_stream H2D-restores cyclic DFlash KV / GDN / pages.
-        auto restored_h =
-            engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
-        auto inflight_h =
-            engine.submit(engine.prepare_tokens(prompts[1]), greedy_reuse(7, false));
+        auto restored_h = engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
+        auto inflight_h = engine.submit(engine.prepare_tokens(prompts[1]), greedy_reuse(7, false));
         const ninfer::GenerationResult hit      = restored_h.wait();
         const ninfer::GenerationResult inflight = inflight_h.wait();
         if (hit.generated_token_ids.size() != 4 || inflight.generated_token_ids.size() != 7 ||
-            check_adaptive_dflash(hit, label) != 0 ||
-            check_adaptive_dflash(inflight, label) != 0) {
+            check_adaptive_dflash(hit, label) != 0 || check_adaptive_dflash(inflight, label) != 0) {
             std::cerr << label << " overlapping RAM restore failed adaptive continuation\n";
             dump_speculative("  hit", hit.speculative);
             dump_speculative("  inflight", inflight.speculative);
@@ -2321,8 +2385,8 @@ int main() {
         }
         if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam &&
             hit.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
-            std::cerr << label << " restore source is "
-                      << static_cast<int>(hit.prefix_reuse_source) << '\n';
+            std::cerr << label << " restore source is " << static_cast<int>(hit.prefix_reuse_source)
+                      << '\n';
             return 1;
         }
         const auto cold = engine.generate(engine.prepare_tokens(history), greedy_reuse(4, false));

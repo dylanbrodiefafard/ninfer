@@ -198,13 +198,18 @@ void bf16_gdn_gating_proj_mma_split40_launch(const Tensor& x, const Weight& a_we
     }
     const auto launch = [&]<int Columns>() {
         launch_bf16_prefill_mma<Bf16Gdn27SmallGeometry<Columns>, 40, Columns / 8>(
-            Bf16GdnGatingTokenVariant::Predicated, x, nullptr, 0.0F, nullptr, a_weight,
-            b_weight, A_log, dt_bias, workspace, g, beta, stream);
+            Bf16GdnGatingTokenVariant::Predicated, x, nullptr, 0.0F, nullptr, a_weight, b_weight,
+            A_log, dt_bias, workspace, g, beta, stream);
     };
-    if (x.ne[1] <= 8) { launch.template operator()<8>(); }
-    else if (x.ne[1] <= 16) { launch.template operator()<16>(); }
-    else if (x.ne[1] <= 32) { launch.template operator()<32>(); }
-    else { launch.template operator()<48>(); }
+    if (x.ne[1] <= 8) {
+        launch.template operator()<8>();
+    } else if (x.ne[1] <= 16) {
+        launch.template operator()<16>();
+    } else if (x.ne[1] <= 32) {
+        launch.template operator()<32>();
+    } else {
+        launch.template operator()<48>();
+    }
 }
 
 void bf16_gdn_gating_proj_mma_split8_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,

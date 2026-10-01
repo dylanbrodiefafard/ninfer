@@ -48,6 +48,7 @@ class MemoryPlan:
     def summary(self) -> str:
         def gib(value):
             return value / GIB
+
         return (
             f"free={gib(self.free_bytes):.2f}GiB "
             f"headroom={gib(self.headroom_bytes):.2f}GiB "
@@ -75,26 +76,13 @@ def estimate_fixed_bytes(
     if kv_dtype == "bf16":
         kv_per_layer_token = 2 * CFG.kv_heads * CFG.head_dim * 2
     elif kv_dtype == "int8":
-        kv_per_layer_token = 2 * CFG.kv_heads * (
-            CFG.head_dim + CFG.head_dim // 64 * 2
-        )
+        kv_per_layer_token = 2 * CFG.kv_heads * (CFG.head_dim + CFG.head_dim // 64 * 2)
     else:
         raise ValueError(f"unsupported KV dtype: {kv_dtype!r}")
     kv = capacity * kv_layers * kv_per_layer_token
     if text:
-        ssm = (
-            CFG.gdn_layers
-            * CFG.gdn_v_heads
-            * CFG.gdn_k_dim
-            * CFG.gdn_v_dim
-            * 4
-        )
-        conv = (
-            CFG.gdn_layers
-            * CFG.conv_dim
-            * (CFG.conv_width - 1)
-            * CFG.conv_state_bytes
-        )
+        ssm = CFG.gdn_layers * CFG.gdn_v_heads * CFG.gdn_k_dim * CFG.gdn_v_dim * 4
+        conv = CFG.gdn_layers * CFG.conv_dim * (CFG.conv_width - 1) * CFG.conv_state_bytes
     else:
         ssm = 0
         conv = 0
@@ -141,9 +129,7 @@ class WeightStore:
         self._decoded: dict[int, torch.Tensor] = {}
         self._axis_decoded: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
         self._representation: dict[int, str] = {}
-        self._expert_block_ids = frozenset(
-            bank.block.tensor_id for bank in binding.expert_banks
-        )
+        self._expert_block_ids = frozenset(bank.block.tensor_id for bank in binding.expert_banks)
 
         selected: dict[int, PhysicalBlock] = {}
 
@@ -186,9 +172,7 @@ class WeightStore:
         budget = max(0, available - headroom_bytes - fixed)
         used = 0
 
-        controls = [
-            block for block in blocks if block.layout == "contiguous-le-v1"
-        ]
+        controls = [block for block in blocks if block.layout == "contiguous-le-v1"]
         for block in controls:
             size = self._decoded_size(block)
             if block.component == "vision":
@@ -200,12 +184,8 @@ class WeightStore:
             if representation == "decoded":
                 used += size
 
-        quantized = [
-            block for block in blocks if block.layout == "row-split-k128-v1"
-        ]
-        for block in sorted(
-            quantized, key=lambda item: item.payload_bytes, reverse=True
-        ):
+        quantized = [block for block in blocks if block.layout == "row-split-k128-v1"]
+        for block in sorted(quantized, key=lambda item: item.payload_bytes, reverse=True):
             if block.component == "vision":
                 self._representation[block.tensor_id] = "stream"
             elif used + block.payload_bytes <= budget:
@@ -237,15 +217,9 @@ class WeightStore:
             decoded_bytes=decoded,
             packed_bytes=packed,
             streamed_bytes=streamed,
-            decoded_blocks=sum(
-                value == "decoded" for value in self._representation.values()
-            ),
-            packed_blocks=sum(
-                value == "packed" for value in self._representation.values()
-            ),
-            streamed_blocks=sum(
-                value == "stream" for value in self._representation.values()
-            ),
+            decoded_blocks=sum(value == "decoded" for value in self._representation.values()),
+            packed_blocks=sum(value == "packed" for value in self._representation.values()),
+            streamed_blocks=sum(value == "stream" for value in self._representation.values()),
         )
 
     @staticmethod
@@ -278,9 +252,7 @@ class WeightStore:
         if cached is not None:
             return cached
         if self.device.type == "cpu":
-            payload = torch.frombuffer(
-                bytearray(self.binding.payload(block)), dtype=torch.uint8
-            )
+            payload = torch.frombuffer(bytearray(self.binding.payload(block)), dtype=torch.uint8)
         else:
             payload = self._stream_tensor(block)
         if self.representation(block) == "packed":
@@ -301,20 +273,14 @@ class WeightStore:
         representation = self.representation(block)
         if block.layout == "contiguous-le-v1":
             source = (
-                self._upload(block)
-                if representation == "decoded"
-                else self._stream_tensor(block)
+                self._upload(block) if representation == "decoded" else self._stream_tensor(block)
             )
-            decoded = decode_direct(
-                source, block.format, block.shape, device=self.device
-            )
+            decoded = decode_direct(source, block.format, block.shape, device=self.device)
             if representation == "stream" and self.device.type == "cpu":
                 decoded = decoded.clone()
         else:
             source = (
-                self._upload(block)
-                if representation == "packed"
-                else self._stream_tensor(block)
+                self._upload(block) if representation == "packed" else self._stream_tensor(block)
             )
             decoded = dequantize_row_split(
                 source,
@@ -341,10 +307,14 @@ class WeightStore:
             cached = self._axis_decoded.get(key)
             if cached is not None:
                 return cached
-            decoded = self._decode_block(
-                value.block,
-                dequant_dtype=dequant_dtype,
-            ).permute(value.axes).contiguous()
+            decoded = (
+                self._decode_block(
+                    value.block,
+                    dequant_dtype=dequant_dtype,
+                )
+                .permute(value.axes)
+                .contiguous()
+            )
             if tuple(decoded.shape) != value.shape:
                 raise RuntimeError("axis view produced an unexpected shape")
             if self.representation(value.block) == "decoded":
@@ -368,9 +338,7 @@ class WeightStore:
             if self.representation(block) == "packed"
             else self.binding.payload(block)
         )
-        planes = split_row_planes(
-            source, geometry, value.row_begin, value.row_count
-        )
+        planes = split_row_planes(source, geometry, value.row_begin, value.row_count)
         return dequantize_row_split(
             planes,
             block.format,
@@ -431,9 +399,7 @@ class WeightStore:
             absolute = tuple(row_begin + row for row in relative)
 
         if self.representation(block) == "decoded":
-            indices = torch.as_tensor(
-                absolute, dtype=torch.long, device=self.device
-            )
+            indices = torch.as_tensor(absolute, dtype=torch.long, device=self.device)
             return self._decode_block(block).index_select(0, indices)
         source = (
             self._upload(block)
@@ -485,9 +451,7 @@ class WeightStore:
         for local_begin in range(0, row_count, rows):
             local_end = min(row_count, local_begin + rows)
             count = local_end - local_begin
-            planes = split_row_planes(
-                source, geometry, row_begin + local_begin, count
-            )
+            planes = split_row_planes(source, geometry, row_begin + local_begin, count)
             decoded = dequantize_row_split(
                 planes,
                 block.format,

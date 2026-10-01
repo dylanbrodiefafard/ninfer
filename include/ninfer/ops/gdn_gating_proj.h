@@ -89,10 +89,11 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
  * equal to `sequence_width * B`. The execution may aggregate qualified profiles or reuse one
  * panel workspace sequentially; both are private implementation choices.
  */
-void gdn_norm_gating_proj_packed_sequences(
-    const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& h, Tensor& g, Tensor& beta, cudaStream_t stream, std::int32_t sequence_width);
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width);
 
 /** Qwen3.6-35B-A3B contiguous-parent storage form of gdn_norm_gating_proj. */
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,

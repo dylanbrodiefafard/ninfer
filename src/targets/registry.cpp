@@ -104,14 +104,14 @@ template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
-    const auto& identity                          = reader.identity();
+    const auto& identity = reader.identity();
     artifact::Binder binder(reader);
     const auto weights_profile                    = Target::resolve_weights(identity, binder);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
-    EngineOptions planned = options;
-    planned.model_id      = identity.model_id;
-    planned.weights_id    = identity.weights_id;
+    EngineOptions planned          = options;
+    planned.model_id               = identity.model_id;
+    planned.weights_id             = identity.weights_id;
     planned.artifact_file_identity = reader.file_identity();
 
     auto load_plan        = Target::plan_load(binder, planned, weights_profile);
@@ -125,9 +125,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     std::future<std::unique_ptr<HostPinnedArena>> kv_ram_future;
     if (options.kv_ram_capacity_bytes != 0) {
-        const int device_index       = options.device;
-        const std::size_t ram_bytes  = options.kv_ram_capacity_bytes;
-        kv_ram_future = std::async(std::launch::async, [device_index, ram_bytes] {
+        const int device_index      = options.device;
+        const std::size_t ram_bytes = options.kv_ram_capacity_bytes;
+        kv_ram_future               = std::async(std::launch::async, [device_index, ram_bytes] {
             CUDA_CHECK(cudaSetDevice(device_index));
             return std::make_unique<HostPinnedArena>(ram_bytes);
         });
@@ -154,9 +154,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     if (kv_ram_future.valid()) { kv_ram_arena = kv_ram_future.get(); }
     auto loaded   = std::make_unique<Loaded>(std::move(model));
     auto instance = with_automatic_headroom_hint(options.kv_capacity, [&] {
-        auto constructed = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
-                                                      std::move(sequence_plan), device,
-                                                      std::move(kv_ram_arena));
+        auto constructed =
+            std::make_unique<Instance>(std::move(loaded), capacity_resolution,
+                                       std::move(sequence_plan), device, std::move(kv_ram_arena));
         device.synchronize();
         return constructed;
     });

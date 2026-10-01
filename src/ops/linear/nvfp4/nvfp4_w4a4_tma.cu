@@ -88,8 +88,8 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4TmaSharedStorage<Schedule>);
     static const bool kConfigured      = [] {
         CUDA_CHECK(cudaFuncSetAttribute(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             static_cast<int>(kSharedBytes)));
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(kSharedBytes)));
         return true;
     }();
     (void)kConfigured;
@@ -108,39 +108,34 @@ void launch_linear(const std::uint8_t* activation_codes, const std::uint8_t* act
                    __nv_bfloat16* output, std::int32_t tokens, float alpha, cudaStream_t stream) {
     switch (nvfp4_tma_schedule_sel()) {
     case 1:
-        launch_tma<Geometry, TmaM256N128S2>(activation_codes, activation_scales, weight_codes,
-                                            weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                            Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
-                                            stream);
+        launch_tma<Geometry, TmaM256N128S2>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
         return;
     case 2:
-        launch_tma<Geometry, TmaM128N128S2O1>(activation_codes, activation_scales, weight_codes,
-                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
-                                               stream);
+        launch_tma<Geometry, TmaM128N128S2O1>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
         return;
     case 3:
-        launch_tma<Geometry, TmaM128N128S3O1>(activation_codes, activation_scales, weight_codes,
-                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
-                                               stream);
+        launch_tma<Geometry, TmaM128N128S3O1>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
         return;
     case 4:
-        launch_tma<Geometry, TmaM128N128S4O1>(activation_codes, activation_scales, weight_codes,
-                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
-                                               stream);
+        launch_tma<Geometry, TmaM128N128S4O1>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
         return;
     case 5:
-        launch_tma<Geometry, TmaM128N128S2O2>(activation_codes, activation_scales, weight_codes,
-                                               weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                               Nvfp4ContiguousOutput{output, Geometry::kOutputRows},
-                                               stream);
+        launch_tma<Geometry, TmaM128N128S2O2>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
         return;
     default:
-        launch_tma<Geometry, TmaM256N128>(activation_codes, activation_scales, weight_codes,
-                                          weight_scales, tokens, alpha, Nvfp4IdentityEpilogue{},
-                                          Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
+        launch_tma<Geometry, TmaM256N128>(
+            activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
+            Nvfp4IdentityEpilogue{}, Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, stream);
         return;
     }
 }

@@ -128,8 +128,8 @@ template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool QuantizeF
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                   std::int64_t rows, float eps,
-                                   std::uint8_t* codes = nullptr, float* scales = nullptr) {
+                                   std::int64_t rows, float eps, std::uint8_t* codes = nullptr,
+                                   float* scales = nullptr) {
     static_assert(Block % kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
@@ -170,8 +170,11 @@ __launch_bounds__(Block) __global__
             const auto normalized =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
-            if constexpr (QuantizeFp8) { values[k] = normalized; }
-            else { out[row_base + pair] = normalized; }
+            if constexpr (QuantizeFp8) {
+                values[k] = normalized;
+            } else {
+                out[row_base + pair] = normalized;
+            }
         }
     }
     if constexpr (QuantizeFp8) {
@@ -180,10 +183,10 @@ __launch_bounds__(Block) __global__
         for (int k = 0; k < MaxPairsPerThread; ++k) {
             if (k < pairs_per_thread) {
                 const float2 value = __bfloat1622float2(values[k]);
-                maximum = fmaxf(maximum, fmaxf(fabsf(value.x), fabsf(value.y)));
+                maximum            = fmaxf(maximum, fmaxf(fabsf(value.x), fabsf(value.y)));
             }
         }
-        maximum = warp_max(maximum);
+        maximum        = warp_max(maximum);
         const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
         if (lane == 0) { warp_sums[warp] = maximum; }
         __syncthreads();
@@ -199,7 +202,7 @@ __launch_bounds__(Block) __global__
                 const float2 value = __bfloat1622float2(values[k]);
                 reinterpret_cast<std::uint16_t*>(codes)[row_base + threadIdx.x + k * Block] =
                     __nv_cvt_float2_to_fp8x2(make_float2(value.x * inverse, value.y * inverse),
-                                            __NV_SATFINITE, __NV_E4M3);
+                                             __NV_SATFINITE, __NV_E4M3);
             }
         }
         if (threadIdx.x == 0) { scales[row] = scale; }

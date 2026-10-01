@@ -123,8 +123,8 @@ void run_split(const Options& options) {
     const std::int32_t query_channels = options.channels / 5;
     const std::int32_t key_channels   = options.channels / 5;
     const std::int32_t value_channels = options.channels - query_channels - key_channels;
-    const std::size_t n = static_cast<std::size_t>(options.channels) * options.tokens;
-    const std::size_t state_n = static_cast<std::size_t>(options.channels) * 3u;
+    const std::size_t n               = static_cast<std::size_t>(options.channels) * options.tokens;
+    const std::size_t state_n         = static_cast<std::size_t>(options.channels) * 3u;
 
     DeviceBuffer x = make_varied_bf16(n, 0x12345678U);
     DeviceBuffer weight =
@@ -132,11 +132,9 @@ void run_split(const Options& options) {
     DeviceBuffer composed_state = make_varied_bf16(state_n, 0x31415926U);
     DeviceBuffer split_state    = make_varied_bf16(state_n, 0x31415926U);
     DeviceBuffer interleaved    = make_zeros(n * 2u);
-    DeviceBuffer query =
-        make_zeros(static_cast<std::size_t>(query_channels) * options.tokens * 2u);
-    DeviceBuffer key = make_zeros(static_cast<std::size_t>(key_channels) * options.tokens * 2u);
-    DeviceBuffer value =
-        make_zeros(static_cast<std::size_t>(value_channels) * options.tokens * 2u);
+    DeviceBuffer query = make_zeros(static_cast<std::size_t>(query_channels) * options.tokens * 2u);
+    DeviceBuffer key   = make_zeros(static_cast<std::size_t>(key_channels) * options.tokens * 2u);
+    DeviceBuffer value = make_zeros(static_cast<std::size_t>(value_channels) * options.tokens * 2u);
 
     Tensor tx(x.p, DType::BF16, {options.channels, options.tokens});
     Tensor tw(weight.p, DType::BF16, {options.channels, 4});
@@ -155,9 +153,9 @@ void run_split(const Options& options) {
                                      static_cast<std::size_t>(rows) * 2u, options.tokens,
                                      cudaMemcpyDeviceToDevice, stream));
     };
-    const double split_bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
+    const double split_bytes    = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
     const double composed_bytes = split_bytes + 4.0 * static_cast<double>(n);
-    const Result composed = bench_loop(
+    const Result composed       = bench_loop(
         [&](cudaStream_t stream) {
             ops::causal_conv1d_silu(tx, tw, tcomposed_state, tinterleaved, stream);
             copy_plane(0, query_channels, query, stream);
@@ -249,7 +247,7 @@ void run_snapshot(const Options& options) {
     // and publishes three BF16 state columns.
     const double bytes = 8.0 * options.channels + 6.0 * options.channels * options.batch +
                          10.0 * static_cast<double>(n);
-    const Result r = bench_loop(
+    const Result r     = bench_loop(
         [&](cudaStream_t s) {
             ops::causal_conv1d_silu_snapshot(tx, tw, ts, tvalid, tslot, tsnapshot_base, tout, s);
         },

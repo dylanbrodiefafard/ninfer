@@ -482,8 +482,8 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
         });
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix                     = " Q4/Q5 A16 T=" + std::to_string(tokens) +
-                               " initial=" + std::to_string(initial_slot) +
-                               " base=" + std::to_string(kSnapshotBaseSlot);
+                                                   " initial=" + std::to_string(initial_slot) +
+                                                   " base=" + std::to_string(kSnapshotBaseSlot);
     int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
@@ -613,8 +613,8 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
         });
     const std::vector<std::uint16_t> state_after = state.bits();
     const std::string suffix                     = " W8 A16 T=" + std::to_string(tokens) +
-                               " initial=" + std::to_string(initial_slot) +
-                               " base=" + std::to_string(kSnapshotBaseSlot);
+                                                   " initial=" + std::to_string(initial_slot) +
+                                                   " base=" + std::to_string(kSnapshotBaseSlot);
     int failures = verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
     failures += compare("snapshot state" + suffix,
                         gather_state(state_after, kChannels, kValueRows, tokens, kSnapshotBaseSlot),
@@ -826,7 +826,8 @@ int run_nvfp4() {
     return failures;
 }
 
-constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
+                                                                      2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjConvSnapshotA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,

@@ -113,8 +113,8 @@ int run_fp8_a16() {
     failures += run_shape("FP8_A16_FULL", ActivationCompute::A16, make_fp8_weight,
                           {5120, 6144, 839U, Comparison::Full, true, full_invocations});
     constexpr std::array batches{1, 2, 3, 4};
-    failures += run_packed_sequences_matches_panels("FP8_PACKED", make_fp8_weight,
-                                                     14336, 5120, 841U, 6, batches);
+    failures += run_packed_sequences_matches_panels("FP8_PACKED", make_fp8_weight, 14336, 5120,
+                                                    841U, 6, batches);
     return failures;
 }
 

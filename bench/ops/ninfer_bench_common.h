@@ -64,14 +64,14 @@ inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
 // at the 5090's 3.09 GHz max-SM and its SM count that is ~4.3 PFLOPS dense FP4.
 // Treated as an ESTIMATE for %-of-peak readouts; the DRAM roofline (kRooflineGBs)
 // is the rock-solid ceiling for the memory-bound path.
-inline constexpr double kNvfp4FlopPerSmClock = 8192.0;  // 4096 MAC
+inline constexpr double kNvfp4FlopPerSmClock = 8192.0; // 4096 MAC
 inline constexpr double kNvfp4MaxSmClockMhz  = 3090.0;
 
 struct DeviceCaps {
-    int    sm_count          = 0;
-    int    smem_per_sm       = 0;
-    int    max_threads_sm    = 0;
-    int    regs_per_sm       = 0;
+    int sm_count             = 0;
+    int smem_per_sm          = 0;
+    int max_threads_sm       = 0;
+    int regs_per_sm          = 0;
     double dram_gbs          = kRooflineGBs;
     double nvfp4_peak_tflops = 0.0;
 };
@@ -82,14 +82,14 @@ inline DeviceCaps read_device_caps() {
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess) {
         if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
-            c.sm_count    = p.multiProcessorCount;
-            c.smem_per_sm = static_cast<int>(p.sharedMemPerMultiprocessor);
+            c.sm_count       = p.multiProcessorCount;
+            c.smem_per_sm    = static_cast<int>(p.sharedMemPerMultiprocessor);
             c.max_threads_sm = p.maxThreadsPerMultiProcessor;
-            c.regs_per_sm = p.regsPerMultiprocessor;
+            c.regs_per_sm    = p.regsPerMultiprocessor;
         }
     }
-    c.nvfp4_peak_tflops =
-        static_cast<double>(c.sm_count) * kNvfp4MaxSmClockMhz * 1.0e6 * kNvfp4FlopPerSmClock / 1.0e12;
+    c.nvfp4_peak_tflops = static_cast<double>(c.sm_count) * kNvfp4MaxSmClockMhz * 1.0e6 *
+                          kNvfp4FlopPerSmClock / 1.0e12;
     return c;
 }
 

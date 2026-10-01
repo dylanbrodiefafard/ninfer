@@ -41,13 +41,16 @@ class Result:
 def _container_running() -> bool:
     probe = subprocess.run(
         ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return probe.returncode == 0 and probe.stdout.strip() == "true"
 
 
-def run(cmd: str, *, check: bool = True, env: dict | None = None,
-        timeout: float = 1800.0) -> Result:
+def run(
+    cmd: str, *, check: bool = True, env: dict | None = None, timeout: float = 1800.0
+) -> Result:
     """Run a shell command inside the dev container; return captured output."""
     if not _container_running():
         raise HarnessError(
@@ -70,8 +73,7 @@ def run(cmd: str, *, check: bool = True, env: dict | None = None,
 
 def build_target(target: str) -> Result:
     """Incremental build of a CMake target in the shared tree."""
-    return run(f"cd {BUILD} && cmake --build . --target {target} --parallel {JOBS}",
-               check=False)
+    return run(f"cd {BUILD} && cmake --build . --target {target} --parallel {JOBS}", check=False)
 
 
 def test_binary(op) -> str:
@@ -88,7 +90,10 @@ def repo_head() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=os.getcwd(), check=False,
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+            check=False,
         ).stdout.strip()
         return out or "unknown"
     except Exception:

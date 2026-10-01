@@ -297,7 +297,7 @@ public:
         const auto suffix         = from_device<std::uint8_t>(suffix_device, guard_bytes_);
         const auto intact         = [this](const std::vector<std::uint8_t>& guard) {
             return std::all_of(guard.begin(), guard.end(),
-                                       [this](std::uint8_t value) { return value == guard_byte_; });
+                               [this](std::uint8_t value) { return value == guard_byte_; });
         };
         if (intact(prefix) && intact(suffix)) return 0;
         std::cerr << label << ": device buffer guard was overwritten\n";

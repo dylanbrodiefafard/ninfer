@@ -15,7 +15,7 @@ inline constexpr std::int32_t kCausalConvSequenceMaxTokens = 64;
 // width: at C=10240 the serial kernel costs 6.1/8.2/14.4 us at T=16/32/64 against 4.1/6.1/6.2 us,
 // and the two tie at T=8.
 inline constexpr std::int32_t kCausalConvSplitSequenceMaxTokens = 8;
-inline constexpr std::int32_t kCausalConvParallelMaxTokens = 16;
+inline constexpr std::int32_t kCausalConvParallelMaxTokens      = 16;
 
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,

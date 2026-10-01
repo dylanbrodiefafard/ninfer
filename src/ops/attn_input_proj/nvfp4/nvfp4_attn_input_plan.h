@@ -25,10 +25,11 @@ void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tens
 
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
-                                   cudaStream_t stream);
+                                  cudaStream_t stream);
 
 void nvfp4_attn_input_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                  Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream);
+                                  Tensor& k, Tensor& v, Fp8A8Workspace workspace,
+                                  cudaStream_t stream);
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,

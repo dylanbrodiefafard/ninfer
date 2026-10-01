@@ -20,6 +20,7 @@ relative to the repo root (auto-detected) unless given as an absolute path.
 
 Outputs a per-run JSON record under profiles/bench/niah-check/ (gitignored).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -146,27 +147,52 @@ def main() -> int:
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--key", default=None, help="API key (else read from env/.env)")
-    ap.add_argument("--needle", default=DEFAULT_NEEDLE,
-                    help="substring that must appear in the answer for a PASS")
-    ap.add_argument("--exact-answer", action="store_true",
-                    help="require the stripped answer to equal --needle exactly")
-    ap.add_argument("--fixture", action="append", default=None,
-                    help="fixture ref (repeatable). Default: 8k + 64k NIAH.")
-    ap.add_argument("--lengths", default="",
-                    help="NIAH matrix lengths (comma list, e.g. '8k,64k,200k')")
-    ap.add_argument("--positions", default="",
-                    help="NIAH matrix positions (comma list from "
-                         "start/q25/mid/q75/end, or a subset); with --lengths, "
-                         "runs the position-matrix cells")
-    ap.add_argument("--multikey", action="store_true",
-                    help="run the multi-key matrix cells (32 same-form distractor records)")
+    ap.add_argument(
+        "--needle",
+        default=DEFAULT_NEEDLE,
+        help="substring that must appear in the answer for a PASS",
+    )
+    ap.add_argument(
+        "--exact-answer",
+        action="store_true",
+        help="require the stripped answer to equal --needle exactly",
+    )
+    ap.add_argument(
+        "--fixture",
+        action="append",
+        default=None,
+        help="fixture ref (repeatable). Default: 8k + 64k NIAH.",
+    )
+    ap.add_argument(
+        "--lengths", default="", help="NIAH matrix lengths (comma list, e.g. '8k,64k,200k')"
+    )
+    ap.add_argument(
+        "--positions",
+        default="",
+        help="NIAH matrix positions (comma list from "
+        "start/q25/mid/q75/end, or a subset); with --lengths, "
+        "runs the position-matrix cells",
+    )
+    ap.add_argument(
+        "--multikey",
+        action="store_true",
+        help="run the multi-key matrix cells (32 same-form distractor records)",
+    )
     ap.add_argument("--max-tokens", type=int, default=64)
-    ap.add_argument("--thinking", action="store_true", default=False,
-                    help="enable thinking (off by default so the answer is the needle)")
+    ap.add_argument(
+        "--thinking",
+        action="store_true",
+        default=False,
+        help="enable thinking (off by default so the answer is the needle)",
+    )
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--temperature", type=float, default=0.0,
-                    help="request temperature; above zero, run i uses seed + i (seed "
-                         "defaults to 1) so repeated runs are independent samples")
+    ap.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="request temperature; above zero, run i uses seed + i (seed "
+        "defaults to 1) so repeated runs are independent samples",
+    )
     ap.add_argument("--runs", type=int, default=1, help="repeat each case N times")
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--label", default="niah")
@@ -174,8 +200,10 @@ def main() -> int:
 
     key = load_key(args.key)
     if not key:
-        print("ERROR: no API key (pass --key or set NINFER_API_KEY / LLAMA_CPP_LOCAL_API_KEY)",
-              file=__import__("sys").stderr)
+        print(
+            "ERROR: no API key (pass --key or set NINFER_API_KEY / LLAMA_CPP_LOCAL_API_KEY)",
+            file=__import__("sys").stderr,
+        )
         return 2
 
     cases = []
@@ -185,19 +213,27 @@ def main() -> int:
             cases.append((label, ref))
     elif args.lengths or args.positions or args.multikey:
         known_lengths = NIAH_MULTIKEY_LENGTHS if args.multikey else NIAH_LENGTHS
-        lengths = ([p.strip() for p in args.lengths.split(",") if p.strip()]
-                   if args.lengths else list(known_lengths))
-        positions = ([p.strip() for p in args.positions.split(",") if p.strip()]
-                     if args.positions else list(NIAH_POSITIONS))
+        lengths = (
+            [p.strip() for p in args.lengths.split(",") if p.strip()]
+            if args.lengths
+            else list(known_lengths)
+        )
+        positions = (
+            [p.strip() for p in args.positions.split(",") if p.strip()]
+            if args.positions
+            else list(NIAH_POSITIONS)
+        )
         # validate against the known sets so a typo fails fast
         for length in lengths:
             if length not in known_lengths:
-                raise SystemExit(f"unknown NIAH length {length!r} (choose from "
-                           f"{', '.join(known_lengths)})")
+                raise SystemExit(
+                    f"unknown NIAH length {length!r} (choose from {', '.join(known_lengths)})"
+                )
         for p in positions:
             if p not in NIAH_POSITIONS:
-                raise SystemExit(f"unknown NIAH position {p!r} (choose from "
-                           f"{', '.join(NIAH_POSITIONS)})")
+                raise SystemExit(
+                    f"unknown NIAH position {p!r} (choose from {', '.join(NIAH_POSITIONS)})"
+                )
         cases = matrix_cases(lengths, positions, args.multikey)
     else:
         cases = DEFAULT_FIXTURES
@@ -258,19 +294,23 @@ def main() -> int:
                 preview = preview[:240] + "..."
             seed_tag = f" (seed {body['seed']})" if "seed" in body else ""
             snippets.append(f"{status}{seed_tag}: {preview}")
-            print(f"  [{label}] run {run + 1}/{args.runs}: {status} "
-                  f"(wall {wall:.1f}s, needle={ok})\n      {preview}")
+            print(
+                f"  [{label}] run {run + 1}/{args.runs}: {status} "
+                f"(wall {wall:.1f}s, needle={ok})\n      {preview}"
+            )
         passed = retrieved == total and total > 0
-        record["cases"].append({
-            "label": label,
-            "fixture": str(ref),
-            "prompt_chars": n_prompt_chars,
-            "retrieved": retrieved,
-            "total": total,
-            "recall": (retrieved / total) if total else 0.0,
-            "passed": passed,
-            "snippets": snippets,
-        })
+        record["cases"].append(
+            {
+                "label": label,
+                "fixture": str(ref),
+                "prompt_chars": n_prompt_chars,
+                "retrieved": retrieved,
+                "total": total,
+                "recall": (retrieved / total) if total else 0.0,
+                "passed": passed,
+                "snippets": snippets,
+            }
+        )
 
     rec_path = out_dir / f"niah-check-{args.label}-{record['ts']}.json"
     rec_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
@@ -282,10 +322,12 @@ def main() -> int:
         nfail = c["total"] - c["retrieved"]
         print(f"  [FAIL] {c['label']}: {nfail}/{c['total']} runs failed to retrieve the needle")
     verdict = "PASS" if all_pass else "FAIL"
-    print(f"NIAH gate: {verdict} "
-          f"({len(failed_cases)}/{len(record['cases'])} cases, "
-          f"{failed_runs}/{total_runs} runs failed; "
-          f"all cases must retrieve the needle in every run)")
+    print(
+        f"NIAH gate: {verdict} "
+        f"({len(failed_cases)}/{len(record['cases'])} cases, "
+        f"{failed_runs}/{total_runs} runs failed; "
+        f"all cases must retrieve the needle in every run)"
+    )
     return 0 if all_pass else 1
 
 

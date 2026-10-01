@@ -96,16 +96,15 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     return failures;
 }
 
-int run_suppressed_case(std::int32_t physical_rows, std::int32_t valid_rows,
-                        const char* label) {
-    constexpr std::int32_t width         = 3;
-    constexpr std::int32_t batch         = 2;
-    constexpr std::int32_t tokens        = width * batch;
+int run_suppressed_case(std::int32_t physical_rows, std::int32_t valid_rows, const char* label) {
+    constexpr std::int32_t width  = 3;
+    constexpr std::int32_t batch  = 2;
+    constexpr std::int32_t tokens = width * batch;
     std::vector<std::uint16_t> logits(static_cast<std::size_t>(physical_rows) * tokens,
                                       f32_to_bf16(-20.0f));
     for (int column = 0; column < tokens; ++column) {
-        const int suppressed = column < width ? 11 : 17;
-        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        const int suppressed      = column < width ? 11 : 17;
+        const std::size_t base    = static_cast<std::size_t>(column) * physical_rows;
         logits[base + suppressed] = f32_to_bf16(9.0f);
         logits[base + 23]         = f32_to_bf16(8.0f);
     }
@@ -129,7 +128,7 @@ int run_suppressed_case(std::int32_t physical_rows, std::int32_t valid_rows,
     cuda_synchronize();
 
     std::vector<std::int32_t> expected(tokens, 23);
-    expected[0] = 1;
+    expected[0]  = 1;
     int failures = verify_exact(
         label, from_device<std::int32_t>(device_output.data(), static_cast<std::size_t>(tokens)),
         expected);
@@ -148,27 +147,28 @@ int column_masks(int physical, int domain) {
         expected.push_back(token);
         masks[col * stride + token / 32] |= 1u << (token % 32);
         masks[col * stride] |= 1u << 8;
-        logits[col * physical] = f32_to_bf16(100);
+        logits[col * physical]     = f32_to_bf16(100);
         logits[col * physical + 8] = f32_to_bf16(90);
     }
     auto device_masks = to_device(masks);
     std::vector<ops::SamplingConfig> configs(batch);
     for (int row = 0; row < batch; ++row) {
-        configs[row].allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p) +
-                                            row * width * stride;
+        configs[row].allowed_token_words =
+            static_cast<const std::uint32_t*>(device_masks.p) + row * width * stride;
         configs[row].allowed_token_column_stride = stride;
-        configs[row].suppressed_token_count = 1;
-        configs[row].suppressed_tokens[0] = 8;
+        configs[row].suppressed_token_count      = 1;
+        configs[row].suppressed_tokens[0]        = 8;
     }
-    auto device_logits = to_device(logits);
+    auto device_logits  = to_device(logits);
     auto device_configs = to_device(configs);
-    auto device_output = to_device(std::vector<std::int32_t>(batch * width, -1));
+    auto device_output  = to_device(std::vector<std::int32_t>(batch * width, -1));
     Tensor x(device_logits.p, DType::BF16, {physical, batch * width});
     Tensor y(device_output.p, DType::I32, {batch * width});
-    ops::argmax(x, y, domain, static_cast<const ops::SamplingConfig*>(device_configs.p), width, nullptr);
+    ops::argmax(x, y, domain, static_cast<const ops::SamplingConfig*>(device_configs.p), width,
+                nullptr);
     cuda_synchronize();
     return verify_exact("argmax per-node masks and row isolation",
-        from_device<std::int32_t>(device_output, expected.size()), expected);
+                        from_device<std::int32_t>(device_output, expected.size()), expected);
 }
 
 } // namespace
@@ -190,8 +190,7 @@ int main() {
     failures += run_case(131072, 131072, 15);
     failures += run_case(131072, 131072, 120);
     failures += run_suppressed_case(1024, 1000, "argmax row-local suppressed tokens small");
-    failures += run_suppressed_case(248320, 248077,
-                                    "argmax row-local suppressed tokens tiled");
+    failures += run_suppressed_case(248320, 248077, "argmax row-local suppressed tokens tiled");
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;
 }

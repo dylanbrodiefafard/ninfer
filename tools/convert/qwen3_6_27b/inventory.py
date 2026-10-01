@@ -121,10 +121,7 @@ MTP_TENSOR_SPECS = _build_mtp_specs()
 VISION_TENSOR_SPECS = _build_vision_specs()
 
 TENSOR_SPECS = (
-    TEXT_CORE_TENSOR_SPECS
-    + DRAFT_HEAD_TENSOR_SPECS
-    + MTP_TENSOR_SPECS
-    + VISION_TENSOR_SPECS
+    TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + MTP_TENSOR_SPECS + VISION_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
@@ -133,8 +130,7 @@ FORMAT_COUNTS = {
     for numeric_format in FORMAT_NAMES
 }
 LAYOUT_COUNTS = {
-    layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
-    for layout in LAYOUT_NAMES
+    layout: sum(spec.layout == layout for spec in TENSOR_SPECS) for layout in LAYOUT_NAMES
 }
 
 

@@ -86,13 +86,9 @@ def _artifact_specs(src: Artifact) -> list[ArtifactTensorSpec | ArtifactResource
     for obj in src.objects:
         if isinstance(obj, TensorObject):
             if obj.name in _MTP_NAMES:
-                specs.append(
-                    ArtifactTensorSpec(obj.name, obj.shape, NVFP4, BLOCK_SCALE_LAYOUT)
-                )
+                specs.append(ArtifactTensorSpec(obj.name, obj.shape, NVFP4, BLOCK_SCALE_LAYOUT))
             else:
-                specs.append(
-                    ArtifactTensorSpec(obj.name, obj.shape, obj.format, obj.layout)
-                )
+                specs.append(ArtifactTensorSpec(obj.name, obj.shape, obj.format, obj.layout))
         elif isinstance(obj, ResourceObject):
             specs.append(ArtifactResourceSpec(obj.name, obj.encoding, obj.bytes))
         else:
@@ -106,9 +102,7 @@ def _payload_chunks(view: memoryview) -> Iterator[memoryview]:
         yield blob[begin : begin + _COPY_CHUNK]
 
 
-def preflight_conversion(
-    base_artifact: str | Path, model_dir: str | Path
-) -> ConversionPreflight:
+def preflight_conversion(base_artifact: str | Path, model_dir: str | Path) -> ConversionPreflight:
     base = Path(base_artifact)
     model = Path(model_dir)
     config_summary = qwen3_6_convert.validate_config(
@@ -125,9 +119,7 @@ def preflight_conversion(
                 raise ValueError(f"{name}: shape {tuple(obj.shape)} != {shape}")
             if obj.format == NVFP4:
                 if obj.layout != BLOCK_SCALE_LAYOUT:
-                    raise ValueError(
-                        f"{name}: NVFP4 parent must use {BLOCK_SCALE_LAYOUT}"
-                    )
+                    raise ValueError(f"{name}: NVFP4 parent must use {BLOCK_SCALE_LAYOUT}")
             elif obj.format != W8:
                 raise ValueError(f"{name}: expected {W8} or {NVFP4}, got {obj.format}")
             identity = src.identity
@@ -164,17 +156,13 @@ def convert(
         flush=True,
     )
 
-    with Artifact.open(preflight.base_artifact) as src, ShardReader(
-        preflight.model_dir
-    ) as reader:
+    with Artifact.open(preflight.base_artifact) as src, ShardReader(preflight.model_dir) as reader:
         specs = _artifact_specs(src)
         with ArtifactWriter(tmp, src.identity, specs) as writer:
             for index, obj in enumerate(src.objects, start=1):
                 if isinstance(obj, TensorObject) and obj.name in _MTP_NAMES:
                     bf16 = materialize_recipe(recipe.RECIPES_BY_NAME[obj.name], reader)
-                    payload = encode_nvfp4_from_bf16(
-                        bf16.to(device=resolved_device), obj.shape
-                    )
+                    payload = encode_nvfp4_from_bf16(bf16.to(device=resolved_device), obj.shape)
                     del bf16
                     writer.write(obj.name, payload)
                     del payload
@@ -225,9 +213,7 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
-    convert(
-        args.base_artifact, args.model, args.out, device=args.device
-    )
+    convert(args.base_artifact, args.model, args.out, device=args.device)
 
 
 if __name__ == "__main__":

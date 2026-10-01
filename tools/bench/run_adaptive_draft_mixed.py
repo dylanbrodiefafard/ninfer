@@ -70,11 +70,19 @@ HOMO_C3 = [
 # Mixed C=2: (want-k from C=1 frozen) pairs that disagree.
 MIX_C2 = [
     job("mix2-dlg-py", ("scenario_story_zh_dialogue", "scenario_code_python"), 1024, 2),  # 3 vs 5
-    job("mix2-sci-jsonl", ("scenario_story_zh_scifi", "scenario_structured_jsonl"), 1024, 2),  # 3 vs 5
-    job("mix2-dlg-story", ("scenario_story_zh_dialogue", "scenario_story_en_mystery"), 1024, 2),  # 3 vs 4
+    job(
+        "mix2-sci-jsonl", ("scenario_story_zh_scifi", "scenario_structured_jsonl"), 1024, 2
+    ),  # 3 vs 5
+    job(
+        "mix2-dlg-story", ("scenario_story_zh_dialogue", "scenario_story_en_mystery"), 1024, 2
+    ),  # 3 vs 4
     job("mix2-cuda-py", ("scenario_code_cuda", "scenario_code_python"), 2048, 2),  # 4 vs 5
-    job("mix2-sql-jsonl", ("scenario_structured_sql", "scenario_structured_jsonl"), 2048, 2),  # 4 vs 5
-    job("mix2-story-jsonl", ("scenario_story_en_mystery", "scenario_structured_jsonl"), 1024, 2),  # 4 vs 5
+    job(
+        "mix2-sql-jsonl", ("scenario_structured_sql", "scenario_structured_jsonl"), 2048, 2
+    ),  # 4 vs 5
+    job(
+        "mix2-story-jsonl", ("scenario_story_en_mystery", "scenario_structured_jsonl"), 1024, 2
+    ),  # 4 vs 5
     job("mix2-dlg-cuda", ("scenario_story_zh_dialogue", "scenario_code_cuda"), 1024, 2),  # 3 vs 4
 ]
 
@@ -108,12 +116,20 @@ HOMO_B = [
 # Second mixed suite: 2× confirmation that ΣE/T_B matches frozen winners.
 # C=1 wants: 3=dialogue/scifi, 4=story/CUDA/SQL, 5=python/jsonl/csv/logic.
 MIX_C2_CONFIRM = [
-    job("mix2-dlg-jsonl", ("scenario_story_zh_dialogue", "scenario_structured_jsonl"), 1024, 2),  # 3 vs 5
+    job(
+        "mix2-dlg-jsonl", ("scenario_story_zh_dialogue", "scenario_structured_jsonl"), 1024, 2
+    ),  # 3 vs 5
     job("mix2-sci-py", ("scenario_story_zh_scifi", "scenario_code_python"), 1024, 2),  # 3 vs 5
-    job("mix2-csv-scifi", ("scenario_structured_csv", "scenario_story_zh_scifi"), 1024, 2),  # 5 vs 3
-    job("mix2-sci-story", ("scenario_story_zh_scifi", "scenario_story_en_mystery"), 1024, 2),  # 3 vs 4
+    job(
+        "mix2-csv-scifi", ("scenario_structured_csv", "scenario_story_zh_scifi"), 1024, 2
+    ),  # 5 vs 3
+    job(
+        "mix2-sci-story", ("scenario_story_zh_scifi", "scenario_story_en_mystery"), 1024, 2
+    ),  # 3 vs 4
     job("mix2-sci-cuda", ("scenario_story_zh_scifi", "scenario_code_cuda"), 1024, 2),  # 3 vs 4
-    job("mix2-dlg-sql", ("scenario_story_zh_dialogue", "scenario_structured_sql"), 1024, 2),  # 3 vs 4
+    job(
+        "mix2-dlg-sql", ("scenario_story_zh_dialogue", "scenario_structured_sql"), 1024, 2
+    ),  # 3 vs 4
     job("mix2-story-py", ("scenario_story_en_mystery", "scenario_code_python"), 1024, 2),  # 4 vs 5
     job("mix2-cuda-jsonl", ("scenario_code_cuda", "scenario_structured_jsonl"), 2048, 2),  # 4 vs 5
     job("mix2-sql-py", ("scenario_structured_sql", "scenario_code_python"), 2048, 2),  # 4 vs 5

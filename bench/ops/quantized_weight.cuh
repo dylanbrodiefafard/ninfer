@@ -150,14 +150,14 @@ inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, 
     weight.padded_shape[1]  = padded_k;
     weight.ndim             = 2;
     weight.qdata            = result.storage.p;
-    weight.qhigh            = high_bytes == 0
-                                  ? nullptr
-                                  : static_cast<const std::uint8_t*>(result.storage.p) + result.high_offset;
-    weight.scales      = static_cast<const std::uint8_t*>(result.storage.p) + result.scale_offset;
-    weight.n           = n;
-    weight.k           = k;
-    weight.group       = geometry.group_size;
-    weight.layout      = QuantLayout::RowSplit;
+    weight.qhigh  = high_bytes == 0
+                        ? nullptr
+                        : static_cast<const std::uint8_t*>(result.storage.p) + result.high_offset;
+    weight.scales = static_cast<const std::uint8_t*>(result.storage.p) + result.scale_offset;
+    weight.n      = n;
+    weight.k      = k;
+    weight.group  = geometry.group_size;
+    weight.layout = QuantLayout::RowSplit;
     weight.scale_dtype = DType::FP16;
     return result;
 }
@@ -235,13 +235,13 @@ inline Weight row_view(const Weight& parent, std::int32_t row_begin, std::int32_
 
     Weight view = parent;
     view.qdata  = static_cast<const std::uint8_t*>(parent.qdata) +
-                 static_cast<std::uint64_t>(row_begin) * low_row_bytes;
+                  static_cast<std::uint64_t>(row_begin) * low_row_bytes;
     view.qhigh  = high_row_bytes == 0 ? nullptr
                                       : static_cast<const std::uint8_t*>(parent.qhigh) +
-                                           static_cast<std::uint64_t>(row_begin) * high_row_bytes;
+                                            static_cast<std::uint64_t>(row_begin) * high_row_bytes;
     view.scales = static_cast<const std::uint8_t*>(parent.scales) +
                   static_cast<std::uint64_t>(row_begin) * scale_row_bytes;
-    view.n               = rows;
+    view.n      = rows;
     view.shape[0]        = rows;
     view.padded_shape[0] = rows;
     return view;

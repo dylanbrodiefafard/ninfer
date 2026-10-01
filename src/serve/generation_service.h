@@ -24,14 +24,14 @@ struct MediaInputCapacity;
 
 struct GenerationMetrics {
     ninfer::GenerationRecoveryStats recovery;
-    double prepare_seconds = 0.0;
-    double ttft_seconds    = 0.0;
-    double vision_seconds  = 0.0;
-    double prefill_seconds = 0.0;
+    double prepare_seconds       = 0.0;
+    double ttft_seconds          = 0.0;
+    double vision_seconds        = 0.0;
+    double prefill_seconds       = 0.0;
     double prefill_tail_tok_s    = 0.0;
     double prefill_tail_window_s = 0.0;
-    double decode_seconds  = 0.0;
-    double total_seconds   = 0.0;
+    double decode_seconds        = 0.0;
+    double total_seconds         = 0.0;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -42,23 +42,23 @@ struct GenerationMetrics {
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t speculative_live_draft_tokens = 0;
     std::vector<std::uint64_t> speculative_rounds_per_draft;
-    std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
-    ninfer::PrefixReuseSource prefix_reuse_source = ninfer::PrefixReuseSource::None;
+    std::uint32_t prefix_cache_hit_tokens            = 0;
+    ninfer::PrefixReusePath prefix_reuse_path        = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReuseSource prefix_reuse_source    = ninfer::PrefixReuseSource::None;
     std::uint32_t captured_context_checkpoint_tokens = 0;
     std::uint32_t restored_context_checkpoint_tokens = 0;
-    double kv_ram_save_seconds        = 0;
-    double kv_ram_load_seconds        = 0;
-    double kv_disk_save_seconds        = 0;
-    double kv_disk_load_seconds        = 0;
-    double kv_disk_h2d_seconds         = 0;
-    double prepare_cpu_seconds         = 0;
-    double media_wait_seconds          = 0;
-    double media_fetch_seconds         = 0;
-    double queued_seconds              = 0;
-    double copy_hold_seconds           = 0;
+    double kv_ram_save_seconds                       = 0;
+    double kv_ram_load_seconds                       = 0;
+    double kv_disk_save_seconds                      = 0;
+    double kv_disk_load_seconds                      = 0;
+    double kv_disk_h2d_seconds                       = 0;
+    double prepare_cpu_seconds                       = 0;
+    double media_wait_seconds                        = 0;
+    double media_fetch_seconds                       = 0;
+    double queued_seconds                            = 0;
+    double copy_hold_seconds                         = 0;
     // HTTP handler clock minus engine e2e. Set by the HTTP layer, not the Engine.
-    double http_tail_seconds           = 0;
+    double http_tail_seconds = 0;
 };
 
 struct GenerationOutcome {
@@ -88,8 +88,7 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 // HTTP 400 owner for capture_context_checkpoint on a server that cannot pin.
 // Throws before Engine submit. No-op when capture is not requested, or when
 // prefix reuse and a speculative backend are both available.
-void reject_unavailable_context_checkpoint_capture(bool capture_requested,
-                                                   bool allow_prefix_reuse,
+void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool allow_prefix_reuse,
                                                    ninfer::SpeculativeBackend spec);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
@@ -136,8 +135,8 @@ public:
                                           std::function<bool()> is_cancelled = {}) const;
 
     // Consumes prepared.generation. A PreparedRequest is single-use.
-    GenerationOutcome run(PreparedRequest& prepared, std::uint64_t request_id, const StreamSink* sink,
-                          std::function<bool()> is_cancelled = {},
+    GenerationOutcome run(PreparedRequest& prepared, std::uint64_t request_id,
+                          const StreamSink* sink, std::function<bool()> is_cancelled = {},
                           std::function<void(const ninfer::RecoveryEvent&)> on_recovery = {});
 
     void warmup();
