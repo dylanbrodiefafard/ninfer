@@ -102,7 +102,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int row = tid; row < RowCount; row += Threads) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
                     -CUDART_INF_F;
@@ -114,7 +114,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d   = idx - row * D;
             int q_head    = 0;
             int token     = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
                     __float2bfloat16(0.0f);
@@ -197,7 +197,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const int grp = unit - row * Groups;
         int q_head    = 0;
         int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+        gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
         if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
@@ -330,8 +330,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int row0 = producer_row_base + gid;
             const int row1 = row0 + 8;
             int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head0, token0);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
             // Packed-tree verify writes unique cache slots E+j; causal-only
@@ -533,14 +533,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m0;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l0;
         }
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m1;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l1;
         }
@@ -557,7 +557,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][0], acc[n][1]);
@@ -565,7 +565,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][2], acc[n][3]);

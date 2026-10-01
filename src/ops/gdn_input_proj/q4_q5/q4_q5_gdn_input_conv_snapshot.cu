@@ -140,7 +140,7 @@ void launch_q4_t1(const Tensor& x, const Weight& qk_weight,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(qk_weight.qdata),
             static_cast<const std::uint8_t*>(qk_weight.scales),
-            static_cast<__nv_bfloat16*>(query.data), nullptr, kQkRows, kHidden,
+            static_cast<__nv_bfloat16*>(query.data), nullptr, kHidden,
             Q4GdnDecodeEpilogue<Publish>{qk_epilogue}));
     } else {
         q4_rowsplit_gemv_kernel<Q4GemvR1W8DirectSchedule, false, 0, Q4GdnDecodeEpilogue<Publish>,
@@ -148,7 +148,7 @@ void launch_q4_t1(const Tensor& x, const Weight& qk_weight,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(qk_weight.qdata),
             static_cast<const std::uint8_t*>(qk_weight.scales),
-            static_cast<__nv_bfloat16*>(query.data), nullptr, kQkRows, kHidden,
+            static_cast<__nv_bfloat16*>(query.data), nullptr, kHidden,
             Q4GdnDecodeEpilogue<Publish>{qk_epilogue});
     }
 }

@@ -15,10 +15,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 #define CUDA_CHECK(expr)                                                                           \
@@ -195,6 +198,20 @@ void print_usage(const char* argv0) {
                  argv0);
 }
 
+// Parses all of `text` as a decimal int; malformed or out-of-range text exits with status 2.
+int parse_int_option(const char* option, std::string_view text) {
+    int value               = 0;
+    const char* const first = text.data();
+    const char* const last  = first + text.size();
+    const auto [end, error] = std::from_chars(first, last, value);
+    if (error != std::errc{} || end != last) {
+        std::fprintf(stderr, "%s: '%.*s' is not a decimal int\n", option,
+                     static_cast<int>(text.size()), text.data());
+        std::exit(2);
+    }
+    return value;
+}
+
 Options parse(int argc, char** argv) {
     Options opt;
     for (int i = 1; i < argc; ++i) {
@@ -226,11 +243,11 @@ Options parse(int argc, char** argv) {
                 std::exit(2);
             }
         } else if (arg == "--iters") {
-            opt.iters = std::atoi(next());
+            opt.iters = parse_int_option("--iters", next());
         } else if (arg == "--warps") {
-            opt.warps = std::atoi(next());
+            opt.warps = parse_int_option("--warps", next());
         } else if (arg == "--blocks-per-sm") {
-            opt.blocks_per_sm = std::atoi(next());
+            opt.blocks_per_sm = parse_int_option("--blocks-per-sm", next());
         } else if (arg == "--json") {
             opt.json = true;
         } else if (arg == "-h" || arg == "--help") {

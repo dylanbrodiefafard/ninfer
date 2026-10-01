@@ -319,7 +319,13 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     if (p_less) {
         // Every column's p-less law first, then block verification over the chain (the
         // multi-block finalize runs the same speculative_p_less_block_verify).
-        __shared__ SamplingPLessMoments col_moments[kSamplerMaxColumns];
+        // SamplingPLessMoments has default member initializers, which a __shared__ declaration
+        // cannot run, so the array is raw storage reused as moments (an aggregate, hence an
+        // implicit-lifetime type). Thread 0 writes slot i for every i <= extent before the
+        // barrier below, and only slots a_sh <= extent are read.
+        __shared__ alignas(SamplingPLessMoments) unsigned char
+            col_moments_storage[sizeof(SamplingPLessMoments) * kSamplerMaxColumns];
+        auto* const col_moments = reinterpret_cast<SamplingPLessMoments*>(col_moments_storage);
         __shared__ float col_admitted[kSamplerMaxColumns];
         __shared__ float residual_weight_sh;
         const float inv_temp     = 1.0f / cfg.temperature;

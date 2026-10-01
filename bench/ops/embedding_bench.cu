@@ -167,7 +167,8 @@ ColdTiming measure_point(const ProfileSpec& spec, const Weight& table, DeviceBuf
 }
 
 double logical_bytes_per_column(const ProfileSpec& spec, const PackedLayout& layout) {
-    const double groups       = static_cast<double>(layout.padded_d / spec.group);
+    const auto group_count    = layout.padded_d / spec.group; // padded_d is a multiple of group.
+    const double groups       = static_cast<double>(group_count);
     const double weight_bytes = spec.qtype == QType::Q6G64_F16S
                                     ? groups * static_cast<double>(32 + 16 + 2)
                                     : static_cast<double>(layout.padded_d) + groups * 2.0;

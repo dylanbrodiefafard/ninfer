@@ -96,9 +96,9 @@ int main(int argc, char** argv) {
                 return 2;
             }
             d      = 1152;
-            tokens = {std::atoi(argv[++i])};
+            tokens = {parse_number<int>(argv[++i], "--patches")};
         } else if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
-            d = std::atoi(argv[++i]);
+            d = parse_number<int>(argv[++i], "--d");
             if (d != 1152 && d != 2048 && d != 5120) {
                 std::fprintf(stderr, "D must be 1152, 2048, or 5120\n");
                 return 2;

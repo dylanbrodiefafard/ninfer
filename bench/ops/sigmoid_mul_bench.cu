@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
             tokens = parse_tokens(argv[++i]);
         } else if (!std::strcmp(argv[i], "--heads") && i + 1 < argc) {
-            heads = std::atoi(argv[++i]);
+            heads = parse_number<int>(argv[++i], "--heads");
             if (heads != 16 && heads != 24) {
                 std::fprintf(stderr, "heads must be 16 or 24\n");
                 return 2;
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
         } else if (!std::strcmp(argv[i], "--control")) {
             control = true;
         } else if (!std::strcmp(argv[i], "--candidate-block") && i + 1 < argc) {
-            candidate_block = std::atoi(argv[++i]);
+            candidate_block = parse_number<int>(argv[++i], "--candidate-block");
             if (candidate_block <= 0 || candidate_block > 256 || candidate_block % 32 != 0) {
                 std::fprintf(stderr,
                              "candidate block must be a positive multiple of 32 no larger than "

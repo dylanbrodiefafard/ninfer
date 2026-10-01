@@ -119,11 +119,11 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
         launch_gemm<M64N64>(weight, q, gate, k, v, workspace, tokens, stream);
     } else if (tokens <= 96) {
         launch_gemm<M32N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 128) {
+    } else if (tokens <= 128) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
     } else if (tokens <= 192) {
         launch_gemm<M64N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 384) {
+    } else if (tokens <= 384) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
     } else if (tokens <= 512) {
         launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);

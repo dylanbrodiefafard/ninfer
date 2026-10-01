@@ -286,7 +286,7 @@ void require_dflash_row_views(const Weight& first_weight, const Weight& second_w
     constexpr std::int32_t kFirstRow       = 4096;
     constexpr std::int32_t kSecondRow      = 5120;
     constexpr std::uint64_t kCodeBytes     = static_cast<std::uint64_t>(kParentRows) * kHidden;
-    constexpr std::uint64_t kScaleRowBytes = (kHidden / 32) * 2;
+    constexpr std::uint64_t kScaleRowBytes = static_cast<std::uint64_t>(kHidden / 32) * 2;
     constexpr std::uint64_t kPayloadBytes =
         kCodeBytes + static_cast<std::uint64_t>(kParentRows) * kScaleRowBytes;
 

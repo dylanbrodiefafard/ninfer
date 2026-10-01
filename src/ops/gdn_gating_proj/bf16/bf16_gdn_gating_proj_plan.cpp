@@ -115,21 +115,21 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
 
 bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
                                   std::int32_t tile_cols, std::int32_t row_tiles,
-                                  std::int32_t resident_ctas) noexcept {
+                                  std::int32_t resident_ctas) {
     const std::int64_t column_tiles = (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
     const std::int64_t grid_ctas =
         column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
     return grid_ctas <= resident_ctas;
 }
 
-bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
     // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
     // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
     return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
 }
 
-bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
     // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
     // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
     // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
@@ -139,8 +139,7 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
     return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
 }
 
-bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
-                        const Bf16GdnGatingProblem& problem) noexcept {
+bool candidate_is_legal(Bf16GdnGatingScheduleId schedule, const Bf16GdnGatingProblem& problem) {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
     if (is_27(problem)) {
         switch (schedule) {
@@ -182,7 +181,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
 }
 
 std::size_t checked_partial_bytes(std::int32_t heads, std::int32_t split_k, std::int32_t cols) {
-    const std::size_t logical_rows = static_cast<std::size_t>(2 * heads);
+    const std::size_t logical_rows = 2 * static_cast<std::size_t>(heads);
     const std::size_t split        = static_cast<std::size_t>(split_k);
     const std::size_t tokens       = static_cast<std::size_t>(cols);
     if (tokens > std::numeric_limits<std::size_t>::max() / logical_rows ||

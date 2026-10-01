@@ -169,9 +169,7 @@ void launch_tc_partial_nvfp4s3(const Tensor& q, CacheInput input, const Tensor& 
                 launch_tier.template operator()<8, 2, 32, false>();
             }
         } else {
-            if (implementation_window > 128 && implementation_window <= 512) {
-                launch_tier.template operator()<24, 1, 32, false>();
-            } else if (implementation_window <= 1029) {
+            if (implementation_window <= 1029) {
                 launch_tier.template operator()<24, 1, 32, false>();
             } else if (implementation_window <= 4096) {
                 launch_tier.template operator()<12, 1, 32, false>();

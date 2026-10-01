@@ -92,7 +92,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         for (int row = tid; row < row_count; row += Threads) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
                     -CUDART_INF_F;
@@ -104,7 +104,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int d   = idx - row * D;
             int q_head    = 0;
             int token     = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
                     __float2bfloat16(0.0f);
@@ -179,7 +179,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         const int d   = idx - row * D;
         int q_head    = 0;
         int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+        gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
         __nv_bfloat16 value = __float2bfloat16(0.0f);
         if (row < row_count && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
             value = q[gqa_q_index<Geometry>(q_head, d, token)];
@@ -282,8 +282,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
-        gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
+        gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head0, token0);
+        gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
         const int qabs0   = (row0 < row_count) ? pos[token0] : -1;
         const int qabs1   = (row1 < row_count) ? pos[token1] : -1;
         int prefix_length = 0;
@@ -399,14 +399,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         if (row0 < row_count) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m0;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l0;
         }
         if (row1 < row_count) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m1;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l1;
         }
@@ -436,7 +436,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         const int d   = (chunk - row * (D / 8)) * 8;
         int q_head    = 0;
         int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+        gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
         if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);

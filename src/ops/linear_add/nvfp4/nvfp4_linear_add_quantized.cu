@@ -46,7 +46,7 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
         launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 192) {
         launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 384) {
+    } else if (tokens <= 384) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 512) {
         launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);

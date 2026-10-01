@@ -115,7 +115,7 @@ __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8
 __launch_bounds__(kEmbedGatherQ6Group* kEmbedGatherQ6GroupsPerBlock) __global__
     void embed_gather_q6_grouped_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                         const std::uint8_t* high, const std::uint8_t* scales,
-                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T) {
+                                        __nv_bfloat16* out, std::int32_t d) {
     const std::int32_t kg           = d / kEmbedGatherQ6Group;
     const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ6GroupsPerBlock);
     const std::int32_t t            = static_cast<std::int32_t>(blockIdx.x) / group_blocks;

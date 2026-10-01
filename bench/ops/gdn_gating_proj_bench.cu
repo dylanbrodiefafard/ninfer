@@ -139,13 +139,13 @@ Options parse_args(int argc, char** argv) {
                 opt.candidate = parse_candidate(raw);
             }
         } else if (!std::strcmp(argv[i], "--packed-width")) {
-            opt.packed_width = std::atoi(next("packed-width"));
+            opt.packed_width = parse_number<int>(next("packed-width"), "--packed-width");
         } else if (!std::strcmp(argv[i], "-p") || !std::strcmp(argv[i], "--tokens")) {
             opt.tokens = parse_tokens(next("tokens"));
         } else if (!std::strcmp(argv[i], "--warmup")) {
-            opt.warmup = std::atoi(next("warmup"));
+            opt.warmup = parse_number<int>(next("warmup"), "--warmup");
         } else if (!std::strcmp(argv[i], "--repeat")) {
-            opt.repeat = std::atoi(next("repeat"));
+            opt.repeat = parse_number<int>(next("repeat"), "--repeat");
         } else if (!std::strcmp(argv[i], "--flush-mib")) {
             const long mib = std::strtol(next("flush-mib"), nullptr, 10);
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
@@ -279,14 +279,16 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const int panel_cols = opt.packed_width != 0 && !aggregate ? opt.packed_width : tokens;
     const bool narrow =
         plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40;
-    const int mma_tile           = narrow ? (panel_cols <= 8    ? 8
-                                             : panel_cols <= 16 ? 16
-                                             : panel_cols <= 32 ? 32
-                                                                : 48)
-                                          : (opt.geometry35 ? 64 : 128);
-    const double executed_cols   = !mma ? tokens
-                                        : static_cast<double>(tokens / panel_cols) *
-                                              ((panel_cols + mma_tile - 1) / mma_tile) * mma_tile;
+    const int mma_tile = narrow ? (panel_cols <= 8    ? 8
+                                   : panel_cols <= 16 ? 16
+                                   : panel_cols <= 32 ? 32
+                                                      : 48)
+                                : (opt.geometry35 ? 64 : 128);
+    // tokens is a whole number of panels; each panel executes its columns rounded up to the tile.
+    const int panels      = tokens / panel_cols;
+    const int panel_tiles = (panel_cols + mma_tile - 1) / mma_tile;
+    const double executed_cols =
+        !mma ? tokens : static_cast<double>(panels) * panel_tiles * mma_tile;
     const double executed_flops  = 2.0 * 2.0 * static_cast<double>(heads) * hidden * executed_cols;
     const double useful_tflops   = useful_flops / sec / 1e12;
     const double executed_tflops = executed_flops / sec / 1e12;

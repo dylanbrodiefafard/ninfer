@@ -17,8 +17,8 @@ namespace ninfer::ops {
 
 inline constexpr int kSigmoidGateMulPairsPerThread = 4;
 
-__device__ __forceinline__ __nv_bfloat162 sigmoid_gate_mul_pair(__nv_bfloat162 gate,
-                                                                __nv_bfloat162 x) {
+__device__ __forceinline__ __nv_bfloat162 sigmoid_gate_mul_pair(const __nv_bfloat162& gate,
+                                                                const __nv_bfloat162& x) {
     const float r0 = __low2float(x) * sigmoid(__low2float(gate));
     const float r1 = __high2float(x) * sigmoid(__high2float(gate));
     return __floats2bfloat162_rn(r0, r1);
