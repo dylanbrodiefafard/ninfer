@@ -466,6 +466,7 @@ std::vector<BenchTest> expand_tests(const BenchOptions& options) {
     }
 
     std::vector<BenchTest> tests;
+    tests.reserve(prompts.size() + gens.size() + combined.size());
     for (const int p : prompts) {
         tests.push_back({TestKind::Prefill, p, 0, "pp" + std::to_string(p)});
     }
@@ -556,7 +557,7 @@ std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prom
 }
 
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec) {
-    const std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
+    std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
     if (spec.draft_tokens == 0) { return suffix; }
     const std::string kind = spec.backend == SpeculativeBackend::DFlash ? "dflash" : "mtp";
     return kind + "_" + suffix;

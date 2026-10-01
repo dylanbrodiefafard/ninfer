@@ -134,20 +134,20 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
-void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& ws,
                 cudaStream_t stream) {
-    linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
+    linear_add(x, w, residual, LinearPolicy::A16Only, ws, stream);
 }
 
-void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     require_tensor(x, DType::BF16, w.k, t, "x");
-    require_tensor(residual_out, DType::BF16, w.n, t, "residual_out");
-    if (overlaps(x, residual_out)) {
-        throw std::invalid_argument("linear_add: x and residual_out must not overlap");
+    require_tensor(residual, DType::BF16, w.n, t, "residual");
+    if (overlaps(x, residual)) {
+        throw std::invalid_argument("linear_add: x and residual must not overlap");
     }
 
     if (w.qtype == QType::BF16_CTRL) {
@@ -158,13 +158,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!detail::bf16_linear_add_admits(w.n, w.k, t)) {
             throw std::invalid_argument("linear_add: unsupported BF16 shape");
         }
-        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
-            !aligned_to(w.qdata, 16)) {
+        if (!aligned_to(x.data, 16) || !aligned_to(residual.data, 16) || !aligned_to(w.qdata, 16)) {
             throw std::invalid_argument(
                 "linear_add: BF16 requires 16-byte x/residual/weight alignment");
         }
         (void)ws;
-        detail::bf16_linear_add_dispatch(x, w, residual_out, stream);
+        detail::bf16_linear_add_dispatch(x, w, residual, stream);
         return;
     }
 
@@ -175,12 +174,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         require_q5(w);
         const bool supported_shape = (w.n == 5120 && w.k == 17408) || (w.n == 5120 && w.k == 6144);
         if (!supported_shape) { throw std::invalid_argument("linear_add: unsupported Q5 shape"); }
-        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
-            !aligned_to(w.qdata, 16) || !aligned_to(w.qhigh, 16) || !aligned_to(w.scales, 16)) {
+        if (!aligned_to(x.data, 16) || !aligned_to(residual.data, 16) || !aligned_to(w.qdata, 16) ||
+            !aligned_to(w.qhigh, 16) || !aligned_to(w.scales, 16)) {
             throw std::invalid_argument(
                 "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
         }
-        detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
+        detail::q5_linear_add_dispatch(x, w, residual, ws, stream);
         return;
     }
 
@@ -192,13 +191,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (w.n != 2048 || (w.k != 4096 && w.k != 6144)) {
             throw std::invalid_argument("linear_add: unsupported W8 shape");
         }
-        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
-            !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 16)) {
+        if (!aligned_to(x.data, 16) || !aligned_to(residual.data, 16) || !aligned_to(w.qdata, 16) ||
+            !aligned_to(w.scales, 16)) {
             throw std::invalid_argument(
                 "linear_add: W8 requires 16-byte x/residual/code/scale alignment");
         }
         (void)ws;
-        detail::w8_linear_add_dispatch(x, w, residual_out, stream);
+        detail::w8_linear_add_dispatch(x, w, residual, stream);
         return;
     }
 
@@ -215,10 +214,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!supported_shape) {
             throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
         }
-        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+        if (!aligned_to(x.data, 16) || !aligned_to(residual.data, 16)) {
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
-        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        detail::nvfp4_linear_add_dispatch(x, w, residual, policy, ws, stream);
         return;
     }
 
@@ -234,10 +233,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!supported_shape) {
             throw std::invalid_argument("fp8 linear_add: unsupported weight shape");
         }
-        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+        if (!aligned_to(x.data, 16) || !aligned_to(residual.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
-        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        detail::fp8_linear_add_dispatch(x, w, residual, policy, ws, stream);
         return;
     }
 

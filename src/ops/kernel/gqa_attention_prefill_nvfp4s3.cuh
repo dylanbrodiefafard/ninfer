@@ -790,11 +790,11 @@ __device__ __forceinline__ void gqa_attention_prefill_nvfp4s3_device(
             running_m0 = nm0;
             running_m1 = nm1;
             if (do_dump && lid == 0 && (!ExactT || k_half == 0)) {
-                const std::int64_t ml = (dht + ki) * Br;
-                dump->m[ml + row0]    = running_m0;
-                dump->l[ml + row0]    = running_l0;
-                dump->m[ml + row1]    = running_m1;
-                dump->l[ml + row1]    = running_l1;
+                const std::int64_t stat_base = (dht + ki) * Br;
+                dump->m[stat_base + row0]    = running_m0;
+                dump->l[stat_base + row0]    = running_l0;
+                dump->m[stat_base + row1]    = running_m1;
+                dump->l[stat_base + row1]    = running_l1;
             }
             if (lid == 0) {
                 alpha_s[row0] = alpha0;

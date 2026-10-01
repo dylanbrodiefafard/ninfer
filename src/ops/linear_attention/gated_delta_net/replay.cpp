@@ -44,11 +44,10 @@ struct MemoryRange {
     std::uintptr_t end;
 };
 
-MemoryRange make_range(const void* pointer, std::size_t bytes, const char* label) {
-    if (pointer == nullptr || bytes == 0) {
+MemoryRange make_range(std::uintptr_t begin, std::size_t bytes, const char* label) {
+    if (begin == 0 || bytes == 0) {
         throw std::invalid_argument(std::string(label) + " has an empty memory range");
     }
-    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
         throw std::overflow_error(std::string(label) + " address range overflows");
     }
@@ -56,7 +55,7 @@ MemoryRange make_range(const void* pointer, std::size_t bytes, const char* label
 }
 
 MemoryRange tensor_range(const Tensor& tensor, const char* label) {
-    return make_range(tensor.data, tensor.bytes(), label);
+    return make_range(reinterpret_cast<std::uintptr_t>(tensor.data), tensor.bytes(), label);
 }
 
 MemoryRange layer_range(const Tensor& layer0, std::int64_t stride_bytes, std::int32_t layer,
@@ -71,7 +70,7 @@ MemoryRange layer_range(const Tensor& layer0, std::int64_t stride_bytes, std::in
     if (offset > std::numeric_limits<std::uintptr_t>::max() - base) {
         throw std::overflow_error(std::string(label) + " layer address overflows");
     }
-    return make_range(reinterpret_cast<const void*>(base + offset), layer0.bytes(), label);
+    return make_range(base + offset, layer0.bytes(), label);
 }
 
 bool overlaps(MemoryRange lhs, MemoryRange rhs) {

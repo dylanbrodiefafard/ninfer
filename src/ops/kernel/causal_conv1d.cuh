@@ -12,8 +12,8 @@
 
 namespace ninfer::ops {
 
-__device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bfloat162 x,
-                                                       float& acc0, float& acc1) {
+__device__ __forceinline__ void
+causal_conv1d_acc_pair(const __nv_bfloat162& w, const __nv_bfloat162& x, float& acc0, float& acc1) {
     acc0 += __low2float(w) * __low2float(x);
     acc1 += __high2float(w) * __high2float(x);
 }
@@ -35,7 +35,7 @@ causal_conv1d_store_split(__nv_bfloat16 value, std::int32_t channel, std::int32_
 }
 
 __device__ __forceinline__ void
-causal_conv1d_store_split_pair(__nv_bfloat162 value, std::int64_t pair, std::int32_t token,
+causal_conv1d_store_split_pair(const __nv_bfloat162& value, std::int64_t pair, std::int32_t token,
                                std::int32_t query_pairs, std::int32_t key_pairs,
                                std::int32_t value_pairs, __nv_bfloat162* query, __nv_bfloat162* key,
                                __nv_bfloat162* value_output) {
@@ -555,7 +555,7 @@ __global__ void
 causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                      __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
                                      const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
-                                     std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
+                                     std::int32_t C, std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
 

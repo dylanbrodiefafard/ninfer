@@ -99,7 +99,7 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
         }
     } else if (tokens <= 192) {
         launch_gemm<Geometry, M64N128>(weight, out, workspace, tokens, stream);
-    } else if (tokens <= 384) {
+    } else if (tokens <= 384) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         launch_gemm<Geometry, M128N128Resident>(weight, out, workspace, tokens, stream);
     } else if (tokens <= 512) {
         if constexpr (Geometry::kOutputRows == Nvfp4GdnInputGeometry::kOutputRows) {

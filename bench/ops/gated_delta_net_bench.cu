@@ -464,7 +464,9 @@ double state_tensor_bytes(const Problem& problem) {
 }
 
 double chunk_state_tensor_bytes(const Problem& problem) {
-    const double chunks = static_cast<double>(problem.tokens / gated_delta_net_detail::kChunkSize);
+    // Only full chunks publish a chunk state; a partial tail chunk does not.
+    const std::int32_t full_chunks = problem.tokens / gated_delta_net_detail::kChunkSize;
+    const double chunks            = static_cast<double>(full_chunks);
     return state_tensor_bytes(problem) * chunks * 0.5;
 }
 

@@ -127,13 +127,13 @@ int main() {
                                            8192, 16384, 32768, 65536, 98304, 153600};
     std::vector<int> contexts           = all_contexts;
     if (const char* e = std::getenv("NINFER_BENCH_MAX_CTX")) {
-        const int cap = std::atoi(e);
+        const int cap = parse_number<int>(e, "NINFER_BENCH_MAX_CTX");
         contexts.erase(
             std::remove_if(contexts.begin(), contexts.end(), [cap](int c) { return c > cap; }),
             contexts.end());
     }
     if (const char* e = std::getenv("NINFER_BENCH_MIN_CTX")) {
-        const int floor = std::atoi(e);
+        const int floor = parse_number<int>(e, "NINFER_BENCH_MIN_CTX");
         contexts.erase(
             std::remove_if(contexts.begin(), contexts.end(), [floor](int c) { return c < floor; }),
             contexts.end());

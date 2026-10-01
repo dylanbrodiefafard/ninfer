@@ -241,8 +241,8 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
     detail::speculative_select_accepted_hidden_launch(hidden, selectors, out, stream);
 }
 
-void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map, std::int32_t n,
-                              cudaStream_t stream) {
+void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
+                              std::int32_t count, cudaStream_t stream) {
     constexpr const char* op = "proposal_remap_token_ids";
     require_dtype(proposal_tokens, DType::I32, op, "proposal_tokens");
     if (proposal_tokens.ne[0] <= 0 || proposal_tokens.ne[1] != 1 || proposal_tokens.ne[2] != 1 ||
@@ -250,10 +250,11 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
         throw std::invalid_argument(
             "proposal_remap_token_ids: proposal_tokens must be a non-empty vector");
     }
-    if (id_map == nullptr || n <= 0) {
-        throw std::invalid_argument("proposal_remap_token_ids: id_map must be non-null and n>0");
+    if (id_map == nullptr || count <= 0) {
+        throw std::invalid_argument(
+            "proposal_remap_token_ids: id_map must be non-null and count>0");
     }
-    detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
+    detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, count, stream);
 }
 
 } // namespace ninfer::ops

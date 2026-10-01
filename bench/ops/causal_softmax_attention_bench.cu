@@ -547,9 +547,11 @@ std::string profile_name(std::span<const std::int32_t> values) {
 
 double cache_vector_bytes(DType dtype) {
     if (dtype == DType::BF16) { return static_cast<double>(kHeadDim * dtype_size(DType::BF16)); }
+    const std::int32_t quant_group = cache_quant_group(dtype);
+    if (quant_group == 0) { throw std::invalid_argument("cache dtype has no quantization group"); }
+    const auto scale_groups = static_cast<std::size_t>(kHeadDim / quant_group);
     return static_cast<double>(cache_code_width(dtype) * dtype_size(dtype) +
-                               (kHeadDim / cache_quant_group(dtype)) *
-                                   dtype_size(cache_scale_dtype(dtype)));
+                               scale_groups * dtype_size(cache_scale_dtype(dtype)));
 }
 
 double causal_key_sum(std::int32_t tokens, std::int32_t context) {

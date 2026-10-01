@@ -16,7 +16,8 @@ namespace ninfer::ops {
 
 inline constexpr int kAddBiasPairsPerThread = 4;
 
-__device__ __forceinline__ __nv_bfloat162 add_bias_pair(__nv_bfloat162 value, __nv_bfloat162 bias) {
+__device__ __forceinline__ __nv_bfloat162 add_bias_pair(const __nv_bfloat162& value,
+                                                        const __nv_bfloat162& bias) {
     return __floats2bfloat162_rn(__low2float(value) + __low2float(bias),
                                  __high2float(value) + __high2float(bias));
 }

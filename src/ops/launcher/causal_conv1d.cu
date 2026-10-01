@@ -260,7 +260,7 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
             static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_state_slots.data),
             static_cast<const std::int32_t*>(snapshot_base_slots.data),
-            static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
+            static_cast<__nv_bfloat16*>(out.data), C, slot_stride);
     } else if (B == 1 && valid_columns.data == nullptr) {
         constexpr int kBlock = 32;
         causal_conv1d_sequence_snapshot_kernel<<<grid_for(C, kBlock, "sequence snapshot"), kBlock,

@@ -132,14 +132,15 @@ int main(int argc, char** argv) {
     // Optional one-shot mode: `bench <context> <tokens>` profiles a single cell
     // (for NCU); default is the full sweep.
     const std::vector<int> contexts =
-        (argc > 1) ? std::vector<int>{std::atoi(argv[1])}
+        (argc > 1) ? std::vector<int>{parse_number<int>(argv[1], "context")}
                    : std::vector<int>{128,  256,   512,   1024,  2048,  4096,
                                       8192, 16384, 32768, 65536, 98304, 153600};
     const std::vector<int> tokens_list =
-        (argc > 2) ? std::vector<int>{std::atoi(argv[2])} : std::vector<int>{1, 2, 4, 6};
+        (argc > 2) ? std::vector<int>{parse_number<int>(argv[2], "tokens")}
+                   : std::vector<int>{1, 2, 4, 6};
     // keep_frac: the sparge-decode tile-skip fraction (1.0 = exact/no-skip, the default).
     // Only engages on the T=1 cached step; width > 1 (MTP verify) ignores it.
-    const float keep_frac = (argc > 3) ? static_cast<float>(std::atof(argv[3])) : 1.0f;
+    const float keep_frac = (argc > 3) ? parse_number<float>(argv[3], "keep_frac") : 1.0f;
     std::printf("ninfer gqa-decode nvfp4s3 bench (geom=27B q=%d kv=%d hdim=%d code=%d groups=%d "
                 "keep_frac=%.2f)\n",
                 kQHeads, kKVHeads, kHeadDim, kCodeW, kGroups, keep_frac);
