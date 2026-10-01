@@ -3,9 +3,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -105,8 +105,10 @@ int run_case(int live, float* d_input_keys, int* d_input_ids, float* d_output_ke
 
     for (int i = 0; i < width; ++i) {
         const RankedValue want = expected[static_cast<std::size_t>(i)];
+        // The sort only moves keys, so each output key must be bit-identical to its expected key.
         const bool key_equal =
-            std::memcmp(&actual_keys[static_cast<std::size_t>(i)], &want.key, sizeof(float)) == 0;
+            std::bit_cast<std::uint32_t>(actual_keys[static_cast<std::size_t>(i)]) ==
+            std::bit_cast<std::uint32_t>(want.key);
         if (!key_equal || actual_ids[static_cast<std::size_t>(i)] != want.id) {
             std::cerr << "XAttention rank live=" << live << " width=" << width << " item=" << i
                       << " got=(" << actual_keys[static_cast<std::size_t>(i)] << ","

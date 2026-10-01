@@ -720,13 +720,13 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
 int verify_packed_workspace_rejections() {
     int failures              = 0;
     const auto expect_invalid = [&](std::int32_t width, std::int32_t first, std::int32_t last) {
-        try {
-            (void)ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(width, first,
-                                                                                      last);
-            std::cerr << "gdn packed workspace accepted invalid W=" << width << " B=" << first
-                      << ".." << last << '\n';
-            ++failures;
-        } catch (const std::invalid_argument&) {}
+        failures += expect_invalid_argument(
+            [&] {
+                return ops::gdn_norm_gating_proj_packed_sequences_workspace_capacity_bytes(
+                    width, first, last);
+            },
+            "gdn packed workspace accepted invalid W=" + std::to_string(width) +
+                " B=" + std::to_string(first) + ".." + std::to_string(last));
     };
     expect_invalid(0, 1, 1);
     expect_invalid(5, 0, 1);

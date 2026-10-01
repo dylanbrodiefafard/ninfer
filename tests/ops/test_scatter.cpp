@@ -117,9 +117,9 @@ int batch_prefix_case() {
     const std::vector<std::int32_t> valid{2, 3};
     const std::vector<std::int32_t> starts{10, 20};
     const std::vector<std::int32_t> ends{12, 23};
-    const auto source = bit_pattern(static_cast<std::size_t>(rows * width * batch), 0x2468'ace0u);
+    const auto source = bit_pattern(static_cast<std::size_t>(rows) * width * batch, 0x2468'ace0u);
     const auto initial =
-        bit_pattern(static_cast<std::size_t>(rows * width * capacity), 0x3141'5926u);
+        bit_pattern(static_cast<std::size_t>(rows) * width * capacity, 0x3141'5926u);
     auto expected_pool = initial;
     for (std::int32_t b = 0; b < batch; ++b) {
         for (std::int32_t column = 0; column < valid[static_cast<std::size_t>(b)]; ++column) {
@@ -164,8 +164,8 @@ int batch_prefix_case() {
     cuda_synchronize();
 
     auto expected_gathered = source;
-    std::fill(expected_gathered.begin() + static_cast<std::ptrdiff_t>(2 * rows),
-              expected_gathered.begin() + static_cast<std::ptrdiff_t>(3 * rows), 0);
+    std::fill(expected_gathered.begin() + 2 * static_cast<std::ptrdiff_t>(rows),
+              expected_gathered.begin() + 3 * static_cast<std::ptrdiff_t>(rows), 0);
     const std::vector<std::int32_t> expected_positions{10, 11, 11, 20, 21, 22};
 
     int failures = verify_exact(
@@ -198,16 +198,19 @@ int pitched_live_width_case() {
     constexpr std::int32_t capacity = 3;
     const std::vector<std::int32_t> lanes{2, 0};
     const std::vector<std::int32_t> valid{6, 4};
-    const auto source = bit_pattern(static_cast<std::size_t>(rows * vw * batch), 0x51ed51edu);
+    const auto source = bit_pattern(static_cast<std::size_t>(rows) * vw * batch, 0x51ed51edu);
     const auto initial =
-        bit_pattern(static_cast<std::size_t>(rows * w_ceil * capacity), 0xa11ce110u);
+        bit_pattern(static_cast<std::size_t>(rows) * w_ceil * capacity, 0xa11ce110u);
     auto expected_pool = initial;
     for (std::int32_t b = 0; b < batch; ++b) {
         for (std::int32_t column = 0; column < valid[static_cast<std::size_t>(b)]; ++column) {
             for (std::int32_t row = 0; row < rows; ++row) {
-                expected_pool[static_cast<std::size_t>(
-                    (lanes[static_cast<std::size_t>(b)] * w_ceil + column) * rows + row)] =
-                    source[static_cast<std::size_t>((b * vw + column) * rows + row)];
+                expected_pool[(static_cast<std::size_t>(lanes[static_cast<std::size_t>(b)]) *
+                                   w_ceil +
+                               column) *
+                                  rows +
+                              row] =
+                    source[(static_cast<std::size_t>(b) * vw + column) * rows + row];
             }
         }
     }
@@ -266,9 +269,12 @@ int pitched_live_width_case() {
         const std::int32_t count = expected_counts[static_cast<std::size_t>(b)];
         for (std::int32_t column = 0; column < count; ++column) {
             for (std::int32_t row = 0; row < rows; ++row) {
-                expected_gathered[static_cast<std::size_t>((b * w_ceil + column) * rows + row)] =
-                    expected_pool[static_cast<std::size_t>(
-                        (lanes[static_cast<std::size_t>(b)] * w_ceil + column) * rows + row)];
+                expected_gathered[(static_cast<std::size_t>(b) * w_ceil + column) * rows + row] =
+                    expected_pool[(static_cast<std::size_t>(lanes[static_cast<std::size_t>(b)]) *
+                                       w_ceil +
+                                   column) *
+                                      rows +
+                                  row];
             }
         }
     }
@@ -311,8 +317,8 @@ int pitched_live_width_case() {
     for (std::int32_t b = 0; b < batch; ++b) {
         for (std::int32_t column = 0; column < vw; ++column) {
             for (std::int32_t row = 0; row < rows; ++row) {
-                expected_compact[static_cast<std::size_t>((b * vw + column) * rows + row)] =
-                    expected_gathered[static_cast<std::size_t>((b * w_ceil + column) * rows + row)];
+                expected_compact[(static_cast<std::size_t>(b) * vw + column) * rows + row] =
+                    expected_gathered[(static_cast<std::size_t>(b) * w_ceil + column) * rows + row];
             }
         }
     }
@@ -354,11 +360,11 @@ int gather_path_crossed_lanes_case() {
             const std::int32_t src = path[static_cast<std::size_t>(b) * width + i];
             std::copy(initial.begin() + static_cast<std::ptrdiff_t>(column(lane, src)),
                       initial.begin() + static_cast<std::ptrdiff_t>(column(lane, src) + rows),
-                      saved.begin() + static_cast<std::ptrdiff_t>(i * rows));
+                      saved.begin() + static_cast<std::ptrdiff_t>(i) * rows);
         }
         for (std::int32_t i = 0; i < count; ++i) {
-            std::copy(saved.begin() + static_cast<std::ptrdiff_t>(i * rows),
-                      saved.begin() + static_cast<std::ptrdiff_t>((i + 1) * rows),
+            std::copy(saved.begin() + static_cast<std::ptrdiff_t>(i) * rows,
+                      saved.begin() + (static_cast<std::ptrdiff_t>(i) + 1) * rows,
                       expected.begin() + static_cast<std::ptrdiff_t>(column(lane, i)));
         }
     }

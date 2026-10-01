@@ -617,8 +617,13 @@ int run_record_fold_rounds() {
         std::vector<float> g_host(static_cast<std::size_t>(kProfile.value_heads) * kWidth);
         std::vector<float> beta_host(g_host.size());
         for (std::size_t index = 0; index < g_host.size(); ++index) {
-            g_host[index]    = -0.04F - static_cast<float>((index + round * 17) % 80) / 100.0F;
-            beta_host[index] = 0.08F + static_cast<float>((index * 7 + round * 13) % 80) / 100.0F;
+            g_host[index] =
+                -0.04F -
+                static_cast<float>((index + static_cast<std::size_t>(round) * 17) % 80) / 100.0F;
+            beta_host[index] =
+                0.08F +
+                static_cast<float>((index * 7 + static_cast<std::size_t>(round) * 13) % 80) /
+                    100.0F;
         }
         device_g.copy_from_host(g_host.data(), device_g.bytes);
         device_beta.copy_from_host(beta_host.data(), device_beta.bytes);

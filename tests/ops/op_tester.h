@@ -35,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace ninfer::test {
@@ -364,6 +365,18 @@ inline int verify_reduction(std::string_view label, std::span<const double> got,
     std::cerr << label << ": reduction criterion failed at index " << stats.maximum_error_index
               << " actual=" << stats.actual_at_maximum
               << " reference=" << stats.reference_at_maximum << '\n';
+    return 1;
+}
+
+// Contract-rejection check for a host-side Op admission call. Returns 0 (pass) when `call` throws
+// std::invalid_argument; otherwise prints `accepted_message` and returns 1 (fail). Any other
+// exception propagates, because only std::invalid_argument is the documented rejection.
+template <typename Call>
+[[nodiscard]] int expect_invalid_argument(Call&& call, std::string_view accepted_message) {
+    try {
+        (void)std::forward<Call>(call)();
+    } catch (const std::invalid_argument&) { return 0; }
+    std::cerr << accepted_message << '\n';
     return 1;
 }
 

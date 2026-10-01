@@ -586,9 +586,9 @@ int run_parent_index_tree() {
     const std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(kBatch), kInitial);
     std::vector<std::int32_t> parent_host(static_cast<std::size_t>(kTreeWidth * kBatch));
     for (std::int32_t batch = 0; batch < kBatch; ++batch) {
-        parent_host[static_cast<std::size_t>(batch * kTreeWidth + 0)] = -1;
-        parent_host[static_cast<std::size_t>(batch * kTreeWidth + 1)] = 0;
-        parent_host[static_cast<std::size_t>(batch * kTreeWidth + 2)] = 0;
+        parent_host[static_cast<std::size_t>(batch) * kTreeWidth + 0] = -1;
+        parent_host[static_cast<std::size_t>(batch) * kTreeWidth + 1] = 0;
+        parent_host[static_cast<std::size_t>(batch) * kTreeWidth + 2] = 0;
     }
 
     const auto pack_pair = [&](std::int32_t second) {
@@ -598,9 +598,9 @@ int run_parent_index_tree() {
             for (std::int32_t dst = 0; dst < kSeqWidth; ++dst) {
                 const std::int32_t src = tokens[static_cast<std::size_t>(dst)];
                 const std::size_t src_base =
-                    static_cast<std::size_t>((batch * kTreeWidth + src) * kHidden);
+                    (static_cast<std::size_t>(batch) * kTreeWidth + src) * kHidden;
                 const std::size_t dst_base =
-                    static_cast<std::size_t>((batch * kSeqWidth + dst) * kHidden);
+                    (static_cast<std::size_t>(batch) * kSeqWidth + dst) * kHidden;
                 std::copy_n(activation.begin() + static_cast<std::ptrdiff_t>(src_base), kHidden,
                             packed.begin() + static_cast<std::ptrdiff_t>(dst_base));
             }
@@ -660,9 +660,9 @@ int run_parent_index_tree() {
                              std::int32_t tree_col, std::int32_t seq_col) {
         for (std::int32_t batch = 0; batch < kBatch; ++batch) {
             const std::size_t tree_base =
-                static_cast<std::size_t>((batch * kTreeWidth + tree_col) * rows);
+                (static_cast<std::size_t>(batch) * kTreeWidth + tree_col) * rows;
             const std::size_t seq_base =
-                static_cast<std::size_t>((batch * kSeqWidth + seq_col) * rows);
+                (static_cast<std::size_t>(batch) * kSeqWidth + seq_col) * rows;
             if (!std::equal(tree_bits.begin() + static_cast<std::ptrdiff_t>(tree_base),
                             tree_bits.begin() + static_cast<std::ptrdiff_t>(tree_base + rows),
                             seq_bits.begin() + static_cast<std::ptrdiff_t>(seq_base))) {
@@ -1262,8 +1262,9 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                         for (int t : path) {
                             (*carried_state)[base + row] = (*carried_state)[base + kChannels + row];
                             (*carried_state)[base + kChannels + row] =
-                                (*carried_state)[base + 2 * kChannels + row];
-                            (*carried_state)[base + 2 * kChannels + row] =
+                                (*carried_state)[base + 2 * static_cast<std::size_t>(kChannels) +
+                                                 row];
+                            (*carried_state)[base + 2 * static_cast<std::size_t>(kChannels) + row] =
                                 record_bits[static_cast<std::size_t>(b * width + t) * kChannels +
                                             row];
                         }
@@ -1285,9 +1286,13 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                                 (*reference_state)[base + row] =
                                     (*reference_state)[base + kChannels + row];
                                 (*reference_state)[base + kChannels + row] =
-                                    (*reference_state)[base + 2 * kChannels + row];
-                                (*reference_state)[base + 2 * kChannels + row] = f32_to_bf16(
-                                    static_cast<float>(round_persistent_bf16(projected)));
+                                    (*reference_state)[base +
+                                                       2 * static_cast<std::size_t>(kChannels) +
+                                                       row];
+                                (*reference_state)[base + 2 * static_cast<std::size_t>(kChannels) +
+                                                   row] =
+                                    f32_to_bf16(
+                                        static_cast<float>(round_persistent_bf16(projected)));
                             }
                         }
                     }
@@ -1381,7 +1386,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
             failures += run_shape(width, batch, {}, {}, 2700U + width * 8 + batch);
         }
         for (int width : {5, 6}) {
-            std::vector<int> valid(batch), parents(batch * width);
+            std::vector<int> valid(batch), parents(static_cast<std::size_t>(batch) * width);
             for (int b = 0; b < batch; ++b) {
                 valid[b] = width - b % width;
                 for (int t = 0; t < width; ++t) {
@@ -1394,7 +1399,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     if (qtype == QType::NVFP4 && policy == ops::LinearPolicy::A16Only) {
         for (int batch : {2, 3, 4}) {
             failures += run_shape(6, batch, {}, {}, 2600U + batch);
-            std::vector<int> valid(batch), parents(batch * 6);
+            std::vector<int> valid(batch), parents(static_cast<std::size_t>(batch) * 6);
             for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? 3 : 6; }
             for (int b = 0; b < batch; ++b)
                 for (int t = 0; t < 6; ++t) parents[b * 6 + t] = t == 0 ? -1 : (t - 1) / 2;
@@ -1416,7 +1421,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                 for (int b = 0; b < 4; ++b) { valid[b] = 1 + (prefix - 1 + b) % width; }
                 std::vector<int> parents;
                 if ((prefix & 1) == 0) {
-                    parents.resize(width * 4);
+                    parents.resize(static_cast<std::size_t>(width) * 4);
                     for (int b = 0; b < 4; ++b) {
                         for (int t = 0; t < width; ++t) {
                             parents[b * width + t] = t == 0 ? -1 : (t - 1) / 2;
@@ -1433,7 +1438,7 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
             for (int batch : {1, 2, 3, 4}) {
                 std::vector<int> valid(batch);
                 for (int b = 0; b < batch; ++b) { valid[b] = b + 1 == batch ? width - 1 : width; }
-                std::vector<int> tree(width * batch);
+                std::vector<int> tree(static_cast<std::size_t>(width) * batch);
                 for (int b = 0; b < batch; ++b)
                     for (int t = 0; t < width; ++t) tree[b * width + t] = t == 0 ? -1 : (t - 1) / 2;
                 failures += run_shape(width, batch, valid, tree, 2200U + width * 4 + batch);

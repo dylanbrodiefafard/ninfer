@@ -208,10 +208,10 @@ public:
                     (row->high[static_cast<std::size_t>(group) * 16 + bit / 8] >> (bit & 7)) &
                     0x03u;
                 const std::uint32_t encoded = low | (high << 4);
-                const int code = (encoded & 0x20u) != 0 ? static_cast<int>(encoded) - 64
-                                                        : static_cast<int>(encoded);
-                const double scale =
-                    static_cast<double>(f16_to_f32(load_u16_le(row->scales, group * 2)));
+                const int code     = (encoded & 0x20u) != 0 ? static_cast<int>(encoded) - 64
+                                                            : static_cast<int>(encoded);
+                const double scale = static_cast<double>(
+                    f16_to_f32(load_u16_le(row->scales, static_cast<std::size_t>(group) * 2)));
                 result[t * static_cast<std::size_t>(kQ6D) + d] = static_cast<double>(code) * scale;
             }
         }

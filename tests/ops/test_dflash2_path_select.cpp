@@ -717,10 +717,14 @@ int run_tree_compact_case() {
     round_to_bf16(logits);
     round_to_bf16(hidden);
     const std::int32_t anchor = 1;
-    GuardedDeviceBuffer device_logits(vocab * tokens * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_hidden(kHidden * tokens * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_pred(kRank * vocab * sizeof(std::uint16_t));
-    GuardedDeviceBuffer device_succ(kRank * vocab * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(static_cast<std::size_t>(vocab) * tokens *
+                                      sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_hidden(static_cast<std::size_t>(kHidden) * tokens *
+                                      sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_pred(static_cast<std::size_t>(kRank) * vocab *
+                                    sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_succ(static_cast<std::size_t>(kRank) * vocab *
+                                    sizeof(std::uint16_t));
     GuardedDeviceBuffer device_anchors(sizeof(std::int32_t));
     GuardedDeviceBuffer device_frontiers(sizeof(std::int32_t));
     GuardedDeviceBuffer device_ids(static_cast<std::size_t>(width) * sizeof(std::int32_t));
@@ -947,12 +951,12 @@ int run_mixed_temperature_batch_case() {
         from_device<std::int32_t>(device_path.data(), static_cast<std::size_t>(tokens) * batch);
     for (std::int32_t t = 0; t < tokens; ++t) {
         const std::int32_t sampled = got[static_cast<std::size_t>(t)];
-        const std::int32_t greedy  = got[static_cast<std::size_t>(tokens + t)];
+        const std::int32_t greedy  = got[static_cast<std::size_t>(tokens) + t];
         if (sampled < 0 || sampled >= kTopK) {
             std::cerr << "dflash2_path_select mixed-temp: sampled row token outside top-16\n";
             return 1;
         }
-        if (greedy != expected[static_cast<std::size_t>(tokens + t)]) {
+        if (greedy != expected[static_cast<std::size_t>(tokens) + t]) {
             std::cerr
                 << "dflash2_path_select mixed-temp: greedy row used another row's temperature\n";
             return 1;
@@ -1123,12 +1127,11 @@ quantized_weight::PackedWeight pack_dflash2_nvfp4_codebook(const std::vector<flo
         const std::int32_t row_tile  = row / 128;
         const std::int32_t row_inner = row % 128;
         for (int group = 0; group < kRank / kGroup; ++group) {
+            const std::size_t group_base =
+                static_cast<std::size_t>(row) * kRank + static_cast<std::size_t>(group) * kGroup;
             float group_amax = 0.0f;
             for (int i = 0; i < kGroup; ++i) {
-                group_amax = std::max(
-                    group_amax,
-                    std::fabs(
-                        token_major[static_cast<std::size_t>(row) * kRank + group * kGroup + i]));
+                group_amax = std::max(group_amax, std::fabs(token_major[group_base + i]));
             }
             const float scale_fp32 =
                 std::min(kE4M3Max, std::max(0.0f, group_amax * divisor / kE2M1Max));
@@ -1144,12 +1147,8 @@ quantized_weight::PackedWeight pack_dflash2_nvfp4_codebook(const std::vector<flo
                            static_cast<std::size_t>(row_inner / 32) * 4U +
                            static_cast<std::size_t>(scale_lane)] = scale_word;
             for (int i = 0; i < kGroup; i += 2) {
-                const float lo =
-                    token_major[static_cast<std::size_t>(row) * kRank + group * kGroup + i] *
-                    divisor / safe;
-                const float hi =
-                    token_major[static_cast<std::size_t>(row) * kRank + group * kGroup + i + 1] *
-                    divisor / safe;
+                const float lo = token_major[group_base + i] * divisor / safe;
+                const float hi = token_major[group_base + i + 1] * divisor / safe;
                 packed.payload[static_cast<std::size_t>(row) * (kRank / 2) +
                                static_cast<std::size_t>(group * (kGroup / 2) + i / 2)] =
                     static_cast<std::uint8_t>(encode_e2m1_nibble(lo) |

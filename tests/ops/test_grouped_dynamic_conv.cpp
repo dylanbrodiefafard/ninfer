@@ -47,7 +47,7 @@ std::size_t dyn_index(std::int32_t g, std::int32_t offset, std::int32_t t, std::
 }
 
 std::size_t base_index(std::int32_t d, std::int32_t offset, std::int32_t phase) {
-    return static_cast<std::size_t>(phase) * (kD * 2) + static_cast<std::size_t>(offset) * kD + d;
+    return static_cast<std::size_t>(phase) * kD * 2 + static_cast<std::size_t>(offset) * kD + d;
 }
 
 void convolve_oracle(const std::vector<float>& hidden, const std::vector<float>& base,
@@ -97,7 +97,8 @@ void split_projection(const std::vector<double>& proj, std::int32_t tokens, std:
             for (std::int32_t offset = 0; offset < 2; ++offset) {
                 for (std::int32_t g = 0; g < kG; ++g) {
                     dynamic[dyn_index(g, offset, t, b, tokens)] =
-                        proj[col * kProj + phase * 640 + offset * kG + g];
+                        proj[col * kProj + static_cast<std::size_t>(phase) * 640 +
+                             static_cast<std::size_t>(offset) * kG + g];
                 }
             }
         }

@@ -489,8 +489,8 @@ int batch_table_case() {
             logical_v.begin() + static_cast<std::ptrdiff_t>(row * logical_count),
             logical_v.begin() + static_cast<std::ptrdiff_t>((row + 1) * logical_count));
         const std::vector<std::int32_t> mapping(
-            block_tables.begin() + static_cast<std::ptrdiff_t>(row * logical_pages),
-            block_tables.begin() + static_cast<std::ptrdiff_t>((row + 1) * logical_pages));
+            block_tables.begin() + static_cast<std::ptrdiff_t>(row) * logical_pages,
+            block_tables.begin() + (static_cast<std::ptrdiff_t>(row) + 1) * logical_pages);
         scatter_context_mapping(physical_k, row_k, logical_capacity, logical_capacity, mapping,
                                 physical_pages);
         scatter_context_mapping(physical_v, row_v, logical_capacity, logical_capacity, mapping,
@@ -577,11 +577,12 @@ int main() {
         std::cerr << "bidirectional GQA interval capacity missed a token-band endpoint\n";
         ++failures;
     }
-    try {
-        (void)ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9, 8, 1);
-        std::cerr << "bidirectional GQA accepted an invalid token interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::bidirectional_gqa_attention_workspace_capacity_bytes(capacity_envelope, 9,
+                                                                             8, 1);
+        },
+        "bidirectional GQA accepted an invalid token interval");
     failures += run_case(1, 0);
     failures += run_case(2, 1);
     failures += run_case(1, 63);

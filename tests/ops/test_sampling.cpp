@@ -348,9 +348,8 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     const std::vector<std::uint16_t> input_bits = bf16_bits(logits);
     DeviceBuffer device_logits                  = to_device(input_bits);
     GuardedDeviceBuffer collected(static_cast<std::size_t>(total) * sizeof(std::int32_t));
-    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
-    const std::vector<ops::SamplingConfig> expected_configs = configs;
-    DeviceBuffer device_configs                             = to_device(configs);
+    const std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(batch), config);
+    DeviceBuffer device_configs = to_device(configs);
     std::vector<int> positions(static_cast<std::size_t>(total));
     for (int i = 0; i < total; ++i) { positions[static_cast<std::size_t>(i)] = position + i; }
     DeviceBuffer device_positions = to_device(positions);
@@ -380,7 +379,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     const std::vector<ops::SamplingConfig> actual_configs =
         from_device<ops::SamplingConfig>(device_configs, configs.size());
     for (std::size_t row = 0; row < configs.size(); ++row) {
-        if (!same_config(actual_configs[row], expected_configs[row])) {
+        if (!same_config(actual_configs[row], configs[row])) {
             std::cerr << "sample repeated modified SamplingConfig row " << row << '\n';
             ++result.integrity_failures;
         }
@@ -566,7 +565,7 @@ int suppressed_token_contract() {
         logits[base + 17]      = 7.0f;
     }
     for (int token = 0; token < token_domain; ++token) {
-        logits[static_cast<std::size_t>(2 * token_domain + token)] = -INFINITY;
+        logits[2 * static_cast<std::size_t>(token_domain) + token] = -INFINITY;
     }
     round_to_bf16(logits);
 
@@ -879,7 +878,8 @@ int p_less_heterogeneous_batch_contract() {
     failures +=
         verify_exact("p-less mixed batch truncated row", std::vector<int>{result.tokens[2]}, {4});
     const Distribution p_less_oracle = distribution_oracle(
-        std::vector<float>(logits.begin() + token_domain, logits.begin() + 2 * token_domain),
+        std::vector<float>(logits.begin() + token_domain,
+                           logits.begin() + 2 * static_cast<std::ptrdiff_t>(token_domain)),
         token_domain, configs[1]);
     const auto it =
         std::find(p_less_oracle.tokens.begin(), p_less_oracle.tokens.end(), result.tokens[1]);
@@ -1414,24 +1414,27 @@ int p_less_floor_binds_with_head_contract() {
 
 int eligibility_masks(int domain, int physical) {
     const int words = (domain + 31) / 32;
-    std::vector<std::uint32_t> masks(3 * words, 0);
+    std::vector<std::uint32_t> masks(3 * static_cast<std::size_t>(words), 0);
     const std::vector<int> expected{31, 32, domain - 1};
-    std::vector<float> logits(3 * physical, -20);
+    std::vector<float> logits(3 * static_cast<std::size_t>(physical), -20);
     for (int row = 0; row < 3; ++row) {
-        masks[row * words + expected[row] / 32] |= 1u << (expected[row] % 32);
-        masks[row * words] |= 1u << 8;
-        logits[row * physical]     = 100;
-        logits[row * physical + 8] = 90;
-        for (int v = domain; v < physical; ++v) { logits[row * physical + v] = 200; }
+        const std::size_t mask_base   = static_cast<std::size_t>(row) * words;
+        const std::size_t logits_base = static_cast<std::size_t>(row) * physical;
+        masks[mask_base + expected[row] / 32] |= 1u << (expected[row] % 32);
+        masks[mask_base] |= 1u << 8;
+        logits[logits_base]     = 100;
+        logits[logits_base + 8] = 90;
+        for (int v = domain; v < physical; ++v) { logits[logits_base + v] = 200; }
         if (domain % 32) { masks[(row + 1) * words - 1] |= ~0u << (domain % 32); }
     }
     auto device_masks = to_device(masks);
     std::vector<ops::SamplingConfig> configs(3);
     for (int row = 0; row < 3; ++row) {
-        auto& cfg               = configs[row];
-        cfg.temperature         = row == 2 ? 0 : 2;
-        cfg.p_less              = row == 0;
-        cfg.allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p) + row * words;
+        auto& cfg                  = configs[row];
+        cfg.temperature            = row == 2 ? 0 : 2;
+        cfg.p_less                 = row == 0;
+        cfg.allowed_token_words    = static_cast<const std::uint32_t*>(device_masks.p) +
+                                     static_cast<std::ptrdiff_t>(row) * words;
         cfg.suppressed_token_count = 1;
         cfg.suppressed_tokens[0]   = 8;
     }
@@ -1449,8 +1452,8 @@ int masked_p_less_distribution(int domain, int physical) {
     mask[0] = 1u << 31;
     mask[(domain - 1) / 32] |= 1u << ((domain - 1) % 32);
     auto device_mask = to_device(mask);
-    std::vector<float> logits(8 * physical, 0);
-    for (int row = 0; row < 8; ++row) { logits[row * physical] = 100; }
+    std::vector<float> logits(8 * static_cast<std::size_t>(physical), 0);
+    for (int row = 0; row < 8; ++row) { logits[static_cast<std::size_t>(row) * physical] = 100; }
     int left = 0, failures = 0;
     for (int group = 0; group < 8; ++group) {
         std::vector<ops::SamplingConfig> configs(8);
@@ -1498,11 +1501,9 @@ int main() {
         std::cerr << "sampling workspace route boundary contract failed\n";
         ++failures;
     }
-    try {
-        (void)ops::sampling_workspace_capacity_bytes(257, 0, 16);
-        std::cerr << "sampling workspace accepted an invalid lane interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures +=
+        expect_invalid_argument([&] { return ops::sampling_workspace_capacity_bytes(257, 0, 16); },
+                                "sampling workspace accepted an invalid lane interval");
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
