@@ -7,7 +7,7 @@
 option(NINFER_WARNINGS_AS_ERRORS "Treat compiler warnings in project code as errors" ON)
 set(NINFER_SANITIZE "" CACHE STRING
   "Host sanitizers for project code, e.g. address,undefined (use a separate build tree)")
-# Sanitizer instrumentation makes GCC's flow-based warnings (-Warray-bounds, -Wnull-dereference)
+# Sanitizer instrumentation makes GCC's flow-based warnings (such as -Warray-bounds)
 # report paths that do not exist, so an instrumented tree reports warnings without failing; the
 # uninstrumented tree is the warning gate.
 if(NINFER_SANITIZE AND NINFER_WARNINGS_AS_ERRORS)
@@ -16,19 +16,22 @@ if(NINFER_SANITIZE AND NINFER_WARNINGS_AS_ERRORS)
 endif()
 
 # Each flag targets a defect class the builder toolchain (GCC 13, nvcc 13.1) reports reliably:
-# shadowed locals, missing virtual destructors, hidden overloads, null dereference on a proven
-# path, unannotated switch fallthrough, unhandled enumerators, format-string mismatch, unused
-# code, and duplicated conditions or branches. Not enabled: conversion warnings (kernel index
-# arithmetic is checked by clang-tidy's bugprone-implicit-widening-* instead), -Wdouble-promotion
-# (host code only, where it fires on float varargs), and -Wmissing-field-initializers (aggregate
-# initialization that relies on default member initializers is the intended idiom).
+# shadowed locals, missing virtual destructors, hidden overloads, unannotated switch fallthrough,
+# unhandled enumerators, format-string mismatch, unused code, and duplicated conditions or
+# branches. Not enabled:
+# - conversion warnings: kernel index arithmetic is checked by clang-tidy's
+#   bugprone-implicit-widening-* instead;
+# - -Wnull-dereference: GCC 13 infers null paths inside libstdc++ shared_ptr and streambuf after
+#   inlining; clang-tidy's path-sensitive clang-analyzer-core.NullDereference covers the class;
+# - -Wdouble-promotion: host code only, where it fires on float varargs;
+# - -Wmissing-field-initializers: aggregate initialization that relies on default member
+#   initializers is the intended idiom.
 set(ninfer_host_warnings
   -Wall
   -Wextra
   -Wshadow
   -Wnon-virtual-dtor
   -Woverloaded-virtual
-  -Wnull-dereference
   -Wimplicit-fallthrough
   -Wformat=2
   -Wmisleading-indentation
