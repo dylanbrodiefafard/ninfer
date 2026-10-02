@@ -69,8 +69,16 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$BUILDER"; then
   docker create "${create_args[@]}" "$IMAGE" sleep infinity >/dev/null
 fi
 
-# Containers created before the limit existed, or with another value, take it here.
-docker update "${memory_args[@]}" "$BUILDER" >/dev/null
+# Containers created before the limit existed, or with another value, take it here. Updating a
+# running container rewrites its cgroup and drops its GPU device access, so the update is applied
+# only when the limit differs and the container is restarted afterwards.
+memory_bytes=$((MEMORY_GIB * 1024 * 1024 * 1024))
+if [[ "$(docker inspect -f '{{.HostConfig.Memory}}' "$BUILDER")" != "$memory_bytes" ]]; then
+  docker update "${memory_args[@]}" "$BUILDER" >/dev/null
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" == "true" ]]; then
+    docker restart "$BUILDER" >/dev/null
+  fi
+fi
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" != "true" ]]; then
   docker start "$BUILDER" >/dev/null
