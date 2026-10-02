@@ -50,7 +50,8 @@ ExcludeHeaderFilterRegex: "/third_party/"
 SystemHeaders: false
 FormatStyle: file
 # Disabled above, with reasons: easily-swappable-parameters (kernel signatures are long runs of
-# same-typed pointers and extents; readability-suspicious-call-argument checks the call sites),
+# same-typed pointers and extents, so it flags nearly every kernel and launcher signature
+# without identifying a defect; bugprone-swapped-arguments still checks the call sites),
 # narrowing-conversions (deliberate in quantization code; the overflow class is covered by the
 # widening checks), random-generator-seed (tests seed deliberately for reproducibility), and
 # definitions-in-headers (target runtime *_impl.h headers are single-inclusion implementation

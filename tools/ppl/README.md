@@ -10,7 +10,7 @@ logits:
 
 | `--schedule` | What runs | GQA route |
 |---|---|---|
-| `prefill` (default) | chunked prompt forward of the full sequence | `prompt` (`T>6`) |
+| `prefill` (default) | chunked prompt forward of the full sequence | `prompt` (`T>8`) |
 | `decode` | prefill the warmup prefix, then teacher-force the suffix at T=1 | `small_t` |
 
 Default `--skip half` drops the first `n/2` positions from the mean (llama.cpp

@@ -41,12 +41,13 @@ inline constexpr std::int32_t kDflash2VerifyWidth                   = 12;
  *       + sum_{r=0}^{255} (pred_code[r, prev[t-1,b]] * h[r,t,b]) * succ_code[r, candidates[c]].
  *
  *   configs is a device-resident SamplingConfig[B] (same buffer the round copies into ingress).
- *   The draft temperature is configs[b].draft_temperature when configs[b].p_less != 0, else
- *   configs[b].temperature (force_greedy makes it 0). P-less temperature parameterizes the target
- *   distribution in sampling.h, not these draft scores: a 16-way softmax at the product p-less
- *   T=2 is nearly uniform, so p-less drafts use their own draft_temperature. If the draft
- *   temperature is <= 0, path[t,b] is the candidate with the greatest score; equal scores select
- *   the lower token id. Otherwise the 16 scores are softmax-normalized after dividing by the
+ *   The draft temperature is configs[b].draft_temperature * p_less_draft_temperature_scale when
+ *   configs[b].p_less != 0, else configs[b].temperature (force_greedy makes it 0). The caller's
+ *   scale calibrates the p-less draft temperature to the drafted block length. P-less temperature
+ * parameterizes the target distribution in sampling.h, not these draft scores: a 16-way softmax at
+ * the product p-less T=2 is nearly uniform, so p-less drafts use their own draft_temperature. If
+ * the draft temperature is <= 0, path[t,b] is the candidate with the greatest score; equal scores
+ * select the lower token id. Otherwise the 16 scores are softmax-normalized after dividing by the
  *   draft temperature and one candidate is drawn by inverse-CDF using
  *
  *     u = splitmix64(configs[b].seed ^ seed_xor,
@@ -116,7 +117,7 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr,
                          Tensor* selector_ids = nullptr, Tensor* selector_q = nullptr,
                          unsigned long long seed_xor = 0, std::int32_t position_offset = 0,
-                         bool force_greedy = false);
+                         bool force_greedy = false, float p_less_draft_temperature_scale = 1.0f);
 
 /**
  * Op: dflash2_tree_select

@@ -85,7 +85,7 @@ std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::
     }
     (void)nvfp4_gdn_conv_resolve_plan(policy, max_tokens, batch_size);
     if (nvfp4_gdn_record_uses_quantized(policy, max_tokens)) {
-        if (policy == LinearPolicy::AllowA8 && max_tokens <= 6) {
+        if (policy == LinearPolicy::AllowA8 && max_tokens <= kNvfp4GdnA8FusedRecordMaxWidth) {
             return fp8_a8_workspace_capacity_bytes(max_tokens * batch_size, 5120);
         }
         WorkspaceLayoutBuilder layout;
