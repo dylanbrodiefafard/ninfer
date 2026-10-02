@@ -854,8 +854,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const std::size_t generation_opener = rendered.size();
         if (!preserve_thinking) { turn_closure_offsets.push_back(generation_opener); }
         if (!preserve_thinking && !rewrite_checkpoint) {
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
-                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+            rewrite_checkpoint = RewriteCheckpointByteSpec{.kind   = RewriteCheckpointKind::TurnClosure,
+                                                           .offset = rendered.size(),
+                                                           .generation_opener = true};
         }
         if (options.enable_thinking) {
             rendered.markup("<think>\n");

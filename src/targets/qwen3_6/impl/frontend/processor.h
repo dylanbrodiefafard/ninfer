@@ -109,6 +109,13 @@ struct EncodedChat {
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
 
+// Token count of text[0, offset) within `encoded`, the encoding of `text` with `offset` as its
+// prefix mark. When the encode reports no count (offset is not an encode-loop position), the
+// prefix is encoded separately and must be an exact token prefix; nullopt otherwise.
+[[nodiscard]] std::optional<std::size_t>
+checkpoint_prefix_tokens(const Tokenizer& tokenizer, std::string_view text, std::size_t offset,
+                         std::span<const ByteSpan> literal_spans, const EncodedText& encoded);
+
 class Processor {
 public:
     Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& chat_template,

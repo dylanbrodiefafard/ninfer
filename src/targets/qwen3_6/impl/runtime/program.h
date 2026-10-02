@@ -206,6 +206,14 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    // The retained request stopped (stop token or string) without a tool call. With its own
+    // TurnClosure checkpoint at its generation opener (closure_frontier), the next preserve-off
+    // prompt re-renders the reply without reasoning and diverges there, so RAM/disk tiers store
+    // the lane cut at that checkpoint (capture_cuts_at_rewrite).
+    bool turn_closed              = false;
+    // The latest request's own TurnClosure checkpoint when it sits at that request's generation
+    // opener (preserve off, outside a tool loop); 0 otherwise. Only that checkpoint is cut at.
+    std::uint32_t closure_frontier = 0;
     std::uint64_t use_tick        = 0;
     std::uint64_t disk_entry_id   = 0;
     RewriteCheckpoint rewrite_checkpoint;
@@ -332,6 +340,8 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // The retained lane's request finished without a tool call (see SequenceState::turn_closed).
+    void mark_turn_closed(std::uint32_t lane) noexcept;
     // `may_block` permits a synchronous disk spill to free RAM; callers pass
     // false while other lanes are decoding. Without it a full RAM tier whose
     // entries are not yet on disk starts their spill on the disk worker and
@@ -537,7 +547,13 @@ private:
                               const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     void finish_request_plan(RequestPlanImpl& plan, const ResidentStateView* view,
                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
-    [[nodiscard]] qwen3_6::detail::RamCaptureSource ram_capture_source(const SequenceState& sequence);
+    [[nodiscard]] bool capture_cuts_at_rewrite(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource
+    ram_capture_source(const SequenceState& sequence,
+                       qwen3_6::detail::ResidentPrefixIdentity& cut_identity);
+    [[nodiscard]] qwen3_6::detail::RamCaptureSource
+    cut_ram_capture_source(const SequenceState& sequence,
+                           qwen3_6::detail::ResidentPrefixIdentity& cut_identity);
     void accumulate_prefill_nll(std::span<const TokenId> ids, std::uint32_t chunk_begin,
                                 std::uint32_t chunk_tokens, std::uint32_t skip, ScoreResult& result);
     void accumulate_decode_nll(const Tensor& logits, TokenId target, ScoreResult& result,
@@ -552,7 +568,7 @@ private:
     void maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
                                      const PreparedPromptData& prompt, ReusePath reuse,
                                      std::uint32_t base, std::uint32_t prompt_tokens,
-                                     bool capture_enabled, bool request_pin);
+                                     bool capture_enabled, bool request_pin, bool cut_restore);
     void restore_context_checkpoint_state(SequenceState& sequence, std::uint32_t base);
     void allocate_rewrite_image(SequenceState& sequence);
     void capture_rewrite_image(SequenceState& sequence);

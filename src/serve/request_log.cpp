@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -267,14 +268,31 @@ std::string format_kv_ram_live(const ninfer::MemorySummary& memory, std::uint64_
     return out.str();
 }
 
+// Non-zero drop counters as `reason:count,...`.
+std::string format_kv_disk_drop_reasons(
+    const std::array<std::uint64_t, ninfer::kKvDiskDropReasonCount>& reasons) {
+    std::string out;
+    for (std::size_t i = 0; i < reasons.size(); ++i) {
+        if (reasons[i] == 0) { continue; }
+        if (!out.empty()) { out += ','; }
+        out += ninfer::kv_disk_drop_reason_name(static_cast<ninfer::KvDiskDropReason>(i));
+        out += ':';
+        out += std::to_string(reasons[i]);
+    }
+    return out;
+}
+
 std::string format_kv_disk_live(const ninfer::MemorySummary& memory, std::uint64_t restores,
-                                std::uint64_t evictions, std::uint64_t drops, double save_seconds,
-                                double load_seconds,
+                                std::uint64_t evictions, std::uint64_t drops,
+                                const std::array<std::uint64_t, ninfer::kKvDiskDropReasonCount>& drop_reasons,
+                                double save_seconds, double load_seconds,
                                 std::optional<double> h2d_seconds = std::nullopt) {
     std::ostringstream out;
     out << " kv-disk=" << format_kv_ram_size(memory.kv_disk_used_bytes, kv_ram_log_exact_bytes())
         << " n=" << memory.kv_disk_entry_count << " restores=" << restores
-        << " evicts=" << evictions << " drops=" << drops << std::fixed << std::setprecision(0)
+        << " evicts=" << evictions << " drops=" << drops;
+    if (drops != 0) { out << " (" << format_kv_disk_drop_reasons(drop_reasons) << ")"; }
+    out << std::fixed << std::setprecision(0)
         << " save=" << (save_seconds * 1000.0) << "ms load=" << (load_seconds * 1000.0) << "ms";
     if (h2d_seconds) {
         out << " h2d=" << (*h2d_seconds * 1000.0) << "ms";
@@ -514,6 +532,7 @@ std::string format_throughput(const ThroughputReport& report) {
         occupancy.kv_disk_entry_count    = report.kv_disk_entry_count;
         out << format_kv_disk_live(occupancy, report.scheduler.kv_disk_restores,
                                    report.scheduler.kv_disk_evictions, report.scheduler.kv_disk_drops,
+                                   report.scheduler.kv_disk_drop_reasons,
                                    report.kv_disk_save_seconds, report.kv_disk_load_seconds);
     }
     if (report.scheduler.gpu_kv_main_capacity_pages != 0 ||
@@ -794,6 +813,15 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                   {"gpu_kv_spec_mapped_pages", report.scheduler.gpu_kv_spec_mapped_pages},
                                   {"gpu_kv_spec_free_pages", report.scheduler.gpu_kv_spec_free_pages},
                                   {"kv_cache_fallbacks", report.scheduler.kv_cache_fallbacks}};
+    if (report.scheduler.kv_disk_drops != 0) {
+        Json reasons = Json::object();
+        for (std::size_t i = 0; i < ninfer::kKvDiskDropReasonCount; ++i) {
+            if (report.scheduler.kv_disk_drop_reasons[i] == 0) { continue; }
+            reasons[std::string(ninfer::kv_disk_drop_reason_name(static_cast<ninfer::KvDiskDropReason>(i)))] =
+                report.scheduler.kv_disk_drop_reasons[i];
+        }
+        record["scheduler"]["kv_disk_drop_reasons"] = std::move(reasons);
+    }
     record["timings_seconds"] =
         Json{{"kv_ram_save", report.kv_ram_save_seconds},
              {"kv_ram_load", report.kv_ram_load_seconds},

@@ -865,9 +865,7 @@ int test_engine_shaped_cache() {
                                          product_input({user("q1")}, first_options));
                     const auto cached = cached_prepare(*template_frontend, turn_cache,
                                                        product_input(shape.messages, options));
-                    // Without a generation prompt the effort template's preserve-off render
-                    // misses the cache (pre-existing); it must still equal cold.
-                    failures += check(cached.observation.cache_hit || !shape.generation_prompt,
+                    failures += check(cached.observation.cache_hit,
                                       (label + ": missed the host-encode cache").c_str());
                     failures += expect_match_cold(*template_frontend, cached,
                                                   product_input(shape.messages, options),
@@ -902,6 +900,11 @@ int test_engine_shaped_cache() {
                     failures += check(checkpoint && checkpoint->kind == (preserve ? replay : closure) &&
                                           prologue_tail && checkpoint->frontier == expected,
                                       (label + ": checkpoint kind or frontier is wrong").c_str());
+                    // Only a preserve-off checkpoint at this request's own opener (not a tool
+                    // loop's first opener) is marked; the runtime cuts closed turns only there.
+                    failures += check(checkpoint &&
+                                          checkpoint->generation_opener == (!preserve && !shape.tool_loop),
+                                      (label + ": generation-opener mark is wrong").c_str());
                 }
             }
         }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -649,6 +650,41 @@ struct MemorySummary {
 // Monotonic execution counters plus fieldwise-concurrent live scheduler gauges. A returned value is
 // race-free but is not a multi-field transaction with one boundary identity. Consumers derive
 // interval throughput from the monotonic counters and their own monotonic wall time.
+// Cause of a KV disk-tier drop; indexes RuntimeStats::kv_disk_drop_reasons.
+enum class KvDiskDropReason : std::uint8_t {
+    IndexLoad,       // a stored entry was rejected while loading the index
+    Persist,         // a manifest write or directory fsync failed
+    NoteAlloc,       // bookkeeping for a new RAM entry could not allocate
+    SpillNoRoom,     // the filesystem lacks room for the append plus the compaction reserve
+    SpillNoCapacity, // capacity eviction could not free enough logical bytes
+    SpillFailed,     // a spill failed while preparing, starting, or writing
+    ReclaimUnsaved,  // a non-durable RAM entry was evicted without a disk copy
+    OptionalAlloc,   // an optional prefetch or idle spill could not allocate
+    PageJob,         // a page read or write job failed
+    RestoreFailed,   // a disk restore failed
+    Count,
+};
+
+inline constexpr std::size_t kKvDiskDropReasonCount =
+    static_cast<std::size_t>(KvDiskDropReason::Count);
+
+[[nodiscard]] constexpr std::string_view kv_disk_drop_reason_name(KvDiskDropReason reason) noexcept {
+    switch (reason) {
+    case KvDiskDropReason::IndexLoad: return "index_load";
+    case KvDiskDropReason::Persist: return "persist";
+    case KvDiskDropReason::NoteAlloc: return "note_alloc";
+    case KvDiskDropReason::SpillNoRoom: return "spill_no_room";
+    case KvDiskDropReason::SpillNoCapacity: return "spill_no_capacity";
+    case KvDiskDropReason::SpillFailed: return "spill_failed";
+    case KvDiskDropReason::ReclaimUnsaved: return "reclaim_unsaved";
+    case KvDiskDropReason::OptionalAlloc: return "optional_alloc";
+    case KvDiskDropReason::PageJob: return "page_job";
+    case KvDiskDropReason::RestoreFailed: return "restore_failed";
+    case KvDiskDropReason::Count: break;
+    }
+    return "unknown";
+}
+
 struct RuntimeStats {
     // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
     std::uint64_t computed_prefill_tokens = 0;
@@ -674,6 +710,7 @@ struct RuntimeStats {
     std::uint64_t kv_disk_restores      = 0;
     std::uint64_t kv_disk_evictions     = 0;
     std::uint64_t kv_disk_drops         = 0;
+    std::array<std::uint64_t, kKvDiskDropReasonCount> kv_disk_drop_reasons{};
     double kv_disk_save_seconds         = 0;
     double kv_disk_load_seconds         = 0;
     std::size_t kv_disk_capacity_bytes  = 0;

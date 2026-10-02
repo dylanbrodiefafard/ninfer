@@ -2042,7 +2042,9 @@ int test_spill_drop_keeps_indexed_source(ninfer::DeviceContext& ctx, ninfer::Pag
     return failures;
 }
 
-int test_full_state_image(ninfer::DeviceContext& ctx) {
+// `cut` captures the lane as of its rewrite checkpoint (frontier 2): one leading KV page, the
+// checkpoint host image and hidden as the current set, and no rewrite set.
+int test_full_state_image(ninfer::DeviceContext& ctx, bool cut) {
     namespace q36 = ninfer::targets::qwen3_6;
     auto text_plan =
         plan_paged_cache(4, 4, 2,
@@ -2177,11 +2179,31 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     source.dflash_local       = &dflash_local;
     source.dflash_lane        = 0;
     source.stream             = ctx.copy_stream;
+    q36::detail::ResidentPrefixIdentity cut_identity = identity;
+    if (cut) {
+        cut_identity.truncate(3);
+        source.execution_frontier = 2;
+        source.ledger_frontier    = 3;
+        source.text_kv_valid      = 2;
+        source.mtp_kv_valid       = 1;
+        source.rewrite_valid      = false;
+        source.rewrite_frontier   = 0;
+        source.hash_c_valid       = false;
+        source.ledger             = std::span<const ninfer::TokenId>(retained.token_ids).first(3);
+        source.identity           = &cut_identity;
+        source.hash_f             = source.hash_c;
+        source.text_pages         = 1;
+        source.backend_pages      = 1;
+        source.current_state      = source_rewrite.source();
+        source.tail_hidden        = &rewrite;
+        source.rewrite_checkpoint_hidden = nullptr;
+    }
     q36::detail::KVRamCache cache(16ULL << 20);
     if (!capture_or_evict(cache, source)) { return fail("full-state capture failed"); }
 
+    const std::uint32_t text_pages = cut ? 1 : 2;
     auto text_dest = text_pool.reserve(2);
-    text_dest.materialize_pages(2, ctx.stream);
+    text_dest.materialize_pages(text_pages, ctx.stream);
     auto backend_dest = backend_pool.reserve(2);
     backend_dest.materialize_pages(1, ctx.stream);
     ninfer::DeviceBuffer hidden_out_buf(128);
@@ -2191,11 +2213,14 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     rewrite_out_buf.fill(0);
     ninfer::Tensor rewrite_out(rewrite_out_buf.p, ninfer::DType::U8, {128});
     const auto match = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-    if (!match) { return fail("full-state capture did not match"); }
+    if (!match || (cut && (match->reuse != ninfer::PrefixReusePath::AppendAtFrontier ||
+                           match->reuse_base != 2))) {
+        return fail("full-state capture did not match");
+    }
     q36::detail::RamRestoreTarget target;
     target.text                    = &text_dest;
     target.text_pool               = &text_pool;
-    target.text_dst_pages          = 2;
+    target.text_dst_pages          = text_pages;
     target.backend                 = &backend_dest;
     target.backend_pool            = &backend_pool;
     target.backend_dst_pages       = 1;
@@ -2215,15 +2240,55 @@ int test_full_state_image(ninfer::DeviceContext& ctx) {
     target_rewrite.unpack(gdn, 3, &dflash_ckpt, 1, ctx.stream);
 
     int failures = 0;
-    if (host.rope_delta != 7 || host.mtp_kv_valid != 3 || !host.backend_image_present ||
-        !host.rewrite_valid || host.rewrite_frontier != 2 ||
-        host.ledger.size() != tokens) {
+    if (cut) {
+        if (host.execution_frontier != 2 || host.text_kv_valid != 2 || host.mtp_kv_valid != 1 ||
+            !host.tail_hidden_valid || host.rewrite_valid || host.ledger.size() != 3 ||
+            host.identity.size() != 3) {
+            std::cerr << "cut host metadata mismatch\n";
+            ++failures;
+        }
+    } else if (host.rope_delta != 7 || host.mtp_kv_valid != 3 || !host.backend_image_present ||
+               !host.rewrite_valid || host.rewrite_frontier != 2 ||
+               host.ledger.size() != tokens) {
         std::cerr << "full-state host metadata mismatch\n";
         ++failures;
     }
     failures += expect_logical_pages(text_pool, text_dest, 7, "full-state text KV");
     failures += expect_logical_pages(backend_pool, backend_dest, 8, "full-state backend KV");
     std::vector<unsigned char> conv_out(conv_cur.size());
+    if (cut) {
+        CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 2).data, conv_out.size(),
+                               cudaMemcpyDeviceToHost));
+        std::vector<unsigned char> rec_out(rec_ckpt.size());
+        CUDA_CHECK(cudaMemcpy(rec_out.data(), gdn.recurrent_slot(1, 2).data, rec_out.size(),
+                               cudaMemcpyDeviceToHost));
+        std::vector<unsigned char> hidden_host(128);
+        CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
+                               cudaMemcpyDeviceToHost));
+        std::vector<unsigned char> k_out(k_ckpt.size());
+        std::vector<unsigned char> v_out(v_ckpt.size());
+        CUDA_CHECK(cudaMemcpy(k_out.data(), dflash_local.layer_view(0).k.slice(3, 1, 1).data,
+                               k_out.size(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(v_out.data(), dflash_local.layer_view(0).v.slice(3, 1, 1).data,
+                               v_out.size(), cudaMemcpyDeviceToHost));
+        if (conv_out != conv_ckpt || rec_out != rec_ckpt) {
+            std::cerr << "cut GDN current is not the checkpoint image\n";
+            ++failures;
+        }
+        if (hidden_host != std::vector<unsigned char>(128, 0xa2)) {
+            std::cerr << "cut tail hidden is not the checkpoint hidden\n";
+            ++failures;
+        }
+        if (k_out != k_ckpt || v_out != v_ckpt) {
+            std::cerr << "cut DFlash lane is not the checkpoint image\n";
+            ++failures;
+        }
+        text.release();
+        backend.release();
+        text_dest.release();
+        backend_dest.release();
+        return failures;
+    }
     CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 2).data, conv_out.size(),
                            cudaMemcpyDeviceToHost));
     if (conv_out != conv_cur) {
@@ -5859,7 +5924,8 @@ int main(int argc, char** argv) {
     failures += test_unready_ram_image_does_not_shadow_usable_image(ctx, paged_pool);
     failures += test_retirement_drains_late_worker_snapshot(ctx, paged_pool);
     failures += test_spill_drop_keeps_indexed_source(ctx, paged_pool);
-    failures += test_full_state_image(ctx);
+    failures += test_full_state_image(ctx, false);
+    failures += test_full_state_image(ctx, true);
     failures += test_context_checkpoint_middle_head(ctx);
     failures += test_context_checkpoint_two_ram_entries(ctx);
     failures += test_context_checkpoint_ladder_beats_rewrite(ctx);

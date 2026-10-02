@@ -598,6 +598,22 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
+std::optional<std::size_t>
+checkpoint_prefix_tokens(const Tokenizer& tokenizer, std::string_view text, std::size_t offset,
+                         std::span<const ByteSpan> literal_spans, const EncodedText& encoded) {
+    if (encoded.prefix_tokens && *encoded.prefix_tokens != 0 &&
+        *encoded.prefix_tokens <= encoded.ids.size()) {
+        return *encoded.prefix_tokens;
+    }
+    const std::vector<int> prefix = tokenizer.encode(
+        text.substr(0, offset), {}, literal_spans_between(literal_spans, 0, offset));
+    if (prefix.empty() || prefix.size() > encoded.ids.size() ||
+        !std::equal(prefix.begin(), prefix.end(), encoded.ids.begin())) {
+        return std::nullopt;
+    }
+    return prefix.size();
+}
+
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     if (!rendered.rewrite_checkpoint) {
@@ -610,28 +626,19 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     }
     EncodedText tokens = tokenizer.encode(rendered.text, rendered.rewrite_checkpoint->offset, {},
                                           rendered.literal_spans);
-    encoded.input_ids  = std::move(tokens.ids);
-    std::uint32_t frontier = 0;
-    if (tokens.prefix_tokens && *tokens.prefix_tokens != 0 &&
-        *tokens.prefix_tokens <= encoded.input_ids.size()) {
-        frontier = *tokens.prefix_tokens;
-    } else {
-        const std::size_t offset      = rendered.rewrite_checkpoint->offset;
-        const std::vector<int> prefix = tokenizer.encode(
-            std::string_view(rendered.text).substr(0, offset), {},
-            literal_spans_between(rendered.literal_spans, 0, offset));
-        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
-            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
-            throw std::logic_error("rewrite checkpoint is not an exact token prefix");
-        }
-        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
-        }
-        frontier = static_cast<std::uint32_t>(prefix.size());
+    const std::optional<std::size_t> prefix =
+        checkpoint_prefix_tokens(tokenizer, rendered.text, rendered.rewrite_checkpoint->offset,
+                                 rendered.literal_spans, tokens);
+    if (!prefix) { throw std::logic_error("rewrite checkpoint is not an exact token prefix"); }
+    if (*prefix > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("rewrite checkpoint token frontier exceeds uint32");
     }
+    const auto frontier = static_cast<std::uint32_t>(*prefix);
+    encoded.input_ids   = std::move(tokens.ids);
     encoded.rewrite_checkpoint = RewriteCheckpointSpec{
-        .kind     = rendered.rewrite_checkpoint->kind,
-        .frontier = frontier,
+        .kind              = rendered.rewrite_checkpoint->kind,
+        .frontier          = frontier,
+        .generation_opener = rendered.rewrite_checkpoint->generation_opener,
     };
     append_turn_closure_frontiers(encoded, tokenizer, rendered);
     return encoded;

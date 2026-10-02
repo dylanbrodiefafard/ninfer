@@ -220,20 +220,21 @@ try_splice_encoded_chat(const Tokenizer& tokenizer, std::span<const int> committ
         encoded.rewrite_checkpoint = RewriteCheckpointSpec{
             .kind     = checkpoint->kind,
             .frontier = checked_frontier(committed_ids.size(), "rewrite checkpoint token frontier"),
+            .generation_opener = checkpoint->generation_opener,
         };
         return encoded;
     }
 
     EncodedText extra = tokenizer.encode(suffix, rel, {}, suffix_spans);
-    if (!extra.prefix_tokens || *extra.prefix_tokens == 0 ||
-        *extra.prefix_tokens > extra.ids.size()) {
-        return std::nullopt;
-    }
+    const std::optional<std::size_t> prefix =
+        checkpoint_prefix_tokens(tokenizer, suffix, rel, suffix_spans, extra);
+    if (!prefix) { return std::nullopt; }
     append_suffix(extra);
     encoded.rewrite_checkpoint = RewriteCheckpointSpec{
         .kind     = checkpoint->kind,
-        .frontier = checked_frontier(committed_ids.size() + *extra.prefix_tokens,
+        .frontier = checked_frontier(committed_ids.size() + *prefix,
                                      "rewrite checkpoint token frontier"),
+        .generation_opener = checkpoint->generation_opener,
     };
     return encoded;
 }

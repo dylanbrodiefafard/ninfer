@@ -791,6 +791,18 @@ Qwen3.6 retained sequence 包含：
   尚无任何 context-checkpoint head 时写入同一 slot。编辑最后一条 user 消息走
   `restore_turn_rollback`；同一 last user 再生成仍走更长的 rewrite `TurnClosure`。
 
+Host RAM capture（因而也包括其后的 disk spill）对已关闭的 preserve-off turn 例外：request 以 stop
+token/string 结束且没有 tool call，并且其 `TurnClosure` checkpoint 就是本 request 自己的 generation
+opener（frontend 标记 `generation_opener`；tool loop 内的 checkpoint 位于 loop 首个 opener，不标记）时，
+下一 preserve-off prompt 会去掉该回复的 reasoning 重新渲染并在该 opener 后分叉，checkpoint 之后的
+frontier 不再可达。此时 entry 按回退到 checkpoint `F` 的状态保存：ledger/identity/Main Text 与 backend
+KV 截到 `F`，current GDN、DFlash cyclic lane 与 tail hidden 取自 checkpoint，不保存 rewrite 副本，
+只保留 frontier 不超过 `F` 的 heads。下一轮因此在 `F` 走 `append_frontier`（复用长度与
+`restore_turn_checkpoint` 相同），每个 entry 只存一份 state。带自身 generation-opener `TurnClosure`
+checkpoint 的 request 从 cut RAM/disk entry append 时不自动写 turn-rollback head（与之前走
+`restore_turn_checkpoint` 时一致）；resident append（例如取消后重发）照常写。VRAM 上的 retained lane 不变。代价：下一轮
+改用 preserve on、或以 assistant continuation 继续该回复时，要重新 prefill 该回复。
+
 每个 checkpoint 都必须同时描述：
 
 - Main Text allocation 可到达的 frontier 和 page mapping；
