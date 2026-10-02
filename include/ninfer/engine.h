@@ -92,7 +92,8 @@ public:
                               const CancellationView& cancellation = {});
 
     // Teacher-forced next-token NLL over a prepared token sequence. Does not sample, decode,
-    // or change generate/serve graphs. Used only by the perplexity tool.
+    // or change generate/serve graphs. Used by the perplexity tool and by real tests that
+    // measure the logit gap between two candidate tokens.
     [[nodiscard]] ScoreResult score(PreparedPrompt prompt, ScoreOptions options = {});
 
     [[nodiscard]] const EngineOptions& options() const;
