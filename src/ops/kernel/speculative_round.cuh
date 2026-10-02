@@ -404,7 +404,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                                                     merge_idx, cand_val, cand_idx, prob, &n_support,
                                                     row_drafts, i);
             }
-            if (tid == 0 && done_sh == 0) {
+            // The loop leaves at the barrier below once a row is decided, so no shared flag is
+            // read here while thread 0 may be writing it.
+            if (tid == 0) {
                 const int L = L_sh;
                 if (i < extent) {
                     const int d = row_drafts[i];
@@ -1277,7 +1279,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_
                                                 merge_idx, cand_val, cand_idx, prob, &n_support,
                                                 lic_sh, a_sh);
         }
-        if (tid == 0 && done_sh == 0) {
+        // The loop leaves at the barrier below once the row is decided, so no shared flag is read
+        // here while thread 0 may be writing it.
+        if (tid == 0) {
             if (!p_less) {
                 const float u = sampling_uniform(cfg.seed, L_sh + a_sh + 1,
                                                  kSamplePurposeSpeculativeAccept, 0u);

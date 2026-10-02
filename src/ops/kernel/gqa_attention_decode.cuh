@@ -271,18 +271,19 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     for (int split = s0; split < s1; ++split) { local_m = fmaxf(local_m, m_s[split]); }
     reduce[d_local * tpd + q] = local_m;
     __syncthreads();
-    if (tid < DChunk) {
-        float gmax = reduce[tid * tpd];
+    // The per-(q_head, token, split) stats are d-independent, so every d-group
+    // computed the same quarter max. Thread 0 combines group 0's quarters in
+    // place: no other thread reads or writes reduce[0..tpd) here, and no
+    // cross-d tree is needed (it would replicate the identical value).
+    if (tid == 0) {
+        float gmax = reduce[0];
 #    pragma unroll
-        for (int i = 1; i < tpd; ++i) { gmax = fmaxf(gmax, reduce[tid * tpd + i]); }
-        reduce[tid] = gmax;
+        for (int i = 1; i < tpd; ++i) { gmax = fmaxf(gmax, reduce[i]); }
+        reduce[0] = gmax;
     }
     __syncthreads();
-    // The per-(q_head, token, split) stats are d-independent, so every d-group
-    // computed the same quarter max; the group result (reduce[0]) is the head
-    // max. No cross-d tree: summing/maxing across the d-groups would replicate
-    // the identical value DChunk times.
     const float head_m = reduce[0];
+    // reduce[] is rewritten below; every thread must have read the head max first.
     __syncthreads();
 
     if (head_m == -CUDART_INF_F) {
@@ -300,16 +301,18 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
     reduce[d_local * tpd + q] = local_l;
     __syncthreads();
-    if (tid < DChunk) {
+    // Each d-group holds the same quarter sums of its (q_head, token); thread 0
+    // combines group 0's in place, as for the max.
+    if (tid == 0) {
         float gsum = 0.0f;
 #    pragma unroll
-        for (int i = 0; i < tpd; ++i) { gsum += reduce[tid * tpd + i]; }
-        reduce[tid] = gsum;
+        for (int i = 0; i < tpd; ++i) { gsum += reduce[i]; }
+        reduce[0] = gsum;
     }
     __syncthreads();
-    // Each d-group holds the full (quarter-summed) l of its (q_head, token); the
-    // value is d-independent, so any group's result is the head sum.
     const float head_l = reduce[0];
+    // reduce[] is rewritten below; every thread must have read the head sum first.
+    __syncthreads();
 
     const int d = d_start + d_local;
     if (d >= kGqaHeadDim) { return; }
