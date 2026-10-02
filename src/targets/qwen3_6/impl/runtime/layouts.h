@@ -83,9 +83,9 @@ struct SequencePlanningInputs {
     std::int32_t xattn_min_len             = 8192;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
-    bool use_cuda_graph = true;
-    int device          = 0;
-    std::size_t kv_ram_capacity_bytes = 0;
+    bool use_cuda_graph                = true;
+    int device                         = 0;
+    std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
@@ -102,15 +102,15 @@ namespace ninfer::targets::qwen3_6::detail {
 template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
-    std::uint32_t capacity                 = 0;
-    std::uint32_t kv_capacity              = 0;
-    std::uint32_t main_page_groups         = 0;
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t prefill_chunk            = 0;
-    std::uint32_t draft_window             = 0;
-    std::uint32_t dflash_verify_width      = 0;
-    bool adaptive_draft                    = false;
-    float p_less_draft_temperature         = 0.0f;
+    std::uint32_t capacity            = 0;
+    std::uint32_t kv_capacity         = 0;
+    std::uint32_t main_page_groups    = 0;
+    std::uint32_t max_concurrency     = 1;
+    std::uint32_t prefill_chunk       = 0;
+    std::uint32_t draft_window        = 0;
+    std::uint32_t dflash_verify_width = 0;
+    bool adaptive_draft               = false;
+    float p_less_draft_temperature    = 0.0f;
     std::vector<std::uint32_t> captured_ks;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
@@ -121,9 +121,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t xattn_min_len             = 8192;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
-    bool use_cuda_graph = true;
-    int device          = 0;
-    std::size_t kv_ram_capacity_bytes = 0;
+    bool use_cuda_graph                = true;
+    int device                         = 0;
+    std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;

@@ -69,7 +69,7 @@ struct ModelConfig {
 };
 
 inline constexpr ModelConfig kCfg{};
-inline constexpr float kAttnScale                     = kAttentionScale;
+inline constexpr float kAttnScale = kAttentionScale;
 
 struct MlpW {
     const MlpWeights* payload = nullptr;
@@ -157,7 +157,7 @@ public:
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
-    ~TextContext();
+    ~TextContext() = default;
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
@@ -169,9 +169,9 @@ public:
     }
 
     void set_prefill_skip(float keep_frac, float xattn_tau, std::int32_t xattn_min_len) noexcept {
-        keep_frac_       = keep_frac;
-        xattn_tau_       = xattn_tau;
-        xattn_min_len_   = xattn_min_len;
+        keep_frac_     = keep_frac;
+        xattn_tau_     = xattn_tau;
+        xattn_min_len_ = xattn_min_len;
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -194,6 +194,7 @@ public:
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
     void set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
                          const Tensor* prefix_lengths);
+
     void set_sequence_row(std::int32_t row) noexcept { active_sequence_row_ = row; }
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
@@ -215,10 +216,11 @@ public:
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
-    [[nodiscard]] PrefillChunkResult
-    prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
-                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end,
-                  DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(const qwen3_6::PreparedPromptData& input,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   VisionPrefillSession& vision,
+                                                   bool finalize_at_end, DFlashFeatureSink& sink);
     // Text suffix of a multimodal prompt. There is no Vision session, but RoPE stays on the
     // prompt's 3-axis positions; a 1-D continuation would not match a cold prefill.
     [[nodiscard]] PrefillChunkResult prefill_mrope_chunk(const qwen3_6::PreparedPromptData& input,
@@ -267,8 +269,8 @@ private:
     }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
-    void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const FullLayerW& weights, Tensor& x, int full_index, Phase phase);
+    void gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
@@ -343,13 +345,13 @@ private:
     const GdnReplayRecords* replay_records_               = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     std::span<const std::uint32_t> prefill_split_frontiers_{};
-    Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
-    std::uint32_t mtp_proposal_extent_                    = 0;
+    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    std::uint32_t mtp_proposal_extent_        = 0;
     // Prefill tile-skip: keep_frac (Sparge) and xattn_tau (XAttention). Decode/SmallT
     // ignore these (forced dense). Defaults are exact attention.
-    float keep_frac_                                       = 1.0f;
-    float xattn_tau_                                       = 1.0f;
-    std::int32_t xattn_min_len_                            = 8192;
+    float keep_frac_            = 1.0f;
+    float xattn_tau_            = 1.0f;
+    std::int32_t xattn_min_len_ = 8192;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

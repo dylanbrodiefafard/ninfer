@@ -34,15 +34,16 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     // Adaptive DFlash stays within the W<=6 small-T verify routes of the 35B geometry.
     static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens = 5;
+
     [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_scale(std::uint32_t) {
         return 1.0f;
     }
-    static constexpr std::uint32_t maximum_context             = kNativeContext;
-    static constexpr bool supports_dflash                      = DFlashConfig::supported;
-    static constexpr std::int32_t draft_head_rows              = 131072;
 
-    [[nodiscard]] static constexpr bool supports_dflash_vision(
-        std::string_view, std::string_view) {
+    static constexpr std::uint32_t maximum_context = kNativeContext;
+    static constexpr bool supports_dflash          = DFlashConfig::supported;
+    static constexpr std::int32_t draft_head_rows  = 131072;
+
+    [[nodiscard]] static constexpr bool supports_dflash_vision(std::string_view, std::string_view) {
         return false;
     }
 
@@ -76,9 +77,9 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
-                       Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
-                       std::int32_t route_tokens = 0);
+    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                       const Weight& weight, Tensor& residual, WorkspaceArena& workspace,
+                       cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_attention_output(const Tensor& attention, const Weight& weight,
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream, std::int32_t route_tokens = 0);
@@ -109,8 +110,8 @@ struct Variant {
     // Normalize the raw residual for the post-mixer; hidden is caller-owned scratch.
     static void post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
                            const PostMixerWeights& weights, Tensor& residual,
-                           qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream, std::int32_t route_tokens = 0);
+                           qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
+                           std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
                                std::int32_t route_tokens = 0);

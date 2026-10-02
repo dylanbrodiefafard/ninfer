@@ -77,9 +77,7 @@ std::size_t item_end(const VisionItem& item) {
     return last.begin + last.count;
 }
 
-PrefixHash128 initial_hash() {
-    return PrefixHash128{kFnvOffset64, kFnvOffset64 ^ kChain1Xor};
-}
+PrefixHash128 initial_hash() { return PrefixHash128{kFnvOffset64, kFnvOffset64 ^ kChain1Xor}; }
 
 struct Writer {
     std::uint8_t* p   = nullptr;
@@ -89,23 +87,28 @@ struct Writer {
         if (p >= end) { throw std::logic_error("prefix identity pack overflow"); }
         *p++ = value;
     }
+
     void u32(std::uint32_t value) {
         u8(static_cast<std::uint8_t>(value));
         u8(static_cast<std::uint8_t>(value >> 8));
         u8(static_cast<std::uint8_t>(value >> 16));
         u8(static_cast<std::uint8_t>(value >> 24));
     }
+
     void u64(std::uint64_t value) {
         for (int shift = 0; shift < 64; shift += 8) {
             u8(static_cast<std::uint8_t>(value >> shift));
         }
     }
+
     void i32(std::int32_t value) { u32(static_cast<std::uint32_t>(value)); }
+
     void f64(double value) {
         std::uint64_t bits = 0;
         std::memcpy(&bits, &value, sizeof(bits));
         u64(bits);
     }
+
     void bytes(const void* data, std::size_t n) {
         const auto* raw = static_cast<const std::uint8_t*>(data);
         for (std::size_t i = 0; i < n; ++i) { u8(raw[i]); }
@@ -117,10 +120,12 @@ struct Reader {
     const std::uint8_t* end = nullptr;
 
     [[nodiscard]] std::size_t remain() const { return static_cast<std::size_t>(end - p); }
+
     [[nodiscard]] std::uint8_t u8() {
         if (p >= end) { throw std::logic_error("prefix identity unpack overflow"); }
         return *p++;
     }
+
     [[nodiscard]] std::uint32_t u32() {
         const std::uint32_t a = u8();
         const std::uint32_t b = u8();
@@ -128,6 +133,7 @@ struct Reader {
         const std::uint32_t d = u8();
         return a | (b << 8) | (c << 16) | (d << 24);
     }
+
     [[nodiscard]] std::uint64_t u64() {
         std::uint64_t value = 0;
         for (int shift = 0; shift < 64; shift += 8) {
@@ -135,13 +141,16 @@ struct Reader {
         }
         return value;
     }
+
     [[nodiscard]] std::int32_t i32() { return static_cast<std::int32_t>(u32()); }
+
     [[nodiscard]] double f64() {
         const std::uint64_t bits = u64();
         double value             = 0;
         std::memcpy(&value, &bits, sizeof(value));
         return value;
     }
+
     void bytes(void* data, std::size_t n) {
         auto* raw = static_cast<std::uint8_t*>(data);
         for (std::size_t i = 0; i < n; ++i) { raw[i] = u8(); }
@@ -286,12 +295,12 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
     return true;
 }
 
-std::size_t longest_matching_prefix(
-    std::span<const TokenId> left_tokens, const ResidentPrefixIdentity& left,
-    std::span<const TokenId> right_tokens, const ResidentPrefixIdentity& right,
-    std::size_t limit) {
-    std::size_t count = std::min({limit, left_tokens.size(), right_tokens.size(),
-                                  left.size(), right.size()});
+std::size_t longest_matching_prefix(std::span<const TokenId> left_tokens,
+                                    const ResidentPrefixIdentity& left,
+                                    std::span<const TokenId> right_tokens,
+                                    const ResidentPrefixIdentity& right, std::size_t limit) {
+    std::size_t count =
+        std::min({limit, left_tokens.size(), right_tokens.size(), left.size(), right.size()});
     std::size_t matched = 0;
     while (matched < count && left_tokens[matched] == right_tokens[matched] &&
            left.token_types()[matched] == right.token_types()[matched] &&
@@ -300,18 +309,18 @@ std::size_t longest_matching_prefix(
            left.positions(2)[matched] == right.positions(2)[matched]) {
         ++matched;
     }
-    count = matched;
-    const auto left_items = left.vision_items();
+    count                  = matched;
+    const auto left_items  = left.vision_items();
     const auto right_items = right.vision_items();
     for (std::size_t i = 0; i < std::max(left_items.size(), right_items.size()); ++i) {
-        const VisionItem* a = i < left_items.size() ? &left_items[i] : nullptr;
-        const VisionItem* b = i < right_items.size() ? &right_items[i] : nullptr;
+        const VisionItem* a       = i < left_items.size() ? &left_items[i] : nullptr;
+        const VisionItem* b       = i < right_items.size() ? &right_items[i] : nullptr;
         const std::size_t a_begin = a ? a->token_spans.front().begin : count;
         const std::size_t b_begin = b ? b->token_spans.front().begin : count;
-        const std::size_t begin = std::min(a_begin, b_begin);
+        const std::size_t begin   = std::min(a_begin, b_begin);
         if (begin >= count) { break; }
-        if (a == nullptr || b == nullptr || !same_item(*a, *b) ||
-            item_end(*a) > count || item_end(*b) > count) {
+        if (a == nullptr || b == nullptr || !same_item(*a, *b) || item_end(*a) > count ||
+            item_end(*b) > count) {
             count = begin;
             break;
         }
@@ -338,16 +347,15 @@ std::size_t ResidentPrefixIdentity::packed_bytes() const {
     bytes += token_types_.size();
     bytes += 3 * token_types_.size() * sizeof(std::int32_t);
     for (const VisionItem& item : vision_items_) {
-        bytes += 1 + 12 + 16 + 32 + 4 + item.timestamps.size() * 8 + 4 +
-                 item.token_spans.size() * 16;
+        bytes +=
+            1 + 12 + 16 + 32 + 4 + item.timestamps.size() * 8 + 4 + item.token_spans.size() * 16;
     }
     return bytes;
 }
 
 void ResidentPrefixIdentity::pack(void* dst) const {
-    if (dst == nullptr && packed_bytes() != 0) {
-        throw std::invalid_argument("prefix identity pack destination is null");
-    }
+    // The packed form always carries its 8-byte header, so a destination is always required.
+    if (dst == nullptr) { throw std::invalid_argument("prefix identity pack destination is null"); }
     auto* raw = static_cast<std::uint8_t*>(dst);
     Writer w{raw, raw + packed_bytes()};
     w.u32(static_cast<std::uint32_t>(token_types_.size()));
@@ -440,11 +448,12 @@ std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
     }
-    std::vector<PrefixHash128> chain(tokens + 1);
-    chain[0]                 = initial_hash();
-    std::size_t item_cursor  = 0;
+    std::vector<PrefixHash128> chain;
+    chain.reserve(tokens + 1);
+    PrefixHash128 hash = initial_hash();
+    chain.push_back(hash);
+    std::size_t item_cursor = 0;
     for (std::size_t k = 1; k <= tokens; ++k) {
-        PrefixHash128 hash = chain[k - 1];
         const std::size_t i = k - 1;
         mix_token(hash, prompt.token_ids[i], prompt.token_types[i], prompt.positions[i],
                   prompt.positions[tokens + i], prompt.positions[2 * tokens + i]);
@@ -459,13 +468,13 @@ std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
             mix_vision_item(hash, item);
             ++item_cursor;
         }
-        chain[k] = hash;
+        chain.push_back(hash);
     }
     return chain;
 }
 
-PrefixHash128 prefix_hash_at(std::span<const TokenId> tokens, const ResidentPrefixIdentity& identity,
-                             std::size_t count) {
+PrefixHash128 prefix_hash_at(std::span<const TokenId> tokens,
+                             const ResidentPrefixIdentity& identity, std::size_t count) {
     if (count > tokens.size() || count > identity.size()) {
         throw std::out_of_range("prefix hash count exceeds resident identity");
     }

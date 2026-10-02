@@ -62,7 +62,9 @@ def parse_args() -> argparse.Namespace:
         help="optional environment variable containing a bearer token",
     )
     parser.add_argument("--output", type=Path, help="optional response JSON output path")
-    parser.add_argument("--dry-run", action="store_true", help="print the request without sending it")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print the request without sending it"
+    )
     args = parser.parse_args()
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")

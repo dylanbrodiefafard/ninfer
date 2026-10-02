@@ -14,12 +14,12 @@ namespace {
 
 using Geometry = Nvfp4GdnInputGeometry;
 
-using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
-using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using M64N128S3                   = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
-using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
+using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using M64N128S3         = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 3, 1>;
+using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+using M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 struct GdnFp32ProjectionOutput {
     float* qkv;
@@ -29,8 +29,7 @@ struct GdnFp32ProjectionOutput {
         if (row < 10240) {
             qkv[static_cast<std::int64_t>(token) * 10240 + row] = value;
         } else {
-            z[static_cast<std::int64_t>(token) * 6144 + row - 10240] =
-                __float2bfloat16_rn(value);
+            z[static_cast<std::int64_t>(token) * 6144 + row - 10240] = __float2bfloat16_rn(value);
         }
     }
 };
@@ -45,27 +44,28 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
     const Nvfp4GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                      static_cast<__nv_bfloat16*>(z.data)};
     nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4GdnInputOutput>
-        <<<grid, Schedule::kThreads, 0, stream>>>(
-            activation, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
-            Nvfp4IdentityEpilogue{}, output);
+        <<<grid, Schedule::kThreads, 0, stream>>>(activation,
+                                                  static_cast<const std::uint8_t*>(weight.qdata),
+                                                  static_cast<const std::uint8_t*>(weight.scales),
+                                                  tokens, alpha, Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                     Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream) {
+void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                      Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    launch_nvfp4_w4a8_mma<Geometry>(weight, x.ne[1], workspace, Nvfp4IdentityEpilogue{},
-        GdnFp32ProjectionOutput{static_cast<float*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}, stream);
+    launch_nvfp4_w4a8_mma<Geometry>(
+        weight, x.ne[1], workspace, Nvfp4IdentityEpilogue{},
+        GdnFp32ProjectionOutput{static_cast<float*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)},
+        stream);
 }
 
-void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                     Tensor& z, Nvfp4W4a4Workspace workspace,
-                                     cudaStream_t stream) {
+void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                      Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     launch_nvfp4_w4a4_quantize(x, weight, workspace, Nvfp4ScaleLayout::RowMajor, stream);
-    using Schedule = M32N64;
+    using Schedule   = M32N64;
     const int tokens = x.ne[1];
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
@@ -86,8 +86,8 @@ void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& 
         nvfp4_w4a4_projection_scale_layout(Nvfp4GdnInputGeometry::kOutputRows,
                                            Nvfp4GdnInputGeometry::kInputRows, tokens),
         stream);
-    if (nvfp4_w4a4_tma_route(Nvfp4GdnInputGeometry::kOutputRows,
-                             Nvfp4GdnInputGeometry::kInputRows, tokens)) {
+    if (nvfp4_w4a4_tma_route(Nvfp4GdnInputGeometry::kOutputRows, Nvfp4GdnInputGeometry::kInputRows,
+                             tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_gdn(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),

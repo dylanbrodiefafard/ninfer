@@ -108,7 +108,9 @@ real-artifact Engine tests):
 opt-in Engine tests and auto-finds exact `.ninfer` filenames in `models/`, `out/`,
 `/models`, the builder's models mount, and sibling folders of that mount. Override
 with environment variables or `models/weights.env`. `--print-weights` shows what
-`--real` would use without running tests. `--python` also runs the host pytest suite
+`--real` would use without running tests. `--compute-sanitizer TOOL` (`memcheck`,
+`racecheck`, `synccheck`, `initcheck`) runs the selected tests under compute-sanitizer; see
+[code-quality gates](../docs/maintainer/code-quality.md). `--python` also runs the host pytest suite
 when that interpreter can import `pytest` and `torch`. The script exits before CTest
 when the GPU has less than 20 GiB free and prints the processes holding VRAM.
 

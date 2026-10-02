@@ -318,10 +318,11 @@ void assign_text_positions(PreparedPromptData& prompt) {
 
 bool enables_tool_output(const PromptInput& input) {
     if (!input.options.tool_jsons.empty()) { return true; }
-    return std::any_of(input.messages.begin(), input.messages.end(), [](const ChatMessage& message) {
-        return message.role == ChatRole::Tool ||
-               (message.role == ChatRole::Assistant && !message.tool_calls.empty());
-    });
+    return std::any_of(
+        input.messages.begin(), input.messages.end(), [](const ChatMessage& message) {
+            return message.role == ChatRole::Tool ||
+                   (message.role == ChatRole::Assistant && !message.tool_calls.empty());
+        });
 }
 
 std::unique_ptr<PreparedPromptData> make_text_prompt_data(fi::EncodedChat encoded,
@@ -331,7 +332,7 @@ std::unique_ptr<PreparedPromptData> make_text_prompt_data(fi::EncodedChat encode
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids.assign(encoded.input_ids.begin(), encoded.input_ids.end());
-    result.identity.rewrite_checkpoint = std::move(encoded.rewrite_checkpoint);
+    result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
     result.turn_closure_frontiers      = std::move(encoded.turn_closure_frontiers);
     assign_text_positions(result);
     (void)checked_token_count(result.token_ids.size());
@@ -396,7 +397,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     const auto append_token   = [&](TokenId token) {
         if (!tokenizer.is_valid_token(token)) {
             throw std::invalid_argument("stop token id is outside the checkpoint vocabulary: " +
-                                          std::to_string(token));
+                                        std::to_string(token));
         }
         if (std::find(result.token_ids.begin(), result.token_ids.end(), token) ==
             result.token_ids.end()) {
@@ -521,17 +522,16 @@ struct DecoderState {
     bool has_non_whitespace_content = false;
     bool in_tool_call               = false;
     std::string tool_marker_pending;
-    std::uint64_t decoded_bytes     = 0;
-    std::uint32_t reasoning_tokens  = 0;
+    std::uint64_t decoded_bytes    = 0;
+    std::uint32_t reasoning_tokens = 0;
 };
 
-void track_structured_content(DecoderState& state, std::string_view text, bool tool_output_enabled) {
+void track_structured_content(DecoderState& state, std::string_view text,
+                              bool tool_output_enabled) {
     if (text.empty()) { return; }
     if (!state.has_non_whitespace_content) {
-        state.has_non_whitespace_content =
-            std::any_of(text.begin(), text.end(), [](unsigned char byte) {
-                return std::isspace(byte) == 0;
-            });
+        state.has_non_whitespace_content = std::any_of(
+            text.begin(), text.end(), [](unsigned char byte) { return std::isspace(byte) == 0; });
     }
     if (!tool_output_enabled) { return; }
 
@@ -754,7 +754,8 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          tool_grammar(tokenizer), processor(processor_options(resources)), vision_enabled(vision_enabled_) {
+          tool_grammar(tokenizer), processor(processor_options(resources)),
+          vision_enabled(vision_enabled_) {
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
@@ -778,6 +779,7 @@ public:
     struct ToolPublication {
         std::string pending;
         std::vector<ToolCall> calls;
+
         void filter(PublishedOutput& output, const ToolGrammarData& grammar, bool terminal) {
             PublishedOutput visible;
             for (auto& delta : output) {
@@ -789,8 +791,9 @@ public:
                 for (;;) {
                     const auto open = pending.find(kToolOpen);
                     if (open == std::string::npos) {
-                        if (!calls.empty() && std::all_of(pending.begin(), pending.end(),
-                                [](unsigned char c) { return std::isspace(c) != 0; })) {
+                        if (!calls.empty() &&
+                            std::all_of(pending.begin(), pending.end(),
+                                        [](unsigned char c) { return std::isspace(c) != 0; })) {
                             if (terminal) { pending.clear(); }
                             break;
                         }
@@ -804,18 +807,20 @@ public:
                         pending.erase(0, pending.size() - hold);
                         break;
                     }
-                    const bool separator = !calls.empty() &&
+                    const bool separator =
+                        !calls.empty() &&
                         std::all_of(pending.begin(), pending.begin() + open,
                                     [](unsigned char c) { return std::isspace(c) != 0; });
                     if (!separator) {
                         append_delta(visible, OutputChannel::Content, pending.substr(0, open));
                     }
                     pending.erase(0, open);
-                    auto close = pending.find(kToolClose);
+                    auto close     = pending.find(kToolClose);
                     bool completed = false;
                     while (close != std::string::npos) {
                         const auto end = close + kToolClose.size();
-                        if (auto call = grammar.decode_call(std::string_view(pending).substr(0, end))) {
+                        if (auto call =
+                                grammar.decode_call(std::string_view(pending).substr(0, end))) {
                             calls.push_back(std::move(*call));
                             pending.erase(0, end);
                             completed = true;
@@ -830,7 +835,8 @@ public:
             // envelope. Never convert that partial call into an executable call
             // or leak its markup into a streamed prose answer.
             if (terminal) {
-                const bool separator = !calls.empty() &&
+                const bool separator =
+                    !calls.empty() &&
                     std::all_of(pending.begin(), pending.end(),
                                 [](unsigned char c) { return std::isspace(c) != 0; });
                 if (!pending.starts_with("<tool_call") && !separator) {
@@ -841,6 +847,7 @@ public:
             output = std::move(visible);
         }
     };
+
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, bool tool_output_enabled_,
          std::span<const TokenId> model_stop_tokens_,
@@ -850,14 +857,15 @@ public:
           model_stop_tokens(model_stop_tokens_.begin(), model_stop_tokens_.end()),
           preserve_special(output.raw || output.preserve_special_tokens), raw(output.raw),
           tool_output_enabled(tool_output_enabled_) {
-        state.in_reasoning = starts_in_reasoning && !output.raw;
+        state.in_reasoning            = starts_in_reasoning && !output.raw;
         state.require_initial_content = !output.raw && (state.in_reasoning || tool_output_enabled);
-        grammar_data = std::move(grammar);
-        recovery_context = std::move(recovery);
+        grammar_data                  = std::move(grammar);
+        recovery_context              = std::move(recovery);
         if (grammar_data) {
             std::vector<TokenId> ignored;
             for (const auto token : model_stop_tokens) {
-                if (std::find(policy.token_ids.begin(), policy.token_ids.end(), token) == policy.token_ids.end()) {
+                if (std::find(policy.token_ids.begin(), policy.token_ids.end(), token) ==
+                    policy.token_ids.end()) {
                     ignored.push_back(token);
                 }
             }
@@ -868,8 +876,8 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::vector<TokenId> model_stop_tokens;
-    bool preserve_special = false;
-    bool raw = false;
+    bool preserve_special    = false;
+    bool raw                 = false;
     bool tool_output_enabled = false;
     DecoderState state;
     DecoderState preview_state;
@@ -971,7 +979,7 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         if (impl_->grammar_data && !impl_->raw) {
             impl_->preview_tools = impl_->tools;
             impl_->preview_tools.filter(impl_->preview_output, *impl_->grammar_data,
-                                         reason != FinishReason::None);
+                                        reason != FinishReason::None);
         }
         impl_->preview_ready = true;
         return runtime::OutputDecision{.accepted_tokens        = count,
@@ -1109,7 +1117,9 @@ bool OutputSession::model_stop_tokens_allowed() const noexcept {
 bool OutputSession::reasoning_cycle_exclusion_allowed(TokenId token) const {
     if (!in_reasoning() || impl_->raw || token < 0) { return false; }
     if (std::find(impl_->model_stop_tokens.begin(), impl_->model_stop_tokens.end(), token) !=
-        impl_->model_stop_tokens.end()) { return false; }
+        impl_->model_stop_tokens.end()) {
+        return false;
+    }
     const auto candidate = impl_->state.think_marker_pending +
                            std::string(impl_->tokenizer->decode_token_bytes(token));
     return candidate.find(kThinkClose) == std::string::npos &&
@@ -1142,9 +1152,10 @@ std::vector<std::string> unconstrained_tool_call_names(std::string_view text,
         const auto end = text.find('>');
         if (end == 0 || end == std::string_view::npos || end > max_name_length) { return {}; }
         const auto name = text.substr(0, end);
-        if (!std::all_of(name.begin(), name.end(), [](unsigned char c) {
-                return std::isalnum(c) || c == '_' || c == '-';
-            })) { return {}; }
+        if (!std::all_of(name.begin(), name.end(),
+                         [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '-'; })) {
+            return {};
+        }
         names.emplace_back(name);
         text.remove_prefix(end + 1);
         for (;;) {
@@ -1168,15 +1179,16 @@ std::span<const ToolCall> OutputSession::tool_calls() const noexcept {
     return impl_ ? std::span<const ToolCall>(impl_->tools.calls) : std::span<const ToolCall>{};
 }
 
-std::shared_ptr<const GenerationRecoveryContext> OutputSession::generation_recovery_context() const noexcept {
+std::shared_ptr<const GenerationRecoveryContext>
+OutputSession::generation_recovery_context() const noexcept {
     return impl_ ? impl_->recovery_context : nullptr;
 }
 
 bool OutputSession::terminal() const noexcept { return impl_ && impl_->state.terminal; }
 
 void OutputSession::fill_tool_masks(std::span<const TokenId> tokens,
-                                     std::span<const std::int32_t> parents,
-                                     std::span<std::uint32_t> words) const {
+                                    std::span<const std::int32_t> parents,
+                                    std::span<std::uint32_t> words) const {
     if (!has_tool_grammar()) { throw std::logic_error("output session has no tool grammar"); }
     impl_->tool_grammar->fill_masks(tokens, parents, words);
 }
@@ -1205,7 +1217,7 @@ const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& promp
 
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    auto data = std::move(prompt.data_);
+    auto data = std::move(prompt).data_;
     return std::move(*data);
 }
 
@@ -1214,14 +1226,16 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input) const {
-    const auto start                      = Clock::now();
-    const PromptOptions options           = input.options;
-    const bool tool_output_enabled        = enables_tool_output(input);
-    const auto grammar = options.add_generation_prompt
-        ? impl_->tool_grammar.compile(options.tool_jsons, options.enable_thinking) : nullptr;
+    const auto start               = Clock::now();
+    const PromptOptions options    = input.options;
+    const bool tool_output_enabled = enables_tool_output(input);
+    const auto grammar =
+        options.add_generation_prompt
+            ? impl_->tool_grammar.compile(options.tool_jsons, options.enable_thinking)
+            : nullptr;
     const auto recovery = GenerationRecoveryContext::analyze(input);
-    const auto finish = [&](std::unique_ptr<PreparedPromptData> data) {
-        data->tool_grammar = grammar;
+    const auto finish   = [&](std::unique_ptr<PreparedPromptData> data) {
+        data->tool_grammar        = grammar;
         data->generation_recovery = recovery;
         return PreparedPrompt(std::move(data));
     };
@@ -1239,14 +1253,13 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         try {
             processed = processor.process(messages, render_options(options));
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
-        return finish(make_media_prompt_data(std::move(processed), options,
-                                                     tool_output_enabled, start));
+        return finish(
+            make_media_prompt_data(std::move(processed), options, tool_output_enabled, start));
     }
     const fi::RenderedChat rendered =
         impl_->chat_template.render(messages, render_options(options));
     fi::EncodedChat encoded = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
-    return finish(
-        make_text_prompt_data(std::move(encoded), options, tool_output_enabled, start));
+    return finish(make_text_prompt_data(std::move(encoded), options, tool_output_enabled, start));
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input) const {
@@ -1297,9 +1310,9 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 
 namespace {
 
-std::optional<std::vector<TokenId>> encode_round_trip(
-    const fi::Tokenizer& tokenizer, std::string_view text, std::string& decoded,
-    std::span<const fi::ByteSpan> literal_spans = {}) {
+std::optional<std::vector<TokenId>>
+encode_round_trip(const fi::Tokenizer& tokenizer, std::string_view text, std::string& decoded,
+                  std::span<const fi::ByteSpan> literal_spans = {}) {
     decoded.clear();
     if (text.empty()) { return std::nullopt; }
     const std::vector<int> encoded = tokenizer.encode(text, {}, literal_spans);
@@ -1325,9 +1338,10 @@ bool insert_enables_tool_output(const PromptInput& source, std::span<const ChatM
 
 } // namespace
 
-std::optional<PreparedPrompt> Frontend::splice_recovery_prompt(
-    std::vector<TokenId> prefix, const PromptInput& source, std::span<const ChatMessage> insert,
-    std::shared_ptr<const GenerationRecoveryContext> recovery) const {
+std::optional<PreparedPrompt>
+Frontend::splice_recovery_prompt(std::vector<TokenId> prefix, const PromptInput& source,
+                                 std::span<const ChatMessage> insert,
+                                 std::shared_ptr<const GenerationRecoveryContext> recovery) const {
     if (impl_ == nullptr || prefix.empty() || insert.empty()) { return std::nullopt; }
     try {
         std::string prologue_decoded;
@@ -1351,13 +1365,12 @@ std::optional<PreparedPrompt> Frontend::splice_recovery_prompt(
         const fi::RenderedFragment rendered_fragment = impl_->chat_template.render_fragment(
             convert_messages(std::move(owned)), fragment_options);
         const std::string& fragment = rendered_fragment.text;
-        const auto fragment_ids     = encode_round_trip(*impl_->tokenizer, fragment, fragment_decoded,
-                                                        rendered_fragment.literal_spans);
+        const auto fragment_ids = encode_round_trip(*impl_->tokenizer, fragment, fragment_decoded,
+                                                    rendered_fragment.literal_spans);
         if (!fragment_ids ||
-            !recovery_suffix_tokens_ok(prefix, *prologue_ids, *close_ids, *fragment_ids,
-                                       kRecoveryThinkingPrologue, prologue_decoded,
-                                       kRecoveryTurnClose, close_decoded, fragment,
-                                       fragment_decoded)) {
+            !recovery_suffix_tokens_ok(
+                prefix, *prologue_ids, *close_ids, *fragment_ids, kRecoveryThinkingPrologue,
+                prologue_decoded, kRecoveryTurnClose, close_decoded, fragment, fragment_decoded)) {
             return std::nullopt;
         }
 
@@ -1372,23 +1385,21 @@ std::optional<PreparedPrompt> Frontend::splice_recovery_prompt(
         data->token_ids  = std::move(prefix);
         assign_text_positions(*data);
         (void)checked_token_count(data->token_ids.size());
-        data->identity.reusable = true;
+        data->identity.reusable           = true;
         data->identity.rewrite_checkpoint = RewriteCheckpointSpec{
             .kind     = RewriteCheckpointKind::ResponseReplay,
             .frontier = static_cast<std::uint32_t>(data->token_ids.size()),
         };
         data->starts_in_reasoning = true;
         data->tool_output_enabled = insert_enables_tool_output(source, insert);
-        data->tool_grammar        = impl_->tool_grammar.compile(source.options.tool_jsons,
-                                                                source.options.enable_thinking);
+        data->tool_grammar =
+            impl_->tool_grammar.compile(source.options.tool_jsons, source.options.enable_thinking);
         data->generation_recovery = std::move(recovery);
         data->prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
         return PreparedPrompt(std::move(data));
     } catch (const std::invalid_argument&) {
         return std::nullopt;
-    } catch (const std::out_of_range&) {
-        return std::nullopt;
-    }
+    } catch (const std::out_of_range&) { return std::nullopt; }
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
@@ -1407,14 +1418,16 @@ const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_-
 
 PreparedPrompt EncodedHistoryPrepare::prepare(const Frontend& frontend, PromptInput input,
                                               frontend_internal::EncodedHistoryCache& cache) {
-    const auto start                      = Clock::now();
-    const PromptOptions options           = input.options;
-    const bool tool_output_enabled        = enables_tool_output(input);
-    const auto grammar = options.add_generation_prompt
-        ? frontend.impl_->tool_grammar.compile(options.tool_jsons, options.enable_thinking) : nullptr;
+    const auto start               = Clock::now();
+    const PromptOptions options    = input.options;
+    const bool tool_output_enabled = enables_tool_output(input);
+    const auto grammar =
+        options.add_generation_prompt
+            ? frontend.impl_->tool_grammar.compile(options.tool_jsons, options.enable_thinking)
+            : nullptr;
     const auto recovery = GenerationRecoveryContext::analyze(input);
-    const auto finish = [&](std::unique_ptr<PreparedPromptData> data) {
-        data->tool_grammar = grammar;
+    const auto finish   = [&](std::unique_ptr<PreparedPromptData> data) {
+        data->tool_grammar        = grammar;
         data->generation_recovery = recovery;
         return PreparedPrompt(std::move(data));
     };
@@ -1433,14 +1446,13 @@ PreparedPrompt EncodedHistoryPrepare::prepare(const Frontend& frontend, PromptIn
         try {
             processed = processor.process(messages, render_options(options));
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
-        return finish(make_media_prompt_data(std::move(processed), options,
-                                                     tool_output_enabled, start));
+        return finish(
+            make_media_prompt_data(std::move(processed), options, tool_output_enabled, start));
     }
     fi::EncodedChat encoded =
         fi::encode_chat_with_cache(*frontend.impl_->tokenizer, frontend.impl_->chat_template,
                                    messages, render_options(options), cache);
-    return finish(
-        make_text_prompt_data(std::move(encoded), options, tool_output_enabled, start));
+    return finish(make_text_prompt_data(std::move(encoded), options, tool_output_enabled, start));
 }
 
 std::uint32_t EncodedHistoryPrepare::count_tokens(const Frontend& frontend, PromptInput input,

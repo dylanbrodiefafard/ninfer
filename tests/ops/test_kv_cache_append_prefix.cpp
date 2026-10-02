@@ -107,7 +107,8 @@ CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& 
 }
 
 int run_case(int tokens, int commit_count, int first_position, bool cyclic,
-             std::vector<std::int32_t> mapping = {}, int min_count = 0, int window = kWindow) {
+             const std::vector<std::int32_t>& mapping = {}, int min_count = 0,
+             int window = kWindow) {
     if (!cyclic && mapping.size() != kLogicalPages) {
         throw std::invalid_argument("paged prefix case requires a complete mapping");
     }
@@ -357,11 +358,12 @@ int batch_selector_case(bool cyclic) {
     for (int b = 0; b < batch; ++b) {
         const std::vector<std::int32_t> mapping(
             tables.begin() +
-                static_cast<std::ptrdiff_t>(selectors[static_cast<std::size_t>(b)] * kLogicalPages),
-            tables.begin() + static_cast<std::ptrdiff_t>(
-                                 (selectors[static_cast<std::size_t>(b)] + 1) * kLogicalPages));
+                static_cast<std::ptrdiff_t>(selectors[static_cast<std::size_t>(b)]) * kLogicalPages,
+            tables.begin() +
+                (static_cast<std::ptrdiff_t>(selectors[static_cast<std::size_t>(b)]) + 1) *
+                    kLogicalPages);
         for (int token = 0; token < counts[static_cast<std::size_t>(b)]; ++token) {
-            const int position = positions[static_cast<std::size_t>(b * tokens + token)];
+            const int position = positions[static_cast<std::size_t>(b) * tokens + token];
             for (int head = 0; head < kKVHeads; ++head) {
                 for (int d = 0; d < kHeadDim; ++d) {
                     const std::size_t src =

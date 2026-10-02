@@ -32,10 +32,11 @@ int main() {
 
     const auto tool_schema = ninfer::serve::request_error_to_api_error(ninfer::RequestError(
         ninfer::RequestErrorKind::InvalidToolSchema, "unsupported tool schema assertion: not"));
-    failures += check(tool_schema.status == 400 && tool_schema.type == "invalid_request_error" &&
-                          tool_schema.code == "invalid_tool_schema" && tool_schema.param == "tools" &&
-                          tool_schema.message == "unsupported tool schema assertion: not",
-                      "tool schema rejection lost its HTTP classification or diagnostic");
+    failures +=
+        check(tool_schema.status == 400 && tool_schema.type == "invalid_request_error" &&
+                  tool_schema.code == "invalid_tool_schema" && tool_schema.param == "tools" &&
+                  tool_schema.message == "unsupported tool schema assertion: not",
+              "tool schema rejection lost its HTTP classification or diagnostic");
 
     const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
@@ -44,9 +45,10 @@ int main() {
                       "media resource rejection did not map to HTTP 400");
     const auto exhausted = ninfer::serve::request_error_to_api_error(ninfer::RequestError(
         ninfer::RequestErrorKind::RecoveryExhausted, "bounded recovery exhausted"));
-    failures += check(exhausted.status == 500 && exhausted.type == "server_error" &&
-                          exhausted.code == "generation_recovery_exhausted" && exhausted.param.empty(),
-                      "recovery exhaustion lost its explicit request-local error");
+    failures +=
+        check(exhausted.status == 500 && exhausted.type == "server_error" &&
+                  exhausted.code == "generation_recovery_exhausted" && exhausted.param.empty(),
+              "recovery exhaustion lost its explicit request-local error");
     const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
         ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
@@ -68,15 +70,13 @@ int main() {
             return 0;
         } catch (const ninfer::serve::ApiException& error) { return error.error().status; }
     };
-    failures += check(ninfer::context_checkpoint_capture_available(
-                          true, ninfer::SpeculativeBackend::Mtp) &&
-                          ninfer::context_checkpoint_capture_available(
-                              true, ninfer::SpeculativeBackend::DFlash) &&
-                          !ninfer::context_checkpoint_capture_available(
-                              true, ninfer::SpeculativeBackend::None) &&
-                          !ninfer::context_checkpoint_capture_available(
-                              false, ninfer::SpeculativeBackend::Mtp),
-                      "pin availability is not prefix-reuse plus a speculative backend");
+    failures += check(
+        ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::Mtp) &&
+            ninfer::context_checkpoint_capture_available(true,
+                                                         ninfer::SpeculativeBackend::DFlash) &&
+            !ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::None) &&
+            !ninfer::context_checkpoint_capture_available(false, ninfer::SpeculativeBackend::Mtp),
+        "pin availability is not prefix-reuse plus a speculative backend");
     failures += check(capture_code(true, true, ninfer::SpeculativeBackend::None) ==
                               "context_checkpoint_unavailable" &&
                           capture_status(true, true, ninfer::SpeculativeBackend::None) == 400,
@@ -84,11 +84,10 @@ int main() {
     failures += check(capture_code(true, false, ninfer::SpeculativeBackend::Mtp) ==
                           "context_checkpoint_unavailable",
                       "--no-prefix-reuse capture did not return context_checkpoint_unavailable");
-    failures +=
-        check(capture_code(false, true, ninfer::SpeculativeBackend::None).empty() &&
-                  capture_code(true, true, ninfer::SpeculativeBackend::Mtp).empty() &&
-                  capture_code(true, true, ninfer::SpeculativeBackend::DFlash).empty(),
-              "available or unrequested capture was rejected");
+    failures += check(capture_code(false, true, ninfer::SpeculativeBackend::None).empty() &&
+                          capture_code(true, true, ninfer::SpeculativeBackend::Mtp).empty() &&
+                          capture_code(true, true, ninfer::SpeculativeBackend::DFlash).empty(),
+                      "available or unrequested capture was rejected");
 
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";

@@ -44,11 +44,10 @@ struct MemoryRange {
     std::uintptr_t end;
 };
 
-MemoryRange make_range(const void* pointer, std::size_t bytes, const char* label) {
-    if (pointer == nullptr || bytes == 0) {
+MemoryRange make_range(std::uintptr_t begin, std::size_t bytes, const char* label) {
+    if (begin == 0 || bytes == 0) {
         throw std::invalid_argument(std::string(label) + " has an empty memory range");
     }
-    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
         throw std::overflow_error(std::string(label) + " address range overflows");
     }
@@ -56,7 +55,7 @@ MemoryRange make_range(const void* pointer, std::size_t bytes, const char* label
 }
 
 MemoryRange tensor_range(const Tensor& tensor, const char* label) {
-    return make_range(tensor.data, tensor.bytes(), label);
+    return make_range(reinterpret_cast<std::uintptr_t>(tensor.data), tensor.bytes(), label);
 }
 
 MemoryRange layer_range(const Tensor& layer0, std::int64_t stride_bytes, std::int32_t layer,
@@ -71,7 +70,7 @@ MemoryRange layer_range(const Tensor& layer0, std::int64_t stride_bytes, std::in
     if (offset > std::numeric_limits<std::uintptr_t>::max() - base) {
         throw std::overflow_error(std::string(label) + " layer address overflows");
     }
-    return make_range(reinterpret_cast<const void*>(base + offset), layer0.bytes(), label);
+    return make_range(base + offset, layer0.bytes(), label);
 }
 
 bool overlaps(MemoryRange lhs, MemoryRange rhs) {
@@ -134,8 +133,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 
     const bool tree = parent_index != nullptr && parent_index->data != nullptr;
     if (tree) {
-        const bool batched = parent_index->ne[0] == width && parent_index->ne[1] == rows &&
-                             parent_index->ne[2] == 1 && parent_index->ne[3] == 1;
+        const bool batched      = parent_index->ne[0] == width && parent_index->ne[1] == rows &&
+                                  parent_index->ne[2] == 1 && parent_index->ne[3] == 1;
         const bool dense_single = rows == 1 && parent_index->ne[0] == width &&
                                   parent_index->ne[1] == 1 && parent_index->ne[2] == 1 &&
                                   parent_index->ne[3] == 1;
@@ -336,7 +335,7 @@ std::size_t replay_record_ssm_pool_bytes(std::int32_t value_heads, std::int32_t 
 std::size_t replay_record_overlay_bytes(std::int32_t value_heads, std::int32_t batch,
                                         std::int32_t width) {
     constexpr const char* kOverflow = "gated_delta_net_replay_record workspace overflow";
-    const std::int64_t slots = static_cast<std::int64_t>(batch) * width;
+    const std::int64_t slots        = static_cast<std::int64_t>(batch) * width;
     if (slots <= 0 || slots > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(kOverflow);
     }
@@ -354,13 +353,12 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    WorkspaceArena* workspace) {
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
                            key_record, value_record, gate_record, out, parent_index);
-    const std::int32_t* parent_ptr =
-        (parent_index != nullptr && parent_index->data != nullptr)
-            ? static_cast<const std::int32_t*>(parent_index->data)
-            : nullptr;
+    const std::int32_t* parent_ptr = (parent_index != nullptr && parent_index->data != nullptr)
+                                         ? static_cast<const std::int32_t*>(parent_index->data)
+                                         : nullptr;
     if (workspace != nullptr && parent_ptr != nullptr) {
-        const std::size_t need = gated_delta_net_replay_record_workspace_capacity_bytes(
-            v.ne[1], q.ne[3], q.ne[2]);
+        const std::size_t need =
+            gated_delta_net_replay_record_workspace_capacity_bytes(v.ne[1], q.ne[3], q.ne[2]);
         auto* overlay_states = reinterpret_cast<float*>(workspace->alloc_bytes(need).data);
         detail::gated_delta_net::launch_recurrent_overlay(
             q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,

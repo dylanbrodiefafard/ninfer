@@ -16,7 +16,7 @@ inline constexpr std::int32_t kGroupedDynamicConvGroups    = 320;
 inline constexpr std::int32_t kGroupedDynamicConvKernel    = 2;
 inline constexpr std::int32_t kGroupedDynamicConvProjRows =
     2 * kGroupedDynamicConvKernel * kGroupedDynamicConvGroups; // 1280
-inline constexpr std::int32_t kGroupedDynamicConvMaxBatch = 8;
+inline constexpr std::int32_t kGroupedDynamicConvMaxBatch            = 8;
 inline constexpr std::int32_t kGroupedDynamicConvMaxWidthWhenBatched = 16;
 
 /**

@@ -100,7 +100,7 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
 
     const std::string label = std::string("gdn_gating T=") + std::to_string(tokens) +
                               (stress_transcendentals ? " transcendental-range" : "");
-    int failures = 0;
+    int failures            = 0;
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
                                  reference_g, kGdnGatingFp32);
     failures += verify_pointwise((label + " beta").c_str(), read_fp32(device_beta.data(), elements),

@@ -77,11 +77,11 @@ int main(int argc, char** argv) {
     bool control        = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
-            d = std::atoi(argv[++i]);
+            d = parse_number<int>(argv[++i], "--d");
         } else if (!std::strcmp(argv[i], "--heads") && i + 1 < argc) {
-            heads = std::atoi(argv[++i]);
+            heads = parse_number<int>(argv[++i], "--heads");
         } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
-            selected_tokens = std::atoi(argv[++i]);
+            selected_tokens = parse_number<int>(argv[++i], "--tokens");
         } else if (!std::strcmp(argv[i], "--decode")) {
             decode = true;
         } else if (!std::strcmp(argv[i], "--prefill")) {

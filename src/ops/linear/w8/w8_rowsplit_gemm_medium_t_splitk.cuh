@@ -16,7 +16,7 @@ namespace ninfer::ops::detail {
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
           bool AddResidual = false>
 __global__
-__launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_splitk_kernel(
+__launch_bounds__(KSplits * NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, int active_cols) {
     constexpr int kTileK       = 64;

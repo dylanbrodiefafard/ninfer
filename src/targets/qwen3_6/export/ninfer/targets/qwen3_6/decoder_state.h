@@ -15,16 +15,16 @@ inline constexpr std::int32_t kKvNvfp4Group     = 16;
 inline constexpr std::int32_t kKvNvfp4CodeWidth = 128;
 
 struct DecoderStateSpec {
-    std::uint32_t full_attention_layers     = 0;
-    std::uint32_t mtp_layers                = 0;
-    std::uint32_t capacity                  = 0;
-    std::int32_t kv_heads                   = 0;
-    std::int32_t attention_head_dim         = 0;
-    DType kv_dtype                          = DType::BF16;
-    std::int32_t kv_quant_group             = 0;
-    bool sage_attn                           = false;
+    std::uint32_t full_attention_layers = 0;
+    std::uint32_t mtp_layers            = 0;
+    std::uint32_t capacity              = 0;
+    std::int32_t kv_heads               = 0;
+    std::int32_t attention_head_dim     = 0;
+    DType kv_dtype                      = DType::BF16;
+    std::int32_t kv_quant_group         = 0;
+    bool sage_attn                      = false;
     // Allocate the k_mean page-stats plane on NVFP4 caches (independent of sage_pv).
-    float keep_frac                          = 1.0f;
+    float keep_frac                         = 1.0f;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -97,8 +97,8 @@ private:
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
-    bool sage_pv_             = false;
-    bool k_mean_              = false;
+    bool sage_pv_              = false;
+    bool k_mean_               = false;
 };
 
 struct DecoderStateLayout {

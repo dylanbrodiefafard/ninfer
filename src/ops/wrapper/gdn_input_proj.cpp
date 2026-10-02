@@ -134,9 +134,10 @@ bool parent_index_active(const Tensor* parent_index);
 // axis. SmallT T=2..16 launches one fused grid (x=batch) instead of this loop.
 void nvfp4_snapshot_decode_rows(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                 Tensor& conv_states, const Tensor& valid_columns,
-                                const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
-                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor& initial_state_slots,
+                                const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                Tensor& value, Tensor& z, LinearPolicy policy,
+                                WorkspaceArena& workspace, cudaStream_t stream,
                                 ConvGeometry geometry) {
     for (std::int32_t batch_index = 0; batch_index < geometry.batch; ++batch_index) {
         const Tensor valid_b = selector_row(valid_columns, batch_index);
@@ -144,11 +145,11 @@ void nvfp4_snapshot_decode_rows(const Tensor& x, const Weight& weight, const Ten
         Tensor key_b         = packed_row(key, batch_index);
         Tensor value_b       = packed_row(value, batch_index);
         Tensor z_b           = packed_row(z, batch_index);
-        detail::nvfp4_gdn_snapshot_dispatch(
-            packed_row(x, batch_index), weight, conv_weight, conv_states, valid_b,
-            initial_state_slots.slice(0, batch_index, 1),
-            snapshot_base_slots.slice(0, batch_index, 1), query_b, key_b, value_b, z_b, policy,
-            workspace, stream);
+        detail::nvfp4_gdn_snapshot_dispatch(packed_row(x, batch_index), weight, conv_weight,
+                                            conv_states, valid_b,
+                                            initial_state_slots.slice(0, batch_index, 1),
+                                            snapshot_base_slots.slice(0, batch_index, 1), query_b,
+                                            key_b, value_b, z_b, policy, workspace, stream);
     }
 }
 
@@ -180,9 +181,9 @@ bool parent_index_active(const Tensor* parent_index) {
 
 void require_record_parent_index(const Tensor* parent_index, ConvGeometry geometry) {
     if (!parent_index_active(parent_index)) { return; }
-    const Tensor& tensor           = *parent_index;
-    const bool batched             = tensor.ne[0] == geometry.width && tensor.ne[1] == geometry.batch &&
-                         tensor.ne[2] == 1 && tensor.ne[3] == 1;
+    const Tensor& tensor    = *parent_index;
+    const bool batched      = tensor.ne[0] == geometry.width && tensor.ne[1] == geometry.batch &&
+                              tensor.ne[2] == 1 && tensor.ne[3] == 1;
     const bool dense_single = geometry.batch == 1 && tensor.ne[0] == geometry.width &&
                               tensor.ne[1] == 1 && tensor.ne[2] == 1 && tensor.ne[3] == 1;
     if (tensor.dtype != DType::I32 || !tensor.is_contiguous() || !aligned_to(tensor.data, 4) ||
@@ -204,10 +205,18 @@ void require_record_nonoverlap(const Tensor& x, const Tensor& conv_weight,
                                const Tensor& query, const Tensor& key, const Tensor& value,
                                const Tensor& z, const WorkspaceArena& workspace,
                                const Tensor* parent_index = nullptr) {
-    const std::array<const Tensor*, 11> tensors{
-        &x,           &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
-        &conv_record, &query,       &key,         &value,         &z,
-        parent_index_active(parent_index) ? parent_index : nullptr};
+    const std::array<const Tensor*, 11> tensors{&x,
+                                                &conv_weight,
+                                                &conv_states,
+                                                &valid_columns,
+                                                &initial_state_slots,
+                                                &conv_record,
+                                                &query,
+                                                &key,
+                                                &value,
+                                                &z,
+                                                parent_index_active(parent_index) ? parent_index
+                                                                                  : nullptr};
     for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
         if (tensors[lhs] == nullptr || tensors[lhs]->data == nullptr) { continue; }
         for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
@@ -640,7 +649,8 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
         constexpr std::int32_t kParentRows = kChannels + kZRows;
         const ConvGeometry geometry        = require_record_input(x, kHidden);
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+            policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("NVFP4 gdn_input_proj_conv_record admits A16, A4 or A8");
         }
         detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
@@ -762,12 +772,13 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     require_record_parent_index(parent_index, geometry);
 
     if (parent_index_active(parent_index) || geometry.batch > 1) {
-        compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
-                       query, key, value, z, geometry, workspace, stream,
-                       [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                           gdn_input_proj(x_flat, weight, record_flat, z_flat, stream);
-                       },
-                       parent_index);
+        compose_record(
+            x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record, query,
+            key, value, z, geometry, workspace, stream,
+            [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+                gdn_input_proj(x_flat, weight, record_flat, z_flat, stream);
+            },
+            parent_index);
         return;
     }
     const detail::W8GdnInputConvPlan plan = resolve_w8_conv_plan(geometry.width, geometry.batch);
@@ -943,7 +954,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
         input_rows != detail::Nvfp4GdnInputGeometry::kInputRows ||
-        (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8)) {
+        (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+         policy != LinearPolicy::AllowA8)) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_record workspace: unsupported single-parent profile");
     }
@@ -1040,7 +1052,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                               conv_record, query, key, value, z, workspace, parent_index);
     require_record_parent_index(parent_index, geometry);
 
-    const bool tree                         = parent_index_active(parent_index);
+    const bool tree = parent_index_active(parent_index);
     const detail::Q4Q5GdnInputConvPlan plan =
         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
     if (!tree && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
@@ -1049,13 +1061,13 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                                    conv_record, query, key, value, z, stream);
         return;
     }
-    compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
-                   query, key, value, z, geometry, workspace, stream,
-                   [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                       gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      stream);
-                   },
-                   parent_index);
+    compose_record(
+        x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record, query, key,
+        value, z, geometry, workspace, stream,
+        [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+            gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat, stream);
+        },
+        parent_index);
 }
 
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,

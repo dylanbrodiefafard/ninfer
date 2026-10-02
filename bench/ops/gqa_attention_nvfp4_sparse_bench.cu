@@ -31,7 +31,7 @@ using namespace ninfer::ops;
 using namespace ninfer::bench;
 
 namespace {
-using Geom = Gqa27Geometry;
+using Geom              = Gqa27Geometry;
 constexpr int kQHeads   = Geom::QHeads;
 constexpr int kKVHeads  = Geom::KVHeads;
 constexpr int kHeadDim  = kGqaNvfp4HeadDim;
@@ -81,21 +81,21 @@ Nvfp4Cache make_cache(int context, bool want_k_mean) {
     for (int p = 0; p < logical_pages; ++p) { h_table[p] = p; }
     cache.block_table.copy_from_host(h_table.data(), table_bytes);
 
-    cache.view                 = PagedKVLayerView{};
-    cache.view.k_pages         = Tensor(cache.k_pages.p, DType::U8,
-                                {kCodeW, kPageSize, kKVHeads, physical_pages});
-    cache.view.v_pages         = Tensor(cache.v_pages.p, DType::U8,
-                                {kCodeW, kPageSize, kKVHeads, physical_pages});
-    cache.view.k_scale_pages   = Tensor(cache.k_scale.p, DType::FP8_E4M3FN,
-                                      {kGroups, kPageSize, kKVHeads, physical_pages});
-    cache.view.v_scale_pages   = Tensor(cache.v_scale.p, DType::FP8_E4M3FN,
-                                      {kGroups, kPageSize, kKVHeads, physical_pages});
+    cache.view = PagedKVLayerView{};
+    cache.view.k_pages =
+        Tensor(cache.k_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
+    cache.view.v_pages =
+        Tensor(cache.v_pages.p, DType::U8, {kCodeW, kPageSize, kKVHeads, physical_pages});
+    cache.view.k_scale_pages =
+        Tensor(cache.k_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
+    cache.view.v_scale_pages =
+        Tensor(cache.v_scale.p, DType::FP8_E4M3FN, {kGroups, kPageSize, kKVHeads, physical_pages});
     if (want_k_mean) {
         cache.view.k_mean_pages =
             Tensor(cache.k_mean.p, DType::FP32, {4, kPageSize, kKVHeads, physical_pages});
     }
-    cache.view.block_table = Tensor(cache.block_table.p, DType::I32, {logical_pages});
-    cache.view.head_dim    = kHeadDim;
+    cache.view.block_table  = Tensor(cache.block_table.p, DType::I32, {logical_pages});
+    cache.view.head_dim     = kHeadDim;
     cache.view.num_kv_heads = kKVHeads;
     cache.view.dtype        = DType::U8;
     cache.view.quant_group  = kGroups;
@@ -148,12 +148,12 @@ int parse_positive(const char* text, const char* flag) {
 
 int main(int argc, char** argv) {
     try {
-        float keep_frac         = 1.0f;
-        float xattn_tau         = 1.0f;
-        int xattn_min_len       = kDefaultXattnMinLen;
-        int warmup              = 8;
-        int repeat              = 64;
-        std::vector<int> tokens = {4096};
+        float keep_frac           = 1.0f;
+        float xattn_tau           = 1.0f;
+        int xattn_min_len         = kDefaultXattnMinLen;
+        int warmup                = 8;
+        int repeat                = 64;
+        std::vector<int> tokens   = {4096};
         std::vector<int> contexts = {8192, 32768, 65536, 131072};
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
@@ -181,10 +181,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--repeat") {
                 repeat = parse_positive(value("--repeat"), "--repeat");
             } else if (arg == "-h" || arg == "--help") {
-                std::printf(
-                    "Usage: ninfer_gqa_attention_nvfp4_sparse_bench [--keep-frac F] "
-                    "[--xattn-tau F] [--tokens LIST] [--contexts LIST] "
-                    "[--xattn-min-len N] [--warmup N] [--repeat N]\n");
+                std::printf("Usage: ninfer_gqa_attention_nvfp4_sparse_bench [--keep-frac F] "
+                            "[--xattn-tau F] [--tokens LIST] [--contexts LIST] "
+                            "[--xattn-min-len N] [--warmup N] [--repeat N]\n");
                 return 0;
             } else {
                 throw std::invalid_argument("unknown argument: " + arg);
@@ -204,7 +203,8 @@ int main(int argc, char** argv) {
         print_device_caps("gqa-nvfp4-sparse-prefill");
         std::printf("%-8s %8s %12s %14s %12s %12s %10s\n", "context", "T", "fill(us)",
                     "op median(us)", "op p95(us)", "workspace", "attn TF/s");
-        std::printf("--------------------------------------------------------------------------------\n");
+        std::printf(
+            "--------------------------------------------------------------------------------\n");
 
         for (int context : contexts) {
             Nvfp4Cache cache = make_cache(context, want_k_mean);
@@ -230,13 +230,12 @@ int main(int argc, char** argv) {
                 if (width > context) {
                     throw std::invalid_argument("every --tokens value must be <= every context");
                 }
-                const std::size_t q_elems =
-                    static_cast<std::size_t>(width) * kQHeads * kHeadDim;
+                const std::size_t q_elems = static_cast<std::size_t>(width) * kQHeads * kHeadDim;
                 const std::size_t kv_window_elems =
                     static_cast<std::size_t>(width) * kKVHeads * kHeadDim;
-                DeviceBuffer q_query   = make_bf16(q_elems);
-                DeviceBuffer k_query   = make_bf16(kv_window_elems);
-                DeviceBuffer v_query   = make_bf16(kv_window_elems);
+                DeviceBuffer q_query = make_bf16(q_elems);
+                DeviceBuffer k_query = make_bf16(kv_window_elems);
+                DeviceBuffer v_query = make_bf16(kv_window_elems);
                 DeviceBuffer out_buf(q_elems * sizeof(std::uint16_t));
                 std::vector<std::int32_t> h_pos_q(width);
                 for (int i = 0; i < width; ++i) { h_pos_q[i] = (context - width) + i; }
@@ -255,8 +254,7 @@ int main(int argc, char** argv) {
                 const Tensor empty;
                 const GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
                                                     static_cast<std::uint32_t>(context)};
-                const bool xattn_active =
-                    xattn_tau < 1.0f && context > xattn_min_len;
+                const bool xattn_active           = xattn_tau < 1.0f && context > xattn_min_len;
                 const std::size_t workspace_bytes = gqa_attention_workspace_capacity_bytes(
                     kQHeads, DType::U8, envelope, 1, width, width, keep_frac, false,
                     xattn_active ? xattn_tau : 1.0f);
@@ -304,8 +302,7 @@ int main(int argc, char** argv) {
                             tflops);
                 if (keep_d > 0) {
                     std::printf("  keep q0 %d/%d (%.1f%%)", keep_n, keep_d,
-                                100.0 * static_cast<double>(keep_n) /
-                                    static_cast<double>(keep_d));
+                                100.0 * static_cast<double>(keep_n) / static_cast<double>(keep_d));
                 }
                 std::printf("\n");
             }

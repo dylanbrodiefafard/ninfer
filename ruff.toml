@@ -1,0 +1,66 @@
+# Python lint and format policy for every project-owned Python file (tools, tests, eval).
+# The version is pinned in .pre-commit-config.yaml; see docs/maintainer/code-quality.md.
+line-length = 100
+target-version = "py311"
+extend-exclude = ["third_party"]
+
+[lint]
+# Rule families are chosen for the bug classes they catch, not for style coverage:
+# undefined names and dead bindings (F), late-binding closures and mutable defaults (B),
+# implicit string concatenation in literals (ISC), unchecked subprocess calls and loop-variable
+# rebinding (PLW), naive datetimes (DTZ), blanket suppressions (PGH), and builtin shadowing (A).
+select = [
+    "A",
+    "ARG",
+    "ASYNC",
+    "B",
+    "C4",
+    "DTZ",
+    "E",
+    "EXE",
+    "F",
+    "FURB",
+    "G",
+    "I",
+    "ISC",
+    "LOG",
+    "PGH",
+    "PIE",
+    "PLE",
+    "PLW",
+    "RUF",
+    "SIM",
+    "T10",
+    "UP",
+    "W",
+]
+ignore = [
+    # The formatter owns line length; the remaining long lines are strings and URLs.
+    "E501",
+    # Keyword arguments named after builtins (`format=`, `type=`) are part of tool CLIs and
+    # function signatures; shadowing a builtin inside one function body is not a defect class.
+    "A002",
+    # `dict(key=value)` is an accepted spelling of a literal.
+    "C408",
+    # Conflicts with the formatter (https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules).
+    "ISC001",
+]
+# Intentional non-ASCII content that RUF001-RUF003 would otherwise flag as lookalikes.
+allowed-confusables = [
+    # Typographic math in rendered reports and comments: minus sign, multiplication sign, sigma.
+    "−",
+    "×",
+    "σ",
+    # Fullwidth CJK punctuation in the Chinese benchmark prompt corpus.
+    "，",
+    "：",
+    "；",
+]
+
+[lint.per-file-ignores]
+# Pytest fixtures are injected by parameter name and are routinely unused in the body.
+"**/tests/**" = ["ARG"]
+"tests/**" = ["ARG"]
+
+[lint.isort]
+known-first-party = ["ninfer_eval"]

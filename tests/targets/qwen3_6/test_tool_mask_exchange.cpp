@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -15,11 +16,12 @@
 
 namespace {
 using namespace ninfer;
-namespace family = ninfer::targets::qwen3_6;
+namespace family        = ninfer::targets::qwen3_6;
 using FrontendResources = family::FrontendResources;
 
 std::string template_source() {
-    std::ifstream input(NINFER_SOURCE_DIR "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
+    std::ifstream input(NINFER_SOURCE_DIR
+                        "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
     if (!input) throw std::runtime_error("missing component template fixture");
     std::string source{std::istreambuf_iterator<char>(input), {}};
     if (!source.empty() && source.back() == '\n') source.pop_back();
@@ -45,19 +47,36 @@ nlohmann::json decoder_added(std::string content, bool special = false) {
 FrontendResources resources(const std::string& chat_template = template_source()) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
-    const nlohmann::json tokens = nlohmann::json::array(
-        {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
-         added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
-         added(14, "   \n"), added(15, "answer"),
-         added(16, "<tool_"), added(17, "call>"), added(18, "<function=f>"),
-         added(19, "</function>"), added(20, "</tool_call>"), added(21, "<tool_call>"),
-         added(22, "preface"), added(23, "call"), added(24, "a <"),
-         added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"), added(33, "system\n"),
-         added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
-         added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
-         added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
-         added(248068, "<think>"), added(248069, "</think>")});
-    result.tokenizer_json = nlohmann::json{
+    const nlohmann::json tokens = nlohmann::json::array({added(1, "helloST"),
+                                                         added(2, "OPtail"),
+                                                         added(3, "thought</thi"),
+                                                         added(4, "nk>\n\nanswer"),
+                                                         added(6, "<eos>", true),
+                                                         added(7, "<0.0 seconds>"),
+                                                         added(14, "   \n"),
+                                                         added(15, "answer"),
+                                                         added(16, "<tool_"),
+                                                         added(17, "call>"),
+                                                         added(18, "<function=f>"),
+                                                         added(19, "</function>"),
+                                                         added(20, "</tool_call>"),
+                                                         added(21, "<tool_call>"),
+                                                         added(22, "preface"),
+                                                         added(23, "call"),
+                                                         added(24, "a <"),
+                                                         added(30, "user\n"),
+                                                         added(31, "assistant\n"),
+                                                         added(32, "\n"),
+                                                         added(33, "system\n"),
+                                                         added(248045, "<|im_start|>", true),
+                                                         added(248046, "<|im_end|>", true),
+                                                         added(248053, "<|vision_start|>", true),
+                                                         added(248054, "<|vision_end|>", true),
+                                                         added(248056, "<|image_pad|>", true),
+                                                         added(248057, "<|video_pad|>", true),
+                                                         added(248068, "<think>"),
+                                                         added(248069, "</think>")});
+    result.tokenizer_json       = nlohmann::json{
         {"model",
          {{"type", "BPE"},
           {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
@@ -113,7 +132,7 @@ void require(bool value, const char* message) {
 }
 
 void run() {
-    auto owned = resources();
+    auto owned     = resources();
     auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
     // Rendered tool declarations are literal client text, so every printable ASCII
     // byte needs an ordinary byte-level vocabulary symbol.
@@ -122,12 +141,12 @@ void run() {
         const std::string symbol = byte_level_symbol(static_cast<std::uint8_t>(c));
         if (!vocab.contains(symbol)) { vocab[symbol] = 1000 + c; }
     }
-    owned.tokenizer_json = tokenizer.dump();
-    const auto frontend = family::FrontendTestAccess::create_component(owned, false);
+    owned.tokenizer_json    = tokenizer.dump();
+    const auto frontend     = family::FrontendTestAccess::create_component(owned, false);
     constexpr int width_max = 5;
-    constexpr int capacity = 6;
-    family::frontend_internal::Tokenizer encoder({owned.tokenizer_json,
-        owned.tokenizer_config_json, owned.generation_config_json});
+    constexpr int capacity  = 6;
+    family::frontend_internal::Tokenizer encoder(
+        {owned.tokenizer_json, owned.tokenizer_config_json, owned.generation_config_json});
     const auto prefix = encoder.encode("<tool_call>\n<function=f>\n<parameter=value>\n");
     std::array<family::OutputSession, capacity> sessions;
     for (int row = 0; row < capacity; ++row) {
@@ -137,11 +156,11 @@ void run() {
         user.parts.push_back(MessagePart{.kind = MessagePartKind::Text, .text = "x"});
         input.messages.push_back(std::move(user));
         input.options.enable_thinking = false;
-        auto tool = nlohmann::json::parse(
+        auto tool                     = nlohmann::json::parse(
             R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"value":{"type":"integer","enum":[1]}},"required":["value"],"additionalProperties":false}}})");
         tool["function"]["parameters"]["properties"]["value"]["enum"] = {row + 1};
         input.options.tool_jsons.push_back(tool.dump());
-        auto prompt = frontend.prepare(std::move(input));
+        auto prompt   = frontend.prepare(std::move(input));
         sessions[row] = frontend.make_output_session(prompt, {});
         require(sessions[row].has_tool_grammar(), "component tool grammar missing");
         (void)sessions[row].preview(prefix, 1024, FinishReason::OutputLimit);
@@ -150,23 +169,23 @@ void run() {
 
     DeviceContext device;
     constexpr int words = (family::kTokenDomain + 31) / 32;
-    DeviceArena arena(4 * 1024 * 1024);
-    auto masks = arena.alloc(DType::I32, {words, width_max, capacity});
-    auto sampling = arena.alloc(DType::I32, {int(sizeof(ops::SamplingConfig) / 4), capacity});
-    auto nodes = arena.alloc(DType::I32, {width_max, capacity, 2});
+    DeviceArena arena(std::size_t{4} * 1024 * 1024);
+    auto masks       = arena.alloc(DType::I32, {words, width_max, capacity});
+    auto sampling    = arena.alloc(DType::I32, {int(sizeof(ops::SamplingConfig) / 4), capacity});
+    auto nodes       = arena.alloc(DType::I32, {width_max, capacity, 2});
     auto ids_storage = arena.alloc(DType::I32, {width_max, capacity});
     auto parents_storage = arena.alloc(DType::I32, {width_max, capacity});
-    auto counts_storage = arena.alloc(DType::I32, {capacity});
-    auto updated_ids = arena.alloc(DType::I32, {width_max, capacity});
+    auto counts_storage  = arena.alloc(DType::I32, {capacity});
+    auto updated_ids     = arena.alloc(DType::I32, {width_max, capacity});
     auto updated_parents = arena.alloc(DType::I32, {width_max, capacity});
-    auto updated_counts = arena.alloc(DType::I32, {capacity});
+    auto updated_counts  = arena.alloc(DType::I32, {capacity});
     family::ToolMaskExchange exchange(masks, sampling, nodes);
     PinnedHostBuffer result_masks(masks.bytes()), result_sampling(sampling.bytes());
     std::array<const family::OutputSession*, capacity> outputs{};
     std::array<ops::SamplingConfig, capacity> configs{};
-    std::array<int, width_max * capacity> ids{}, parents{};
+    std::array<int, std::size_t{width_max} * capacity> ids{}, parents{};
     std::array<int, capacity> counts{};
-    std::vector<std::uint32_t> expected(width_max * words);
+    std::vector<std::uint32_t> expected(std::size_t{width_max} * words);
 
     for (int batch : {1, 2, 3, 4, 5, 6, 1}) {
         for (bool tree : {false, true}) {
@@ -178,13 +197,15 @@ void run() {
                 Tensor parent_view(parents_storage.data, DType::I32, {width, batch});
                 Tensor count_view(counts_storage.data, DType::I32, {batch});
                 auto body = [&] {
-                    const auto submission = exchange.enqueue(ids_view, tree ? &parent_view : nullptr,
-                                           count_view, device.stream, device.host_stream);
+                    const auto submission =
+                        exchange.enqueue(ids_view, tree ? &parent_view : nullptr, count_view,
+                                         device.stream, device.host_stream);
                     CUDA_CHECK(cudaStreamWaitEvent(device.stream, submission.ready, 0));
                     CUDA_CHECK(cudaMemcpyAsync(result_masks.data(), masks.data, masks.bytes(),
-                                                cudaMemcpyDeviceToHost, device.stream));
-                    CUDA_CHECK(cudaMemcpyAsync(result_sampling.data(), sampling.data, sampling.bytes(),
-                                                cudaMemcpyDeviceToHost, device.stream));
+                                               cudaMemcpyDeviceToHost, device.stream));
+                    CUDA_CHECK(cudaMemcpyAsync(result_sampling.data(), sampling.data,
+                                               sampling.bytes(), cudaMemcpyDeviceToHost,
+                                               device.stream));
                 };
                 DecodeGraphDefinition definition;
                 definition.capture(device.stream, body);
@@ -196,20 +217,21 @@ void run() {
                         // A new frontier profile can retain shape while moving
                         // workspace input panels. The executable must update all
                         // source addresses, not merely replay identical pointers.
-                        ids_view = Tensor(updated_ids.data, DType::I32, {width, batch});
+                        ids_view    = Tensor(updated_ids.data, DType::I32, {width, batch});
                         parent_view = Tensor(updated_parents.data, DType::I32, {width, batch});
-                        count_view = Tensor(updated_counts.data, DType::I32, {batch});
+                        count_view  = Tensor(updated_counts.data, DType::I32, {batch});
                         DecodeGraphDefinition updated;
                         updated.capture(device.stream, body);
                         graph.update(updated);
                     }
                     for (int row = 0; row < batch; ++row) {
-                        outputs[row] = ((row + replay) % 3 == 2) ? nullptr : &sessions[row];
+                        outputs[row]      = ((row + replay) % 3 == 2) ? nullptr : &sessions[row];
                         configs[row].seed = 100 + row + replay * 10;
-                        counts[row] = width - (replay % 2);
-                        const std::array<int, 5> tokens{0, 1000 + '1' + row, 32, 1000 + '<', 1000 + '/'};
+                        counts[row]       = width - (replay % 2);
+                        const std::array<int, 5> tokens{0, 1000 + '1' + row, 32, 1000 + '<',
+                                                        1000 + '/'};
                         for (int node = 0; node < width; ++node) {
-                            ids[row * width + node] = tokens[node];
+                            ids[row * width + node]     = tokens[node];
                             parents[row * width + node] = tree && node == 2 ? 0 : node - 1;
                         }
                         if (replay % 2) ids[row * width + 1] = 22; // prose branch
@@ -218,50 +240,74 @@ void run() {
                                   {configs.data(), std::size_t(batch)});
                     // Inputs are ordered on the launch stream: the DeviceContext streams are
                     // nonblocking, so legacy-stream uploads could race the overlap branch.
-                    CUDA_CHECK(cudaMemcpyAsync(ids_view.data, ids.data(), width * batch * sizeof(int), cudaMemcpyHostToDevice, device.stream));
-                    CUDA_CHECK(cudaMemcpyAsync(parent_view.data, parents.data(), width * batch * sizeof(int), cudaMemcpyHostToDevice, device.stream));
-                    CUDA_CHECK(cudaMemcpyAsync(count_view.data, counts.data(), batch * sizeof(int), cudaMemcpyHostToDevice, device.stream));
-                    if (replay == 0) body(); else graph.launch(device.stream);
+                    CUDA_CHECK(cudaMemcpyAsync(ids_view.data, ids.data(),
+                                               std::size_t(width) * batch * sizeof(int),
+                                               cudaMemcpyHostToDevice, device.stream));
+                    CUDA_CHECK(cudaMemcpyAsync(parent_view.data, parents.data(),
+                                               std::size_t(width) * batch * sizeof(int),
+                                               cudaMemcpyHostToDevice, device.stream));
+                    CUDA_CHECK(cudaMemcpyAsync(count_view.data, counts.data(), batch * sizeof(int),
+                                               cudaMemcpyHostToDevice, device.stream));
+                    if (replay == 0)
+                        body();
+                    else
+                        graph.launch(device.stream);
                     device.synchronize();
                     exchange.rethrow_error();
                     const auto* actual = static_cast<const std::uint32_t*>(result_masks.data());
-                    const auto* actual_config = static_cast<const ops::SamplingConfig*>(result_sampling.data());
+                    const auto* actual_config =
+                        static_cast<const ops::SamplingConfig*>(result_sampling.data());
                     for (int row = 0; row < batch; ++row) {
-                        require(actual_config[row].seed == configs[row].seed, "stale captured sampling binding");
+                        require(actual_config[row].seed == configs[row].seed,
+                                "stale captured sampling binding");
                         if (!outputs[row]) {
-                            require(actual_config[row].allowed_token_words == nullptr, "unconstrained row retained grammar");
+                            require(actual_config[row].allowed_token_words == nullptr,
+                                    "unconstrained row retained grammar");
                             continue;
                         }
                         std::vector<int> row_parents(counts[row]);
                         for (int node = 0; node < counts[row]; ++node)
                             row_parents[node] = tree ? parents[row * width + node] : node - 1;
-                        sessions[row].fill_tool_masks({ids.data() + row * width, std::size_t(counts[row])},
-                                                      row_parents, {expected.data(), std::size_t(counts[row] * words)});
+                        sessions[row].fill_tool_masks(
+                            {ids.data() + std::ptrdiff_t(row) * width, std::size_t(counts[row])},
+                            row_parents, {expected.data(), std::size_t(counts[row]) * words});
                         for (int other = 0; other < capacity; ++other) {
                             const int value_token = 1000 + '1' + other;
-                            const bool allowed = (expected[value_token / 32] >> (value_token % 32)) & 1U;
-                            require(allowed == (other == row), "row fixture does not distinguish its own enum value");
+                            const bool allowed =
+                                (expected[value_token / 32] >> (value_token % 32)) & 1U;
+                            require(allowed == (other == row),
+                                    "row fixture does not distinguish its own enum value");
                         }
-                        require(std::equal(expected.begin(), expected.begin() + counts[row] * words,
-                                           actual + row * width_max * words), "GPU mask differs from committed CPU grammar snapshot");
+                        require(std::equal(expected.begin(),
+                                           expected.begin() + std::ptrdiff_t(counts[row]) * words,
+                                           actual + std::ptrdiff_t(row) * width_max * words),
+                                "GPU mask differs from committed CPU grammar snapshot");
                         require(actual_config[row].allowed_token_words ==
-                                    static_cast<std::uint32_t*>(masks.data) + row * width_max * words,
+                                    static_cast<std::uint32_t*>(masks.data) +
+                                        std::ptrdiff_t(row) * width_max * words,
                                 "mask row pointer changed across graph replay");
-                        require(actual_config[row].allowed_token_column_stride == words, "invalid node mask stride");
+                        require(actual_config[row].allowed_token_column_stride == words,
+                                "invalid node mask stride");
                     }
                 }
                 outputs[0] = &sessions[0];
-                exchange.bind({outputs.data(), std::size_t(batch)}, {configs.data(), std::size_t(batch)});
+                exchange.bind({outputs.data(), std::size_t(batch)},
+                              {configs.data(), std::size_t(batch)});
                 counts[0] = 0; // callback failure must drain and surface on the owning thread
-                CUDA_CHECK(cudaMemcpyAsync(count_view.data, counts.data(), batch * sizeof(int), cudaMemcpyHostToDevice, device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(count_view.data, counts.data(), batch * sizeof(int),
+                                           cudaMemcpyHostToDevice, device.stream));
                 graph.launch(device.stream);
                 device.synchronize();
                 bool failed = false;
-                try { exchange.rethrow_error(); } catch (const std::logic_error&) { failed = true; }
+                try {
+                    exchange.rethrow_error();
+                } catch (const std::logic_error&) { failed = true; }
                 require(failed, "callback failure was lost");
-                const auto* actual_config = static_cast<const ops::SamplingConfig*>(result_sampling.data());
+                const auto* actual_config =
+                    static_cast<const ops::SamplingConfig*>(result_sampling.data());
                 for (int row = 0; row < batch; ++row)
-                    require(actual_config[row].allowed_token_words == nullptr, "callback failure left a constrained sampling domain");
+                    require(actual_config[row].allowed_token_words == nullptr,
+                            "callback failure left a constrained sampling domain");
             }
         }
     }
@@ -273,19 +319,18 @@ void run() {
         outputs[0] = &temporary;
         exchange.bind({outputs.data(), 4}, {configs.data(), 4});
         counts.fill(1);
-        CUDA_CHECK(cudaMemcpyAsync(counts_storage.data, counts.data(), 4 * sizeof(int), cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(counts_storage.data, counts.data(), 4 * sizeof(int),
+                                   cudaMemcpyHostToDevice, device.stream));
         Tensor fork_ids(ids_storage.data, DType::I32, {1, 4});
         Tensor fork_counts(counts_storage.data, DType::I32, {4});
         CUDA_CHECK(cudaMemsetAsync(masks.data, 0, masks.bytes(), device.stream));
         bool forked = false;
         try {
-            const auto submission = exchange.enqueue(fork_ids, nullptr, fork_counts,
-                                                       device.stream, device.host_stream);
+            const auto submission =
+                exchange.enqueue(fork_ids, nullptr, fork_counts, device.stream, device.host_stream);
             forked = submission.ready != nullptr;
             throw std::runtime_error("interrupted after mask fork");
-        } catch (const std::runtime_error&) {
-            device.synchronize_all();
-        }
+        } catch (const std::runtime_error&) { device.synchronize_all(); }
         require(forked, "partial enqueue fixture did not fork");
         exchange.rethrow_error();
         CUDA_CHECK(cudaMemcpy(result_masks.data(), masks.data, words * sizeof(std::uint32_t),
@@ -301,6 +346,11 @@ void run() {
 } // namespace
 
 int main() {
-    try { run(); std::cout << "tool mask exchange eager/capture C1..6 and partial-fork drain passed\n"; }
-    catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    try {
+        run();
+        std::cout << "tool mask exchange eager/capture C1..6 and partial-fork drain passed\n";
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }

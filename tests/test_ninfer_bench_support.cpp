@@ -158,14 +158,13 @@ int test_cli_contract() {
                 {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
         },
         "unsupported KV storage");
-    failures += expect(
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"})
-            .kv_cache == ninfer::KvCacheStorage::Nvfp4,
-        "NVFP4 KV");
-    failures += expect(
-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).kv_cache ==
-            ninfer::KvCacheStorage::Nvfp4,
-        "default KV is NVFP4");
+    failures +=
+        expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "nvfp4"})
+                       .kv_cache == ninfer::KvCacheStorage::Nvfp4,
+               "NVFP4 KV");
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).kv_cache ==
+                           ninfer::KvCacheStorage::Nvfp4,
+                       "default KV is NVFP4");
     failures += expect_u32(
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--concurrency", "2"})
             .concurrency,
@@ -195,7 +194,7 @@ int test_measurement_contract() {
         expect_u32(combined.requested_output_tokens(), 129, "combined begin plus G outputs");
     const ninfer::SpeculativeOptions none{};
     const ninfer::SpeculativeOptions mtp5{.backend      = ninfer::SpeculativeBackend::Mtp,
-                                         .draft_tokens = 5};
+                                          .draft_tokens = 5};
     failures += expect_u32(pp.required_context(none), 512, "pp context");
     failures += expect_u32(pp.required_context(mtp5), 522, "MTP pp context");
     failures += expect_u32(tg.required_context(none), 129, "tg context");
@@ -217,8 +216,8 @@ int test_measurement_contract() {
             (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), mtp5, true);
         },
         "undersized context");
-    failures += expect_u32(qb::concurrent_kv_capacity_tokens(50134, 2), 100352,
-                           "C=2 page-aligned Main KV");
+    failures +=
+        expect_u32(qb::concurrent_kv_capacity_tokens(50134, 2), 100352, "C=2 page-aligned Main KV");
     failures += expect_u32(qb::concurrent_kv_capacity_tokens(64, 1), 64, "exact page C=1");
     return failures;
 }
@@ -246,17 +245,15 @@ ninfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted
 std::vector<qb::TestResult> sample_results() {
     qb::TestResult pp;
     pp.test = {qb::TestKind::Prefill, 512, 0, "pp512"};
-    pp.reps = {
-        {timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.52},
-        {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.28}};
+    pp.reps = {{timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.52},
+               {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1, 0.28}};
     pp.workspace_peak_bytes           = 5ULL * 1024ULL * 1024ULL * 1024ULL;
     pp.workspace_allocator_peak_bytes = 4ULL * 1024ULL * 1024ULL;
 
     qb::TestResult tg;
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
-    tg.reps = {
-        {timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4, 0.62},
-        {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4, 1.13}};
+    tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4, 0.62},
+               {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4, 1.13}};
     tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
     tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
     return {std::move(pp), std::move(tg)};
@@ -362,18 +359,20 @@ int test_report_contract() {
     failures += expect_near(tg.at("decode_engine_tok_s_mean").get<double>(), 7.5,
                             "decode engine throughput");
 
-    qb::TestResult concurrent               = sample_results()[1];
-    concurrent.concurrency                  = 2;
-    const qb::Stats concurrent_output       = qb::compute_stats(qb::decode_output_tok_s_series(concurrent));
-    const qb::Stats concurrent_engine       = qb::compute_stats(qb::decode_engine_tok_s_series(concurrent));
+    qb::TestResult concurrent = sample_results()[1];
+    concurrent.concurrency    = 2;
+    const qb::Stats concurrent_output =
+        qb::compute_stats(qb::decode_output_tok_s_series(concurrent));
+    const qb::Stats concurrent_engine =
+        qb::compute_stats(qb::decode_engine_tok_s_series(concurrent));
     failures += expect_near(concurrent_output.mean, 9.0, "C=2 decode output throughput");
-    failures += expect_near(concurrent_engine.mean, 7.5, "C=2 decode engine throughput is not doubled");
+    failures +=
+        expect_near(concurrent_engine.mean, 7.5, "C=2 decode engine throughput is not doubled");
 
     qb::TestResult concurrent_pp = sample_results()[0];
     concurrent_pp.concurrency    = 2;
     for (qb::RepTiming& rep : concurrent_pp.reps) { rep.wave_seconds *= 2.0; }
-    const qb::Stats concurrent_prefill =
-        qb::compute_stats(qb::prefill_tok_s_series(concurrent_pp));
+    const qb::Stats concurrent_prefill = qb::compute_stats(qb::prefill_tok_s_series(concurrent_pp));
     const qb::Stats concurrent_prefill_active =
         qb::compute_stats(qb::prefill_active_tok_s_series(concurrent_pp));
     failures += expect_near(concurrent_prefill.mean, 1406.5934065934,

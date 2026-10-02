@@ -107,7 +107,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
-    auto& shared = w8_small_t_shared_storage<Schedule>();
+    auto& shared       = w8_small_t_shared_storage<Schedule>();
     auto& code_shared  = shared.staging.codes;
     auto& b_shared     = shared.staging.activations;
     auto& scale_shared = shared.staging.scales;

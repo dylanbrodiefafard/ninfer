@@ -11,11 +11,11 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -34,7 +34,6 @@ from . import draft_head
 from . import inventory_nvfp4 as inventory
 from . import recipe as base_recipe
 from . import recipe_nvfp4 as recipe
-
 
 RECIPE_ID = "qwen3_6_27b_nvfp4-v1"
 OUTPUT_BASENAME = "qwen3_6_27b_nvfp4.ninfer"
@@ -63,19 +62,14 @@ def _validate_index(model_dir: Path) -> None:
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"{index_path}: weight_map must be a nonempty object")
     if any(
-        not isinstance(name, str)
-        or not name
-        or not isinstance(shard, str)
-        or not shard
+        not isinstance(name, str) or not name or not isinstance(shard, str) or not shard
         for name, shard in weight_map.items()
     ):
         raise ValueError(f"{index_path}: invalid weight_map entry")
     referenced = set(weight_map.values())
     actual = {path.name for path in model_dir.glob("*.safetensors")}
     if actual != referenced:
-        raise ValueError(
-            f"{model_dir}: safetensors shard set does not match the index"
-        )
+        raise ValueError(f"{model_dir}: safetensors shard set does not match the index")
     for shard in sorted(referenced):
         path = model_dir / shard
         if not path.is_file() or path.stat().st_size == 0:
@@ -176,12 +170,8 @@ def preflight_conversion(
     nvfp4 = Path(nvfp4_model_dir)
     _validate_index(base)
     _validate_index(nvfp4)
-    base_summary = base_convert.validate_config(
-        family_conversion.load_json(base / "config.json")
-    )
-    nvfp4_summary = _validate_nvfp4_config(
-        family_conversion.load_json(nvfp4 / "config.json")
-    )
+    base_summary = base_convert.validate_config(family_conversion.load_json(base / "config.json"))
+    nvfp4_summary = _validate_nvfp4_config(family_conversion.load_json(nvfp4 / "config.json"))
     if base_summary != nvfp4_summary:
         raise ValueError("base and NVFP4 source model configs do not match")
     _validate_source_manifest(nvfp4)
@@ -218,9 +208,7 @@ def _encode_nvfp4_weight(
     selected = recipe.NVFP4_WEIGHTS_BY_NAME[spec.name]
     packed, scales, divisor = recipe.materialize_nvfp4_weight(selected, reader)
     payload = encode_nvfp4(packed, scales, divisor, spec.shape)
-    decoded_packed, decoded_scales, decoded_divisor = decode_nvfp4_words(
-        payload, spec.shape
-    )
+    decoded_packed, decoded_scales, decoded_divisor = decode_nvfp4_words(payload, spec.shape)
     if (
         not torch.equal(decoded_packed, packed)
         or not torch.equal(decoded_scales, scales)
@@ -231,9 +219,7 @@ def _encode_nvfp4_weight(
 
 
 def _is_fused_text_attention_parent(name: str) -> bool:
-    return name.startswith("text/layers/") and name.endswith(
-        "/attention/query_key_gate_value"
-    )
+    return name.startswith("text/layers/") and name.endswith("/attention/query_key_gate_value")
 
 
 def _materialize_base_tensor(
@@ -247,8 +233,9 @@ def _materialize_base_tensor(
         draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT,
     ):
         derived = {
-            draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT:
-            draft_head.materialize_draft_head_token_ids(draft)
+            draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_head.materialize_draft_head_token_ids(
+                draft
+            )
         }
     if _is_fused_text_attention_parent(spec.name):
         prefix = spec.name.removesuffix("query_key_gate_value")
@@ -272,9 +259,7 @@ def _materialize_base_tensor(
             derived,
         )
     if tuple(tensor.shape) != spec.shape:
-        raise ValueError(
-            f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"
-        )
+        raise ValueError(f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}")
     return tensor
 
 
@@ -346,9 +331,7 @@ def convert(
     started = time.perf_counter()
     output = Path(out_path)
     if output.name != OUTPUT_BASENAME:
-        raise ValueError(
-            f"NVFP4 converter output basename must be {OUTPUT_BASENAME!r}"
-        )
+        raise ValueError(f"NVFP4 converter output basename must be {OUTPUT_BASENAME!r}")
     requested_device = str(device)
     resolved_device = pick_device(device)
     preflight = preflight_conversion(model_dir, nvfp4_model_dir)
@@ -361,43 +344,38 @@ def convert(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    with ShardReader(preflight.base_dir) as base_reader, ShardReader(
-        preflight.nvfp4_dir
-    ) as nvfp4_reader:
-        with ArtifactWriter(
+    with (
+        ShardReader(preflight.base_dir) as base_reader,
+        ShardReader(preflight.nvfp4_dir) as nvfp4_reader,
+        ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
-        ) as writer:
-            if writer.objects != preflight.object_plan.objects:
-                raise RuntimeError(
-                    "writer object plan differs from completed preflight"
+        ) as writer,
+    ):
+        if writer.objects != preflight.object_plan.objects:
+            raise RuntimeError("writer object plan differs from completed preflight")
+        for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            if isinstance(spec, inventory.ResourceSpec):
+                payload = resources[spec.name]
+            elif spec.format == inventory.NVFP4:
+                payload = _encode_nvfp4_weight(spec, nvfp4_reader)
+            elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
+                scalar = recipe.materialize_input_divisor(
+                    recipe.INPUT_DIVISORS_BY_NAME[spec.name],
+                    nvfp4_reader,
                 )
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
-                if isinstance(spec, inventory.ResourceSpec):
-                    payload = resources[spec.name]
-                elif spec.format == inventory.NVFP4:
-                    payload = _encode_nvfp4_weight(spec, nvfp4_reader)
-                elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
-                    scalar = recipe.materialize_input_divisor(
-                        recipe.INPUT_DIVISORS_BY_NAME[spec.name],
-                        nvfp4_reader,
-                    )
-                    payload = encode_direct(scalar, inventory.FP32)
-                else:
-                    tensor = _materialize_base_tensor(
-                        spec, base_reader, preflight.draft
-                    )
-                    payload = family_conversion.encode_tensor_payload(
-                        tensor, spec, resolved_device
-                    )
-                    del tensor
-                writer.write(spec.name, payload)
-                del payload
-                print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
-                    flush=True,
-                )
+                payload = encode_direct(scalar, inventory.FP32)
+            else:
+                tensor = _materialize_base_tensor(spec, base_reader, preflight.draft)
+                payload = family_conversion.encode_tensor_payload(tensor, spec, resolved_device)
+                del tensor
+            writer.write(spec.name, payload)
+            del payload
+            print(
+                f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
+                flush=True,
+            )
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size

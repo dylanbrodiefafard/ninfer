@@ -2,7 +2,7 @@
 //
 // Examples:
 //   ./build/bench/ninfer_gdn_gating_proj_bench --35b --candidate auto
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b \
+//   ./build/bench/ninfer_gdn_gating_proj_bench --35b
 //     --candidate mma-split16 -p 128,512,1024
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -75,14 +75,14 @@ Weight bf16_weight(const void* data, std::int32_t rows, std::int32_t hidden) {
 Weight bf16_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
     const std::size_t row_bytes = static_cast<std::size_t>(parent.k) * sizeof(std::uint16_t);
     const auto* data            = static_cast<const std::uint8_t*>(parent.qdata) +
-                       static_cast<std::size_t>(row_begin) * row_bytes;
-    Weight view          = parent;
-    view.payload         = data;
-    view.payload_bytes   = static_cast<std::uint64_t>(rows) * row_bytes;
-    view.qdata           = data;
-    view.shape[0]        = rows;
-    view.padded_shape[0] = rows;
-    view.n               = rows;
+                                  static_cast<std::size_t>(row_begin) * row_bytes;
+    Weight view                 = parent;
+    view.payload                = data;
+    view.payload_bytes          = static_cast<std::uint64_t>(rows) * row_bytes;
+    view.qdata                  = data;
+    view.shape[0]               = rows;
+    view.padded_shape[0]        = rows;
+    view.n                      = rows;
     return view;
 }
 
@@ -139,13 +139,13 @@ Options parse_args(int argc, char** argv) {
                 opt.candidate = parse_candidate(raw);
             }
         } else if (!std::strcmp(argv[i], "--packed-width")) {
-            opt.packed_width = std::atoi(next("packed-width"));
+            opt.packed_width = parse_number<int>(next("packed-width"), "--packed-width");
         } else if (!std::strcmp(argv[i], "-p") || !std::strcmp(argv[i], "--tokens")) {
             opt.tokens = parse_tokens(next("tokens"));
         } else if (!std::strcmp(argv[i], "--warmup")) {
-            opt.warmup = std::atoi(next("warmup"));
+            opt.warmup = parse_number<int>(next("warmup"), "--warmup");
         } else if (!std::strcmp(argv[i], "--repeat")) {
-            opt.repeat = std::atoi(next("repeat"));
+            opt.repeat = parse_number<int>(next("repeat"), "--repeat");
         } else if (!std::strcmp(argv[i], "--flush-mib")) {
             const long mib = std::strtol(next("flush-mib"), nullptr, 10);
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
@@ -175,8 +175,7 @@ Options parse_args(int argc, char** argv) {
     }
     if (opt.packed_width != 0 &&
         (!opt.norm_control || opt.geometry35 || !opt.auto_route || opt.packed_width < 1)) {
-        throw std::invalid_argument(
-            "--packed-width requires 27B --norm-control --candidate auto");
+        throw std::invalid_argument("--packed-width requires 27B --norm-control --candidate auto");
     }
     if (!opt.norm_control && opt.composed_norm_control) {
         throw std::invalid_argument("--candidate composed requires --norm-control");
@@ -223,14 +222,12 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
     const auto plan = [&] {
-        if (opt.packed_width != 0 &&
-            ops::detail::bf16_gdn_gating_packed_aggregates(opt.packed_width,
-                                                           tokens / opt.packed_width)) {
+        if (opt.packed_width != 0 && ops::detail::bf16_gdn_gating_packed_aggregates(
+                                         opt.packed_width, tokens / opt.packed_width)) {
             return ops::detail::bf16_gdn_gating_resolve_packed_plan(problem);
         }
         if (opt.packed_width != 0) {
-            return ops::detail::bf16_gdn_gating_resolve_plan(
-                {heads, hidden, opt.packed_width});
+            return ops::detail::bf16_gdn_gating_resolve_plan({heads, hidden, opt.packed_width});
         }
         return opt.auto_route || opt.composed_norm_control
                    ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
@@ -241,9 +238,9 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
         if (opt.norm_control && opt.packed_width != 0) {
-            ops::gdn_norm_gating_proj_packed_sequences(
-                tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log, tdt_bias, ws, th, tg, tbeta, stream,
-                opt.packed_width);
+            ops::gdn_norm_gating_proj_packed_sequences(tx, tnorm_weight, 1.0e-6F, wa, wb, tA_log,
+                                                       tdt_bias, ws, th, tg, tbeta, stream,
+                                                       opt.packed_width);
         } else if (opt.norm_control && opt.composed_norm_control) {
             ops::rmsnorm(tx, tnorm_weight, 1.0e-6F, true, th, stream);
             if (opt.geometry35) {
@@ -276,14 +273,22 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const double useful_flops =
         2.0 * 2.0 * static_cast<double>(heads) * hidden * static_cast<double>(tokens);
     const bool mma = plan.token_variant != ops::detail::Bf16GdnGatingTokenVariant::None;
-    const bool aggregate = opt.packed_width != 0 &&
+    const bool aggregate =
+        opt.packed_width != 0 &&
         ops::detail::bf16_gdn_gating_packed_aggregates(opt.packed_width, tokens / opt.packed_width);
     const int panel_cols = opt.packed_width != 0 && !aggregate ? opt.packed_width : tokens;
-    const bool narrow = plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40;
-    const int mma_tile = narrow ? (panel_cols <= 8 ? 8 : panel_cols <= 16 ? 16 : panel_cols <= 32 ? 32 : 48)
+    const bool narrow =
+        plan.schedule == ops::detail::Bf16GdnGatingScheduleId::MmaCooperativeSplit40;
+    const int mma_tile = narrow ? (panel_cols <= 8    ? 8
+                                   : panel_cols <= 16 ? 16
+                                   : panel_cols <= 32 ? 32
+                                                      : 48)
                                 : (opt.geometry35 ? 64 : 128);
-    const double executed_cols = !mma ? tokens :
-        static_cast<double>(tokens / panel_cols) * ((panel_cols + mma_tile - 1) / mma_tile) * mma_tile;
+    // tokens is a whole number of panels; each panel executes its columns rounded up to the tile.
+    const int panels      = tokens / panel_cols;
+    const int panel_tiles = (panel_cols + mma_tile - 1) / mma_tile;
+    const double executed_cols =
+        !mma ? tokens : static_cast<double>(panels) * panel_tiles * mma_tile;
     const double executed_flops  = 2.0 * 2.0 * static_cast<double>(heads) * hidden * executed_cols;
     const double useful_tflops   = useful_flops / sec / 1e12;
     const double executed_tflops = executed_flops / sec / 1e12;
@@ -296,9 +301,8 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
     const double useful_gbs = useful_bytes / sec / 1e9;
 
     const char* route =
-        opt.packed_width != 0
-            ? "gdn_norm_gating_proj.bf16.packed_sequences"
-            : opt.norm_control
+        opt.packed_width != 0 ? "gdn_norm_gating_proj.bf16.packed_sequences"
+        : opt.norm_control
             ? (opt.composed_norm_control
                    ? "gdn_norm_gating_proj.bf16.composed_control"
                    : ops::detail::bf16_gdn_norm_gating_schedule_name(norm_plan.schedule))
@@ -307,7 +311,7 @@ bool run(const Options& opt, std::int32_t tokens, std::size_t interval_capacity,
         opt.packed_width != 0
             ? interval_capacity
             : (opt.norm_control && !opt.composed_norm_control ? norm_plan.workspace_bytes
-                                                               : plan.workspace_bytes);
+                                                              : plan.workspace_bytes);
 
     std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n", opt.geometry35 ? "35b" : "27b",
                 opt.norm_control ? "norm_control" : "control", tokens, route, timing.median_us,

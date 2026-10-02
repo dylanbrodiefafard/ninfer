@@ -56,12 +56,12 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
                     int xattn_min_len, float rank_us, float mma_us) {
     std::int32_t base_pos = 0;
     CUDA_CHECK(cudaMemcpy(&base_pos, positions.data, sizeof(base_pos), cudaMemcpyDeviceToHost));
-    const int q_heads    = scratch.q_heads;
-    const int n_br       = scratch.n_br;
-    const int n_kb_cap   = scratch.n_kb;
-    const int n_slots    = q_heads * n_br;
-    const int max_abs    = base_pos + tokens - 1;
-    const bool identity  = (max_abs + 1) <= xattn_min_len;
+    const int q_heads   = scratch.q_heads;
+    const int n_br      = scratch.n_br;
+    const int n_kb_cap  = scratch.n_kb;
+    const int n_slots   = q_heads * n_br;
+    const int max_abs   = base_pos + tokens - 1;
+    const bool identity = (max_abs + 1) <= xattn_min_len;
     std::vector<int> counts(static_cast<std::size_t>(n_slots));
     CUDA_CHECK(cudaMemcpy(counts.data(), scratch.count, counts.size() * sizeof(int),
                           cudaMemcpyDeviceToHost));
@@ -73,15 +73,15 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
     int ident_n     = 0;
     int denom_n     = 0;
     for (int br = 0; br < n_br; ++br) {
-        const int q0         = br * kGqaPrefillNvfp4Br;
+        const int q0 = br * kGqaPrefillNvfp4Br;
         if (q0 >= tokens) { continue; }
         const int tile_rows  = std::min(kGqaPrefillNvfp4Br, tokens - q0);
         const int key_blocks = std::min(kGqaPrefillNvfp4RankTiles,
                                         (base_pos + q0 + tile_rows - 1) / kGqaPrefillNvfp4Bc + 1);
         if (key_blocks <= 0) { continue; }
         for (int h = 0; h < q_heads; ++h) {
-            const int n = std::min(std::max(counts[static_cast<std::size_t>(h * n_br + br)], 0),
-                                   key_blocks);
+            const int n =
+                std::min(std::max(counts[static_cast<std::size_t>(h * n_br + br)], 0), key_blocks);
             const int pct = (n * 100) / key_blocks;
             keep_sum += pct;
             keep_min = std::min(keep_min, pct);
@@ -99,20 +99,21 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
             break;
         }
     }
-    const int inspect = last_br; // head 0
-    const int q0      = inspect * kGqaPrefillNvfp4Br;
-    const int tile_rows =
-        std::min(kGqaPrefillNvfp4Br, std::max(0, tokens - q0));
-    const int key_blocks = std::min(kGqaPrefillNvfp4RankTiles,
-                                    (base_pos + q0 + std::max(tile_rows, 1) - 1) / kGqaPrefillNvfp4Bc + 1);
-    const int nkeep      = (inspect < n_br) ? std::min(std::max(counts[static_cast<std::size_t>(inspect)], 0),
-                                                  key_blocks)
-                                           : 0;
+    const int inspect   = last_br; // head 0
+    const int q0        = inspect * kGqaPrefillNvfp4Br;
+    const int tile_rows = std::min(kGqaPrefillNvfp4Br, std::max(0, tokens - q0));
+    const int key_blocks =
+        std::min(kGqaPrefillNvfp4RankTiles,
+                 (base_pos + q0 + std::max(tile_rows, 1) - 1) / kGqaPrefillNvfp4Bc + 1);
+    const int nkeep =
+        (inspect < n_br)
+            ? std::min(std::max(counts[static_cast<std::size_t>(inspect)], 0), key_blocks)
+            : 0;
     std::vector<std::uint16_t> keep(static_cast<std::size_t>(std::max(nkeep, 1)));
     if (nkeep > 0) {
-        CUDA_CHECK(cudaMemcpy(keep.data(), scratch.keep + static_cast<std::int64_t>(inspect) * n_kb_cap,
-                              static_cast<std::size_t>(nkeep) * sizeof(std::uint16_t),
-                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(
+            keep.data(), scratch.keep + static_cast<std::int64_t>(inspect) * n_kb_cap,
+            static_cast<std::size_t>(nkeep) * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
         bool ident = nkeep == key_blocks;
         for (int i = 0; ident && i < nkeep; ++i) {
             ident = keep[static_cast<std::size_t>(i)] == static_cast<std::uint16_t>(i);
@@ -120,14 +121,14 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
         ident_n = ident ? 1 : 0;
     }
 
-    float top1 = 0.0f;
+    float top1        = 0.0f;
     const int br_last = last_br;
-    const int kb_lim = std::min(n_kb_cap, std::max(1, max_abs / kGqaPrefillNvfp4Bc + 1));
+    const int kb_lim  = std::min(n_kb_cap, std::max(1, max_abs / kGqaPrefillNvfp4Bc + 1));
     if (!identity && kb_lim > 0 && scratch.mass != nullptr) {
         std::vector<float> mass(static_cast<std::size_t>(kb_lim));
         const int mass_off = (0 * scratch.n_br + br_last) * n_kb_cap;
-        CUDA_CHECK(cudaMemcpy(mass.data(), scratch.mass + mass_off,
-                              mass.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(mass.data(), scratch.mass + mass_off, mass.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
         float z = 0.0f;
         float m = 0.0f;
         for (float x : mass) {
@@ -139,12 +140,13 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
 
     const double keep_mean = denom_n > 0 ? keep_sum / static_cast<double>(denom_n) : 0.0;
     const double full_pct  = denom_n > 0 ? 100.0 * full_n / static_cast<double>(denom_n) : 0.0;
-    std::fprintf(stderr,
-                 "[xattn] pos=%d T=%d kb=%d ident=%d keep%% mean/min/max=%.1f/%d/%d full_slots=%.0f%% "
-                 "h0_last %d/%d%s top1=%.3f rank=%.1fus mma=%.1fus\n",
-                 base_pos, tokens, kb_lim, identity ? 1 : 0, keep_mean, keep_min == 1000 ? 0 : keep_min,
-                 keep_max, full_pct, nkeep, key_blocks, ident_n ? " consecutive" : "", top1, rank_us,
-                 mma_us);
+    std::fprintf(
+        stderr,
+        "[xattn] pos=%d T=%d kb=%d ident=%d keep%% mean/min/max=%.1f/%d/%d full_slots=%.0f%% "
+        "h0_last %d/%d%s top1=%.3f rank=%.1fus mma=%.1fus\n",
+        base_pos, tokens, kb_lim, identity ? 1 : 0, keep_mean, keep_min == 1000 ? 0 : keep_min,
+        keep_max, full_pct, nkeep, key_blocks, ident_n ? " consecutive" : "", top1, rank_us,
+        mma_us);
     (void)slot;
 }
 
@@ -152,10 +154,10 @@ void xattn_log_keep(const GqaXattnScratchView& scratch, const Tensor& positions,
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                          const CacheView& cache, Metadata metadata, Tensor& out,
-                                          cudaStream_t stream, float keep_frac, float xattn_tau,
-                                          std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
-                                          void* xattn_scratch, GqaExecutionEnvelope envelope) {
+                                         const CacheView& cache, Metadata metadata, Tensor& out,
+                                         cudaStream_t stream, float keep_frac, float xattn_tau,
+                                         std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
+                                         void* xattn_scratch, GqaExecutionEnvelope envelope) {
     const Tensor& cache_k       = cache.k_pages;
     const Tensor& cache_v       = cache.v_pages;
     const Tensor& cache_k_scale = cache.k_scale_pages;
@@ -186,12 +188,11 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
         const int q_heads  = Geometry::QHeads;
         const int kv_heads = Geometry::KVHeads;
         const int n_br     = div_up(tokens, kGqaPrefillNvfp4Br);
-        const int n_kb =
-            gqa_xattn_n_kb(gqa_xattn_logical_pages(cache), envelope.max_visible_keys);
+        const int n_kb = gqa_xattn_n_kb(gqa_xattn_logical_pages(cache), envelope.max_visible_keys);
         const int score_smem = gqa_xattn_score_smem_bytes();
-        static const cudaError_t score_attr = cudaFuncSetAttribute(
-            gqa_xattn_score_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, score_smem);
+        static const cudaError_t score_attr =
+            cudaFuncSetAttribute(gqa_xattn_score_kernel<Geometry, Metadata>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, score_smem);
         CUDA_CHECK(score_attr);
         static const cudaError_t finish_attr = cudaFuncSetAttribute(
             gqa_xattn_finish_kernel<Geometry, Metadata>,
@@ -200,21 +201,20 @@ void gqa_sparse_prefill_attention_launch(const Tensor& q, const Tensor& position
 
         const std::size_t bytes = gqa_xattn_scratch_bytes(q_heads, kv_heads, n_br, n_kb);
         void* scratch_mem = xattn_scratch != nullptr ? xattn_scratch : xattn_ensure_scratch(bytes);
-        scratch = gqa_xattn_bind_scratch(scratch_mem, q_heads, kv_heads, n_br, n_kb);
+        scratch           = gqa_xattn_bind_scratch(scratch_mem, q_heads, kv_heads, n_br, n_kb);
 
         const dim3 pack_grid(static_cast<unsigned>(kv_heads), static_cast<unsigned>(n_kb), 1u);
-        gqa_xattn_pack_kernel<Geometry, Metadata>
-            <<<pack_grid, kXAttnPackThreads, 0, stream>>>(
-                static_cast<const std::uint8_t*>(cache_k.data),
-                static_cast<const std::uint8_t*>(cache_k_scale.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), tokens, xattn_min_len, n_kb,
-                scratch.n_j, scratch.packed);
+        gqa_xattn_pack_kernel<Geometry, Metadata><<<pack_grid, kXAttnPackThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(cache_k.data),
+            static_cast<const std::uint8_t*>(cache_k_scale.data), metadata,
+            static_cast<const std::int32_t*>(positions.data), tokens, xattn_min_len, n_kb,
+            scratch.n_j, scratch.packed);
         CUDA_CHECK(cudaGetLastError());
 
-        const dim3 score_grid(static_cast<unsigned>(q_heads),
-                              static_cast<unsigned>(div_up(n_br, kXAttnScoreBrPerCta)),
-                              static_cast<unsigned>(std::max(1, (scratch.n_j + kXAttnScoreBN - 1) /
-                                                                   kXAttnScoreBN)));
+        const dim3 score_grid(
+            static_cast<unsigned>(q_heads),
+            static_cast<unsigned>(div_up(n_br, kXAttnScoreBrPerCta)),
+            static_cast<unsigned>(std::max(1, (scratch.n_j + kXAttnScoreBN - 1) / kXAttnScoreBN)));
         gqa_xattn_score_kernel<Geometry, Metadata>
             <<<score_grid, kXAttnScoreThreads, static_cast<std::size_t>(score_smem), stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), scratch.packed, metadata,

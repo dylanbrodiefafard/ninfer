@@ -42,16 +42,12 @@ class ConfigTest(unittest.TestCase):
             config = load_config(self.write(text.format(runs_dir=root / "runs"), root))
             self.assertEqual(config.target("api").max_concurrency, 2)
             self.assertEqual(config.suite("test").jobs[0].backend, "mock")
-            self.assertTrue(
-                config.suite("test").jobs[0].generation["parallel_tool_calls"]
-            )
+            self.assertTrue(config.suite("test").jobs[0].generation["parallel_tool_calls"])
 
     def test_rejects_literal_api_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            text = BASE.replace(
-                "max_concurrency: 2", "max_concurrency: 2\n    api_key: secret"
-            )
+            text = BASE.replace("max_concurrency: 2", "max_concurrency: 2\n    api_key: secret")
             with self.assertRaisesRegex(ConfigError, "unknown field.*api_key"):
                 load_config(self.write(text.format(runs_dir=root / "runs"), root))
 
@@ -68,9 +64,7 @@ class ConfigTest(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "TEST_EVAL_KEY"):
                     resolve_target(config.target("api"))
                 os.environ["TEST_EVAL_KEY"] = "sensitive-value"
-                self.assertEqual(
-                    resolve_target(config.target("api")).api_key, "sensitive-value"
-                )
+                self.assertEqual(resolve_target(config.target("api")).api_key, "sensitive-value")
             finally:
                 os.environ.pop("TEST_EVAL_KEY", None)
                 if old is not None:

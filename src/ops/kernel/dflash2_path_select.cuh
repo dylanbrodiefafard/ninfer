@@ -13,20 +13,20 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kDflash2PathSelectBlock     = 256;
-inline constexpr int kDflash2PathSelectK         = 16;
-inline constexpr int kDflash2PathSelectRank      = 256;
-inline constexpr int kDflash2PathSelectSuccStride  = kDflash2PathSelectRank + 2;
-inline constexpr int kDflash2PathSelectGemmBlock = 256;
+inline constexpr int kDflash2PathSelectBlock            = 256;
+inline constexpr int kDflash2PathSelectK                = 16;
+inline constexpr int kDflash2PathSelectRank             = 256;
+inline constexpr int kDflash2PathSelectSuccStride       = kDflash2PathSelectRank + 2;
+inline constexpr int kDflash2PathSelectGemmBlock        = 256;
 inline constexpr int kDflash2PathSelectRngPurposeDevice = 16;
-inline constexpr int kDflash2PathSelectTopkSplits = 32;
-inline constexpr int kDflash2PathSelectMaxBatchDevice = 8;
+inline constexpr int kDflash2PathSelectTopkSplits       = 32;
+inline constexpr int kDflash2PathSelectMaxBatchDevice   = 8;
 
 struct Dflash2CodebookDevice {
-    const __nv_bfloat16* bf16          = nullptr;
-    const std::uint8_t* nvfp4_codes    = nullptr;
-    const std::uint8_t* nvfp4_scales   = nullptr;
-    float inv_dw                       = 0.0f;
+    const __nv_bfloat16* bf16        = nullptr;
+    const std::uint8_t* nvfp4_codes  = nullptr;
+    const std::uint8_t* nvfp4_scales = nullptr;
+    float inv_dw                     = 0.0f;
 };
 
 __device__ __forceinline__ float dflash2_e2m1_value(std::uint8_t code) {
@@ -35,24 +35,24 @@ __device__ __forceinline__ float dflash2_e2m1_value(std::uint8_t code) {
     return (code & 8u) ? -mag : mag;
 }
 
-__device__ __forceinline__ __nv_bfloat16 dflash2_codebook_load(Dflash2CodebookDevice book, int token,
-                                                              int rank) {
+__device__ __forceinline__ __nv_bfloat16 dflash2_codebook_load(Dflash2CodebookDevice book,
+                                                               int token, int rank) {
     if (token < 0) { token = 0; }
     if (book.bf16 != nullptr) {
         return book.bf16[static_cast<std::int64_t>(token) * kDflash2PathSelectRank + rank];
     }
     constexpr int kTiles = kDflash2PathSelectRank / 64;
     const std::uint8_t packed =
-        book.nvfp4_codes[static_cast<std::int64_t>(token) * (kDflash2PathSelectRank / 2) + rank / 2];
-    const std::uint8_t nibble =
-        (rank & 1) != 0 ? static_cast<std::uint8_t>(packed >> 4) : static_cast<std::uint8_t>(packed & 0x0f);
-    const int group      = rank / 16;
-    const int m_tile     = token / 128;
-    const int row_inner  = token - m_tile * 128;
-    const std::int64_t scale_off =
-        static_cast<std::int64_t>(m_tile * kTiles + group / 4) * 512 +
-        static_cast<std::int64_t>(row_inner & 31) * 16 + static_cast<std::int64_t>(row_inner >> 5) * 4 +
-        (group & 3);
+        book.nvfp4_codes[static_cast<std::int64_t>(token) * (kDflash2PathSelectRank / 2) +
+                         rank / 2];
+    const std::uint8_t nibble    = (rank & 1) != 0 ? static_cast<std::uint8_t>(packed >> 4)
+                                                   : static_cast<std::uint8_t>(packed & 0x0f);
+    const int group              = rank / 16;
+    const int m_tile             = token / 128;
+    const int row_inner          = token - m_tile * 128;
+    const std::int64_t scale_off = static_cast<std::int64_t>(m_tile * kTiles + group / 4) * 512 +
+                                   static_cast<std::int64_t>(row_inner & 31) * 16 +
+                                   static_cast<std::int64_t>(row_inner >> 5) * 4 + (group & 3);
     const float value = dflash2_e2m1_value(nibble) *
                         detail::decode_nvfp4_e4m3(book.nvfp4_scales[scale_off]) * book.inv_dw;
     return __float2bfloat16_rn(value);
@@ -91,8 +91,7 @@ __global__ void dflash2_path_select_bf16_gemv_kernel(const __nv_bfloat16* x,
     }
 }
 
-__device__ __forceinline__ unsigned long long dflash2_path_select_splitmix64(
-    unsigned long long x) {
+__device__ __forceinline__ unsigned long long dflash2_path_select_splitmix64(unsigned long long x) {
     x += 0x9E3779B97F4A7C15ull;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
@@ -100,7 +99,7 @@ __device__ __forceinline__ unsigned long long dflash2_path_select_splitmix64(
 }
 
 __device__ __forceinline__ float dflash2_path_select_uniform(unsigned long long seed, int position,
-                                                              int purpose, unsigned int hop) {
+                                                             int purpose, unsigned int hop) {
     unsigned long long key = seed;
     key                    = dflash2_path_select_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
@@ -133,7 +132,7 @@ __device__ __forceinline__ void dflash2_insert_topk(float* vals, int* idxs, int 
     idxs[pos] = index;
 }
 
-__device__ __forceinline__ std::int64_t dflash2_column_index(int batch, int tokens, int t, int b) {
+__device__ __forceinline__ std::int64_t dflash2_column_index(int tokens, int t, int b) {
     return static_cast<std::int64_t>(b) * tokens + t;
 }
 
@@ -160,7 +159,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     }
     if (v0 < v1) {
         const std::int64_t logit_col =
-            dflash2_column_index(batch, tokens, t, b) * static_cast<std::int64_t>(vocab);
+            dflash2_column_index(tokens, t, b) * static_cast<std::int64_t>(vocab);
         // The optimized production shortlist leaves at most 16 rows per thread in each
         // split. Keep those rows unsorted and select the split's ranks cooperatively below;
         // sorting every thread's private list costs more than the vocabulary scan.
@@ -265,7 +264,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                                 warp_idx[p]);
         }
         const std::int64_t out =
-            (dflash2_column_index(batch, tokens, t, b) * kDflash2PathSelectTopkSplits + split) *
+            (dflash2_column_index(tokens, t, b) * kDflash2PathSelectTopkSplits + split) *
             kDflash2PathSelectK;
         for (int j = 0; j < kDflash2PathSelectK; ++j) {
             split_val[out + j] = merged_val[j];
@@ -284,7 +283,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     const int tid = static_cast<int>(threadIdx.x);
     if (t >= tokens || b >= batch) { return; }
 
-    const std::int64_t column = dflash2_column_index(batch, tokens, t, b);
+    const std::int64_t column = dflash2_column_index(tokens, t, b);
     const std::int64_t src    = column * kDflash2PathSelectTopkSplits * kDflash2PathSelectK;
     constexpr int kCandidates = kDflash2PathSelectTopkSplits * kDflash2PathSelectK;
     constexpr int kPerThread  = kCandidates / kDflash2PathSelectBlock;
@@ -359,9 +358,9 @@ __device__ __forceinline__ float dflash2_markov_score_serial(const __nv_bfloat16
 }
 
 __device__ __forceinline__ float dflash2_markov_score_staged(const float* hidden,
-                                                            const __nv_bfloat16* pred,
-                                                            const __nv_bfloat16* succ,
-                                                            float unary) {
+                                                             const __nv_bfloat16* pred,
+                                                             const __nv_bfloat16* succ,
+                                                             float unary) {
     float acc = unary;
     for (int r = 0; r < kDflash2PathSelectRank; ++r) {
         const float pr = __bfloat162float(pred[r]);
@@ -371,16 +370,13 @@ __device__ __forceinline__ float dflash2_markov_score_staged(const float* hidden
     return acc;
 }
 
-__launch_bounds__(kDflash2PathSelectBlock) __global__
-    void dflash2_path_select_kernel(const float* cand_val, const int* cand_idx,
-                                    const __nv_bfloat16* hidden_proj, Dflash2CodebookDevice pred_code,
-                                    Dflash2CodebookDevice succ_code, const std::int32_t* anchors,
-                                     const std::int32_t* logical_positions, std::int32_t* path,
-                                     std::int32_t* selector_ids, float* selector_q,
-                                    std::int32_t tokens, std::int32_t batch,
-                                    const SamplingConfig* configs, unsigned long long seed_xor,
-                                    std::int32_t position_offset, bool force_greedy,
-                                    float p_less_draft_temperature_scale) {
+__launch_bounds__(kDflash2PathSelectBlock) __global__ void dflash2_path_select_kernel(
+    const float* cand_val, const int* cand_idx, const __nv_bfloat16* hidden_proj,
+    Dflash2CodebookDevice pred_code, Dflash2CodebookDevice succ_code, const std::int32_t* anchors,
+    const std::int32_t* logical_positions, std::int32_t* path, std::int32_t* selector_ids,
+    float* selector_q, std::int32_t tokens, std::int32_t batch, const SamplingConfig* configs,
+    unsigned long long seed_xor, std::int32_t position_offset, bool force_greedy,
+    float p_less_draft_temperature_scale) {
     const int b   = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     if (b >= batch) { return; }
@@ -393,7 +389,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
         force_greedy ? 0.0f
                      : (cfg.p_less != 0 ? cfg.draft_temperature * p_less_draft_temperature_scale
                                         : cfg.temperature);
-    const unsigned long long seed  = cfg.seed ^ seed_xor;
+    const unsigned long long seed = cfg.seed ^ seed_xor;
 
     __shared__ float scores[kDflash2PathSelectK];
     __shared__ float sm_val[kDflash2PathSelectK];
@@ -407,7 +403,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     __syncthreads();
 
     for (std::int32_t t = 0; t < tokens; ++t) {
-        const std::int64_t col   = dflash2_column_index(batch, tokens, t, b);
+        const std::int64_t col   = dflash2_column_index(tokens, t, b);
         const std::int64_t h_col = col * kDflash2PathSelectRank;
         if (tid < kDflash2PathSelectK) {
             sm_val[tid] = cand_val[col * kDflash2PathSelectK + tid];
@@ -423,7 +419,8 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
              i += kDflash2PathSelectBlock) {
             const int c = i / kDflash2PathSelectRank;
             const int r = i - c * kDflash2PathSelectRank;
-            sm_succ[c * kDflash2PathSelectSuccStride + r]  = dflash2_codebook_load(succ_code, sm_idx[c], r);
+            sm_succ[c * kDflash2PathSelectSuccStride + r] =
+                dflash2_codebook_load(succ_code, sm_idx[c], r);
         }
         __syncthreads();
 
@@ -448,9 +445,9 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                 // length depends on drafts past it, so a draft uniform must not be reused by the
                 // next round's hops at the same absolute position.
                 const int round_start = logical_positions[b] + position_offset + 1;
-                const float u         = dflash2_path_select_uniform(
-                    seed, round_start, kDflash2PathSelectRngPurposeDevice,
-                    static_cast<unsigned int>(t));
+                const float u    = dflash2_path_select_uniform(seed, round_start,
+                                                               kDflash2PathSelectRngPurposeDevice,
+                                                               static_cast<unsigned int>(t));
                 const float goal = u * sum;
                 float run        = 0.0f;
                 pick             = kDflash2PathSelectK - 1;
@@ -502,15 +499,12 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     }
 }
 
-__launch_bounds__(kDflash2PathSelectBlock) __global__
-    void dflash2_tree_select_kernel(const float* cand_val, const int* cand_idx,
-                                    const __nv_bfloat16* hidden_proj, Dflash2CodebookDevice pred_code,
-                                    Dflash2CodebookDevice succ_code, const std::int32_t* anchors,
-                                    const std::int32_t* frontiers, std::int32_t* verify_ids,
-                                    std::int32_t* parent_index, std::int32_t* cache_positions,
-                                    std::int32_t* rope_positions, std::int32_t* ancestor_mask,
-                                    std::int32_t* valid_columns, std::int32_t tokens,
-                                    std::int32_t batch, std::int32_t out_width) {
+__launch_bounds__(kDflash2PathSelectBlock) __global__ void dflash2_tree_select_kernel(
+    const float* cand_val, const int* cand_idx, const __nv_bfloat16* hidden_proj,
+    Dflash2CodebookDevice pred_code, Dflash2CodebookDevice succ_code, const std::int32_t* anchors,
+    const std::int32_t* frontiers, std::int32_t* verify_ids, std::int32_t* parent_index,
+    std::int32_t* cache_positions, std::int32_t* rope_positions, std::int32_t* ancestor_mask,
+    std::int32_t* valid_columns, std::int32_t tokens, std::int32_t batch, std::int32_t out_width) {
     constexpr int kExpand   = 16;
     constexpr int kFrontier = 2;
     const int kOut          = out_width;
@@ -544,7 +538,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     __syncthreads();
 
     for (std::int32_t t = 0; t < tokens; ++t) {
-        const std::int64_t col   = dflash2_column_index(batch, tokens, t, b);
+        const std::int64_t col   = dflash2_column_index(tokens, t, b);
         const std::int64_t h_col = col * kDflash2PathSelectRank;
         if (tid < kDflash2PathSelectK) {
             sm_val[tid] = cand_val[col * kDflash2PathSelectK + tid];
@@ -559,13 +553,14 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
             const int f    = i / kDflash2PathSelectRank;
             const int r    = i - f * kDflash2PathSelectRank;
             const int prev = f < frontier_n ? node_id[frontier[f]] : 0;
-            sm_pred[i] = dflash2_codebook_load(pred_code, prev, r);
+            sm_pred[i]     = dflash2_codebook_load(pred_code, prev, r);
         }
         for (int i = tid; i < kDflash2PathSelectK * kDflash2PathSelectRank;
              i += kDflash2PathSelectBlock) {
             const int c = i / kDflash2PathSelectRank;
             const int r = i - c * kDflash2PathSelectRank;
-            sm_succ[c * kDflash2PathSelectSuccStride + r] = dflash2_codebook_load(succ_code, sm_idx[c], r);
+            sm_succ[c * kDflash2PathSelectSuccStride + r] =
+                dflash2_codebook_load(succ_code, sm_idx[c], r);
         }
         __syncthreads();
 
@@ -599,7 +594,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                 for (int c = 0; c < kDflash2PathSelectK; ++c) {
                     const int cand    = sm_idx[c];
                     const float joint = base + pair_score[f * kDflash2PathSelectK + c];
-                    int slot = kFrontier;
+                    int slot          = kFrontier;
                     for (int s = 0; s < kFrontier; ++s) {
                         if (joint > best_score[s] ||
                             (joint == best_score[s] &&

@@ -343,8 +343,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         DecodeGraphDefinition graph_definition;
         DecodeGraphExecutable graph;
         if (invocation.graph_replay) graph_context = std::make_unique<DeviceContext>();
-        const cudaStream_t stream = graph_context ? graph_context->stream : nullptr;
-        const auto launch         = [&] {
+        cudaStream_t stream = graph_context ? graph_context->stream : nullptr;
+        const auto launch   = [&] {
             if (invocation.call_form == CallForm::A16Convenience) {
                 ops::linear(input, weight, destination, stream);
             } else {
@@ -407,27 +407,43 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                     cpu_linear_gemm_fp64(oracle_weight.data(), activation.data(), reference.data(),
                                          static_cast<std::int32_t>(oracle_rows.size()), shape.k,
                                          static_cast<std::int32_t>(columns.size()));
-                    if (weight.qtype == QType::NVFP4 && invocation.policy == ops::LinearPolicy::AllowA8 && invocation.t >= 4) {
+                    if (weight.qtype == QType::NVFP4 &&
+                        invocation.policy == ops::LinearPolicy::AllowA8 && invocation.t >= 4) {
                         const auto encoded = fp8_activation_reference(activation, shape.k);
                         std::vector<double> quantized(reference.size());
-                        cpu_linear_gemm_fp64(oracle_weight.data(), encoded.represented.data(), quantized.data(),
-                            static_cast<int>(oracle_rows.size()), shape.k, static_cast<int>(columns.size()));
-                        const auto distortion = compute_reduction_stats(quantized.data(), reference.data(), reference.size());
-                        const auto residual = compute_reduction_stats(actual.selected.data(), quantized.data(), quantized.size());
-                        const auto canonical = compute_reduction_stats(actual.selected.data(), reference.data(), reference.size());
+                        cpu_linear_gemm_fp64(oracle_weight.data(), encoded.represented.data(),
+                                             quantized.data(), static_cast<int>(oracle_rows.size()),
+                                             shape.k, static_cast<int>(columns.size()));
+                        const auto distortion = compute_reduction_stats(
+                            quantized.data(), reference.data(), reference.size());
+                        const auto residual = compute_reduction_stats(
+                            actual.selected.data(), quantized.data(), quantized.size());
+                        const auto canonical = compute_reduction_stats(
+                            actual.selected.data(), reference.data(), reference.size());
                         auto criterion = tolerance_for(ActivationCompute::A16);
-                        failures += verify_reduction(case_label + " codec residual", actual.selected, quantized, criterion);
-                        double squared = 0, maximum = 0;
-                        for (double v : quantized) { squared += v * v; maximum = std::max(maximum, std::abs(v)); }
-                        criterion.relative_l2 = distortion.relative_l2 + criterion.relative_l2 *
-                            std::sqrt(squared / quantized.size()) / std::max(distortion.reference_root_mean_square, 1e-30);
-                        criterion.gross_absolute += distortion.maximum_absolute_error + criterion.gross_relative_to_max_reference * maximum;
+                        failures += verify_reduction(case_label + " codec residual",
+                                                     actual.selected, quantized, criterion);
+                        double squared = 0, max_quantized = 0;
+                        for (double v : quantized) {
+                            squared += v * v;
+                            max_quantized = std::max(max_quantized, std::abs(v));
+                        }
+                        criterion.relative_l2 =
+                            distortion.relative_l2 +
+                            criterion.relative_l2 * std::sqrt(squared / quantized.size()) /
+                                std::max(distortion.reference_root_mean_square, 1e-30);
+                        criterion.gross_absolute +=
+                            distortion.maximum_absolute_error +
+                            criterion.gross_relative_to_max_reference * max_quantized;
                         criterion.gross_relative_to_max_reference = 0;
-                        failures += verify_reduction(case_label + " canonical", actual.selected, reference, criterion);
+                        failures += verify_reduction(case_label + " canonical", actual.selected,
+                                                     reference, criterion);
                         std::cout << case_label << " canonical=" << canonical.relative_l2
-                                  << " codec=" << distortion.relative_l2 << " residual=" << residual.relative_l2 << '\n';
+                                  << " codec=" << distortion.relative_l2
+                                  << " residual=" << residual.relative_l2 << '\n';
                     } else {
-                        failures += compare_output(case_label, actual.selected, reference, activation_compute);
+                        failures += compare_output(case_label, actual.selected, reference,
+                                                   activation_compute);
                     }
                 }
                 if (replay == 1) {
@@ -471,16 +487,14 @@ int run_packed_column0_matches_decode(std::string_view label, WeightGenerator ge
                                       std::int32_t n, std::int32_t k, std::uint32_t seed,
                                       ops::LinearPolicy packed_policy,
                                       std::span<const std::int32_t> packed_widths) {
-    if (packed_widths.empty()) {
-        throw std::invalid_argument("linear test: no packed widths");
-    }
+    if (packed_widths.empty()) { throw std::invalid_argument("linear test: no packed widths"); }
     for (std::size_t index = 0; index < packed_widths.size(); ++index) {
         if (packed_widths[index] < 2 ||
             (index != 0 && packed_widths[index] <= packed_widths[index - 1])) {
             throw std::invalid_argument("linear test: packed widths must be >= 2 and increasing");
         }
     }
-    const std::int32_t maximum_tokens = packed_widths.back();
+    const std::int32_t maximum_tokens          = packed_widths.back();
     quantized_weight::PackedWeight host_weight = generator(n, k, seed);
     const std::vector<std::uint16_t> activation_bits =
         make_activation(k, maximum_tokens, seed + 1U, ActivationCompute::A16);
@@ -508,8 +522,8 @@ int run_packed_column0_matches_decode(std::string_view label, WeightGenerator ge
         GuardedOutput output(checked_elements(n, tokens, "packed output"));
         Tensor x(device_activation.p, DType::BF16, {k, tokens});
         Tensor destination(output.data(), DType::BF16, {n, tokens});
-        const std::size_t packed_capacity = ops::linear_workspace_capacity_bytes(
-            weight.qtype, n, k, packed_policy, tokens, tokens);
+        const std::size_t packed_capacity =
+            ops::linear_workspace_capacity_bytes(weight.qtype, n, k, packed_policy, tokens, tokens);
         DeviceArena packed_workspace(std::max<std::size_t>(packed_capacity, 256));
         const std::string case_label =
             std::string(label) + " T=" + std::to_string(tokens) + " col0";
@@ -538,12 +552,11 @@ int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator 
     if (sequence_width <= 0 || batch_sizes.empty()) {
         throw std::invalid_argument("linear test: invalid packed sequence domain");
     }
-    const std::int32_t maximum_batch =
-        *std::max_element(batch_sizes.begin(), batch_sizes.end());
+    const std::int32_t maximum_batch = *std::max_element(batch_sizes.begin(), batch_sizes.end());
     if (maximum_batch <= 0) {
         throw std::invalid_argument("linear test: packed batch must be positive");
     }
-    const std::int32_t maximum_tokens = sequence_width * maximum_batch;
+    const std::int32_t maximum_tokens          = sequence_width * maximum_batch;
     quantized_weight::PackedWeight host_weight = generator(n, k, seed);
     const std::vector<std::uint16_t> activation_bits =
         make_activation(k, maximum_tokens, seed + 1U, ActivationCompute::A16);
@@ -559,7 +572,7 @@ int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator 
         if (batch <= 0 || batch > maximum_batch) {
             throw std::invalid_argument("linear test: invalid packed batch");
         }
-        const std::int32_t tokens = sequence_width * batch;
+        const std::int32_t tokens  = sequence_width * batch;
         const std::size_t elements = checked_elements(n, tokens, "packed comparison");
         GuardedOutput aggregate(elements);
         GuardedOutput panels(elements);
@@ -583,8 +596,8 @@ int run_packed_sequences_matches_panels(std::string_view label, WeightGenerator 
             cuda_check(cudaMemcpy(convenience_bits.data(), aggregate.data(),
                                   elements * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
                        "copy aggregate packed output");
-            cuda_check(cudaMemcpy(panel_bits.data(), panels.data(), elements * sizeof(std::uint16_t),
-                                  cudaMemcpyDeviceToHost),
+            cuda_check(cudaMemcpy(panel_bits.data(), panels.data(),
+                                  elements * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
                        "copy panel packed output");
             if (convenience_bits != panel_bits) {
                 std::cerr << case_label << ": aggregate output differs from independent panels\n";

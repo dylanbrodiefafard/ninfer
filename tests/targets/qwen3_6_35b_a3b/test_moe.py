@@ -107,8 +107,7 @@ def test_selected_expert_rows_and_high_precision_moe_formula() -> None:
     assert set(actual.expert_ids[0].tolist()) == set(selected)
 
     read_experts = {
-        begin // (1024 if block == "routed_gate_up" else 2048)
-        for block, begin, _ in model.reads
+        begin // (1024 if block == "routed_gate_up" else 2048) for block, begin, _ in model.reads
     }
     assert read_experts == set(selected)
     assert len(model.reads) == 2 * CFG.experts_per_token
@@ -126,13 +125,9 @@ def test_selected_expert_rows_and_high_precision_moe_formula() -> None:
         routed_terms.append(route_weight.float() * expert_down)
     routed = torch.stack(routed_terms).sum()
 
-    shared_hidden = F.silu(torch.tensor(shared_gate_weight)) * torch.tensor(
-        shared_up_weight
-    )
+    shared_hidden = F.silu(torch.tensor(shared_gate_weight)) * torch.tensor(shared_up_weight)
     shared = shared_hidden * shared_down_weight
     shared_scale = torch.sigmoid(torch.tensor(0.0))
-    expected = (
-        routed + shared_scale * shared
-    ).to(torch.bfloat16)
+    expected = (routed + shared_scale * shared).to(torch.bfloat16)
     assert torch.equal(actual.output[0, 0], expected)
     assert torch.count_nonzero(actual.output[0, 1:]) == 0

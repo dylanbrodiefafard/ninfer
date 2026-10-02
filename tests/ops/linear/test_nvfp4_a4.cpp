@@ -53,15 +53,15 @@ int run_nvfp4_a4() {
          }) {
         failures += run_shape("NVFP4_A4", ActivationCompute::A4, make_nvfp4_weight, shape);
     }
-    failures += run_packed_column0_matches_decode(
-        "NVFP4_A4 packed-col0 [14336,5120]", make_nvfp4_weight, 14336, 5120, 719U,
-        ops::LinearPolicy::AllowA4, packed_col0);
-    failures += run_packed_column0_matches_decode(
-        "NVFP4_A4 packed-col0 [5120,6144]", make_nvfp4_weight, 5120, 6144, 723U,
-        ops::LinearPolicy::AllowA4, packed_col0);
-    failures += run_packed_column0_matches_decode(
-        "NVFP4_A4 packed-col0 [5120,17408]", make_nvfp4_weight, 5120, 17408, 725U,
-        ops::LinearPolicy::AllowA4, packed_col0);
+    failures += run_packed_column0_matches_decode("NVFP4_A4 packed-col0 [14336,5120]",
+                                                  make_nvfp4_weight, 14336, 5120, 719U,
+                                                  ops::LinearPolicy::AllowA4, packed_col0);
+    failures += run_packed_column0_matches_decode("NVFP4_A4 packed-col0 [5120,6144]",
+                                                  make_nvfp4_weight, 5120, 6144, 723U,
+                                                  ops::LinearPolicy::AllowA4, packed_col0);
+    failures += run_packed_column0_matches_decode("NVFP4_A4 packed-col0 [5120,17408]",
+                                                  make_nvfp4_weight, 5120, 17408, 725U,
+                                                  ops::LinearPolicy::AllowA4, packed_col0);
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
     // Gate-up/down aggregate every width whose request panel already takes W4A4 (down: W>=3),
     // including the k=6/7 chains (W=7/8, T<=48).
@@ -73,15 +73,15 @@ int run_nvfp4_a4() {
             "NVFP4_A4 DFlash down packed", make_nvfp4_weight, 5120, 17408, 733U, width,
             dflash_batches, ops::LinearPolicy::AllowA4, false);
     }
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A4 DFlash QKV packed", make_nvfp4_weight, 6144, 5120, 735U, 5,
-        dflash_batches, ops::LinearPolicy::AllowA4, false);
+    failures += run_packed_sequences_matches_panels("NVFP4_A4 DFlash QKV packed", make_nvfp4_weight,
+                                                    6144, 5120, 735U, 5, dflash_batches,
+                                                    ops::LinearPolicy::AllowA4, false);
     failures += run_packed_sequences_matches_panels(
         "NVFP4_A4 DFlash attention-output packed", make_nvfp4_weight, 5120, 4096, 737U, 5,
         dflash_batches, ops::LinearPolicy::AllowA4, false);
     failures += run_packed_sequences_matches_panels(
-        "NVFP4_A4 DFlash feature packed", make_nvfp4_weight, 5120, 25600, 741U, 5,
-        dflash_batches, ops::LinearPolicy::AllowA4, false);
+        "NVFP4_A4 DFlash feature packed", make_nvfp4_weight, 5120, 25600, 741U, 5, dflash_batches,
+        ops::LinearPolicy::AllowA4, false);
     return failures;
 }
 

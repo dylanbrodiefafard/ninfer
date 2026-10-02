@@ -1,10 +1,16 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Optional command prefix for every test, e.g. "compute-sanitizer;--tool;memcheck;--error-exitcode;1".
+# Only test registration depends on it, so changing it re-generates CTest files without
+# recompiling. ./scripts/run-unit-tests.sh --compute-sanitizer sets it.
+set(NINFER_TEST_LAUNCHER "" CACHE STRING "Command prefix for every registered test")
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
 add_executable(ninfer_public_api_test test_public_api.cpp)
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
-add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
+add_test(NAME ninfer_public_api_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_public_api_test>)
 
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
@@ -25,7 +31,7 @@ function(ninfer_add_test name)
       NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
-  add_test(NAME ${name} COMMAND ${name})
+  add_test(NAME ${name} COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:${name}>)
 endfunction()
 
 function(ninfer_add_op_test name)

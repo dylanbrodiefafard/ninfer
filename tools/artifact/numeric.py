@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import struct
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TypeAlias
 
@@ -58,19 +58,12 @@ NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
 
 
-DIRECT_FORMATS = MappingProxyType(
-    {item.name: item for item in (BF16, FP32, I32)}
-)
+DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, I32)})
 QUANT_FORMATS = MappingProxyType(
-    {
-        item.name: item
-        for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)
-    }
+    {item.name: item for item in (Q4G64_F16S, Q5G64_F16S, Q6G64_F16S, W8G32_F16S)}
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
-FP8_ROW_FORMATS = MappingProxyType(
-    {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
-)
+FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S})
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
 )
@@ -108,12 +101,7 @@ def decode_e4m3fn_word(word: int) -> float:
 def valid_nvfp4_scale_word(word: int) -> bool:
     """Return whether *word* is an admitted nonnegative finite E4M3FN scale."""
 
-    return (
-        type(word) is int
-        and 0 <= word <= 0xFF
-        and word & 0x80 == 0
-        and word != 0x7F
-    )
+    return type(word) is int and 0 <= word <= 0xFF and word & 0x80 == 0 and word != 0x7F
 
 
 def valid_fp8_weight_word(word: int) -> bool:
@@ -152,23 +140,23 @@ def get_format(name: str) -> NumericFormat:
 __all__ = [
     "BF16",
     "DIRECT_FORMATS",
-    "DirectFormat",
     "FP8_E4M3FN_ROW_BF16S",
     "FP8_ROW_FORMATS",
     "FP32",
-    "Fp8RowFormat",
     "I32",
     "NUMERIC_FORMATS",
     "NVFP4",
     "NVFP4_FORMATS",
-    "Nvfp4Format",
-    "NumericFormat",
     "Q4G64_F16S",
     "Q5G64_F16S",
     "Q6G64_F16S",
     "QUANT_FORMATS",
-    "QuantFormat",
     "W8G32_F16S",
+    "DirectFormat",
+    "Fp8RowFormat",
+    "NumericFormat",
+    "Nvfp4Format",
+    "QuantFormat",
     "decode_e2m1_word",
     "decode_e4m3fn_word",
     "get_format",

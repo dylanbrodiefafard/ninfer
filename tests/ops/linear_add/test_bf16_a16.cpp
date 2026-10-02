@@ -59,8 +59,7 @@ int bf16_a16_rejections() {
 int bf16_a16_conformance() {
     constexpr std::array<std::int32_t, 3> kRouteStarts{2, 5, 49};
     constexpr std::array<std::int32_t, 21> kRouteInteriors{
-        4,  5,  8,  10, 15, 16, 20,  24,  28,  32, 36,
-        44, 48, 52, 60, 64, 127, 128, 129, 1024, 1536,
+        4, 5, 8, 10, 15, 16, 20, 24, 28, 32, 36, 44, 48, 52, 60, 64, 127, 128, 129, 1024, 1536,
     };
     return ninfer::test::linear_add::run_shape(
                "BF16_A16 LinearAdd", WeightFormat::BF16,
@@ -80,7 +79,7 @@ int bf16_aggregate_matches_panels() {
     std::vector<std::uint16_t> activation(static_cast<std::size_t>(kK) * kMaxT);
     std::vector<std::uint16_t> residual(static_cast<std::size_t>(kN) * kMaxT);
     for (std::size_t index = 0; index < activation.size(); ++index) {
-        const int value = static_cast<int>((index * 17U + 29U) & 0xffU) - 128;
+        const int value   = static_cast<int>((index * 17U + 29U) & 0xffU) - 128;
         activation[index] = ninfer::test::f32_to_bf16(static_cast<float>(value) / 256.0F);
     }
     for (std::size_t index = 0; index < residual.size(); ++index) {
@@ -106,8 +105,8 @@ int bf16_aggregate_matches_panels() {
             ninfer::Tensor aggregate_y(aggregate.data(), ninfer::DType::BF16, {kN, tokens});
             ninfer::ops::linear_add(aggregate_x, weight.view(), aggregate_y, workspace, nullptr);
             for (std::int32_t row = 0; row < batch; ++row) {
-                auto* input = static_cast<std::uint8_t*>(device_activation.p) +
-                              static_cast<std::int64_t>(row) * width * kK * sizeof(std::uint16_t);
+                auto* input  = static_cast<std::uint8_t*>(device_activation.p) +
+                               static_cast<std::int64_t>(row) * width * kK * sizeof(std::uint16_t);
                 auto* output = static_cast<std::uint8_t*>(panels.data()) +
                                static_cast<std::int64_t>(row) * width * kN * sizeof(std::uint16_t);
                 ninfer::Tensor panel_x(input, ninfer::DType::BF16, {kK, width});

@@ -14,9 +14,9 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
@@ -150,9 +150,7 @@ class CampaignError(RuntimeError):
 
 
 class ServerLogTail:
-    def __init__(
-        self, path: Path, process: subprocess.Popen[bytes], initial_offset: int
-    ) -> None:
+    def __init__(self, path: Path, process: subprocess.Popen[bytes], initial_offset: int) -> None:
         self.path = path
         self.process = process
         self.offset = initial_offset
@@ -220,7 +218,7 @@ class RunningServer:
         self.process: subprocess.Popen[bytes] | None = None
         self.tail: ServerLogTail | None = None
 
-    def __enter__(self) -> "RunningServer":
+    def __enter__(self) -> RunningServer:
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
         self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
@@ -407,7 +405,9 @@ def load_fixtures() -> dict[str, Fixture]:
                 category=category,
             )
         except (KeyError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise CampaignError(f"failed to load fixture {name!r} from the examples manifest: {exc}") from exc
+            raise CampaignError(
+                f"failed to load fixture {name!r} from the examples manifest: {exc}"
+            ) from exc
     return fixtures
 
 
@@ -570,9 +570,7 @@ def validate_server_start(
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
-    if event.get("sampling_defaults", {}).get("greedy") != (
-        spec.sampling_mode == "greedy"
-    ):
+    if event.get("sampling_defaults", {}).get("greedy") != (spec.sampling_mode == "greedy"):
         raise CampaignError("server_start sampling mode does not match the campaign")
     p_less = event.get("sampling_defaults", {}).get("server_overrides", {}).get("p_less")
     if p_less != (spec.sampling_mode == "p-less"):
@@ -647,8 +645,7 @@ def build_result_record(
 
     if backend != spec.speculative_backend:
         raise CampaignError(
-            f"request_done speculative backend {backend!r} != "
-            f"{spec.speculative_backend!r}"
+            f"request_done speculative backend {backend!r} != {spec.speculative_backend!r}"
         )
 
     usage = response.get("usage", {})
@@ -847,12 +844,9 @@ def run_block(
         / "server"
         / f"{first.target}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
     )
-    command = server_command(
-        serve, first, server_log, port, device, kv_dtype, lm_head_draft
-    )
+    command = server_command(serve, first, server_log, port, device, kv_dtype, lm_head_draft)
     print(
-        f"start {first.target}/{first.speculative_mode}: "
-        f"{len(block_specs)} missing request(s)",
+        f"start {first.target}/{first.speculative_mode}: {len(block_specs)} missing request(s)",
         flush=True,
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
@@ -861,9 +855,7 @@ def run_block(
             server_start, first, device, kv_dtype, lm_head_draft
         )
 
-        connection = http.client.HTTPConnection(
-            "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
-        )
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS)
         last_request_id: int | None = None
         try:
             warmup = fixtures[WARMUP_FIXTURE]
@@ -904,7 +896,9 @@ def metric_values(records: Iterable[dict[str, Any]], name: str) -> list[float]:
     return values
 
 
-def sample_stats(records: Sequence[dict[str, Any]], name: str) -> tuple[int, float | None, float | None]:
+def sample_stats(
+    records: Sequence[dict[str, Any]], name: str
+) -> tuple[int, float | None, float | None]:
     values = metric_values(records, name)
     if not values:
         return 0, None, None
@@ -1026,9 +1020,7 @@ def build_summary_rows(
                             fixture,
                             mode_name,
                             sampling_mode,
-                            select_records(
-                                records, target, mode_name, sampling_mode, (fixture,)
-                            ),
+                            select_records(records, target, mode_name, sampling_mode, (fixture,)),
                         )
                     )
                 continue
@@ -1044,9 +1036,7 @@ def build_summary_rows(
                         fixture,
                         mode_name,
                         sampling_mode,
-                        select_records(
-                            records, target, mode_name, sampling_mode, (fixture,)
-                        ),
+                        select_records(records, target, mode_name, sampling_mode, (fixture,)),
                     )
                 )
 
@@ -1063,9 +1053,7 @@ def build_summary_rows(
                             fixture,
                             mode_name,
                             sampling_mode,
-                            select_records(
-                                records, target, mode_name, sampling_mode, (fixture,)
-                            ),
+                            select_records(records, target, mode_name, sampling_mode, (fixture,)),
                         )
                     )
 
@@ -1077,9 +1065,7 @@ def build_summary_rows(
                         "",
                         mode_name,
                         sampling_mode,
-                        select_records(
-                            records, target, mode_name, sampling_mode, category_present
-                        ),
+                        select_records(records, target, mode_name, sampling_mode, category_present),
                     )
                 )
     return rows
@@ -1119,7 +1105,7 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
 def mode_display_name(mode_name: str) -> str:
     if mode_name not in SPECULATIVE_MODES:
         raise CampaignError(f"unsupported summary mode: {mode_name}")
-    backend, draft_tokens, verify_width = SPECULATIVE_MODES[mode_name]
+    backend, draft_tokens, _verify_width = SPECULATIVE_MODES[mode_name]
     if backend == "none":
         return "MTP0"
     if backend == "mtp":
@@ -1154,15 +1140,9 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     for mode_name in mode_names:
         label = mode_display_name(mode_name)
         mode_rows = [row for row in rows if row["speculative_mode"] == mode_name]
-        context_rows = [
-            row for row in mode_rows if row["section"] == "context_profile"
-        ]
-        long_decode_rows = [
-            row for row in mode_rows if row["section"] == "long_decode"
-        ]
-        category_rows = [
-            row for row in mode_rows if row["section"] == "scenario_category"
-        ]
+        context_rows = [row for row in mode_rows if row["section"] == "context_profile"]
+        long_decode_rows = [row for row in mode_rows if row["section"] == "long_decode"]
+        category_rows = [row for row in mode_rows if row["section"] == "scenario_category"]
 
         if context_rows:
             table = markdown_table(
@@ -1213,9 +1193,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "completion_tokens"),
                         format_mean_stddev(row, "decode_tok_s"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
-                        format_mean_stddev(
-                            row, "speculative_tokens_per_round", digits=2
-                        ),
+                        format_mean_stddev(row, "speculative_tokens_per_round", digits=2),
                     )
                     for row in long_decode_rows
                 ],
@@ -1241,9 +1219,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         str(row["samples"]),
                         format_mean_stddev(row, "decode_tok_s"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
-                        format_mean_stddev(
-                            row, "speculative_tokens_per_round", digits=2
-                        ),
+                        format_mean_stddev(row, "speculative_tokens_per_round", digits=2),
                     )
                     for row in category_rows
                 ],
@@ -1277,9 +1253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(mode_names) != len(set(mode_names)):
         raise CampaignError("duplicate --mode value")
     fixtures = load_fixtures()
-    specs = build_specs(
-        artifacts, fixtures, mode_names, args.sampling, args.fixtures, args.seeds
-    )
+    specs = build_specs(artifacts, fixtures, mode_names, args.sampling, args.fixtures, args.seeds)
     expected_specs = {spec.key: spec for spec in specs}
     total = len(expected_specs)
 

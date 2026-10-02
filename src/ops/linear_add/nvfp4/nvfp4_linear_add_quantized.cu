@@ -14,11 +14,11 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
-using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 1>;
+using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+using M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
@@ -46,7 +46,7 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
         launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 192) {
         launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 384) {
+    } else if (tokens <= 384) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 512) {
         launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
@@ -58,23 +58,25 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
 } // namespace
 
 void nvfp4_linear_add_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                   Fp8A8Workspace workspace, cudaStream_t stream) {
+                                  Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     auto* data = static_cast<__nv_bfloat16*>(residual.data);
     const Nvfp4AddResidualEpilogue epilogue{data, weight.n};
     const Nvfp4ContiguousOutput out{data, weight.n};
     if (weight.k == 6144) {
-        launch_nvfp4_w4a8_mma<Nvfp4Residual6144Geometry>(weight, x.ne[1], workspace, epilogue, out, stream);
+        launch_nvfp4_w4a8_mma<Nvfp4Residual6144Geometry>(weight, x.ne[1], workspace, epilogue, out,
+                                                         stream);
     } else {
-        launch_nvfp4_w4a8_mma<Nvfp4Residual17408Geometry>(weight, x.ne[1], workspace, epilogue, out, stream);
+        launch_nvfp4_w4a8_mma<Nvfp4Residual17408Geometry>(weight, x.ne[1], workspace, epilogue, out,
+                                                          stream);
     }
 }
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(
-        x, weight, workspace, nvfp4_w4a4_projection_scale_layout(weight.n, weight.k, x.ne[1]),
-        stream);
+    launch_nvfp4_w4a4_quantize(x, weight, workspace,
+                               nvfp4_w4a4_projection_scale_layout(weight.n, weight.k, x.ne[1]),
+                               stream);
     const std::int32_t tokens  = x.ne[1];
     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
     if (nvfp4_w4a4_tma_route(weight.n, weight.k, tokens)) {

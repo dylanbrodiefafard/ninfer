@@ -22,10 +22,10 @@ ninfer::EngineOptions dflash_vision_options(std::string model_id, std::string we
     options.max_concurrency          = 1;
     options.speculative.backend      = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens = 4;
-    options.enable_vision           = true;
-    options.use_cuda_graph          = false;
-    options.model_id                = std::move(model_id);
-    options.weights_id              = std::move(weights_id);
+    options.enable_vision            = true;
+    options.use_cuda_graph           = false;
+    options.model_id                 = std::move(model_id);
+    options.weights_id               = std::move(weights_id);
     return options;
 }
 
@@ -48,8 +48,7 @@ int main() {
     ninfer::DeviceContext device(0);
     try {
         auto options = dflash_vision_options("qwen3.8-27b", "nvfp4");
-        (void)Package27::make_sequence_planner(device, options,
-                                               Package27::WeightsProfile::Nvfp4);
+        (void)Package27::make_sequence_planner(device, options, Package27::WeightsProfile::Nvfp4);
     } catch (const std::exception& error) {
         std::cerr << "qwen3.8-27b/nvfp4 rejected DFlash with Vision: " << error.what() << '\n';
         return 1;
@@ -58,13 +57,12 @@ int main() {
     int failures = 0;
     failures += expect_rejection("qwen3.6-27b/nvfp4", [&] {
         auto options = dflash_vision_options("qwen3.6-27b", "nvfp4");
-        return Package27::make_sequence_planner(device, options,
-                                                Package27::WeightsProfile::Nvfp4);
+        return Package27::make_sequence_planner(device, options, Package27::WeightsProfile::Nvfp4);
     });
     failures += expect_rejection("qwen3.8-27b/groupwise-int", [&] {
         auto options = dflash_vision_options("qwen3.8-27b", "groupwise-int");
-        return Package27::make_sequence_planner(
-            device, options, Package27::WeightsProfile::GroupwiseIntW8Endpoints);
+        return Package27::make_sequence_planner(device, options,
+                                                Package27::WeightsProfile::GroupwiseIntW8Endpoints);
     });
     failures += expect_rejection("qwen3.6-35b-a3b/groupwise-int", [&] {
         auto options = dflash_vision_options("qwen3.6-35b-a3b", "groupwise-int");

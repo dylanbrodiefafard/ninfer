@@ -52,7 +52,8 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
-// Small 27B panels and packed verify (T<=48, C<=6 x W<=8) use the same split-40 MMA reduction. Token tiling changes neither the K partition nor the order of the final reduction.
+// Small 27B panels and packed verify (T<=48, C<=6 x W<=8) use the same split-40 MMA reduction.
+// Token tiling changes neither the K partition nor the order of the final reduction.
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 48;
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxBatch = 6;
 
@@ -91,9 +92,10 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    const Weight& a_weight, const Weight& b_weight,
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                                    Tensor& g, Tensor& beta, cudaStream_t stream);
-void bf16_gdn_norm_gating_packed_dispatch(
-    const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h, const Weight& a_weight,
-    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-    Tensor& g, Tensor& beta, cudaStream_t stream);
+void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& A_log, const Tensor& dt_bias,
+                                          WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                                          cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

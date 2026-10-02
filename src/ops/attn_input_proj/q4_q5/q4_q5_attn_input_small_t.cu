@@ -30,7 +30,7 @@ void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ke
     q4_rowsplit_gemv_kernel<Schedule, true, kSplitRow><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(key.data), kParentRows, kHidden);
+        static_cast<__nv_bfloat16*>(key.data), kHidden);
     CUDA_CHECK(cudaGetLastError());
 }
 

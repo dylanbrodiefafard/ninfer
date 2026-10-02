@@ -17,8 +17,8 @@ int w8_a16_conformance() {
     int failures = 0;
 
     constexpr std::array kN248320K5120{
-        a16(1),  a16(5),  a16(6),  a16(10), a16(15), a16(16), a16(17), a16(20),
-        a16(32), a16(33), a16(34), a16(40), a16(41), a16(42), a16(48), a16(49), a16(64), a16(65),
+        a16(1),  a16(5),  a16(6),  a16(10), a16(15), a16(16), a16(17), a16(20), a16(32),
+        a16(33), a16(34), a16(40), a16(41), a16(42), a16(48), a16(49), a16(64), a16(65),
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});
@@ -27,9 +27,8 @@ int w8_a16_conformance() {
     constexpr std::array kVocabularyBatches{2, 3, 4, 5, 6};
     for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
         failures += run_packed_sequences_matches_panels(
-            "W8_A16 vocabulary packed W" + std::to_string(width), make_w8g32_f16s_weight,
-            248320, 5120,
-            199U + static_cast<std::uint32_t>(width), width, kVocabularyBatches);
+            "W8_A16 vocabulary packed W" + std::to_string(width), make_w8g32_f16s_weight, 248320,
+            5120, 199U + static_cast<std::uint32_t>(width), width, kVocabularyBatches);
     }
 
     constexpr std::array kN5120K10240{
@@ -141,8 +140,7 @@ int w8_a16_conformance() {
                           {2048, 4608, 271U, Comparison::Sampled, false, kN2048K4608});
 
     constexpr std::array kN4608K4608{
-        a16(1),   a16(8),   a16(9),   a16(11),  a16(12), a16(13),
-        a16(256), a16(257), a16(384), a16(32768),
+        a16(1), a16(8), a16(9), a16(11), a16(12), a16(13), a16(256), a16(257), a16(384), a16(32768),
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {4608, 4608, 277U, Comparison::Sampled, false, kN4608K4608});

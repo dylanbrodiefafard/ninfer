@@ -12,6 +12,9 @@
 #   ./scripts/run-unit-tests.sh --real           # include real-artifact tests
 #   ./scripts/run-unit-tests.sh --print-weights  # show which .ninfer files were found
 #   ./scripts/run-unit-tests.sh --python         # also run the host Python pytest suite
+#   ./scripts/run-unit-tests.sh --compute-sanitizer memcheck -R ninfer_arena_test
+#                                                # run tests under compute-sanitizer
+#                                                # (memcheck, racecheck, synccheck, initcheck)
 #
 # --real auto-finds exact filenames in models/, out/, /models, the builder's
 # models mount, and sibling folders of that mount. Override with env vars or
@@ -30,6 +33,7 @@ INNER=0
 INCLUDE_REAL=0
 PRINT_WEIGHTS=0
 RUN_PYTHON=0
+SANITIZER_TOOL=""
 CTEST_ARGS=()
 
 WEIGHT_VARS=(
@@ -46,8 +50,14 @@ while [[ $# -gt 0 ]]; do
     --real) INCLUDE_REAL=1; shift ;;
     --print-weights) PRINT_WEIGHTS=1; shift ;;
     --python) RUN_PYTHON=1; shift ;;
+    --compute-sanitizer)
+      case "${2:-}" in
+        memcheck|racecheck|synccheck|initcheck) SANITIZER_TOOL="$2"; shift 2 ;;
+        *) echo "--compute-sanitizer needs memcheck, racecheck, synccheck, or initcheck" >&2; exit 2 ;;
+      esac
+      ;;
     --help|-h)
-      sed -n '2,21p' "$0"
+      sed -n '2,24p' "$0"
       exit 0
       ;;
     --) shift; CTEST_ARGS+=("$@"); break ;;
@@ -263,7 +273,7 @@ configure_weights() {
   WEIGHT_SOURCE=()
   WEIGHT_MISSING=()
   WEIGHT_UNMAPPED=()
-  local var names name path mapped source
+  local var name path mapped source
   for var in "${WEIGHT_VARS[@]}"; do
     path="${!var:-}"
     source=""
@@ -313,7 +323,7 @@ configure_weights() {
 }
 
 print_weights_report() {
-  local entry var path source tests
+  local entry var rest path source
   echo "=== real-artifact weights ==="
   if [[ ${#WEIGHT_SOURCE[@]} -gt 0 ]]; then
     for entry in "${WEIGHT_SOURCE[@]}"; do
@@ -483,6 +493,14 @@ run_cpp_suite() {
       -DNINFER_BUILD_APPS=ON \
       -DBUILD_TESTING=ON
   fi
+  # The test launcher changes only CTest registration, so switching it does not recompile.
+  local launcher=""
+  if [[ -n "$SANITIZER_TOOL" ]]; then
+    launcher="compute-sanitizer;--tool;${SANITIZER_TOOL};--error-exitcode;1"
+  fi
+  if [[ "$(sed -n 's/^NINFER_TEST_LAUNCHER:STRING=//p' "${build}/CMakeCache.txt")" != "$launcher" ]]; then
+    cmake -S "$src" -B "$build" "-DNINFER_TEST_LAUNCHER=${launcher}" >/dev/null
+  fi
   echo "=== cmake --build ${build} ==="
   cmake --build "$build" --parallel "$JOBS"
   local ctest_cmd=(ctest --test-dir "$build" --output-on-failure)
@@ -551,6 +569,9 @@ if command -v docker >/dev/null 2>&1 && "${ROOT}/scripts/dev-setup.sh"; then
   inner_args=(--inner)
   if [[ "$INCLUDE_REAL" -eq 1 ]]; then
     inner_args+=(--real)
+  fi
+  if [[ -n "$SANITIZER_TOOL" ]]; then
+    inner_args+=(--compute-sanitizer "$SANITIZER_TOOL")
   fi
   echo "=== docker exec ${BUILDER} ==="
   docker_cmd=(docker exec

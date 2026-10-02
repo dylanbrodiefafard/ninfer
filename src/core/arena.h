@@ -135,6 +135,7 @@ private:
         std::size_t offset = 0;
         std::size_t size   = 0;
     };
+
     struct LiveBlock {
         std::size_t offset = 0;
         std::size_t size   = 0;

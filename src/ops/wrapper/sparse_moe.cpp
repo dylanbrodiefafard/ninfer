@@ -251,8 +251,6 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         return;
     }
 
-    const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
-        weights.routed_gate_up.qtype, weights.routed_down.qtype);
     const detail::SparseMoeDecodeWorkspace views =
         detail::allocate_sparse_moe_decode_workspace(workspace);
     for (std::int32_t token = 0; token < tokens; ++token) {

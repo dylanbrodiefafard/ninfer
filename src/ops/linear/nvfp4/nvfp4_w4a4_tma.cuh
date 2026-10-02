@@ -86,7 +86,7 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
                                                         std::int32_t tokens) {
     static_assert(BlockM == 128 || BlockM == 256);
     constexpr std::uint32_t kCodeColumns = 64;
-    constexpr std::uint32_t kBlockN = 128;
+    constexpr std::uint32_t kBlockN      = 128;
     constexpr std::uint64_t kWeightScaleBytes =
         static_cast<std::uint64_t>(Geometry::kOutputRows) * Geometry::kInputRows / 16;
 
@@ -99,8 +99,8 @@ Nvfp4W4a4TmaDescriptors make_nvfp4_w4a4_tma_descriptors(const std::uint8_t* acti
         const_cast<std::uint8_t*>(weight_codes), CU_TENSOR_MAP_DATA_TYPE_UINT8,
         Geometry::kCodeBytesPerRow, Geometry::kOutputRows, Geometry::kCodeBytesPerRow, kCodeColumns,
         kBlockN, CU_TENSOR_MAP_SWIZZLE_64B, "encode weight codes TMA");
-    descriptors.a_scales = make_nvfp4_tiled_scale_descriptor<Geometry, BlockM>(activation_scales,
-                                                                               tokens);
+    descriptors.a_scales =
+        make_nvfp4_tiled_scale_descriptor<Geometry, BlockM>(activation_scales, tokens);
     descriptors.b_scales = nvfp4_make_tma_2d(
         const_cast<std::uint8_t*>(weight_scales), CU_TENSOR_MAP_DATA_TYPE_UINT8, 16,
         kWeightScaleBytes / 16, 16, 16, 64, CU_TENSOR_MAP_SWIZZLE_NONE, "encode weight scales TMA");
@@ -117,17 +117,18 @@ struct Nvfp4W4a4TmaSchedule {
     static_assert((128 % WarpsN) == 0);
     static_assert((128 / WarpsN) % 8 == 0);
 
-    static constexpr int kBlockM           = BlockM;
-    static constexpr int kBlockN           = 128;
-    static constexpr int kBlockK           = 128;
-    static constexpr int kStages           = Stages;
-    static constexpr int kWarpsM           = WarpsM;
-    static constexpr int kWarpsN           = WarpsN;
-    static constexpr int kConsumerWarps    = kWarpsM * kWarpsN;
-    static constexpr int kConsumerThreads  = kConsumerWarps * 32;
-    static constexpr int kProducerThreads  = BlockM == 256 ? 128 : 32;
-    static constexpr int kThreads          = kConsumerThreads + kProducerThreads;
-    static_assert(kThreads <= 1024, "CTA thread count exceeds the 1024/CTA hardware limit (e.g. 32 consumer warps)");
+    static constexpr int kBlockM          = BlockM;
+    static constexpr int kBlockN          = 128;
+    static constexpr int kBlockK          = 128;
+    static constexpr int kStages          = Stages;
+    static constexpr int kWarpsM          = WarpsM;
+    static constexpr int kWarpsN          = WarpsN;
+    static constexpr int kConsumerWarps   = kWarpsM * kWarpsN;
+    static constexpr int kConsumerThreads = kConsumerWarps * 32;
+    static constexpr int kProducerThreads = BlockM == 256 ? 128 : 32;
+    static constexpr int kThreads         = kConsumerThreads + kProducerThreads;
+    static_assert(kThreads <= 1024,
+                  "CTA thread count exceeds the 1024/CTA hardware limit (e.g. 32 consumer warps)");
     static constexpr int kWarpM            = kBlockM / kWarpsM;
     static constexpr int kWarpN            = kBlockN / kWarpsN;
     static constexpr int kMmaM             = kWarpM / 16;
@@ -140,11 +141,12 @@ struct Nvfp4W4a4TmaSchedule {
     // and the freed registers are handed to the consumer warps. The consumer cap must scale with
     // the consumer-warp count or the reallocation exceeds the SM register file and the CTAs never
     // become resident (a silent mbarrier deadlock).
-    static constexpr int kProducerRegCap    = 40;
+    static constexpr int kProducerRegCap = 40;
     static constexpr int kConsumerRegCapRaw =
         (65536 / kMinBlocksPerSm - kProducerThreads * kProducerRegCap) / kConsumerThreads;
-    static constexpr int kConsumerRegCapFloor = (kConsumerRegCapRaw / 8) * 8;  // setmaxnreg is a multiple of 8
-    static constexpr int kConsumerRegCap    = kConsumerRegCapFloor < 232 ? kConsumerRegCapFloor : 232;
+    static constexpr int kConsumerRegCapFloor =
+        (kConsumerRegCapRaw / 8) * 8; // setmaxnreg is a multiple of 8
+    static constexpr int kConsumerRegCap = kConsumerRegCapFloor < 232 ? kConsumerRegCapFloor : 232;
 };
 
 template <class Schedule>
@@ -279,7 +281,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
 
     if (threadIdx.x < Schedule::kProducerThreads) {
         if constexpr (Schedule::kProducerThreads == 128 && Schedule::kConsumerThreads == 256) {
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(Schedule::kProducerRegCap)
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(Schedule::kProducerRegCap)
                          : "memory");
         }
         if (threadIdx.x == 0) {
@@ -298,9 +300,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 // scales cover two K tiles: fetch the box on the even tile into a scale slot
                 // and let the odd tile expect that many bytes fewer.
                 const bool load_scales = (k_tile & 1) == 0;
-                nvfp4_mbarrier_arrive_expect_tx(
-                    &shared.full[stage],
-                    load_scales ? kTransactionBytes : kTransactionBytes - kScaleBytes);
+                nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage],
+                                                load_scales ? kTransactionBytes
+                                                            : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
                 nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
@@ -326,7 +328,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     }
 
     if constexpr (Schedule::kProducerThreads == 128 && Schedule::kConsumerThreads == 256) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(Schedule::kConsumerRegCap)
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(Schedule::kConsumerRegCap)
                      : "memory");
     }
     auto& tensors             = shared.scratch.tensors;
@@ -426,8 +428,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 shared_output + token0 * kOutputStride + parent_row);
             auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
                 shared_output + token1 * kOutputStride + parent_row);
-            const int global_row0   = row_begin + parent_row;
-            const int global_row1   = global_row0 + 1;
+            const int global_row0 = row_begin + parent_row;
+            const int global_row1 = global_row0 + 1;
             // The last M tile may be partial. The code descriptor's row extent is the real token
             // count, so TMA zero-fills code rows past it, and the quantizer wrote zero scales for
             // the tiled plane's padding: a padded lane accumulates exactly zero. It only has to

@@ -34,9 +34,8 @@ using Json = nlohmann::json;
     throw ApiException(std::move(error));
 }
 
-const Json& require_object(const Json& body) {
+void require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
 }
 
 bool optional_bool(const Json& object, const char* key, bool fallback) {
@@ -548,7 +547,7 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
                     "max",
                     "reasoning");
     }
-    out.generation.reasoning_effort       = *effort;
+    out.generation.reasoning_effort       = effort;
     out.generation.reasoning_effort_param = "reasoning.effort";
 }
 
@@ -751,11 +750,11 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         if (*temperature < 0.0 || *temperature > 2.0) {
             bad_request("temperature must be in [0,2]", "temperature");
         }
-        out.generation.sampling.temperature = *temperature;
+        out.generation.sampling.temperature = temperature;
     }
     if (const std::optional<double> top_p = optional_number(body, "top_p")) {
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
-        out.generation.sampling.top_p = *top_p;
+        out.generation.sampling.top_p = top_p;
     }
 
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {

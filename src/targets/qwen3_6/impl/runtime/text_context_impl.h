@@ -43,7 +43,6 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
@@ -150,12 +149,10 @@ private:
     T previous_;
 };
 
-} // namespace
-
 void DFlashFeatureSink::begin(const Tensor& value) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
-                       batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
+                         batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
     if ((!prefill && !batch) || layers.empty()) {
         throw std::logic_error("DFlash feature sink is incomplete");
     }
@@ -243,9 +240,9 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
                          const qwen3_6::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
-      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv),
+      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state), io_(io),
+      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -256,8 +253,6 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     set_linear_state_slot(0);
     bind();
 }
-
-TextContext::~TextContext() = default;
 
 void TextContext::set_linear_state_slot(std::int32_t current_slot) {
     if (current_slot < 0 || current_slot >= state_.slot_count()) {
@@ -283,9 +278,8 @@ void TextContext::set_tree_verify(const Tensor* parent_index, const Tensor* ance
 }
 
 void TextContext::bind() {
-    using TargetBindings = LoadedModelData;
-    using TargetMlp      = MlpWeights;
-    const auto bind_mlp  = [](const TargetMlp& source) { return MlpW{&source}; };
+    using TargetMlp     = MlpWeights;
+    const auto bind_mlp = [](const TargetMlp& source) { return MlpW{&source}; };
 
     embed_      = &weights_.token_embedding;
     final_norm_ = &weights_.final_norm;
@@ -302,15 +296,15 @@ void TextContext::bind() {
         }
         const auto& source = *weights_.mtp;
         mtp_               = MtpW{&source,
-                    &source.input_projection,
-                    &source.embedding_norm,
-                    &source.hidden_norm,
-                    &source.input_norm,
-                    &source.query_norm,
-                    &source.key_norm,
-                    &source.output,
-                    &source.post_attention_norm,
-                    &source.final_norm};
+                                  &source.input_projection,
+                                  &source.embedding_norm,
+                                  &source.hidden_norm,
+                                  &source.input_norm,
+                                  &source.query_norm,
+                                  &source.key_norm,
+                                  &source.output,
+                                  &source.post_attention_norm,
+                                  &source.final_norm};
     }
 
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
@@ -427,18 +421,18 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
-    Variant::mtp_attention_output(a.view({kCfg.q_size, T}), *mtp_.o_proj, x, work_, s,
-                                 packed_route_tokens(active_sequence_batch_,
-                                                     active_sequence_width_));
+    Variant::mtp_attention_output(
+        a.view({kCfg.q_size, T}), *mtp_.o_proj, x, work_, s,
+        packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 
     Tensor mh = post.post_mixer_hidden;
     ops::rmsnorm(x, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
 
     {
         auto post_mixer_scope = work_.scope();
-            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s,
-                                    packed_route_tokens(active_sequence_batch_,
-                                                        active_sequence_width_));
+        Variant::mtp_post_mixer(
+            mh, mtp_.payload->post_mixer, x, work_, s,
+            packed_route_tokens(active_sequence_batch_, active_sequence_width_));
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({kCfg.hidden, T});
@@ -515,8 +509,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         if (final_chunk) {
             const std::size_t column_bytes =
                 static_cast<std::size_t>(kCfg.hidden) * dtype_size(DType::BF16);
-            const auto* x_src = static_cast<const unsigned char*>(x.data) +
-                                static_cast<std::size_t>(T - 1) * column_bytes;
+            const auto* x_src  = static_cast<const unsigned char*>(x.data) +
+                                 static_cast<std::size_t>(T - 1) * column_bytes;
             const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
                                  static_cast<std::size_t>(T - 1) * column_bytes;
             CUDA_CHECK(
@@ -544,7 +538,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             for (int axis = 0; axis < 3; ++axis) {
                 const auto* src = static_cast<const std::int32_t*>(rope_positions.data) +
                                   static_cast<std::size_t>(axis) * T + (T - 1);
-                auto* dst = static_cast<std::int32_t*>(last_rope_position.data) + axis;
+                auto* dst       = static_cast<std::int32_t*>(last_rope_position.data) + axis;
                 CUDA_CHECK(
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
@@ -773,8 +767,8 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                      Tensor& logits, Tensor& target_tokens,
-                                      bool reset_workspace, cudaEvent_t sampling_ready) {
+                                      Tensor& logits, Tensor& target_tokens, bool reset_workspace,
+                                      cudaEvent_t sampling_ready) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, tap,
@@ -786,7 +780,8 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
-                                      DFlashFeatureSink& sink, bool reset_workspace, cudaEvent_t sampling_ready) {
+                                      DFlashFeatureSink& sink, bool reset_workspace,
+                                      cudaEvent_t sampling_ready) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, sink,
                              reset_workspace, sampling_ready);
@@ -831,7 +826,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const FullLayerW& weights, Tensor& x, int full_index, Phase phase) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     if (active_gqa_envelope_ == nullptr) {
@@ -840,7 +835,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+    ops::rmsnorm(x, *weights.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -852,14 +847,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     const std::int32_t route_tokens =
         packed_route_tokens(active_sequence_batch_, active_sequence_width_);
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_, s,
-                                 route_tokens);
+    Variant::attention_projection(h, *weights.projection, q_flat, gate_flat, k_flat, v_flat, phase,
+                                  work_, s, route_tokens);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    ops::rmsnorm(q, *weights.q_norm, kCfg.rms_eps, true, qn, s);
+    ops::rmsnorm(k, *weights.k_norm, kCfg.rms_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
@@ -886,21 +881,21 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         const Tensor prefix_lengths =
             active_prefix_lengths_ != nullptr ? *active_prefix_lengths_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
+                           kAttnScale, batch_text_kv_->batch_layer_view(full_index),
                            *active_gqa_envelope_, work_, a_batch, s, keep_frac_, xattn_tau_,
                            xattn_min_len_, nullptr, ancestor_mask, prefix_lengths);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                            s, keep_frac_, xattn_tau_, xattn_min_len_);
+                           batch_text_kv_->batch_layer_view(full_index), *active_gqa_envelope_,
+                           work_, a, s, keep_frac_, xattn_tau_, xattn_min_len_);
     }
     ops::sigmoid_mul(gate, a, s);
 
     Tensor a_flat = a.view({kCfg.q_size, T});
-    Variant::attention_output_projection(a_flat, *w.o_proj, x, ph, work_, s, route_tokens);
+    Variant::attention_output_projection(a_flat, *weights.o_proj, x, phase, work_, s, route_tokens);
 }
 
-void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
@@ -909,7 +904,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor g           = control.g;
     Tensor beta        = control.beta;
     Variant::gdn_norm_control_projection(
-        x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta, work_, s,
+        x, *weights.input_norm, kCfg.rms_eps, *weights.projection, h, g, beta, work_, s,
         packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
@@ -917,7 +912,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor qc             = projection.query;
     Tensor kc             = projection.key;
     Tensor vc             = projection.value;
-    if (ph == Phase::Verify) {
+    if (phase == Phase::Verify) {
         if (active_sequence_batch_ == 0 || active_linear_state_slots_ == nullptr) {
             throw std::logic_error(
                 "Verify GDN requires an explicit sequence batch and state slots");
@@ -931,43 +926,40 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor key_output       = kc.view({kCfg.key_dim, width, active_sequence_batch_});
         Tensor value_output     = vc.view({kCfg.value_dim, width, active_sequence_batch_});
         Tensor gate_output      = z.view({kCfg.value_dim, width, active_sequence_batch_});
-        Tensor& conv_states     = state_.conv.at(static_cast<std::size_t>(gidx));
+        Tensor& conv_states     = state_.conv.at(static_cast<std::size_t>(gdn_index));
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         GdnReplayRecordLayer persistent_records;
         GdnReplayRecordLayer live_records;
-        const bool pack_replay =
-            gdn_state_action_ == GdnStateAction::RecordForReplay && replay_records_ != nullptr &&
-            width != replay_records_->spec.width;
+        const bool pack_replay = gdn_state_action_ == GdnStateAction::RecordForReplay &&
+                                 replay_records_ != nullptr && width != replay_records_->spec.width;
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             if (replay_records_ == nullptr) {
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
-            persistent_records = replay_records_->layer(gidx, active_sequence_row_,
-                                                        active_sequence_batch_);
-            live_records       = persistent_records;
+            persistent_records =
+                replay_records_->layer(gdn_index, active_sequence_row_, active_sequence_batch_);
+            live_records = persistent_records;
             if (pack_replay) {
                 // LLD Capture/run: GDN requires record.ne[2]==q.ne[2]; pack only when they differ.
                 const GdnReplayRecordSpec& spec = replay_records_->spec;
-                live_records.conv = work_.alloc(DType::BF16, {spec.conv_channels, width,
-                                                              active_sequence_batch_});
-                live_records.key  = work_.alloc(
+                live_records.conv =
+                    work_.alloc(DType::BF16, {spec.conv_channels, width, active_sequence_batch_});
+                live_records.key = work_.alloc(
                     DType::BF16, {spec.key_dim, spec.qk_heads, width, active_sequence_batch_});
                 live_records.value = work_.alloc(
-                    DType::BF16,
-                    {spec.value_dim, spec.value_heads, width, active_sequence_batch_});
-                live_records.gate = work_.alloc(
-                    DType::FP32, {2, spec.value_heads, width, active_sequence_batch_});
+                    DType::BF16, {spec.value_dim, spec.value_heads, width, active_sequence_batch_});
+                live_records.gate =
+                    work_.alloc(DType::FP32, {2, spec.value_heads, width, active_sequence_batch_});
             }
-            Variant::gdn_input_projection_record(projection_input, *w.projection, *w.conv1d,
-                                                 conv_states, valid, *active_linear_state_slots_,
-                                                 live_records.conv, query_output, key_output,
-                                                 value_output, gate_output, ph, work_, s,
-                                                 active_parent_index_);
+            Variant::gdn_input_projection_record(
+                projection_input, *weights.projection, *weights.conv1d, conv_states, valid,
+                *active_linear_state_slots_, live_records.conv, query_output, key_output,
+                value_output, gate_output, phase, work_, s, active_parent_index_);
         } else {
             Variant::gdn_input_projection_snapshot(
-                projection_input, *w.projection, *w.conv1d, conv_states, valid,
+                projection_input, *weights.projection, *weights.conv1d, conv_states, valid,
                 *active_linear_state_slots_, *active_linear_state_slots_, query_output, key_output,
-                value_output, gate_output, ph, work_, s);
+                value_output, gate_output, phase, work_, s);
         }
 
         Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
@@ -975,7 +967,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor vv          = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
         Tensor o           = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
             {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-        Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
+        Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gdn_index));
         Tensor q_batch =
             q_recurrent.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, width, active_sequence_batch_});
         Tensor k_batch =
@@ -990,11 +982,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             // gdn_normalized_output. Same-stream launch keeps the pointer live
             // until this kernel completes.
             auto fold_scope = work_.scope();
-            ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
-                                               kGdnScale, recurrent_states, valid,
-                                               *active_linear_state_slots_, live_records.key,
-                                               live_records.value, live_records.gate, out_batch, s,
-                                               active_parent_index_, &work_);
+            ops::gated_delta_net_replay_record(
+                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
+                *active_linear_state_slots_, live_records.key, live_records.value,
+                live_records.gate, out_batch, s, active_parent_index_, &work_);
             if (pack_replay) {
                 qwen3_6::pack_replay_record_layer(persistent_records, live_records, s);
             }
@@ -1007,20 +998,20 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
         Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
             {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-        ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+        ops::gated_rmsnorm(o, *weights.gdn_norm, z, kCfg.rms_eps, on, s);
         Tensor on_flat = on.view({kCfg.value_dim, T});
-        Variant::gdn_output_projection(on_flat, *w.out_proj, x, ph, work_, s,
-                                       packed_route_tokens(active_sequence_batch_,
-                                                           active_sequence_width_));
+        Variant::gdn_output_projection(
+            on_flat, *weights.out_proj, x, phase, work_, s,
+            packed_route_tokens(active_sequence_batch_, active_sequence_width_));
         return;
     }
 
     const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
     Tensor qkv      = conv.projected;
-    Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
+    Variant::gdn_input_projection(h, *weights.projection, qkv, z, phase, work_, s);
     Tensor conv_state =
-        state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-    ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state, qc, kc, vc, s);
+        state_.conv_slot(static_cast<std::uint32_t>(gdn_index), linear_state_current_slot_);
+    ops::causal_conv1d_silu_split(qkv, *weights.conv1d, conv_state, qc, kc, vc, s);
 
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
     Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
@@ -1028,31 +1019,31 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor o           = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor recurrent_state =
-        state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        state_.recurrent_slot(static_cast<std::uint32_t>(gdn_index), linear_state_current_slot_);
     ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                          /*normalize_qk=*/true, work_, recurrent_state, o, s);
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    ops::gated_rmsnorm(o, *weights.gdn_norm, z, kCfg.rms_eps, on, s);
 
     Tensor on_flat = on.view({kCfg.value_dim, T});
-    Variant::gdn_output_projection(on_flat, *w.out_proj, x, ph, work_, s,
-                                   packed_route_tokens(active_sequence_batch_,
-                                                       active_sequence_width_));
+    Variant::gdn_output_projection(
+        on_flat, *weights.out_proj, x, phase, work_, s,
+        packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 }
 
-void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
+void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
-    Variant::post_mixer(*post_norm, kCfg.rms_eps, h, *m.payload, x, ph, work_, s,
+    Variant::post_mixer(*post_norm, kCfg.rms_eps, h, *weights.payload, x, phase, work_, s,
                         packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 }
 
 template <class Tap>
-void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
-    const bool prefill = ph == Phase::Prefill;
+void TextContext::run_layers(Tensor& x, Phase phase, Tap& tap) {
+    const bool prefill = phase == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1065,14 +1056,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, ph);
+                attn_mix(full, x, fidx, phase);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                mlp_tail(full.post_attn_norm, full.mlp, x, phase);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1086,23 +1077,23 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                gdn_mix(gdn, x, gidx, ph);
+                gdn_mix(gdn, x, gidx, phase);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, phase);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
     }
 }
 
-void TextContext::run_layers(Tensor& x, Phase ph) {
+void TextContext::run_layers(Tensor& x, Phase phase) {
     NullTap tap;
-    run_layers(x, ph, tap);
+    run_layers(x, phase, tap);
 }
 
 template <class Tap>
@@ -1292,10 +1283,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
                 Tensor mtp_ids = work_.alloc(DType::I32, {len});
                 if (prompt_columns > 0) {
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        mtp_ids.data, mtp_ids_host.data(),
-                        static_cast<std::size_t>(prompt_columns) * sizeof(std::int32_t),
-                        cudaMemcpyHostToDevice, s));
+                    CUDA_CHECK(cudaMemcpyAsync(mtp_ids.data, mtp_ids_host.data(),
+                                               static_cast<std::size_t>(prompt_columns) *
+                                                   sizeof(std::int32_t),
+                                               cudaMemcpyHostToDevice, s));
                 }
                 if (mtp_window.final_column_uses_generated_token) {
                     // Keep the sampled token on-device: a host sync here sat on the TTFT

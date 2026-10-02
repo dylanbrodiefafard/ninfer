@@ -104,9 +104,9 @@ Json parse_sse(const std::string& event) {
 }
 
 int test_parse_string_content() {
-    int failures                = 0;
-    const Json body             = {{"model", "qwen3.6-27b"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+    int failures    = 0;
+    const Json body = {{"model", "qwen3.6-27b"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.model == "qwen3.6-27b", "model parsed");
     failures += check(req.messages.size() == 1, "one message parsed");
@@ -124,10 +124,11 @@ int test_ninfer_capture_object() {
     const Json base = {{"model", "m"},
                        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
     int failures    = 0;
-    failures += check(!parse_chat_completion_request(base, default_limits()).capture_context_checkpoint,
-                      "omitted ninfer does not pin");
-    Json pin          = base;
-    pin["ninfer"]     = Json{{"capture_context_checkpoint", true}};
+    failures +=
+        check(!parse_chat_completion_request(base, default_limits()).capture_context_checkpoint,
+              "omitted ninfer does not pin");
+    Json pin                       = base;
+    pin["ninfer"]                  = Json{{"capture_context_checkpoint", true}};
     const GenerationRequest pinned = parse_chat_completion_request(pin, default_limits());
     failures += check(pinned.capture_context_checkpoint, "ninfer capture flag parsed");
     failures +=
@@ -135,23 +136,25 @@ int test_ninfer_capture_object() {
               "ninfer capture flag reached ExecutionOptions");
     Json unknown      = base;
     unknown["ninfer"] = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
-    failures += check(api_code([&] { (void)parse_chat_completion_request(unknown, default_limits()); }) ==
-                          "ninfer_option_not_supported",
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(unknown, default_limits());
+                      }) == "ninfer_option_not_supported",
                       "unknown ninfer key rejected");
     Json not_bool      = base;
     not_bool["ninfer"] = Json{{"capture_context_checkpoint", 1}};
-    failures += check(throws_api([&] { (void)parse_chat_completion_request(not_bool, default_limits()); }),
-                      "non-bool capture flag rejected");
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(not_bool, default_limits()); }),
+              "non-bool capture flag rejected");
     Json not_object      = base;
     not_object["ninfer"] = true;
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(not_object, default_limits()); }),
-              "non-object ninfer rejected");
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(not_object, default_limits()); }),
+        "non-object ninfer rejected");
     Json ninfer_null      = base;
     ninfer_null["ninfer"] = nullptr;
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(ninfer_null, default_limits()); }),
-              "Chat ninfer null is rejected");
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(ninfer_null, default_limits()); }),
+        "Chat ninfer null is rejected");
     return failures;
 }
 
@@ -507,7 +510,7 @@ int test_parse_tool_history_messages() {
     failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
                       "tool history preserves special tokens in Engine output");
 
-    Json text_parts                 = body;
+    Json text_parts                      = body;
     text_parts["messages"][2]["content"] = Json::array(
         {Json{{"type", "text"}, {"text", "part one "}}, Json{{"type", "text"}, {"text", "two"}}});
     const GenerationRequest parts_req = parse_chat_completion_request(text_parts, default_limits());
@@ -515,13 +518,13 @@ int test_parse_tool_history_messages() {
                           parts_req.messages[2].content[0].text == "part one " &&
                           parts_req.messages[2].content[1].text == "two",
                       "tool text-part content parsed in order");
-    Json image_part                 = body;
+    Json image_part                      = body;
     image_part["messages"][2]["content"] = Json::array(
         {Json{{"type", "image_url"}, {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}});
     failures += check(
         throws_api([&] { (void)parse_chat_completion_request(image_part, default_limits()); }),
         "non-text tool content part rejected");
-    Json null_content                    = body;
+    Json null_content                      = body;
     null_content["messages"][2]["content"] = nullptr;
     failures += check(
         throws_api([&] { (void)parse_chat_completion_request(null_content, default_limits()); }),
@@ -562,13 +565,13 @@ int test_parse_stop_and_max_tokens() {
 }
 
 int test_parse_sampling_carried() {
-    int failures                = 0;
-    const Json body             = {{"model", "m"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                                   {"temperature", 0.7},
-                                   {"top_p", 0.9},
-                                   {"seed", 123},
-                                   {"logit_bias", Json{{"5", -1.5}}}};
+    int failures    = 0;
+    const Json body = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                       {"temperature", 0.7},
+                       {"top_p", 0.9},
+                       {"seed", 123},
+                       {"logit_bias", Json{{"5", -1.5}}}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.7,
                       "temperature carried");
@@ -612,38 +615,40 @@ int test_response_serialization() {
                       "usage without timings has no prompt_tokens_details");
     failures += check(!j.contains("timings"), "top-level timings field present");
 
-    CompletionTimings timings = make_completion_timings(10, 3, 0.25, 1.0);
-    timings.kv_ram_save_ms        = 8.0;
-    timings.kv_ram_load_ms        = 14.0;
-    timings.prefix_reuse_source   = ninfer::PrefixReuseSource::HostRam;
-    timings.prompt_per_second     = 12.34567;
-    timings.ttft_ms               = 358.024679;
-    const Json jt = Json::parse(
-        make_chat_completion_response("id-1", "m", 111, "hello world", "", "stop", usage, &timings));
-    const Json& usage_t   = jt.at("usage");
-    const Json& ptd       = usage_t.at("prompt_tokens_details");
+    CompletionTimings timings   = make_completion_timings(10, 3, 0.25, 1.0);
+    timings.kv_ram_save_ms      = 8.0;
+    timings.kv_ram_load_ms      = 14.0;
+    timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
+    timings.prompt_per_second   = 12.34567;
+    timings.ttft_ms             = 358.024679;
+    const Json jt = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world", "",
+                                                              "stop", usage, &timings));
+    const Json& usage_t    = jt.at("usage");
+    const Json& ptd        = usage_t.at("prompt_tokens_details");
     const Json& ninfer_ptd = ptd.at("ninfer");
     failures += check(usage_t.contains("prompt_tokens_details"),
                       "usage does not nest prompt_tokens_details");
     failures += check(!usage_t.contains("prompt_ms"), "usage duplicates stats at top level");
     failures += check(!usage_t.contains("prompt_eval_count"), "usage still emits Ollama aliases");
-    failures += check(!usage_t.contains("reuse_source"), "usage duplicates reuse_source at top level");
+    failures +=
+        check(!usage_t.contains("reuse_source"), "usage duplicates reuse_source at top level");
     failures += check(!jt.contains("timings"), "top-level timings still present");
     failures += check(ptd.at("cached_tokens") == 0, "ptd cached_tokens zero on cache miss");
     failures += check(ninfer_ptd.at("ttft_ms") == 358.025, "ttft_ms rounded to three decimals");
     failures += check(ninfer_ptd.at("reuse_source") == "host_ram", "reuse_source host_ram");
     timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostDisk;
-    const Json disk_source = Json::parse(
-        make_chat_completion_response("id-1d", "m", 111, "hello world", "", "stop", usage, &timings));
-    failures += check(disk_source.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") ==
-                          "host_disk",
-                      "reuse_source host_disk");
+    const Json disk_source      = Json::parse(make_chat_completion_response(
+        "id-1d", "m", 111, "hello world", "", "stop", usage, &timings));
+    failures +=
+        check(disk_source.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") ==
+                  "host_disk",
+              "reuse_source host_disk");
     timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
     failures += check(ninfer_ptd.at("prefix_reuse_path") == "full_reset",
                       "prefix_reuse_path defaults to full_reset");
     failures += check(ninfer_ptd.at("prefill").at("ms") == 250.0, "prefill ms");
-    failures += check(ninfer_ptd.at("prefill").at("tokens") == 10,
-                      "prefill tokens is the computed suffix");
+    failures +=
+        check(ninfer_ptd.at("prefill").at("tokens") == 10, "prefill tokens is the computed suffix");
     failures += check(ninfer_ptd.at("prefill").at("tok_s") == 12.346,
                       "prefill rates are not rounded to three decimals");
     failures += check(ninfer_ptd.at("decode").at("ms") == 1000.0, "decode ms");
@@ -661,8 +666,8 @@ int test_response_serialization() {
     timings.kv_disk_save_ms = 5.0;
     timings.kv_disk_load_ms = 9.0;
     timings.kv_disk_h2d_ms  = 12.0;
-    const Json disk_usage = Json::parse(
-        make_chat_completion_response("id-1k", "m", 111, "hello world", "", "stop", usage, &timings));
+    const Json disk_usage   = Json::parse(make_chat_completion_response(
+        "id-1k", "m", 111, "hello world", "", "stop", usage, &timings));
     const Json& kv_disk =
         disk_usage.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk");
     failures += check(!kv_disk.contains("used_bytes") && !kv_disk.contains("lifetime"),
@@ -670,12 +675,14 @@ int test_response_serialization() {
     failures += check(kv_disk.at("load_ms") == 9.0, "kv_disk per-request load_ms");
     failures += check(kv_disk.at("h2d_ms") == 12.0, "kv_disk per-request h2d_ms");
     timings.kv_disk_h2d_ms = 0.0;
-    const Json disk_zero = Json::parse(
-        make_chat_completion_response("id-1kz", "m", 111, "hello world", "", "stop", usage, &timings));
-    failures += check(disk_zero.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk").at(
-                          "h2d_ms") == 0.0,
-                      "kv_disk emits zero h2d_ms by default");
-    failures += check(!kv_disk.contains("lifetime"), "kv_disk lifetime restores remain on the request");
+    const Json disk_zero   = Json::parse(make_chat_completion_response(
+        "id-1kz", "m", 111, "hello world", "", "stop", usage, &timings));
+    failures += check(
+        disk_zero.at("usage").at("prompt_tokens_details").at("ninfer").at("kv_disk").at("h2d_ms") ==
+            0.0,
+        "kv_disk emits zero h2d_ms by default");
+    failures +=
+        check(!kv_disk.contains("lifetime"), "kv_disk lifetime restores remain on the request");
 
     // completion_tokens_details carries only OpenAI-standard keys.
     const Json& ctd = usage_t.at("completion_tokens_details");
@@ -684,133 +691,162 @@ int test_response_serialization() {
                       "ctd emits prediction tokens without speculation");
 
     CompletionTimings zero_timings = make_completion_timings(10, 3, 0.25, 1.0);
-    const Json jz = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    const Json jz = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world", "",
+                                                              "stop", usage, &zero_timings));
     failures += check(!jz.at("usage").at("prompt_tokens_details").at("ninfer").contains("kv_ram"),
                       "usage emits the KV RAM block when the tier is off");
-    failures += check(jz.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") == "none",
-                      "reuse_source omitted on cache miss");
+    failures +=
+        check(jz.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") == "none",
+              "reuse_source omitted on cache miss");
     failures += check(!jz.at("usage").contains("reuse_source"),
                       "usage duplicates reuse_source at top level");
 
     zero_timings.prefix_reuse_source = ninfer::PrefixReuseSource::VramResident;
     zero_timings.prefix_reuse_path   = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
     zero_timings.prompt_reused_n     = 4;
-    const Json jturn = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    const Json jturn = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world",
+                                                                 "", "stop", usage, &zero_timings));
     failures += check(jturn.at("usage").at("prompt_tokens_details").at("cached_tokens") == 4,
                       "turn restore still reports cached_tokens");
-    failures += check(jturn.at("usage").at("prompt_tokens_details").at("ninfer")
-                          .at("context_checkpoint")
-                          .at("restored_tokens") == 0,
+    failures += check(jturn.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("restored_tokens") == 0,
                       "turn restore must not copy cached_tokens into restored_tokens");
 
     zero_timings.prefix_reuse_path = ninfer::PrefixReusePath::RestoreContextCheckpoint;
     zero_timings.prompt_reused_n   = 0;
-    const Json jv = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    const Json jv = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world", "",
+                                                              "stop", usage, &zero_timings));
     failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("reuse_source") ==
                           "vram_resident",
                       "reuse_source vram_resident");
-    failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("prefix_reuse_path") ==
-                          "restore_context_checkpoint",
-                      "prefix_reuse_path restore_context_checkpoint");
+    failures +=
+        check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("prefix_reuse_path") ==
+                  "restore_context_checkpoint",
+              "prefix_reuse_path restore_context_checkpoint");
     zero_timings.prefix_reuse_path = ninfer::PrefixReusePath::RestoreTurnRollback;
-    const Json jrollback = Json::parse(make_chat_completion_response(
+    const Json jrollback           = Json::parse(make_chat_completion_response(
         "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
-    failures += check(jrollback.at("usage").at("prompt_tokens_details").at("ninfer")
-                          .at("prefix_reuse_path") == "restore_turn_rollback",
-                      "prefix_reuse_path restore_turn_rollback");
+    failures += check(
+        jrollback.at("usage").at("prompt_tokens_details").at("ninfer").at("prefix_reuse_path") ==
+            "restore_turn_rollback",
+        "prefix_reuse_path restore_turn_rollback");
     zero_timings.prefix_reuse_path = ninfer::PrefixReusePath::RestoreContextCheckpoint;
-    failures += check(jv.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("restored_tokens") == 0,
+    failures += check(jv.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("restored_tokens") == 0,
                       "context_checkpoint restored_tokens without cached_tokens");
     zero_timings.prompt_reused_n                    = 36864;
     zero_timings.restored_context_checkpoint_tokens = 36864;
     zero_timings.captured_context_checkpoint_tokens = 0;
-    const Json jspan = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    const Json jspan = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world",
+                                                                 "", "stop", usage, &zero_timings));
     failures += check(jspan.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
                       "cached_tokens remains the full reused prefix");
-    failures += check(jspan.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("restored_tokens") == 36864,
-                      "restored_tokens is the restored head frontier");
-    failures += check(jspan.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("captured_tokens") == 0,
-                      "restore-only request reports captured_tokens 0");
-    failures += check(jspan.at("usage").at("prompt_tokens_details").at("cached_tokens").get<int>() ==
-                          jspan.at("usage")
+    failures += check(jspan.at("usage")
                               .at("prompt_tokens_details")
                               .at("ninfer")
                               .at("context_checkpoint")
-                              .at("restored_tokens")
-                              .get<int>(),
-                      "restored_tokens matches cached_tokens on a staged restore");
+                              .at("restored_tokens") == 36864,
+                      "restored_tokens is the restored head frontier");
+    failures += check(jspan.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("captured_tokens") == 0,
+                      "restore-only request reports captured_tokens 0");
+    failures +=
+        check(jspan.at("usage").at("prompt_tokens_details").at("cached_tokens").get<int>() ==
+                  jspan.at("usage")
+                      .at("prompt_tokens_details")
+                      .at("ninfer")
+                      .at("context_checkpoint")
+                      .at("restored_tokens")
+                      .get<int>(),
+              "restored_tokens matches cached_tokens on a staged restore");
     zero_timings.prompt_reused_n                    = 0;
     zero_timings.restored_context_checkpoint_tokens = 0;
     zero_timings.captured_context_checkpoint_tokens = 24576;
-    const Json jmade = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    const Json jmade = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world",
+                                                                 "", "stop", usage, &zero_timings));
     failures += check(jmade.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,
                       "freeze-only cached_tokens stays 0");
-    failures += check(jmade.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("captured_tokens") == 24576,
+    failures += check(jmade.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("captured_tokens") == 24576,
                       "captured_tokens is this request's freeze frontier");
-    failures += check(jmade.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("restored_tokens") == 0,
+    failures += check(jmade.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("restored_tokens") == 0,
                       "freeze-only restored_tokens stays 0");
     zero_timings.prompt_reused_n                    = 36864;
     zero_timings.restored_context_checkpoint_tokens = 36864;
     zero_timings.captured_context_checkpoint_tokens = 102400;
-    const Json jboth = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &zero_timings));
+    const Json jboth = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world",
+                                                                 "", "stop", usage, &zero_timings));
     failures += check(jboth.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
                       "combined cached_tokens stays the full reused prefix");
-    failures += check(jboth.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("restored_tokens") == 36864,
+    failures += check(jboth.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("restored_tokens") == 36864,
                       "combined restored_tokens is the restore frontier");
-    failures += check(jboth.at("usage").at("prompt_tokens_details").at("ninfer").at("context_checkpoint")
-                          .at("captured_tokens") == 102400,
+    failures += check(jboth.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("captured_tokens") == 102400,
                       "combined captured_tokens is the freeze frontier");
 
     // Prefill rates cover the non-reused suffix only: a 6-token cached prefix must not
     // inflate prefill tok_s (4 computed tokens over 0.25s = 16, not 40).
-    CompletionTimings reused_timings =
-        make_completion_timings(10, 3, 0.25, 1.0, 0, 0, 0.0, 0.0, 6);
+    CompletionTimings reused_timings = make_completion_timings(10, 3, 0.25, 1.0, 0, 0, 0.0, 0.0, 6);
     failures += check(reused_timings.prompt_reused_n == 6, "prompt_reused_n recorded");
     failures +=
         check(reused_timings.prompt_per_second == 16.0, "prompt_per_second uses computed tokens");
     failures += check(reused_timings.prompt_per_token_ms == 62.5, "prompt_per_token_ms");
     failures += check(reused_timings.predicted_n == 2, "predicted_n is decode eval tokens");
-    const Json jre = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &reused_timings));
+    const Json jre = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world", "",
+                                                               "stop", usage, &reused_timings));
     failures += check(jre.at("usage").at("prompt_tokens_details").at("cached_tokens") == 6,
                       "cached_tokens serialized");
-    failures += check(jre.at("usage").at("prompt_tokens_details").at("ninfer")
-                         .at("prefill")
-                         .at("tokens") == 4,
-                      "serialized prefill tokens reflects computed suffix");
-    failures += check(jre.at("usage").at("prompt_tokens_details").at("ninfer")
-                         .at("prefill")
-                         .at("tok_s") == 16.0,
-                      "serialized prefill tok_s reflects computed suffix");
+    failures += check(
+        jre.at("usage").at("prompt_tokens_details").at("ninfer").at("prefill").at("tokens") == 4,
+        "serialized prefill tokens reflects computed suffix");
+    failures += check(
+        jre.at("usage").at("prompt_tokens_details").at("ninfer").at("prefill").at("tok_s") == 16.0,
+        "serialized prefill tok_s reflects computed suffix");
 
     failures += check(decode_eval_tokens(0) == 0 && decode_eval_tokens(1) == 0 &&
                           decode_eval_tokens(2) == 1,
                       "decode_eval_tokens is max(0, n-1)");
-    ninfer::GenerationRecoveryStats recovery{.attempts = 1, .discarded_tool_calls = 1,
-        .prefill_samples = 1, .prefill_tokens = 7, .prepare_seconds = 0.1, .prefill_seconds = 0.2};
+    ninfer::GenerationRecoveryStats recovery{.attempts             = 1,
+                                             .discarded_tool_calls = 1,
+                                             .prefill_samples      = 1,
+                                             .prefill_tokens       = 7,
+                                             .prepare_seconds      = 0.1,
+                                             .prefill_seconds      = 0.2};
     auto recovered = make_completion_timings(10, 8, 0.25, 1.0, 0, 0, 0, 0, 0, recovery);
     const auto recovered_response = Json::parse(make_chat_completion_response(
         "recovered", "m", 111, "done", "", "stop", CompletionUsage{10, 8}, &recovered));
-    const auto& recovery_details = recovered_response.at("usage").at("prompt_tokens_details").at("ninfer");
+    const auto& recovery_details =
+        recovered_response.at("usage").at("prompt_tokens_details").at("ninfer");
     failures += check(recovered.predicted_n == 6 && recovery_details.at("decode").at("tokens") == 6,
                       "recovery prefill samples were counted as decode tokens");
     failures += check(recovered_response.at("usage").at("completion_tokens") == 8 &&
                           recovery_details.at("recovery").at("prefill_tokens") == 7 &&
                           recovery_details.at("recovery").at("prefill_ms") == 200.0,
                       "recovery work was hidden or changed the completion ledger");
-    recovery.discarded_tool_calls = 0;
+    recovery.discarded_tool_calls       = 0;
     recovery.discarded_reasoning_tokens = 5;
     recovered = make_completion_timings(10, 8, 0.25, 1.0, 0, 0, 0, 0, 0, recovery);
     const auto reasoning_recovered = Json::parse(make_chat_completion_response(
@@ -818,8 +854,11 @@ int test_response_serialization() {
         CompletionUsage{10, 8}, &recovered));
     failures += check(reasoning_recovered.at("usage").at("prompt_tokens") == 10 &&
                           reasoning_recovered.at("usage").at("completion_tokens") == 8 &&
-                          reasoning_recovered.at("usage").at("prompt_tokens_details").at("ninfer")
-                              .at("recovery").at("discarded_reasoning_tokens") == 5,
+                          reasoning_recovered.at("usage")
+                                  .at("prompt_tokens_details")
+                                  .at("ninfer")
+                                  .at("recovery")
+                                  .at("discarded_reasoning_tokens") == 5,
                       "reasoning-only recovery lost accounting without a discarded tool");
     failures += check(prefill_eval_tokens(10, 6) == 4 && prefill_eval_tokens(4, 6) == 0,
                       "prefill_eval_tokens clamps reused to the prompt");
@@ -832,9 +871,9 @@ int test_response_serialization() {
 
     // Speculation + reasoning populate the OpenAI-standard completion details.
     CompletionTimings spec_timings = make_completion_timings(10, 3, 0.25, 1.0, 8, 5);
-    spec_timings.reasoning_tokens = 2;
-    const Json jsp = Json::parse(make_chat_completion_response(
-        "id-1", "m", 111, "hello world", "", "stop", usage, &spec_timings));
+    spec_timings.reasoning_tokens  = 2;
+    const Json jsp = Json::parse(make_chat_completion_response("id-1", "m", 111, "hello world", "",
+                                                               "stop", usage, &spec_timings));
     const Json& ctd_sp = jsp.at("usage").at("completion_tokens_details");
     failures += check(ctd_sp.at("reasoning_tokens") == 2, "ctd reasoning_tokens carried");
     failures += check(ctd_sp.at("accepted_prediction_tokens") == 5, "ctd accepted prediction");
@@ -929,50 +968,55 @@ int test_chunk_serialization() {
         check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
 
-    CompletionTimings ram_timings = make_completion_timings(2, 5, 0.25, 1.0);
-    ram_timings.kv_ram_save_ms        = 8.0;
-    ram_timings.kv_ram_load_ms        = 14.0;
-    ram_timings.prefix_reuse_source   = ninfer::PrefixReuseSource::VramResident;
-    const Json ram_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ram_timings));
+    CompletionTimings ram_timings   = make_completion_timings(2, 5, 0.25, 1.0);
+    ram_timings.kv_ram_save_ms      = 8.0;
+    ram_timings.kv_ram_load_ms      = 14.0;
+    ram_timings.prefix_reuse_source = ninfer::PrefixReuseSource::VramResident;
+    const Json ram_chunk   = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ram_timings));
     const Json& ram_ninfer = ram_chunk.at("usage").at("prompt_tokens_details").at("ninfer");
     failures += check(ram_chunk.at("usage").contains("prompt_tokens_details"),
                       "usage chunk does not nest prompt_tokens_details");
     failures += check(!ram_chunk.at("usage").contains("kv_ram_used_bytes"),
                       "usage chunk duplicates kv stats at top level");
-    failures += check(!ram_ninfer.at("kv_ram").contains("used_bytes"),
-                      "usage chunk kv_ram used_bytes");
+    failures +=
+        check(!ram_ninfer.at("kv_ram").contains("used_bytes"), "usage chunk kv_ram used_bytes");
     failures += check(ram_ninfer.at("kv_ram").at("load_ms") == 14.0, "usage chunk kv_ram load_ms");
     failures += check(ram_ninfer.at("reuse_source") == "vram_resident", "usage chunk reuse_source");
 
-    CompletionTimings ckpt_timings = make_completion_timings(2, 5, 0.25, 1.0);
-    ckpt_timings.prefix_reuse_source                = ninfer::PrefixReuseSource::HostRam;
-    ckpt_timings.prefix_reuse_path                  = ninfer::PrefixReusePath::RestoreContextCheckpoint;
-    ckpt_timings.prompt_reused_n                    = 36864;
+    CompletionTimings ckpt_timings   = make_completion_timings(2, 5, 0.25, 1.0);
+    ckpt_timings.prefix_reuse_source = ninfer::PrefixReuseSource::HostRam;
+    ckpt_timings.prefix_reuse_path   = ninfer::PrefixReusePath::RestoreContextCheckpoint;
+    ckpt_timings.prompt_reused_n     = 36864;
     ckpt_timings.restored_context_checkpoint_tokens = 36864;
     ckpt_timings.captured_context_checkpoint_tokens = 102400;
-    const Json ckpt_chunk =
-        parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ckpt_timings));
+    const Json ckpt_chunk   = parse_sse(make_chat_chunk_usage("id", "m", 1, usage, &ckpt_timings));
     const Json& ckpt_ninfer = ckpt_chunk.at("usage").at("prompt_tokens_details").at("ninfer");
-    failures += check(ckpt_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
-                      "stream usage chunk cached_tokens is the full reused prefix");
+    failures +=
+        check(ckpt_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens") == 36864,
+              "stream usage chunk cached_tokens is the full reused prefix");
     failures += check(ckpt_ninfer.at("prefix_reuse_path") == "restore_context_checkpoint",
                       "stream usage chunk prefix_reuse_path");
     failures += check(ckpt_ninfer.at("context_checkpoint").at("restored_tokens") == 36864,
                       "stream usage chunk restored_tokens is the restored head frontier");
     failures += check(ckpt_ninfer.at("context_checkpoint").at("captured_tokens") == 102400,
                       "stream usage chunk captured_tokens is the freeze frontier");
-    failures += check(ckpt_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens").get<int>() ==
-                          ckpt_ninfer.at("context_checkpoint").at("restored_tokens").get<int>(),
-                      "stream usage chunk restored_tokens matches cached_tokens");
-    const Json finish_ckpt = parse_sse(
-        make_chat_chunk_final("id", "m", 1, "stop", true, &ckpt_timings, &usage));
-    failures += check(finish_ckpt.at("usage").at("prompt_tokens_details").at("ninfer")
-                          .at("context_checkpoint")
-                          .at("restored_tokens") == 36864,
+    failures +=
+        check(ckpt_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens").get<int>() ==
+                  ckpt_ninfer.at("context_checkpoint").at("restored_tokens").get<int>(),
+              "stream usage chunk restored_tokens matches cached_tokens");
+    const Json finish_ckpt =
+        parse_sse(make_chat_chunk_final("id", "m", 1, "stop", true, &ckpt_timings, &usage));
+    failures += check(finish_ckpt.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("restored_tokens") == 36864,
                       "finish-with-usage chunk restored_tokens");
-    failures += check(finish_ckpt.at("usage").at("prompt_tokens_details").at("ninfer")
-                          .at("context_checkpoint")
-                          .at("captured_tokens") == 102400,
+    failures += check(finish_ckpt.at("usage")
+                              .at("prompt_tokens_details")
+                              .at("ninfer")
+                              .at("context_checkpoint")
+                              .at("captured_tokens") == 102400,
                       "finish-with-usage chunk captured_tokens");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
@@ -1058,7 +1102,7 @@ int test_system_prepend_merge() {
     const GenerationRequest leading_system = parse_chat_completion_request(
         Json{{"model", "m"},
              {"messages", Json::array({Json{{"role", "system"}, {"content", "Be brief."}},
-                                      Json{{"role", "user"}, {"content", "hello"}}})}},
+                                       Json{{"role", "user"}, {"content", "hello"}}})}},
         default_limits());
     const ninfer::PromptInput merged = translate(leading_system, "P");
     failures += check(merged.messages.size() == 2, "leading system prepend message count");
@@ -1069,7 +1113,7 @@ int test_system_prepend_merge() {
     const GenerationRequest empty_system = parse_chat_completion_request(
         Json{{"model", "m"},
              {"messages", Json::array({Json{{"role", "system"}, {"content", ""}},
-                                      Json{{"role", "user"}, {"content", "hello"}}})}},
+                                       Json{{"role", "user"}, {"content", "hello"}}})}},
         default_limits());
     const ninfer::PromptInput empty_merged = translate(empty_system, "P");
     failures += check(empty_merged.messages[0].role == ninfer::ChatRole::System &&
@@ -1079,7 +1123,7 @@ int test_system_prepend_merge() {
     const GenerationRequest late_system = parse_chat_completion_request(
         Json{{"model", "m"},
              {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}},
-                                      Json{{"role", "system"}, {"content", "later"}}})}},
+                                       Json{{"role", "system"}, {"content", "later"}}})}},
         default_limits());
     const ninfer::PromptInput late = translate(late_system, "P");
     failures += check(late.messages.size() == 3, "late system prepend message count");
@@ -1096,9 +1140,9 @@ int test_system_prepend_merge() {
     const GenerationRequest follow_up = parse_chat_completion_request(
         Json{{"model", "m"},
              {"messages", Json::array({Json{{"role", "system"}, {"content", "Be brief."}},
-                                      Json{{"role", "user"}, {"content", "q1"}},
-                                      Json{{"role", "assistant"}, {"content", "old"}},
-                                      Json{{"role", "user"}, {"content", "q2"}}})}},
+                                       Json{{"role", "user"}, {"content", "q1"}},
+                                       Json{{"role", "assistant"}, {"content", "old"}},
+                                       Json{{"role", "user"}, {"content", "q2"}}})}},
         default_limits());
     const ninfer::PromptInput follow = translate(follow_up, "P");
     failures += check(follow.messages[0].role == ninfer::ChatRole::System &&
@@ -1128,22 +1172,23 @@ int test_system_prepend_merge() {
     const GenerationRequest tool_history = parse_chat_completion_request(
         Json{{"model", "m"},
              {"messages",
-              Json::array(
-                  {Json{{"role", "user"}, {"content", "weather?"}},
-                   Json{{"role", "assistant"},
-                        {"content", nullptr},
-                        {"tool_calls",
-                         Json::array({Json{{"id", "call_1"},
-                                           {"type", "function"},
-                                           {"function", Json{{"name", "get_weather"},
-                                                             {"arguments", R"({"city":"Paris"})"}}}}})}},
-                   Json{{"role", "tool"},
-                        {"tool_call_id", "call_1"},
-                        {"content", R"({"temp":20})"}}})},
+              Json::array({Json{{"role", "user"}, {"content", "weather?"}},
+                           Json{{"role", "assistant"},
+                                {"content", nullptr},
+                                {"tool_calls",
+                                 Json::array({Json{
+                                     {"id", "call_1"},
+                                     {"type", "function"},
+                                     {"function", Json{{"name", "get_weather"},
+                                                       {"arguments", R"({"city":"Paris"})"}}}}})}},
+                           Json{{"role", "tool"},
+                                {"tool_call_id", "call_1"},
+                                {"content", R"({"temp":20})"}}})},
              {"tools", Json::array({tool})}},
         default_limits());
     const ninfer::PromptInput looped = translate(tool_history, "P");
-    failures += check(!looped.options.tool_jsons.empty(), "tool-loop tools were dropped when prepending");
+    failures +=
+        check(!looped.options.tool_jsons.empty(), "tool-loop tools were dropped when prepending");
     failures += check(looped.messages[0].role == ninfer::ChatRole::System &&
                           joined_text(looped.messages[0]) == "P",
                       "tool-loop prepend did not insert a leading System");
@@ -1164,14 +1209,15 @@ int run_sse_bench() {
     const std::string model = "qwen3.8-27b";
     const std::string delta = " the";
     auto nlohmann_chunk     = [&] {
-        nlohmann::json payload = {{"id", id},
-                                  {"object", "chat.completion.chunk"},
-                                  {"created", 1},
-                                  {"model", model},
-                                  {"choices", nlohmann::json::array(
-                                                 {nlohmann::json{{"index", 0},
-                                                                 {"delta", nlohmann::json{{"content", delta}}},
-                                                                 {"finish_reason", nullptr}}})}};
+        nlohmann::json payload = {
+            {"id", id},
+            {"object", "chat.completion.chunk"},
+            {"created", 1},
+            {"model", model},
+            {"choices",
+             nlohmann::json::array({nlohmann::json{{"index", 0},
+                                                   {"delta", nlohmann::json{{"content", delta}}},
+                                                   {"finish_reason", nullptr}}})}};
         return std::string("data: ") + payload.dump() + "\n\n";
     };
     auto time_ns = [](auto fn, int repeats) {
@@ -1196,10 +1242,10 @@ int run_sse_bench() {
                 {"object", "chat.completion.chunk"},
                 {"created", 1},
                 {"model", model},
-                {"choices", nlohmann::json::array({nlohmann::json{
-                    {"index", 0},
-                    {"delta", nlohmann::json{{"content", long_delta}}},
-                    {"finish_reason", nullptr}}})}};
+                {"choices", nlohmann::json::array(
+                                {nlohmann::json{{"index", 0},
+                                                {"delta", nlohmann::json{{"content", long_delta}}},
+                                                {"finish_reason", nullptr}}})}};
             return std::string("data: ") + payload.dump() + "\n\n";
         },
         repeats);
@@ -1222,11 +1268,12 @@ int test_owui_youtube_fetch_url_logged_turn() {
         "</function>\n</tool_call>";
     const std::string reasoning =
         "The user shared a YouTube link without any instructions. Per my instructions: "
-        "\"When given a YouTube link and no instructions provide a detailed summary of the video.\"\n\n"
-        "I need to fetch the YouTube URL to get details about the video. Let me use fetch_url on it.\n";
+        "\"When given a YouTube link and no instructions provide a detailed summary of the "
+        "video.\"\n\n"
+        "I need to fetch the YouTube URL to get details about the video. Let me use fetch_url on "
+        "it.\n";
     const Json user_message =
-        Json{{"role", "user"},
-             {"content", "https://youtu.be/7cEdPWh9hqU?si=48PBda0VDwvAzclN"}};
+        Json{{"role", "user"}, {"content", "https://youtu.be/7cEdPWh9hqU?si=48PBda0VDwvAzclN"}};
     const Json fetch_tool =
         Json{{"type", "function"},
              {"function",
@@ -1242,54 +1289,56 @@ int test_owui_youtube_fetch_url_logged_turn() {
 
     int failures = 0;
 
-    const GenerationRequest no_tools = parse_chat_completion_request(
-        Json{{"model", "angel-gpt27b-5090"},
-             {"messages", Json::array({user_message})},
-             {"stream", true}},
-        default_limits());
+    const GenerationRequest no_tools =
+        parse_chat_completion_request(Json{{"model", "angel-gpt27b-5090"},
+                                           {"messages", Json::array({user_message})},
+                                           {"stream", true}},
+                                      default_limits());
     failures += check(!no_tools.uses_tools() && !no_tools.has_tool_history(),
                       "logged request without tools is not tool-capable");
 
-    const Json leaked = Json::parse(make_chat_completion_response(
+    const Json leaked          = Json::parse(make_chat_completion_response(
         "chatcmpl-owui", "angel-gpt27b-5090", 1788077000, content, reasoning, "stop", usage));
     const Json& leaked_message = leaked.at("choices").at(0).at("message");
     failures += check(leaked.at("choices").at(0).at("finish_reason") == "stop",
                       "tools-off finish_reason is stop");
-    failures += check(leaked_message.at("content") == content,
-                      "tools-off content keeps the logged xml");
+    failures +=
+        check(leaked_message.at("content") == content, "tools-off content keeps the logged xml");
     failures += check(leaked_message.at("reasoning_content") == reasoning,
                       "tools-off reasoning matches the logged think block");
-    failures += check(!leaked_message.contains("tool_calls"),
-                      "tools-off response has no tool_calls");
+    failures +=
+        check(!leaked_message.contains("tool_calls"), "tools-off response has no tool_calls");
 
-    const GenerationRequest with_tools = parse_chat_completion_request(
-        Json{{"model", "angel-gpt27b-5090"},
-             {"messages", Json::array({user_message})},
-             {"stream", true},
-             {"tools", Json::array({fetch_tool})}},
-        default_limits());
+    const GenerationRequest with_tools =
+        parse_chat_completion_request(Json{{"model", "angel-gpt27b-5090"},
+                                           {"messages", Json::array({user_message})},
+                                           {"stream", true},
+                                           {"tools", Json::array({fetch_tool})}},
+                                      default_limits());
     failures += check(with_tools.uses_tools(), "logged request with fetch_url is tool-capable");
 
     const std::string spoken =
         "I'll look up what that video is about so I can summarize it for you.";
-    const std::vector<ToolCall> calls{{.id = "call_fixture_0", .name = "fetch_url",
-        .arguments_json = R"({"url":"https://www.youtube.com/watch?v=7cEdPWh9hqU"})"}};
+    const std::vector<ToolCall> calls{
+        {.id             = "call_fixture_0",
+         .name           = "fetch_url",
+         .arguments_json = R"({"url":"https://www.youtube.com/watch?v=7cEdPWh9hqU"})"}};
 
-    const Json native = Json::parse(make_chat_completion_tool_response(
+    const Json native          = Json::parse(make_chat_completion_tool_response(
         "chatcmpl-owui", "angel-gpt27b-5090", 1788077000, spoken, reasoning, calls, usage));
     const Json& native_message = native.at("choices").at(0).at("message");
     failures += check(native.at("choices").at(0).at("finish_reason") == "tool_calls",
                       "tools-on finish_reason is tool_calls");
-    failures += check(native_message.at("content") == spoken,
-                      "tools-on serialized content has no xml");
+    failures +=
+        check(native_message.at("content") == spoken, "tools-on serialized content has no xml");
     failures += check(native_message.at("content").get<std::string>().find("<tool_call>") ==
                           std::string::npos,
                       "tools-on content does not contain tool markup");
     failures += check(native_message.at("reasoning_content") == reasoning,
                       "tools-on reasoning is unchanged");
-    failures += check(native_message.at("tool_calls").at(0).at("function").at("name") ==
-                          "fetch_url",
-                      "tools-on wire tool name");
+    failures +=
+        check(native_message.at("tool_calls").at(0).at("function").at("name") == "fetch_url",
+              "tools-on wire tool name");
 
     return failures;
 }

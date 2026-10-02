@@ -1,7 +1,7 @@
 """Observable paired-score accounting and distribution diagnostics."""
 
-import math
 import json
+import math
 import struct
 import tempfile
 import unittest
@@ -18,7 +18,8 @@ class VerifyCompareTests(unittest.TestCase):
             # TSV-only checkpoints must not imply that distribution evidence exists.
             for profile in "ac":
                 (root / f"phase-c-{profile}-common-p8.tsv").write_text(
-                    "document\tposition\ttoken\tnll\n0\t9\t42\t1\n")
+                    "document\tposition\ttoken\tnll\n0\t9\t42\t1\n"
+                )
             result = campaign_report(root)
             self.assertIn("A/c1-w5-8k", result["missing_cells"])
             self.assertIn("C/c4-w5-8k", result["missing_cells"])
@@ -42,9 +43,9 @@ class VerifyCompareTests(unittest.TestCase):
         result = compare(a, b, block_size=2)
         self.assertEqual(result["tokens"], 5)
         self.assertEqual(result["blocks"], 3)
-        self.assertEqual(result["delta_nll"], .25)
-        self.assertEqual(result["block_bootstrap_95_ci"], [.25, .25])
-        self.assertAlmostEqual(result["ppl_ratio"], math.exp(.25))
+        self.assertEqual(result["delta_nll"], 0.25)
+        self.assertEqual(result["block_bootstrap_95_ci"], [0.25, 0.25])
+        self.assertAlmostEqual(result["ppl_ratio"], math.exp(0.25))
 
     def test_mismatched_gold_or_position_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -53,15 +54,17 @@ class VerifyCompareTests(unittest.TestCase):
             compare({(0, 1): (3, 1.0)}, {(0, 2): (3, 1.0)})
 
     def test_context_trends_do_not_cross_document_resets(self):
-        a = {(doc, pos): (pos, 1.0) for doc, length in ((0, 1100), (1, 100))
-             for pos in range(9, 9 + length)}
-        b = {key: (token, nll + (.25 if key[0] == 0 else .5))
-             for key, (token, nll) in a.items()}
+        a = {
+            (doc, pos): (pos, 1.0)
+            for doc, length in ((0, 1100), (1, 100))
+            for pos in range(9, 9 + length)
+        }
+        b = {key: (token, nll + (0.25 if key[0] == 0 else 0.5)) for key, (token, nll) in a.items()}
         result = compare(a, b)
         trends = result["position_trends"]
         self.assertEqual([v["tokens"] for v in trends], [1024, 76, 100])
         self.assertTrue(all(v["first"][0] == v["last"][0] for v in trends))
-        self.assertEqual([v["delta_nll"] for v in trends], [.25, .25, .5])
+        self.assertEqual([v["delta_nll"] for v in trends], [0.25, 0.25, 0.5])
 
     def test_replicated_lanes_are_counted_once_and_must_be_exact(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -82,8 +85,10 @@ class VerifyCompareTests(unittest.TestCase):
             b.write_bytes(header + struct.pack("<2H", 0, 0x3F80))
             result = logit_comparison(a, b)[0]
             self.assertAlmostEqual(result["delta_nll"], math.log1p(math.e) - math.log(2))
-            self.assertAlmostEqual(result["total_variation"], .5 - 1 / (1 + math.e))
-            self.assertAlmostEqual(result["kl_baseline_candidate"], math.log1p(math.e) - .5 - math.log(2))
+            self.assertAlmostEqual(result["total_variation"], 0.5 - 1 / (1 + math.e))
+            self.assertAlmostEqual(
+                result["kl_baseline_candidate"], math.log1p(math.e) - 0.5 - math.log(2)
+            )
             self.assertEqual(result["candidate_top"], 1)
             self.assertEqual(result["candidate_margin"], 1)
 

@@ -54,7 +54,7 @@ __device__ __forceinline__ int4 gqa_s3_dequant_v_bf16x8(const std::uint8_t* code
     for (int i = 0; i < 4; ++i) {
         const float lo = gqa_s3_e2m1_value(codes4[i] & 0x0fu);
         const float hi = gqa_s3_e2m1_value((codes4[i] >> 4) & 0x0fu);
-        packed[i] = pack_bf16x2(lo * s[2 * i], hi * s[2 * i + 1]);
+        packed[i]      = pack_bf16x2(lo * s[2 * i], hi * s[2 * i + 1]);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
@@ -65,13 +65,12 @@ __device__ __forceinline__ int4 gqa_s3_dequant_v_bf16x8(const std::uint8_t* code
 // const memory, which the consumer-side PV dequant hits per fragment). Same
 // exact values: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
 __device__ __forceinline__ float gqa_s3_e2m1_value_alu(std::uint8_t code) {
-    const int e = (code >> 1) & 0x03;
+    const int e   = (code >> 1) & 0x03;
     const float m = static_cast<float>(code & 0x01u);
     // e2m1: sign|exp(2)|mant(1). exp=0 -> subnormal 0.m (0, 0.5);
     // exp>=1 -> (1 + 0.5*m) * 2^(e-1) = {1,1.5,2,3,4,6}. Matches the host
     // decode_e2m1_word table (mantissa weight is 0.5, not 1).
-    const float mag = (e == 0) ? 0.5f * m
-                               : static_cast<float>(1 << (e - 1)) * (1.f + 0.5f * m);
+    const float mag = (e == 0) ? 0.5f * m : static_cast<float>(1 << (e - 1)) * (1.f + 0.5f * m);
     return (code & 0x08u) ? -mag : mag;
 }
 
@@ -91,8 +90,7 @@ __device__ __forceinline__ float gqa_s3_e2m1_value_alu(std::uint8_t code) {
 // tile-ascending tie-break inside the threshold bin, so a host oracle can
 // rebuild the exact keep set from a dump.
 template <typename Geometry, int Bc, bool MultiBatch>
-__launch_bounds__(256) __global__
-void gqa_attention_decode_rank_nvfp4s3_kernel(
+__launch_bounds__(256) __global__ void gqa_attention_decode_rank_nvfp4s3_kernel(
     const __nv_bfloat16* q, const std::int32_t* pos, const std::int32_t* block_tables,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
     std::int32_t column_begin, std::int32_t splits, float keep_frac, const float* k_mean,
@@ -110,13 +108,12 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
     const std::int32_t* block_table = block_tables;
     std::int64_t column_base        = column_begin;
     if constexpr (MultiBatch) {
-        block_table =
-            block_tables + static_cast<std::int64_t>(table_rows[batch]) * table_stride;
+        block_table = block_tables + static_cast<std::int64_t>(table_rows[batch]) * table_stride;
         column_base += static_cast<std::int64_t>(batch) * full_width;
     }
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
 
-    const int row = batch * Geometry::KVHeads + kv_head;
+    const int row               = batch * Geometry::KVHeads + kv_head;
     std::int32_t* keep_list_row = keep_tiles + static_cast<std::int64_t>(row) * keep_stride;
     std::int32_t* off_row       = split_off + static_cast<std::int64_t>(row) * (splits + 1);
 
@@ -131,8 +128,8 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
     // popcount prefix, q_mean, bin edges, the threshold-bin member list, and
     // the small cross-warp scratch.
     extern __shared__ std::uint8_t rank_smem[];
-    float* warp_score = reinterpret_cast<float*>(rank_smem);
-    int* warp_hist    = reinterpret_cast<int*>(warp_score + std::size_t(Warps) * per_warp);
+    float* warp_score        = reinterpret_cast<float*>(rank_smem);
+    int* warp_hist           = reinterpret_cast<int*>(warp_score + std::size_t(Warps) * per_warp);
     std::uint32_t* flags     = reinterpret_cast<std::uint32_t*>(warp_hist + Warps * 64);
     std::uint32_t* word_pref = reinterpret_cast<std::uint32_t*>(flags + flag_words);
     float* q_mean_s          = reinterpret_cast<float*>(word_pref + flag_words);
@@ -148,19 +145,25 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
         keep_count[row] = 0;
         for (std::int32_t s = tid; s <= splits; s += 256) { off_row[s] = 0; }
     };
-    if (window <= 0 || tiles == 0) { write_neutral(); return; }
+    if (window <= 0 || tiles == 0) {
+        write_neutral();
+        return;
+    }
 
     // q_mean[d] = the average of the group's BF16 query heads (T=1 step).
     if (tid < D) {
         float acc = 0.0f;
         for (int g = 0; g < Geometry::GroupSize; ++g) {
-            acc += __bfloat162float(q[gqa_q_index<Geometry>(kv_head * Geometry::GroupSize + g,
-                                                            tid, 0)]);
+            acc += __bfloat162float(
+                q[gqa_q_index<Geometry>(kv_head * Geometry::GroupSize + g, tid, 0)]);
         }
         q_mean_s[tid] = acc / static_cast<float>(Geometry::GroupSize);
     }
     if (tid < Warps * 64) { warp_hist[tid] = 0; }
-    if (tid < Warps) { warp_min[tid] = FLT_MAX; warp_max[tid] = -FLT_MAX; }
+    if (tid < Warps) {
+        warp_min[tid] = FLT_MAX;
+        warp_max[tid] = -FLT_MAX;
+    }
     __syncthreads();
 
     // Phase 1: per-tile proxy scores, one warp per tile, 8 d's per lane
@@ -182,8 +185,8 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
         for (int o = 16; o > 0; o >>= 1) { acc += __shfl_down_sync(0xffffffffu, acc, o); }
         if (lane == 0) {
             warp_score[static_cast<std::size_t>(warp) * per_warp + it] = acc;
-            warp_min[warp] = fminf(warp_min[warp], acc);
-            warp_max[warp] = fmaxf(warp_max[warp], acc);
+            warp_min[warp]                                             = fminf(warp_min[warp], acc);
+            warp_max[warp]                                             = fmaxf(warp_max[warp], acc);
         }
     }
     __syncthreads();
@@ -197,23 +200,24 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
             lo = fmin(lo, __shfl_xor_sync(0xffffffffu, lo, o));
             hi = fmax(hi, __shfl_xor_sync(0xffffffffu, hi, o));
         }
-        if (lane == 0) { warp_min[0] = lo; warp_max[0] = hi; }
+        if (lane == 0) {
+            warp_min[0] = lo;
+            warp_max[0] = hi;
+        }
     }
     __syncthreads();
     const float lo_all = warp_min[0];
     const float range  = warp_max[0] - lo_all;
     if (tid <= 64) {
-        bin_edge[tid] = (range > 0.0f)
-                            ? (lo_all + range * static_cast<float>(tid) / 64.0f)
-                            : (lo_all + static_cast<float>(tid));
+        bin_edge[tid] = (range > 0.0f) ? (lo_all + range * static_cast<float>(tid) / 64.0f)
+                                       : (lo_all + static_cast<float>(tid));
     }
     __syncthreads();
 
     // Per-tile coarse bin (deterministic; re-derived from the stored score so
     // no k_mean bytes are re-read).
     const auto tile_bin = [&](int kb) {
-        const float s =
-            warp_score[static_cast<std::size_t>(kb % Warps) * per_warp + kb / Warps];
+        const float s = warp_score[static_cast<std::size_t>(kb % Warps) * per_warp + kb / Warps];
         if (range <= 0.0f) { return 0; }
         const int b = static_cast<int>((s - lo_all) / range * 64.0f);
         return (b > 63) ? 63 : b;
@@ -232,17 +236,20 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
         global_hist[tid] = acc;
     }
     __syncthreads();
-    const int topk =
-        (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac) < 1) ? 1
-                                                                           : (static_cast<int>(static_cast<std::size_t>(tiles) *
-                                                                                          keep_frac));
+    const int topk = (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac) < 1)
+                         ? 1
+                         : (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac));
     if (tid == 0) {
-        int cum = 0;
+        int cum   = 0;
         thr_bin_s = 0;
         needed_s  = 0;
         for (int b = 63; b >= 0; --b) {
             const int next = cum + global_hist[b];
-            if (next >= topk) { thr_bin_s = b; needed_s = topk - cum; break; }
+            if (next >= topk) {
+                thr_bin_s = b;
+                needed_s  = topk - cum;
+                break;
+            }
             cum = next;
         }
     }
@@ -277,19 +284,15 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
         }
     }
     __syncthreads();
-    const int sinks =
-        (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.2f) < 1) ? 1
-                                                                                  : (static_cast<int>(static_cast<std::size_t>(tiles) *
-                                                                                              keep_frac * 0.2f));
-    const int win =
-        (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.4f) < 1) ? 1
-                                                                                  : (static_cast<int>(static_cast<std::size_t>(tiles) *
-                                                                                              keep_frac * 0.4f));
+    const int sinks = (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.2f) < 1)
+                          ? 1
+                          : (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.2f));
+    const int win   = (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.4f) < 1)
+                          ? 1
+                          : (static_cast<int>(static_cast<std::size_t>(tiles) * keep_frac * 0.4f));
     if (warp == 0) {
         for (int kb = lane; kb < tiles; kb += 32) {
-            if (kb < sinks || kb >= tiles - win) {
-                atomicOr(&flags[kb >> 5], 1u << (kb & 31));
-            }
+            if (kb < sinks || kb >= tiles - win) { atomicOr(&flags[kb >> 5], 1u << (kb & 31)); }
         }
     }
     __syncthreads();
@@ -302,7 +305,7 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
     const int chunk = (tiles + 255) / 256;
     const int kb_lo = tid * chunk;
     const int kb_hi = (kb_lo + chunk < tiles) ? (kb_lo + chunk) : tiles;
-    int local_n = 0;
+    int local_n     = 0;
     for (int kb = kb_lo; kb < kb_hi; ++kb) {
         if ((flags[kb >> 5] >> (kb & 31)) & 1u) { ++local_n; }
     }
@@ -329,9 +332,7 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
     {
         int i2 = 0;
         for (int kb = kb_lo; kb < kb_hi; ++kb) {
-            if ((flags[kb >> 5] >> (kb & 31)) & 1u) {
-                keep_list_row[base + excl + i2++] = kb;
-            }
+            if ((flags[kb >> 5] >> (kb & 31)) & 1u) { keep_list_row[base + excl + i2++] = kb; }
         }
     }
     if (tid == 0) {
@@ -345,17 +346,17 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
     // kernel (gqa_small_t_active_splits + its units_per_split choice): split s
     // processes the whole tiles covering its key range [s*units, s*units+units)
     // (tile-aligned in tile-split mode, floor-to-tile otherwise).
-    const bool tile_split      = tiles >= active;
-    const int units_per_split  = tile_split ? div_up(tiles, active) : div_up(window, active);
+    const bool tile_split     = tiles >= active;
+    const int units_per_split = tile_split ? div_up(tiles, active) : div_up(window, active);
     for (std::size_t i = 0; i < flag_words; ++i) {
         word_pref[i] = (i * 32 < tiles) ? __popc(flags[i]) : 0u;
     }
     if (tid == 0) {
         std::uint32_t run = 0;
-        const int words = (tiles + 31) / 32;
+        const int words   = (tiles + 31) / 32;
         for (int i = 0; i < words; ++i) {
             const std::uint32_t p = word_pref[i];
-            word_pref[i]         = run;
+            word_pref[i]          = run;
             run += p;
         }
         for (int i = words; i < flag_words; ++i) { word_pref[i] = run; }
@@ -365,9 +366,8 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
 
     if (warp == 0) {
         for (std::int32_t s = lane; s <= active; s += 32) {
-            const int first_tile =
-                tile_split ? (s * units_per_split) : (s * units_per_split) / Bc;
-            int kept_before = 0;
+            const int first_tile = tile_split ? (s * units_per_split) : (s * units_per_split) / Bc;
+            int kept_before      = 0;
             if (first_tile < tiles) {
                 const int w   = first_tile >> 5;
                 const int rem = first_tile & 31;
@@ -378,19 +378,17 @@ void gqa_attention_decode_rank_nvfp4s3_kernel(
             }
             off_row[s] = kept_before;
         }
-        if (lane == 0) {
-            off_row[active] = rank_total_s;
-        }
+        if (lane == 0) { off_row[active] = rank_total_s; }
     }
 }
 
 // Dynamic-smem size for the rank kernel (must match its extern __shared__ layout).
 inline std::size_t gqa_s3_decode_rank_smem_bytes(std::int32_t n_pow2) {
     const std::size_t flag_words = (static_cast<std::size_t>(n_pow2) + 31) / 32;
-    const std::size_t per_warp  = (static_cast<std::size_t>(n_pow2) + 7) / 8;
-    return 8 * per_warp * 4 /*warp_score*/ + 8 * 64 * 4 /*warp_hist*/ +
-           flag_words * 4 /*flags*/ + flag_words * 4 /*word_pref*/ + 256 * 4 /*q_mean*/ +
-           65 * 4 /*bin_edge*/ + 256 * 4 /*member_list*/;
+    const std::size_t per_warp   = (static_cast<std::size_t>(n_pow2) + 7) / 8;
+    return 8 * per_warp * 4 /*warp_score*/ + 8 * 64 * 4 /*warp_hist*/ + flag_words * 4 /*flags*/ +
+           flag_words * 4 /*word_pref*/ + 256 * 4 /*q_mean*/ + 65 * 4 /*bin_edge*/ +
+           256 * 4 /*member_list*/;
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
@@ -398,13 +396,12 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm,
           bool FusedFill = true, bool StrictPV = false, bool TileSkip = false>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_nvfp4s3_tiled_kernel(
-        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
-        std::uint8_t* cache_k, std::uint8_t* cache_v, std::uint8_t* cache_k_scale,
-        std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
-        const std::int32_t* valid_columns, const std::int32_t* table_rows,
-        std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
-        std::int32_t logical_capacity, float scale, __nv_bfloat16* partial_acc, float* partial_m,
-        float* partial_l,
+        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::uint8_t* cache_k,
+        std::uint8_t* cache_v, std::uint8_t* cache_k_scale, std::uint8_t* cache_v_scale,
+        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+        std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
         const std::int32_t* keep_tiles, const std::int32_t* split_off, std::int32_t max_keep) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -437,13 +434,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     // mma is still reading its codes. K codes stay single-buffered exactly as
     // the FP4 path has always run them (the QK ldmatrix finishes before the
     // DRAM bytes land - the FP4-PV oracle tier proves it).
-    constexpr int P4Row        = (Bc == 64) ? 48 : 32;
-    constexpr int PBlocks      = Bc / 16;
+    constexpr int P4Row   = (Bc == 64) ? 48 : 32;
+    constexpr int PBlocks = Bc / 16;
     constexpr std::size_t ArenaBytes =
         StrictPV
             ? std::size_t(4 * Bc * CodeW + 2 * D * 4 + Bc * Groups + Br * Bc * 2)
-            : std::size_t(2 * Bc * CodeW + Br * P4Row + Br * 4 + D * P4Row + D * 4 +
-                          Bc * Groups);
+            : std::size_t(2 * Bc * CodeW + Br * P4Row + Br * 4 + D * P4Row + D * 4 + Bc * Groups);
 
     static_assert(TokenTile >= 1 && TokenTile <= Geometry::SmallTMaxTokens);
     static_assert(Bc == 32 || Bc == 64);
@@ -452,20 +448,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
 
     __shared__ __align__(16) std::uint8_t q_s[Br * CodeW];
-    __shared__ __align__(16) std::uint8_t
-        static_r_s[DynamicArena ? 16 : ArenaBytes];
+    __shared__ __align__(16) std::uint8_t static_r_s[DynamicArena ? 16 : ArenaBytes];
     extern __shared__ __align__(16) std::uint8_t dynamic_r_s_nvfp4s3[];
-    std::uint8_t* r_s        = DynamicArena ? dynamic_r_s_nvfp4s3 : static_r_s;
-    std::uint8_t* q_codes    = q_s;
-    std::uint8_t* k_codes    = r_s;
-    std::uint8_t* v_codes    = r_s + Bc * CodeW;
-    std::uint8_t* p4         = v_codes + Bc * CodeW;
-    std::uint8_t* psf        = p4 + Br * P4Row;
-    std::uint8_t* v_t        = psf + Br * 4;
-    std::uint8_t* v_scales   = v_t + D * P4Row;
-    std::uint8_t* k_scale_s  = v_scales + D * 4;
+    std::uint8_t* r_s            = DynamicArena ? dynamic_r_s_nvfp4s3 : static_r_s;
+    std::uint8_t* q_codes        = q_s;
+    std::uint8_t* k_codes        = r_s;
+    std::uint8_t* v_codes        = r_s + Bc * CodeW;
+    std::uint8_t* p4             = v_codes + Bc * CodeW;
+    std::uint8_t* psf            = p4 + Br * P4Row;
+    std::uint8_t* v_t            = psf + Br * 4;
+    std::uint8_t* v_scales       = v_t + D * P4Row;
+    std::uint8_t* k_scale_s      = v_scales + D * 4;
     std::uint8_t* v_scales_e4m3t = nullptr;
-    __nv_bfloat16* p_s       = nullptr;
+    __nv_bfloat16* p_s           = nullptr;
     if constexpr (StrictPV) {
         // v_codes[buf]: two V code buffers indexed by tile parity (kb & 1). The
         // staged e4m3 scale plane is double-buffered with the same parity: the
@@ -474,14 +469,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         // tile's PV dequant reads it (adjacent-tile scales are close, which is
         // why the error was a mild rel_L2 ~0.06, not a blow-up; single-tile CTAs
         // never saw it at all).
-        v_scales_e4m3t =
-            reinterpret_cast<std::uint8_t*>(v_codes + 2 * Bc * CodeW);
-        k_scale_s     = reinterpret_cast<std::uint8_t*>(v_scales_e4m3t + 2 * D * 4);
-        p_s           = reinterpret_cast<__nv_bfloat16*>(k_scale_s + Bc * Groups);
-        p4            = nullptr;
-        psf           = nullptr;
-        v_t           = nullptr;
-        v_scales      = nullptr;
+        v_scales_e4m3t = reinterpret_cast<std::uint8_t*>(v_codes + 2 * Bc * CodeW);
+        k_scale_s      = reinterpret_cast<std::uint8_t*>(v_scales_e4m3t + 2 * D * 4);
+        p_s            = reinterpret_cast<__nv_bfloat16*>(k_scale_s + Bc * Groups);
+        p4             = nullptr;
+        psf            = nullptr;
+        v_t            = nullptr;
+        v_scales       = nullptr;
     }
     __shared__ __align__(16) float alpha_s[Br];
     __shared__ __align__(16) std::uint8_t q_scale_s[Br * Groups];
@@ -522,7 +516,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int row = tid; row < RowCount; row += Threads) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
                     -CUDART_INF_F;
@@ -534,7 +528,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d   = idx - row * D;
             int q_head    = 0;
             int token     = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
                     __float2bfloat16(0.0f);
@@ -569,8 +563,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     if constexpr (TileSkip) {
         skip_base = static_cast<std::int64_t>(batch * Geometry::KVHeads + kv_head);
         const std::int32_t* off_row = split_off + skip_base * (split_count + 1);
-        off_cur  = off_row[split];
-        off_next = off_row[split + 1];
+        off_cur                     = off_row[split];
+        off_next                    = off_row[split + 1];
         if (off_cur == off_next) {
             write_neutral();
             return;
@@ -599,8 +593,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     if constexpr (CacheInput::writes_cache && FusedFill) {
         const int k_units = valid_tokens * Groups;
         for (int unit = tid; unit < k_units; unit += Threads) {
-            const int token  = unit / Groups;
-            const int grp    = unit - token * Groups;
+            const int token    = unit / Groups;
+            const int grp      = unit - token * Groups;
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
             const int physical_page = paged_kv_physical_page(block_table, position);
@@ -612,10 +606,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                        k_lo, k_hi, k_sc);
             const std::int64_t code =
                 gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_offset);
-            *reinterpret_cast<std::uint32_t*>(cache_k + code)     = k_lo;
-            *reinterpret_cast<std::uint32_t*>(cache_k + code + 4) = k_hi;
+            *reinterpret_cast<std::uint32_t*>(cache_k + code)           = k_lo;
+            *reinterpret_cast<std::uint32_t*>(cache_k + code + 4)       = k_hi;
             cache_k_scale[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp,
-                                                           page_offset)] = k_sc;
+                                                          page_offset)] = k_sc;
         }
         // V side (S3 d-major layout): same hybrid as the standalone fill kernel.
         // Pack starts at the block's first key: bump from the whole-pack max of
@@ -625,12 +619,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int token = 0; token < valid_tokens; ++token) {
             const int position = pos[token];
             if (position < split_start || position >= split_end) { continue; }
-            const int physical_page = paged_kv_physical_page(block_table, position);
-            const int page_offset   = position & kPagedKVPageMask;
-            const int kb            = page_offset >> 4;
-            const int block_start   = position - (page_offset & 15);
+            const int physical_page          = paged_kv_physical_page(block_table, position);
+            const int page_offset            = position & kPagedKVPageMask;
+            const int kb                     = page_offset >> 4;
+            const int block_start            = position - (page_offset & 15);
             const bool pack_owns_block_start = (page_offset & 15) == 0;
-            bool first_packed_in_block = true;
+            bool first_packed_in_block       = true;
             for (int earlier = 0; earlier < token; ++earlier) {
                 const int earlier_pos = pos[earlier];
                 if (earlier_pos >= block_start && earlier_pos < block_start + 16) {
@@ -640,19 +634,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
             for (int dp = tid; dp < D / 2; dp += Threads) {
                 const int d0            = dp * 2;
-                const std::int64_t vidx  = gqa_kv_new_index<Geometry>(kv_head, d0, token);
+                const std::int64_t vidx = gqa_kv_new_index<Geometry>(kv_head, d0, token);
                 const float v0          = __bfloat162float(input.v[vidx]);
                 const float v1          = __bfloat162float(input.v[vidx + 1]);
-                float bump_src0 = fabsf(v0);
-                float bump_src1 = fabsf(v1);
+                float bump_src0         = fabsf(v0);
+                float bump_src1         = fabsf(v1);
                 if (pack_owns_block_start && first_packed_in_block) {
                     for (int later = token + 1; later < valid_tokens; ++later) {
                         const int later_pos = pos[later];
-                        if (later_pos < block_start || later_pos >= block_start + 16) {
-                            continue;
-                        }
-                        const std::int64_t lidx =
-                            gqa_kv_new_index<Geometry>(kv_head, d0, later);
+                        if (later_pos < block_start || later_pos >= block_start + 16) { continue; }
+                        const std::int64_t lidx = gqa_kv_new_index<Geometry>(kv_head, d0, later);
                         bump_src0 = fmaxf(bump_src0, fabsf(__bfloat162float(input.v[lidx])));
                         bump_src1 = fmaxf(bump_src1, fabsf(__bfloat162float(input.v[lidx + 1])));
                     }
@@ -663,30 +654,26 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0, kb);
                 const std::int64_t sc1_off =
                     gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0 + 1, kb);
-                const float s_cur0       = detail::decode_nvfp4_e4m3(cache_v_scale[sc0_off]);
-                const float s_cur1       = detail::decode_nvfp4_e4m3(cache_v_scale[sc1_off]);
+                const float s_cur0 = detail::decode_nvfp4_e4m3(cache_v_scale[sc0_off]);
+                const float s_cur1 = detail::decode_nvfp4_e4m3(cache_v_scale[sc1_off]);
                 const bool bumped0 =
                     first_packed_in_block && fmaxf(bump_src0, s_cur0 * 6.0f) > s_cur0 * 6.0f;
                 const bool bumped1 =
                     first_packed_in_block && fmaxf(bump_src1, s_cur1 * 6.0f) > s_cur1 * 6.0f;
                 if (bumped0) {
-                    cache_v_scale[sc0_off] =
-                        __nv_cvt_float_to_fp8(fmaxf(bump_src0, s_cur0 * 6.0f) / 6.0f,
-                                              __NV_SATFINITE, __NV_E4M3);
+                    cache_v_scale[sc0_off] = __nv_cvt_float_to_fp8(
+                        fmaxf(bump_src0, s_cur0 * 6.0f) / 6.0f, __NV_SATFINITE, __NV_E4M3);
                 }
                 if (bumped1) {
-                    cache_v_scale[sc1_off] =
-                        __nv_cvt_float_to_fp8(fmaxf(bump_src1, s_cur1 * 6.0f) / 6.0f,
-                                              __NV_SATFINITE, __NV_E4M3);
+                    cache_v_scale[sc1_off] = __nv_cvt_float_to_fp8(
+                        fmaxf(bump_src1, s_cur1 * 6.0f) / 6.0f, __NV_SATFINITE, __NV_E4M3);
                 }
-                const float s0_final     = detail::decode_nvfp4_e4m3(cache_v_scale[sc0_off]);
-                const float s1_final     = detail::decode_nvfp4_e4m3(cache_v_scale[sc1_off]);
-                const float rescale0     = (bumped0 && s_cur0 > 0.0f && s0_final > 0.0f)
-                                               ? s_cur0 / s0_final
-                                               : 1.0f;
-                const float rescale1     = (bumped1 && s_cur1 > 0.0f && s1_final > 0.0f)
-                                               ? s_cur1 / s1_final
-                                               : 1.0f;
+                const float s0_final = detail::decode_nvfp4_e4m3(cache_v_scale[sc0_off]);
+                const float s1_final = detail::decode_nvfp4_e4m3(cache_v_scale[sc1_off]);
+                const float rescale0 =
+                    (bumped0 && s_cur0 > 0.0f && s0_final > 0.0f) ? s_cur0 / s0_final : 1.0f;
+                const float rescale1 =
+                    (bumped1 && s_cur1 > 0.0f && s1_final > 0.0f) ? s_cur1 / s1_final : 1.0f;
                 if (rescale0 != 1.0f || rescale1 != 1.0f) {
                     const int page_base = position - page_offset;
                     for (int i = page_base + kb * 16; i < position; ++i) {
@@ -695,11 +682,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         const std::uint8_t byte = cache_v[co];
                         const float d0          = gqa_s3_e2m1_value(byte & 0x0fu);
                         const float d1          = gqa_s3_e2m1_value((byte >> 4) & 0x0fu);
-                        cache_v[co] = gqa_s3_cvt_e2m1x2(d0 * rescale0, d1 * rescale1);
+                        cache_v[co]             = gqa_s3_cvt_e2m1x2(d0 * rescale0, d1 * rescale1);
                     }
                 }
-                const float c0      = (s0_final > 0.0f) ? v0 / s0_final : 0.0f;
-                const float c1      = (s1_final > 0.0f) ? v1 / s1_final : 0.0f;
+                const float c0 = (s0_final > 0.0f) ? v0 / s0_final : 0.0f;
+                const float c1 = (s1_final > 0.0f) ? v1 / s1_final : 0.0f;
                 cache_v[gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp, page_offset)] =
                     gqa_s3_cvt_e2m1x2(c0, c1);
             }
@@ -721,18 +708,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const int grp = unit - row * Groups;
         int q_head    = 0;
         int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+        gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
         if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-            gqa_nvfp4_quantize_bf16x16(&q[gqa_q_index<Geometry>(q_head, grp * kGqaNvfp4Group, token)],
-                                       lo, hi, sc);
+            gqa_nvfp4_quantize_bf16x16(
+                &q[gqa_q_index<Geometry>(q_head, grp * kGqaNvfp4Group, token)], lo, hi, sc);
         }
         const int logical = grp * 8;
         const int phys    = gqa_nvfp4_swizzle_byte(row, logical);
         *reinterpret_cast<std::uint32_t*>(q_codes + row * CodeW + phys)     = lo;
         *reinterpret_cast<std::uint32_t*>(q_codes + row * CodeW + phys + 4) = hi;
-        q_scale_s[row * Groups + grp]                                        = sc;
+        q_scale_s[row * Groups + grp]                                       = sc;
     }
     __syncthreads();
 
@@ -765,24 +752,24 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if ((TileSkip || (key >= split_start && key < split_end))) {
-                const std::int64_t off = gqa_nvfp4_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
+                const std::int64_t off = gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, 0,
+                                                                         key & kPagedKVPageMask);
                 ninfer::ops::cp_async<16>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
             } else {
                 store_vec(&k_scale_s[key_l * Groups], make_int4(0, 0, 0, 0));
             }
         }
         for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += Threads) {
-            const int key_l       = chunk / (CodeW / 16);
-            const int seg         = chunk - key_l * (CodeW / 16);
-            const int logical     = seg * 16;
-            const int key         = tile_k0 + key_l;
-            const int phys        = gqa_nvfp4_swizzle_byte(key_l, logical);
-            std::uint8_t* k_dst   = &k_codes[key_l * CodeW + phys];
+            const int key_l     = chunk / (CodeW / 16);
+            const int seg       = chunk - key_l * (CodeW / 16);
+            const int logical   = seg * 16;
+            const int key       = tile_k0 + key_l;
+            const int phys      = gqa_nvfp4_swizzle_byte(key_l, logical);
+            std::uint8_t* k_dst = &k_codes[key_l * CodeW + phys];
             // Double-buffered V (strict) vs single-buffered (FP4): the buffer
             // offset is a compile-time zero on the FP4 path.
             const std::size_t vbuf_off = StrictPV ? static_cast<std::size_t>(buf) * Bc * CodeW : 0;
-            std::uint8_t* v_dst   = &v_codes[vbuf_off + key_l * CodeW + logical];
+            std::uint8_t* v_dst        = &v_codes[vbuf_off + key_l * CodeW + logical];
             if ((TileSkip || (key >= split_start && key < split_end))) {
                 const std::int64_t off = gqa_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, logical, key & kPagedKVPageMask);
@@ -802,17 +789,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             for (int c = tid; c < D / 4; c += Threads) {
                 const int d0 = c * 4;
                 std::uint32_t w[4];
-                const std::int64_t off = gqa_s3_v_scale_index<Geometry>(
-                    physical_page, kv_head, d0, 0);
-                *reinterpret_cast<int4*>(w) =
-                    *reinterpret_cast<const int4*>(&cache_v_scale[off]);
+                const std::int64_t off =
+                    gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0, 0);
+                *reinterpret_cast<int4*>(w) = *reinterpret_cast<const int4*>(&cache_v_scale[off]);
                 // Plane parity matches the V code buffer: tile kb's scales
                 // land in plane (buf & 1), so the current tile's PV dequant
                 // reads its own scales even though staging runs ahead.
                 std::uint8_t* plane = v_scales_e4m3t + (buf ? D * 4 : 0u);
 #pragma unroll
                 for (int kb = 0; kb < 4; ++kb) {
-                    const int key = tile_k0 + kb * 16;
+                    const int key     = tile_k0 + kb * 16;
                     std::uint8_t* row = plane + kb * D + d0;
                     if (kb < PBlocks && (TileSkip || (key + 16 > split_start && key < split_end))) {
                         // Tile-local kb -> in-page 16-key block: a Bc=32 tile may
@@ -844,10 +830,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 for (int kb = 0; kb < 4; ++kb) {
                     const int key = tile_k0 + kb * 16;
                     if (kb < PBlocks && (TileSkip || (key + 16 > split_start && key < split_end))) {
-                        const int key_block = (key & kPagedKVPageMask) >> 4;
-                        v_scales[d * 4 + kb] =
-                            cache_v_scale[gqa_s3_v_scale_index<Geometry>(
-                                physical_page, kv_head, d, key_block)];
+                        const int key_block  = (key & kPagedKVPageMask) >> 4;
+                        v_scales[d * 4 + kb] = cache_v_scale[gqa_s3_v_scale_index<Geometry>(
+                            physical_page, kv_head, d, key_block)];
                     } else {
                         v_scales[d * 4 + kb] = 0;
                     }
@@ -871,9 +856,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int tile_last = TileSkip ? (off_next - off_cur - 1) : (key_blocks - 1);
     for (int kb = 0; kb <= tile_last; ++kb) {
-        const int k0 = TileSkip
-                           ? (keep_tiles[skip_base * max_keep + off_cur + kb] * Bc)
-                           : (first_tile + kb * Bc);
+        const int k0 = TileSkip ? (keep_tiles[skip_base * max_keep + off_cur + kb] * Bc)
+                                : (first_tile + kb * Bc);
 
         if (warp < RowTiles) {
             const int producer_row_base = warp * 16;
@@ -902,9 +886,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    const int brow          = nt * 8 + b_row_offset;
-                    const int b_logical     = k64 * 32 + b_column_byte;
-                    const int b_physical    = gqa_nvfp4_swizzle_byte(brow, b_logical);
+                    const int brow       = nt * 8 + b_row_offset;
+                    const int b_logical  = k64 * 32 + b_column_byte;
+                    const int b_physical = gqa_nvfp4_swizzle_byte(brow, b_logical);
                     unsigned bf[2];
                     ldmatrix_x2(bf[0], bf[1], smem_addr(k_codes + brow * CodeW + b_physical));
                     const int b_scale_row = nt * 8 + sfb_row;
@@ -921,8 +905,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int row0 = producer_row_base + gid;
             const int row1 = row0 + 8;
             int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head0, token0);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
 
@@ -935,22 +919,26 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int col0 = nt * 8 + 2 * lid;
                     const int key0 = k0 + col0;
                     const int key1 = key0 + 1;
-                    score[nt][0] = (row0 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
-                                    key0 <= qabs0)
-                                       ? score[nt][0] * scale
-                                       : -CUDART_INF_F;
-                    score[nt][1] = (row0 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
-                                    key1 <= qabs0)
-                                       ? score[nt][1] * scale
-                                       : -CUDART_INF_F;
-                    score[nt][2] = (row1 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
-                                    key0 <= qabs1)
-                                       ? score[nt][2] * scale
-                                       : -CUDART_INF_F;
-                    score[nt][3] = (row1 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
-                                    key1 <= qabs1)
-                                       ? score[nt][3] * scale
-                                       : -CUDART_INF_F;
+                    score[nt][0] =
+                        (row0 < RowCount &&
+                         (TileSkip || (key0 >= split_start && key0 < split_end)) && key0 <= qabs0)
+                            ? score[nt][0] * scale
+                            : -CUDART_INF_F;
+                    score[nt][1] =
+                        (row0 < RowCount &&
+                         (TileSkip || (key1 >= split_start && key1 < split_end)) && key1 <= qabs0)
+                            ? score[nt][1] * scale
+                            : -CUDART_INF_F;
+                    score[nt][2] =
+                        (row1 < RowCount &&
+                         (TileSkip || (key0 >= split_start && key0 < split_end)) && key0 <= qabs1)
+                            ? score[nt][2] * scale
+                            : -CUDART_INF_F;
+                    score[nt][3] =
+                        (row1 < RowCount &&
+                         (TileSkip || (key1 >= split_start && key1 < split_end)) && key1 <= qabs1)
+                            ? score[nt][3] * scale
+                            : -CUDART_INF_F;
                     bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                     bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
                 }
@@ -966,8 +954,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 __nv_bfloat16* p_sw = &p_s[producer_row_base * Bc];
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    const int col0 = nt * 8 + 2 * lid;
-                    const int col1 = col0 + 1;
+                    const int col0  = nt * 8 + 2 * lid;
+                    const int col1  = col0 + 1;
                     const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
                                           ? exp2_approx((score[nt][0] - nm0) * Log2E)
                                           : 0.0f;
@@ -982,8 +970,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                           : 0.0f;
                     bl0 += p00 + p01;
                     bl1 += p10 + p11;
-                    p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
-                    p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
+                    p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)] = __float2bfloat16(p00);
+                    p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)] = __float2bfloat16(p01);
                     p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] =
                         __float2bfloat16(p10);
                     p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] =
@@ -1001,165 +989,169 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     alpha_s[row1] = alpha1;
                 }
             } else {
-            // Per-16-key raw-score maxima (after masking). Each 16-key block spans
-            // two nt tiles; each lane holds 4 of the 16 keys per row.
-            float bm0_blk[PBlocks], bm1_blk[PBlocks];
+                // Per-16-key raw-score maxima (after masking). Each 16-key block spans
+                // two nt tiles; each lane holds 4 of the 16 keys per row.
+                float bm0_blk[PBlocks], bm1_blk[PBlocks];
 #pragma unroll
-            for (int nb = 0; nb < PBlocks; ++nb) {
-                const int nt = 2 * nb;
-                const int col0 = nt * 8 + 2 * lid;
-                const int key0 = k0 + col0;
-                const int key1 = key0 + 1;
-                const int key2 = k0 + (nt + 1) * 8 + 2 * lid;
-                const int key3 = key2 + 1;
-                score[nt][0]   = (row0 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
-                                  key0 <= qabs0)
-                                     ? score[nt][0] * scale
-                                     : -CUDART_INF_F;
-                score[nt][1]   = (row0 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
-                                  key1 <= qabs0)
-                                     ? score[nt][1] * scale
-                                     : -CUDART_INF_F;
-                score[nt + 1][0] = (row0 < RowCount && (TileSkip || (key2 >= split_start && key2 < split_end)) &&
-                                    key2 <= qabs0)
-                                        ? score[nt + 1][0] * scale
-                                        : -CUDART_INF_F;
-                score[nt + 1][1] = (row0 < RowCount && (TileSkip || (key3 >= split_start && key3 < split_end)) &&
-                                    key3 <= qabs0)
-                                        ? score[nt + 1][1] * scale
-                                        : -CUDART_INF_F;
-                score[nt][2]   = (row1 < RowCount && (TileSkip || (key0 >= split_start && key0 < split_end)) &&
-                                  key0 <= qabs1)
-                                     ? score[nt][2] * scale
-                                     : -CUDART_INF_F;
-                score[nt][3]   = (row1 < RowCount && (TileSkip || (key1 >= split_start && key1 < split_end)) &&
-                                  key1 <= qabs1)
-                                     ? score[nt][3] * scale
-                                     : -CUDART_INF_F;
-                score[nt + 1][2] = (row1 < RowCount && (TileSkip || (key2 >= split_start && key2 < split_end)) &&
-                                    key2 <= qabs1)
-                                        ? score[nt + 1][2] * scale
-                                        : -CUDART_INF_F;
-                score[nt + 1][3] = (row1 < RowCount && (TileSkip || (key3 >= split_start && key3 < split_end)) &&
-                                    key3 <= qabs1)
-                                        ? score[nt + 1][3] * scale
-                                        : -CUDART_INF_F;
-                bm0_blk[nb] = fmaxf(fmaxf(score[nt][0], score[nt][1]),
-                                    fmaxf(score[nt + 1][0], score[nt + 1][1]));
-                bm1_blk[nb] = fmaxf(fmaxf(score[nt][2], score[nt][3]),
-                                    fmaxf(score[nt + 1][2], score[nt + 1][3]));
-            }
-#pragma unroll
-            for (int nb = 0; nb < PBlocks; ++nb) {
-                bm0_blk[nb] = warp_max<4>(bm0_blk[nb], FullMask);
-                bm1_blk[nb] = warp_max<4>(bm1_blk[nb], FullMask);
-            }
-            float bm0 = bm0_blk[0], bm1 = bm1_blk[0];
-#pragma unroll
-            for (int nb = 1; nb < PBlocks; ++nb) {
-                bm0 = fmaxf(bm0, bm0_blk[nb]);
-                bm1 = fmaxf(bm1, bm1_blk[nb]);
-            }
-
-            const float nm0    = fmaxf(m0, bm0);
-            const float nm1    = fmaxf(m1, bm1);
-            const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
-            const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
-            const float nm0_scaled = nm0 * Log2E;
-            const float nm1_scaled = nm1 * Log2E;
-            const float amp        = -kGqaS3Fp8ScaleLog2; // log2(448 * 6)
-            const float sbl        = -kGqaS3Fp8ScaleLog2 + kGqaS3Fp4ScaleLog2; // log2(448)
-
-            float bl0 = 0.0f, bl1 = 0.0f;
-#pragma unroll
-            for (int nb = 0; nb < PBlocks; ++nb) {
-                const float sb0f = (bm0_blk[nb] == -CUDART_INF_F)
-                                       ? 0.0f
-                                       : exp2_approx(
-                                             __fmaf_rn(bm0_blk[nb], Log2E, -nm0_scaled) + sbl);
-                const float sb1f = (bm1_blk[nb] == -CUDART_INF_F)
-                                       ? 0.0f
-                                       : exp2_approx(
-                                             __fmaf_rn(bm1_blk[nb], Log2E, -nm1_scaled) + sbl);
-                const std::uint8_t sc0 =
-                    (sb0f == 0.0f) ? 0 : __nv_cvt_float_to_fp8(sb0f, __NV_SATFINITE, __NV_E4M3);
-                const std::uint8_t sc1 =
-                    (sb1f == 0.0f) ? 0 : __nv_cvt_float_to_fp8(sb1f, __NV_SATFINITE, __NV_E4M3);
-                const float dec0 = detail::decode_nvfp4_e4m3(sc0);
-                const float dec1 = detail::decode_nvfp4_e4m3(sc1);
-                const int nt     = 2 * nb;
-                const float pa0  = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt][0], Log2E, -nm0_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pa1  = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt][1], Log2E, -nm0_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pa2  = (nm0 > -CUDART_INF_F && score[nt + 1][0] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt + 1][0], Log2E,
-                                                                -nm0_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pa3  = (nm0 > -CUDART_INF_F && score[nt + 1][1] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt + 1][1], Log2E,
-                                                                -nm0_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pb0  = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt][2], Log2E, -nm1_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pb1  = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt][3], Log2E, -nm1_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pb2  = (nm1 > -CUDART_INF_F && score[nt + 1][2] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt + 1][2], Log2E,
-                                                                -nm1_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float pb3  = (nm1 > -CUDART_INF_F && score[nt + 1][3] > -CUDART_INF_F)
-                                        ? exp2_approx(__fmaf_rn(score[nt + 1][3], Log2E,
-                                                                -nm1_scaled) +
-                                                      amp)
-                                        : 0.0f;
-                const float qa0 = (dec0 > 0.0f) ? pa0 / dec0 : 0.0f;
-                const float qa1 = (dec0 > 0.0f) ? pa1 / dec0 : 0.0f;
-                const float qa2 = (dec0 > 0.0f) ? pa2 / dec0 : 0.0f;
-                const float qa3 = (dec0 > 0.0f) ? pa3 / dec0 : 0.0f;
-                const float qb0 = (dec1 > 0.0f) ? pb0 / dec1 : 0.0f;
-                const float qb1 = (dec1 > 0.0f) ? pb1 / dec1 : 0.0f;
-                const float qb2 = (dec1 > 0.0f) ? pb2 / dec1 : 0.0f;
-                const float qb3 = (dec1 > 0.0f) ? pb3 / dec1 : 0.0f;
-                p4[row0 * P4Row + nb * 8 + lid]   = gqa_s3_cvt_e2m1x2(qa0, qa1);
-                p4[row0 * P4Row + nb * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qa2, qa3);
-                p4[row1 * P4Row + nb * 8 + lid]   = gqa_s3_cvt_e2m1x2(qb0, qb1);
-                p4[row1 * P4Row + nb * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qb2, qb3);
-                if (lid == 0) {
-                    psf[row0 * 4 + nb] = sc0;
-                    psf[row1 * 4 + nb] = sc1;
-                    // Bc=32: the k64 PV mma still reads four e4m3 SFA per row; the
-                    // slots past PBlocks belong to zero-padded keys and must be 0.
-                    for (int pb = PBlocks; pb < 4; ++pb) {
-                        psf[row0 * 4 + pb] = 0;
-                        psf[row1 * 4 + pb] = 0;
-                    }
+                for (int nb = 0; nb < PBlocks; ++nb) {
+                    const int nt   = 2 * nb;
+                    const int col0 = nt * 8 + 2 * lid;
+                    const int key0 = k0 + col0;
+                    const int key1 = key0 + 1;
+                    const int key2 = k0 + (nt + 1) * 8 + 2 * lid;
+                    const int key3 = key2 + 1;
+                    score[nt][0] =
+                        (row0 < RowCount &&
+                         (TileSkip || (key0 >= split_start && key0 < split_end)) && key0 <= qabs0)
+                            ? score[nt][0] * scale
+                            : -CUDART_INF_F;
+                    score[nt][1] =
+                        (row0 < RowCount &&
+                         (TileSkip || (key1 >= split_start && key1 < split_end)) && key1 <= qabs0)
+                            ? score[nt][1] * scale
+                            : -CUDART_INF_F;
+                    score[nt + 1][0] =
+                        (row0 < RowCount &&
+                         (TileSkip || (key2 >= split_start && key2 < split_end)) && key2 <= qabs0)
+                            ? score[nt + 1][0] * scale
+                            : -CUDART_INF_F;
+                    score[nt + 1][1] =
+                        (row0 < RowCount &&
+                         (TileSkip || (key3 >= split_start && key3 < split_end)) && key3 <= qabs0)
+                            ? score[nt + 1][1] * scale
+                            : -CUDART_INF_F;
+                    score[nt][2] =
+                        (row1 < RowCount &&
+                         (TileSkip || (key0 >= split_start && key0 < split_end)) && key0 <= qabs1)
+                            ? score[nt][2] * scale
+                            : -CUDART_INF_F;
+                    score[nt][3] =
+                        (row1 < RowCount &&
+                         (TileSkip || (key1 >= split_start && key1 < split_end)) && key1 <= qabs1)
+                            ? score[nt][3] * scale
+                            : -CUDART_INF_F;
+                    score[nt + 1][2] =
+                        (row1 < RowCount &&
+                         (TileSkip || (key2 >= split_start && key2 < split_end)) && key2 <= qabs1)
+                            ? score[nt + 1][2] * scale
+                            : -CUDART_INF_F;
+                    score[nt + 1][3] =
+                        (row1 < RowCount &&
+                         (TileSkip || (key3 >= split_start && key3 < split_end)) && key3 <= qabs1)
+                            ? score[nt + 1][3] * scale
+                            : -CUDART_INF_F;
+                    bm0_blk[nb] = fmaxf(fmaxf(score[nt][0], score[nt][1]),
+                                        fmaxf(score[nt + 1][0], score[nt + 1][1]));
+                    bm1_blk[nb] = fmaxf(fmaxf(score[nt][2], score[nt][3]),
+                                        fmaxf(score[nt + 1][2], score[nt + 1][3]));
                 }
-                bl0 += pa0 + pa1 + pa2 + pa3;
-                bl1 += pb0 + pb1 + pb2 + pb3;
-            }
-            bl0 = warp_sum<4>(bl0, FullMask);
-            bl1 = warp_sum<4>(bl1, FullMask);
+#pragma unroll
+                for (int nb = 0; nb < PBlocks; ++nb) {
+                    bm0_blk[nb] = warp_max<4>(bm0_blk[nb], FullMask);
+                    bm1_blk[nb] = warp_max<4>(bm1_blk[nb], FullMask);
+                }
+                float bm0 = bm0_blk[0], bm1 = bm1_blk[0];
+#pragma unroll
+                for (int nb = 1; nb < PBlocks; ++nb) {
+                    bm0 = fmaxf(bm0, bm0_blk[nb]);
+                    bm1 = fmaxf(bm1, bm1_blk[nb]);
+                }
 
-            l0 = l0 * alpha0 + bl0;
-            l1 = l1 * alpha1 + bl1;
-            m0 = nm0;
-            m1 = nm1;
-            if (lid == 0) {
-                alpha_s[row0] = alpha0;
-                alpha_s[row1] = alpha1;
-            }
+                const float nm0    = fmaxf(m0, bm0);
+                const float nm1    = fmaxf(m1, bm1);
+                const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
+                const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
+                const float nm0_scaled = nm0 * Log2E;
+                const float nm1_scaled = nm1 * Log2E;
+                const float amp        = -kGqaS3Fp8ScaleLog2;                      // log2(448 * 6)
+                const float sbl        = -kGqaS3Fp8ScaleLog2 + kGqaS3Fp4ScaleLog2; // log2(448)
+
+                float bl0 = 0.0f, bl1 = 0.0f;
+#pragma unroll
+                for (int nb = 0; nb < PBlocks; ++nb) {
+                    const float sb0f =
+                        (bm0_blk[nb] == -CUDART_INF_F)
+                            ? 0.0f
+                            : exp2_approx(__fmaf_rn(bm0_blk[nb], Log2E, -nm0_scaled) + sbl);
+                    const float sb1f =
+                        (bm1_blk[nb] == -CUDART_INF_F)
+                            ? 0.0f
+                            : exp2_approx(__fmaf_rn(bm1_blk[nb], Log2E, -nm1_scaled) + sbl);
+                    const std::uint8_t sc0 =
+                        (sb0f == 0.0f) ? 0 : __nv_cvt_float_to_fp8(sb0f, __NV_SATFINITE, __NV_E4M3);
+                    const std::uint8_t sc1 =
+                        (sb1f == 0.0f) ? 0 : __nv_cvt_float_to_fp8(sb1f, __NV_SATFINITE, __NV_E4M3);
+                    const float dec0 = detail::decode_nvfp4_e4m3(sc0);
+                    const float dec1 = detail::decode_nvfp4_e4m3(sc1);
+                    const int nt     = 2 * nb;
+                    const float pa0 =
+                        (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt][0], Log2E, -nm0_scaled) + amp)
+                            : 0.0f;
+                    const float pa1 =
+                        (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt][1], Log2E, -nm0_scaled) + amp)
+                            : 0.0f;
+                    const float pa2 =
+                        (nm0 > -CUDART_INF_F && score[nt + 1][0] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt + 1][0], Log2E, -nm0_scaled) + amp)
+                            : 0.0f;
+                    const float pa3 =
+                        (nm0 > -CUDART_INF_F && score[nt + 1][1] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt + 1][1], Log2E, -nm0_scaled) + amp)
+                            : 0.0f;
+                    const float pb0 =
+                        (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt][2], Log2E, -nm1_scaled) + amp)
+                            : 0.0f;
+                    const float pb1 =
+                        (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt][3], Log2E, -nm1_scaled) + amp)
+                            : 0.0f;
+                    const float pb2 =
+                        (nm1 > -CUDART_INF_F && score[nt + 1][2] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt + 1][2], Log2E, -nm1_scaled) + amp)
+                            : 0.0f;
+                    const float pb3 =
+                        (nm1 > -CUDART_INF_F && score[nt + 1][3] > -CUDART_INF_F)
+                            ? exp2_approx(__fmaf_rn(score[nt + 1][3], Log2E, -nm1_scaled) + amp)
+                            : 0.0f;
+                    const float qa0                     = (dec0 > 0.0f) ? pa0 / dec0 : 0.0f;
+                    const float qa1                     = (dec0 > 0.0f) ? pa1 / dec0 : 0.0f;
+                    const float qa2                     = (dec0 > 0.0f) ? pa2 / dec0 : 0.0f;
+                    const float qa3                     = (dec0 > 0.0f) ? pa3 / dec0 : 0.0f;
+                    const float qb0                     = (dec1 > 0.0f) ? pb0 / dec1 : 0.0f;
+                    const float qb1                     = (dec1 > 0.0f) ? pb1 / dec1 : 0.0f;
+                    const float qb2                     = (dec1 > 0.0f) ? pb2 / dec1 : 0.0f;
+                    const float qb3                     = (dec1 > 0.0f) ? pb3 / dec1 : 0.0f;
+                    p4[row0 * P4Row + nb * 8 + lid]     = gqa_s3_cvt_e2m1x2(qa0, qa1);
+                    p4[row0 * P4Row + nb * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qa2, qa3);
+                    p4[row1 * P4Row + nb * 8 + lid]     = gqa_s3_cvt_e2m1x2(qb0, qb1);
+                    p4[row1 * P4Row + nb * 8 + 4 + lid] = gqa_s3_cvt_e2m1x2(qb2, qb3);
+                    if (lid == 0) {
+                        psf[row0 * 4 + nb] = sc0;
+                        psf[row1 * 4 + nb] = sc1;
+                        // Bc=32: the k64 PV mma still reads four e4m3 SFA per row; the
+                        // slots past PBlocks belong to zero-padded keys and must be 0.
+                        for (int pb = PBlocks; pb < 4; ++pb) {
+                            psf[row0 * 4 + pb] = 0;
+                            psf[row1 * 4 + pb] = 0;
+                        }
+                    }
+                    bl0 += pa0 + pa1 + pa2 + pa3;
+                    bl1 += pb0 + pb1 + pb2 + pb3;
+                }
+                bl0 = warp_sum<4>(bl0, FullMask);
+                bl1 = warp_sum<4>(bl1, FullMask);
+
+                l0 = l0 * alpha0 + bl0;
+                l1 = l1 * alpha1 + bl1;
+                m0 = nm0;
+                m1 = nm1;
+                if (lid == 0) {
+                    alpha_s[row0] = alpha0;
+                    alpha_s[row1] = alpha1;
+                }
             } // else (S3 FP4-PV path)
         } else {
             if constexpr (StrictPV) {
@@ -1172,34 +1164,30 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 // the store hits distinct SMEM banks. The original unit-strided store
                 // placed every lane's write on the same bank (32-way conflict).
                 for (int d = loader_tid; d < D; d += VLoaderThreads) {
-                const int dp = d >> 1;
-                const int sh = (d & 1) * 4;
+                    const int dp = d >> 1;
+                    const int sh = (d & 1) * 4;
 #pragma unroll 1
-                for (int kp = 0; kp < Bc / 2; ++kp) {
-                    const std::uint8_t b0 = v_codes[2 * kp * CodeW + dp];
-                    const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + dp];
-                    v_t[d * P4Row + kp]   = (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
-                                           static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu));
+                    for (int kp = 0; kp < Bc / 2; ++kp) {
+                        const std::uint8_t b0 = v_codes[2 * kp * CodeW + dp];
+                        const std::uint8_t b1 = v_codes[(2 * kp + 1) * CodeW + dp];
+                        v_t[d * P4Row + kp] =
+                            (static_cast<std::uint8_t>(((b1 >> sh) & 0x0Fu) << 4) |
+                             static_cast<std::uint8_t>((b0 >> sh) & 0x0Fu));
+                    }
                 }
-            }
             }
         }
         __syncthreads();
 
-        const bool has_next =
-            TileSkip ? (off_cur + kb + 1 < off_next) : (kb + 1 < key_blocks);
+        const bool has_next = TileSkip ? (off_cur + kb + 1 < off_next) : (kb + 1 < key_blocks);
         if (has_next) {
             const int next_k0 =
                 TileSkip ? (keep_tiles[skip_base * max_keep + off_cur + kb + 1] * Bc) : (k0 + Bc);
-            if constexpr (TileSkip) {
-                // The keep-list order is not monotonic in key index, so the page
-                // is looked up per entry (the contiguous path only updates it on
-                // page boundaries).
-                physical_page =
-                    physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
-            } else if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page =
-                    physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
+            // The keep-list order is not monotonic in key index, so the tile-skip path
+            // looks the page up per entry; the contiguous path updates it only on page
+            // boundaries.
+            if (TileSkip || (next_k0 & kPagedKVPageMask) == 0) {
+                physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
             }
             issue_kv_tile(next_k0, physical_page, (kb + 1) & 1);
         }
@@ -1225,7 +1213,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             // e2m1 x e4m3 product rounded to BF16 (bit-identical to the old
             // producer-side dequant), so numerics are unchanged.
             __nv_bfloat16* p_consumer = &p_s[consumer_row_base * Bc];
-            const int d_key0 = 2 * (lane & 3);
+            const int d_key0          = 2 * (lane & 3);
 #pragma unroll
             for (int n = 0; n < PVNtPerWarp; ++n) {
                 const int global_n = consumer_slice * PVNtPerWarp + n;
@@ -1234,18 +1222,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int nib      = (d & 1) << 2;
 #pragma unroll
                 for (int k = 0; k < PVKs; ++k) {
-                    const float sv = detail::decode_nvfp4_e4m3(
-                        v_scales_e4m3t[(kb & 1) * D * 4 + k * D + d]);
+                    const float sv =
+                        detail::decode_nvfp4_e4m3(v_scales_e4m3t[(kb & 1) * D * 4 + k * D + d]);
                     unsigned pf[4];
                     const int pcol = k * 16 + a_coloff;
                     ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
                                 smem_addr(&p_consumer[a_row_offset * Bc +
-                                                  gqa_small_t_tc_swz32(a_row_offset, pcol)]));
+                                                      gqa_small_t_tc_swz32(a_row_offset, pcol)]));
                     const std::uint8_t* v_base = &v_codes[(kb & 1) * Bc * CodeW];
-                    const std::uint8_t* ck0 = &v_base[(k * 16 + d_key0) * CodeW + dbyte];
-                    const std::uint8_t* ck1  = &v_base[(k * 16 + d_key0 + 1) * CodeW + dbyte];
-                    const std::uint8_t* ck8  = &v_base[(k * 16 + d_key0 + 8) * CodeW + dbyte];
-                    const std::uint8_t* ck9  = &v_base[(k * 16 + d_key0 + 9) * CodeW + dbyte];
+                    const std::uint8_t* ck0    = &v_base[(k * 16 + d_key0) * CodeW + dbyte];
+                    const std::uint8_t* ck1    = &v_base[(k * 16 + d_key0 + 1) * CodeW + dbyte];
+                    const std::uint8_t* ck8    = &v_base[(k * 16 + d_key0 + 8) * CodeW + dbyte];
+                    const std::uint8_t* ck9    = &v_base[(k * 16 + d_key0 + 9) * CodeW + dbyte];
                     const unsigned vf0 =
                         pack_bf16x2(gqa_s3_e2m1_value_alu(((*ck0 >> nib) & 0x0Fu)) * sv,
                                     gqa_s3_e2m1_value_alu(((*ck1 >> nib) & 0x0Fu)) * sv);
@@ -1257,30 +1245,28 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
             }
         } else {
-        // A: P codes (16 rows x 32B for the k64 mma); SFA: per-16-key e4m3 row.
-        unsigned pf[4];
-        ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(p4 + (consumer_row_base + a_row_offset) * P4Row + a_column_byte));
-        unsigned sfa = 0;
-        if ((lane & 2) == 0) {
-                sfa = *reinterpret_cast<const unsigned*>(
-                    &psf[(consumer_row_base + sfa_row) * 4]);
-        }
-#pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            const int global_n = consumer_slice * PVNtPerWarp + n;
-            const int vrow     = global_n * 8 + b_row_offset;
-            unsigned vf[2];
-            ldmatrix_x2(vf[0], vf[1],
-                        smem_addr(v_t + vrow * P4Row + b_column_byte));
-            const int vsf_row = global_n * 8 + sfb_row;
-            unsigned sfb      = 0;
-            if ((lane & 3) == 0) {
-                sfb = *reinterpret_cast<const unsigned*>(&v_scales[vsf_row * 4]);
+            // A: P codes (16 rows x 32B for the k64 mma); SFA: per-16-key e4m3 row.
+            unsigned pf[4];
+            ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                        smem_addr(p4 + (consumer_row_base + a_row_offset) * P4Row + a_column_byte));
+            unsigned sfa = 0;
+            if ((lane & 2) == 0) {
+                sfa = *reinterpret_cast<const unsigned*>(&psf[(consumer_row_base + sfa_row) * 4]);
             }
-            mma_nvfp4_e4m3(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                           vf[0], vf[1], sfa, sfb);
-        }
+#pragma unroll
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                const int global_n = consumer_slice * PVNtPerWarp + n;
+                const int vrow     = global_n * 8 + b_row_offset;
+                unsigned vf[2];
+                ldmatrix_x2(vf[0], vf[1], smem_addr(v_t + vrow * P4Row + b_column_byte));
+                const int vsf_row = global_n * 8 + sfb_row;
+                unsigned sfb      = 0;
+                if ((lane & 3) == 0) {
+                    sfb = *reinterpret_cast<const unsigned*>(&v_scales[vsf_row * 4]);
+                }
+                mma_nvfp4_e4m3(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                               pf[3], vf[0], vf[1], sfa, sfb);
+            }
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
@@ -1292,14 +1278,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m0;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l0;
         }
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m1;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l1;
         }
@@ -1316,7 +1302,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][0], acc[n][1]);
@@ -1324,7 +1310,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][2], acc[n][3]);
@@ -1344,8 +1330,8 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     const std::int32_t* __restrict__ pos, const std::int32_t* __restrict__ block_tables,
     const std::int32_t* __restrict__ table_rows, std::int32_t table_stride,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, std::int32_t full_width,
+    std::int32_t column_begin, std::int32_t batch_size,
     const std::int32_t* __restrict__ valid_columns) {
     constexpr int D       = kGqaHeadDim;
     constexpr int Groups  = kGqaNvfp4Groups;
@@ -1353,11 +1339,10 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     const int tid         = static_cast<int>(threadIdx.x);
     const int unit        = static_cast<int>(blockIdx.x) * 256 + tid;
 
-    const int v_blocks = (TokenTile + 15) / 16 + 1;
-    const int k_max    = TokenTile * Geometry::KVHeads * Groups;
-    const int per_batch =
-        k_max + v_blocks * Geometry::KVHeads * DpPairs;
-    const int batch = MultiBatch ? unit / per_batch : 0;
+    const int v_blocks  = (TokenTile + 15) / 16 + 1;
+    const int k_max     = TokenTile * Geometry::KVHeads * Groups;
+    const int per_batch = k_max + v_blocks * Geometry::KVHeads * DpPairs;
+    const int batch     = MultiBatch ? unit / per_batch : 0;
     if (MultiBatch && batch >= batch_size) { return; }
     const int rest = MultiBatch ? unit - batch * per_batch : unit;
 
@@ -1365,30 +1350,26 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     // valid_columns[b] is the per-row live width, not a packed column index.
     // column_base is packed (column_begin + b*full_width); comparing the two
     // skipped fill for every b>=1 whenever live width <= b*W (always, for W>=1).
-    const int valid_tokens =
-        Masked
-            ? (valid_columns[batch] <= column_begin
-                   ? 0
-                   : (valid_columns[batch] - column_begin < TokenTile
-                          ? valid_columns[batch] - column_begin
-                          : TokenTile))
-            : TokenTile;
+    const int valid_tokens = Masked ? (valid_columns[batch] <= column_begin
+                                           ? 0
+                                           : (valid_columns[batch] - column_begin < TokenTile
+                                                  ? valid_columns[batch] - column_begin
+                                                  : TokenTile))
+                                    : TokenTile;
     if (valid_tokens <= 0) { return; }
-    const std::int32_t* block_table = block_tables +
-                                      (table_rows == nullptr ? 0 : table_rows[batch]) * table_stride;
-    const int base_pos = pos[column_base];
-    const __nv_bfloat16* kb =
-        k + static_cast<std::int64_t>(column_base) * D * Geometry::KVHeads;
-    const __nv_bfloat16* vb =
-        v + static_cast<std::int64_t>(column_base) * D * Geometry::KVHeads;
+    const std::int32_t* block_table =
+        block_tables + (table_rows == nullptr ? 0 : table_rows[batch]) * table_stride;
+    const int base_pos      = pos[column_base];
+    const __nv_bfloat16* kb = k + static_cast<std::int64_t>(column_base) * D * Geometry::KVHeads;
+    const __nv_bfloat16* vb = v + static_cast<std::int64_t>(column_base) * D * Geometry::KVHeads;
 
     if (rest < k_max) {
         // K: per-(token, d-16-group), stateless.
-        const int token   = rest / (Geometry::KVHeads * Groups);
+        const int token = rest / (Geometry::KVHeads * Groups);
         if (token >= valid_tokens) { return; }
-        const int tmp     = rest % (Geometry::KVHeads * Groups);
-        const int kv_head = tmp / Groups;
-        const int grp     = tmp % Groups;
+        const int tmp           = rest % (Geometry::KVHeads * Groups);
+        const int kv_head       = tmp / Groups;
+        const int grp           = tmp % Groups;
         const int position      = base_pos + token;
         const int physical_page = paged_kv_physical_page(block_table, position);
         const int page_off      = position & kPagedKVPageMask;
@@ -1398,8 +1379,8 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
         gqa_nvfp4_quantize_bf16x16(&kb[gqa_kv_new_index<Geometry>(kv_head, d0, token)], lo, hi, sc);
         const std::int64_t code =
             gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_off);
-        *reinterpret_cast<std::uint32_t*>(cache_k + code)     = lo;
-        *reinterpret_cast<std::uint32_t*>(cache_k + code + 4) = hi;
+        *reinterpret_cast<std::uint32_t*>(cache_k + code)                               = lo;
+        *reinterpret_cast<std::uint32_t*>(cache_k + code + 4)                           = hi;
         scale_k[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)] = sc;
         return;
     }
@@ -1410,11 +1391,11 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     // a single pass (a scale bump moves the block's prefix codes by a single-ratio
     // one-shot pass). A 16-key block never straddles a page (64 keys/page), so its
     // whole state lives in one physical page.
-    const int v_unit  = rest - k_max;
-    const int blk     = v_unit / (Geometry::KVHeads * DpPairs);
-    const int tmp     = v_unit % (Geometry::KVHeads * DpPairs);
-    const int kv_head = tmp / DpPairs;
-    const int dp      = tmp % DpPairs;
+    const int v_unit     = rest - k_max;
+    const int blk        = v_unit / (Geometry::KVHeads * DpPairs);
+    const int tmp        = v_unit % (Geometry::KVHeads * DpPairs);
+    const int kv_head    = tmp / DpPairs;
+    const int dp         = tmp % DpPairs;
     const int block_key0 = (base_pos / 16 + blk) * 16;
     if (block_key0 + 16 <= base_pos || block_key0 >= base_pos + valid_tokens) { return; }
     const int ib_begin = base_pos > block_key0 ? base_pos - block_key0 : 0;
@@ -1430,8 +1411,8 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
         gqa_s3_v_scale_index<Geometry>(physical_page, kv_head, d0 + 1, key_block);
     const std::uint8_t scale_byte0 = scale_v[sc0_off];
     const std::uint8_t scale_byte1 = scale_v[sc1_off];
-    const float s_cur0 = detail::decode_nvfp4_e4m3(scale_byte0);
-    const float s_cur1 = detail::decode_nvfp4_e4m3(scale_byte1);
+    const float s_cur0             = detail::decode_nvfp4_e4m3(scale_byte0);
+    const float s_cur1             = detail::decode_nvfp4_e4m3(scale_byte1);
     // New (in-range) keys: register-resident. Hybrid block max:
     // ib_begin==0 (append owns the block's first slot): whole-pack max of the
     // in-range keys — no stored prefix to rescale, better e2m1 range.
@@ -1441,10 +1422,10 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
     // decode never sees those siblings.
     float v0s[16], v1s[16];
     for (int ki = ib_begin; ki < ib_end; ++ki) {
-        const int t = ki + block_key0 - base_pos;
+        const int t            = ki + block_key0 - base_pos;
         const std::int64_t src = gqa_kv_new_index<Geometry>(kv_head, d0, t);
-        v0s[ki] = __bfloat162float(vb[src]);
-        v1s[ki] = __bfloat162float(vb[src + 1]);
+        v0s[ki]                = __bfloat162float(vb[src]);
+        v1s[ki]                = __bfloat162float(vb[src + 1]);
     }
     float m0 = 0.0f, m1 = 0.0f;
     if (ib_begin == 0) {
@@ -1475,12 +1456,12 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_fill_nvfp4s3_kernel(
         (bump1 && s_cur1 > 0.0f && s_new1 > 0.0f) ? __fdiv_rn(s_cur1, s_new1) : 1.0f;
     if (rescale0 != 1.0f || rescale1 != 1.0f) {
         for (int ki = 0; ki < ib_begin; ++ki) {
-            const std::int64_t co = gqa_nvfp4_code_index<Geometry>(
-                physical_page, kv_head, dp, page_off + ki);
+            const std::int64_t co =
+                gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, dp, page_off + ki);
             const std::uint8_t byte = cache_v[co];
-            const float d0v        = gqa_s3_e2m1_value(byte & 0x0fu);
+            const float d0v         = gqa_s3_e2m1_value(byte & 0x0fu);
             const float d1          = gqa_s3_e2m1_value((byte >> 4) & 0x0fu);
-            cache_v[co] = gqa_s3_cvt_e2m1x2(d0v * rescale0, d1 * rescale1);
+            cache_v[co]             = gqa_s3_cvt_e2m1x2(d0v * rescale0, d1 * rescale1);
         }
     }
     // New key codes under the final scale: single rounding, one coalesced pass.

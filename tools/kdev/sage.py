@@ -26,8 +26,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
 
@@ -43,7 +41,8 @@ _KV_RE = re.compile(r"([a-z_0-9]+)=(\S+)")
 # nvfp4s3 bench table row: context window fill(us) attn_median(us) attn_p95(us) gbps
 _BENCH_ROW_RE = re.compile(
     r"^(?P<ctx>\d+)\s+(?P<window>\d+)\s+(?P<fill>[\d.]+)\s+(?P<median>[\d.]+)\s+"
-    r"(?P<p95>[\d.]+)\s+(?P<gbps>[\d.]+)\s*$", re.M,
+    r"(?P<p95>[\d.]+)\s+(?P<gbps>[\d.]+)\s*$",
+    re.MULTILINE,
 )
 
 
@@ -67,11 +66,19 @@ def _parse_floor_lines(output: str) -> list:
         if not match:
             continue
         label = match.group("label")
-        values = {k: v for k, v in _KV_RE.findall(match.group("kv"))}
+        values = dict(_KV_RE.findall(match.group("kv")))
         record = {"case": label}
-        for key in ("floor", "device_vs_exact", "device_vs_sage", "dev_vs_step_pref64",
-                    "dev_vs_step_dec32", "step64_vs_sage", "step32_vs_sage",
-                    "step64_vs_exact", "n"):
+        for key in (
+            "floor",
+            "device_vs_exact",
+            "device_vs_sage",
+            "dev_vs_step_pref64",
+            "dev_vs_step_dec32",
+            "step64_vs_sage",
+            "step32_vs_sage",
+            "step64_vs_exact",
+            "n",
+        ):
             if key in values:
                 record[key] = float(values[key])
         # A1 (gqa_attention, prefill s3, Bc=64 tiles) uses the prefill step
@@ -88,7 +95,8 @@ def _parse_floor_lines(output: str) -> list:
             if record["bc64_tier"]:
                 record["bug_residual"] = min(
                     record.get("dev_vs_step_pref64", float("inf")),
-                    record.get("dev_vs_step_dec32", float("inf")))
+                    record.get("dev_vs_step_dec32", float("inf")),
+                )
             else:
                 record["bug_residual"] = record.get("dev_vs_step_dec32")
         else:
@@ -103,13 +111,18 @@ def _parse_floor_lines(output: str) -> list:
         if record["bug_residual"] is not None and not record["single_tile"]:
             record["bug_class"] = _bug_class(record["bug_residual"], record.get("floor"))
         else:
-            record["bug_class"] = "no-signal" if record["route"] == "A1" else _bug_class(record["bug_residual"], record.get("floor"))
+            record["bug_class"] = (
+                "no-signal"
+                if record["route"] == "A1"
+                else _bug_class(record["bug_residual"], record.get("floor"))
+            )
         cases.append(record)
     return cases
 
 
-def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
-             run_bench: bool = False) -> dict:
+def run_sage(
+    op_name: str, fast: bool = False, keep_frac: float | None = None, run_bench: bool = False
+) -> dict:
     op = registry.get(op_name)
     if not op.sage:
         raise SystemExit(f"op '{op_name}' has no sage mode; only gqa_attention does (registry)")
@@ -124,20 +137,22 @@ def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
     if keep_frac is not None:
         raise SystemExit("--keep-frac cannot be combined with sage quality mode")
 
-    result = harness.run(f"cd {harness.BUILD} && {harness.test_binary(op)}",
-                         env=env, check=False, timeout=1800.0)
+    result = harness.run(
+        f"cd {harness.BUILD} && {harness.test_binary(op)}", env=env, check=False, timeout=1800.0
+    )
     output = result.output
     lines = output.strip().splitlines()
     last = lines[-1] if lines else ""
     # Gate on the exit code + the absence of a FAIL verdict line: the SAGE_FLOOR
     # diagnostics go to cerr and can land AFTER the stdout "PASS" line in the
     # merged capture, so the last line is not the verdict.
-    fail_line = next((l for l in lines if l.startswith("FAIL")), None)
+    fail_line = next((line for line in lines if line.startswith("FAIL")), None)
     gate_passed = result.ok and fail_line is None
 
     cases = _parse_floor_lines(output)
-    classifiable = [c for c in cases
-                    if c.get("bug_residual") is not None and c.get("bug_class") != "no-signal"]
+    classifiable = [
+        c for c in cases if c.get("bug_residual") is not None and c.get("bug_class") != "no-signal"
+    ]
     worst = max((c["bug_residual"] for c in classifiable), default=None)
     floors = [c["floor"] for c in cases if c.get("floor") is not None]
     avg_floor = sum(floors) / len(floors) if floors else None
@@ -165,12 +180,21 @@ def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
 
     if run_bench:
         bench_env = None
-        bench_result = harness.run(f"cd {harness.BUILD} && {harness.bench_binary(op)}",
-                                   env=bench_env, check=False, timeout=1800.0)
+        bench_result = harness.run(
+            f"cd {harness.BUILD} && {harness.bench_binary(op)}",
+            env=bench_env,
+            check=False,
+            timeout=1800.0,
+        )
         points = [
-            {"context": int(m.group("ctx")), "window": int(m.group("window")),
-             "fill_us": float(m.group("fill")), "median_us": float(m.group("median")),
-             "p95_us": float(m.group("p95")), "gbps": float(m.group("gbps"))}
+            {
+                "context": int(m.group("ctx")),
+                "window": int(m.group("window")),
+                "fill_us": float(m.group("fill")),
+                "median_us": float(m.group("median")),
+                "p95_us": float(m.group("p95")),
+                "gbps": float(m.group("gbps")),
+            }
             for m in _BENCH_ROW_RE.finditer(bench_result.output)
         ]
         verdict_dict["bench"] = {
@@ -179,7 +203,8 @@ def run_sage(op_name: str, fast: bool = False, keep_frac: float | None = None,
             "median_us": points[0]["median_us"] if points else None,
             "ok": bench_result.ok,
             "tail": bench_result.output.strip().splitlines()[-1]
-            if bench_result.output.strip() else "",
+            if bench_result.output.strip()
+            else "",
         }
 
     return verdict_dict
@@ -190,67 +215,95 @@ def render(v: dict) -> str:
     keep = v["keep_frac"]
     flag = "PASS" if o["passed"] else "FAIL"
     lines = [
-        f"[kdev-sage] {v['op']} (sage-{v['tier'][5:]}) gate={flag} keep_frac={keep:g}"
-        f"  git@{v['git']}",
+        (
+            f"[kdev-sage] {v['op']} (sage-{v['tier'][5:]}) gate={flag} keep_frac={keep:g}"
+            f"  git@{v['git']}"
+        ),
     ]
     if not o["sage_cases"]:
-        lines.append("  no SAGE_FLOOR lines parsed — check the test output tail:\n"
-                     + (o.get("tail") or "").strip())
+        lines.append(
+            "  no SAGE_FLOOR lines parsed — check the test output tail:\n"
+            + (o.get("tail") or "").strip()
+        )
         return "\n".join(lines)
 
-    header = (f"  {'case':<58s} {'rt':<3s} {'floor':>7s} {'vs_exact':>9s} "
-              f"{'vs_sage':>8s} {'bug_resid':>10s}  class")
+    header = (
+        f"  {'case':<58s} {'rt':<3s} {'floor':>7s} {'vs_exact':>9s} "
+        f"{'vs_sage':>8s} {'bug_resid':>10s}  class"
+    )
     lines.append(header)
     for c in o["sage_cases"]:
-        def f(key):
+
+        def f(key, c=c):
             value = c.get(key)
             return f"{value:.4g}" if isinstance(value, (int, float)) else "-"
+
         lines.append(
             f"  {c['case'][:58]:<58s} {c['route']:<3s} {f('floor'):>7s} "
             f"{f('device_vs_exact'):>9s} {f('device_vs_sage'):>8s} "
-            f"{f('bug_residual'):>10s}  {c.get('bug_class', '-')}")
+            f"{f('bug_residual'):>10s}  {c.get('bug_class', '-')}"
+        )
 
-    floors = [c["floor"] for c in o["sage_cases"] if c.get("floor") is not None]
+    # avg_floor is None when no case produced a floor value.
+    avg_floor = o.get("avg_floor")
+    floor_text = f"{avg_floor:.4f}" if avg_floor is not None else "n/a"
     # Only classifiable cases count toward the worst residual: single-tile A1 cases
     # have no independent step signal (step64 == closed-form), so their residual is
     # the expected independent-rounding distance, not a bug candidate.
-    classifiable = [c for c in o["sage_cases"]
-                    if c.get("bug_residual") is not None and c.get("bug_class") != "no-signal"]
+    classifiable = [
+        c
+        for c in o["sage_cases"]
+        if c.get("bug_residual") is not None and c.get("bug_class") != "no-signal"
+    ]
     worst = max((c["bug_residual"] for c in classifiable), default=None)
     if worst is not None:
-        lines.append(f"  floor: avg {o.get('avg_floor'):.4f} (documented 0.053-0.059) | "
-                     f"worst bug-residual (classifiable cases) {worst:.4g}")
+        lines.append(
+            f"  floor: avg {floor_text} (documented 0.053-0.059) | "
+            f"worst bug-residual (classifiable cases) {worst:.4g}"
+        )
     else:
-        lines.append(f"  floor: avg {o.get('avg_floor'):.4f}")
+        lines.append(f"  floor: avg {floor_text}")
     if worst is None:
         return "\n".join(lines)
     if keep < 1.0:
-        skip = [c.get("device_vs_exact", 0) - c["floor"] for c in o["sage_cases"]
-                if c.get("floor") is not None]
+        skip = [
+            c.get("device_vs_exact", 0) - c["floor"]
+            for c in o["sage_cases"]
+            if c.get("floor") is not None
+        ]
         avg_skip = sum(skip) / len(skip) if skip else None
-        lines.append(f"  tile-skip loss (keep_frac={keep:g}): device_vs_exact - floor = "
-                     f"{avg_skip:.4g}" if avg_skip is not None else
-                     "  tile-skip loss: no floor values to subtract")
+        lines.append(
+            f"  tile-skip loss (keep_frac={keep:g}): device_vs_exact - floor = {avg_skip:.4g}"
+            if avg_skip is not None
+            else "  tile-skip loss: no floor values to subtract"
+        )
     if worst < _NOISE_BAND:
-        lines.append("  => within the FP32 noise band (1e-03) of the kernel-faithful "
-                     "emulation: no kernel-bug signal. The keep_frac=1.0 quality loss is the "
-                     "FP4-P quant floor — intrinsic, not a bug.")
+        lines.append(
+            "  => within the FP32 noise band (1e-03) of the kernel-faithful "
+            "emulation: no kernel-bug signal. The keep_frac=1.0 quality loss is the "
+            "FP4-P quant floor — intrinsic, not a bug."
+        )
     else:
-        worst_class = max((c["bug_class"] for c in classifiable),
-                          key=lambda x: {"noise": 0, "sub-floor-dev": 1, ">=floor-dev": 2}[x])
+        worst_class = max(
+            (c["bug_class"] for c in classifiable),
+            key=lambda x: {"noise": 0, "sub-floor-dev": 1, ">=floor-dev": 2}[x],
+        )
         lines.append(
             f"  => the kernel adds {worst:.4g} rel_L2 on top of the FP4-P floor "
-            f"(avg floor {o.get('avg_floor'):.4f}; class {worst_class}): a systematic "
+            f"(avg floor {floor_text}; class {worst_class}): a systematic "
             "deviation beyond the intrinsic quant floor. Localize it: the S3_ORC_DUMP / "
             "SAGE_DUMP env dumps of this test already per-block-dump the s3 P-quant "
             "stages, and the P2 side-band port (op_dump + diff.py) localizes the first "
-            "divergent stage + index.")
+            "divergent stage + index."
+        )
     b = v.get("bench")
     if b and b.get("points"):
         p = b["points"][0]
-        lines.append(f"  bench (keep_frac={b['keep_frac']:g}): ctx={p['context']} "
-                     f"attn median={p['median_us']:.1f}us p95={p['p95_us']:.1f}us "
-                     f"{p['gbps']:.0f} GB/s")
+        lines.append(
+            f"  bench (keep_frac={b['keep_frac']:g}): ctx={p['context']} "
+            f"attn median={p['median_us']:.1f}us p95={p['p95_us']:.1f}us "
+            f"{p['gbps']:.0f} GB/s"
+        )
     return "\n".join(lines)
 
 

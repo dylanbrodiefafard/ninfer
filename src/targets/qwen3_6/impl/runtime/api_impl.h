@@ -173,10 +173,11 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
-runtime::PrefillStepResult
-Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
-                                     RequestPlan<Variant>&& plan,
-                                     runtime::TransientRegion transient, const OutputSession* output) {
+runtime::PrefillStepResult Program<Variant>::start_prefill_lane(std::uint32_t lane,
+                                                                PreparedPrompt&& prompt,
+                                                                RequestPlan<Variant>&& plan,
+                                                                runtime::TransientRegion transient,
+                                                                const OutputSession* output) {
     return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
                                      std::move(plan), transient, output);
 }
@@ -319,9 +320,10 @@ bool Program<Variant>::claim_disk_entry(std::uint64_t entry_id, std::uint32_t ex
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
                                         std::uint32_t expected_reuse_base,
                                         PrefixReusePath expected_reuse,
-                                         std::uint64_t expected_committed_generation) {
+                                        std::uint64_t expected_committed_generation) {
     return impl_->claim_disk_entry(entry_id, expected_frontier, hash_lo, hash_hi,
-                                   expected_reuse_base, expected_reuse, expected_committed_generation);
+                                   expected_reuse_base, expected_reuse,
+                                   expected_committed_generation);
 }
 
 template <>
@@ -387,7 +389,8 @@ qwen3_6::detail::KvRamCopySeconds Program<Variant>::harvest_kv_ram_copy_seconds(
 }
 
 template <>
-std::optional<qwen3_6::detail::KvDiskSnapshot> Program<Variant>::try_kv_disk_snapshot() const noexcept {
+std::optional<qwen3_6::detail::KvDiskSnapshot>
+Program<Variant>::try_kv_disk_snapshot() const noexcept {
     return impl_->try_kv_disk_snapshot();
 }
 
@@ -508,14 +511,14 @@ std::unique_ptr<Program<Variant>>
 create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile weights_profile,
                         SequencePlan<Variant>&& plan, DeviceContext& device,
                         std::unique_ptr<HostPinnedArena> kv_ram_arena) {
-    if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
-    if (plan.impl_->weights_profile != weights_profile) {
+    const SequencePlan<Variant> consumed = std::move(plan);
+    if (consumed.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
+    if (consumed.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
     }
-    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(
-        model, *plan.impl_, device, std::move(kv_ram_arena));
-    plan.impl_.reset();
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *consumed.impl_, device,
+                                                               std::move(kv_ram_arena));
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }
 

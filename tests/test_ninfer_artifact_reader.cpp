@@ -119,16 +119,20 @@ void test_registered_sizes() {
 
 void test_fp8_row_layout() {
     const std::array<std::uint64_t, 2> shape{2, 4};
-    const auto geometry = ninfer::artifact::row_scale_geometry(
-        NumericFormat::FP8_E4M3FN_ROW_BF16S, shape);
+    const auto geometry =
+        ninfer::artifact::row_scale_geometry(NumericFormat::FP8_E4M3FN_ROW_BF16S, shape);
     if (geometry.code_plane_bytes != 8 || geometry.scale_plane_offset != 256 ||
         geometry.scale_plane_bytes != 4 || geometry.encoded_bytes != 260) {
         throw std::runtime_error("FP8 row-scale geometry differs from exact byte layout");
     }
     auto directory = normative_directory();
-    directory["objects"].push_back({{"name", "fp8"}, {"kind", "tensor"}, {"shape", {2, 4}},
-        {"format", "FP8_E4M3FN_ROW_BF16S"}, {"layout", "row-scale-v1"},
-        {"offset", 3584}, {"bytes", 260}});
+    directory["objects"].push_back({{"name", "fp8"},
+                                    {"kind", "tensor"},
+                                    {"shape", {2, 4}},
+                                    {"format", "FP8_E4M3FN_ROW_BF16S"},
+                                    {"layout", "row-scale-v1"},
+                                    {"offset", 3584},
+                                    {"bytes", 260}});
     auto fixture = write_fixture(directory, "fp8-row-scale");
     Reader reader(fixture.path);
     const auto* tensor = std::get_if<TensorDescriptor>(reader.find("fp8"));
@@ -136,10 +140,12 @@ void test_fp8_row_layout() {
         tensor->layout != StorageLayout::RowScaleV1 || reader.payload(*tensor).data.size() != 260) {
         throw std::runtime_error("FP8 row-scale directory/payload did not round trip");
     }
-    expect_artifact_error([&] {
-        (void)ninfer::artifact::tensor_encoded_size(StorageLayout::RowSplitK128V1,
-            NumericFormat::FP8_E4M3FN_ROW_BF16S, shape);
-    }, "FP8 cannot use grouped integer layout");
+    expect_artifact_error(
+        [&] {
+            (void)ninfer::artifact::tensor_encoded_size(StorageLayout::RowSplitK128V1,
+                                                        NumericFormat::FP8_E4M3FN_ROW_BF16S, shape);
+        },
+        "FP8 cannot use grouped integer layout");
 }
 
 void test_normative_fixture() {
@@ -212,8 +218,8 @@ void test_common_validation() {
 }
 
 void test_file_generation_identity() {
-    auto original = write_fixture(normative_directory(), "file-identity-original");
-    auto replacement = write_fixture(normative_directory(), "file-identity-replacement");
+    auto original      = write_fixture(normative_directory(), "file-identity-original");
+    auto replacement   = write_fixture(normative_directory(), "file-identity-replacement");
     const auto initial = Reader(original.path).file_identity();
     if (initial.empty() || Reader(original.path).file_identity() != initial) {
         throw std::runtime_error("unchanged artifact file identity is not stable");

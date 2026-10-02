@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
 import json
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-import struct
-from typing import Mapping, Sequence
 
 from tools.artifact.container import (
     MAGIC,
@@ -28,7 +27,6 @@ from tools.artifact.container import (
 from tools.artifact.layouts import align_up
 from tools.convert.qwen3_6_27b import inventory as inventory_27b
 from tools.convert.qwen3_6_35b_a3b import inventory as inventory_35b
-
 
 V1_MAGIC = b"NINFER\x00\x01"
 BACKUP_SUFFIX = ".v1-metadata-backup"
@@ -84,9 +82,7 @@ def _require_nonempty_string(value: object, field: str) -> str:
     return value
 
 
-def _require_nonnegative_integer(
-    value: object, field: str, *, positive: bool = False
-) -> int:
+def _require_nonnegative_integer(value: object, field: str, *, positive: bool = False) -> int:
     if type(value) is not int or value < (1 if positive else 0):
         qualifier = "positive" if positive else "nonnegative"
         raise MigrationError(f"{field} must be a {qualifier} integer")
@@ -107,9 +103,7 @@ def _read_v1_directory(path: Path) -> V1Directory:
         metadata_end = PREFIX_BYTES + json_bytes
         payload_offset = align_up(metadata_end, PAYLOAD_ALIGNMENT)
         if metadata_end > file_bytes or payload_offset > file_bytes:
-            raise MigrationError(
-                "declared JSON or payload start extends beyond the file"
-            )
+            raise MigrationError("declared JSON or payload start extends beyond the file")
         encoded = handle.read(json_bytes)
     if len(encoded) != json_bytes:
         raise MigrationError("artifact JSON is truncated")
@@ -117,12 +111,8 @@ def _read_v1_directory(path: Path) -> V1Directory:
         root = json.loads(encoded.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MigrationError(f"invalid v1 JSON directory: {exc}") from exc
-    if not isinstance(root, dict) or frozenset(root) != frozenset(
-        ("model_id", "objects")
-    ):
-        raise MigrationError(
-            "v1 directory root must contain exactly model_id and objects"
-        )
+    if not isinstance(root, dict) or frozenset(root) != frozenset(("model_id", "objects")):
+        raise MigrationError("v1 directory root must contain exactly model_id and objects")
     model_id = _require_nonempty_string(root["model_id"], "model_id")
     objects = root["objects"]
     if not isinstance(objects, list) or not objects:
@@ -143,9 +133,7 @@ def _candidate_for_model(
 ) -> PublishedV1Artifact:
     matches = [candidate for candidate in candidates if candidate.model_id == model_id]
     if len(matches) != 1:
-        raise MigrationError(
-            f"v1 model_id {model_id!r} is not one of the two published artifacts"
-        )
+        raise MigrationError(f"v1 model_id {model_id!r} is not one of the two published artifacts")
     return matches[0]
 
 
@@ -160,7 +148,7 @@ def _validate_inventory(
 
     specs: list[ResourceSpec | TensorSpec] = []
     for position, (raw, expected) in enumerate(
-        zip(directory.raw_objects, candidate.inventory)
+        zip(directory.raw_objects, candidate.inventory, strict=True)
     ):
         if expected.kind == "resource":
             required_members = frozenset(("name", "kind", "encoding", "offset", "bytes"))
@@ -195,7 +183,7 @@ def _validate_inventory(
         planned = plan_objects(specs)
     except (ArtifactError, KeyError, TypeError, ValueError) as exc:
         raise MigrationError(f"v1 object inventory is invalid: {exc}") from exc
-    for position, (raw, expected) in enumerate(zip(directory.raw_objects, planned)):
+    for position, (raw, expected) in enumerate(zip(directory.raw_objects, planned, strict=True)):
         if raw != expected.to_json():
             raise MigrationError(
                 f"v1 object at position {position} does not match the published "
@@ -204,9 +192,7 @@ def _validate_inventory(
     payload_bytes = directory.file_bytes - directory.payload_offset
     last = planned[-1]
     if last.offset + last.bytes != payload_bytes:
-        raise MigrationError(
-            "v1 payload length does not match the complete published inventory"
-        )
+        raise MigrationError("v1 payload length does not match the complete published inventory")
     return planned
 
 
@@ -239,10 +225,7 @@ def _restore_backup(path: Path, backup: Path) -> None:
     if len(data) < PREFIX_BYTES or data[:8] != V1_MAGIC:
         raise MigrationError(f"invalid migration recovery file: {backup}")
     _, json_bytes = PREFIX.unpack(data[:PREFIX_BYTES])
-    if (
-        json_bytes == 0
-        or align_up(PREFIX_BYTES + json_bytes, PAYLOAD_ALIGNMENT) != len(data)
-    ):
+    if json_bytes == 0 or align_up(PREFIX_BYTES + json_bytes, PAYLOAD_ALIGNMENT) != len(data):
         raise MigrationError(f"invalid migration recovery file: {backup}")
     with path.open("r+b") as handle:
         handle.seek(0)
@@ -258,9 +241,7 @@ def _remove_backup(backup: Path) -> None:
     _fsync_directory(backup.parent)
 
 
-def _already_v2(
-    path: Path, candidates: Sequence[PublishedV1Artifact]
-) -> ArtifactIdentity | None:
+def _already_v2(path: Path, candidates: Sequence[PublishedV1Artifact]) -> ArtifactIdentity | None:
     with path.open("rb") as handle:
         magic = handle.read(8)
     if magic != MAGIC:
@@ -276,9 +257,7 @@ def _already_v2(
     return identity
 
 
-def _migrate(
-    path: Path, candidates: Sequence[PublishedV1Artifact]
-) -> ArtifactIdentity:
+def _migrate(path: Path, candidates: Sequence[PublishedV1Artifact]) -> ArtifactIdentity:
     path = path.resolve()
     if not path.is_file():
         raise MigrationError(f"artifact does not exist: {path}")
@@ -305,8 +284,7 @@ def _migrate(
     directory_digest = hashlib.sha256(directory.encoded).hexdigest()
     if directory_digest != candidate.directory_sha256:
         raise MigrationError(
-            f"v1 directory SHA-256 is {directory_digest}; expected "
-            f"{candidate.directory_sha256}"
+            f"v1 directory SHA-256 is {directory_digest}; expected {candidate.directory_sha256}"
         )
     planned = _validate_inventory(directory, candidate)
 
@@ -320,9 +298,7 @@ def _migrate(
     encoded = encode_directory(candidate.identity, planned)
     payload_offset = align_up(PREFIX_BYTES + len(encoded), PAYLOAD_ALIGNMENT)
     if payload_offset != directory.payload_offset:
-        raise MigrationError(
-            "v2 directory does not preserve the existing payload offset"
-        )
+        raise MigrationError("v2 directory does not preserve the existing payload offset")
 
     with path.open("rb") as handle:
         old_metadata = handle.read(directory.payload_offset)
@@ -346,8 +322,7 @@ def _migrate(
         with Artifact.open(path) as artifact:
             if artifact.identity != candidate.identity:
                 raise MigrationError(
-                    f"migrated identity is {artifact.identity!r}; expected "
-                    f"{candidate.identity!r}"
+                    f"migrated identity is {artifact.identity!r}; expected {candidate.identity!r}"
                 )
             if artifact.objects != planned:
                 raise MigrationError("migrated object directory changed")
@@ -360,10 +335,7 @@ def _migrate(
         raise
 
     _remove_backup(backup)
-    print(
-        f"migrated in place: {candidate.model_id}/{candidate.weights_id} "
-        f"({path})"
-    )
+    print(f"migrated in place: {candidate.model_id}/{candidate.weights_id} ({path})")
     return candidate.identity
 
 

@@ -21,12 +21,12 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 template <class Geometry, int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule {
     static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);
-    static constexpr int kWarpsPerCta = ActiveTokens <= 19 ? 8 : 4;
-    static constexpr int kRowsPerWarp = ActiveTokens <= 5 ? 1 : 2;
+    static constexpr int kWarpsPerCta   = ActiveTokens <= 19 ? 8 : 4;
+    static constexpr int kRowsPerWarp   = ActiveTokens <= 5 ? 1 : 2;
     static constexpr int kValuesPerLane = ActiveTokens <= 19 ? 16 : 8;
     using Type = Fp8SmallTSchedule<kWarpsPerCta, kRowsPerWarp, kValuesPerLane, ActiveTokens, 1,
-        Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
-        Fp8SmallTBlockOrder::RowsContiguous, 1>;
+                                   Fp8SmallTActivationAccess::TokenPacked, Fp8CodeCache::Default, 1,
+                                   Fp8SmallTBlockOrder::RowsContiguous, 1>;
 };
 
 template <class Geometry, int ActiveTokens>

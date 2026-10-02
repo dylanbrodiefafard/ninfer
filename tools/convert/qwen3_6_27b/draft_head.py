@@ -12,14 +12,17 @@ import numpy as np
 
 from tools.convert.qwen3_6.common.draft_head import (
     DraftHeadContext,
-    compute_shortlist as _compute_shortlist,
-    load_total_counts as _load_total_counts,
     materialize_draft_head,
     materialize_draft_head_token_ids,
     read_special_ids,
     select_shortlist,
 )
-
+from tools.convert.qwen3_6.common.draft_head import (
+    compute_shortlist as _compute_shortlist,
+)
+from tools.convert.qwen3_6.common.draft_head import (
+    load_total_counts as _load_total_counts,
+)
 
 VOCAB_SIZE = 248320
 TOKENIZER_VOCAB_SIZE = 248077
@@ -28,9 +31,7 @@ DRAFT_HEAD_WIDTH = 5120
 
 DRAFT_HEAD_OBJECT = "text/draft_head"
 DRAFT_HEAD_TOKEN_IDS_OBJECT = "text/draft_head_token_ids"
-DEFAULT_RANKING = Path(
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
-)
+DEFAULT_RANKING = Path("tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64")
 
 
 def load_total_counts(path: str | Path, vocab: int = VOCAB_SIZE) -> np.ndarray:
@@ -45,9 +46,7 @@ def compute_shortlist(
     tokenizer_vocab_size: int | None = None,
 ) -> DraftHeadContext:
     domain = (
-        min(TOKENIZER_VOCAB_SIZE, vocab)
-        if tokenizer_vocab_size is None
-        else tokenizer_vocab_size
+        min(TOKENIZER_VOCAB_SIZE, vocab) if tokenizer_vocab_size is None else tokenizer_vocab_size
     )
     return _compute_shortlist(
         ranking_path,
@@ -64,9 +63,9 @@ __all__ = [
     "DRAFT_HEAD_OBJECT",
     "DRAFT_HEAD_TOKEN_IDS_OBJECT",
     "DRAFT_HEAD_WIDTH",
-    "DraftHeadContext",
     "TOKENIZER_VOCAB_SIZE",
     "VOCAB_SIZE",
+    "DraftHeadContext",
     "compute_shortlist",
     "load_total_counts",
     "materialize_draft_head",

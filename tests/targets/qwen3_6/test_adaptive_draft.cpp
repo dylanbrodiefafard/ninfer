@@ -29,17 +29,17 @@ void expect_near(float got, float want, float tol, std::string_view message) {
     expect(err <= tol, message);
 }
 
-void plant_r(q36::AdaptiveDraftState& state, std::uint32_t live_k,
-             std::initializer_list<float> rs, std::uint32_t n = 256) {
+void plant_r(q36::AdaptiveDraftState& state, std::uint32_t live_k, std::initializer_list<float> rs,
+             std::uint32_t n = 256) {
     q36::seed_adaptive_draft_state(state, live_k, q36::AdaptiveDraftLaw::Greedy);
     state.observed    = n;
     state.rounds_at_k = 32;
     std::uint32_t i   = 0;
     for (float r : rs) {
         if (i >= q36::kAdaptiveMaxHops) { break; }
-        const float nn   = static_cast<float>(n);
-        state.alpha[i]   = r * nn + 1.0f;
-        state.beta[i]    = (1.0f - r) * nn + 1.0f;
+        const float nn = static_cast<float>(n);
+        state.alpha[i] = r * nn + 1.0f;
+        state.beta[i]  = (1.0f - r) * nn + 1.0f;
         state.r_seen |= static_cast<std::uint16_t>(1U << i);
         ++i;
     }
@@ -72,17 +72,20 @@ std::uint32_t pick(const q36::AdaptiveDraftConfig& cfg, const q36::AdaptiveDraft
 
 void test_capture_set() {
     using ninfer::SpeculativeBackend;
-    const auto eq = [](std::vector<std::uint32_t> got, std::vector<std::uint32_t> want,
+    const auto eq = [](const std::vector<std::uint32_t>& got,
+                       const std::vector<std::uint32_t>& want,
                        std::string_view msg) { expect(got == want, msg); };
     eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false, 7), {5}, "frozen MTP {N}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7), {3, 4, 5}, "MTP adaptive {3,4,5}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7), {3, 4, 5},
+       "MTP adaptive {3,4,5}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true, 7), {3, 4, 5},
        "DFlash adaptive {3,4,5}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, true, 7), {3, 4, 5, 6, 7},
        "DFlash adaptive {3..7}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 15, true, 5), {3, 4, 5},
        "DFlash adaptive bounded by the target maximum");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 4, true, 7), {4}, "DFlash N=4 frozen {4}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 4, true, 7), {4},
+       "DFlash N=4 frozen {4}");
     eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, false, 7), {7}, "frozen DFlash {N}");
 }
 
@@ -92,7 +95,8 @@ void test_seed_is_captured_min() {
     const auto mt = q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7);
     expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 3,
            "seed fallback is captured.front()");
-    expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3, "MTP seed is also the smallest k");
+    expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3,
+           "MTP seed is also the smallest k");
     const std::uint32_t frozen[] = {7};
     expect(q36::adaptive_seed_k(frozen, SpeculativeBackend::DFlash) == 7, "frozen |K|=1 seeds N");
 }
@@ -244,9 +248,8 @@ void test_unmeasured_k4_probed_at_most_once() {
 void test_mtp_unseen_hop_stops_expected_tokens() {
     q36::AdaptiveDraftState planted;
     plant_r(planted, 3, {0.80f, 0.625f, 0.60f});
-    expect_near(q36::detail::expected_tokens(planted, 5),
-                q36::detail::expected_tokens(planted, 3), 1e-5f,
-                "MTP: unseen r3,r4 do not add tokens");
+    expect_near(q36::detail::expected_tokens(planted, 5), q36::detail::expected_tokens(planted, 3),
+                1e-5f, "MTP: unseen r3,r4 do not add tokens");
     q36::AdaptiveDraftState state;
     q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::Greedy);
     q36::AdaptiveRoundTimeState t;
@@ -294,9 +297,7 @@ void test_stationary_late_hop_does_not_force_k5() {
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
     cfg.switch_seconds       = 0.0f;
-    for (int i = 0; i < 80; ++i) {
-        (void)q36::adaptive_draft_next(cfg, state, 3, 4, 5, 4, false);
-    }
+    for (int i = 0; i < 80; ++i) { (void)q36::adaptive_draft_next(cfg, state, 3, 4, 5, 4, false); }
     expect(state.live_k == 4, "stationary hop-3 failures do not inject k=5");
     expect((state.r_seen & 0x10U) == 0, "k=4 rounds never observe r4");
 }
@@ -315,10 +316,11 @@ void test_batch_sum_e_over_t() {
     const std::uint32_t rows[]           = {5, 5};
     const std::uint32_t picked =
         q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, nullptr);
-    float best_s               = -1.0f;
-    std::uint32_t want         = 3;
+    float best_s       = -1.0f;
+    std::uint32_t want = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e  = q36::detail::expected_tokens(hot, k) + q36::detail::expected_tokens(cold, k);
+        const float e =
+            q36::detail::expected_tokens(hot, k) + q36::detail::expected_tokens(cold, k);
         const float tk = q36::adaptive_t_hat(t, k, 512);
         const float sc = e / tk;
         if (sc > best_s) {
@@ -341,11 +343,11 @@ void test_batch_row_budget_clips_expected_tokens() {
     const std::uint32_t rows[]           = {5, 3};
     const std::uint32_t picked =
         q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, nullptr);
-    float best_s               = -1.0f;
-    std::uint32_t want         = 3;
+    float best_s       = -1.0f;
+    std::uint32_t want = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e = q36::detail::expected_tokens(hot, std::min(k, 5U)) +
-                        q36::detail::expected_tokens(hot, std::min(k, 3U));
+        const float e  = q36::detail::expected_tokens(hot, std::min(k, 5U)) +
+                         q36::detail::expected_tokens(hot, std::min(k, 3U));
         const float sc = e / q36::adaptive_t_hat(t, k, 512);
         if (sc > best_s) {
             best_s = sc;
@@ -368,8 +370,7 @@ void test_batch_next_writes_executed_k() {
     const q36::AdaptiveDraftState* mid[] = {&a, &b};
     const std::uint32_t rows[]           = {5, 5};
     q36::AdaptiveBatchKState batch;
-    const std::uint32_t k =
-        q36::adaptive_batch_next(batch, mid, rows, captured, &t, 512, nullptr);
+    const std::uint32_t k = q36::adaptive_batch_next(batch, mid, rows, captured, &t, 512, nullptr);
     expect(k == 4 && batch.live_k == 4, "batch live_k is the executed argmax, not a per-row pick");
     q36::AdaptiveDraftState* mut[] = {&a, &b};
     q36::adaptive_assign_live_k(mut, k);
@@ -398,13 +399,14 @@ void test_t_survives_request_seed() {
            "T is server-global; hop posterior is per-request");
 }
 
-
 // DFlash hop model. Exploration rows are recorded directly so the arithmetic stays explicit.
 void explore_rows(q36::AdaptiveHopRates& rates, q36::AdaptiveDraftLaw law, std::uint32_t k,
                   std::uint32_t accepted, int rows) {
     q36::AdaptiveDraftState scratch;
     q36::seed_adaptive_draft_state(scratch, k, law);
-    for (int r = 0; r < rows; ++r) { q36::adaptive_record_round(scratch, accepted, k, k, &rates, true); }
+    for (int r = 0; r < rows; ++r) {
+        q36::adaptive_record_round(scratch, accepted, k, k, &rates, true);
+    }
 }
 
 float sum_of_products(std::initializer_list<float> rates) {
@@ -444,9 +446,9 @@ void test_hop_exploration_rows_alone_update_the_table() {
            "a full exploration row counts trials up to the failing hop");
     expect(state.rounds_at_k == 1, "exploration rounds do not count toward the incumbent k");
     // Exact hierarchy after that single row.
-    const float p0 = (0.0f + 4.0f * 0.35f) / (1.0f + 4.0f);
-    const float p2 = (1.0f + 4.0f * 0.35f) / (1.0f + 4.0f);
-    const float pr[] = {p0, p0, p2, 0.35f, 0.35f};
+    const float p0       = (0.0f + 4.0f * 0.35f) / (1.0f + 4.0f);
+    const float p2       = (1.0f + 4.0f * 0.35f) / (1.0f + 4.0f);
+    const float pr[]     = {p0, p0, p2, 0.35f, 0.35f};
     const float expected = pr[0] + pr[1] + pr[2];
     const float a        = q36::kAdaptiveBlockRatioPrior;
     const float b        = q36::kAdaptiveCellPriorTrials;
@@ -519,10 +521,11 @@ void test_hop_batch_row_uses_block_length() {
     q36::seed_adaptive_draft_state(state, 5, q36::AdaptiveDraftLaw::Greedy);
     const q36::AdaptiveDraftState* rows[] = {&state, &state};
     const std::uint32_t caps[]            = {5, 3};
-    const float e = q36::detail::row_sum_e(rows, caps, 5, &rates);
-    expect_near(e, q36::detail::hop_expected_tokens(state, rates, 5, 5) +
-                       q36::detail::hop_expected_tokens(state, rates, 5, 3), 1e-5f,
-                "a capped row in a k=5 batch uses the k=5 block hazards over its extent");
+    const float e                         = q36::detail::row_sum_e(rows, caps, 5, &rates);
+    expect_near(e,
+                q36::detail::hop_expected_tokens(state, rates, 5, 5) +
+                    q36::detail::hop_expected_tokens(state, rates, 5, 3),
+                1e-5f, "a capped row in a k=5 batch uses the k=5 block hazards over its extent");
     expect(q36::detail::hop_expected_tokens(state, rates, 5, 3) <
                q36::detail::hop_expected_tokens(state, rates, 3, 3),
            "block length, not extent, selects the hazards");
@@ -532,9 +535,13 @@ void test_hop_decay_relaxes_unreached_hops() {
     q36::AdaptiveHopRates rates;
     q36::AdaptiveDraftState state;
     q36::seed_adaptive_draft_state(state, 7, q36::AdaptiveDraftLaw::Greedy);
-    for (int round = 0; round < 8; ++round) { q36::adaptive_record_round(state, 5, 7, 7, &rates, false); }
+    for (int round = 0; round < 8; ++round) {
+        q36::adaptive_record_round(state, 5, 7, 7, &rates, false);
+    }
     expect(state.hazard_failures[5] > 4.0f, "hop 5 failed every k=7 round");
-    for (int round = 0; round < 200; ++round) { q36::adaptive_record_round(state, 0, 3, 3, &rates, false); }
+    for (int round = 0; round < 200; ++round) {
+        q36::adaptive_record_round(state, 0, 3, 3, &rates, false);
+    }
     expect(state.hazard_failures[5] < 0.01f && state.hazard_expected[5] < 0.01f,
            "a hop the picker stops reaching decays back to its prior");
 }
@@ -543,14 +550,17 @@ void test_hop_easy_content_does_not_saturate_unseen_hops() {
     q36::AdaptiveHopRates rates;
     q36::AdaptiveDraftState state;
     q36::seed_adaptive_draft_state(state, 5, q36::AdaptiveDraftLaw::Greedy);
-    for (int round = 0; round < 64; ++round) { q36::adaptive_record_round(state, 5, 5, 5, &rates, false); }
+    for (int round = 0; round < 64; ++round) {
+        q36::adaptive_record_round(state, 5, 5, 5, &rates, false);
+    }
     const float e3 = q36::detail::hop_expected_tokens(state, rates, 7, 3);
     const float e4 = q36::detail::hop_expected_tokens(state, rates, 7, 4);
     const float e5 = q36::detail::hop_expected_tokens(state, rates, 7, 5);
     const float e6 = q36::detail::hop_expected_tokens(state, rates, 7, 6);
     const float r4 = (e5 - e4) / (e4 - e3);
     const float r5 = (e6 - e5) / (e5 - e4);
-    expect(r4 > 0.9f && r4 <= q36::kAdaptiveMaxHopRate + 1e-6f, "a seen easy hop approaches the cap");
+    expect(r4 > 0.9f && r4 <= q36::kAdaptiveMaxHopRate + 1e-6f,
+           "a seen easy hop approaches the cap");
     expect(r5 < r4 && r5 > 0.6f, "the unseen hop inherits half of the easiness, not the cap");
 }
 
@@ -599,14 +609,17 @@ void test_exploration_trigger_is_uniform_and_capped() {
     q36::AdaptiveHopRates again;
     bool same = true;
     for (int i = 0; i < 1000; ++i) {
-        same = same && q36::adaptive_explore_k(replay, ks, t, 7) == q36::adaptive_explore_k(again, ks, t, 7);
+        same = same && q36::adaptive_explore_k(replay, ks, t, 7) ==
+                           q36::adaptive_explore_k(again, ks, t, 7);
     }
     expect(same, "the trigger is a deterministic function of the decision counter");
     q36::AdaptiveRoundTimeState partial;
     plant_t(partial, 3, 0.015f);
     q36::AdaptiveHopRates probe;
     std::uint32_t during_probe = 0;
-    for (int i = 0; i < 4000; ++i) { during_probe += q36::adaptive_explore_k(probe, ks, partial, 7); }
+    for (int i = 0; i < 4000; ++i) {
+        during_probe += q36::adaptive_explore_k(probe, ks, partial, 7);
+    }
     expect(during_probe == 0, "no exploration while a k within the cap is unmeasured");
 }
 

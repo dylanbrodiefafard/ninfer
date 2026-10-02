@@ -27,9 +27,13 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
     if (policy == LinearPolicy::AllowA8) {
         const auto problem = resolve_nvfp4_problem(output_rows, input_rows);
-        return tokens >= kNvfp4FirstA8 && (problem == Nvfp4Problem::AttnInput || problem == Nvfp4Problem::GdnInput ||
-            problem == Nvfp4Problem::MlpGateUp || problem == Nvfp4Problem::Residual6144 ||
-            problem == Nvfp4Problem::Residual17408) ? Nvfp4LinearRoute::W4A8 : Nvfp4LinearRoute::A16;
+        return tokens >= kNvfp4FirstA8 &&
+                       (problem == Nvfp4Problem::AttnInput || problem == Nvfp4Problem::GdnInput ||
+                        problem == Nvfp4Problem::MlpGateUp ||
+                        problem == Nvfp4Problem::Residual6144 ||
+                        problem == Nvfp4Problem::Residual17408)
+                   ? Nvfp4LinearRoute::W4A8
+                   : Nvfp4LinearRoute::A16;
     }
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
@@ -63,8 +67,9 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
 // DFlash qkv, attention-output and feature projections run BF16 activations on tensor cores for
 // T>=2; T=1 keeps the GEMV decode kernel.
 bool a16_uses_mma(Nvfp4Problem problem, std::int32_t tokens) {
-    return tokens >= 2 && (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
-                           problem == Nvfp4Problem::DflashFeature);
+    return tokens >= 2 &&
+           (problem == Nvfp4Problem::DflashQkv || problem == Nvfp4Problem::DflashAttnOut ||
+            problem == Nvfp4Problem::DflashFeature);
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -75,8 +80,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     constexpr std::int32_t kChunk = kNvfp4LastSmallT;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
-                      static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+        auto* input  = static_cast<std::uint8_t*>(x.data) +
+                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(out.data) +
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
@@ -92,7 +97,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 } // namespace
 
 bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                           LinearPolicy policy) noexcept {
+                                           LinearPolicy policy) {
     if (!is_nvfp4_linear_problem(output_rows, input_rows) ||
         (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
         return false;
@@ -101,20 +106,18 @@ bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_
 }
 
 bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                            LinearPolicy policy,
-                                            std::int32_t sequence_width) noexcept {
+                                            LinearPolicy policy, std::int32_t sequence_width) {
     if (policy != LinearPolicy::AllowA4 || sequence_width <= 0 ||
         !is_nvfp4_linear_problem(output_rows, input_rows)) {
         return false;
     }
     const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
     return (problem == Nvfp4Problem::MlpGateUp || problem == Nvfp4Problem::Residual17408) &&
-           resolve_route(output_rows, input_rows, policy, sequence_width) ==
-               Nvfp4LinearRoute::W4A4;
+           resolve_route(output_rows, input_rows, policy, sequence_width) == Nvfp4LinearRoute::W4A4;
 }
 
 bool is_nvfp4_dflash_conv_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                               LinearPolicy policy) noexcept {
+                                               LinearPolicy policy) {
     return policy == LinearPolicy::A16Only && is_nvfp4_linear_problem(output_rows, input_rows) &&
            resolve_nvfp4_problem(output_rows, input_rows) == Nvfp4Problem::DflashConvProj;
 }
@@ -147,7 +150,7 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     }
     if (resolve_route(weight.n, weight.k, policy, x.ne[1]) == Nvfp4LinearRoute::W4A8) {
         if (!workspace) { throw std::invalid_argument("NVFP4 A8 requires workspace"); }
-        auto scope = workspace->scope();
+        auto scope   = workspace->scope();
         auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
         launch_nvfp4_w4a8(x, weight, out, scratch, stream);
         return;
@@ -167,10 +170,10 @@ void launch_nvfp4_mtp_fc_splitk(const Tensor& embedding, const Tensor& hidden, c
     const std::int32_t half_k     = weight.k / 2;
     for (std::int32_t token_begin = 0; token_begin < tokens; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, tokens - token_begin);
-        auto* emb = static_cast<std::uint8_t*>(embedding.data) +
-                    static_cast<std::int64_t>(token_begin) * half_k * sizeof(std::uint16_t);
-        auto* hid = static_cast<std::uint8_t*>(hidden.data) +
-                    static_cast<std::int64_t>(token_begin) * half_k * sizeof(std::uint16_t);
+        auto* emb    = static_cast<std::uint8_t*>(embedding.data) +
+                       static_cast<std::int64_t>(token_begin) * half_k * sizeof(std::uint16_t);
+        auto* hid    = static_cast<std::uint8_t*>(hidden.data) +
+                       static_cast<std::int64_t>(token_begin) * half_k * sizeof(std::uint16_t);
         auto* output = static_cast<std::uint8_t*>(out.data) +
                        static_cast<std::int64_t>(token_begin) * weight.n * sizeof(std::uint16_t);
         Tensor embedding_chunk(emb, DType::BF16, {half_k, active});

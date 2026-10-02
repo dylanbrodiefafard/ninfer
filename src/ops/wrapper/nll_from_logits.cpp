@@ -16,7 +16,9 @@ void nll_from_logits(const Tensor& logits, const Tensor& targets, Tensor& out,
     if (targets.dtype != DType::I32) {
         throw std::invalid_argument("nll_from_logits: targets must be I32");
     }
-    if (out.dtype != DType::FP32) { throw std::invalid_argument("nll_from_logits: out must be FP32"); }
+    if (out.dtype != DType::FP32) {
+        throw std::invalid_argument("nll_from_logits: out must be FP32");
+    }
     if (logits.ne[2] != 1 || logits.ne[3] != 1) {
         throw std::invalid_argument("nll_from_logits: logits must be rank-2 [vocab,T]");
     }

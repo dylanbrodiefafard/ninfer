@@ -32,20 +32,20 @@ struct W8LinearGeometry {
 template <int KWarps, int TileTokens, int MinBlocksPerSm, W8SmallTMmaScaleAccess ScaleAccess,
           Cache ActivationCache = Cache::ca, Cache WeightCache = Cache::cg,
           W8SmallTMmaActivationStage ActivationStage = W8SmallTMmaActivationStage::ActiveOnly,
-          bool DynamicShared = false>
+          bool DynamicShared                         = false>
 struct W8SmallTMmaSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
                   TileTokens == 40 || TileTokens == 48);
     static_assert(MinBlocksPerSm > 0);
 
-    static constexpr int kKWarps            = KWarps;
-    static constexpr int kTileTokens        = TileTokens;
-    static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
-    static constexpr auto kScaleAccess      = ScaleAccess;
-    static constexpr auto kActivationCache  = ActivationCache;
-    static constexpr auto kWeightCache      = WeightCache;
-    static constexpr auto kActivationStage  = ActivationStage;
+    static constexpr int kKWarps           = KWarps;
+    static constexpr int kTileTokens       = TileTokens;
+    static constexpr int kMinBlocksPerSm   = MinBlocksPerSm;
+    static constexpr auto kScaleAccess     = ScaleAccess;
+    static constexpr auto kActivationCache = ActivationCache;
+    static constexpr auto kWeightCache     = WeightCache;
+    static constexpr auto kActivationStage = ActivationStage;
     // Tiles whose staging exceeds the 48 KiB static limit opt into launch-time dynamic storage.
     static constexpr bool kDynamicShared    = DynamicShared;
     static constexpr int kThreads           = KWarps * 32;

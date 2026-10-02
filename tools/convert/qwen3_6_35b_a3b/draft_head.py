@@ -11,11 +11,12 @@ from pathlib import Path
 
 from tools.convert.qwen3_6.common.draft_head import (
     DraftHeadContext,
-    compute_shortlist as _compute_shortlist,
     materialize_draft_head,
     materialize_draft_head_token_ids,
 )
-
+from tools.convert.qwen3_6.common.draft_head import (
+    compute_shortlist as _compute_shortlist,
+)
 
 VOCAB_SIZE = 248320
 TOKENIZER_VOCAB_SIZE = 248077
@@ -23,9 +24,7 @@ DRAFT_HEAD_N = 131072
 
 DRAFT_HEAD_OBJECT = "text/draft_head"
 DRAFT_HEAD_TOKEN_IDS_OBJECT = "text/draft_head_token_ids"
-DEFAULT_RANKING = Path(
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
-)
+DEFAULT_RANKING = Path("tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64")
 RANKING_SOURCE_TARGET = "qwen3_6_27b"
 
 
@@ -39,9 +38,7 @@ def compute_shortlist(
     """Build the fixed shortlist over the shared 27B/35B token-id domain."""
 
     domain = (
-        min(TOKENIZER_VOCAB_SIZE, vocab)
-        if tokenizer_vocab_size is None
-        else tokenizer_vocab_size
+        min(TOKENIZER_VOCAB_SIZE, vocab) if tokenizer_vocab_size is None else tokenizer_vocab_size
     )
     return _compute_shortlist(
         ranking_path,
@@ -57,10 +54,10 @@ __all__ = [
     "DRAFT_HEAD_N",
     "DRAFT_HEAD_OBJECT",
     "DRAFT_HEAD_TOKEN_IDS_OBJECT",
-    "DraftHeadContext",
     "RANKING_SOURCE_TARGET",
     "TOKENIZER_VOCAB_SIZE",
     "VOCAB_SIZE",
+    "DraftHeadContext",
     "compute_shortlist",
     "materialize_draft_head",
     "materialize_draft_head_token_ids",

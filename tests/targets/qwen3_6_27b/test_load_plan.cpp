@@ -185,9 +185,8 @@ int verify_profile_mismatch_rejection() {
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
-        (void)ninfer::targets::qwen3_6::create_program<Variant>(empty_model, WeightsProfile::Nvfp4,
-                                                                std::move(sequence), device,
-                                                                nullptr);
+        (void)ninfer::targets::qwen3_6::create_program<Variant>(
+            empty_model, WeightsProfile::Nvfp4, std::move(sequence), device, nullptr);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }
@@ -209,22 +208,26 @@ int verify_selective(const std::filesystem::path& path) {
     int fp8 = 0;
     for (std::size_t i = 0; i < plan.bindings.text_layers.size(); ++i) {
         const auto& layer = plan.bindings.text_layers[i];
-        const auto count = [&](const WeightPlan& w) {
+        const auto count  = [&](const WeightPlan& w) {
             if (w.format == NumericFormat::FP8_E4M3FN_ROW_BF16S) ++fp8;
             if (w.format == NumericFormat::NVFP4 && !valid_divisors(w)) {
                 throw std::runtime_error("selective profile lost NVFP4 divisor");
             }
         };
-        count(layer.mlp.gate_up); count(layer.mlp.down);
+        count(layer.mlp.gate_up);
+        count(layer.mlp.down);
         if (layer.is_full_attention) {
-            const auto& input = std::get<FusedAttentionProjectionPlan>(layer.attention.projection).query_key_gate_value;
-            count(input); count(layer.attention.output);
+            const auto& input = std::get<FusedAttentionProjectionPlan>(layer.attention.projection)
+                                    .query_key_gate_value;
+            count(input);
+            count(layer.attention.output);
             if ((i <= 23 && input.format != NumericFormat::BF16) ||
                 (i <= 7 && layer.attention.output.format != NumericFormat::BF16)) {
                 throw std::runtime_error("selective profile changed protected attention weight");
             }
         } else {
-            count(std::get<FusedGdnInputProjectionPlan>(layer.gdn.input_projection).query_key_value_z);
+            count(std::get<FusedGdnInputProjectionPlan>(layer.gdn.input_projection)
+                      .query_key_value_z);
             count(layer.gdn.output);
             if (i == 4 && layer.gdn.output.format != NumericFormat::BF16) {
                 throw std::runtime_error("selective profile changed protected GDN weight");

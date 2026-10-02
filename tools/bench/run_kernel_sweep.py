@@ -23,8 +23,9 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -204,29 +205,27 @@ def main() -> int:
                     path = cell_cache[scheme]
                 else:
                     path = out_dir / name / f"ppl-{scheme}.json"
-                    cmd = (
-                        [
-                            str(ppl_bin),
-                            "--weights",
-                            str(weights),
-                            "--ids",
-                            str(ppl_corpus),
-                            "--scheme",
-                            scheme,
-                            "--kv-dtype",
-                            kv_dtype,
-                            "--schedule",
-                            args.ppl_schedule,
-                            "--tokens",
-                            str(args.ppl_tokens),
-                            "--skip",
-                            "half",
-                            "--out-json",
-                            str(path),
-                        ]
-                        + list(extra)
-                        + list(kernel.get("ppl_args", []))
-                    )
+                    cmd = [
+                        str(ppl_bin),
+                        "--weights",
+                        str(weights),
+                        "--ids",
+                        str(ppl_corpus),
+                        "--scheme",
+                        scheme,
+                        "--kv-dtype",
+                        kv_dtype,
+                        "--schedule",
+                        args.ppl_schedule,
+                        "--tokens",
+                        str(args.ppl_tokens),
+                        "--skip",
+                        "half",
+                        "--out-json",
+                        str(path),
+                        *extra,
+                        *kernel.get("ppl_args", []),
+                    ]
                     rc = run(cmd, env, out_dir / name / f"ppl-{scheme}.log")
                     if rc != 0:
                         print(

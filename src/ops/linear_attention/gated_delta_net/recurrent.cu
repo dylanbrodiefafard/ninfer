@@ -244,32 +244,28 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream,
-                             const std::int32_t* parent_index) {
+                             Tensor& out, cudaStream_t stream, const std::int32_t* parent_index) {
     const bool masked = valid_columns.data != nullptr;
     if (parent_index == nullptr) {
         if (!masked) {
-            launch_recurrent_record_fixed<false, false>(q, k, v, g, beta, scale, ssm_states,
-                                                        valid_columns, initial_state_slots,
-                                                        parent_index, key_record, value_record,
-                                                        gate_record, out, stream);
+            launch_recurrent_record_fixed<false, false>(
+                q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                parent_index, key_record, value_record, gate_record, out, stream);
         } else {
-            launch_recurrent_record_fixed<true, false>(q, k, v, g, beta, scale, ssm_states,
-                                                       valid_columns, initial_state_slots,
-                                                       parent_index, key_record, value_record,
-                                                       gate_record, out, stream);
+            launch_recurrent_record_fixed<true, false>(
+                q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                parent_index, key_record, value_record, gate_record, out, stream);
         }
         return;
     }
     if (!masked) {
-        launch_recurrent_record_fixed<false, true>(q, k, v, g, beta, scale, ssm_states,
-                                                   valid_columns, initial_state_slots, parent_index,
-                                                   key_record, value_record, gate_record, out,
-                                                   stream);
+        launch_recurrent_record_fixed<false, true>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
+            key_record, value_record, gate_record, out, stream);
     } else {
-        launch_recurrent_record_fixed<true, true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                                  initial_state_slots, parent_index, key_record,
-                                                  value_record, gate_record, out, stream);
+        launch_recurrent_record_fixed<true, true>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
+            key_record, value_record, gate_record, out, stream);
     }
 }
 
@@ -319,18 +315,16 @@ void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& beta, float scale, const Tensor& ssm_states,
                               const Tensor& valid_columns, const Tensor& initial_state_slots,
                               Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                              Tensor& out, float* overlay_states,
-                              const std::int32_t* parent_index, cudaStream_t stream) {
+                              Tensor& out, float* overlay_states, const std::int32_t* parent_index,
+                              cudaStream_t stream) {
     if (valid_columns.data == nullptr) {
-        launch_recurrent_overlay_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                              initial_state_slots, key_record, value_record,
-                                              gate_record, out, overlay_states, parent_index,
-                                              stream);
+        launch_recurrent_overlay_fixed<false>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, overlay_states, parent_index, stream);
     } else {
-        launch_recurrent_overlay_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                             initial_state_slots, key_record, value_record,
-                                             gate_record, out, overlay_states, parent_index,
-                                             stream);
+        launch_recurrent_overlay_fixed<true>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, overlay_states, parent_index, stream);
     }
 }
 

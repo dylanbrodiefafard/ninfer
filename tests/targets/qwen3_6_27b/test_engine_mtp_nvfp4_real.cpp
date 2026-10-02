@@ -48,7 +48,7 @@ ninfer::RequestOptions greedy_options(std::uint32_t outputs) {
 }
 
 ninfer::RequestOptions greedy_reuse(std::uint32_t outputs, bool reuse) {
-    ninfer::RequestOptions options = greedy_options(outputs);
+    ninfer::RequestOptions options       = greedy_options(outputs);
     options.execution.allow_prefix_reuse = reuse;
     return options;
 }
@@ -56,9 +56,7 @@ ninfer::RequestOptions greedy_reuse(std::uint32_t outputs, bool reuse) {
 std::vector<ninfer::TokenId> resume_prefix(const std::vector<ninfer::TokenId>& keep,
                                            const std::vector<ninfer::TokenId>& generated) {
     std::vector<ninfer::TokenId> prefix = keep;
-    if (!generated.empty()) {
-        prefix.insert(prefix.end(), generated.begin(), generated.end() - 1);
-    }
+    if (!generated.empty()) { prefix.insert(prefix.end(), generated.begin(), generated.end() - 1); }
     return prefix;
 }
 
@@ -136,7 +134,8 @@ int run_overlapping(ninfer::Engine& engine, std::span<const std::vector<ninfer::
     std::vector<ninfer::GenerationHandle> handles;
     handles.reserve(prompts.size());
     for (std::size_t i = 0; i < prompts.size(); ++i) {
-        handles.push_back(engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(lengths[i])));
+        handles.push_back(
+            engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(lengths[i])));
     }
     int failed = 0;
     for (std::size_t i = 0; i < handles.size(); ++i) {
@@ -153,18 +152,18 @@ int run_overlapping(ninfer::Engine& engine, std::span<const std::vector<ninfer::
 }
 
 int check_k4_b4_isolation(ninfer::Engine& engine,
-                          std::span<const std::vector<ninfer::TokenId>> seeds,
-                          const char* label) {
-    std::array<std::vector<ninfer::TokenId>, 5> prompts{
-        seeds[0], seeds[1], seeds[2], seeds[0], seeds[1]};
+                          std::span<const std::vector<ninfer::TokenId>> seeds, const char* label) {
+    std::array<std::vector<ninfer::TokenId>, 5> prompts{seeds[0], seeds[1], seeds[2], seeds[0],
+                                                        seeds[1]};
     constexpr std::array<ninfer::TokenId, 5> fills{3709, 4120, 5200, 96220, 74455};
     for (std::size_t i = 0; i < prompts.size(); ++i) { prompts[i].resize(896, fills[i]); }
     // Prefills are serialized, so short generations finish before the fourth prompt joins; long
     // enough outputs make four-row rounds dominate and provable (rows > 3 * rounds).
     constexpr std::uint32_t kIsolationTokens = 128;
 
-    const auto run_wave = [&](const std::array<std::size_t, 4>& order, const char* wave)
-        -> std::optional<std::array<std::vector<ninfer::TokenId>, 5>> {
+    const auto run_wave =
+        [&](const std::array<std::size_t, 4>& order,
+            const char* wave) -> std::optional<std::array<std::vector<ninfer::TokenId>, 5>> {
         std::array<decltype(engine.prepare_tokens(prompts[0])), 4> prepared{
             engine.prepare_tokens(prompts[order[0]]), engine.prepare_tokens(prompts[order[1]]),
             engine.prepare_tokens(prompts[order[2]]), engine.prepare_tokens(prompts[order[3]])};
@@ -178,7 +177,8 @@ int check_k4_b4_isolation(ninfer::Engine& engine,
         std::array<std::vector<ninfer::TokenId>, 5> outputs;
         for (std::size_t row = 0; row < handles.size(); ++row) {
             const ninfer::GenerationResult result = handles[row].wait();
-            if (result.generated_token_ids.size() != kIsolationTokens || check_speculative(result, label) != 0) {
+            if (result.generated_token_ids.size() != kIsolationTokens ||
+                check_speculative(result, label) != 0) {
                 std::cerr << label << ' ' << wave << " row " << row
                           << " did not complete MTP decode\n";
                 dump_tokens("  got", result.generated_token_ids);
@@ -192,16 +192,17 @@ int check_k4_b4_isolation(ninfer::Engine& engine,
         const std::uint64_t rounds       = after.decode_rounds - before.decode_rounds;
         const std::uint64_t rows         = after.decode_row_rounds - before.decode_row_rounds;
         if (rounds == 0 || rows <= 3 * rounds) {
-            std::cerr << label << ' ' << wave << " did not exercise a B=4 decode round: rounds="
-                      << rounds << " rows=" << rows << '\n';
+            std::cerr << label << ' ' << wave
+                      << " did not exercise a B=4 decode round: rounds=" << rounds
+                      << " rows=" << rows << '\n';
             return std::nullopt;
         }
         return outputs;
     };
 
-    const auto base = run_wave({0, 1, 2, 3}, "base");
+    const auto base     = run_wave({0, 1, 2, 3}, "base");
     const auto permuted = run_wave({3, 2, 0, 1}, "permuted");
-    const auto partner = run_wave({0, 1, 2, 4}, "alternate-partner");
+    const auto partner  = run_wave({0, 1, 2, 4}, "alternate-partner");
     if (!base || !permuted || !partner) { return 1; }
     for (std::size_t i = 0; i < 4; ++i) {
         for (std::size_t j = i + 1; j < 4; ++j) {
@@ -237,16 +238,15 @@ int check_prefill_first_batch(ninfer::Engine& engine,
     prompt_b.resize(896, 4120);
     prompt_c.resize(896, 5200);
 
-    const auto run_pair = [&](const std::vector<ninfer::TokenId>& first,
-                              const std::vector<ninfer::TokenId>& second,
-                              const char* wave)
-        -> std::optional<std::array<std::vector<ninfer::TokenId>, 2>> {
-        auto prepared_first  = engine.prepare_tokens(first);
-        auto prepared_second = engine.prepare_tokens(second);
+    const auto run_pair =
+        [&](const std::vector<ninfer::TokenId>& first, const std::vector<ninfer::TokenId>& second,
+            const char* wave) -> std::optional<std::array<std::vector<ninfer::TokenId>, 2>> {
+        auto prepared_first               = engine.prepare_tokens(first);
+        auto prepared_second              = engine.prepare_tokens(second);
         const ninfer::RuntimeStats before = engine.runtime_stats();
-        auto handle_first = engine.submit(std::move(prepared_first), greedy_options(2));
+        auto handle_first  = engine.submit(std::move(prepared_first), greedy_options(2));
         auto handle_second = engine.submit(std::move(prepared_second), greedy_options(2));
-        const ninfer::GenerationResult result_first = handle_first.wait();
+        const ninfer::GenerationResult result_first  = handle_first.wait();
         const ninfer::GenerationResult result_second = handle_second.wait();
         (void)engine.memory_summary(); // Fence the worker's counter publication at this boundary.
         const ninfer::RuntimeStats after = engine.runtime_stats();
@@ -292,20 +292,19 @@ int check_terminal_prefill_debt(ninfer::Engine& engine,
     std::array<decltype(engine.prepare_tokens(prompts[0])), 4> prepared{
         engine.prepare_tokens(prompts[0]), engine.prepare_tokens(prompts[1]),
         engine.prepare_tokens(prompts[2]), engine.prepare_tokens(prompts[3])};
-    auto donor = engine.submit(std::move(prepared[0]), greedy_options(2));
+    auto donor      = engine.submit(std::move(prepared[0]), greedy_options(2));
     auto terminal_b = engine.submit(std::move(prepared[1]), greedy_options(1));
     auto terminal_c = engine.submit(std::move(prepared[2]), greedy_options(1));
     auto terminal_d = engine.submit(std::move(prepared[3]), greedy_options(1));
 
     const ninfer::GenerationResult donor_result = donor.wait();
-    const ninfer::GenerationResult result_b = terminal_b.wait();
-    const ninfer::GenerationResult result_c = terminal_c.wait();
-    const ninfer::GenerationResult result_d = terminal_d.wait();
+    const ninfer::GenerationResult result_b     = terminal_b.wait();
+    const ninfer::GenerationResult result_c     = terminal_c.wait();
+    const ninfer::GenerationResult result_d     = terminal_d.wait();
     (void)engine.memory_summary();
 
     if (result_b.generated_token_ids.size() != 1 || result_c.generated_token_ids.size() != 1 ||
-        result_d.generated_token_ids.size() != 1 ||
-        donor_result.generated_token_ids.size() != 2) {
+        result_d.generated_token_ids.size() != 1 || donor_result.generated_token_ids.size() != 2) {
         std::cerr << label
                   << " terminal-prefill burst did not preserve donor and terminal completions\n";
         return 1;
@@ -324,16 +323,58 @@ int main() {
 
     const std::array<std::vector<ninfer::TokenId>, 3> prompts{
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            3709,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 4120,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            4120,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
         std::vector<ninfer::TokenId>{
-            248045, 846,    198, 109266, 5200,  96220, 117443, 97913,
-            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+            248045,
+            846,
+            198,
+            109266,
+            5200,
+            96220,
+            117443,
+            97913,
+            1710,
+            248046,
+            198,
+            248045,
+            74455,
+            198,
+            248068,
+            198,
         },
     };
 
@@ -354,16 +395,15 @@ int main() {
         }
 
         const std::array<std::uint32_t, 2> c2_lengths{19, 13};
-        if (const int result =
-                run_overlapping(engine, std::span(prompts.data(), 2), c2_lengths,
-                                (std::string(label) + " C=2").c_str());
+        if (const int result = run_overlapping(engine, std::span(prompts.data(), 2), c2_lengths,
+                                               (std::string(label) + " C=2").c_str());
             result != 0) {
             return result;
         }
 
         const std::array<std::uint32_t, 3> c3_lengths{19, 13, 7};
-        if (const int result = run_overlapping(engine, prompts, c3_lengths,
-                                               (std::string(label) + " C=3").c_str());
+        if (const int result =
+                run_overlapping(engine, prompts, c3_lengths, (std::string(label) + " C=3").c_str());
             result != 0) {
             return result;
         }
@@ -375,11 +415,11 @@ int main() {
     if (const int result = run_k(5, "MTP NVFP4 k=5"); result != 0) { return result; }
 
     {
-        const char* label = "MTP NVFP4 k=4 B=4 isolation";
+        const char* label             = "MTP NVFP4 k=4 B=4 isolation";
         ninfer::EngineOptions options = mtp_engine_options(artifact, 4, 4);
-        options.max_context = 1024;
-        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
-            options.max_context * options.max_concurrency);
+        options.max_context           = 1024;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context *
+                                                                          options.max_concurrency);
         ninfer::Engine engine(options);
         if (const int result = check_load(engine); result != 0) { return result; }
         if (const int result = check_k4_b4_isolation(engine, prompts, label); result != 0) {
@@ -389,11 +429,11 @@ int main() {
     }
 
     {
-        const char* label = "MTP NVFP4 prefill-first scheduling";
+        const char* label             = "MTP NVFP4 prefill-first scheduling";
         ninfer::EngineOptions options = mtp_engine_options(artifact, 3, 3);
-        options.max_context = 1024;
-        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
-            options.max_context * options.max_concurrency);
+        options.max_context           = 1024;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context *
+                                                                          options.max_concurrency);
         ninfer::Engine engine(options);
         if (const int result = check_load(engine); result != 0) { return result; }
         if (const int result = check_prefill_first_batch(engine, prompts, label); result != 0) {
@@ -420,7 +460,8 @@ int main() {
         }
         const std::array<std::uint32_t, 3> c3_lengths{19, 13, 7};
         std::vector<ninfer::GenerationHandle> handles;
-        for (std::size_t i = 0; i < 3; ++i) {
+        handles.reserve(c3_lengths.size());
+        for (std::size_t i = 0; i < c3_lengths.size(); ++i) {
             handles.push_back(
                 engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(c3_lengths[i])));
         }
@@ -465,7 +506,7 @@ int main() {
     }
 
     {
-        const char* label = "MTP NVFP4 adaptive RAM reseed";
+        const char* label             = "MTP NVFP4 adaptive RAM reseed";
         ninfer::EngineOptions options = mtp_adaptive_options(artifact, 5, 1);
         options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
         ninfer::Engine engine(options);
@@ -498,8 +539,8 @@ int main() {
         const ninfer::GenerationResult hit =
             engine.generate(engine.prepare_tokens(history), greedy_reuse(4, true));
         if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam) {
-            std::cerr << label << " restore source is "
-                      << static_cast<int>(hit.prefix_reuse_source) << ", expected HostRam\n";
+            std::cerr << label << " restore source is " << static_cast<int>(hit.prefix_reuse_source)
+                      << ", expected HostRam\n";
             return 1;
         }
         if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
@@ -516,7 +557,7 @@ int main() {
     }
 
     {
-        const char* label = "MTP NVFP4 adaptive RAM restore in flight";
+        const char* label             = "MTP NVFP4 adaptive RAM restore in flight";
         ninfer::EngineOptions options = mtp_adaptive_options(artifact, 5, 2);
         options.kv_ram_capacity_bytes = 1024ULL * 1024ULL * 1024ULL;
         ninfer::Engine engine(options);
@@ -539,10 +580,8 @@ int main() {
         }
         const std::vector<ninfer::TokenId> history =
             resume_prefix(prompts[0], first.generated_token_ids);
-        auto restored_h =
-            engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
-        auto inflight_h =
-            engine.submit(engine.prepare_tokens(prompts[1]), greedy_reuse(4, false));
+        auto restored_h = engine.submit(engine.prepare_tokens(history), greedy_reuse(4, true));
+        auto inflight_h = engine.submit(engine.prepare_tokens(prompts[1]), greedy_reuse(4, false));
         const ninfer::GenerationResult hit      = restored_h.wait();
         const ninfer::GenerationResult inflight = inflight_h.wait();
         if (hit.generated_token_ids.size() != 4 || inflight.generated_token_ids.size() != 4 ||
@@ -555,8 +594,8 @@ int main() {
         }
         if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam &&
             hit.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident) {
-            std::cerr << label << " restore source is "
-                      << static_cast<int>(hit.prefix_reuse_source) << '\n';
+            std::cerr << label << " restore source is " << static_cast<int>(hit.prefix_reuse_source)
+                      << '\n';
             return 1;
         }
         std::cout << "ok " << label << '\n' << std::flush;

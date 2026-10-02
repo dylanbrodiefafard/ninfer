@@ -15,10 +15,13 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 #define CUDA_CHECK(expr)                                                                           \
@@ -33,20 +36,20 @@
 
 namespace {
 
-constexpr int kInner    = 16;
-constexpr int kDefaultIters = 8192;
-constexpr int kWarmup   = 5;
-constexpr int kTrials   = 7;
+constexpr int kInner             = 16;
+constexpr int kDefaultIters      = 8192;
+constexpr int kWarmup            = 5;
+constexpr int kTrials            = 7;
 constexpr double kDenseFp4TflopS = 1676.0;
 
 enum class Atom : int { Nvfp4, Bf16, Fp8, Fp8K16, S8 };
 
 struct Options {
-    Atom atom      = Atom::Nvfp4;
-    bool all       = true;
-    bool json      = false;
-    int iters      = kDefaultIters;
-    int warps      = 8;
+    Atom atom         = Atom::Nvfp4;
+    bool all          = true;
+    bool json         = false;
+    int iters         = kDefaultIters;
+    int warps         = 8;
     int blocks_per_sm = 2;
 };
 
@@ -67,7 +70,9 @@ __device__ __forceinline__ void issue_bf16(int iters, float& c0, float& c1, floa
     unsigned b0 = 0x3c003c00u, b1 = 0x3c003c00u;
     for (int i = 0; i < iters; ++i) {
 #pragma unroll
-        for (int u = 0; u < kInner; ++u) { ninfer::ops::mma_bf16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1); }
+        for (int u = 0; u < kInner; ++u) {
+            ninfer::ops::mma_bf16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+        }
     }
 }
 
@@ -77,7 +82,9 @@ __device__ __forceinline__ void issue_s8(int iters, float& c0, float& c1, float&
     unsigned b0 = 0x55555555u, b1 = 0x66666666u;
     for (int i = 0; i < iters; ++i) {
 #pragma unroll
-        for (int u = 0; u < kInner; ++u) { ninfer::ops::mma_s8(ic0, ic1, ic2, ic3, a0, a1, a2, a3, b0, b1); }
+        for (int u = 0; u < kInner; ++u) {
+            ninfer::ops::mma_s8(ic0, ic1, ic2, ic3, a0, a1, a2, a3, b0, b1);
+        }
     }
     c0 = static_cast<float>(ic0);
     c1 = static_cast<float>(ic1);
@@ -112,7 +119,10 @@ __global__ void mma_issue_kernel(float* sink, int iters) {
                 ninfer::ops::mma_fp8_e4m3_k16(d, 0x38383838U, 0x38383838U, 0x38383838U);
             }
         }
-        c0 = d[0]; c1 = d[1]; c2 = d[2]; c3 = d[3];
+        c0 = d[0];
+        c1 = d[1];
+        c2 = d[2];
+        c3 = d[3];
     } else {
         issue_s8(iters, c0, c1, c2, c3);
     }
@@ -146,7 +156,7 @@ Result run_atom(const char* name, int m, int n, int k, const Options& opt, int s
 
     auto launch = [&]() {
         CUDA_CHECK(cudaMemset(sink, 0, sizeof(float)));
-        mma_issue_kernel<kAtom><<<blocks, threads>>>(sink, opt.iters);
+        mma_issue_kernel<kAtom><<<blocks, threads, 0, cudaStreamLegacy>>>(sink, opt.iters);
         CUDA_CHECK(cudaGetLastError());
     };
 
@@ -188,6 +198,20 @@ void print_usage(const char* argv0) {
                  argv0);
 }
 
+// Parses all of `text` as a decimal int; malformed or out-of-range text exits with status 2.
+int parse_int_option(const char* option, std::string_view text) {
+    int value               = 0;
+    const char* const first = text.data();
+    const char* const last  = first + text.size();
+    const auto [end, error] = std::from_chars(first, last, value);
+    if (error != std::errc{} || end != last) {
+        std::fprintf(stderr, "%s: '%.*s' is not a decimal int\n", option,
+                     static_cast<int>(text.size()), text.data());
+        std::exit(2);
+    }
+    return value;
+}
+
 Options parse(int argc, char** argv) {
     Options opt;
     for (int i = 1; i < argc; ++i) {
@@ -219,11 +243,11 @@ Options parse(int argc, char** argv) {
                 std::exit(2);
             }
         } else if (arg == "--iters") {
-            opt.iters = std::atoi(next());
+            opt.iters = parse_int_option("--iters", next());
         } else if (arg == "--warps") {
-            opt.warps = std::atoi(next());
+            opt.warps = parse_int_option("--warps", next());
         } else if (arg == "--blocks-per-sm") {
-            opt.blocks_per_sm = std::atoi(next());
+            opt.blocks_per_sm = parse_int_option("--blocks-per-sm", next());
         } else if (arg == "--json") {
             opt.json = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -259,8 +283,12 @@ int main(int argc, char** argv) {
         results.push_back(run_atom<Atom::Bf16>("bf16", 16, 8, 16, opt, sm_count));
     }
     if (want(Atom::S8)) { results.push_back(run_atom<Atom::S8>("s8", 16, 8, 32, opt, sm_count)); }
-    if (want(Atom::Fp8)) { results.push_back(run_atom<Atom::Fp8>("fp8", 16, 8, 32, opt, sm_count)); }
-    if (want(Atom::Fp8K16)) { results.push_back(run_atom<Atom::Fp8K16>("fp8_k16", 16, 8, 16, opt, sm_count)); }
+    if (want(Atom::Fp8)) {
+        results.push_back(run_atom<Atom::Fp8>("fp8", 16, 8, 32, opt, sm_count));
+    }
+    if (want(Atom::Fp8K16)) {
+        results.push_back(run_atom<Atom::Fp8K16>("fp8_k16", 16, 8, 16, opt, sm_count));
+    }
 
     if (opt.json) {
         std::printf("{\n");
@@ -274,8 +302,8 @@ int main(int argc, char** argv) {
             std::printf("  \"%s\": {\"m\": %d, \"n\": %d, \"k\": %d, \"mma_per_s\": %.6e, "
                         "\"tflop_s\": %.3f, \"median_ms\": %.4f, \"warps_per_block\": %d, "
                         "\"blocks\": %d}%s\n",
-                        r.name, r.m, r.n, r.k, r.mma_per_s, r.tflop_s, r.median_ms, r.warps, r.blocks,
-                        i + 1 == results.size() ? "" : ",");
+                        r.name, r.m, r.n, r.k, r.mma_per_s, r.tflop_s, r.median_ms, r.warps,
+                        r.blocks, i + 1 == results.size() ? "" : ",");
         }
         std::printf("}\n");
         return 0;

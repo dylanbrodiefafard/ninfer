@@ -35,8 +35,8 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     // Internal cache recovery bypasses existing images without disabling capture.
-    bool force_cold_prefill               = false;
-    bool capture_context_checkpoint       = false;
+    bool force_cold_prefill         = false;
+    bool capture_context_checkpoint = false;
     std::array<TokenId, kMaximumSuppressedTokens> suppressed_token_ids{};
     std::uint32_t suppressed_token_count = 0;
 };
@@ -74,15 +74,15 @@ struct RequestPlanSummary {
     std::size_t transient_bytes           = 0;
     std::size_t transient_alignment       = 1;
     AdmissionResources admission;
-    std::uint64_t service_work_quanta = 0;
-    std::uint64_t ram_entry_id             = 0;
-    std::uint64_t disk_entry_id            = 0;
-    std::uint64_t disk_hash_f_lo           = 0;
-    std::uint64_t disk_hash_f_hi           = 0;
-    std::uint32_t disk_execution_frontier  = 0;
+    std::uint64_t service_work_quanta       = 0;
+    std::uint64_t ram_entry_id              = 0;
+    std::uint64_t disk_entry_id             = 0;
+    std::uint64_t disk_hash_f_lo            = 0;
+    std::uint64_t disk_hash_f_hi            = 0;
+    std::uint32_t disk_execution_frontier   = 0;
     std::uint64_t disk_committed_generation = 0;
-    PrefixReusePath disk_reuse_path       = PrefixReusePath::FullReset;
-    PrefixReuseSource reuse_source         = PrefixReuseSource::None;
+    PrefixReusePath disk_reuse_path         = PrefixReusePath::FullReset;
+    PrefixReuseSource reuse_source          = PrefixReuseSource::None;
 };
 
 struct BeginSummary {

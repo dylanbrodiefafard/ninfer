@@ -161,8 +161,8 @@ int main() {
         2 * ninfer::Tensor(nullptr, ninfer::DType::FP16, {1, 64, 2, 10}).bytes();
     failures +=
         expect_size(paged_plan.layout.payload_bytes(), expected_payload, "paged payload bytes");
-    failures += expect_size(paged_plan.layout.metadata_bytes(), 10 * 2 * sizeof(std::int32_t),
-                            "paged metadata bytes");
+    failures += expect_size(paged_plan.layout.metadata_bytes(),
+                            std::size_t{10} * 2 * sizeof(std::int32_t), "paged metadata bytes");
     const std::int32_t selected_pages[] = {1, 2, 6};
     failures += expect_zeroed_pages(paged_pool, ninfer::PagedKVPlaneOrder::PageMajor,
                                     selected_pages, ctx.stream, "page-major selective zero");
@@ -234,12 +234,15 @@ int main() {
         {.pool = &main_pool, .page_entitlement = 3},
         {.pool = &backend_pool, .page_entitlement = 3},
     };
+    bool reservation_rejected = false;
     try {
         auto unused = ninfer::reserve_paged_kv_bundle(impossible_bundle);
         (void)unused;
+    } catch (const std::bad_alloc&) { reservation_rejected = true; }
+    if (!reservation_rejected) {
         ++failures;
         std::cerr << "Impossible multi-pool reservation succeeded\n";
-    } catch (const std::bad_alloc&) {}
+    }
     failures += expect_size(main_pool.entitled_pages(), 0, "failed bundle main entitlement");
     failures += expect_size(backend_pool.entitled_pages(), 0, "failed bundle backend entitlement");
 
@@ -254,11 +257,14 @@ int main() {
         {.allocation = &bundle[0], .mapped_pages = 1, .page_entitlement = 1},
         {.allocation = &bundle[1], .mapped_pages = 1, .page_entitlement = 3},
     };
+    bool resize_rejected = false;
     try {
         ninfer::resize_paged_kv_bundle(impossible_resize);
+    } catch (const std::bad_alloc&) { resize_rejected = true; }
+    if (!resize_rejected) {
         ++failures;
         std::cerr << "Impossible multi-pool resize succeeded\n";
-    } catch (const std::bad_alloc&) {}
+    }
     failures += expect_size(bundle[0].mapped_page_count(), 2, "failed resize main mapping");
     failures += expect_size(bundle[0].page_entitlement(), 2, "failed resize main entitlement");
     failures += expect_size(bundle[1].mapped_page_count(), 2, "failed resize backend mapping");

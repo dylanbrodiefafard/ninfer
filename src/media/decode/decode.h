@@ -5,7 +5,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace ninfer::media::decode {
@@ -16,8 +15,7 @@ enum class ErrorKind {
 
 class Error final : public std::runtime_error {
 public:
-    Error(ErrorKind kind, std::string message)
-        : std::runtime_error(std::move(message)), kind_(kind) {}
+    Error(ErrorKind kind, const std::string& message) : std::runtime_error(message), kind_(kind) {}
 
     [[nodiscard]] ErrorKind kind() const noexcept { return kind_; }
 

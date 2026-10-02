@@ -41,13 +41,16 @@ class Result:
 def _container_running() -> bool:
     probe = subprocess.run(
         ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return probe.returncode == 0 and probe.stdout.strip() == "true"
 
 
-def run(cmd: str, *, check: bool = True, env: dict | None = None,
-        timeout: float = 1800.0) -> Result:
+def run(
+    cmd: str, *, check: bool = True, env: dict | None = None, timeout: float = 1800.0
+) -> Result:
     """Run a shell command inside the dev container; return captured output."""
     if not _container_running():
         raise HarnessError(
@@ -58,7 +61,7 @@ def run(cmd: str, *, check: bool = True, env: dict | None = None,
     for key, value in (env or {}).items():
         argv += ["-e", f"{key}={value}"]
     argv += [CONTAINER, "bash", "-lc", cmd]
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     result = Result(proc.returncode == 0, proc.returncode, proc.stdout, proc.stderr)
     if check and proc.returncode != 0:
         raise HarnessError(
@@ -70,8 +73,7 @@ def run(cmd: str, *, check: bool = True, env: dict | None = None,
 
 def build_target(target: str) -> Result:
     """Incremental build of a CMake target in the shared tree."""
-    return run(f"cd {BUILD} && cmake --build . --target {target} --parallel {JOBS}",
-               check=False)
+    return run(f"cd {BUILD} && cmake --build . --target {target} --parallel {JOBS}", check=False)
 
 
 def test_binary(op) -> str:
@@ -88,7 +90,10 @@ def repo_head() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            cwd=os.getcwd(),
+            check=False,
         ).stdout.strip()
         return out or "unknown"
     except Exception:
@@ -101,7 +106,7 @@ def build_stamp(op) -> str:
     return f"git@{repo_head()}/{op.test_target}+{op.bench_target}"
 
 
-_OP_STATS_RE = re.compile(r"^OP_ERROR_STATS\s+(?P<kv>.*)$", re.M)
+_OP_STATS_RE = re.compile(r"^OP_ERROR_STATS\s+(?P<kv>.*)$", re.MULTILINE)
 _KV_RE = re.compile(r"([a-z_]+)=([^ ]+)")
 _LABEL_RE = re.compile(r"case=(.+)$")
 
@@ -110,7 +115,7 @@ def parse_op_stats(text: str) -> list:
     """Parse OP_ERROR_STATS lines into a list of dicts (stable, LLM-readable)."""
     records = []
     for line in _OP_STATS_RE.findall(text):
-        record = {key: value for key, value in _KV_RE.findall(line)}
+        record = dict(_KV_RE.findall(line))
         label = _LABEL_RE.search(line)
         if label:
             record["case"] = label.group(1).strip()

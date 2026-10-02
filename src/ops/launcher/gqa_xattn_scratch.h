@@ -9,16 +9,16 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kGqaXattnPrefillBr  = 128;
-inline constexpr int kGqaXattnPrefillBc  = 64;
+inline constexpr int kGqaXattnPrefillBr = 128;
+inline constexpr int kGqaXattnPrefillBc = 64;
 // Paper find_blocks B. MMA still walks 64-token pages; each kept block expands
 // to two consecutive pages (or one remainder page).
-inline constexpr int kGqaXattnFindB      = 128;
-inline constexpr int kGqaXattnStride     = 16;
-inline constexpr int kGqaXattnIRows      = kGqaXattnPrefillBr / kGqaXattnStride;
-inline constexpr int kGqaXattnHeadDim    = 256;
-inline constexpr int kGqaXattnRankTiles  = 4096; // 262144 / Bc
-inline constexpr int kGqaXattnBf16Bytes  = 2;
+inline constexpr int kGqaXattnFindB     = 128;
+inline constexpr int kGqaXattnStride    = 16;
+inline constexpr int kGqaXattnIRows     = kGqaXattnPrefillBr / kGqaXattnStride;
+inline constexpr int kGqaXattnHeadDim   = 256;
+inline constexpr int kGqaXattnRankTiles = 4096; // 262144 / Bc
+inline constexpr int kGqaXattnBf16Bytes = 2;
 
 inline int gqa_xattn_n_kb(int table_pages, std::uint32_t max_visible_keys) {
     const int env_pages =
@@ -39,14 +39,14 @@ inline std::size_t gqa_xattn_scratch_bytes(int q_heads, int kv_heads, int n_br, 
                           static_cast<std::size_t>(kGqaXattnStride) *
                           static_cast<std::size_t>(kGqaXattnHeadDim);
     b = align256(b) + sizeof(float) * static_cast<std::size_t>(q_heads) *
-                          static_cast<std::size_t>(n_br) * static_cast<std::size_t>(kGqaXattnIRows) *
-                          static_cast<std::size_t>(n_j);
+                          static_cast<std::size_t>(n_br) *
+                          static_cast<std::size_t>(kGqaXattnIRows) * static_cast<std::size_t>(n_j);
     b = align256(b) + sizeof(float) * static_cast<std::size_t>(q_heads) *
                           static_cast<std::size_t>(n_br) * static_cast<std::size_t>(n_kb);
     b = align256(b) + sizeof(std::uint16_t) * static_cast<std::size_t>(q_heads) *
                           static_cast<std::size_t>(n_br) * static_cast<std::size_t>(n_kb);
-    b = align256(b) + sizeof(int) * static_cast<std::size_t>(q_heads) *
-                          static_cast<std::size_t>(n_br);
+    b = align256(b) +
+        sizeof(int) * static_cast<std::size_t>(q_heads) * static_cast<std::size_t>(n_br);
     return b;
 }
 

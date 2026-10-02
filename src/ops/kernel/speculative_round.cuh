@@ -74,10 +74,11 @@ __device__ __forceinline__ void speculative_chain_hop_q(const std::int32_t* sele
 // one-hot for greedy drafts, the shortlist softmax for sampled ones. Accept/correction use it
 // under every target sampler, p-less included (MTP and DFlash1 pass null ids, the one-hot
 // convention).
-__device__ __forceinline__ void
-speculative_chain_hop_q_for_target(const std::int32_t* selector_ids, const float* selector_q,
-                                   int selector_k, int hop, int row, int k, const int*& hop_ids,
-                                   const float*& hop_q) {
+__device__ __forceinline__ void speculative_chain_hop_q_for_target(const std::int32_t* selector_ids,
+                                                                   const float* selector_q,
+                                                                   int selector_k, int hop, int row,
+                                                                   int k, const int*& hop_ids,
+                                                                   const float*& hop_q) {
     speculative_chain_hop_q(selector_ids, selector_q, selector_k, hop, row, k, hop_ids, hop_q);
 }
 
@@ -93,14 +94,15 @@ speculative_chain_hop_q_for_target(const std::int32_t* selector_ids, const float
 // eta_i is keyed by the round's first position and the hop: the next round starts past tau and
 // must not reuse a uniform this round conditioned on.
 template <class ColumnProb>
-__device__ inline void speculative_p_less_block_verify(
-    int extent, const std::int32_t* row_drafts, const std::int32_t* selector_ids,
-    const float* selector_q, int selector_k, int row, int k, unsigned long long seed, int length,
-    ColumnProb column_prob, int& tau, float& tau_weight) {
-    const int q_n  = selector_k > 0 ? selector_k : 0;
-    float p_prev   = 1.0f;
-    tau            = 0;
-    tau_weight     = 1.0f;
+__device__ inline void
+speculative_p_less_block_verify(int extent, const std::int32_t* row_drafts,
+                                const std::int32_t* selector_ids, const float* selector_q,
+                                int selector_k, int row, int k, unsigned long long seed, int length,
+                                ColumnProb column_prob, int& tau, float& tau_weight) {
+    const int q_n = selector_k > 0 ? selector_k : 0;
+    float p_prev  = 1.0f;
+    tau           = 0;
+    tau_weight    = 1.0f;
     for (int i = 1; i <= extent; ++i) {
         const int d      = row_drafts[i - 1];
         const int* ids_j = nullptr;
@@ -166,7 +168,7 @@ __device__ inline int speculative_tree_path_overlay(const std::int32_t* ids,
                                                     const std::int32_t* pars, int node,
                                                     int* overlay) {
     int stack[kSamplerMaxColumns];
-    int n = 0;
+    int n   = 0;
     int cur = node;
     while (cur > 0 && n < kSamplerMaxColumns) {
         stack[n++] = cur;
@@ -191,7 +193,7 @@ __device__ inline void speculative_tree_greedy_commit(
     path[0]  = 0;
     while (a < extent) {
         const int predicted = ttok[node];
-        const int child = speculative_tree_child_for_token(pars, ids, node, predicted, valid);
+        const int child     = speculative_tree_child_for_token(pars, ids, node, predicted, valid);
         if (child < 0) {
             lic[a]               = predicted;
             licensed_counts[row] = a + 1;
@@ -223,9 +225,7 @@ __device__ inline void speculative_tree_sampling_commit(
         lic[i]  = 0;
         path[i] = 0;
     }
-    for (int i = 0; i < a; ++i) {
-        lic[i] = sampling_clamp_token(lic_src[i], 0, token_domain);
-    }
+    for (int i = 0; i < a; ++i) { lic[i] = sampling_clamp_token(lic_src[i], 0, token_domain); }
     lic[a] = sampling_clamp_token(tstar, 0, token_domain);
     for (int i = 0; i <= a; ++i) { path[i] = path_src[i]; }
     const int produced   = a + 1;
@@ -305,7 +305,6 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     __shared__ int done_sh;
     __shared__ int tstar_sh;
     __shared__ int L_sh;
-    __shared__ int decision_sh;
 
     const bool p_less = sampling_p_less_active(cfg);
 
@@ -320,7 +319,13 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     if (p_less) {
         // Every column's p-less law first, then block verification over the chain (the
         // multi-block finalize runs the same speculative_p_less_block_verify).
-        __shared__ SamplingPLessMoments col_moments[kSamplerMaxColumns];
+        // SamplingPLessMoments has default member initializers, which a __shared__ declaration
+        // cannot run, so the array is raw storage reused as moments (an aggregate, hence an
+        // implicit-lifetime type). Thread 0 writes slot i for every i <= extent before the
+        // barrier below, and only slots a_sh <= extent are read.
+        __shared__ alignas(SamplingPLessMoments) unsigned char
+            col_moments_storage[sizeof(SamplingPLessMoments) * kSamplerMaxColumns];
+        auto* const col_moments = reinterpret_cast<SamplingPLessMoments*>(col_moments_storage);
         __shared__ float col_admitted[kSamplerMaxColumns];
         __shared__ float residual_weight_sh;
         const float inv_temp     = 1.0f / cfg.temperature;
@@ -331,8 +336,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             return c;
         };
         for (int i = 0; i <= extent; ++i) {
-            const std::int64_t base      = static_cast<std::int64_t>(i) * physical_rows;
-            const SamplingConfig ci      = column_config(i);
+            const std::int64_t base       = static_cast<std::int64_t>(i) * physical_rows;
+            const SamplingConfig ci       = column_config(i);
             const SamplingPLessMoments st = sampling_p_less_moments(
                 row_logits, base, token_domain, ci, inv_temp, red_val, red_idx, red_aux);
             const float admitted = sampling_p_less_admitted_mass(
@@ -345,10 +350,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         }
         if (tid == 0) {
             const auto column_prob = [&](int i, int token) {
-                return sampling_p_less_prob(row_logits, static_cast<std::int64_t>(i) * physical_rows,
-                                            token, token_domain, column_config(i),
-                                            sampling_p_less_gate(col_moments[i], inv_temp),
-                                            col_admitted[i]);
+                return sampling_p_less_prob(
+                    row_logits, static_cast<std::int64_t>(i) * physical_rows, token, token_domain,
+                    column_config(i), sampling_p_less_gate(col_moments[i], inv_temp),
+                    col_admitted[i]);
             };
             int tau     = 0;
             float tau_w = 1.0f;
@@ -359,25 +364,24 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
             residual_weight_sh = tau_w;
         }
         __syncthreads();
-        const int i                  = a_sh;
-        const std::int64_t base      = static_cast<std::int64_t>(i) * physical_rows;
-        const SamplingConfig ci      = column_config(i);
+        const int i                   = a_sh;
+        const std::int64_t base       = static_cast<std::int64_t>(i) * physical_rows;
+        const SamplingConfig ci       = column_config(i);
         const SamplingPLessMoments st = col_moments[i];
-        const SamplingPLessGate gate = sampling_p_less_gate(st, inv_temp);
-        int tstar                    = 0;
+        const SamplingPLessGate gate  = sampling_p_less_gate(st, inv_temp);
+        int tstar                     = 0;
         if (i < extent) {
             const int d        = row_drafts[i];
             const int* hop_ids = nullptr;
             const float* hop_q = nullptr;
             speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i, row, k,
                                                hop_ids, hop_q);
-            const float ur = sampling_uniform(cfg.seed, L_sh + i + 1,
-                                              kSamplePurposeSpeculativeCorrection, 0u);
-            tstar = sampling_p_less_residual(row_logits, base, token_domain, ci, gate,
-                                             col_admitted[i], residual_weight_sh, ur, d, hop_ids,
-                                             hop_q, selector_k,
-                                             sampling_p_less_support_fallback(st, ci), red_val,
-                                             red_idx);
+            const float ur =
+                sampling_uniform(cfg.seed, L_sh + i + 1, kSamplePurposeSpeculativeCorrection, 0u);
+            tstar = sampling_p_less_residual(
+                row_logits, base, token_domain, ci, gate, col_admitted[i], residual_weight_sh, ur,
+                d, hop_ids, hop_q, selector_k, sampling_p_less_support_fallback(st, ci), red_val,
+                red_idx);
         } else {
             const float u =
                 sampling_uniform(cfg.seed, L_sh + i + 1, kSamplePurposeSpeculativeBonus, 0u);
@@ -391,53 +395,54 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         for (int i = 0; i <= extent; ++i) {
             const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
             cfg.allowed_token_words = sampling_column_config(configs[row], i).allowed_token_words;
-        if (token_domain <= kSamplerTileItems) {
-            sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
-                                           cand_val, cand_idx, prob, &n_support, row_drafts, i);
-        } else {
-            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
-                                                merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                row_drafts, i);
-        }
-        if (tid == 0 && done_sh == 0) {
-            const int L = L_sh;
-            if (i < extent) {
-                const int d = row_drafts[i];
-                float pd    = 0.0f;
-                for (int j = 0; j < n_support; ++j) {
-                    if (cand_idx[j] == d) {
-                        pd = prob[j];
-                        break;
-                    }
-                }
-                const int* hop_ids  = nullptr;
-                const float* hop_q  = nullptr;
-                speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i,
-                                                   row, k, hop_ids, hop_q);
-                const float qd =
-                    sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
-                const float u =
-                    sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                const bool take = qd > 0.0f && u < fminf(1.0f, pd / qd);
-                if (take) {
-                    a_sh = i + 1;
-                } else {
-                    const float ur = sampling_uniform(cfg.seed, L + i + 1,
-                                                      kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar_sh       = sampling_pick_from_p_minus_q(cand_idx, prob, n_support, hop_ids,
-                                                                  hop_q, selector_k, d, ur);
-                    done_sh        = 1;
-                }
+            if (token_domain <= kSamplerTileItems) {
+                sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val,
+                                               red_idx, cand_val, cand_idx, prob, &n_support,
+                                               row_drafts, i);
             } else {
-                const float u =
-                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
-                tstar_sh = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
-                done_sh  = 1;
+                sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
+                                                    merge_idx, cand_val, cand_idx, prob, &n_support,
+                                                    row_drafts, i);
             }
+            if (tid == 0 && done_sh == 0) {
+                const int L = L_sh;
+                if (i < extent) {
+                    const int d = row_drafts[i];
+                    float pd    = 0.0f;
+                    for (int j = 0; j < n_support; ++j) {
+                        if (cand_idx[j] == d) {
+                            pd = prob[j];
+                            break;
+                        }
+                    }
+                    const int* hop_ids = nullptr;
+                    const float* hop_q = nullptr;
+                    speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i, row,
+                                                       k, hop_ids, hop_q);
+                    const float qd =
+                        sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
+                    const float u =
+                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
+                    const bool take = qd > 0.0f && u < fminf(1.0f, pd / qd);
+                    if (take) {
+                        a_sh = i + 1;
+                    } else {
+                        const float ur = sampling_uniform(cfg.seed, L + i + 1,
+                                                          kSamplePurposeSpeculativeCorrection, 0u);
+                        tstar_sh = sampling_pick_from_p_minus_q(cand_idx, prob, n_support, hop_ids,
+                                                                hop_q, selector_k, d, ur);
+                        done_sh  = 1;
+                    }
+                } else {
+                    const float u = sampling_uniform(cfg.seed, L + extent + 1,
+                                                     kSamplePurposeSpeculativeBonus, 0u);
+                    tstar_sh      = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
+                    done_sh       = 1;
+                }
+            }
+            __syncthreads();
+            if (done_sh) { break; }
         }
-        __syncthreads();
-        if (done_sh) { break; }
-    }
     }
 
     if (tid == 0) {
@@ -482,9 +487,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         return;
     }
     const SamplingConfig cfg = sampling_column_config(configs[row], col);
-    if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) {
-        return;
-    }
+    if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
@@ -626,9 +629,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     if (sampling_p_less_active(cfg)) {
         const float inv_temp = 1.0f / cfg.temperature;
-        const SamplingPLessMoments group_moments = sampling_p_less_merge_moments(
-            workspace, col, group_begin, group_partials, inv_temp, p_less_red_val,
-            p_less_red_aux, p_less_warp_keys);
+        const SamplingPLessMoments group_moments =
+            sampling_p_less_merge_moments(workspace, col, group_begin, group_partials, inv_temp,
+                                          p_less_red_val, p_less_red_aux, p_less_warp_keys);
         if (tid == 0) {
             sampling_p_less_store_moments(workspace, col, partial_blocks + group, group_moments);
             const int done = sampling_completion_add(&workspace.group_done[col], group_count);
@@ -637,9 +640,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         __syncthreads();
         if (!is_last_group) { return; }
 
-        const SamplingPLessMoments global_moments = sampling_p_less_merge_moments(
-            workspace, col, partial_blocks, group_count, inv_temp, p_less_red_val,
-            p_less_red_aux, p_less_warp_keys);
+        const SamplingPLessMoments global_moments =
+            sampling_p_less_merge_moments(workspace, col, partial_blocks, group_count, inv_temp,
+                                          p_less_red_val, p_less_red_aux, p_less_warp_keys);
         if (tid == 0) {
             sampling_p_less_store_global(workspace, col, global_moments);
             workspace.group_done[col] = 0;
@@ -647,7 +650,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         return;
     }
 
-    const int cap = sampling_candidate_cap(cfg, token_domain);
+    const int cap     = sampling_candidate_cap(cfg, token_domain);
     const int group_n = group_partials * cap;
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
@@ -717,7 +720,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             sampling_publish_float(workspace.dist_prob, off, prob[j]);
         }
         workspace.group_done[col] = 0;
-        const int need_cols = tree ? valid : (extent + 1);
+        const int need_cols       = tree ? valid : (extent + 1);
         const int done_cols =
             sampling_completion_add(workspace.speculative_finalize_count, need_cols);
         if (done_cols == need_cols) {
@@ -725,22 +728,21 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
             if (tree) {
                 int path_local[kSamplerMaxColumns];
                 int lic_local[kSamplerMaxColumns];
-                int node  = 0;
-                int a     = 0;
-                int tstar = 0;
+                int node      = 0;
+                int a         = 0;
+                int tstar     = 0;
                 path_local[0] = 0;
                 for (int step = 0; step <= extent; ++step) {
-                    const int n = sampling_load_published_i32(workspace.dist_support, node);
-                    const int* dist_idx =
-                        workspace.dist_idx + sampling_dist_offset(node, 0);
-                    const float* dist_prob =
-                        workspace.dist_prob + sampling_dist_offset(node, 0);
-                    const float u = sampling_uniform(
-                        cfg.seed, L + a + 1, kSamplePurposeSpeculativeAccept, 0u);
+                    const int n         = sampling_load_published_i32(workspace.dist_support, node);
+                    const int* dist_idx = workspace.dist_idx + sampling_dist_offset(node, 0);
+                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset(node, 0);
+                    const float u =
+                        sampling_uniform(cfg.seed, L + a + 1, kSamplePurposeSpeculativeAccept, 0u);
                     const int sampled = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
-                    const int child   = step < extent ? speculative_tree_child_for_token(
-                                                          pars, ids, node, sampled, valid)
-                                                      : -1;
+                    const int child =
+                        step < extent
+                            ? speculative_tree_child_for_token(pars, ids, node, sampled, valid)
+                            : -1;
                     if (child >= 0) {
                         lic_local[a]      = sampled;
                         path_local[a + 1] = child;
@@ -756,60 +758,58 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                                                  accepted_column, anchors, lengths, L, cfg,
                                                  token_domain);
             } else {
-            int a     = 0;
-            int tstar = 0;
-            for (int i = 0; i <= extent; ++i) {
-                const int n = sampling_load_published_i32(workspace.dist_support, i);
-                const int* dist_idx =
-                    workspace.dist_idx + sampling_dist_offset(i, 0);
-                const float* dist_prob =
-                    workspace.dist_prob + sampling_dist_offset(i, 0);
-                if (i < extent) {
-                    const int d = row_drafts[i];
-                    float pd    = 0.0f;
-                    for (int j = 0; j < n; ++j) {
-                        if (dist_idx[j] == d) {
-                            pd = dist_prob[j];
-                            break;
+                int a     = 0;
+                int tstar = 0;
+                for (int i = 0; i <= extent; ++i) {
+                    const int n            = sampling_load_published_i32(workspace.dist_support, i);
+                    const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
+                    const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
+                    if (i < extent) {
+                        const int d = row_drafts[i];
+                        float pd    = 0.0f;
+                        for (int j = 0; j < n; ++j) {
+                            if (dist_idx[j] == d) {
+                                pd = dist_prob[j];
+                                break;
+                            }
                         }
+                        const int* hop_ids = nullptr;
+                        const float* hop_q = nullptr;
+                        speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i,
+                                                           row, k, hop_ids, hop_q);
+                        const float qd =
+                            sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
+                        const float u = sampling_uniform(cfg.seed, L + i + 1,
+                                                         kSamplePurposeSpeculativeAccept, 0u);
+                        // A zero-q draft is outside the proposal support and must be corrected.
+                        const bool take = qd > 0.0f && u < fminf(1.0f, pd / qd);
+                        if (take) {
+                            a = i + 1;
+                            continue;
+                        }
+                        const float ur = sampling_uniform(cfg.seed, L + i + 1,
+                                                          kSamplePurposeSpeculativeCorrection, 0u);
+                        tstar = sampling_pick_from_p_minus_q(dist_idx, dist_prob, n, hop_ids, hop_q,
+                                                             selector_k, d, ur);
+                        break;
                     }
-                    const int* hop_ids = nullptr;
-                    const float* hop_q = nullptr;
-                    speculative_chain_hop_q_for_target(selector_ids, selector_q, selector_k, i,
-                                                       row, k, hop_ids, hop_q);
-                    const float qd =
-                        sampling_selector_q(hop_ids, hop_q, selector_k > 0 ? selector_k : 0, d);
-                    const float u =
-                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    // A zero-q draft is outside the proposal support and must be corrected.
-                    const bool take = qd > 0.0f && u < fminf(1.0f, pd / qd);
-                    if (take) {
-                        a = i + 1;
-                        continue;
-                    }
-                    const float ur = sampling_uniform(cfg.seed, L + i + 1,
-                                                      kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar          = sampling_pick_from_p_minus_q(dist_idx, dist_prob, n, hop_ids,
-                                                                  hop_q, selector_k, d, ur);
-                    break;
+                    const float u = sampling_uniform(cfg.seed, L + extent + 1,
+                                                     kSamplePurposeSpeculativeBonus, 0u);
+                    tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
                 }
-                const float u =
-                    sampling_uniform(cfg.seed, L + extent + 1, kSamplePurposeSpeculativeBonus, 0u);
-                tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
-            }
-            for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
-            for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
-            row_tokens[a]        = tstar;
-            const int produced   = a + 1;
-            licensed_counts[row] = produced;
-            accepted[row]        = a;
-            anchors[row]         = tstar;
-            lengths[row]         = L + produced;
-            for (int i = 0; i < produced; ++i) {
-                row_tokens[i] = sampling_clamp_token(row_tokens[i], 0, token_domain);
-                sampling_count_token(cfg, row_tokens[i], token_domain);
-            }
-            anchors[row] = row_tokens[a];
+                for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
+                for (int i = 0; i < a; ++i) { row_tokens[i] = row_drafts[i]; }
+                row_tokens[a]        = tstar;
+                const int produced   = a + 1;
+                licensed_counts[row] = produced;
+                accepted[row]        = a;
+                anchors[row]         = tstar;
+                lengths[row]         = L + produced;
+                for (int i = 0; i < produced; ++i) {
+                    row_tokens[i] = sampling_clamp_token(row_tokens[i], 0, token_domain);
+                    sampling_count_token(cfg, row_tokens[i], token_domain);
+                }
+                anchors[row] = row_tokens[a];
             }
             *workspace.speculative_finalize_count = 0;
         }
@@ -872,19 +872,20 @@ __device__ inline float speculative_p_less_residual_tile_mass(
 
 // Thread-0 helper. Chooses a tile in either p' or max(0, w p'-q) and leaves only
 // that tile for the cooperative 512-token rescan.
-__device__ inline void speculative_p_less_choose_tile(
-    const __nv_bfloat16* row_logits, std::int64_t base, std::int32_t token_domain,
-    const SamplingConfig& cfg, const SamplingWorkspace& workspace, int col, int partial_blocks,
-    float inv_temp, bool residual, float residual_weight, int draft_id, const int* q_ids,
-    const float* q_vals, int q_n, float u, int* selected_tile, float* selected_goal,
-    int* fallback) {
+__device__ inline void
+speculative_p_less_choose_tile(const __nv_bfloat16* row_logits, std::int64_t base,
+                               std::int32_t token_domain, const SamplingConfig& cfg,
+                               const SamplingWorkspace& workspace, int col, int partial_blocks,
+                               float inv_temp, bool residual, float residual_weight, int draft_id,
+                               const int* q_ids, const float* q_vals, int q_n, float u,
+                               int* selected_tile, float* selected_goal, int* fallback) {
     const SamplingPLessMoments moments = sampling_p_less_load_global(workspace, col);
     const SamplingPLessGate gate       = sampling_p_less_gate(moments, inv_temp);
     const float admitted               = sampling_p_less_load_admitted(workspace, col);
-    *selected_tile = -1;
-    *selected_goal = 0.0f;
-    *fallback      = sampling_clamp_token(sampling_p_less_support_fallback(moments, cfg), 0,
-                                          token_domain);
+    *selected_tile                     = -1;
+    *selected_goal                     = 0.0f;
+    *fallback =
+        sampling_clamp_token(sampling_p_less_support_fallback(moments, cfg), 0, token_domain);
 
     float total = admitted;
     if (residual) {
@@ -924,21 +925,21 @@ __device__ inline void speculative_p_less_choose_tile(
 }
 
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mass_finalize_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts,
-    const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
-    std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
-    const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t cols, std::int32_t partial_blocks, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride, const std::int32_t* selector_ids, const float* selector_q,
-    std::int32_t selector_k, const std::int32_t* verify_ids, const std::int32_t* parent_index,
+    const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
+    std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
+    std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t cols,
+    std::int32_t partial_blocks, SamplingWorkspace workspace, std::size_t workspace_row_stride,
+    const std::int32_t* selector_ids, const float* selector_q, std::int32_t selector_k,
+    const std::int32_t* verify_ids, const std::int32_t* parent_index,
     const std::int32_t* valid_columns, std::int32_t* accepted_column, std::int32_t* fold_path) {
-    const int row     = static_cast<int>(blockIdx.z);
-    const int col     = static_cast<int>(blockIdx.y);
-    const int k       = cols - 1;
-    const bool tree   = parent_index != nullptr;
-    int extent        = current_extents[row];
-    extent            = extent < 0 ? 0 : (extent > k ? k : extent);
-    int valid         = cols;
+    const int row   = static_cast<int>(blockIdx.z);
+    const int col   = static_cast<int>(blockIdx.y);
+    const int k     = cols - 1;
+    const bool tree = parent_index != nullptr;
+    int extent      = current_extents[row];
+    extent          = extent < 0 ? 0 : (extent > k ? k : extent);
+    int valid       = cols;
     if (tree) {
         valid = valid_columns[row];
         valid = valid < 1 ? 1 : (valid > cols ? cols : valid);
@@ -979,10 +980,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
     __syncthreads();
     for (int partial = static_cast<int>(blockIdx.x); partial < partial_blocks;
          partial += static_cast<int>(gridDim.x)) {
-        const float tile_max = sampling_p_less_load_tile_max(workspace, col, partial);
+        const float tile_max  = sampling_p_less_load_tile_max(workspace, col, partial);
         const float tile_mass = sampling_p_less_tile_admitted_mass(
-            row_logits, base, token_domain, cfg, partial * kSamplerPartialTileItems, gate,
-            tile_max, warp_sums);
+            row_logits, base, token_domain, cfg, partial * kSamplerPartialTileItems, gate, tile_max,
+            warp_sums);
         if (threadIdx.x == 0) {
             sampling_p_less_store_tile_mass(workspace, col, partial, tile_mass);
             const int done = sampling_completion_add(&workspace.group_done[col], partial_blocks);
@@ -998,10 +999,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
             }
             sampling_p_less_store_admitted(workspace, col, admitted);
             workspace.group_done[col] = 0;
-            const int need_cols = tree ? valid : (extent + 1);
+            const int need_cols       = tree ? valid : (extent + 1);
             const int done_cols =
                 sampling_completion_add(workspace.speculative_finalize_count, need_cols);
-            is_finalizer        = done_cols == need_cols ? 1 : 0;
+            is_finalizer = done_cols == need_cols ? 1 : 0;
         }
         __syncthreads();
         if (!is_finalizer) { return; }
@@ -1011,18 +1012,18 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
 
     // Any column can win finalization. Restore the root's one-token restriction
     // before walking, then clear it for each subsequent logical token.
-    cfg.typical_exclude = configs[row].typical_exclude;
-    const float inv_temp = 1.0f / cfg.temperature;
+    cfg.typical_exclude            = configs[row].typical_exclude;
+    const float inv_temp           = 1.0f / cfg.temperature;
     const std::int32_t* row_drafts = drafts != nullptr ? drafts + row * k : nullptr;
-    std::int32_t* row_tokens        = licensed_tokens + row * cols;
-    const std::int32_t* ids         = tree ? verify_ids + row * cols : nullptr;
-    const std::int32_t* pars        = tree ? parent_index + row * cols : nullptr;
-    std::int32_t* path              = tree ? fold_path + row * cols : nullptr;
+    std::int32_t* row_tokens       = licensed_tokens + row * cols;
+    const std::int32_t* ids        = tree ? verify_ids + row * cols : nullptr;
+    const std::int32_t* pars       = tree ? parent_index + row * cols : nullptr;
+    std::int32_t* path             = tree ? fold_path + row * cols : nullptr;
     if (threadIdx.x == 0) {
-        node_sh  = 0;
-        a_sh     = 0;
-        tstar_sh = 0;
-        L_sh     = lengths[row];
+        node_sh    = 0;
+        a_sh       = 0;
+        tstar_sh   = 0;
+        L_sh       = lengths[row];
         path_sh[0] = 0;
         for (int i = 0; i < cols; ++i) { lic_sh[i] = 0; }
     }
@@ -1032,10 +1033,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
         for (int step = 0; step <= extent; ++step) {
             if (step > 0) { cfg.typical_exclude = -1; }
             const int node = node_sh;
-            cfg.allowed_token_words = sampling_column_config(configs[row], node).allowed_token_words;
-            const SamplingPLessMoments node_moments =
-                sampling_p_less_load_global(workspace, node);
-            const SamplingPLessGate node_gate = sampling_p_less_gate(node_moments, inv_temp);
+            cfg.allowed_token_words =
+                sampling_column_config(configs[row], node).allowed_token_words;
+            const SamplingPLessMoments node_moments = sampling_p_less_load_global(workspace, node);
+            const SamplingPLessGate node_gate       = sampling_p_less_gate(node_moments, inv_temp);
             const float admitted = sampling_p_less_load_admitted(workspace, node);
             int sampled;
             {
@@ -1052,15 +1053,14 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
                 if (selected_tile >= 0) {
                     sampled = sampling_p_less_pick_from_tile(
                         row_logits, static_cast<std::int64_t>(node) * physical_rows, token_domain,
-                        cfg, selected_tile, node_gate, admitted, selected_goal, fallback, false, 1.0f,
-                        -1, nullptr, nullptr, 0, weights, &running, &picked, &found);
+                        cfg, selected_tile, node_gate, admitted, selected_goal, fallback, false,
+                        1.0f, -1, nullptr, nullptr, 0, weights, &running, &picked, &found);
                 }
             }
             if (threadIdx.x == 0) {
-                const int child =
-                    step < extent
-                        ? speculative_tree_child_for_token(pars, ids, node, sampled, valid)
-                        : -1;
+                const int child = step < extent ? speculative_tree_child_for_token(pars, ids, node,
+                                                                                   sampled, valid)
+                                                : -1;
                 if (child >= 0) {
                     lic_sh[a_sh]      = sampled;
                     path_sh[a_sh + 1] = child;
@@ -1076,10 +1076,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
             if (action != 0) { break; }
         }
         if (threadIdx.x == 0) {
-            speculative_tree_sampling_commit(
-                row_tokens, path, cols, row, lic_sh, path_sh, a_sh, tstar_sh, node_sh,
-                licensed_counts, accepted, accepted_column, anchors, lengths, L_sh, cfg,
-                token_domain);
+            speculative_tree_sampling_commit(row_tokens, path, cols, row, lic_sh, path_sh, a_sh,
+                                             tstar_sh, node_sh, licensed_counts, accepted,
+                                             accepted_column, anchors, lengths, L_sh, cfg,
+                                             token_domain);
             *workspace.speculative_finalize_count = 0;
         }
         return;
@@ -1111,8 +1111,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
     }
     __syncthreads();
     {
-        const int i                     = a_sh;
-        cfg                             = column_config(i);
+        const int i = a_sh;
+        cfg         = column_config(i);
         const SamplingPLessGate col_gate =
             sampling_p_less_gate(sampling_p_less_load_global(workspace, i), inv_temp);
         const float admitted = sampling_p_less_load_admitted(workspace, i);
@@ -1125,10 +1125,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
         }
         if (threadIdx.x == 0) {
             const bool residual = action == 1;
-            const float u       = sampling_uniform(
-                cfg.seed, L_sh + i + 1,
-                residual ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus,
-                0u);
+            const float u       = sampling_uniform(cfg.seed, L_sh + i + 1,
+                                                   residual ? kSamplePurposeSpeculativeCorrection
+                                                            : kSamplePurposeSpeculativeBonus,
+                                                   0u);
             speculative_p_less_choose_tile(
                 row_logits, static_cast<std::int64_t>(i) * physical_rows, token_domain, cfg,
                 workspace, i, partial_blocks, inv_temp, residual, residual_weight_sh, d, hop_ids,
@@ -1157,17 +1157,17 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_p_less_mas
     if (threadIdx.x == 0) {
         for (int i = 0; i <= k; ++i) { row_tokens[i] = 0; }
         for (int i = 0; i < a_sh; ++i) { row_tokens[i] = row_drafts[i]; }
-        row_tokens[a_sh]        = tstar_sh;
-        const int produced      = a_sh + 1;
-        licensed_counts[row]    = produced;
-        accepted[row]           = a_sh;
-        anchors[row]            = tstar_sh;
-        lengths[row]            = L_sh + produced;
+        row_tokens[a_sh]     = tstar_sh;
+        const int produced   = a_sh + 1;
+        licensed_counts[row] = produced;
+        accepted[row]        = a_sh;
+        anchors[row]         = tstar_sh;
+        lengths[row]         = L_sh + produced;
         for (int i = 0; i < produced; ++i) {
             row_tokens[i] = sampling_clamp_token(row_tokens[i], 0, token_domain);
             sampling_count_token(cfg, row_tokens[i], token_domain);
         }
-        anchors[row] = row_tokens[a_sh];
+        anchors[row]                          = row_tokens[a_sh];
         *workspace.speculative_finalize_count = 0;
     }
 }
@@ -1207,7 +1207,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_
     valid                    = valid < 1 ? 1 : (valid > width ? width : valid);
     int extent               = current_extents[row];
     extent                   = extent < 0 ? 0 : (extent > width - 1 ? width - 1 : extent);
-    SamplingConfig cfg = configs[row];
+    SamplingConfig cfg       = configs[row];
     const std::int32_t* ids  = verify_ids + row * width;
     const std::int32_t* pars = parent_index + row * width;
     const std::int32_t* ttok = target_tokens + row * width;
@@ -1249,29 +1249,26 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_tree_drafts_
     __shared__ int lic_sh[kSamplerMaxColumns];
 
     if (tid == 0) {
-        node_sh  = 0;
-        a_sh     = 0;
-        done_sh  = 0;
-        tstar_sh = 0;
-        L_sh     = lengths[row];
+        node_sh    = 0;
+        a_sh       = 0;
+        done_sh    = 0;
+        tstar_sh   = 0;
+        L_sh       = lengths[row];
         path_sh[0] = 0;
-        for (int i = 0; i < width; ++i) {
-            lic_sh[i] = 0;
-        }
+        for (int i = 0; i < width; ++i) { lic_sh[i] = 0; }
     }
     __syncthreads();
 
     for (int step = 0; step <= extent; ++step) {
-        const int node            = node_sh;
+        const int node          = node_sh;
         cfg.allowed_token_words = sampling_column_config(configs[row], node).allowed_token_words;
-        const std::int64_t base =
-            static_cast<std::int64_t>(node) * physical_rows;
-        int sampled = 0;
+        const std::int64_t base = static_cast<std::int64_t>(node) * physical_rows;
+        int sampled             = 0;
         if (p_less) {
             if (step > 0) { cfg.typical_exclude = -1; }
-            sampled = sampling_p_less_draw(row_logits, base, token_domain, cfg, L_sh + a_sh + 1,
-                                           kSamplePurposeSpeculativeAccept, red_val, red_idx,
-                                           red_aux);
+            sampled =
+                sampling_p_less_draw(row_logits, base, token_domain, cfg, L_sh + a_sh + 1,
+                                     kSamplePurposeSpeculativeAccept, red_val, red_idx, red_aux);
         } else if (token_domain <= kSamplerTileItems) {
             sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
                                            cand_val, cand_idx, prob, &n_support, lic_sh, a_sh);

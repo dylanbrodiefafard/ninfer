@@ -143,7 +143,8 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); raise it when other processes, such as a desktop, share the GPU.\n"
            "--kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default off).\n"
-           "--kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB (default off).\n"
+           "--kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB (default "
+           "off).\n"
            "--kv-disk-location is required iff --kv-disk-capacity is enabled.\n"
            "--kv-disk-compress applies zstd-1 to new GDN/hidden/cyclic writes (default off).\n"
            "--context-checkpoints off disables the automatic prefill ladder; a comma list "
@@ -213,8 +214,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--adaptive-draft") {
             options.speculative.adaptive_draft = true;
         } else if (arg == "--dflash-verify-width") {
-            options.speculative.dflash_verify_width =
-                parse_u32(value(arg), "dflash-verify-width");
+            options.speculative.dflash_verify_width = parse_u32(value(arg), "dflash-verify-width");
         } else if (arg == "--dflash-p-less-draft-temperature") {
             options.speculative.dflash_p_less_draft_temperature =
                 parse_float(value(arg), "dflash-p-less-draft-temperature", 0.0F, 2.0F);

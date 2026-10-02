@@ -14,14 +14,13 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm,
           typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void gqa_attention_decode_nvfp4_tiled_kernel(
-        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
-        std::uint8_t* cache_k, std::uint8_t* cache_v, std::uint8_t* cache_k_scale,
-        std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
-        const std::int32_t* valid_columns, const std::int32_t* ancestor_mask,
-        const std::int32_t* prefix_lengths, const std::int32_t* table_rows,
-        std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
-        std::int32_t logical_capacity, float scale, __nv_bfloat16* partial_acc, float* partial_m,
-        float* partial_l) {
+        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::uint8_t* cache_k,
+        std::uint8_t* cache_v, std::uint8_t* cache_k_scale, std::uint8_t* cache_v_scale,
+        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        const std::int32_t* ancestor_mask, const std::int32_t* prefix_lengths,
+        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+        std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -103,7 +102,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int row = tid; row < RowCount; row += Threads) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
                     -CUDART_INF_F;
@@ -115,7 +114,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d   = idx - row * D;
             int q_head    = 0;
             int token     = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
                     __float2bfloat16(0.0f);
@@ -177,10 +176,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                        v_lo, v_hi, v_sc);
             const std::int64_t code =
                 gqa_nvfp4_code_index<Geometry>(physical_page, kv_head, grp * 8, page_offset);
-            *reinterpret_cast<std::uint32_t*>(cache_k + code)     = k_lo;
-            *reinterpret_cast<std::uint32_t*>(cache_k + code + 4) = k_hi;
-            *reinterpret_cast<std::uint32_t*>(cache_v + code)     = v_lo;
-            *reinterpret_cast<std::uint32_t*>(cache_v + code + 4) = v_hi;
+            *reinterpret_cast<std::uint32_t*>(cache_k + code)           = k_lo;
+            *reinterpret_cast<std::uint32_t*>(cache_k + code + 4)       = k_hi;
+            *reinterpret_cast<std::uint32_t*>(cache_v + code)           = v_lo;
+            *reinterpret_cast<std::uint32_t*>(cache_v + code + 4)       = v_hi;
             cache_k_scale[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp,
                                                           page_offset)] = k_sc;
             cache_v_scale[gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp,
@@ -198,18 +197,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const int grp = unit - row * Groups;
         int q_head    = 0;
         int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+        gqa_small_t_tc_row_to_qt<Geometry>(row, kv_head, q_head, token);
         std::uint32_t lo = 0, hi = 0;
         std::uint8_t sc = 0;
         if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-            gqa_nvfp4_quantize_bf16x16(&q[gqa_q_index<Geometry>(q_head, grp * kGqaNvfp4Group, token)],
-                                       lo, hi, sc);
+            gqa_nvfp4_quantize_bf16x16(
+                &q[gqa_q_index<Geometry>(q_head, grp * kGqaNvfp4Group, token)], lo, hi, sc);
         }
         const int logical = grp * 8;
         const int phys    = gqa_nvfp4_swizzle_byte(row, logical);
         *reinterpret_cast<std::uint32_t*>(q_codes + row * CodeW + phys)     = lo;
         *reinterpret_cast<std::uint32_t*>(q_codes + row * CodeW + phys + 4) = hi;
-        q_scale_s[row * Groups + grp]                                        = sc;
+        q_scale_s[row * Groups + grp]                                       = sc;
     }
     __syncthreads();
 
@@ -245,8 +244,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = gqa_nvfp4_scale_index<Geometry>(
-                    physical_page, kv_head, 0, key & kPagedKVPageMask);
+                const std::int64_t off = gqa_nvfp4_scale_index<Geometry>(physical_page, kv_head, 0,
+                                                                         key & kPagedKVPageMask);
                 ninfer::ops::cp_async<16>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
                 ninfer::ops::cp_async<16>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             } else {
@@ -255,13 +254,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         }
         for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += Threads) {
-            const int key_l       = chunk / (CodeW / 16);
-            const int seg         = chunk - key_l * (CodeW / 16);
-            const int logical     = seg * 16;
-            const int key         = tile_k0 + key_l;
-            const int phys        = gqa_nvfp4_swizzle_byte(key_l, logical);
-            std::uint8_t* k_dst   = &k_codes[key_l * CodeW + phys];
-            std::uint8_t* v_dst   = &v_codes[key_l * CodeW + logical];
+            const int key_l     = chunk / (CodeW / 16);
+            const int seg       = chunk - key_l * (CodeW / 16);
+            const int logical   = seg * 16;
+            const int key       = tile_k0 + key_l;
+            const int phys      = gqa_nvfp4_swizzle_byte(key_l, logical);
+            std::uint8_t* k_dst = &k_codes[key_l * CodeW + phys];
+            std::uint8_t* v_dst = &v_codes[key_l * CodeW + logical];
             if (key >= split_start && key < split_end) {
                 const std::int64_t off = gqa_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, logical, key & kPagedKVPageMask);
@@ -277,10 +276,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     // Producer warps score tile kb into P/alpha[stage]; the remaining warps decode its V.
     auto score_and_decode = [&]<int Stage>(int k0) {
-        const std::uint8_t* k_codes   = r_s + Stage * StageBytes;
-        const std::uint8_t* v_codes   = k_codes + Bc * CodeW;
-        __nv_bfloat16* v_bf16         = reinterpret_cast<__nv_bfloat16*>(
-            r_s + Stage * StageBytes + 2 * Bc * CodeW);
+        const std::uint8_t* k_codes = r_s + Stage * StageBytes;
+        const std::uint8_t* v_codes = k_codes + Bc * CodeW;
+        __nv_bfloat16* v_bf16 =
+            reinterpret_cast<__nv_bfloat16*>(r_s + Stage * StageBytes + 2 * Bc * CodeW);
         const std::uint8_t* k_scale_s = k_scale_stages + Stage * Bc * Groups;
         const std::uint8_t* v_scale_s = v_scale_stages + Stage * Bc * Groups;
         float* alpha_s                = alpha_stages + Stage * Br;
@@ -312,9 +311,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    const int brow          = nt * 8 + b_row_offset;
-                    const int b_logical     = k64 * 32 + b_column_byte;
-                    const int b_physical    = gqa_nvfp4_swizzle_byte(brow, b_logical);
+                    const int brow       = nt * 8 + b_row_offset;
+                    const int b_logical  = k64 * 32 + b_column_byte;
+                    const int b_physical = gqa_nvfp4_swizzle_byte(brow, b_logical);
                     unsigned bf[2];
                     ldmatrix_x2(bf[0], bf[1], smem_addr(k_codes + brow * CodeW + b_physical));
                     const int b_scale_row = nt * 8 + sfb_row;
@@ -331,8 +330,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int row0 = producer_row_base + gid;
             const int row1 = row0 + 8;
             int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head0, token0);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
             // Packed-tree verify writes unique cache slots E+j; causal-only
@@ -429,9 +428,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key      = k0 + key_l;
                 __nv_bfloat16* dst = &v_bf16[key_l * D + gqa_small_t_tc_swz(key_l, d)];
                 if (key >= split_start && key < split_end) {
-                    const int grp   = d >> 4;
-                    const float vs =
-                        detail::decode_nvfp4_e4m3(v_scale_s[key_l * Groups + grp]);
+                    const int grp  = d >> 4;
+                    const float vs = detail::decode_nvfp4_e4m3(v_scale_s[key_l * Groups + grp]);
                     store_vec(dst, gqa_nvfp4_dequant_bf16x8(&v_codes[key_l * CodeW + d / 2], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
@@ -444,13 +442,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     auto accumulate_pv = [&]<int Stage>() {
         const __nv_bfloat16* v_bf16 =
             reinterpret_cast<const __nv_bfloat16*>(r_s + Stage * StageBytes + 2 * Bc * CodeW);
-        const float* alpha_s        = alpha_stages + Stage * Br;
-        const int consumer_tile     = warp % RowTiles;
-        const int consumer_slice    = warp / RowTiles;
-        const int consumer_row_base = consumer_tile * 16;
+        const float* alpha_s            = alpha_stages + Stage * Br;
+        const int consumer_tile         = warp % RowTiles;
+        const int consumer_slice        = warp / RowTiles;
+        const int consumer_row_base     = consumer_tile * 16;
         const __nv_bfloat16* p_consumer = &p_stages[Stage * Br * Bc + consumer_row_base * Bc];
-        const float alpha0          = alpha_s[consumer_row_base + gid];
-        const float alpha1          = alpha_s[consumer_row_base + gid + 8];
+        const float alpha0              = alpha_s[consumer_row_base + gid];
+        const float alpha1              = alpha_s[consumer_row_base + gid + 8];
 #pragma unroll
         for (int n = 0; n < PVNtPerWarp; ++n) {
             acc[n][0] *= alpha0;
@@ -468,8 +466,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int pcol = k * 16 + a_coloff;
                 ldmatrix_x4(
                     pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(&p_consumer[a_row_offset * Bc +
-                                          gqa_small_t_tc_swz32(a_row_offset, pcol)]));
+                    smem_addr(
+                        &p_consumer[a_row_offset * Bc + gqa_small_t_tc_swz32(a_row_offset, pcol)]));
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = global_n * 8;
@@ -481,7 +479,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
     };
 
-    int physical_page = physical_pages_s[0];
+    int physical_page    = physical_pages_s[0];
     const auto next_page = [&](int next_k0) {
         if ((next_k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
@@ -535,14 +533,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m0;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l0;
         }
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = m1;
             partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l1;
         }
@@ -559,7 +557,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row0 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][0], acc[n][1]);
@@ -567,7 +565,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, kv_head, q_head, token);
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][2], acc[n][3]);

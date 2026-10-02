@@ -31,7 +31,8 @@ struct FrontendResources {
 };
 
 [[nodiscard]] FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder);
-[[nodiscard]] FrontendResources take_frontend_resources(artifact::MaterializedArtifact& artifact,
-                                                        const FrontendResourcePlan& plan);
+[[nodiscard]] FrontendResources
+take_frontend_resources(artifact::MaterializedArtifact& materialized,
+                        const FrontendResourcePlan& plan);
 
 } // namespace ninfer::targets::qwen3_6

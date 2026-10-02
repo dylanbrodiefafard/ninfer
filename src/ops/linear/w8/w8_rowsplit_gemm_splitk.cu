@@ -127,7 +127,7 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
 
     if (t <= 64) {
         launch_medium<64, 8, 4, 1>(x, w, out, stream);
-    } else if (t == 65) {
+    } else if (t == 65) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         launch_medium<80, 8, 2, 1>(x, w, out, stream);
     } else if (t <= 72) {
         launch_medium<72, 8, 3, 1>(x, w, out, stream);

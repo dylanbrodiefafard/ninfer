@@ -262,15 +262,14 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& spec) const 
     const std::uint64_t prompt =
         static_cast<std::uint64_t>(kind == TestKind::Decode ? kDecodeSeedTokens : n_prompt);
     const std::uint64_t decode = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
-    std::uint64_t margin = 0;
+    std::uint64_t margin       = 0;
     if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::Mtp) {
         margin = 2ULL * spec.draft_tokens;
     } else if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::DFlash) {
         // 27B DFlash2 is chain W=k+1. An explicit dflash_verify_width wins. Two
         // verify-widths of headroom cover the transient uncommitted round state.
-        const std::uint32_t width = spec.dflash_verify_width != 0
-                                       ? spec.dflash_verify_width
-                                       : spec.draft_tokens + 1U;
+        const std::uint32_t width =
+            spec.dflash_verify_width != 0 ? spec.dflash_verify_width : spec.draft_tokens + 1U;
         margin = 2ULL * width;
     }
     return checked_context(prompt + decode + margin, "benchmark context requirement");
@@ -296,22 +295,24 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-         << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: nvfp4)\n"
-         << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
-         << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
-         << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
+        << "  --kv-dtype <bf16|int8|nvfp4> KV cache storage (default: nvfp4)\n"
+        << "  --sage                    Sage3-style FP4-PV attention; requires --kv-dtype nvfp4\n"
+        << "  --keep-frac <f>           Sparge keep fraction (0,1] on exact NVFP4; forbids --sage\n"
+        << "  --xattn-tau <f>           XAttention mass threshold (0,1] on exact NVFP4\n"
         << "  --concurrency <1..6>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
-         << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
-         << "                              the artifact to contain dflash/ objects\n"
-         << "  --draft-tokens <0..7>     speculative draft window: mtp [0,5] (0 = none),\n"
-         << "                              dflash [1,7] (default: 0)\n"
-         << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5, MTP {3..5}, within the captured set\n"
-         << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
-         << "                              default (dflash only)\n"
-         << "  --lm-head-draft             use the optimized proposal head; requires --draft-tokens\n"
-         << "                              greater than zero\n"
+        << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
+        << "                              the artifact to contain dflash/ objects\n"
+        << "  --draft-tokens <0..7>     speculative draft window: mtp [0,5] (0 = none),\n"
+        << "                              dflash [1,7] (default: 0)\n"
+        << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5, "
+           "MTP {3..5}, within the captured set\n"
+        << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
+        << "                              default (dflash only)\n"
+        << "  --lm-head-draft             use the optimized proposal head; requires "
+           "--draft-tokens\n"
+        << "                              greater than zero\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
@@ -365,9 +366,11 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--sage") {
             options.sage_attn = true;
         } else if (arg == "--keep-frac") {
-            options.keep_frac = parse_unit_interval_flag(value("--keep-frac").c_str(), "--keep-frac");
+            options.keep_frac =
+                parse_unit_interval_flag(value("--keep-frac").c_str(), "--keep-frac");
         } else if (arg == "--xattn-tau") {
-            options.xattn_tau = parse_unit_interval_flag(value("--xattn-tau").c_str(), "--xattn-tau");
+            options.xattn_tau =
+                parse_unit_interval_flag(value("--xattn-tau").c_str(), "--xattn-tau");
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
             if (options.concurrency > kMaximumConcurrency) {
@@ -444,11 +447,11 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--dflash-verify-width must be in [2,16]");
     }
     if (options.proposal_head == ProposalHead::Optimized && options.draft_tokens == 0) {
-        throw std::invalid_argument(
-            "--lm-head-draft requires --draft-tokens greater than zero");
+        throw std::invalid_argument("--lm-head-draft requires --draft-tokens greater than zero");
     }
     if (options.adaptive_draft && options.draft_tokens == 0) {
-        throw std::invalid_argument("--adaptive-draft requires --spec mtp|dflash and --draft-tokens");
+        throw std::invalid_argument(
+            "--adaptive-draft requires --spec mtp|dflash and --draft-tokens");
     }
     return options;
 }
@@ -463,6 +466,7 @@ std::vector<BenchTest> expand_tests(const BenchOptions& options) {
     }
 
     std::vector<BenchTest> tests;
+    tests.reserve(prompts.size() + gens.size() + combined.size());
     for (const int p : prompts) {
         tests.push_back({TestKind::Prefill, p, 0, "pp" + std::to_string(p)});
     }
@@ -553,10 +557,9 @@ std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prom
 }
 
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec) {
-    const std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
+    std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
     if (spec.draft_tokens == 0) { return suffix; }
-    const std::string kind =
-        spec.backend == SpeculativeBackend::DFlash ? "dflash" : "mtp";
+    const std::string kind = spec.backend == SpeculativeBackend::DFlash ? "dflash" : "mtp";
     return kind + "_" + suffix;
 }
 
@@ -572,9 +575,12 @@ std::uint32_t decode_graph_prime_required_context(const SpeculativeOptions& spec
 
 std::string speculative_backend_name(SpeculativeBackend backend) {
     switch (backend) {
-        case SpeculativeBackend::None: return "none";
-        case SpeculativeBackend::Mtp: return "mtp";
-        case SpeculativeBackend::DFlash: return "dflash";
+    case SpeculativeBackend::None:
+        return "none";
+    case SpeculativeBackend::Mtp:
+        return "mtp";
+    case SpeculativeBackend::DFlash:
+        return "dflash";
     }
     return "none";
 }
@@ -596,12 +602,10 @@ std::vector<double> prefill_tok_s_series(const TestResult& result) {
     std::vector<double> out;
     if (!result.test.has_prefill()) { return out; }
     for (const RepTiming& rep : result.reps) {
-        const double seconds = result.test.kind == TestKind::Prefill
-                                   ? rep.wave_seconds
-                                   : rep.timings.prefill_seconds;
+        const double seconds =
+            result.test.kind == TestKind::Prefill ? rep.wave_seconds : rep.timings.prefill_seconds;
         if (seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_prompt) * result.concurrency /
-                          seconds);
+            out.push_back(static_cast<double>(result.test.n_prompt) * result.concurrency / seconds);
         }
     }
     return out;
@@ -612,8 +616,7 @@ std::vector<double> prefill_active_tok_s_series(const TestResult& result) {
     if (!result.test.has_prefill()) { return out; }
     for (const RepTiming& rep : result.reps) {
         if (rep.timings.prefill_seconds > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_prompt) /
-                          rep.timings.prefill_seconds);
+            out.push_back(static_cast<double>(result.test.n_prompt) / rep.timings.prefill_seconds);
         }
     }
     return out;
@@ -643,7 +646,7 @@ std::vector<double> decode_engine_tok_s_series(const TestResult& result) {
     return out;
 }
 
-template <double GenerationTimings::*Field>
+template <double GenerationTimings::* Field>
 std::vector<double> timing_series(const TestResult& result) {
     std::vector<double> out;
     out.reserve(result.reps.size());
@@ -700,11 +703,11 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " kv_cache=" << kv_cache_name(env.kv_cache) << " concurrency=" << env.concurrency
         << " spec=" << speculative_backend_name(env.speculative_backend)
-        << " k=" << env.draft_tokens
-        << " proposal_head=" << proposal_head_name(env.proposal_head)
-        << " decode_path=" << decode_path_name(
-            env.use_cuda_graph, SpeculativeOptions{env.speculative_backend, env.draft_tokens,
-                                                   env.proposal_head, env.dflash_verify_width})
+        << " k=" << env.draft_tokens << " proposal_head=" << proposal_head_name(env.proposal_head)
+        << " decode_path="
+        << decode_path_name(env.use_cuda_graph,
+                            SpeculativeOptions{env.speculative_backend, env.draft_tokens,
+                                               env.proposal_head, env.dflash_verify_width})
         << " graph_prime="
         << (env.decode_graph_primed
                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
@@ -713,7 +716,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
 
     constexpr std::size_t cols                   = 10;
     const std::array<std::string, cols> headings = {
-        "test",           "n_prompt", "n_gen",         "prefill t/s", "active pp t/s",
+        "test",           "n_prompt",       "n_gen",    "prefill t/s",   "active pp t/s",
         "decode out t/s", "decode eng t/s", "spec acc", "spec round/fb", "work peak"};
     std::vector<std::array<std::string, cols>> rows;
     for (const TestResult& result : results) {
@@ -809,21 +812,21 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
-         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
-         << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
-         << "    \"keep_frac\": " << env.keep_frac << ",\n"
-         << "    \"xattn_tau\": " << env.xattn_tau << ",\n"
-         << "    \"concurrency\": " << env.concurrency << ",\n"
-         << "    \"spec\": \"" << speculative_backend_name(env.speculative_backend) << "\",\n"
-         << "    \"draft_tokens\": " << env.draft_tokens << ",\n"
-         << "    \"dflash_verify_width\": " << env.dflash_verify_width << ",\n"
-         << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
-         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
-         << "    \"decode_path\": \"" << decode_path_name(
-                   env.use_cuda_graph, SpeculativeOptions{env.speculative_backend, env.draft_tokens,
-                                                          env.proposal_head,
-                                                          env.dflash_verify_width})
-         << "\",\n"
+        << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"sage_attn\": " << (env.sage_attn ? "true" : "false") << ",\n"
+        << "    \"keep_frac\": " << env.keep_frac << ",\n"
+        << "    \"xattn_tau\": " << env.xattn_tau << ",\n"
+        << "    \"concurrency\": " << env.concurrency << ",\n"
+        << "    \"spec\": \"" << speculative_backend_name(env.speculative_backend) << "\",\n"
+        << "    \"draft_tokens\": " << env.draft_tokens << ",\n"
+        << "    \"dflash_verify_width\": " << env.dflash_verify_width << ",\n"
+        << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
+        << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
+        << "    \"decode_path\": \""
+        << decode_path_name(env.use_cuda_graph,
+                            SpeculativeOptions{env.speculative_backend, env.draft_tokens,
+                                               env.proposal_head, env.dflash_verify_width})
+        << "\",\n"
         << "    \"decode_graph_prime\": {\"primed\": "
         << (env.decode_graph_primed ? "true" : "false")
         << ", \"output_tokens\": " << env.decode_graph_prime_output_tokens << "},\n"
@@ -919,10 +922,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << speculative_backend_name(env.speculative_backend) << ',' << env.draft_tokens << ','
             << env.dflash_verify_width << ',' << proposal_head_name(env.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph,
-                               SpeculativeOptions{env.speculative_backend, env.draft_tokens,
-                                                  env.proposal_head, env.dflash_verify_width})
-            << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
+                                SpeculativeOptions{env.speculative_backend, env.draft_tokens,
+                                                   env.proposal_head, env.dflash_verify_width})
+            << ',' << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
             << ',' << env.memory.request_transient.capacity_bytes << ','
@@ -931,8 +933,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << spec.fallback_steps << ',' << acceptance << ',' << result.reps.size() << ','
             << mean(prefill_tok_s_series(result)) << ',' << stddev(prefill_tok_s_series(result))
             << ',' << mean(prefill_active_tok_s_series(result)) << ','
-            << stddev(prefill_active_tok_s_series(result))
-            << ',' << mean(decode_output_tok_s_series(result)) << ','
+            << stddev(prefill_active_tok_s_series(result)) << ','
+            << mean(decode_output_tok_s_series(result)) << ','
             << stddev(decode_output_tok_s_series(result)) << ','
             << mean(decode_engine_tok_s_series(result)) << ','
             << stddev(decode_engine_tok_s_series(result)) << ','

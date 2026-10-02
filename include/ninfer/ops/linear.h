@@ -66,8 +66,9 @@ enum class LinearPolicy : std::uint8_t {
  * [5120,6144], [5120,17408], [5120,25600], [6144,5120], [5120,4096],
  * [1280,5120], [256,5120], [5120,10240]}` accept every positive T. The five
  * DFlash2-only geometries are A16-only; AllowA4 still resolves them to A16.
- * MTP `fc` `[5120,10240]` admits W4A4 at T≥8 (residual-class N; T=4/6 stay A16). Text and MTP packed-weight problems accept
- * every positive column extent T. Registered W8 problems `[5120,25600]`, `[5120,4096]`,
+ * MTP `fc` `[5120,10240]` admits W4A4 at T≥8 (residual-class N; T=4/6 stay A16). Text and MTP
+ * packed-weight problems accept every positive column extent T. Registered W8 problems
+ * `[5120,25600]`, `[5120,4096]`,
  * `[1280,5120]`, and `[256,5120]`, and registered Q4 problems `[5120,25600]`, `[5120,4096]`,
  * `[5120,17408]`, `[1280,5120]`, and `[256,5120]`, also accept every positive T. Registered Vision
  * problems accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix
@@ -87,10 +88,10 @@ enum class LinearPolicy : std::uint8_t {
  * `policy` specifies the permitted private activation-compute set. A permission does not require a
  * corresponding low-precision route: the resolved plan may remain A16 when that is the qualified
  * choice. BF16_CTRL admits only LinearPolicy::A16Only. Registered Q4/Q5/Q6/W8 formats admit
- * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only, AllowA4 and AllowA8; AllowA4
- * permits the private resolver to select either a qualified A16 route or activation quantization
- * to NVFP4 at every positive T. The selected route depends only on the registered problem and T.
- * NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4 for [14336,5120],
+ * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only, AllowA4 and AllowA8;
+ * AllowA4 permits the private resolver to select either a qualified A16 route or activation
+ * quantization to NVFP4 at every positive T. The selected route depends only on the registered
+ * problem and T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4 for [14336,5120],
  * [16384,5120], [34816,5120], [5120,6144], and [5120,17408]. Other NVFP4 shapes and T<4
  * retain A16. Weight codes and per16 E4M3 scales remain unchanged: exact code expansion and
  * separately scaled K16 partials introduce no additional weight quantization. The canonical
@@ -138,9 +139,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * at `T=width*B` can select a different kernel than sequential C=1 (`T=width`). This entry
  * launches one Linear per sequence by default. Qualified exceptions aggregate the A16 W8
  * vocabulary W=2..6 profile in passes of at most 32 same-reduction columns and aggregate selected
- * NVFP4 DFlash and Q4 27B draft-head profiles. `T` must be a positive multiple of `sequence_width`. Tensor, weight, aliasing,
- * policy, and workspace
- * requirements match `linear`.
+ * NVFP4 DFlash and Q4 27B draft-head profiles. `T` must be a positive multiple of `sequence_width`.
+ * Tensor, weight, aliasing, policy, and workspace requirements match `linear`.
  *
  * @param[in] sequence_width Per-sequence column count (the C=1 T).
  */

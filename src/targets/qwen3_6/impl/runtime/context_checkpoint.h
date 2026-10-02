@@ -42,23 +42,25 @@ struct ContextCheckpointImageLayout {
     std::size_t dflash_bytes    = 0;
 };
 
-[[nodiscard]] constexpr bool context_checkpoint_image_layout_matches(
-    ContextCheckpointImageLayout lhs, ContextCheckpointImageLayout rhs) noexcept {
+[[nodiscard]] constexpr bool
+context_checkpoint_image_layout_matches(ContextCheckpointImageLayout lhs,
+                                        ContextCheckpointImageLayout rhs) noexcept {
     return lhs.conv_bytes == rhs.conv_bytes && lhs.recurrent_bytes == rhs.recurrent_bytes &&
            lhs.hidden_bytes == rhs.hidden_bytes && lhs.dflash_bytes == rhs.dflash_bytes;
 }
 
 // Each lane owns at most one image for each ladder mark and one rollback image. Retired images
 // are only retained within this exact live high-water bound.
-[[nodiscard]] constexpr std::size_t context_checkpoint_image_pool_capacity(
-    std::uint32_t max_concurrency, std::size_t mark_count) noexcept {
+[[nodiscard]] constexpr std::size_t
+context_checkpoint_image_pool_capacity(std::uint32_t max_concurrency,
+                                       std::size_t mark_count) noexcept {
     return static_cast<std::size_t>(max_concurrency) * (mark_count + 1U);
 }
 
 // Prefill chunk-end thresholds. Advertised restore frontier is the committed chunk end
 // at or past the mark, never the raw named size (24000, 36000, 150000, ...).
-inline constexpr std::array<std::uint32_t, 6> kPrefillContextMarks = {
-    24576u, 36864u, 53248u, 77824u, 102400u, 151552u};
+inline constexpr std::array<std::uint32_t, 6> kPrefillContextMarks = {24576u, 36864u,  53248u,
+                                                                      77824u, 102400u, 151552u};
 
 [[nodiscard]] constexpr std::optional<std::uint32_t>
 next_prefill_context_mark(std::uint32_t frontier, std::span<const std::uint32_t> marks) noexcept {
@@ -78,11 +80,9 @@ first_prefill_context_mark(std::span<const std::uint32_t> marks) noexcept {
     return marks.empty() ? 0 : marks.front();
 }
 
-[[nodiscard]] inline std::vector<std::uint32_t> resolved_prefill_context_marks(
-    const std::optional<std::vector<std::uint32_t>>& configured) {
-    if (!configured) {
-        return {kPrefillContextMarks.begin(), kPrefillContextMarks.end()};
-    }
+[[nodiscard]] inline std::vector<std::uint32_t>
+resolved_prefill_context_marks(const std::optional<std::vector<std::uint32_t>>& configured) {
+    if (!configured) { return {kPrefillContextMarks.begin(), kPrefillContextMarks.end()}; }
     return *configured;
 }
 
@@ -114,8 +114,9 @@ inline void validate_configured_context_checkpoint_marks(
 }
 
 // Restore to R keeps heads at R so a later request can hit R after current moves on.
-[[nodiscard]] constexpr bool retain_context_checkpoint_head(std::uint32_t head_frontier,
-                                                            std::uint32_t restore_frontier) noexcept {
+[[nodiscard]] constexpr bool
+retain_context_checkpoint_head(std::uint32_t head_frontier,
+                               std::uint32_t restore_frontier) noexcept {
     return head_frontier <= restore_frontier;
 }
 
@@ -137,17 +138,19 @@ advertised_context_checkpoint_frontier(std::uint32_t chunk_end) noexcept {
 
 // Span between two advertised head frontiers. Public restore/capture fields report the
 // absolute head F, not this increment.
-[[nodiscard]] constexpr std::uint32_t newly_frozen_context_checkpoint_tokens(
-    std::uint32_t advertised_frontier, std::uint32_t existing_frontier) noexcept {
+[[nodiscard]] constexpr std::uint32_t
+newly_frozen_context_checkpoint_tokens(std::uint32_t advertised_frontier,
+                                       std::uint32_t existing_frontier) noexcept {
     return advertised_frontier > existing_frontier ? advertised_frontier - existing_frontier : 0;
 }
 
-[[nodiscard]] constexpr bool staging_holds_restore_identity(
-    bool occupied, std::uint32_t staging_lane, PrefixHash128 staging_hash,
-    std::uint32_t staging_frontier, std::uint32_t lane, PrefixHash128 hash,
-    std::uint32_t frontier) noexcept {
-    return occupied && staging_lane == lane && staging_frontier == frontier &&
-           staging_hash == hash;
+[[nodiscard]] constexpr bool staging_holds_restore_identity(bool occupied,
+                                                            std::uint32_t staging_lane,
+                                                            PrefixHash128 staging_hash,
+                                                            std::uint32_t staging_frontier,
+                                                            std::uint32_t lane, PrefixHash128 hash,
+                                                            std::uint32_t frontier) noexcept {
+    return occupied && staging_lane == lane && staging_frontier == frontier && staging_hash == hash;
 }
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ninfer::PrefixReusePath path) noexcept {
@@ -166,10 +169,11 @@ advertised_context_checkpoint_frontier(std::uint32_t chunk_end) noexcept {
 
 // Occupy-append pin of the completed frontier before suffix prefill. Exact-hit
 // (prompt_tokens == E) must not replace an older rollback head.
-[[nodiscard]] constexpr bool should_capture_turn_rollback(
-    ninfer::PrefixReusePath reuse, std::uint32_t execution_frontier, std::uint32_t prompt_tokens,
-    bool capture_enabled, bool tail_hidden_valid, bool already_has_head_at_e,
-    bool prefix_items_complete) noexcept {
+[[nodiscard]] constexpr bool
+should_capture_turn_rollback(ninfer::PrefixReusePath reuse, std::uint32_t execution_frontier,
+                             std::uint32_t prompt_tokens, bool capture_enabled,
+                             bool tail_hidden_valid, bool already_has_head_at_e,
+                             bool prefix_items_complete) noexcept {
     if (reuse != ninfer::PrefixReusePath::AppendAtFrontier) { return false; }
     if (execution_frontier == 0 || prompt_tokens <= execution_frontier) { return false; }
     if (!capture_enabled || !tail_hidden_valid || already_has_head_at_e || !prefix_items_complete) {
@@ -181,10 +185,11 @@ advertised_context_checkpoint_frontier(std::uint32_t chunk_end) noexcept {
 // Occupy-time exact-hit / decode-only pin. Independent of reuse path; does not
 // replace should_capture_turn_rollback (auto still requires AppendAtFrontier
 // and prompt_tokens > E).
-[[nodiscard]] constexpr bool should_capture_exact_hit_pin(
-    bool request_pin, std::uint32_t execution_frontier, std::uint32_t prompt_tokens,
-    bool capture_enabled, bool tail_hidden_valid, bool already_has_head_at_e,
-    bool prefix_items_complete) noexcept {
+[[nodiscard]] constexpr bool
+should_capture_exact_hit_pin(bool request_pin, std::uint32_t execution_frontier,
+                             std::uint32_t prompt_tokens, bool capture_enabled,
+                             bool tail_hidden_valid, bool already_has_head_at_e,
+                             bool prefix_items_complete) noexcept {
     if (!request_pin || execution_frontier == 0 || prompt_tokens != execution_frontier) {
         return false;
     }
@@ -222,7 +227,8 @@ advertised_context_checkpoint_frontier(std::uint32_t chunk_end) noexcept {
     return staging_holds_identity && head_present;
 }
 
-[[nodiscard]] constexpr bool mtp_bridge_reads_rewrite_hidden(ninfer::PrefixReusePath path) noexcept {
+[[nodiscard]] constexpr bool
+mtp_bridge_reads_rewrite_hidden(ninfer::PrefixReusePath path) noexcept {
     return is_rewrite_checkpoint_restore(path);
 }
 
@@ -233,10 +239,11 @@ struct PrefillReuseSelection {
 
 // Current matching frontier always wins. Otherwise the longest complete rewrite or
 // staged head. Same-F rewrite vs rollback/ladder keeps rewrite (`>` not `>=`).
-[[nodiscard]] inline PrefillReuseSelection select_resident_prefill_reuse(
-    bool current_matches, std::uint32_t execution_frontier, bool rewrite_matches,
-    std::uint32_t rewrite_frontier, ninfer::PrefixReusePath rewrite_path,
-    std::span<const PrefillReuseHead> matching_heads) {
+[[nodiscard]] inline PrefillReuseSelection
+select_resident_prefill_reuse(bool current_matches, std::uint32_t execution_frontier,
+                              bool rewrite_matches, std::uint32_t rewrite_frontier,
+                              ninfer::PrefixReusePath rewrite_path,
+                              std::span<const PrefillReuseHead> matching_heads) {
     if (current_matches && execution_frontier != 0) {
         return {ninfer::PrefixReusePath::AppendAtFrontier, execution_frontier};
     }
@@ -254,10 +261,11 @@ struct PrefillReuseSelection {
     return best;
 }
 
-[[nodiscard]] inline PrefillReuseSelection select_resident_prefill_reuse(
-    bool current_matches, std::uint32_t execution_frontier, bool rewrite_matches,
-    std::uint32_t rewrite_frontier, ninfer::PrefixReusePath rewrite_path,
-    std::span<const std::uint32_t> matching_ladder_frontiers) {
+[[nodiscard]] inline PrefillReuseSelection
+select_resident_prefill_reuse(bool current_matches, std::uint32_t execution_frontier,
+                              bool rewrite_matches, std::uint32_t rewrite_frontier,
+                              ninfer::PrefixReusePath rewrite_path,
+                              std::span<const std::uint32_t> matching_ladder_frontiers) {
     std::vector<PrefillReuseHead> heads;
     heads.reserve(matching_ladder_frontiers.size());
     for (const std::uint32_t frontier : matching_ladder_frontiers) {
@@ -269,30 +277,30 @@ struct PrefillReuseSelection {
 
 // Resident checkpoint head reduced to the identity fields the reuse decision consumes.
 struct ContextCheckpointRef {
-    std::uint32_t frontier       = 0;
+    std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind   = ContextCheckpointKind::Ladder;
+    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
 };
 
 // Resident sequence state consumed by the reuse decision. This is the detail-level view of
 // the runtime's richer ResidentStateView: the owner maps into it on every planning pass.
 struct ResidentReuseState {
-    const std::vector<TokenId>* ledger                  = nullptr;
-    const ResidentPrefixIdentity* identity              = nullptr;
-    std::uint32_t execution_frontier                    = 0;
-    bool rewrite_valid                                   = false;
-    RewriteCheckpointKind rewrite_kind                  = RewriteCheckpointKind::TurnClosure;
-    std::uint32_t rewrite_frontier                      = 0;
-    std::uint32_t mtp_kv_valid                          = 0;
-    std::uint32_t dflash_context_frontier               = 0;
-    bool tail_hidden_valid                              = false;
-    bool backend_image_present                          = false;
+    const std::vector<TokenId>* ledger     = nullptr;
+    const ResidentPrefixIdentity* identity = nullptr;
+    std::uint32_t execution_frontier       = 0;
+    bool rewrite_valid                     = false;
+    RewriteCheckpointKind rewrite_kind     = RewriteCheckpointKind::TurnClosure;
+    std::uint32_t rewrite_frontier         = 0;
+    std::uint32_t mtp_kv_valid             = 0;
+    std::uint32_t dflash_context_frontier  = 0;
+    bool tail_hidden_valid                 = false;
+    bool backend_image_present             = false;
     std::vector<ContextCheckpointRef> context_checkpoints;
 };
 
 // The restore path a rewrite checkpoint kind replays through.
-[[nodiscard]] constexpr ninfer::PrefixReusePath rewrite_restore_path(
-    RewriteCheckpointKind kind) noexcept {
+[[nodiscard]] constexpr ninfer::PrefixReusePath
+rewrite_restore_path(RewriteCheckpointKind kind) noexcept {
     return kind == RewriteCheckpointKind::TurnClosure
                ? ninfer::PrefixReusePath::RestoreTurnCheckpoint
                : ninfer::PrefixReusePath::RestoreResponseCheckpoint;
@@ -300,25 +308,27 @@ struct ResidentReuseState {
 
 struct ReuseBackendPolicy {
     ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::None;
-    bool mtp_cache_present = false;
-    bool dflash_present = false;
-    bool dflash_full_layers = false;
+    bool mtp_cache_present             = false;
+    bool dflash_present                = false;
+    bool dflash_full_layers            = false;
 };
 
 // Filter every candidate before ranking, including candidates in different RAM
 // or disk entries. An unusable longer frontier cannot hide an earlier usable head.
-[[nodiscard]] inline bool reuse_candidate_ready(
-    const ResidentReuseState& state, ninfer::PrefixReusePath path,
-    std::uint32_t frontier, std::size_t prompt_tokens,
-    const ReuseBackendPolicy& policy) noexcept {
+[[nodiscard]] inline bool reuse_candidate_ready(const ResidentReuseState& state,
+                                                ninfer::PrefixReusePath path,
+                                                std::uint32_t frontier, std::size_t prompt_tokens,
+                                                const ReuseBackendPolicy& policy) noexcept {
     if (path == ninfer::PrefixReusePath::AppendAtFrontier) {
         if (prompt_tokens == frontier && !state.tail_hidden_valid) { return false; }
         if (policy.backend == ninfer::SpeculativeBackend::DFlash &&
-            state.dflash_context_frontier != frontier) { return false; }
+            state.dflash_context_frontier != frontier) {
+            return false;
+        }
     }
     if (policy.backend == ninfer::SpeculativeBackend::Mtp &&
-        !mtp_prefix_reuse_ready(path, frontier, state.mtp_kv_valid,
-                                state.tail_hidden_valid, policy.mtp_cache_present)) {
+        !mtp_prefix_reuse_ready(path, frontier, state.mtp_kv_valid, state.tail_hidden_valid,
+                                policy.mtp_cache_present)) {
         return false;
     }
     if (is_rewrite_checkpoint_restore(path) &&
@@ -326,7 +336,7 @@ struct ReuseBackendPolicy {
         if (!policy.dflash_present || state.dflash_context_frontier < frontier) { return false; }
         if (policy.dflash_full_layers &&
             !dflash_rewrite_checkpoint_ready(state.backend_image_present,
-                                              state.dflash_context_frontier, frontier)) {
+                                             state.dflash_context_frontier, frontier)) {
             return false;
         }
     }
@@ -339,10 +349,10 @@ struct ReuseBackendPolicy {
 // hidden + MTP KV there. An unready append falls through to a usable rewrite or staged
 // checkpoint instead of forcing a FullReset later. Among the non-append candidates the
 // longest matching head that the backend can legally continue wins.
-[[nodiscard]] inline PrefillReuseSelection decide_resident_reuse(
-    const ResidentReuseState& state, const PreparedPromptData& prompt,
-    ninfer::SpeculativeBackend backend, bool mtp_cache_present, bool dflash_present,
-    bool dflash_full_layers) {
+[[nodiscard]] inline PrefillReuseSelection
+decide_resident_reuse(const ResidentReuseState& state, const PreparedPromptData& prompt,
+                      ninfer::SpeculativeBackend backend, bool mtp_cache_present,
+                      bool dflash_present, bool dflash_full_layers) {
     const ReuseBackendPolicy policy{backend, mtp_cache_present, dflash_present, dflash_full_layers};
     const auto ready = [&](ninfer::PrefixReusePath path, std::uint32_t frontier) {
         return reuse_candidate_ready(state, path, frontier, prompt.token_ids.size(), policy);
@@ -351,13 +361,13 @@ struct ReuseBackendPolicy {
         state.execution_frontier != 0 &&
         ready(ninfer::PrefixReusePath::AppendAtFrontier, state.execution_frontier) &&
         prefix_matches(prompt, *state.ledger, *state.identity, state.execution_frontier);
-    bool rewrite_matches                     = false;
-    ninfer::PrefixReusePath rewrite_path     = ninfer::PrefixReusePath::FullReset;
-    std::uint32_t rewrite_frontier           = 0;
+    bool rewrite_matches                 = false;
+    ninfer::PrefixReusePath rewrite_path = ninfer::PrefixReusePath::FullReset;
+    std::uint32_t rewrite_frontier       = 0;
     std::vector<PrefillReuseHead> matching_heads;
     if (!current_matches) {
-        const auto chain    = prefix_hash_chain(prompt);
-        const auto hash_ok  = [&](std::uint32_t frontier, PrefixHash128 hash) {
+        const auto chain   = prefix_hash_chain(prompt);
+        const auto hash_ok = [&](std::uint32_t frontier, PrefixHash128 hash) {
             return frontier != 0 && frontier <= prompt.token_ids.size() &&
                    frontier < chain.size() && chain[frontier] == hash &&
                    prefix_matches(prompt, *state.ledger, *state.identity, frontier);
@@ -383,29 +393,30 @@ struct ReuseBackendPolicy {
         }
     }
     PrefillReuseSelection selected =
-        select_resident_prefill_reuse(current_matches, state.execution_frontier,
-                                      rewrite_matches, rewrite_frontier, rewrite_path,
-                                      matching_heads);
+        select_resident_prefill_reuse(current_matches, state.execution_frontier, rewrite_matches,
+                                      rewrite_frontier, rewrite_path, matching_heads);
     return selected;
 }
 
-[[nodiscard]] constexpr bool occupy_drops_rewrite_ahead_of_restore(
-    ninfer::PrefixReusePath reuse, bool rewrite_valid, std::uint32_t rewrite_frontier,
-    std::uint32_t restore_frontier) noexcept {
+[[nodiscard]] constexpr bool
+occupy_drops_rewrite_ahead_of_restore(ninfer::PrefixReusePath reuse, bool rewrite_valid,
+                                      std::uint32_t rewrite_frontier,
+                                      std::uint32_t restore_frontier) noexcept {
     return is_staged_checkpoint_restore(reuse) && rewrite_valid &&
            rewrite_frontier > restore_frontier;
 }
 
-[[nodiscard]] constexpr bool occupy_clears_context_checkpoints(
-    ninfer::PrefixReusePath reuse) noexcept {
+[[nodiscard]] constexpr bool
+occupy_clears_context_checkpoints(ninfer::PrefixReusePath reuse) noexcept {
     return reuse == ninfer::PrefixReusePath::FullReset;
 }
 
-[[nodiscard]] constexpr bool occupy_keeps_context_checkpoint_head(
-    ninfer::PrefixReusePath reuse, std::uint32_t head_frontier, std::uint32_t new_base) noexcept {
+[[nodiscard]] constexpr bool occupy_keeps_context_checkpoint_head(ninfer::PrefixReusePath reuse,
+                                                                  std::uint32_t head_frontier,
+                                                                  std::uint32_t new_base) noexcept {
     if (occupy_clears_context_checkpoints(reuse)) { return false; }
-    if (reuse == ninfer::PrefixReusePath::AppendAtFrontier ||
-        is_staged_checkpoint_restore(reuse) || is_rewrite_checkpoint_restore(reuse)) {
+    if (reuse == ninfer::PrefixReusePath::AppendAtFrontier || is_staged_checkpoint_restore(reuse) ||
+        is_rewrite_checkpoint_restore(reuse)) {
         return retain_context_checkpoint_head(head_frontier, new_base);
     }
     return false;

@@ -18,7 +18,7 @@ namespace ninfer::ops {
 [[nodiscard]] std::size_t rmsnorm_linear_swiglu_workspace_capacity_bytes(std::int32_t tokens);
 
 void rmsnorm_linear_swiglu(const Tensor& x, const Tensor& norm_weight, float eps,
-                          const Weight& gate_up, Tensor& out, WorkspaceArena& workspace,
-                          cudaStream_t stream);
+                           const Weight& gate_up, Tensor& out, WorkspaceArena& workspace,
+                           cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -26,9 +26,8 @@ std::int64_t numel_nonzero(const Tensor& t) {
 void require_same_shape(const Tensor& a, const Tensor& b, const char* b_label) {
     for (int d = 0; d < 4; ++d) {
         if (a.ne[d] != b.ne[d]) {
-            throw std::invalid_argument(
-                std::string("residual_rmsnorm: ") + std::string(b_label) +
-                " shape must match y [x/out]");
+            throw std::invalid_argument(std::string("residual_rmsnorm: ") + std::string(b_label) +
+                                        " shape must match y [x/out]");
         }
     }
 }
@@ -36,7 +35,7 @@ void require_same_shape(const Tensor& a, const Tensor& b, const char* b_label) {
 } // namespace
 
 void residual_rmsnorm(const Tensor& y, Tensor& x, const Tensor& weight, float eps, Tensor& out,
-                       cudaStream_t stream) {
+                      cudaStream_t stream) {
     if (y.dtype != DType::BF16 || x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
         throw std::invalid_argument("residual_rmsnorm: y/x/weight/out must be BF16");

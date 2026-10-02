@@ -157,8 +157,8 @@ __device__ __forceinline__ int gqa_small_t_tc_swz32(int row, int col) {
 // accumulator (c0/c1 -> row groupID, c2/c3 -> row groupID+8), so score
 // consumption is unchanged; only per-64-group scale rescale differs.
 template <typename Geometry>
-__device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, int kv_head,
-                                                         int& q_head, int& token) {
+__device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int kv_head, int& q_head,
+                                                         int& token) {
     token             = row / Geometry::GroupSize;
     const int local_q = row - token * Geometry::GroupSize;
     q_head            = kv_head * Geometry::GroupSize + local_q;
@@ -197,12 +197,12 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     if constexpr (MultiBatch) {
         const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * kGqaHeadDim *
-                                              Geometry::QHeads * tokens * split_count;
+                                             Geometry::QHeads * tokens * split_count;
         const std::int64_t partial_stat_row =
             static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
         partial_acc += partial_acc_row;
-        partial_m   += partial_stat_row;
-        partial_l   += partial_stat_row;
+        partial_m += partial_stat_row;
+        partial_l += partial_stat_row;
     }
 
     const int window = last_pos + 1;
@@ -224,19 +224,20 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     extern __shared__ std::uint8_t smem_raw[];
     float* m_s = reinterpret_cast<float*>(smem_raw);
     float* l_s = m_s + split_count;
-    __nv_bfloat16* acc_s =
-        reinterpret_cast<__nv_bfloat16*>((reinterpret_cast<std::uintptr_t>(l_s + split_count) + 15) &
-                                          ~std::uintptr_t(15));
+    // Round the end of l_s up to 16 bytes by advancing the pointer, which keeps its provenance.
+    auto* const l_end    = reinterpret_cast<std::uint8_t*>(l_s + split_count);
+    const auto l_end_pad = (16u - (reinterpret_cast<std::uintptr_t>(l_end) & 15u)) & 15u;
+    __nv_bfloat16* acc_s = reinterpret_cast<__nv_bfloat16*>(l_end + l_end_pad);
 
-    const std::int64_t acc_base = gqa_partial_acc_index<Geometry>(q_head, d_start, token, 0, tokens);
-    const std::int64_t stat_base =
-        gqa_partial_stat_index<Geometry>(q_head, token, 0, tokens);
+    const std::int64_t acc_base =
+        gqa_partial_acc_index<Geometry>(q_head, d_start, token, 0, tokens);
+    const std::int64_t stat_base = gqa_partial_stat_index<Geometry>(q_head, token, 0, tokens);
     const std::int64_t acc_step =
-        static_cast<std::int64_t>(tokens) * Geometry::QHeads * kGqaHeadDim;  // bf16 elems/split
+        static_cast<std::int64_t>(tokens) * Geometry::QHeads * kGqaHeadDim; // bf16 elems/split
     const std::int64_t stat_step =
-        static_cast<std::int64_t>(tokens) * Geometry::QHeads;  // f32 elems/split
-    constexpr int kAccChunks = DChunk * 2 / 16;  // 16B chunks per split row
-    const int acc_chunks = active_split_count * kAccChunks;
+        static_cast<std::int64_t>(tokens) * Geometry::QHeads; // f32 elems/split
+    constexpr int kAccChunks = DChunk * 2 / 16;               // 16B chunks per split row
+    const int acc_chunks     = active_split_count * kAccChunks;
     for (int c = tid; c < acc_chunks; c += 256) {
         const int s = c / kAccChunks;
         const int i = c - s * kAccChunks;
@@ -267,14 +268,12 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const int s1      = s0 + S4 < active_split_count ? s0 + S4 : active_split_count;
 
     float local_m = -CUDART_INF_F;
-    for (int split = s0; split < s1; ++split) {
-        local_m = fmaxf(local_m, m_s[split]);
-    }
+    for (int split = s0; split < s1; ++split) { local_m = fmaxf(local_m, m_s[split]); }
     reduce[d_local * tpd + q] = local_m;
     __syncthreads();
     if (tid < DChunk) {
         float gmax = reduce[tid * tpd];
-#pragma unroll
+#    pragma unroll
         for (int i = 1; i < tpd; ++i) { gmax = fmaxf(gmax, reduce[tid * tpd + i]); }
         reduce[tid] = gmax;
     }
@@ -288,7 +287,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     if (head_m == -CUDART_INF_F) {
         if (q == 0) {
-            const int d = d_start + d_local;
+            const int d                                          = d_start + d_local;
             out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
         }
         return;
@@ -297,15 +296,13 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     float local_l = 0.0f;
     for (int split = s0; split < s1; ++split) {
         const float tile_l = l_s[split];
-        if (tile_l > 0.0f) {
-            local_l += tile_l * expf(m_s[split] - head_m);
-        }
+        if (tile_l > 0.0f) { local_l += tile_l * expf(m_s[split] - head_m); }
     }
     reduce[d_local * tpd + q] = local_l;
     __syncthreads();
     if (tid < DChunk) {
         float gsum = 0.0f;
-#pragma unroll
+#    pragma unroll
         for (int i = 0; i < tpd; ++i) { gsum += reduce[tid * tpd + i]; }
         reduce[tid] = gsum;
     }
@@ -330,7 +327,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     __syncthreads();
     if (q == 0) {
         float numerator = 0.0f;
-#pragma unroll
+#    pragma unroll
         for (int i = 0; i < tpd; ++i) { numerator += reduce[d_local * tpd + i]; }
         bool valid = true;
         if constexpr (Masked) {

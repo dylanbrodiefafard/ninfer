@@ -66,7 +66,8 @@ private:
     void emit_messages_error(httplib::Response& response, const ApiError& error);
     void record_generation(const RequestLogContext& context, GenerationOutcome outcome, bool tools,
                            bool capture, bool media, std::chrono::steady_clock::time_point started);
-    void record_rejection(const RequestRejectionLogContext& context, const GenerationRequest& request);
+    void record_rejection(const RequestRejectionLogContext& context,
+                          const GenerationRequest& request);
     void record_failure(const RequestLogContext& context, bool tools, bool capture, bool media,
                         const std::string& message, const ApiError* error,
                         bool count_api_error = true);

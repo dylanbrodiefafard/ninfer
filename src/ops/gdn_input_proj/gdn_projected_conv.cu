@@ -154,16 +154,16 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
     constexpr int kDefaultThreads = 256;
     const std::int32_t width      = projected.ne[1];
     const std::int32_t batch      = projected.ne[2];
-    const std::int32_t* valid_ptr =
-        valid_columns.data == nullptr ? nullptr
-                                      : static_cast<const std::int32_t*>(valid_columns.data);
-    const auto* projected_ptr = static_cast<const __nv_bfloat16*>(projected.data);
-    const auto* weight_ptr    = static_cast<const __nv_bfloat16*>(conv_weight.data);
-    const auto* state_ptr     = static_cast<const __nv_bfloat16*>(state_read.data);
-    const auto* initial_ptr   = static_cast<const std::int32_t*>(initial_state_slots.data);
-    auto* query_ptr           = static_cast<__nv_bfloat16*>(query.data);
-    auto* key_ptr             = static_cast<__nv_bfloat16*>(key.data);
-    auto* value_ptr           = static_cast<__nv_bfloat16*>(value.data);
+    const std::int32_t* valid_ptr = valid_columns.data == nullptr
+                                        ? nullptr
+                                        : static_cast<const std::int32_t*>(valid_columns.data);
+    const auto* projected_ptr     = static_cast<const __nv_bfloat16*>(projected.data);
+    const auto* weight_ptr        = static_cast<const __nv_bfloat16*>(conv_weight.data);
+    const auto* state_ptr         = static_cast<const __nv_bfloat16*>(state_read.data);
+    const auto* initial_ptr       = static_cast<const std::int32_t*>(initial_state_slots.data);
+    auto* query_ptr               = static_cast<__nv_bfloat16*>(query.data);
+    auto* key_ptr                 = static_cast<__nv_bfloat16*>(key.data);
+    auto* value_ptr               = static_cast<__nv_bfloat16*>(value.data);
 
     if (parent_index != nullptr) {
         const dim3 grid((Channels + kDefaultThreads - 1) / kDefaultThreads,
@@ -238,10 +238,9 @@ void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& c
                                       const Tensor& initial_state_slots, Tensor& query, Tensor& key,
                                       Tensor& value, cudaStream_t stream,
                                       const Tensor* parent_index) {
-    const std::int32_t* parent_ptr =
-        (parent_index != nullptr && parent_index->data != nullptr)
-            ? static_cast<const std::int32_t*>(parent_index->data)
-            : nullptr;
+    const std::int32_t* parent_ptr = (parent_index != nullptr && parent_index->data != nullptr)
+                                         ? static_cast<const std::int32_t*>(parent_index->data)
+                                         : nullptr;
     dispatch(conv_record, conv_weight, conv_states, valid_columns, initial_state_slots, parent_ptr,
              query, key, value, NoHistoryPublish{}, stream);
 }

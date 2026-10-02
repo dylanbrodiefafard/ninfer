@@ -112,7 +112,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         constexpr std::int32_t kRows   = 14336;
         const std::int32_t cols        = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+            policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("NVFP4 attn_input_proj admits only A16 or A4");
         }
         require_matrix(x, kHidden, cols, "x");
@@ -129,10 +130,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        constexpr std::int32_t hidden = 5120;
+        constexpr std::int32_t hidden     = 5120;
         constexpr std::int32_t query_rows = 6144;
-        constexpr std::int32_t kv_rows = 1024;
-        const std::int32_t cols = x.ne[1];
+        constexpr std::int32_t kv_rows    = 1024;
+        const std::int32_t cols           = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 attn_input_proj admits only A16 or A8");
@@ -188,7 +189,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::NVFP4:
         if (parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows ||
             input_rows != detail::Nvfp4AttnInputGeometry::kInputRows ||
-            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 && policy != LinearPolicy::AllowA8)) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4 &&
+             policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);

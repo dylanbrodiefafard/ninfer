@@ -23,9 +23,9 @@ struct KvDiskSnapshot {
     std::uint64_t evictions    = 0;
     std::uint64_t drops        = 0;
     std::array<std::uint64_t, kKvDiskDropReasonCount> drop_reasons{};
-    double save_seconds        = 0;
-    double load_seconds        = 0;
-    std::uint64_t sequence     = 0; // strictly increasing per read; later reads saw later state
+    double save_seconds    = 0;
+    double load_seconds    = 0;
+    std::uint64_t sequence = 0; // strictly increasing per read; later reads saw later state
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
