@@ -522,7 +522,7 @@ int exercise_prefill_cancel_capture_ram(ninfer::Engine& engine) {
     }
 
     std::string long_user;
-    long_user.reserve(3500 * 9);
+    long_user.reserve(std::size_t{3500} * 9);
     for (int index = 0; index < 3500; ++index) { long_user += "continue "; }
 
     ninfer::PromptInput followup  = first_input;

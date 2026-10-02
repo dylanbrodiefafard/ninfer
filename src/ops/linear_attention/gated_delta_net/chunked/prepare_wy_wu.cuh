@@ -559,6 +559,9 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
         case 3:
             kkt_strip.template operator()<4>();
             break;
+        default:
+            // Warps at or beyond WY_WARPS own no KKT strip.
+            break;
         }
 
         // The wide route's four W/U helper warps would otherwise wait for the
@@ -664,6 +667,9 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
     case 3:
         store_frag_to_M(A_reg[3], 3, 3, lane_g, lane_t, M_view);
         break;
+    default:
+        // Warps at or beyond WY_WARPS own no diagonal block.
+        break;
     }
     __syncwarp();
 
@@ -679,6 +685,9 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
         break;
     case 3:
         solve_diag_block<3>(lane, M_view);
+        break;
+    default:
+        // Warps at or beyond WY_WARPS own no diagonal block.
         break;
     }
     __syncthreads();
@@ -701,6 +710,9 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
     case 3:
         wave_compute_store.template operator()<3, 2>();
         break;
+    default:
+        // Only warps 1..3 own a block in this wave.
+        break;
     }
     __syncthreads();
 
@@ -710,6 +722,9 @@ prepare_wy_wu_kernel(const void* __restrict__ k_raw, const __nv_bfloat16* __rest
         break;
     case 3:
         wave_compute_store.template operator()<3, 1>();
+        break;
+    default:
+        // Only warps 2 and 3 own a block in this wave.
         break;
     }
     __syncthreads();

@@ -9,6 +9,8 @@
 
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -42,8 +44,8 @@ class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, double frontend_seconds, SamplingMode mode,
          targets::qwen3_6::PreparedPrompt prepared)
-        : summary(std::move(prompt_summary)), prepare_seconds(frontend_seconds),
-          sampling_mode(mode), value(std::move(prepared)) {}
+        : summary(prompt_summary), prepare_seconds(frontend_seconds), sampling_mode(mode),
+          value(std::move(prepared)) {}
 
     PromptSummary summary;
     double prepare_seconds     = 0.0;
@@ -59,8 +61,11 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 PreparedPrompt::PreparedPrompt(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 const PromptSummary& PreparedPrompt::summary() const noexcept {
-    static const PromptSummary empty;
-    return impl_ != nullptr ? impl_->summary : empty;
+    if (impl_ == nullptr) {
+        static const PromptSummary empty;
+        return empty;
+    }
+    return impl_->summary;
 }
 
 std::span<const TokenId> PreparedPrompt::token_ids() const {
@@ -160,10 +165,26 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
-        executor.emplace<std::monostate>();
+        // Destroying the executor joins its worker, so no CUDA work is issued after this point.
+        visit_loaded_executor([](auto& loaded) noexcept { loaded.reset(); });
+        // The final drain only orders teardown of device resources owned by later members; a
+        // destructor has no caller to report a sticky device error to, and every allocation is
+        // released by its own RAII owner regardless.
         try {
             device.synchronize_all();
-        } catch (...) {}
+            // NOLINTNEXTLINE(bugprone-empty-catch): unreportable teardown drain; see above.
+        } catch (const std::exception&) {}
+    }
+
+    // Calls visitor with the active executor's owning pointer; does nothing before an executor
+    // is constructed. std::get_if keeps this path free of std::bad_variant_access.
+    template <class Visitor>
+    void visit_loaded_executor(Visitor&& visitor) noexcept {
+        if (auto* loaded27 = std::get_if<std::unique_ptr<Executor27>>(&executor)) {
+            std::forward<Visitor>(visitor)(*loaded27);
+        } else if (auto* loaded35 = std::get_if<std::unique_ptr<Executor35>>(&executor)) {
+            std::forward<Visitor>(visitor)(*loaded35);
+        }
     }
 
     EngineOptions options;
@@ -396,14 +417,7 @@ RuntimeStats Engine::runtime_stats() const {
 
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
-    std::visit(
-        [](auto& executor) {
-            using Executor = std::remove_cvref_t<decltype(executor)>;
-            if constexpr (!std::is_same_v<Executor, std::monostate>) {
-                executor->reset_memory_peaks();
-            }
-        },
-        impl_->executor);
+    impl_->visit_loaded_executor([](auto& executor) noexcept { executor->reset_memory_peaks(); });
 }
 
 } // namespace ninfer

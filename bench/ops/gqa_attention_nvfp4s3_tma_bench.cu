@@ -560,12 +560,9 @@ int main() {
         }
         const ColdTiming cpasync = measure_launch(attn_launch, stream, 8, 64);
 
-        ColdTiming tma;
-        if (stages == 2)
-            tma = run_tma<2>(cache, q_src, out_buf, pos_q, window, keep_frac, stream);
-        else if (stages == 3)
-            tma = run_tma<3>(cache, q_src, out_buf, pos_q, window, keep_frac, stream);
-        else { tma = run_tma<2>(cache, q_src, out_buf, pos_q, window, keep_frac, stream); }
+        const ColdTiming tma =
+            stages == 3 ? run_tma<3>(cache, q_src, out_buf, pos_q, window, keep_frac, stream)
+                        : run_tma<2>(cache, q_src, out_buf, pos_q, window, keep_frac, stream);
 
         // Numeric cross-check: cp.async baseline result vs TMA result (max abs diff).
         DeviceBuffer out_ref(static_cast<std::size_t>(q_elems) * 2);
@@ -758,17 +755,14 @@ int main() {
                                 resolved);
                     int agree = 0;
                     for (int r = 0; r < 64; ++r) {
-                        char line[160] = "";
-                        char cell[24];
-                        std::snprintf(line, sizeof(line), "    row %2d: ", r);
+                        std::printf("    row %2d: ", r);
                         for (int c = 0; c < 8; ++c) {
                             const int expect = c ^ ((T8 + r) & 7);
                             const int actual = order[r][c];
                             if (actual == expect) ++agree;
-                            std::snprintf(cell, sizeof(cell), "%d ", actual);
-                            std::strcat(line, cell);
+                            std::printf("%d ", actual);
                         }
-                        std::printf("%s\n", line);
+                        std::printf("\n");
                     }
                     std::printf("  [dump] cells matching expected formula: %d/512\n", agree);
                 }
@@ -952,8 +946,7 @@ int main() {
                 CUDA_CHECK(cudaMemcpy(hb.data(), st, hb.size(), cudaMemcpyDeviceToHost));
                 std::printf("  [dump] score grid (rows 0-127 x keys 0-63, head0 tile0):\n");
                 for (int rt = 0; rt < 8; ++rt) {
-                    char line[128] = "    rt=%d: ";
-                    std::snprintf(line, sizeof(line), "    rt=%d: ", rt);
+                    std::printf("    rt=%d: ", rt);
                     for (int kb = 0; kb < 4; ++kb) {
                         int bad = 0;
                         for (int r = rt * 16; r < rt * 16 + 16; ++r)
@@ -964,11 +957,9 @@ int main() {
                                     *reinterpret_cast<const float*>(hb.data() + (r * 64 + k) * 4);
                                 if (a != b) ++bad;
                             }
-                        char cell[24];
-                        std::snprintf(cell, sizeof(cell), "%4d/256   ", bad);
-                        std::strcat(line, cell);
+                        std::printf("%4d/256   ", bad);
                     }
-                    std::printf("%s\n", line);
+                    std::printf("\n");
                 }
             }
             cmp_field("p_code", dump_base.d.p_code, dump_tma.d.p_code, H * T * Br * Bc, false);

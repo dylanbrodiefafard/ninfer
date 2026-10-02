@@ -27,7 +27,7 @@ __device__ __forceinline__ float gelu_one(float value) {
 }
 
 template <bool TanhApprox>
-__device__ __forceinline__ __nv_bfloat162 gelu_pair(__nv_bfloat162 input) {
+__device__ __forceinline__ __nv_bfloat162 gelu_pair(const __nv_bfloat162& input) {
     return __floats2bfloat162_rn(gelu_one<TanhApprox>(__low2float(input)),
                                  gelu_one<TanhApprox>(__high2float(input)));
 }

@@ -71,7 +71,7 @@ std::vector<int> parse_tokens(std::string_view text) {
         const std::string_view token = text.substr(
             begin, end == std::string_view::npos ? std::string_view::npos : end - begin);
         if (token.empty()) { throw std::invalid_argument("empty token in --t-sweep"); }
-        const int v = std::atoi(std::string(token).c_str());
+        const int v = parse_number<int>(token, "--t-sweep");
         if (v <= 0) { throw std::invalid_argument("tokens must be positive"); }
         result.push_back(v);
         if (end == std::string_view::npos) { break; }
@@ -91,11 +91,11 @@ Options parse_args(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--d") {
-            opt.d = std::atoi(next("--d").c_str());
+            opt.d = parse_number<int>(next("--d"), "--d");
         } else if (a == "--eps") {
-            opt.eps = std::atof(next("--eps").c_str());
+            opt.eps = parse_number<float>(next("--eps"), "--eps");
         } else if (a == "--t") {
-            opt.tokens = {std::atoi(next("--t").c_str())};
+            opt.tokens = {parse_number<int>(next("--t"), "--t")};
         } else if (a == "--t-sweep") {
             opt.tokens = parse_tokens(next("--t-sweep"));
         } else if (a == "--no-bitexact") {
@@ -103,9 +103,9 @@ Options parse_args(int argc, char** argv) {
         } else if (a == "--profile") {
             opt.profile = true;
         } else if (a == "--warmup") {
-            opt.warmup = std::atoi(next("--warmup").c_str());
+            opt.warmup = parse_number<int>(next("--warmup"), "--warmup");
         } else if (a == "--repeat") {
-            opt.repeat = std::atoi(next("--repeat").c_str());
+            opt.repeat = parse_number<int>(next("--repeat"), "--repeat");
         } else if (a == "--help" || a == "-h") {
             std::printf("usage: %s [--d D] [--eps E] [--t T | --t-sweep T,...] [--no-bitexact] "
                         "[--profile] [--warmup N] [--repeat N]\n",

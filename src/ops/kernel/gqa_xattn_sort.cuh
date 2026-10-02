@@ -8,9 +8,12 @@
 
 namespace ninfer::ops {
 
+// Precondition: tid is the calling thread's index in a block of exactly Threads threads, all of
+// which call; keys and ids hold N entries each.
 template <int N, int Threads>
 __device__ void gqa_xattn_bitonic_sort_desc(float* keys, int* ids, int tid) {
     static_assert((N & (N - 1)) == 0, "bitonic length must be a power of two");
+    __builtin_assume(tid >= 0 && tid < Threads);
     for (int k = 2; k <= N; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
             for (int i = tid; i < N; i += Threads) {

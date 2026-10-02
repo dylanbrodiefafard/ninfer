@@ -40,6 +40,40 @@
 namespace ninfer::targets::qwen3_6::detail {
 namespace {
 
+// Runs one step whose failure the disk cache tolerates by design and must not propagate to the
+// caller: durability work (manifest rewrite, directory fsync, eviction persistence) that a later
+// index mutation or startup maintenance repeats; a best-effort unlink or metadata parse whose
+// leftovers startup reclamation removes; a RAM-cache ticket write or I/O-pin release while a
+// spill attempt is retired or abandoned; and restore cancellation during shutdown. Returns
+// whether the step completed.
+template <class Step>
+bool attempt_recoverable(Step&& step) noexcept {
+    try {
+        std::forward<Step>(step)();
+        return true;
+    } catch (...) { return false; }
+}
+
+// Returns the first kDiskPageIoAlignment boundary at or after `allocation`. Callers over-allocate
+// by kDiskPageIoAlignment - 1 bytes, so the aligned span stays inside the allocation.
+void* align_up_io(void* allocation) noexcept {
+    const std::size_t misalignment =
+        reinterpret_cast<std::uintptr_t>(allocation) % kDiskPageIoAlignment;
+    const std::size_t pad = misalignment == 0 ? 0 : kDiskPageIoAlignment - misalignment;
+    return static_cast<std::uint8_t*>(allocation) + pad;
+}
+
+// Classifies the exception being handled by the enclosing catch handler: a std::logic_error is a
+// broken invariant that must reach the restore caller, and is returned; any other failure only
+// makes the restore source unavailable, and yields null.
+std::exception_ptr current_logic_error() noexcept {
+    try {
+        throw;
+    } catch (const std::logic_error&) { return std::current_exception(); } catch (...) {
+        return nullptr;
+    }
+}
+
 std::mutex g_location_mu;
 std::unordered_set<std::string> g_locations;
 
@@ -789,8 +823,7 @@ read_file_bytes(const std::filesystem::path& path,
     if (sz > max_bytes) {
         throw std::runtime_error("KV disk file exceeds host read bound: " + path.string());
     }
-    if (sz > std::numeric_limits<std::size_t>::max() ||
-        sz > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+    if (sz > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
         throw std::runtime_error("KV disk file cannot be represented in host memory: " +
                                  path.string());
     }
@@ -1081,10 +1114,7 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
                                    restore_window_bytes_ + kDiskPageIoAlignment - 1,
                                    cudaHostAllocDefault),
                      "KV disk restore window allocation failed");
-        const auto raw = reinterpret_cast<std::uintptr_t>(restore_window_allocation_);
-        restore_window_mem_ =
-            reinterpret_cast<void*>((raw + kDiskPageIoAlignment - 1) &
-                                    ~(static_cast<std::uintptr_t>(kDiskPageIoAlignment) - 1));
+        restore_window_mem_ = align_up_io(restore_window_allocation_);
         for (std::uint32_t i = 0; i < slots; ++i) {
             window_[i].io   = static_cast<std::uint8_t*>(restore_window_mem_) +
                               restore_window_stride_ * static_cast<std::size_t>(i);
@@ -1095,10 +1125,7 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
                                        restore_state_arena_bytes_ + kDiskPageIoAlignment - 1,
                                        cudaHostAllocDefault),
                          "KV disk immediate-state arena allocation failed");
-            const auto state_raw = reinterpret_cast<std::uintptr_t>(restore_state_allocation_);
-            restore_state_mem_ =
-                reinterpret_cast<void*>((state_raw + kDiskPageIoAlignment - 1) &
-                                        ~(static_cast<std::uintptr_t>(kDiskPageIoAlignment) - 1));
+            restore_state_mem_       = align_up_io(restore_state_allocation_);
             std::size_t state_offset = 0;
             auto take_state_slice    = [&](std::size_t bytes) {
                 auto* data = static_cast<std::uint8_t*>(restore_state_mem_) + state_offset;
@@ -1273,7 +1300,8 @@ KVDiskCache::~KVDiskCache() noexcept {
         if (restore_window_allocation_ != nullptr) {
             (void)cudaFreeHost(restore_window_allocation_);
         }
-    } catch (...) {}
+    } catch (...) { // NOLINT(bugprone-empty-catch): a destructor cannot report teardown failure.
+    }
 }
 
 void KVDiskCache::register_location() {
@@ -1573,7 +1601,7 @@ void KVDiskCache::open_pack_store() {
                 const auto bytes = item.file_size(tree_ec);
                 if (tree_ec ||
                     (name == base_name &&
-                     bytes != static_cast<std::uintmax_t>(kPackMapBaseHeaderBytes + 4)) ||
+                     bytes != static_cast<std::uintmax_t>(kPackMapBaseHeaderBytes) + 4) ||
                     (name == log_name && bytes != 0)) {
                     return true;
                 }
@@ -2128,7 +2156,7 @@ bool KVDiskCache::begin_compaction_locked() {
     if (!retired_generations_.empty() || !packs_need_compaction()) { return true; }
     if (!active_generation_) { return false; }
     const auto available_bytes = [&]() -> std::optional<std::uint64_t> {
-        if (test_free_bytes_override_) { return *test_free_bytes_override_; }
+        if (test_free_bytes_override_) { return test_free_bytes_override_; }
         struct statvfs fs{};
         if (::statvfs(config_.location.c_str(), &fs) != 0 || fs.f_frsize == 0 ||
             fs.f_bavail > std::numeric_limits<std::uint64_t>::max() / fs.f_frsize) {
@@ -3090,15 +3118,11 @@ void KVDiskCache::load_index() {
                 (void)load_entry(id);
             }
             if (extras) {
-                try {
-                    write_manifest();
-                } catch (...) {}
+                (void)attempt_recoverable([&] { write_manifest(); });
             }
             queue_tombstone_object_unlinks();
             flush_queued_unlinks();
-            try {
-                fsync_store_dirs();
-            } catch (...) {}
+            (void)attempt_recoverable([&] { fsync_store_dirs(); });
             reclaim_durable_tombstones();
         } catch (...) { rebuild_manifest(); }
     }
@@ -3162,9 +3186,7 @@ void KVDiskCache::invalidate_ram_notes_for_disk_entry(std::uint64_t disk_id) {
         note.durable = false;
         note.ticket  = 0;
         if (config_.ram != nullptr) {
-            try {
-                config_.ram->set_disk_entry_id(ram_id, 0);
-            } catch (...) {}
+            (void)attempt_recoverable([&] { config_.ram->set_disk_entry_id(ram_id, 0); });
         }
     }
 }
@@ -3251,10 +3273,11 @@ bool KVDiskCache::unlink_path(const std::filesystem::path& path) {
             std::vector<std::pair<DiskObjectKind, std::uint64_t>> objects;
             const auto meta_path = path / "meta.bin";
             if (std::filesystem::exists(meta_path, ec)) {
-                try {
+                // An unreadable meta leaves its objects to orphan-object reclamation.
+                (void)attempt_recoverable([&] {
                     const auto decoded = try_decode_meta(read_file_bytes(meta_path));
                     if (decoded) { append_meta_objects(objects, *decoded); }
-                } catch (...) {}
+                });
             }
             try {
                 write_entry_tombstone(id, objects);
@@ -3351,9 +3374,7 @@ void KVDiskCache::reclaim_durable_tombstones() {
     }
     for (std::uint64_t id : drop) { clear_entry_tombstone(id); }
     if (!drop.empty()) {
-        try {
-            fsync_dir(config_.location / "tombstones");
-        } catch (...) {}
+        (void)attempt_recoverable([&] { fsync_dir(config_.location / "tombstones"); });
     }
 }
 
@@ -3474,9 +3495,7 @@ bool KVDiskCache::flush_queued_unlinks() {
     std::size_t failed = 0;
     for (std::size_t i = 0; i < paths.size(); ++i) {
         bool removed = false;
-        try {
-            removed = unlink_path(paths[i]);
-        } catch (...) {}
+        (void)attempt_recoverable([&] { removed = unlink_path(paths[i]); });
         if (!removed) {
             if (failed != i) { paths[failed] = std::move(paths[i]); }
             ++failed;
@@ -3497,9 +3516,7 @@ bool KVDiskCache::flush_queued_unlinks(std::unique_lock<std::mutex>& lock) {
     // but retaining their paths must not allocate while the mutex is released.
     for (std::size_t i = 0; i < paths.size(); ++i) {
         bool removed = false;
-        try {
-            removed = unlink_path(paths[i]);
-        } catch (...) {}
+        (void)attempt_recoverable([&] { removed = unlink_path(paths[i]); });
         if (!removed) {
             if (failed != i) { paths[failed] = std::move(paths[i]); }
             ++failed;
@@ -3513,7 +3530,7 @@ bool KVDiskCache::flush_queued_unlinks(std::unique_lock<std::mutex>& lock) {
         try {
             pending_unlinks_.reserve(pending_unlinks_.size() + failed);
             for (auto& path : paths) { pending_unlinks_.push_back(std::move(path)); }
-        } catch (const std::bad_alloc&) {
+        } catch (const std::bad_alloc&) { // NOLINT(bugprone-empty-catch): retry list is optional.
             // Tombstones already exclude these entries. Losing an optional
             // retry leaves only disk garbage for startup maintenance to remove.
         }
@@ -3541,8 +3558,8 @@ void KVDiskCache::fifo_evict_one() {
     }
 }
 
-bool KVDiskCache::evict_entry(std::uint64_t key) {
-    const auto rec = entries_.find(key);
+bool KVDiskCache::evict_entry(std::uint64_t entry_id) {
+    const auto rec = entries_.find(entry_id);
     if (rec == entries_.end() || rec->second.pinned || rec->second.io_pins != 0) { return false; }
     std::vector<std::pair<DiskObjectKind, std::uint64_t>> objects;
     append_meta_objects(objects, rec->second.meta);
@@ -3553,12 +3570,12 @@ bool KVDiskCache::evict_entry(std::uint64_t key) {
     }
     const DiskMeta meta = rec->second.meta;
     try {
-        write_entry_tombstone(key, objects);
+        write_entry_tombstone(entry_id, objects);
     } catch (...) { return false; }
     // Reserve queued-unlink ownership before removing the live index entry.
-    queue_unlink(entry_dir(key));
+    queue_unlink(entry_dir(entry_id));
     entries_.erase(rec);
-    fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), key), fifo_.end());
+    fifo_.erase(std::remove(fifo_.begin(), fifo_.end(), entry_id), fifo_.end());
     auto drop = [&](std::uint64_t id) { drop_ref(id); };
     drop(meta.ledger_id);
     drop(meta.identity_id);
@@ -3579,7 +3596,7 @@ bool KVDiskCache::evict_entry(std::uint64_t key) {
     for (std::uint64_t id : meta.main_page_ids) { drop(id); }
     for (std::uint64_t id : meta.backend_page_ids) { drop(id); }
     for (std::uint64_t id : held) { release_hold(id); }
-    invalidate_ram_notes_for_disk_entry(key);
+    invalidate_ram_notes_for_disk_entry(entry_id);
     ++evictions_;
     bump_version();
     bump_durable_generation();
@@ -4719,8 +4736,9 @@ bool KVDiskCache::claim(std::uint64_t entry_id, PrefixHash128 expected_hash_f,
     ++it->second.claim_generation;
     bump_version();
     if (spill_ && idle_rewrite_of(entry_id)) {
+        SpillSession& spill = *spill_;
         demote_reclaim_spill_locked();
-        spill_->cancelled = true;
+        spill.cancelled = true;
         if (payload_io_inflight_ == 0) { discard_spill(lock); }
         idle_cv_.notify_all();
         cv_.notify_all();
@@ -4774,11 +4792,9 @@ void KVDiskCache::invalidate_entry(std::uint64_t entry_id) {
     // this source and ordinary eviction can retry its removal later.
     try {
         if (evict_entry(entry_id)) {
-            try {
-                persist_eviction(lock);
-            } catch (...) {}
+            (void)attempt_recoverable([&] { persist_eviction(lock); });
         }
-    } catch (const std::bad_alloc&) {
+    } catch (const std::bad_alloc&) { // NOLINT(bugprone-empty-catch): cleanup is optional.
         // Runtime quarantine is sufficient when optional cleanup cannot allocate.
     }
 }
@@ -5170,9 +5186,7 @@ void KVDiskCache::drop_spill(SpillSession& session) noexcept {
     }
     if (config_.ram != nullptr && session.ram_id != 0) {
         if (session.ram_pin_owned) {
-            try {
-                config_.ram->unpin_for_io(session.ram_id);
-            } catch (...) {}
+            (void)attempt_recoverable([&] { config_.ram->unpin_for_io(session.ram_id); });
             session.ram_pin_owned = false;
         }
         auto it = ram_notes_.find(session.ram_id);
@@ -5186,6 +5200,7 @@ void KVDiskCache::drop_spill(SpillSession& session) noexcept {
 }
 
 void KVDiskCache::discard_spill(std::unique_lock<std::mutex>& lock) {
+    if (!spill_) { throw std::logic_error("KV disk spill discard requires an installed session"); }
     drop_spill(*spill_);
     spill_.reset();
     cv_.notify_all();
@@ -5695,9 +5710,10 @@ void KVDiskCache::promote_idle_spill_to_emergency() {
 
 void KVDiskCache::promote_spill_for_reclaim_locked() {
     if (!spill_ || spill_->emergency || spill_->cancelled) { return; }
+    SpillSession& spill = *spill_;
     promote_idle_spill_to_emergency();
-    spill_->reclaim = true;
-    reclaim_ram_    = spill_->ram_id;
+    spill.reclaim = true;
+    reclaim_ram_  = spill.ram_id;
 }
 
 void KVDiskCache::demote_reclaim_spill_locked() {
@@ -6138,7 +6154,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
         const std::uint64_t retained       = packed_retained_bytes();
         const std::uint64_t reserve_base   = packs_need_compaction() ? retained : 0;
         const auto available_bytes         = [&]() -> std::optional<std::uint64_t> {
-            if (test_free_bytes_override_) { return *test_free_bytes_override_; }
+            if (test_free_bytes_override_) { return test_free_bytes_override_; }
             struct statvfs fs{};
             if (::statvfs(config_.location.c_str(), &fs) != 0 || fs.f_frsize == 0 ||
                 fs.f_bavail > std::numeric_limits<std::uint64_t>::max() / fs.f_frsize) {
@@ -6331,7 +6347,8 @@ void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mute
             // prevent releasing its RAM/disk pins under allocation pressure.
             try {
                 queue_unlink(dir);
-            } catch (const std::bad_alloc&) {}
+            } catch (const std::bad_alloc&) { // NOLINT(bugprone-empty-catch): retry is optional.
+            }
         }
         drop_spill(session);
         // Unlink the cancelled generation before the directory sync persists its removal.
@@ -6357,9 +6374,7 @@ void KVDiskCache::release_spill_pins(SpillSession& session, bool mark_failed) {
     }
     if (config_.ram != nullptr && session.ram_id != 0) {
         if (session.ram_pin_owned) {
-            try {
-                config_.ram->unpin_for_io(session.ram_id);
-            } catch (...) {}
+            (void)attempt_recoverable([&] { config_.ram->unpin_for_io(session.ram_id); });
             session.ram_pin_owned = false;
         }
         auto it = ram_notes_.find(session.ram_id);
@@ -6497,17 +6512,14 @@ void KVDiskCache::install_committed_entry(SpillSession& session, PreparedPublica
         bump_durable_generation();
         if (session.ticket != 0) { unpin_disk(session.ticket); }
         if (config_.ram != nullptr) {
-            try {
+            // One retry covers a transient ticket-write failure; the disk-side RAM note below is
+            // updated either way.
+            const auto write_ticket = [&] {
                 config_.ram->set_disk_entry_id(session.ram_id, session.child_id);
-            } catch (...) {
-                try {
-                    config_.ram->set_disk_entry_id(session.ram_id, session.child_id);
-                } catch (...) {}
-            }
+            };
+            if (!attempt_recoverable(write_ticket)) { (void)attempt_recoverable(write_ticket); }
             if (session.ram_pin_owned) {
-                try {
-                    config_.ram->unpin_for_io(session.ram_id);
-                } catch (...) {}
+                (void)attempt_recoverable([&] { config_.ram->unpin_for_io(session.ram_id); });
                 session.ram_pin_owned = false;
             }
         }
@@ -6527,14 +6539,15 @@ void KVDiskCache::install_committed_entry(SpillSession& session, PreparedPublica
         // Any newly durable entry can satisfy a waiting reclaim.
         reclaim_ram_ = 0;
     }
-    try {
-        write_manifest(lock);
-    } catch (...) {}
+    (void)attempt_recoverable([&] { write_manifest(lock); });
     flush_queued_unlinks(lock);
 }
 
-bool KVDiskCache::spill_live_locked() const noexcept {
-    return spill_ && !spill_->cancelled && !spill_->failed && !spill_->committed;
+std::optional<std::uint64_t> KVDiskCache::live_spill_ram_locked() const noexcept {
+    if (!spill_) { return std::nullopt; }
+    const SpillSession& spill = *spill_;
+    if (spill.cancelled || spill.failed || spill.committed) { return std::nullopt; }
+    return spill.ram_id;
 }
 
 bool KVDiskCache::reclaim_target_live_locked() const {
@@ -6562,7 +6575,7 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::u
     // candidate below; finishing it is the fastest way to a durable victim.
     auto live_spill_ram = [&]() -> std::uint64_t {
         std::lock_guard lock(mutex_);
-        return spill_live_locked() ? spill_->ram_id : 0;
+        return live_spill_ram_locked().value_or(0);
     };
     auto wait_live_spill = [&](std::uint64_t ram_id) {
         (void)emergency_spill_ram(ram_id);
@@ -6574,9 +6587,9 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::u
             spilling != 0 && (may_block || !kept(spilling))) {
             if (may_block) { return wait_live_spill(spilling); }
             std::lock_guard lock(mutex_);
-            if (spill_live_locked() && !kept(spill_->ram_id)) {
+            if (const auto live = live_spill_ram_locked(); live && !kept(*live)) {
                 promote_spill_for_reclaim_locked();
-                reclaim_ram_ = spill_->ram_id;
+                reclaim_ram_ = *live;
                 return RamReclaim::Pending;
             }
             return RamReclaim::Retry;
@@ -6604,9 +6617,9 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::u
         } else {
             std::lock_guard lock(mutex_);
             if (reclaim_target_live_locked() && !kept(reclaim_ram_)) { return RamReclaim::Pending; }
-            if (spill_live_locked() && !kept(spill_->ram_id)) {
+            if (const auto live = live_spill_ram_locked(); live && !kept(*live)) {
                 promote_spill_for_reclaim_locked();
-                reclaim_ram_ = spill_->ram_id;
+                reclaim_ram_ = *live;
                 return RamReclaim::Pending;
             }
             for (std::uint64_t id : candidates) {
@@ -6665,9 +6678,7 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         return ram_notes_.count(ram_id) != 0 && ram_notes_[ram_id].durable;
     };
     auto unpin_extra = [&] {
-        try {
-            config_.ram->unpin_for_io(ram_id);
-        } catch (...) {}
+        (void)attempt_recoverable([&] { config_.ram->unpin_for_io(ram_id); });
     };
     std::unique_lock lock(mutex_);
     if (idle_cancel_ram_ != 0 && idle_cancel_ram_ != ram_id) {
@@ -6685,8 +6696,9 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         return false;
     }
     if (spill_ && spill_->ram_id == ram_id) {
+        SpillSession& spill = *spill_;
         promote_idle_spill_to_emergency();
-        spill_->reclaim = false;
+        spill.reclaim = false;
         if (idle_cancel_ram_ == ram_id) { idle_cancel_ram_ = 0; }
         return wait_done(lock);
     }
@@ -6726,8 +6738,9 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
     });
     if (spill_ && spill_->ram_id == ram_id && !spill_->cancelled && !spill_->failed &&
         !spill_->committed) {
+        SpillSession& spill = *spill_;
         promote_idle_spill_to_emergency();
-        spill_->reclaim = false;
+        spill.reclaim = false;
         if (idle_cancel_ram_ == ram_id) { idle_cancel_ram_ = 0; }
         lock.unlock();
         unpin_extra();
@@ -7231,8 +7244,8 @@ bool KVDiskCache::test_waiting_h2d_drain() const {
 
 void KVDiskCache::h2d_ready_slots(cudaStream_t stream) {
     if (!restore_target_) { return; }
-    reclaim_completed_h2d_slots();
     DiskRestoreTarget& target = *restore_target_;
+    reclaim_completed_h2d_slots();
     for (std::size_t slot_index = 0; slot_index < window_.size(); ++slot_index) {
         WindowSlot& slot = window_[slot_index];
         if (!slot.filled || slot.h2d_done) { continue; }
@@ -7318,6 +7331,7 @@ void KVDiskCache::test_gate_state_h2d(cudaEvent_t gate) {
 
 void KVDiskCache::start_restore_state_h2d_locked(cudaStream_t stream) {
     if (!restore_target_ || restore_failed_) { return; }
+    DiskRestoreTarget& target = *restore_target_;
     auto live = [&] { return restore_target_ && !restore_failed_ && !restore_state_done_; };
     if (!copies_timed_) {
         ensure_copies_start_locked();
@@ -7358,36 +7372,34 @@ void KVDiskCache::start_restore_state_h2d_locked(cudaStream_t stream) {
         copied_state = true;
     };
 
-    const bool skip_frontier_current = restore_target_ &&
-                                       is_rewrite_checkpoint_restore(restore_target_->reuse) &&
-                                       !restore_use_context_head_;
+    const bool skip_frontier_current =
+        is_rewrite_checkpoint_restore(target.reuse) && !restore_use_context_head_;
     if (restore_use_context_head_) {
-        gdn_from_arena(restore_target_->gdn_current_slot, restore_state_slices_.gdn_conv,
+        gdn_from_arena(target.gdn_current_slot, restore_state_slices_.gdn_conv,
                        restore_state_slices_.gdn_rec);
-        hidden_from_arena(restore_target_->tail_hidden, restore_state_slices_.hidden);
-        cyclic_from_arena(restore_target_->dflash_local, restore_state_slices_.cyclic);
+        hidden_from_arena(target.tail_hidden, restore_state_slices_.hidden);
+        cyclic_from_arena(target.dflash_local, restore_state_slices_.cyclic);
     } else if (!skip_frontier_current) {
-        gdn_from_arena(restore_target_->gdn_current_slot, restore_state_slices_.gdn_conv,
+        gdn_from_arena(target.gdn_current_slot, restore_state_slices_.gdn_conv,
                        restore_state_slices_.gdn_rec);
     }
-    if (restore_unpack_rewrite_ && restore_target_->gdn != nullptr) {
-        host_from_arena(restore_target_->rewrite_state.conv, restore_state_slices_.rewrite_gdn_conv,
+    if (restore_unpack_rewrite_ && target.gdn != nullptr) {
+        host_from_arena(target.rewrite_state.conv, restore_state_slices_.rewrite_gdn_conv,
                         "rewrite-checkpoint GDN image");
-        host_from_arena(restore_target_->rewrite_state.recurrent,
-                        restore_state_slices_.rewrite_gdn_rec, "rewrite-checkpoint GDN image");
+        host_from_arena(target.rewrite_state.recurrent, restore_state_slices_.rewrite_gdn_rec,
+                        "rewrite-checkpoint GDN image");
     }
     if (!restore_use_context_head_ && !skip_frontier_current) {
-        hidden_from_arena(restore_target_->tail_hidden, restore_state_slices_.hidden);
+        hidden_from_arena(target.tail_hidden, restore_state_slices_.hidden);
     }
     if (restore_unpack_rewrite_) {
-        hidden_from_arena(restore_target_->rewrite_checkpoint_hidden,
-                          restore_state_slices_.rewrite_hidden);
+        hidden_from_arena(target.rewrite_checkpoint_hidden, restore_state_slices_.rewrite_hidden);
     }
     if (!restore_use_context_head_ && !skip_frontier_current) {
-        cyclic_from_arena(restore_target_->dflash_local, restore_state_slices_.cyclic);
+        cyclic_from_arena(target.dflash_local, restore_state_slices_.cyclic);
     }
-    if (restore_unpack_rewrite_ && restore_target_->dflash_local != nullptr) {
-        host_from_arena(restore_target_->rewrite_state.dflash, restore_state_slices_.rewrite_cyclic,
+    if (restore_unpack_rewrite_ && target.dflash_local != nullptr) {
+        host_from_arena(target.rewrite_state.dflash, restore_state_slices_.rewrite_cyclic,
                         "rewrite-checkpoint DFlash image");
     }
     if (fail_after_state_h2d_enqueue_.exchange(false, std::memory_order_acq_rel)) {
@@ -7454,7 +7466,7 @@ void KVDiskCache::finish_restore_state() {
 void KVDiskCache::pump_restore_locked(std::unique_lock<std::mutex>& lock, cudaStream_t stream) {
     if (restore_failed_) { return; }
     reclaim_completed_h2d_slots();
-    const cudaStream_t live = restore_target_ ? restore_target_->stream : stream;
+    cudaStream_t live = restore_target_ ? restore_target_->stream : stream;
     h2d_ready_slots(live);
     if (!restore_target_) { return; }
     const DiskRestoreTarget& target = *restore_target_;
@@ -7917,7 +7929,7 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
         committed = it->second.committed_generation;
         claim     = it->second.claim_generation;
     }
-    auto publish_setup_failure = [&](std::exception_ptr unexpected = nullptr) {
+    auto publish_setup_failure = [&](const std::exception_ptr& unexpected = nullptr) {
         release_owner();
         if (restore_state_is_live(epoch, entry, committed, claim, reuse, reuse_base)) {
             if (unexpected) { restore_worker_error_ = unexpected; }
@@ -7971,16 +7983,20 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
         if (fail_next_restore_state_setup_.exchange(false, std::memory_order_acq_rel)) {
             throw std::bad_alloc();
         }
-        meta             = require(entry).meta;
-        use_head         = restore_use_context_head_;
-        unpack_rewrite   = restore_unpack_rewrite_;
-        conv_n           = static_cast<std::size_t>(config_.fingerprint.gdn_conv_bytes);
-        rec_n            = static_cast<std::size_t>(config_.fingerprint.gdn_recurrent_bytes);
-        hidden_n         = restore_target_->tail_hidden ? restore_target_->tail_hidden->bytes() : 0;
-        rewrite_hidden_n = restore_target_->rewrite_checkpoint_hidden
-                               ? restore_target_->rewrite_checkpoint_hidden->bytes()
-                               : 0;
-        cyclic_n         = static_cast<std::size_t>(config_.fingerprint.cyclic_lane_bytes);
+        meta           = require(entry).meta;
+        use_head       = restore_use_context_head_;
+        unpack_rewrite = restore_unpack_rewrite_;
+        conv_n         = static_cast<std::size_t>(config_.fingerprint.gdn_conv_bytes);
+        rec_n          = static_cast<std::size_t>(config_.fingerprint.gdn_recurrent_bytes);
+        // The caller holds the mutex throughout setup, so the target checked on entry remains.
+        if (!restore_target_) {
+            throw std::logic_error("KV disk restore state setup lost its restore target");
+        }
+        const DiskRestoreTarget& target = *restore_target_;
+        hidden_n                        = target.tail_hidden ? target.tail_hidden->bytes() : 0;
+        rewrite_hidden_n =
+            target.rewrite_checkpoint_hidden ? target.rewrite_checkpoint_hidden->bytes() : 0;
+        cyclic_n = static_cast<std::size_t>(config_.fingerprint.cyclic_lane_bytes);
 
         if (use_head) {
             const PrefixReusePath want = reuse;
@@ -8139,11 +8155,7 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
             }
         }
     } catch (...) {
-        std::exception_ptr unexpected;
-        try {
-            throw;
-        } catch (const std::logic_error&) { unexpected = std::current_exception(); } catch (...) {
-        }
+        std::exception_ptr unexpected = current_logic_error();
         if (checkpoint_prepare.joinable()) {
             if (lock.owns_lock()) { lock.unlock(); }
             checkpoint_prepare.join();
@@ -8389,9 +8401,8 @@ void KVDiskCache::stop_io_threads() noexcept {
             scatter_record_continue_.store(true, std::memory_order_release);
             scatter_record_barrier_armed_.store(false, std::memory_order_release);
         }
-        try {
-            cancel_restore();
-        } catch (...) {}
+        // Shutdown proceeds when cancellation fails: stopping_ below ends every worker loop.
+        (void)attempt_recoverable([&] { cancel_restore(); });
         {
             std::lock_guard lock(mutex_);
             stopping_ = true;
@@ -8399,7 +8410,8 @@ void KVDiskCache::stop_io_threads() noexcept {
         cv_.notify_all();
         idle_cv_.notify_all();
         join_io_threads();
-    } catch (...) {}
+    } catch (...) { // NOLINT(bugprone-empty-catch): noexcept teardown has no caller to report to.
+    }
 }
 
 void KVDiskCache::restore_loop() {
@@ -8481,9 +8493,7 @@ void KVDiskCache::start_worker_spill(std::unique_lock<std::mutex>& lock, std::ui
         config_.ram->wait_entry_copies(ram_id);
     } catch (...) {
         if (ram_pinned) {
-            try {
-                config_.ram->unpin_for_io(ram_id);
-            } catch (...) {}
+            (void)attempt_recoverable([&] { config_.ram->unpin_for_io(ram_id); });
         }
         lock.lock();
         idle_pinning_     = false;
@@ -8513,9 +8523,7 @@ void KVDiskCache::start_worker_spill(std::unique_lock<std::mutex>& lock, std::ui
         ++drops_;
     }
     if (abort_pin || !prepared) {
-        try {
-            config_.ram->unpin_for_io(ram_id);
-        } catch (...) {}
+        (void)attempt_recoverable([&] { config_.ram->unpin_for_io(ram_id); });
         idle_pinning_     = false;
         idle_pinning_ram_ = 0;
         give_up();
@@ -8526,13 +8534,15 @@ void KVDiskCache::start_worker_spill(std::unique_lock<std::mutex>& lock, std::ui
     // before installing. A cancellation in that window saw no session to
     // cancel, so the one installed here is discarded; this thread takes every
     // payload job, so none is in flight.
-    const bool installed = spill_ && spill_->epoch >= first_new_epoch;
-    if (installed && urgent && spill_->emergency) { spill_->reclaim = true; }
-    if (installed && cancelled()) {
-        demote_reclaim_spill_locked();
-        if (!spill_->emergency) {
-            spill_->cancelled = true;
-            discard_spill(lock);
+    if (spill_ && spill_->epoch >= first_new_epoch) {
+        SpillSession& installed = *spill_;
+        if (urgent && installed.emergency) { installed.reclaim = true; }
+        if (cancelled()) {
+            demote_reclaim_spill_locked();
+            if (!installed.emergency) {
+                installed.cancelled = true;
+                discard_spill(lock);
+            }
         }
     }
     // A reclaim that arrived while this idle spill was preparing waits on it.

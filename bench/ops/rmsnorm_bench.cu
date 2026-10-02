@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--kind") && i + 1 < argc) {
             selected_kind = argv[++i];
         } else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) {
-            selected_tokens = std::atoi(argv[++i]);
+            selected_tokens = parse_number<int>(argv[++i], "--tokens");
         } else if (!std::strcmp(argv[i], "--t-sweep") && i + 1 < argc) {
             selected_sweep = parse_t_sweep(argv[++i]);
         } else if (!std::strcmp(argv[i], "--decode")) {

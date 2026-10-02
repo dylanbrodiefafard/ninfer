@@ -151,8 +151,8 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
                 const int col = gg * 32 + half_lane * 2;
                 const std::uint16_t packed =
                     *reinterpret_cast<const std::uint16_t*>(&Cr[p][row * BK + col]);
-                const int q0 = static_cast<int>(static_cast<std::int8_t>(packed & 0xffu));
-                const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
+                const int q0                = int8_code_value(packed);
+                const int q1                = int8_code_value(packed >> 8);
                 const __nv_bfloat162 values = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                                                     static_cast<float>(q1) * scale);
                 store_vec(&As[row * BK + w8g32_swz64(row, col)], values);

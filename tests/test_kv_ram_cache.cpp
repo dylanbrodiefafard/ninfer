@@ -1129,12 +1129,15 @@ int test_copy_compute_stream_overlap(ninfer::DeviceContext& ctx, ninfer::PagedKV
     }
     CUDA_CHECK(cudaEventDestroy(compute_done));
 
+    bool full_reserve_rejected = false;
     try {
         auto extra = pool.reserve(static_cast<std::uint32_t>(pool.page_group_count()));
         extra.release();
+    } catch (const std::bad_alloc&) { full_reserve_rejected = true; }
+    if (!full_reserve_rejected) {
         source.release();
         return fail("in-flight capture still allowed a full-pool reserve");
-    } catch (const std::bad_alloc&) {}
+    }
 
     capture_gate.release();
     ctx.synchronize_all();

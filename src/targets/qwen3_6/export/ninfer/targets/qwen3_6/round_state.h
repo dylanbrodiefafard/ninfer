@@ -52,8 +52,10 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<std::int32_t, kMaximumConcurrency> current_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> current_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency * kMtpDecodeMaximumWidth> target_rope_positions{};
+    std::array<TokenId, std::size_t{kMaximumConcurrency} * kMtpDecodeMaximumDrafts>
+        current_drafts{};
+    std::array<std::int32_t, std::size_t{kMaximumConcurrency} * kMtpDecodeMaximumWidth>
+        target_rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
@@ -62,11 +64,12 @@ struct MtpDecodeIngress {
 };
 
 struct MtpDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, std::size_t{kMaximumConcurrency} * kMtpDecodeMaximumWidth>
+        licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
+    std::array<TokenId, std::size_t{kMaximumConcurrency} * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
 };
 
@@ -88,11 +91,13 @@ struct DFlashDecodeIngress {
 };
 
 struct DFlashDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth>
+        licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_column{};
-    std::array<std::int32_t, kMaximumConcurrency * kDFlashDecodeMaximumWidth> fold_path{};
+    std::array<std::int32_t, std::size_t{kMaximumConcurrency} * kDFlashDecodeMaximumWidth>
+        fold_path{};
 };
 
 struct OrdinaryDecodeStateLayout {

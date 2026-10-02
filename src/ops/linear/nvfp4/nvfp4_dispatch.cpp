@@ -97,7 +97,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 } // namespace
 
 bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                           LinearPolicy policy) noexcept {
+                                           LinearPolicy policy) {
     if (!is_nvfp4_linear_problem(output_rows, input_rows) ||
         (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
         return false;
@@ -106,8 +106,7 @@ bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_
 }
 
 bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                            LinearPolicy policy,
-                                            std::int32_t sequence_width) noexcept {
+                                            LinearPolicy policy, std::int32_t sequence_width) {
     if (policy != LinearPolicy::AllowA4 || sequence_width <= 0 ||
         !is_nvfp4_linear_problem(output_rows, input_rows)) {
         return false;
@@ -118,7 +117,7 @@ bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32
 }
 
 bool is_nvfp4_dflash_conv_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                               LinearPolicy policy) noexcept {
+                                               LinearPolicy policy) {
     return policy == LinearPolicy::A16Only && is_nvfp4_linear_problem(output_rows, input_rows) &&
            resolve_nvfp4_problem(output_rows, input_rows) == Nvfp4Problem::DflashConvProj;
 }

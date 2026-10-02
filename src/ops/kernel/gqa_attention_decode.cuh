@@ -157,8 +157,8 @@ __device__ __forceinline__ int gqa_small_t_tc_swz32(int row, int col) {
 // accumulator (c0/c1 -> row groupID, c2/c3 -> row groupID+8), so score
 // consumption is unchanged; only per-64-group scale rescale differs.
 template <typename Geometry>
-__device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, int kv_head,
-                                                         int& q_head, int& token) {
+__device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int kv_head, int& q_head,
+                                                         int& token) {
     token             = row / Geometry::GroupSize;
     const int local_q = row - token * Geometry::GroupSize;
     q_head            = kv_head * Geometry::GroupSize + local_q;
@@ -222,10 +222,12 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     // 16B pad | acc_s (split-major [s][DChunk] bf16)], so the 16B staging chunks are
     // 1:1 copies of the global rows (d is fastest in the workspace, 16B-aligned).
     extern __shared__ std::uint8_t smem_raw[];
-    float* m_s           = reinterpret_cast<float*>(smem_raw);
-    float* l_s           = m_s + split_count;
-    __nv_bfloat16* acc_s = reinterpret_cast<__nv_bfloat16*>(
-        (reinterpret_cast<std::uintptr_t>(l_s + split_count) + 15) & ~std::uintptr_t(15));
+    float* m_s = reinterpret_cast<float*>(smem_raw);
+    float* l_s = m_s + split_count;
+    // Round the end of l_s up to 16 bytes by advancing the pointer, which keeps its provenance.
+    auto* const l_end    = reinterpret_cast<std::uint8_t*>(l_s + split_count);
+    const auto l_end_pad = (16u - (reinterpret_cast<std::uintptr_t>(l_end) & 15u)) & 15u;
+    __nv_bfloat16* acc_s = reinterpret_cast<__nv_bfloat16*>(l_end + l_end_pad);
 
     const std::int64_t acc_base =
         gqa_partial_acc_index<Geometry>(q_head, d_start, token, 0, tokens);

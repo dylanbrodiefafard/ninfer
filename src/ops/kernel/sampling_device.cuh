@@ -162,7 +162,10 @@ __device__ inline float sampling_block_sum(float value, float* shared) {
         if (tid < s) { shared[tid] += shared[tid + s]; }
         __syncthreads();
     }
-    return shared[0];
+    const float total = shared[0];
+    // The shared array is reused by the next reduction; every thread must have read it first.
+    __syncthreads();
+    return total;
 }
 
 __device__ inline float sampling_block_sum_fast(float value, float* warp_sums) {
@@ -182,7 +185,10 @@ __device__ inline float sampling_block_sum_fast(float value, float* warp_sums) {
         if (lane == 0) { warp_sums[0] = value; }
     }
     __syncthreads();
-    return warp_sums[0];
+    value = warp_sums[0];
+    // The shared array is reused by the next reduction; every thread must have read it first.
+    __syncthreads();
+    return value;
 }
 
 struct SamplingFloatPair {
@@ -218,7 +224,10 @@ __device__ inline SamplingFloatPair sampling_block_sum_pair(float first, float s
         }
     }
     __syncthreads();
-    return {first_warp_sums[0], second_warp_sums[0]};
+    const SamplingFloatPair sums{first_warp_sums[0], second_warp_sums[0]};
+    // The shared array is reused by the next reduction; every thread must have read it first.
+    __syncthreads();
+    return sums;
 }
 
 __device__ inline unsigned long long
@@ -226,7 +235,10 @@ sampling_block_max_key_broadcast(unsigned long long key, unsigned long long* war
     key = sampling_block_max_key(key, warp_keys);
     if (threadIdx.x == 0) { warp_keys[0] = key; }
     __syncthreads();
-    return warp_keys[0];
+    key = warp_keys[0];
+    // The caller's next reduction rewrites warp_keys[0]; every thread must have read it first.
+    __syncthreads();
+    return key;
 }
 
 // Block-wide top-2 of (local_best, local_second) keys. Unique sort keys; 0 is empty.
@@ -350,8 +362,10 @@ sampling_p_less_moments(const __nv_bfloat16* logits, std::int64_t base, std::int
     SamplingPLessMoments out;
     out.m      = red_val[0];
     out.argmax = red_idx[0];
-    float sv   = -CUDART_INF_F;
-    int si     = INT_MAX;
+    // The shared array is reused by the next reduction; every thread must have read it first.
+    __syncthreads();
+    float sv = -CUDART_INF_F;
+    int si   = INT_MAX;
     for (int v = tid; v < vocab; v += blockDim.x) {
         if (!sampling_p_less_in_domain(v, vocab, cfg) || v == out.argmax) { continue; }
         const float x = __bfloat162float(logits[base + v]);
@@ -373,8 +387,9 @@ sampling_p_less_moments(const __nv_bfloat16* logits, std::int64_t base, std::int
     }
     out.runner_up  = red_idx[0];
     out.runner_key = (red_idx[0] == INT_MAX) ? 0ull : sampling_sort_key(red_val[0], red_idx[0]);
-    float local_s  = 0.0f;
-    float local_q  = 0.0f;
+    __syncthreads();
+    float local_s = 0.0f;
+    float local_q = 0.0f;
     for (int v = tid; v < vocab; v += blockDim.x) {
         if (!sampling_p_less_in_domain(v, vocab, cfg)) { continue; }
         const float e = __expf((__bfloat162float(logits[base + v]) - out.m) * inv_temp);
@@ -393,6 +408,7 @@ sampling_p_less_moments(const __nv_bfloat16* logits, std::int64_t base, std::int
     }
     out.sum_exp  = red_val[0];
     out.sum_exp2 = red_aux[0];
+    __syncthreads();
     return out;
 }
 
@@ -452,9 +468,9 @@ __device__ inline int sampling_p_less_inverse_cdf(const __nv_bfloat16* logits, s
             break;
         }
     }
-    if (tid == 0) { red_idx[0] = picked; }
+    // Every thread scanned the same array, so the pick is already block-uniform.
     __syncthreads();
-    return red_idx[0];
+    return picked;
 }
 
 // One p-less token from a logit column. All threads of the block must call.
@@ -741,6 +757,8 @@ __device__ inline int sampling_p_less_pick_from_tile(
     }
     __syncthreads();
 
+    // Thread 0 owns the scan; it tracks completion locally so no thread reads *found mid-scan.
+    bool scan_done       = false;
     const int tile_start = tile * kSamplerPartialTileItems;
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -758,7 +776,7 @@ __device__ inline int sampling_p_less_pick_from_tile(
         }
         weights[threadIdx.x] = weight;
         __syncthreads();
-        if (threadIdx.x == 0 && *found == 0) {
+        if (threadIdx.x == 0 && !scan_done) {
             float acc = *running;
             for (int lane = 0; lane < blockDim.x; ++lane) {
                 const float w = weights[lane];
@@ -766,7 +784,8 @@ __device__ inline int sampling_p_less_pick_from_tile(
                 acc += w;
                 *picked = tile_start + item * blockDim.x + lane;
                 if (goal < acc) {
-                    *found = 1;
+                    *found    = 1;
+                    scan_done = true;
                     break;
                 }
             }
@@ -1099,9 +1118,9 @@ __device__ inline int sampling_p_less_residual(const __nv_bfloat16* logits, std:
             break;
         }
     }
-    if (tid == 0) { red_idx[0] = picked; }
+    // Every thread scanned the same array, so the pick is already block-uniform.
     __syncthreads();
-    return red_idx[0];
+    return picked;
 }
 
 } // namespace ninfer::ops

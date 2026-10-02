@@ -12,7 +12,6 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
-namespace {
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
@@ -73,8 +72,6 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
     return prefill_units + decode_units;
 }
-
-} // namespace
 
 RequestBasePlan
 ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
@@ -297,12 +294,8 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan.reuse == ReusePath::FullReset) {
             plan.prepare_mtp = true;
-        } else if (plan.reuse == ReusePath::AppendAtFrontier) {
-            plan.prepare_mtp = true;
-            plan.mtp_bridge  = plan.reuse_base < plan.summary.prompt_tokens
-                                   ? MtpBridgeMode::BeforeSuffix
-                                   : MtpBridgeMode::AfterExactHit;
-        } else if (is_complete_checkpoint_restore(plan.reuse)) {
+        } else if (plan.reuse == ReusePath::AppendAtFrontier ||
+                   is_complete_checkpoint_restore(plan.reuse)) {
             plan.prepare_mtp = true;
             plan.mtp_bridge  = plan.reuse_base < plan.summary.prompt_tokens
                                    ? MtpBridgeMode::BeforeSuffix

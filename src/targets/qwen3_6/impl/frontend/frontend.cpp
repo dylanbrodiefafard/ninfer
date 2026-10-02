@@ -332,7 +332,7 @@ std::unique_ptr<PreparedPromptData> make_text_prompt_data(fi::EncodedChat encode
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids.assign(encoded.input_ids.begin(), encoded.input_ids.end());
-    result.identity.rewrite_checkpoint = std::move(encoded.rewrite_checkpoint);
+    result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
     result.turn_closure_frontiers      = std::move(encoded.turn_closure_frontiers);
     assign_text_positions(result);
     (void)checked_token_count(result.token_ids.size());
@@ -1217,7 +1217,7 @@ const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& promp
 
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
-    auto data = std::move(prompt.data_);
+    auto data = std::move(prompt).data_;
     return std::move(*data);
 }
 

@@ -114,9 +114,10 @@ ops::LinearPolicy residual_packed_policy(const Weight& weight, qwen3_6::TextPhas
     if (route_tokens <= 0 || weight.qtype != QType::NVFP4 || policy != ops::LinearPolicy::AllowA4) {
         return policy;
     }
-    if (weight.n == TextConfig::hidden &&
-        (weight.k == TextConfig::query_size || weight.k == TextConfig::value_dim) &&
-        route_tokens < 5) {
+    // The residual-6144 class covers both attention o_proj (K = query_size) and GDN out_proj
+    // (K = value_dim); this target fixes both widths to one K.
+    static_assert(TextConfig::query_size == TextConfig::value_dim);
+    if (weight.n == TextConfig::hidden && weight.k == TextConfig::query_size && route_tokens < 5) {
         return ops::LinearPolicy::A16Only;
     }
     if (weight.n == TextConfig::hidden && weight.k == TextConfig::intermediate &&

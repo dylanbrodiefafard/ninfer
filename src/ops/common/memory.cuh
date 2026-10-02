@@ -52,7 +52,7 @@ __device__ __forceinline__ V load_ldg(const T* ptr) {
 }
 
 template <class T, class V>
-__device__ __forceinline__ void store_vec(T* ptr, V value) {
+__device__ __forceinline__ void store_vec(T* ptr, const V& value) {
     static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
                   sizeof(V) == 16);
     *reinterpret_cast<V*>(ptr) = value;

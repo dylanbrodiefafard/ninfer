@@ -289,12 +289,13 @@ void ToolGrammarState::fill_masks(std::span<const TokenId> tokens,
             continue;
         }
         std::int64_t shape = mask_words;
-        DLTensor mask{};
-        mask.data   = output.data();
-        mask.device = {kDLCPU, 0};
-        mask.ndim   = 1;
-        mask.dtype  = {kDLInt, 32, 1};
-        mask.shape  = &shape;
+        DLTensor mask{.data        = output.data(),
+                      .device      = {kDLCPU, 0},
+                      .ndim        = 1,
+                      .dtype       = {kDLInt, 32, 1},
+                      .shape       = &shape,
+                      .strides     = nullptr,
+                      .byte_offset = 0};
         (void)nodes[node]->FillNextTokenBitmask(&mask);
     }
 }

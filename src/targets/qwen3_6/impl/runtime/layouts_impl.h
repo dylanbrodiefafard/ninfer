@@ -32,7 +32,6 @@
 #include "ninfer/types.h"
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
-namespace {
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
@@ -100,7 +99,6 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         LinearStateSlots::state_slot_count(plan.max_concurrency, context_checkpoint_staging);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
-    const std::uint32_t logical_pages  = page_count(plan.capacity);
     const std::uint32_t physical_pages = plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
@@ -168,7 +166,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             if constexpr (DFlashConfig::full_layers > 0) {
                 PagedKVPoolSpec full_pool{
                     .page_group_count      = physical_pages,
-                    .logical_page_capacity = logical_pages,
+                    .logical_page_capacity = page_count(plan.capacity),
                     .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                     .plane_order           = PagedKVPlaneOrder::HeadMajor,
                     .planes =
@@ -1114,8 +1112,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }
-
-} // namespace
 
 std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,

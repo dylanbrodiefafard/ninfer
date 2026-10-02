@@ -10,9 +10,13 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 
+#include <charconv>
 #include <cstdint>
 #include <cstdlib> // NINFER_S3_STRICT_PV
+#include <cstring>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -197,9 +201,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             // Three Q row tiles for the 35B group of eight. The 24/12-warp
             // routes retain eight/four consumer warps per tile; the 6-warp
             // route is reserved for long windows where CTA residency wins.
-            if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<24, 1, 32, false>();
-            } else if (implementation_window <= 1029) {
+            if (implementation_window <= 1029) {
                 launch.template operator()<24, 1, 32, false>();
             } else if (implementation_window <= 4096) {
                 launch.template operator()<12, 1, 32, false>();
@@ -313,9 +315,7 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
                 launch.template operator()<8, 2, 32, false, false>();
             }
         } else {
-            if (implementation_window > 128 && implementation_window <= 512) {
-                launch.template operator()<24, 1, 32, false, false>();
-            } else if (implementation_window <= 1029) {
+            if (implementation_window <= 1029) {
                 launch.template operator()<24, 1, 32, false, false>();
             } else if (implementation_window <= 4096) {
                 launch.template operator()<12, 1, 32, false, false>();
@@ -493,11 +493,19 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     // and widens the in-block quarters to 256/DChunk, raising occupancy so the
     // long-scoreboard global-load latency is hidden. Numerics are unchanged in
     // expectation (m/l stats are d-independent; only the acc sum order moves).
+    // A value other than 8, 16, 32, or 64 is rejected rather than ignored.
     static const int reduce_dchunk = [] {
         const char* e = std::getenv("NINFER_SMALL_T_REDUCE_DCHUNK");
         if (e == nullptr) { return 64; }
-        const int v = std::atoi(e);
-        return (v == 8 || v == 16 || v == 32 || v == 64) ? v : 64;
+        const char* const last  = e + std::strlen(e);
+        int v                   = 0;
+        const auto [end, error] = std::from_chars(e, last, v);
+        if (error != std::errc{} || end != last || (v != 8 && v != 16 && v != 32 && v != 64)) {
+            throw std::invalid_argument(
+                std::string("NINFER_SMALL_T_REDUCE_DCHUNK must be 8, 16, 32, or 64, got '") + e +
+                "'");
+        }
+        return v;
     }();
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, reduce_dchunk),
                            invocation.width * invocation.batch_size);
@@ -566,7 +574,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 }
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
-                                  const Tensor& pos, const Tensor& valid_columns,
+                                  const Tensor& positions, const Tensor& valid_columns,
                                   const Tensor& table_rows, float scale,
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
@@ -587,17 +595,17 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .batch_size     = q.ne[3],
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
-                                                        envelope, partial_acc, partial_m, partial_l,
-                                                        out, stream, keep_frac, keep);
+        gqa_attention_small_t_launch_for<Gqa27Geometry>(
+            q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
+            partial_l, out, stream, keep_frac, keep);
         return;
     }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
+    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, positions, scale, cache, invocation,
                                                     envelope, partial_acc, partial_m, partial_l,
                                                     out, stream, keep_frac, keep);
 }
 
-void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
+void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
@@ -618,7 +626,7 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(
-            q, input, pos, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
+            q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
             partial_l, out, stream, keep_frac, keep);
         if (rank_dump != nullptr && keep.keep_tiles.data != nullptr) {
             // Copy the rank's keep set into the caller's dump arrays (stream-
@@ -641,9 +649,9 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         }
         return;
     }
-    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, batch_cache, invocation,
-                                                    envelope, partial_acc, partial_m, partial_l,
-                                                    out, stream, keep_frac, keep);
+    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, positions, scale, batch_cache,
+                                                    invocation, envelope, partial_acc, partial_m,
+                                                    partial_l, out, stream, keep_frac, keep);
     if (rank_dump != nullptr && keep.keep_tiles.data != nullptr) {
         const std::int32_t kv_rows = 2; // Gqa35Geometry::KVHeads (batch 1)
         CUDA_CHECK(cudaMemcpyAsync(rank_dump->keep_tiles, keep.keep_tiles.data,

@@ -23,7 +23,6 @@
 #include <string>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
@@ -136,13 +135,11 @@ void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
 }
 
-} // namespace
-
-VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights) : ctx_(ctx) {
-    if (!weights.vision) {
+VisionContext::VisionContext(DeviceContext& device, const LoadedModelData& model) : ctx_(device) {
+    if (!model.vision) {
         throw std::invalid_argument("Vision execution was requested without materialized weights");
     }
-    const auto& vision = *weights.vision;
+    const auto& vision = *model.vision;
     patch_embed_       = &vision.common.patch_embedding;
     patch_embed_bias_  = &vision.common.patch_embedding_bias;
     position_embed_    = &vision.common.position_embedding;

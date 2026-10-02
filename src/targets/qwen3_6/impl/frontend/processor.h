@@ -10,7 +10,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
@@ -21,8 +20,8 @@ enum class ProcessorErrorKind {
 
 class ProcessorError final : public std::runtime_error {
 public:
-    ProcessorError(ProcessorErrorKind kind, std::string message)
-        : std::runtime_error(std::move(message)), kind_(kind) {}
+    ProcessorError(ProcessorErrorKind kind, const std::string& message)
+        : std::runtime_error(message), kind_(kind) {}
 
     [[nodiscard]] ProcessorErrorKind kind() const noexcept { return kind_; }
 
@@ -115,7 +114,7 @@ public:
               ProcessorOptions options = {});
 
     ProcessedInput process(const std::vector<ChatMessage>& messages,
-                           ChatRenderOptions render_options = {}) const;
+                           const ChatRenderOptions& render_options = {}) const;
 
 private:
     const Tokenizer& tokenizer_;

@@ -515,7 +515,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
             const std::uint64_t row   = group_index / static_cast<std::uint64_t>(kg);
             const std::uint64_t group = group_index % static_cast<std::uint64_t>(kg);
             if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
-            const std::uint32_t row_mix =
+            // Each mix keeps only its low byte, so the 64-bit arithmetic width cannot change it.
+            const std::uint64_t row_mix =
                 static_cast<std::uint32_t>(row ^ (row >> 8) ^ (row >> 16));
             for (std::uint64_t byte = 0; byte < code_bytes_per_group; ++byte) {
                 std::uint8_t code = static_cast<std::uint8_t>(
@@ -529,7 +530,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                 packed.payload[static_cast<std::size_t>(
                     packed.high_plane_offset + group_index * high_bytes_per_group + byte)] =
                     static_cast<std::uint8_t>(
-                        (row_mix * 43u + group * 31u + byte * 13u + seed * 3u) & 0xffu);
+                        (row_mix * 43u + group * 31u + byte * 13u + std::uint64_t{seed} * 3u) &
+                        0xffu);
             }
         }
     } else {

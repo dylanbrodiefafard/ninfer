@@ -354,9 +354,8 @@ std::size_t ResidentPrefixIdentity::packed_bytes() const {
 }
 
 void ResidentPrefixIdentity::pack(void* dst) const {
-    if (dst == nullptr && packed_bytes() != 0) {
-        throw std::invalid_argument("prefix identity pack destination is null");
-    }
+    // The packed form always carries its 8-byte header, so a destination is always required.
+    if (dst == nullptr) { throw std::invalid_argument("prefix identity pack destination is null"); }
     auto* raw = static_cast<std::uint8_t*>(dst);
     Writer w{raw, raw + packed_bytes()};
     w.u32(static_cast<std::uint32_t>(token_types_.size()));

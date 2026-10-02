@@ -554,7 +554,7 @@ using LabelList = std::initializer_list<std::pair<std::string_view, std::string_
 
 class TextWriter {
 public:
-    TextWriter() { out_.reserve(96 * 1024); }
+    TextWriter() { out_.reserve(std::size_t{96} * 1024); }
 
     void family(std::string_view name, std::string_view help, std::string_view type) {
         name_ = name;

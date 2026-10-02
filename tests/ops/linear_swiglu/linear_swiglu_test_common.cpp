@@ -214,8 +214,9 @@ linear_swiglu_oracle_fp64(const Profile& profile, const quantized_weight::Packed
                         // followed by BF16 gate/up materialization and BF16 final output.
                         // Bound rounding from magnitudes, not rounded oracle intermediates.
                         constexpr double u32 = 0x1p-24, ub = 1.0 / 256.0;
-                        const double steps = profile.input_rows / 16 + 20;
-                        const double gamma = steps * u32 / (1.0 - steps * u32);
+                        const auto k16_partials = profile.input_rows / 16;
+                        const double steps      = k16_partials + 20;
+                        const double gamma      = steps * u32 / (1.0 - steps * u32);
                         const double eg =
                             gamma * gate_abs[token] * (1 + ub) + ub * std::abs(gate[token]);
                         const double eu =
@@ -422,8 +423,8 @@ int run_profile(std::string_view label, const Profile& profile,
         Tensor destination(output.data(), DType::BF16, {profile.output_rows, tokens});
         workspace.reset();
         workspace.reset_peak();
-        const cudaStream_t stream = replay ? graph_context->stream : nullptr;
-        const auto launch         = [&] {
+        cudaStream_t stream = replay ? graph_context->stream : nullptr;
+        const auto launch   = [&] {
             if (profile.input_rmsnorm) {
                 ops::rmsnorm_linear_swiglu(x, norm, 1e-6F, weight, destination, workspace, stream);
             } else {

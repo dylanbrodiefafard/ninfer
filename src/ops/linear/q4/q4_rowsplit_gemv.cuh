@@ -402,6 +402,8 @@ struct Q4GemvStoreEpilogue {
     }
 };
 
+// The grid has no row tail: CTA b owns output rows [b * kRowsPerCta, (b + 1) * kRowsPerCta), so
+// the launcher's output row count must be a multiple of Schedule::kRowsPerCta.
 template <class Schedule, bool SplitOutput = false, int SplitRow = 0,
           class Epilogue = Q4GemvStoreEpilogue, bool TriggerPdl = false, bool JoinPdl = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kLaunchBoundsMinBlocks)
@@ -411,7 +413,6 @@ void q4_rowsplit_gemv_kernel(
     const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ out_tail,
-    std::int32_t rows,
     std::int32_t k,
     Epilogue epilogue = {}) {
     // clang-format on

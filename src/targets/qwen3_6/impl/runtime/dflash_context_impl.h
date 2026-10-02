@@ -22,8 +22,8 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                           staging_local.lane_capacity() == 1;
     if (!local_ok) { throw std::invalid_argument("DFlash persistent cache layout is invalid"); }
     if constexpr (DFlashConfig::full_layers > 0) {
-        if (!full || full->layers() != 1 || full->max_context() != layout.full->max_context ||
-            full->pool().plane_count() != 2 ||
+        if (!full || !layout.full || full->layers() != 1 ||
+            full->max_context() != layout.full->max_context || full->pool().plane_count() != 2 ||
             local.lane_capacity() != full->pool().table_row_count() ||
             full->pool().plane(0).dtype != DType::BF16 ||
             full->pool().plane(0).ne[0] != DFlashConfig::head_dim ||

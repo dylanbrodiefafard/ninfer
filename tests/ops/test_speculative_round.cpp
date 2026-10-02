@@ -1255,9 +1255,10 @@ int batched_sampling_workspace_stride_case() {
         token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
     cuda_synchronize();
 
-    int failures = verify_exact("speculative sampling B=2 licensed",
-                                from_device<std::int32_t>(d_licensed, columns * batch),
-                                {10, 20, 0, 0, 30, 31, 32, 33});
+    int failures = verify_exact(
+        "speculative sampling B=2 licensed",
+        from_device<std::int32_t>(d_licensed, static_cast<std::size_t>(columns) * batch),
+        {10, 20, 0, 0, 30, 31, 32, 33});
     failures += verify_exact("speculative sampling B=2 counts",
                              from_device<std::int32_t>(d_counts, batch), {2, 4});
     failures += verify_exact("speculative sampling B=2 accepted",
@@ -1806,29 +1807,29 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
         double qsum = 0.0;
         for (int c = 0; c < cap; ++c) {
             const int token                            = (c * (5 + 2 * h) + 3 + h) % active;
-            ids[static_cast<std::size_t>(h * cap + c)] = token;
+            ids[static_cast<std::size_t>(h) * cap + c] = token;
             const double w =
                 std::exp(logits[static_cast<std::size_t>(h) * physical_rows + token] / 0.8 +
                          0.3 * std::cos(static_cast<double>(c + h)));
-            q[static_cast<std::size_t>(h * cap + c)] = static_cast<float>(w);
+            q[static_cast<std::size_t>(h) * cap + c] = static_cast<float>(w);
             qsum += w;
         }
         for (int c = 0; c < cap; ++c) {
-            q[static_cast<std::size_t>(h * cap + c)] =
-                static_cast<float>(q[static_cast<std::size_t>(h * cap + c)] / qsum);
+            q[static_cast<std::size_t>(h) * cap + c] =
+                static_cast<float>(q[static_cast<std::size_t>(h) * cap + c] / qsum);
         }
     }
     const auto q_at = [&](int h, int token) {
         for (int c = 0; c < cap; ++c) {
-            if (ids[static_cast<std::size_t>(h * cap + c)] == token) {
-                return static_cast<double>(q[static_cast<std::size_t>(h * cap + c)]);
+            if (ids[static_cast<std::size_t>(h) * cap + c] == token) {
+                return static_cast<double>(q[static_cast<std::size_t>(h) * cap + c]);
             }
         }
         return 0.0;
     };
     double uncovered = 1.0;
     for (int c = 0; c < cap; ++c) {
-        uncovered -= target[1][static_cast<std::size_t>(ids[static_cast<std::size_t>(cap + c)])];
+        uncovered -= target[1][static_cast<std::size_t>(ids[static_cast<std::size_t>(cap) + c])];
     }
 
     // Independent Algorithm 2 over dense laws: E[tau] = 2 h2 + (1 - h2) h1, E[tau^2] = 4 h2 + (1 -
@@ -1838,9 +1839,9 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     for (int c0 = 0; c0 < cap; ++c0) {
         for (int c1 = 0; c1 < cap; ++c1) {
             const int d0    = ids[static_cast<std::size_t>(c0)];
-            const int d1    = ids[static_cast<std::size_t>(cap + c1)];
+            const int d1    = ids[static_cast<std::size_t>(cap) + c1];
             const double w  = static_cast<double>(q[static_cast<std::size_t>(c0)]) *
-                              static_cast<double>(q[static_cast<std::size_t>(cap + c1)]);
+                              static_cast<double>(q[static_cast<std::size_t>(cap) + c1]);
             const double p1 = std::min(target[0][static_cast<std::size_t>(d0)] / q_at(0, d0), 1.0);
             double z1       = 0.0;
             for (int x = 0; x < token_domain; ++x) {
@@ -1893,7 +1894,7 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     const auto run_round = [&](std::int32_t start, std::vector<std::int32_t>& out, int& produced,
                                int& acc) {
         const std::vector<std::int32_t> drafts{ids[static_cast<std::size_t>(draw0(rng))],
-                                               ids[static_cast<std::size_t>(cap + draw1(rng))]};
+                                               ids[static_cast<std::size_t>(cap) + draw1(rng)]};
         cuda_check(cudaMemcpy(d_drafts.p, drafts.data(), drafts.size() * sizeof(std::int32_t),
                               cudaMemcpyHostToDevice),
                    "drafts");
@@ -1957,7 +1958,7 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
         outside += target[1][static_cast<std::size_t>(t1)] <= 0.0;
         ++marginal0[static_cast<std::size_t>(t0)];
         ++marginal1[static_cast<std::size_t>(t1)];
-        ++observed[static_cast<std::size_t>(bucket(top0, t0) * b1 + bucket(top1, t1))];
+        ++observed[static_cast<std::size_t>(bucket(top0, t0)) * b1 + bucket(top1, t1)];
     }
     const auto chi2_marginal = [&](const std::vector<std::int64_t>& obs, int col, double& dof) {
         double chi2 = 0.0;
@@ -1987,7 +1988,7 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
             const double expected = pa * pb * trials;
             if (expected <= 0.0) { continue; }
             const double diff =
-                static_cast<double>(observed[static_cast<std::size_t>(a * b1 + b)]) - expected;
+                static_cast<double>(observed[static_cast<std::size_t>(a) * b1 + b]) - expected;
             chij += diff * diff / expected;
         }
     }
@@ -2641,7 +2642,7 @@ int check_p_less_tree_invariants(const char* label, const TreeAcceptObserved& go
                  " is outside p-less support at packed column " + std::to_string(node));
         }
         if (i < got.accepted) {
-            const int child = got.path[static_cast<std::size_t>(i + 1)];
+            const int child = got.path[static_cast<std::size_t>(i) + 1];
             if (verify_ids[static_cast<std::size_t>(child)] != token) {
                 fail("accepted hop does not match the child verify id");
             }
@@ -3205,9 +3206,10 @@ int batched_selector_row_isolation_case() {
                                           workspace, nullptr, &sel_ids_t, &sel_q_t);
     cuda_synchronize();
 
-    int failures =
-        verify_exact("batched selector licensed",
-                     from_device<std::int32_t>(d_licensed, columns * batch), {7, 11, 3, 0});
+    int failures = verify_exact(
+        "batched selector licensed",
+        from_device<std::int32_t>(d_licensed, static_cast<std::size_t>(columns) * batch),
+        {7, 11, 3, 0});
     failures += verify_exact("batched selector accepted",
                              from_device<std::int32_t>(d_accepted, batch), {1, 0});
     failures +=
@@ -3289,11 +3291,12 @@ int remap_case(int token_count) {
 
 int column_eligibility_cases(int domain, int physical) {
     const int stride = (domain + 31) / 32 + 3;
-    std::vector<std::uint32_t> masks(5 * stride, 0);
+    std::vector<std::uint32_t> masks(5 * static_cast<std::size_t>(stride), 0);
     const std::vector<int> allowed{22, 31, 44, 41, 55};
     for (int col = 0; col < 5; ++col) {
-        masks[col * stride + allowed[col] / 32] |= 1u << (allowed[col] % 32);
-        masks[col * stride] |= 1u << 8; // explicitly suppressed despite grammar eligibility
+        const std::size_t mask_base = static_cast<std::size_t>(col) * stride;
+        masks[mask_base + allowed[col] / 32] |= 1u << (allowed[col] % 32);
+        masks[mask_base] |= 1u << 8; // explicitly suppressed despite grammar eligibility
     }
     DeviceBuffer device_masks = to_device(masks);
     std::vector<std::int32_t> counts(domain, 0);
@@ -3353,11 +3356,11 @@ int main() {
         std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
         ++failures;
     }
-    try {
-        (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
-        std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
+        },
+        "speculative accept workspace accepted an invalid draft interval");
     const std::size_t tree12 =
         ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 1);
     if (tree12 == 0 || tree12 != ops::sampling_workspace_capacity_bytes(257, 12, 12) ||
@@ -3367,11 +3370,11 @@ int main() {
         std::cerr << "speculative tree accept workspace did not close over packed width\n";
         ++failures;
     }
-    try {
-        (void)ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
-        std::cerr << "speculative tree accept workspace accepted W<2\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
+        },
+        "speculative tree accept workspace accepted W<2");
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);

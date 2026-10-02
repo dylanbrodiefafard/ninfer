@@ -30,7 +30,13 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     return out;
 }
 
-__device__ __forceinline__ float2 bf16x2_to_float2(__nv_bfloat162 value) {
+// Sign-extends the low byte of `bits` as a two's-complement int8 weight code.
+__device__ __forceinline__ int int8_code_value(unsigned bits) {
+    // NOLINTNEXTLINE(bugprone-signed-char-misuse): int8 weight codes are signed by definition.
+    return static_cast<std::int8_t>(bits & 0xffu);
+}
+
+__device__ __forceinline__ float2 bf16x2_to_float2(const __nv_bfloat162& value) {
     return __bfloat1622float2(value);
 }
 

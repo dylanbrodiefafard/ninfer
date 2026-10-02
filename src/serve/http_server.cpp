@@ -140,11 +140,13 @@ std::string_view unstreamed_content(const GenerationOutcome& outcome) {
 }
 
 struct HttpRequestClock {
+    constexpr HttpRequestClock() noexcept = default;
+
     std::chrono::steady_clock::time_point started{};
     bool active = false;
 };
 
-thread_local HttpRequestClock http_request_clock;
+constinit thread_local HttpRequestClock http_request_clock;
 
 } // namespace
 
@@ -415,7 +417,7 @@ void HttpServer::register_routes() {
     });
 
     server_.set_exception_handler(
-        [this](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
+        [this](const httplib::Request&, httplib::Response& res, const std::exception_ptr& ep) {
             try {
                 std::rethrow_exception(ep);
             } catch (const ApiException& e) {

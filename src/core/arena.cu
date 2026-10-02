@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -351,9 +352,12 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment
     }
 
     const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+    const auto aligned = (address + alignment - 1) & ~(alignment - 1);
     allocation_        = ptr;
-    data_              = reinterpret_cast<void*>((address + alignment - 1) & ~(alignment - 1));
-    size_              = size_bytes;
+    // Offsetting the allocation keeps its provenance; the padding is at most the alignment - 1
+    // extra bytes requested above.
+    data_ = static_cast<std::byte*>(ptr) + (aligned - address);
+    size_ = size_bytes;
 }
 
 PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(allocation_); }

@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <span>
@@ -265,19 +266,32 @@ private:
     struct stat status_{};
 };
 
+// Applies accessor to the active descriptor through std::get_if, so the noexcept accessors below
+// carry no std::bad_variant_access path. A descriptor is never valueless: descriptors are built
+// whole and never reassigned in place, so the terminate branch marks a broken invariant.
+template <class Accessor>
+decltype(auto) access_descriptor(const ObjectDescriptor& object, Accessor accessor) noexcept {
+    if (const auto* tensor = std::get_if<TensorDescriptor>(&object)) { return accessor(*tensor); }
+    const auto* resource = std::get_if<ResourceDescriptor>(&object);
+    if (resource == nullptr) { std::terminate(); }
+    return accessor(*resource);
+}
+
 } // namespace
 
 std::string_view object_name(const ObjectDescriptor& object) noexcept {
-    return std::visit([](const auto& descriptor) -> std::string_view { return descriptor.name; },
-                      object);
+    return access_descriptor(
+        object, [](const auto& descriptor) -> std::string_view { return descriptor.name; });
 }
 
 std::uint64_t object_offset(const ObjectDescriptor& object) noexcept {
-    return std::visit([](const auto& descriptor) { return descriptor.offset; }, object);
+    return access_descriptor(
+        object, [](const auto& descriptor) -> std::uint64_t { return descriptor.offset; });
 }
 
 std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept {
-    return std::visit([](const auto& descriptor) { return descriptor.bytes; }, object);
+    return access_descriptor(
+        object, [](const auto& descriptor) -> std::uint64_t { return descriptor.bytes; });
 }
 
 struct Reader::Impl {

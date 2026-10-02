@@ -17,18 +17,42 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace ninfer::bench {
 
 constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
+
+// Parses all of `text` as a decimal T (integral or floating point) with std::from_chars, so
+// leading whitespace, a leading '+', trailing characters, and values outside T's range are
+// rejected. Throws std::invalid_argument naming `what` (the option or variable being parsed).
+template <class T>
+[[nodiscard]] T parse_number(std::string_view text, std::string_view what) {
+    static_assert(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>);
+    T value{};
+    const char* const first = text.data();
+    const char* const last  = first + text.size();
+    const auto [end, error] = std::from_chars(first, last, value);
+    if (error != std::errc{} || end != last) {
+        throw std::invalid_argument(std::string(what) + ": '" + std::string(text) +
+                                    (error == std::errc::result_out_of_range
+                                         ? "' is out of range"
+                                         : "' is not a decimal number"));
+    }
+    return value;
+}
 
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;

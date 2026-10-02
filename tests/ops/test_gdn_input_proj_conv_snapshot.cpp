@@ -238,8 +238,8 @@ int verify_batched_state_effects(std::string_view label, const std::vector<std::
         const std::int32_t valid =
             valid_columns.empty() ? width : valid_columns[static_cast<std::size_t>(batch_row)];
         for (std::int32_t column = 0; column < valid; ++column) {
-            written[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(batch_row)] +
-                                             column)] = true;
+            written[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(batch_row)]) +
+                    column] = true;
         }
     }
     for (std::int32_t slot = 0; slot < slots; ++slot) {
@@ -469,7 +469,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
-                                                       3 * kChannels);
+                                                       3 * static_cast<std::size_t>(kChannels));
     const SnapshotOracle oracle = snapshot_oracle(
         kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
             const float* token_activation =
@@ -604,7 +604,7 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
-                                                       3 * kChannels);
+                                                       3 * static_cast<std::size_t>(kChannels));
     const SnapshotOracle oracle = snapshot_oracle(
         kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
             return quantized_weight::dot_fp64(
@@ -732,7 +732,7 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
-                                                       3 * kChannels);
+                                                       3 * static_cast<std::size_t>(kChannels));
     const SnapshotOracle oracle = snapshot_oracle(
         kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
             return quantized_weight::dot_fp64(
@@ -888,7 +888,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
     const std::span<const std::uint16_t> initial_state(state_before.data() + initial_base,
-                                                       3 * kChannels);
+                                                       3 * static_cast<std::size_t>(kChannels));
     const SnapshotOracle oracle = snapshot_oracle(
         kValueRows, tokens, conv_weight, initial_state, [&](std::int32_t row, std::int32_t token) {
             return quantized_weight::dot_fp64(

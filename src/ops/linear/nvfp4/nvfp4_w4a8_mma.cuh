@@ -20,7 +20,7 @@ __device__ __forceinline__ unsigned nvfp4_codes_to_fp8(unsigned codes) {
 // Exact E2M1-code expansion to BF16 with the stored E4M3 block scale folded in: every product of
 // an E2M1 value and an E4M3 scale has at most six significant bits, so the BF16 multiply is exact.
 // Nibbles 0..3 (K 4t..4t+3) return as {K 4t, 4t+1} and {K 4t+2, 4t+3} BF16 pairs.
-__device__ __forceinline__ void nvfp4_codes_to_bf16x2(unsigned codes, __nv_bfloat162 scale,
+__device__ __forceinline__ void nvfp4_codes_to_bf16x2(unsigned codes, const __nv_bfloat162& scale,
                                                       unsigned& low, unsigned& high) {
     const unsigned magnitude = codes & 0x7777U;
     const unsigned lo        = __byte_perm(0xC0800000U, 0xC0804000U, magnitude);

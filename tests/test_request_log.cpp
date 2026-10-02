@@ -531,7 +531,7 @@ int main() {
         format_request_done(context, outcome).find("context_ckpt=restored:36864,captured:102400") !=
             std::string::npos,
         "human request log omits combined restored/captured frontiers");
-    failures += check(ninfer::product::format_context_checkpoint_frontiers(0, 0, ' ') == "",
+    failures += check(ninfer::product::format_context_checkpoint_frontiers(0, 0, ' ').empty(),
                       "CLI/serve frontier formatter empty when both are 0");
     failures +=
         check(ninfer::product::format_context_checkpoint_frontiers(0, 0, ' ', "none") == "none",
