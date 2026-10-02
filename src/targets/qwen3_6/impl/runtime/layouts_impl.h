@@ -806,13 +806,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             dflash_captured_verify_width(k, plan.dflash_verify_width));
                         if (wk >= dflash_verify) { continue; }
                         const std::int32_t compact_t = wk * batch;
-                        WorkspaceLayoutBuilder extra;
-                        matrix(extra, DType::BF16, DFlashConfig::feature_rows, compact_t);
-                        matrix(extra, DType::I32, wk, batch);
-                        const std::size_t extra_bytes = finish(extra);
-                        out.dflash_round              = std::max(
-                            out.dflash_round,
-                            checked_add(dflash_peak, extra_bytes, "adaptive DFlash prefix compact"));
                         WorkspaceLayoutBuilder panels;
                         matrix(panels, DType::I32, static_cast<std::int32_t>(k), batch);
                         matrix(panels, DType::I32, wk, batch);
@@ -960,6 +953,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
                              options.kv_disk_location);
 }
 
+
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
                                                            std::uint32_t main_page_groups) {
     if (main_page_groups == 0) {
@@ -979,7 +973,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->p_less_draft_temperature = inputs.p_less_draft_temperature;
     impl->captured_ks =
         qwen3_6::adaptive_draft_ks(inputs.speculative_backend, inputs.draft_window,
-                                   inputs.adaptive_draft);
+                                   inputs.adaptive_draft,
+                                   Variant::maximum_adaptive_dflash_draft_tokens);
     impl->dflash_verify_width =
         inputs.speculative_backend == SpeculativeBackend::DFlash
             ? dflash_storage_verify_width(impl->captured_ks, inputs.draft_window,

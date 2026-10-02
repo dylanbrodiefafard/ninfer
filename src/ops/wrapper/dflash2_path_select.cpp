@@ -240,7 +240,8 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          cudaStream_t stream, const Tensor* logit_token_ids,
                          const Weight* pred_nvfp4, const Weight* succ_nvfp4, Tensor* selector_ids,
                          Tensor* selector_q, unsigned long long seed_xor,
-                         std::int32_t position_offset, bool force_greedy) {
+                         std::int32_t position_offset, bool force_greedy,
+                         float p_less_draft_temperature_scale) {
     require_logits(logits);
     const std::int32_t vocab  = logits.ne[0];
     const std::int32_t tokens = logits.ne[1];
@@ -295,7 +296,7 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                                        succ_q == nullptr ? &succ_code : nullptr, pred_q, succ_q,
                                        anchors, logical_positions, path, tokens, batch, configs,
                                        stream, selector_ids, selector_q, seed_xor, position_offset,
-                                       force_greedy);
+                                       force_greedy, p_less_draft_temperature_scale);
 }
 
 void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,

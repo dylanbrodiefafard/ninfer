@@ -34,6 +34,14 @@ struct Variant {
     static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;
     static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
+    static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens =
+        kMaximumDFlashDraftTokens;
+    // The DFlash2 drafter is trained at block eight (k=7). Its block attention is bidirectional,
+    // so the untruncated block gives flatter per-position selector laws; the p-less draft
+    // temperature (set for k<=5) is scaled down for longer blocks: 0.4 -> 0.35 (k=6), 0.3 (k=7).
+    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_scale(std::uint32_t k) {
+        return k <= 5 ? 1.0f : (k == 6 ? 0.875f : 0.75f);
+    }
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;

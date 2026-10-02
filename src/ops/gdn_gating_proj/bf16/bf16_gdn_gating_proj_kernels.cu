@@ -193,8 +193,8 @@ void bf16_gdn_gating_proj_mma_split40_launch(const Tensor& x, const Weight& a_we
                                              Tensor& beta, cudaStream_t stream) {
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
-    if (x.ne[1] < 1 || x.ne[1] > 36) {
-        throw std::invalid_argument("gdn_gating_proj: narrow split-40 admits T=1..36");
+    if (x.ne[1] < 1 || x.ne[1] > 48) {
+        throw std::invalid_argument("gdn_gating_proj: narrow split-40 admits T=1..48");
     }
     const auto launch = [&]<int Columns>() {
         launch_bf16_prefill_mma<Bf16Gdn27SmallGeometry<Columns>, 40, Columns / 8>(

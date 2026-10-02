@@ -32,6 +32,11 @@ struct Variant {
     static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;
     static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
+    // Adaptive DFlash stays within the W<=6 small-T verify routes of the 35B geometry.
+    static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens = 5;
+    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_scale(std::uint32_t) {
+        return 1.0f;
+    }
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;

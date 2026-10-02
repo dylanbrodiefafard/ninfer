@@ -17,14 +17,15 @@ int w8_a16_conformance() {
     int failures = 0;
 
     constexpr std::array kN248320K5120{
-        a16(1),  a16(5),  a16(6),  a16(10), a16(15), a16(16), a16(17),
-        a16(20), a16(32), a16(33), a16(34), a16(48), a16(49), a16(64), a16(65),
+        a16(1),  a16(5),  a16(6),  a16(10), a16(15), a16(16), a16(17), a16(20),
+        a16(32), a16(33), a16(34), a16(40), a16(41), a16(42), a16(48), a16(49), a16(64), a16(65),
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});
-    // Verify LM head: every chain width across C=2..6, including W=6 C=6 (30+6 columns).
+    // Verify LM head: every chain width across C=2..6 shares one weight pass of at most 48
+    // columns (W=7 C=6 is 42, W=8 C=6 is 48).
     constexpr std::array kVocabularyBatches{2, 3, 4, 5, 6};
-    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+    for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
         failures += run_packed_sequences_matches_panels(
             "W8_A16 vocabulary packed W" + std::to_string(width), make_w8g32_f16s_weight,
             248320, 5120,

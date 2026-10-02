@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -52,6 +53,38 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
     return result.bits;
 }
 
+template <class Schedule>
+union W8SmallTMmaSharedStorage {
+    struct {
+        std::uint8_t codes[Schedule::kRowsPerCta][Schedule::kGroupK];
+        __nv_bfloat16 activations[Schedule::kKWarps]
+                                 [Schedule::kTileTokens * Schedule::kTileKPerWarp];
+        std::uint8_t scales[Schedule::kRowsPerCta]
+                           [Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
+                                ? Schedule::kScaleBytesPerRow
+                                : 1];
+    } staging;
+
+    float partial[Schedule::kKWarps * (Schedule::kTileTokens / 8) * 32 * 4];
+};
+
+// Launch-time dynamic shared bytes; zero for statically allocated schedules.
+template <class Schedule>
+inline constexpr std::size_t w8_small_t_mma_dynamic_shared_bytes =
+    Schedule::kDynamicShared ? sizeof(W8SmallTMmaSharedStorage<Schedule>) : 0;
+
+template <class Schedule>
+__device__ __forceinline__ W8SmallTMmaSharedStorage<Schedule>& w8_small_t_shared_storage() {
+    using Storage = W8SmallTMmaSharedStorage<Schedule>;
+    if constexpr (!Schedule::kDynamicShared) {
+        __shared__ __align__(16) Storage storage;
+        return storage;
+    } else {
+        extern __shared__ __align__(16) unsigned char w8_small_t_dynamic_shared[];
+        return *reinterpret_cast<Storage*>(w8_small_t_dynamic_shared);
+    }
+}
+
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
           bool DirectPairEpilogue = false>
@@ -74,19 +107,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
-    union SharedStorage {
-        struct {
-            std::uint8_t codes[kMmaRows][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint8_t scales[kMmaRows][Schedule::kScaleAccess == W8SmallTMmaScaleAccess::Shared
-                                              ? Schedule::kScaleBytesPerRow
-                                              : 1];
-        } staging;
-
-        float partial[kWarps * kNt * 32 * 4];
-    };
-
-    __shared__ __align__(16) SharedStorage shared;
+    auto& shared = w8_small_t_shared_storage<Schedule>();
     auto& code_shared  = shared.staging.codes;
     auto& b_shared     = shared.staging.activations;
     auto& scale_shared = shared.staging.scales;

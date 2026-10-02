@@ -65,13 +65,13 @@ int q4_a16_conformance() {
     constexpr std::array kN131072K5120{
         a16(1),  a16(2),  a16(3),  a16(4),  a16(5),  a16(6),  a16(7), a16(8),
         a16(9),  a16(12), a16(16), a16(17), a16(20), a16(24), a16(25), a16(30), a16(32),
-        a16(33), a16(128),
+        a16(33), a16(40), a16(42), a16(48), a16(49), a16(128),
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4g64_f16s_weight,
                           {131072, 5120, 127U, Comparison::Sampled, false, kN131072K5120});
-    // Draft proposals per request are k=2..5 columns; C=2..6 share passes of at most 32 columns.
+    // Draft proposals per request are k=2..7 columns; C=2..6 share passes of at most 48 columns.
     constexpr std::array<std::int32_t, 5> draft_head_batches{2, 3, 4, 5, 6};
-    for (const std::int32_t width : {2, 3, 4, 5}) {
+    for (const std::int32_t width : {2, 3, 4, 5, 6, 7}) {
         failures += run_packed_sequences_matches_panels(
             "Q4_A16 27B draft-head packed W" + std::to_string(width), make_q4g64_f16s_weight,
             131072, 5120, 129U + static_cast<std::uint32_t>(width), width, draft_head_batches);

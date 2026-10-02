@@ -27,17 +27,21 @@ server must accept image or video input. Speculative residency is likewise froze
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
-Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..5`; on RTX 5090,
-`--spec dflash --draft-tokens 4 --lm-head-draft` is the measured single-request speed recommendation.
+Vision-composed target hidden features. Verify is chain `W=k+1` for `k` in `1..7`; on RTX 5090,
+`--spec dflash --draft-tokens 5 --adaptive-draft --lm-head-draft` remains the p-less
+recommendation. `--draft-tokens 7 --adaptive-draft` runs k=7 at C=1; it is about 6% faster at C=1
+under `--greedy`, but under p-less it is 1-4% slower at C=1/C=4 (see
+[K7 measurements](performance.md#dflash2-k6k7-verify-2026-09-29)).
 For concurrent requests, `--draft-tokens 5 --adaptive-draft --lm-head-draft` runs k=4 at C=2–6
 on the A8 verification routes; fixed `--draft-tokens 2` no longer wins at C=2
 ([adaptive k set](performance.md#adaptive-draft-start-and-k-set-2026-09-27); the older
 [C=2–4 measurements](performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22) predate A8). At [C=5/6](performance.md#concurrency-c56-2026-09-25),
 `--draft-tokens 5 --adaptive-draft --lm-head-draft` reaches 550/626 aggregate tok/s.
-With `--draft-tokens 5`, `--adaptive-draft` picks live DFlash k in `{3,4,5}`
+With `--draft-tokens N` (N=5..7), `--adaptive-draft` picks live DFlash k in `{3..N}`
 after each round by locking
-`argmax E[Y(k)] / T(k,C,L)` from nested hop-survival `r_i` (a hop not yet observed counts as
-accepted) and online least-squares round time
+`argmax E[Y(k)] / T(k,C,L)` from nested hop survival (engine-global per-k hop hazards learned on
+randomized exploration rounds, scaled by a per-request content factor) and online least-squares
+round time
 (shared slope, per-k intercept). Every captured k is measured once per batch size before the
 argmax applies, because round time need not grow smoothly with k;
 switching k costs 1 ms. That is a sticky policy, not a once-per-launch latch: see
@@ -700,8 +704,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--keep-frac F` | Sparge prompt-prefill tile skipping on NVFP4 KV: per 128-query tile, keep the top fraction `F` `(0,1]` of 64-key tiles by mean-Q·mean-K score, plus forced leading-sink and local-window tiles. `1` is dense; decode, verify and ≤6-token chunks stay dense | `1` |
 | `--xattn-tau F` | XAttention prompt-prefill block skipping on NVFP4 KV: keep the 128-key blocks covering attention mass `F` `(0,1]` once more than 8,192 keys are visible. `1` is dense; exclusive with `--keep-frac` below `1`; decode and verify stay dense | `1` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..5` | unset |
-| `--adaptive-draft` | pick live draft K by `E[Y]/T(k,C,L)` (nested `r_i`; DFlash counts unobserved hops as accepted; least-squares T; each captured k measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens 5` captures `{3,4,5}`; DFlash `--draft-tokens 4` stays `{4}`. MTP captures `{3,4,5}` up to its configured limit | off |
+| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
+| `--adaptive-draft` | pick live draft K by `E[Y]/T(k,C,L)` (nested hop acceptance; DFlash learns engine-global per-k hop hazards from one exploration round in 32; least-squares T; each captured k measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures `{3..N}`; DFlash `--draft-tokens 4` stays `{4}`. MTP captures `{3,4,5}` up to its configured limit | off |
 | `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 is chain `W=k+1` | auto |
 | `--dflash-p-less-draft-temperature T` | DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. At p-less `T=1.5`, `0.4` gave +5.7% C=1 decode (9 prompts x 4 seeds, no prompt slower) and +14-16% aggregate at C=4/6 over greedy drafts | 0.4 |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -738,9 +742,9 @@ sampler resolution.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
 p-less remains exact argmax. P-less membership is `p_v ≥ max(L·exp(-2ε/T), 1/M)` with
 `ε = 1/16` and `M = 1024`; L is the unperturbed collision probability, and an empty set
-falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (block verification over
-the chain with the recorded draft `q`; DFlash2 drafts are sampled at `--dflash-p-less-draft-temperature`) and to the
-bonus. A thinking-cycle exclusion affects only the next token,
+falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (block verification
+over the chain with the recorded draft `q`; DFlash2 drafts are sampled at
+`--dflash-p-less-draft-temperature`, scaled down for k=6/7 blocks) and to the bonus. A thinking-cycle exclusion affects only the next token,
 not later hops in the same speculative round. There is
 no OpenAI or Anthropic schema field for this mode.
 

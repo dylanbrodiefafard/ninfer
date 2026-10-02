@@ -28,7 +28,9 @@ struct GqaSmallTInvocation {
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope);
 
-bool gqa_attention_uses_small_t(std::int32_t tokens);
+// Largest query width one small-T launch covers for this head geometry (27B: 8, 35B: 6).
+std::int32_t gqa_attention_small_t_max_tokens(std::int32_t q_heads);
+bool gqa_attention_uses_small_t(std::int32_t q_heads, std::int32_t tokens);
 
 // dense_nvfp4: the call would run the dense NVFP4 Prompt kernel (U8 cache without S3, no
 // Sparge/XAttention skip, no dump). Only such 27B calls move short appends to six-row chunks;

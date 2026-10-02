@@ -445,7 +445,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             : std::size_t(2 * Bc * CodeW + Br * P4Row + Br * 4 + D * P4Row + D * 4 +
                           Bc * Groups);
 
-    static_assert(TokenTile >= 1 && TokenTile <= 6);
+    static_assert(TokenTile >= 1 && TokenTile <= Geometry::SmallTMaxTokens);
     static_assert(Bc == 32 || Bc == 64);
     static_assert(RowTiles >= 1 && RowTiles <= 3);
     static_assert(Wc % RowTiles == 0);

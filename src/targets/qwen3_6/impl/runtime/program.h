@@ -405,6 +405,13 @@ public:
     const std::uint32_t dflash_verify_width;
     const bool adaptive_draft;
     const float p_less_draft_temperature;
+    // Engine-global adaptive DFlash hop hazards, learned from exploration rounds.
+    qwen3_6::AdaptiveHopRates adaptive_hop_rates{};
+    [[nodiscard]] qwen3_6::AdaptiveHopRates* hop_rates() {
+        return adaptive_draft && speculative_backend == SpeculativeBackend::DFlash
+                   ? &adaptive_hop_rates
+                   : nullptr;
+    }
     const std::vector<std::uint32_t> captured_ks;
     std::array<qwen3_6::AdaptiveRoundTimeState, kMaximumConcurrency> adaptive_t_by_batch{};
     std::array<qwen3_6::AdaptiveBatchKState, kMaximumConcurrency> adaptive_batch_k_by_c{};
