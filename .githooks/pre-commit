@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# NInfer commit hook: format and lint the staged files, fold the automatic fixes into the commit,
+# and fail only when a check still fails after fixing. Enable it once per checkout with
+#   git config core.hooksPath .githooks
+# (./scripts/dev-setup.sh does this). Tools and versions: .pre-commit-config.yaml.
+set -euo pipefail
+
+if command -v pre-commit >/dev/null 2>&1; then
+  runner=pre-commit
+elif command -v prek >/dev/null 2>&1; then
+  runner=prek
+else
+  echo "commit hook: pre-commit is not installed." >&2
+  echo "Install it with: python3 -m pip install pre-commit==4.6.2" >&2
+  exit 1
+fi
+
+# Files that already had unstaged edits cannot take automatic fixes: staging them would also
+# stage those edits. Everything else a fixer touches is re-staged below.
+unstaged() { git -c core.quotePath=off diff --name-only; }
+mapfile -t before < <(unstaged)
+
+if "$runner" run --hook-stage pre-commit; then
+  exit 0
+fi
+
+mapfile -t after < <(unstaged)
+fixed=()
+for path in "${after[@]}"; do
+  seen=0
+  for old in "${before[@]}"; do
+    if [[ "$old" == "$path" ]]; then
+      seen=1
+      break
+    fi
+  done
+  if ((seen == 0)); then fixed+=("$path"); fi
+done
+
+if ((${#fixed[@]} == 0)); then
+  echo "commit hook: a check failed and nothing could be fixed automatically; see above." >&2
+  echo "A file with unstaged edits cannot take automatic fixes: stage or stash those edits." >&2
+  exit 1
+fi
+
+git add -- "${fixed[@]}"
+echo "commit hook: folded automatic fixes into this commit:" >&2
+printf '  %s\n' "${fixed[@]}" >&2
+
+# The second pass must be clean: anything still failing is a finding to fix by hand.
+if "$runner" run --hook-stage pre-commit; then
+  exit 0
+fi
+echo "commit hook: checks still fail after automatic fixes; see above." >&2
+exit 1

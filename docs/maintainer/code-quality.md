@@ -20,18 +20,36 @@ property of the code, not of the contributor's machine.
 | compute-sanitizer | device out-of-bounds and misaligned access, shared-memory races, illegal barrier use, reads of uninitialized device memory | CUDA 13.1 toolkit | `./scripts/run-unit-tests.sh --compute-sanitizer TOOL` |
 | AddressSanitizer / UBSan | host heap/stack overflow, use-after-free, leaks, signed overflow, misaligned and invalid casts | `NINFER_SANITIZE` in `cmake/warnings.cmake` | separate tree, below |
 
-CI ([`.github/workflows/quality.yml`](../../.github/workflows/quality.yml)) runs the pre-commit
-gate on every push and pull request. Gates that need the CUDA toolchain or a GPU run in the
-`ninfer-builder` container; the clean way to enforce them in CI is a self-hosted runner on the
-RTX 5090 host that runs the build, `run-clang-tidy.py`, and `run-unit-tests.sh`.
+No hosted CI runs these gates. They are enforced in two tiers:
+
+| When | What runs | How |
+|---|---|---|
+| Every commit, on any branch | formatters, ruff, shellcheck, typos, file hygiene on the staged files | the commit hook, automatically |
+| Often while working | the `-Werror` build, the fast unit tests, clang-tidy on changed lines | `./scripts/run-unit-tests.sh --fast`, `./scripts/run-clang-tidy.py --changed` |
+| When the change requires them | the slow unit tests; the Engine tests for Engine, runtime, cache, speculative, or serving changes; sanitizers for changed kernels | `./scripts/run-unit-tests.sh`, `--real`, `--compute-sanitizer TOOL` |
+| Every merge into `master` | every gate in this document, all passing on the merged commit | [Merging into master](merging-to-master.md) |
 
 ## Running the gates
 
-Install the hook runner once (Python 3.11): `python3 -m pip install pre-commit==4.6.2` (or the
-compatible, faster [`prek`](https://github.com/j178/prek)), then `pre-commit install`. The
-commit hook runs the fast gates on staged files; `pre-commit run --all-files` checks the whole
-tree exactly as CI does. Hooks that rewrite files (formatters, `--fix`) leave the rewrite
-unstaged; review it and stage it.
+Set up the commit hook once per checkout:
+
+```bash
+python3 -m pip install pre-commit==4.6.2   # the hook runner (Python 3.11); `prek` also works
+git config core.hooksPath .githooks        # ./scripts/dev-setup.sh does this for you
+```
+
+The hook ([`.githooks/pre-commit`](../../.githooks/pre-commit)) runs the tools in
+`.pre-commit-config.yaml` on the staged files. Formatters and `ruff --fix` rewrite files; the hook
+stages those rewrites so they are part of the commit, runs the checks once more, and fails only
+when a check still fails (a lint finding with no automatic fix, a misspelling, a shell error, a
+broken JSON/TOML/YAML file). A file that also has unstaged edits is not re-staged, because that
+would commit those edits too; stage or stash them and commit again. Committing with `--no-verify`
+bypasses a gate and is not accepted. `pre-commit run --all-files` runs the same tools over the
+whole tree.
+
+clang-tidy is not in the commit hook: it needs the running builder and a built tree, and a widely
+included header re-checks every includer. Run it on changed lines while working, and on the whole
+tree before a merge into `master`.
 
 Compiler diagnostics need no separate step: every project C++ and CUDA translation unit builds
 with `NINFER_WARNINGS_AS_ERRORS=ON` by default. The policy applies only to NInfer targets;
@@ -42,6 +60,7 @@ clang-tidy runs in the builder container against `/build/compile_commands.json`:
 ```bash
 ./scripts/run-clang-tidy.py                      # whole tree: the gate, zero findings
 ./scripts/run-clang-tidy.py --changed            # lines changed vs. origin/HEAD, while iterating
+./scripts/run-clang-tidy.py --changed HEAD       # uncommitted changes only
 ./scripts/run-clang-tidy.py src/serve/foo.cpp    # named files; a header selects its includers
 ```
 

@@ -8,6 +8,7 @@
 #
 # Usage:
 #   ./scripts/run-unit-tests.sh                  # full unit suite
+#   ./scripts/run-unit-tests.sh --fast           # skip the tests labelled slow (minutes each)
 #   ./scripts/run-unit-tests.sh -R ninfer_sampling_test
 #   ./scripts/run-unit-tests.sh --real           # include real-artifact tests
 #   ./scripts/run-unit-tests.sh --print-weights  # show which .ninfer files were found
@@ -34,6 +35,7 @@ INCLUDE_REAL=0
 PRINT_WEIGHTS=0
 RUN_PYTHON=0
 SANITIZER_TOOL=""
+FAST=0
 CTEST_ARGS=()
 
 WEIGHT_VARS=(
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --inner) INNER=1; shift ;;
     --real) INCLUDE_REAL=1; shift ;;
+    --fast) FAST=1; shift ;;
     --print-weights) PRINT_WEIGHTS=1; shift ;;
     --python) RUN_PYTHON=1; shift ;;
     --compute-sanitizer)
@@ -57,7 +60,7 @@ while [[ $# -gt 0 ]]; do
       esac
       ;;
     --help|-h)
-      sed -n '2,24p' "$0"
+      sed -n '2,25p' "$0"
       exit 0
       ;;
     --) shift; CTEST_ARGS+=("$@"); break ;;
@@ -507,6 +510,9 @@ run_cpp_suite() {
   if [[ "$INCLUDE_REAL" -eq 0 ]]; then
     ctest_cmd+=(-E '_real_test$')
   fi
+  if [[ "$FAST" -eq 1 ]]; then
+    ctest_cmd+=(-LE slow)
+  fi
   if [[ ${#CTEST_ARGS[@]} -gt 0 ]]; then
     ctest_cmd+=("${CTEST_ARGS[@]}")
   fi
@@ -569,6 +575,9 @@ if command -v docker >/dev/null 2>&1 && "${ROOT}/scripts/dev-setup.sh"; then
   inner_args=(--inner)
   if [[ "$INCLUDE_REAL" -eq 1 ]]; then
     inner_args+=(--real)
+  fi
+  if [[ "$FAST" -eq 1 ]]; then
+    inner_args+=(--fast)
   fi
   if [[ -n "$SANITIZER_TOOL" ]]; then
     inner_args+=(--compute-sanitizer "$SANITIZER_TOOL")

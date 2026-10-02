@@ -106,6 +106,8 @@ routing map, not a mandatory reading list:
   performance-evidence rules;
 - `docs/maintainer/kernel-iteration.md`: Layer 0-3 CUDA speed procedure (`tools.kdev`
   bound/mma/Op sweep/production path);
+- `docs/maintainer/merging-to-master.md`: the gates every merge into `master` must pass, their
+  commands, and how the result is recorded;
 - `docs/maintainer/code-quality.md`: compiler-warning, clang-tidy, formatter, linter, spelling,
   and sanitizer gates, their pinned versions, commands, and suppression policy;
 - `docs/maintainer/upstream-sync.md`: porting from upstream Neroued/ninfer `dev` (remote
@@ -221,13 +223,24 @@ Comments:
 - Comments and documentation are precise English in complete sentences, with correct spelling
   and consistent terminology.
 
-Every applicable gate in [`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md)
-passes with zero findings before a commit: the `-Werror` build, `pre-commit run` (formatting,
-ruff, shellcheck, typos, file hygiene), and, for any C++ or CUDA change, the whole-tree
-`./scripts/run-clang-tidy.py` (`--changed` is the fast check while iterating). The tree is clean
-under every gate, so any finding belongs to the change that produced it and is fixed; a
-suppression is reserved for correct code, is scoped to one line, and states its reason. Never
-weaken, disable, or bypass a gate (`--no-verify`, removing a check or flag) to land a change.
+The gates are enforced in two tiers; no hosted CI runs them.
+
+- **Every commit, on any branch.** The commit hook (`.githooks/pre-commit`, enabled by
+  `./scripts/dev-setup.sh` or `git config core.hooksPath .githooks`) formats and lints the staged
+  files, folds the automatic fixes into the commit, and fails only when a check still fails.
+  Every build is `-Werror`. While working, run the fast unit tests often
+  (`./scripts/run-unit-tests.sh --fast`) and `./scripts/run-clang-tidy.py --changed` on C++ or
+  CUDA changes.
+- **Every merge into `master`.** Every formatter, linter, compiler warning, clang-tidy check,
+  unit test, Engine test, compute-sanitizer tool, and AddressSanitizer run passes on the commit
+  being merged, as [`docs/maintainer/merging-to-master.md`](docs/maintainer/merging-to-master.md)
+  specifies.
+
+[`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md) describes each gate. The
+tree is clean under every gate, so any finding belongs to the change that produced it and is
+fixed; a suppression is reserved for correct code, is scoped to one line, and states its reason.
+Never weaken, disable, or bypass a gate (`--no-verify`, removing a check or flag) to land a
+change.
 
 ## Performance work
 
@@ -268,11 +281,15 @@ attribution tools only when needed; serving changes get affected OpenAI/Anthropi
 and observable request/stream behavior.
 
 The quality gates in `docs/maintainer/code-quality.md` apply to every change in addition to this
-evidence. After substantial work, and before a commit or push, run the full C++ unit-test suite with
-`./scripts/run-unit-tests.sh`. That command builds the test targets in the `ninfer-builder`
-GPU container and runs every CTest except the opt-in real-artifact Engine tests.
-`--real` includes those Engine tests and binds `.ninfer` files from `models/`, `/models`, or `models/weights.env`. Focused checks remain the right evidence during the work;
-the full suite is the gate that unrelated tests still pass.
+evidence. Run the fast unit tests often while working: `./scripts/run-unit-tests.sh --fast`
+builds the test targets in the `ninfer-builder` GPU container and runs every CTest except the
+few labelled `slow` and the real-artifact Engine tests; without `--fast` it also runs the slow
+ones, which is the right check after substantial work. Run the Engine tests
+(`./scripts/run-unit-tests.sh --real`, binding `.ninfer` files from `models/`, `/models`, or
+`models/weights.env`) only when the change requires them: Engine, runtime, target Program,
+KV-cache tiers, speculative decoding, or serving behavior. Focused checks remain the right
+evidence during the work. A merge into `master` runs everything, as
+`docs/maintainer/merging-to-master.md` specifies.
 
 ## Local environment
 

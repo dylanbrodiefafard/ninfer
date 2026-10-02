@@ -104,7 +104,9 @@ real-artifact Engine tests):
 
 `./scripts/dev-setup.sh` starts `ninfer-builder` from this repository's Dockerfile
 `build` stage when the container is not already running. Extra arguments go to CTest
-(`./scripts/run-unit-tests.sh -R ninfer_sampling_test`). `--real` includes the
+(`./scripts/run-unit-tests.sh -R ninfer_sampling_test`). `--fast` skips the tests labelled
+`slow` (each runs for minutes) and is the run to repeat while working; Op tests carry the
+`kernel` label, which selects the tests compute-sanitizer runs over (`-L kernel`). `--real` includes the
 opt-in Engine tests and auto-finds exact `.ninfer` filenames in `models/`, `out/`,
 `/models`, the builder's models mount, and sibling folders of that mount. Override
 with environment variables or `models/weights.env`. `--print-weights` shows what
@@ -113,6 +115,19 @@ with environment variables or `models/weights.env`. `--print-weights` shows what
 [code-quality gates](../docs/maintainer/code-quality.md). `--python` also runs the host pytest suite
 when that interpreter can import `pytest` and `torch`. The script exits before CTest
 when the GPU has less than 20 GiB free and prints the processes holding VRAM.
+
+> **Warning: `ninfer_attn_input_proj_test` can hard-hang the host.** On the RTX 5090 development
+> host it has frozen the whole machine five times (drivers 580.178.04 and 595.91.07), most
+> recently inside its FP8 `AllowA8` section at T=127, with no kernel log and no recovery short
+> of a reset. The cause is not established. Until it is, exclude it when running the suite
+> unattended or remotely, and do not run it under compute-sanitizer:
+>
+> ```bash
+> ./scripts/run-unit-tests.sh -E '_real_test$|^ninfer_attn_input_proj_test$'
+> ```
+>
+> The test stays in the tree because it is the oracle for the attention input projection,
+> including the NVFP4 route of the supported model.
 
 Equivalent native commands:
 
