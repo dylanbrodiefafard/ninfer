@@ -378,15 +378,15 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
     // on MMA M (N16 tiles for T<=16, N32 above) and streams K512 of FP8 over three stages; wider
     // projections place sixteen weight rows on MMA M (SwapAB) and compile the exact eight-token
     // panel count, streaming K256 over three stages (M16) or two (M32). T=33..48 (C=5/6 verify)
-    // uses one M48 tile so every weight byte is read once. BF16 activations halve BK to keep the
-    // same staged bytes. Every schedule keeps each output's ascending K order, so neither tile
-    // height nor panel count changes an output.
+    // uses one M48 tile so every weight byte is read once; it streams K256 over the same stage
+    // counts (N<=6144 at K512 would exceed shared memory at three stages). BF16 activations halve
+    // BK to keep the same staged bytes. Every schedule keeps each output's ascending K order, so
+    // neither tile height nor panel count changes an output.
     const auto launch = [&]<int BM, int Panels>() {
         constexpr bool narrow = Geometry::kOutputRows <= 6144;
         constexpr int BN      = narrow ? (BM == 16 ? 16 : 32) : 64;
-        constexpr int BK =
-            (BM == 48 ? (narrow ? 256 : 128) : (narrow ? 512 : 256)) / kActivationBytes;
-        constexpr int S       = BM == 48 ? (narrow ? 2 : 3) : (narrow || BM == 16 ? 3 : 2);
+        constexpr int BK      = (BM == 48 || !narrow ? 256 : 512) / kActivationBytes;
+        constexpr int S       = narrow || BM == 16 ? 3 : 2;
         using Schedule        = Nvfp4W4a4MmaSchedule<BM, BN, BK, 1, BN == 16 ? 2 : 4, S, 1>;
         constexpr auto kernel = nvfp4_w4a8_mma_kernel < Geometry, Schedule, Epilogue, Output,
                        RowPolicy, PairRows, narrow ? 0 : Panels, Activation > ;

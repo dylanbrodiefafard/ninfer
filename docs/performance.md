@@ -175,6 +175,182 @@ RTX 5090, DFlash2 NVFP4, `--draft-tokens 5 --adaptive-draft`, p-less: C=6 tokens
 2.29 -> 2.44 (aggregate 544.2 -> 623.7 tok/s, C=6 wave totals carry straggler noise); C=4
 464.2 -> 474.5; C=1 within seed noise. Raw reports: `profiles/bench/k7/p4`.
 
+## DFlash2 k=6/k=7 verify (2026-09-29)
+
+RTX 5090, CUDA 13.1, DFlash2 `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, `ninfer-serve --spec dflash
+--lm-head-draft --kv-dtype nvfp4`, driver `profiles/bench/k7/adk_drive.py` (the
+[adaptive k set](#adaptive-draft-start-and-k-set-2026-09-27) waves; C=1 `c1long`, C=4/C=6 waves).
+Aggregate tok/s is completion tokens over wave wall time.
+
+The 27B cap is now `--draft-tokens 7` (W<=8). Before that cap was usable, W=7/8 had these slower
+routes:
+- C=1 decode attention used the prefill kernel.
+- C>1 attention split into 6+1/6+2 chunks.
+- Merged verify projections, the fused MLP norm, the LM-head grouping and the GDN gating/record
+  fusions all split per request above W=6 or T=36.
+
+The 27B small-T GQA kernels already stage six query heads per KV head in three 16-row tiles, so
+W=7/8 (42/48 rows) run on the same tiles as W=6. Every merged route now covers W<=8, T<=48. Round
+time grows only slightly with k at C=1: fixed k=5/6/7 run 15.5/15.7/15.8 ms.
+
+| aggregate tok/s | C=1 `c1long` | C=4 | C=6 |
+|---|---|---|---|
+| fixed k=5 / 6 / 7, p-less | 147.8 / 144.1 / 141.6 | 389.5 / 362.3 / 339.5 | 425.0 / 390.0 / 384.4 |
+| adaptive `{3,4,5}` / `{3..7}`, p-less | 148.0 / 140.2 | 464.2 / 461.6 | 544.2 / 550.4 |
+| fixed k=5 / 7, `--greedy` | 206.2 / 217.3 | 550.0 / 584.0 | - |
+| adaptive `{3,4,5}` / `{3..7}`, `--greedy` | 204.4 / 217.2 | 661.5 / 649.7 | - |
+
+C>=4 adaptive runs k=4 in 98-100% of rounds under either set. Under greedy, k=7 is 5-6% faster
+at C=1 and hop-0 acceptance barely moves (0.667 at k=5, 0.660 at k=7).
+
+Under the default p-less sampler, hop-0 acceptance falls with block length:
+
+| k | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|
+| C=1 hop-0 acceptance | 0.513 | 0.519 | 0.532 | 0.509 | 0.486 |
+
+The drafter's block attention is non-causal, so a longer mask block flattens the selector `q` that
+p-less samples from. Seed-offset repeats (1000/2000) keep the same ordering:
+- hop 0: k=5 0.520/0.528, k=7 0.472/0.521;
+- throughput: k=5 averages 144.8 tok/s and k=7 averages 141.0.
+
+The DFlash2 drafter is trained at block eight (k=7, z-lab model card), so k=5 is a truncated
+block. With block attention, the native block gives flatter selector laws at every position. The
+p-less draft temperature 0.4 was tuned at k=5. At k=7, C=1, one seed each:
+
+| draft temperature | 0 | 0.2 | 0.25 | 0.3 | 0.35 | 0.4 |
+|---|---|---|---|---|---|---|
+| k=7 tok/s | 140.7 | 135.2 | 146.9 | 148.2 | 143.8 | 141.6 |
+
+At k=5, 0.3/0.2 are slower than 0.4 (139.9/138.1). The 27B variant therefore scales the draft
+temperature by block length: x1 for k<=5, x0.875 at k=6, x0.75 at k=7 (k=6 is interpolated, not
+measured).
+
+Final comparison with [block verification](#p-less-block-verification-2026-09-30) and the per-k
+draft temperature, C=1 `c1long`, p-less, seed
+offsets 0/1000/2000:
+
+| aggregate tok/s | seed 0 | 1000 | 2000 | mean |
+|---|---|---|---|---|
+| adaptive `--draft-tokens 5` | 153.6 | 128.8 | 144.8 | 142.4 |
+| adaptive `--draft-tokens 7` | 151.4 | 155.2 | 144.0 | 150.2 |
+
+- **C=1:** `{3..7}` runs k=7 in 89-99% of rounds, and its hop-0 acceptance (0.51) now equals k=5's.
+  The paired median difference is -0.6%. The mean (+5.5%) is carried by seed 1000, where k=5
+  accepts poorly.
+- **C=4 / C=6:** `{3,4,5}` 475.1 / 624.1 and `{3..7}` 467.4 / 628.0 tok/s. Both run k=4 in 99% of
+  rounds.
+- **Before this change:** C=6 adaptive k=5 was 544.2 with per-hop verification (tokens per round
+  2.29 -> 2.44). Wave totals at C=6 also carry straggler noise.
+- **Graph memory:** the k=6/7 captures add 10 MiB at C=1 and 62 MiB at C=6.
+
+**After the upstream batched drafter for every chain k** (`9b7d1277`, merged), one seed:
+
+| aggregate tok/s | C=1 `c1long` | C=4 | C=6 |
+|---|---|---|---|
+| adaptive `--draft-tokens 5` | 154.1 | 479.8 | 632.7 |
+| adaptive `--draft-tokens 7` | 152.0 | 459.0 | 626.4 |
+
+Fixed k=7 at C=4 went from 339.5 to 378.6 tok/s with the batched drafter, but that is still far
+below k=4. Adaptive N=7 spends about 5% of C=4 rounds at k=7 (5.47 ms against 4.67 ms), so it
+trails N=5 by 1.6-4.3% there. Under p-less, `--draft-tokens 5 --adaptive-draft` stays the
+recommendation. `--draft-tokens 7` (fixed or adaptive) is the greedy C=1 choice, at +6%.
+
+**Round-time attribution and fixes (2026-09-30).** `nsys --cuda-graph-trace=node` of fixed-k
+`ninfer_bench -pg 512,256 --spec dflash --lm-head-draft` (p-less), per verify round:
+
+| round, nsys | C=4 k=4 | C=4 k=5 | C=4 k=7 | C=6 k=5 | C=6 k=7 |
+|---|---|---|---|---|---|
+| before | 16.46 ms | 18.29 ms | 19.60 ms | 24.40 ms | 26.79 ms |
+| after | 16.48 ms | 16.87 ms | 18.14 ms | 21.34 ms | 24.09 ms |
+
+- The C=4 k=4 -> k=5 cliff was the BF16 early layers (attention input in layers 3-23, attention
+  output in 3/7, GDN output in 4). They aggregated only at W=5, so every other width ran one
+  147 MB weight pass per request (0.69 -> 2.21 ms/round). BF16 MMA keeps one K-ordered
+  accumulator per output under every tile, so aggregates now reproduce each panel exactly:
+  attention input at every W, residuals at W>=5.
+- The W8 vocabulary head (T=16 850 us, T=32 993 us) and the Q4 draft head grouped at most 32
+  columns, so C=6 W=7/8 ran two passes. Both now keep their panel reduction through T=48 in one
+  pass: W8 T=40/42/48 1155/1522/1718 us against about 1840 us for two passes. The W8 T>32 tiles
+  exceed static shared memory and launch with dynamic shared memory.
+- The A8 M48 tile (T=33-48) now streams K256 with the general stage counts: public-Op gate/up
+  T=48 118.8 -> 106.5 us. In the engine it is 110.9 -> 107.5 us; the other projections are flat.
+- What remains at C=6 k=7 is compute: gate/up at T=48 is at 78% of the A8 K16 MMA issue roof
+  (`tools.kdev`), and the GDN recurrent record and fold grow with T.
+
+**Adaptive draft context bug.** A round that follows a longer k commits up to the previous W, but
+the drafter context append was sized to the current W(k). The kernel skipped any row whose count
+exceeded that bound, which dropped its committed context. Greedy C=1 with a forced k=3/4/5 cycle
+showed the loss at matched start positions: a k=3 round after k=5 accepted 0.99 drafts against
+1.29. The cycle ran at 2.51 tokens/round, the same as fixed k=3. The append now always covers
+W_ceil. After the fix, matched-position acceptance equals the pinned runs, and the cycle runs at
+2.70 tokens/round (fixed k=3/4/5: 2.50/2.71/2.88). Before the kernel fixes, adaptive stayed at
+k=4 in 99% of C>=4 rounds, so the bug rarely fired there.
+
+After both fixes, aggregate tok/s (`p13`, `p14`). The p-less columns are the mean of seed offsets
+0/1000/2000:
+
+| aggregate tok/s | C=4 p-less | C=6 p-less | C=4 greedy | C=6 greedy |
+|---|---|---|---|---|
+| adaptive `--draft-tokens 5` | 436.5 | 593.6 | 668.4 | 900.8 |
+| adaptive `--draft-tokens 7` | 445.8 | 606.7 | 701.7 | 916.4 |
+| fixed k=4 | 448.6 | 623.5 | 666.2 | 912.6 |
+
+With k=5-7 rounds now close to k=4 in cost, adaptive mixes k=3-7 at C>=4. Individual p-less
+seeds vary by +/-7% because each policy samples a different text, and wave wall time follows its
+slowest request. At C=1 (`c1long`, seed 0), N=5/N=7 run 154.3/151.9 tok/s. At C=2 they run
+259.2/229.3; N=7 stays at k=7 in 95% of rounds there. This picker treated hop acceptance as
+independent of block length; the per-k hop model below replaced it.
+
+**Per-k hop model (2026-10-01).** Fixed-k hop acceptance (`p15`, `c6`+`c1long`, about 16-22k
+rounds per cell; hop i conditional on reaching it):
+
+| law | k=3 | k=4 | k=5 | k=6 | k=7 |
+|---|---|---|---|---|---|
+| greedy, hop 0 / mean | 0.754 / 0.727 | 0.745 / 0.722 | 0.746 / 0.721 | 0.724 / 0.721 | 0.738 / 0.744 |
+| p-less, hop 0 / mean | 0.605 / 0.615 | 0.596 / 0.631 | 0.603 / 0.635 | 0.561 / 0.619 | 0.563 / 0.657 |
+
+Block length matters little: greedy is flat, and p-less hop 0 fails about 10% more often at
+k=6/7 (0.44 against 0.40). The picker now learns an engine-global hazard per draft law, k and hop from randomized
+exploration rounds, and a per-request content factor on it
+([model §8.1](maintainer/qwen3.6-27b-model.md#81-adaptive-draft-length)).
+
+Greedy output is not identical across k. Verify numerics differ slightly by width, so a k switch
+can flip a near-tie argmax and the texts diverge mid-generation (at 1.5-4.3k characters on three
+C=1 prompts). With the picker forced to k=7, adaptive output and rounds equal fixed k=7 exactly,
+so the adaptive path itself costs nothing. The divergence makes single runs noisy by up to
++/-10% for greedy and p-less alike: for example, a C=6 p-less run at k=4 in 87% of rounds came in
+9.7% below fixed k=4 on the same seed.
+
+- **First version** (hierarchy priors of 8 failures and 16 trials, 1/4 warm exploration):
+  -5.0% geomean against the best fixed k over 13 runs. With about 30 exploration rounds per k, the
+  learned ratios were mostly content noise: C=6 greedy settled on k=3, with rho_3/rho_4 at
+  0.85/1.21 against flat truth.
+- **Retained** (priors of 64 expected failures and 256 trials, 1/32 exploration): -3.9% against the
+  best fixed k per scenario. That baseline takes the best of five noisy arms, which biases it
+  toward fixed. Against fixed k=4 it is +2.6%.
+- **Matched A/B, dynamic vs measured seed** (`p20`): the seed preloads the table above at 4096
+  trials per cell. Same scenarios and seeds, 6 greedy and 11 p-less runs: dynamic/seed = -1.8%
+  +/- 1.9% (paired geomean +/- SE). On held-out scenarios only it is about -1.5%. The difference
+  is within noise, so the picker stays fully dynamic with no artifact-specific table.
+
+The spliced two-block drafter (a k=5 prefix plus the k=7 tail) was not built. Its expected gain was
+to recover k=5's early-position acceptance, which the per-k draft temperature already does.
+
+Correctness evidence:
+- `ninfer_speculative_round_test` checks block verification on both accept routes (single-block and
+  multi-block). It compares the first two emitted tokens' joint law with the p-less oracle, and
+  the accepted-length mean with an exact enumeration of Algorithm 2 (0.2265 vs 0.2258). A chained
+  two-round case checks that the second round keeps the exact mean (0.268 vs 0.266).
+- Every widened route passes its FP64/FP32 oracle and merged-vs-panel checks at W=7/8, T<=48.
+- `ninfer_qwen3_8_27b_dflash_real_test` passes for fixed k=6 and k=7: target-only greedy
+  identity and C=6 isolation.
+
+Raw reports: `profiles/bench/k7/p0`, `p2`, `p2g`, `p2s`, `p3` (draft temperature), `p4` (block
+verification), `p5` (adaptive A/B), `p6` (merged tree), `p9`-`p12` (switch diagnosis), `p13`/`p14`
+(after the fixes), `p15` (fixed-k hop table), `p16`/`p19` (picker gate), `p20` (dynamic vs
+seed); traces in `profiles/nsys/k7`.
+
 ## NVFP4 decode attention pipelining and overlap candidates (2026-09-27)
 
 Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /

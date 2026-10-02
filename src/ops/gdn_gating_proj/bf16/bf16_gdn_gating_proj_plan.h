@@ -52,9 +52,9 @@ bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept;
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
                                                     const Bf16GdnGatingProblem& problem);
-// Small 27B panels and packed verify use the same split-40 MMA reduction through T=36.
+// Small 27B panels and packed verify (T<=48, C<=6 x W<=8) use the same split-40 MMA reduction.
 // Token tiling changes neither the K partition nor the order of the final reduction.
-inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 36;
+inline constexpr std::int32_t kBf16GdnGatingPackedMaxCols  = 48;
 inline constexpr std::int32_t kBf16GdnGatingPackedMaxBatch = 6;
 
 [[nodiscard]] constexpr bool bf16_gdn_gating_packed_aggregates(std::int32_t sequence_width,

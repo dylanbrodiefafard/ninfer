@@ -330,8 +330,8 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
 
 template <int Width, bool Tree>
 struct A8RecordOutput {
-    static_assert(Width >= kNvfp4FirstA8 && Width <= 6);
-    // C<=6 and W<=6 (T<=36) fit the launcher's single M16/M32/M48 tile, so every
+    static_assert(Width >= kNvfp4FirstA8 && Width <= kNvfp4GdnA8FusedRecordMaxWidth);
+    // C<=6 and W<=8 (T<=48) fit the launcher's single M16/M32/M48 tile, so every
     // request's temporal columns are present here; wider public widths retain global staging.
     Nvfp4GdnConvOutput<Width, RecordColumnPublish, Tree> output;
 
@@ -360,7 +360,7 @@ void launch_quantized_record_exact(const Tensor& x, const Weight& weight, const 
                                    const std::int32_t* parent_index, cudaStream_t stream) {
     auto scope      = workspace.scope();
     const int batch = x.ne[2];
-    if constexpr (A8 && Width <= 6) {
+    if constexpr (A8 && Width <= kNvfp4GdnA8FusedRecordMaxWidth) {
         if (Width * batch > 48) {
             throw std::invalid_argument("nvfp4 gdn A8 record: W*B exceeds the single M48 tile");
         }

@@ -111,7 +111,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{6, ops::LinearPolicy::AllowA8},    Invocation{10, ops::LinearPolicy::AllowA8},
         Invocation{12, ops::LinearPolicy::AllowA8},   Invocation{15, ops::LinearPolicy::AllowA8},
         Invocation{18, ops::LinearPolicy::AllowA8},   Invocation{20, ops::LinearPolicy::AllowA8},
-        Invocation{24, ops::LinearPolicy::AllowA8},   Invocation{1, ops::LinearPolicy::A16Only},
+        Invocation{24, ops::LinearPolicy::AllowA8},   Invocation{28, ops::LinearPolicy::AllowA8},
+        Invocation{32, ops::LinearPolicy::AllowA8},   Invocation{42, ops::LinearPolicy::AllowA8},
+        Invocation{48, ops::LinearPolicy::AllowA8},   Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},    Invocation{4, ops::LinearPolicy::A16Only},
         Invocation{5, ops::LinearPolicy::A16Only},    Invocation{6, ops::LinearPolicy::A16Only},
         Invocation{8, ops::LinearPolicy::A16Only},    Invocation{10, ops::LinearPolicy::A16Only},
@@ -350,7 +352,7 @@ int main() {
     failures += run_packed_column0(5120, 6144, 811U);
     failures += run_packed_column0(5120, 17408, 821U);
     // Every verify width uses A8; aggregates across C<=6 equal their W-panels.
-    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+    for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
         failures += run_aggregate_matches_panels(5120, 6144, 831U + width, width,
                                                  ops::LinearPolicy::AllowA8, 6);
         failures += run_aggregate_matches_panels(5120, 17408, 841U + width, width,
