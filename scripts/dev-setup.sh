@@ -28,9 +28,24 @@ fi
 
 docker volume create "$BUILD_VOL" >/dev/null
 
+# Hard memory limit for everything run in the builder (builds, tests, sanitizers), with no swap
+# on top: a runaway process is OOM-killed inside the container instead of exhausting the host.
+# The default leaves a quarter of host RAM for the desktop, the page cache, and driver-pinned
+# memory, which the cgroup does not account. Override with NINFER_BUILDER_MEMORY_GIB.
+host_mem_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+MEMORY_GIB="${NINFER_BUILDER_MEMORY_GIB:-$((host_mem_kib * 3 / 4 / 1024 / 1024))}"
+if ! [[ "$MEMORY_GIB" =~ ^[1-9][0-9]*$ ]] || ((MEMORY_GIB * 1024 * 1024 >= host_mem_kib)); then
+  echo "NINFER_BUILDER_MEMORY_GIB=${MEMORY_GIB} must be a whole number of GiB below host RAM" >&2
+  exit 1
+fi
+memory_args=(--memory "${MEMORY_GIB}g" --memory-swap "${MEMORY_GIB}g")
+
 create_args=(
   --name "$BUILDER"
   --gpus all
+  "${memory_args[@]}"
+  # A crashing CUDA process must not hand a multi-gigabyte core to the host crash handler.
+  --ulimit core=0
   -v "${ROOT}:/src:rw"
   -v "${BUILD_VOL}:/build"
   -w /src
@@ -43,6 +58,9 @@ if ! docker ps -a --format '{{.Names}}' | grep -qx "$BUILDER"; then
   echo "Creating builder container ${BUILDER}..."
   docker create "${create_args[@]}" "$IMAGE" sleep infinity >/dev/null
 fi
+
+# Containers created before the limit existed, or with another value, take it here.
+docker update "${memory_args[@]}" "$BUILDER" >/dev/null
 
 if [[ "$(docker inspect -f '{{.State.Running}}' "$BUILDER")" != "true" ]]; then
   docker start "$BUILDER" >/dev/null
@@ -108,6 +126,7 @@ echo "container : $BUILDER (running=$(docker inspect -f '{{.State.Running}}' "$B
 echo "image     : $IMAGE"
 echo "repo      : ${ROOT} -> /src"
 echo "build     : volume ${BUILD_VOL} -> /build"
+echo "memory    : ${MEMORY_GIB} GiB limit, no swap"
 echo "testing   : $(docker exec "$BUILDER" bash -lc 'grep -E "^BUILD_TESTING:BOOL=" /build/CMakeCache.txt')"
 echo "gpu       : $(docker exec "$BUILDER" bash -lc 'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo NO-GPU')"
 echo
