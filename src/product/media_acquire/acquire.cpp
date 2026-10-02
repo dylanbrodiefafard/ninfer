@@ -49,13 +49,11 @@ std::vector<std::uint8_t> decode_base64(std::string_view text) {
     static constexpr std::array<std::int8_t, 256> table = [] {
         std::array<std::int8_t, 256> out{};
         out.fill(-1);
-        for (int i = 0; i < 26; ++i) {
-            out[static_cast<std::size_t>('A' + i)] = static_cast<std::int8_t>(i);
-            out[static_cast<std::size_t>('a' + i)] = static_cast<std::int8_t>(26 + i);
+        for (std::size_t i = 0; i < 26; ++i) {
+            out['A' + i] = static_cast<std::int8_t>(i);
+            out['a' + i] = static_cast<std::int8_t>(26 + i);
         }
-        for (int i = 0; i < 10; ++i) {
-            out[static_cast<std::size_t>('0' + i)] = static_cast<std::int8_t>(52 + i);
-        }
+        for (std::size_t i = 0; i < 10; ++i) { out['0' + i] = static_cast<std::int8_t>(52 + i); }
         out[static_cast<std::size_t>('+')] = 62;
         out[static_cast<std::size_t>('/')] = 63;
         return out;

@@ -106,5 +106,5 @@ class VisionConfig:
 
 
 VISION_CFG = VisionConfig()
-ATTN_SCALE = CFG.head_dim ** -0.5
-GDN_SCALE = CFG.gdn_k_dim ** -0.5
+ATTN_SCALE = CFG.head_dim**-0.5
+GDN_SCALE = CFG.gdn_k_dim**-0.5

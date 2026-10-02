@@ -36,44 +36,28 @@ class KVCache:
             return
         shape = (self.capacity, CFG.kv_heads, CFG.head_dim)
         if self.dtype == "bf16":
-            self._k[layer] = torch.empty(
-                shape, device=self.device, dtype=torch.bfloat16
-            )
-            self._v[layer] = torch.empty(
-                shape, device=self.device, dtype=torch.bfloat16
-            )
+            self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
+            self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
         else:
             self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
             self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
             scales = (self.capacity, CFG.kv_heads, CFG.head_dim // 64)
-            self._ks[layer] = torch.empty(
-                scales, device=self.device, dtype=torch.float16
-            )
-            self._vs[layer] = torch.empty(
-                scales, device=self.device, dtype=torch.float16
-            )
+            self._ks[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
+            self._vs[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
 
     @staticmethod
     def _quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         groups = x.float().reshape(*x.shape[:-1], CFG.head_dim // 64, 64)
         scale = (groups.abs().amax(dim=-1) / 127.0).to(torch.float16)
         safe_scale = torch.where(scale == 0, torch.ones_like(scale), scale).float()
-        code = (
-            torch.round(groups / safe_scale.unsqueeze(-1))
-            .clamp(-127, 127)
-            .to(torch.int8)
-        )
+        code = torch.round(groups / safe_scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
         code = torch.where((scale == 0).unsqueeze(-1), 0, code).to(torch.int8)
         return code.reshape_as(x), scale
 
     @staticmethod
     def _dequantize(code: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         groups = code.float().reshape(*code.shape[:-1], CFG.head_dim // 64, 64)
-        return (
-            (groups * scale.float().unsqueeze(-1))
-            .reshape_as(code)
-            .to(torch.bfloat16)
-        )
+        return (groups * scale.float().unsqueeze(-1)).reshape_as(code).to(torch.bfloat16)
 
     def write(
         self,

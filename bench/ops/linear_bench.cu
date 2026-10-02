@@ -4,7 +4,7 @@
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
 //   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
 //   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-//   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
+//   ncu --profile-from-start off ./build/bench/ninfer_linear_bench
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
 #include "ninfer/ops/linear.h"
@@ -301,9 +301,9 @@ Sweep parse_sweep(std::string_view text) {
     }
     Sweep sweep;
     sweep.begin = parse_i32(value.substr(0, first), "sweep start");
-    sweep.end   = parse_i32(value.substr(first + 1, second == std::string::npos ? std::string::npos
-                                                                                : second - first - 1),
-                            "sweep end");
+    sweep.end = parse_i32(value.substr(first + 1, second == std::string::npos ? std::string::npos
+                                                                              : second - first - 1),
+                          "sweep end");
     if (second != std::string::npos) {
         sweep.step = parse_i32(value.substr(second + 1), "sweep step");
     }
@@ -490,32 +490,35 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
 
 LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        const auto codes = checked_mul(n, k, "FP8 codes");
+        const auto codes  = checked_mul(n, k, "FP8 codes");
         const auto scales = align_up(codes, 256);
-        const auto bytes = checked_add(scales, 2ULL * n, "FP8 payload");
+        const auto bytes  = checked_add(scales, 2ULL * n, "FP8 payload");
         LinearBenchWeight result{DeviceBuffer(bytes), {}, codes + 2ULL * n};
         CUDA_CHECK(cudaMemset(result.storage.p, 0x38, codes));
-        bench::detail::fill_f16_kernel<<<bench::detail::launch_grid(n), 256>>>(
+        bench::detail::fill_f16_kernel<<<bench::detail::launch_grid(n), 256, 0, cudaStreamLegacy>>>(
             reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(result.storage.p) + scales),
             n, 0x3b80);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
-        auto& w = result.weight;
-        w.qtype = qtype;
-        w.layout = QuantLayout::RowScale;
+        auto& w       = result.weight;
+        w.qtype       = qtype;
+        w.layout      = QuantLayout::RowScale;
         w.scale_dtype = DType::BF16;
         w.payload = w.qdata = result.storage.p;
-        w.payload_bytes = bytes;
-        w.scales = static_cast<std::uint8_t*>(result.storage.p) + scales;
+        w.payload_bytes     = bytes;
+        w.scales            = static_cast<std::uint8_t*>(result.storage.p) + scales;
         w.group_size = w.group = k;
-        w.ndim = 2;
+        w.ndim                 = 2;
         w.shape[0] = w.padded_shape[0] = n;
         w.shape[1] = w.padded_shape[1] = k;
-        w.n = n;
-        w.k = k;
-        w.scale_ne[0] = n;
-        w.scale_nb[0] = 2;
-        for (int i = 1; i < 4; ++i) { w.scale_ne[i] = 1; w.scale_nb[i] = 2LL * n; }
+        w.n                            = n;
+        w.k                            = k;
+        w.scale_ne[0]                  = n;
+        w.scale_nb[0]                  = 2;
+        for (int i = 1; i < 4; ++i) {
+            w.scale_ne[i] = 1;
+            w.scale_nb[i] = 2LL * n;
+        }
         for (int i = 2; i < 4; ++i) { w.shape[i] = w.padded_shape[i] = 1; }
         return result;
     }
@@ -567,7 +570,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
-    const double seconds = timing.median_us * 1.0e-6;
+    const double seconds      = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(model_bytes) / (kRtx5090DramGBs * 1.0e9) * 1.0e6;
 

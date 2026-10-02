@@ -330,34 +330,31 @@ DeviceBuffer make_normalized_bf16(std::size_t rows, std::uint32_t seed) {
 }
 
 struct Operands {
-    explicit Operands(Problem problem, bool normalized_qk)
-        : problem(problem),
+    explicit Operands(Problem shape, bool normalized_qk)
+        : problem(shape),
           q(normalized_qk
-                ? make_normalized_bf16(static_cast<std::size_t>(problem.qk_heads) * problem.tokens *
-                                           problem.batch,
+                ? make_normalized_bf16(static_cast<std::size_t>(shape.qk_heads) * shape.tokens *
+                                           shape.batch,
                                        0x12345678U)
                 : make_varied_bf16(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                       problem.qk_heads * problem.tokens * problem.batch,
+                                       shape.qk_heads * shape.tokens * shape.batch,
                                    0x12345678U)),
           k(normalized_qk
-                ? make_normalized_bf16(static_cast<std::size_t>(problem.qk_heads) * problem.tokens *
-                                           problem.batch,
+                ? make_normalized_bf16(static_cast<std::size_t>(shape.qk_heads) * shape.tokens *
+                                           shape.batch,
                                        0x87654321U)
                 : make_varied_bf16(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                       problem.qk_heads * problem.tokens * problem.batch,
+                                       shape.qk_heads * shape.tokens * shape.batch,
                                    0x87654321U)),
           v(make_varied_bf16(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                 problem.value_heads * problem.tokens * problem.batch,
+                                 shape.value_heads * shape.tokens * shape.batch,
                              0x31415926U)),
-          g(make_constant_f32(static_cast<std::size_t>(problem.value_heads) * problem.tokens *
-                                  problem.batch,
-                              -1.0F)),
-          beta(make_constant_f32(static_cast<std::size_t>(problem.value_heads) * problem.tokens *
-                                     problem.batch,
-                                 0.5F)),
+          g(make_constant_f32(
+              static_cast<std::size_t>(shape.value_heads) * shape.tokens * shape.batch, -1.0F)),
+          beta(make_constant_f32(
+              static_cast<std::size_t>(shape.value_heads) * shape.tokens * shape.batch, 0.5F)),
           out(make_zeros(static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                         problem.value_heads * problem.tokens * problem.batch *
-                         sizeof(std::uint16_t))) {}
+                         shape.value_heads * shape.tokens * shape.batch * sizeof(std::uint16_t))) {}
 
     Tensor query() const {
         return Tensor(
@@ -416,10 +413,10 @@ GraphMeasurement measure_graph(Launch& launch, DeviceBuffer& flush, cudaStream_t
 }
 
 double running_logical_bytes(const Problem& problem) {
-    const double tokens   = static_cast<double>(problem.tokens);
-    const double batch    = static_cast<double>(problem.batch);
-    const double qk_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                            problem.qk_heads * tokens * batch * sizeof(std::uint16_t);
+    const double tokens      = static_cast<double>(problem.tokens);
+    const double batch       = static_cast<double>(problem.batch);
+    const double qk_bytes    = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                               problem.qk_heads * tokens * batch * sizeof(std::uint16_t);
     const double value_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
                                problem.value_heads * tokens * batch * sizeof(std::uint16_t);
     const double gate_bytes =
@@ -431,10 +428,10 @@ double running_logical_bytes(const Problem& problem) {
 }
 
 double snapshot_logical_bytes(const Problem& problem) {
-    const double tokens   = static_cast<double>(problem.tokens);
-    const double batch    = static_cast<double>(problem.batch);
-    const double qk_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
-                            problem.qk_heads * tokens * batch * sizeof(std::uint16_t);
+    const double tokens      = static_cast<double>(problem.tokens);
+    const double batch       = static_cast<double>(problem.batch);
+    const double qk_bytes    = static_cast<double>(gated_delta_net_detail::kStateDim) *
+                               problem.qk_heads * tokens * batch * sizeof(std::uint16_t);
     const double value_bytes = static_cast<double>(gated_delta_net_detail::kStateDim) *
                                problem.value_heads * tokens * batch * sizeof(std::uint16_t);
     const double gate_bytes =
@@ -467,7 +464,9 @@ double state_tensor_bytes(const Problem& problem) {
 }
 
 double chunk_state_tensor_bytes(const Problem& problem) {
-    const double chunks = static_cast<double>(problem.tokens / gated_delta_net_detail::kChunkSize);
+    // Only full chunks publish a chunk state; a partial tail chunk does not.
+    const std::int32_t full_chunks = problem.tokens / gated_delta_net_detail::kChunkSize;
+    const double chunks            = static_cast<double>(full_chunks);
     return state_tensor_bytes(problem) * chunks * 0.5;
 }
 
@@ -562,8 +561,8 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
 
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer state_in  = make_zeros(state_elements * sizeof(float));
-    DeviceBuffer state_out = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_in            = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_out           = make_zeros(state_elements * sizeof(float));
 
     Tensor q       = operands.query();
     Tensor k       = operands.key();
@@ -612,8 +611,8 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
     const Problem problem{options.qk_heads, options.value_heads, tokens, options.batch};
     Operands operands(problem, false);
 
-    const std::size_t qk_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
-                                    problem.qk_heads * tokens * problem.batch;
+    const std::size_t qk_elements    = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
+                                       problem.qk_heads * tokens * problem.batch;
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
     const std::int32_t slots =
@@ -680,8 +679,8 @@ BenchRow run_snapshot(const Options& options, std::int32_t tokens, DeviceBuffer&
         const Tensor& q_input = composed ? q_norm : q;
         const Tensor& k_input = composed ? k_norm : k;
         ops::gated_delta_net_snapshot(q_input, k_input, v, g, beta, gated_delta_net_scale(),
-                                              !composed, ssm_states, valid, initial, snapshot_base, out,
-                                              launch_stream);
+                                      !composed, ssm_states, valid, initial, snapshot_base, out,
+                                      launch_stream);
     };
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
     const TrafficBytes traffic         = snapshot_traffic(problem, composed);
@@ -713,8 +712,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
 
     const std::size_t state_elements = static_cast<std::size_t>(gated_delta_net_detail::kStateDim) *
                                        gated_delta_net_detail::kStateDim * problem.value_heads;
-    DeviceBuffer state_in             = make_zeros(state_elements * sizeof(float));
-    DeviceBuffer state_out            = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_in            = make_zeros(state_elements * sizeof(float));
+    DeviceBuffer state_out           = make_zeros(state_elements * sizeof(float));
     const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
         problem.qk_heads, problem.value_heads, false, tokens, tokens);
     DeviceBuffer workspace = make_zeros(workspace_bytes);

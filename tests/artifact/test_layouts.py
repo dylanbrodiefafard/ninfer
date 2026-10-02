@@ -121,9 +121,7 @@ def test_row_split_geometry_and_encoded_size_are_derived_from_format_and_shape()
         ("W8G32_F16S", 33, (-127, -1, 0, 1, 127), b"\x81\xff\x00\x01\x7f", b""),
     ],
 )
-def test_row_split_plane_bit_order_and_round_trip(
-    format_name, k, prefix, base_prefix, high_prefix
-):
+def test_row_split_plane_bit_order_and_round_trip(format_name, k, prefix, base_prefix, high_prefix):
     geometry = row_split_geometry(format_name, (1, k))
     group_size = geometry.k_pad // geometry.groups_per_row
     codes = torch.zeros((1, geometry.groups_per_row, group_size), dtype=torch.int8)
@@ -140,13 +138,11 @@ def test_row_split_plane_bit_order_and_round_trip(
     assert payload[geometry.base_bytes : geometry.high_offset] == bytes(
         geometry.high_offset - geometry.base_bytes
     )
-    assert payload[
-        geometry.high_offset + geometry.high_bytes : geometry.scale_offset
-    ] == bytes(geometry.scale_offset - geometry.high_offset - geometry.high_bytes)
-
-    decoded_scales, decoded_codes = decode_row_split_codes(
-        payload, format_name, (1, k)
+    assert payload[geometry.high_offset + geometry.high_bytes : geometry.scale_offset] == bytes(
+        geometry.scale_offset - geometry.high_offset - geometry.high_bytes
     )
+
+    decoded_scales, decoded_codes = decode_row_split_codes(payload, format_name, (1, k))
     assert torch.equal(decoded_scales, scales)
     assert torch.equal(decoded_codes, codes)
 
@@ -192,26 +188,20 @@ def test_consecutive_views_arbitrary_gathers_and_standalone_assembly():
     )
     assert torch.equal(gathered_scales, scales[[3, 1]])
     assert torch.equal(gathered_codes, codes[[3, 1]])
-    expected = (
-        codes[[3, 1]].float() * scales[[3, 1]].float().unsqueeze(-1)
-    ).reshape(2, geometry.k_pad)[:, : shape[1]]
-    actual = dequantize_row_split(
-        gathered, format_name, (2, shape[1]), dtype=torch.float32
-    )
+    expected = (codes[[3, 1]].float() * scales[[3, 1]].float().unsqueeze(-1)).reshape(
+        2, geometry.k_pad
+    )[:, : shape[1]]
+    actual = dequantize_row_split(gathered, format_name, (2, shape[1]), dtype=torch.float32)
     assert torch.equal(actual, expected)
 
     resident = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
-    tensor_gather = gather_row_planes(
-        resident, geometry, torch.tensor([2, 0], dtype=torch.long)
-    )
+    tensor_gather = gather_row_planes(resident, geometry, torch.tensor([2, 0], dtype=torch.long))
     assert all(
         isinstance(plane, torch.Tensor)
         for plane in (tensor_gather.base, tensor_gather.high, tensor_gather.scale)
     )
     tensor_payload = assemble_row_planes(tensor_gather, format_name, shape[1])
-    tensor_scales, tensor_codes = decode_row_split_codes(
-        tensor_payload, format_name, (2, shape[1])
-    )
+    tensor_scales, tensor_codes = decode_row_split_codes(tensor_payload, format_name, (2, shape[1]))
     assert torch.equal(tensor_scales, scales[[2, 0]])
     assert torch.equal(tensor_codes, codes[[2, 0]])
 
@@ -235,10 +225,7 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     )
     packed[0, 0] = 0x10
     scales = (
-        torch.arange(128 * 4, dtype=torch.int64)
-        .remainder(0x7F)
-        .to(torch.uint8)
-        .reshape(128, 4)
+        torch.arange(128 * 4, dtype=torch.int64).remainder(0x7F).to(torch.uint8).reshape(128, 4)
     )
     divisor = struct.pack("<f", 2.5)
     payload = encode_nvfp4(packed, scales, divisor, shape)
@@ -246,18 +233,11 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     assert len(payload) == 4612
     assert payload[0] == 0x10  # low nibble is K=0; high nibble is K=1.
     for row, lane in ((0, 0), (31, 3), (32, 0), (127, 3)):
-        offset = (
-            geometry.scale_plane_offset
-            + (row % 32) * 16
-            + (row // 32) * 4
-            + lane
-        )
+        offset = geometry.scale_plane_offset + (row % 32) * 16 + (row // 32) * 4 + lane
         assert payload[offset] == int(scales[row, lane])
     assert payload[geometry.weight_divisor_offset :] == divisor
 
-    decoded_packed, decoded_scales, decoded_divisor = decode_nvfp4_words(
-        payload, shape
-    )
+    decoded_packed, decoded_scales, decoded_divisor = decode_nvfp4_words(payload, shape)
     assert torch.equal(decoded_packed, packed)
     assert torch.equal(decoded_scales, scales)
     assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
@@ -293,8 +273,6 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
         ),
     ],
 )
-def test_nvfp4_layout_rejects_out_of_contract_signatures(
-    layout, format_name, shape, message
-):
+def test_nvfp4_layout_rejects_out_of_contract_signatures(layout, format_name, shape, message):
     with pytest.raises(ValueError, match=message):
         encoded_size(layout, format_name, shape)

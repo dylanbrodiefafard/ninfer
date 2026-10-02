@@ -11,17 +11,17 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::int32_t kDflash2PathSelectTopK           = 16;
-inline constexpr std::int32_t kDflash2PathSelectRank           = 256;
-inline constexpr std::int32_t kDflash2PathSelectHidden         = 5120;
-inline constexpr std::int32_t kDflash2PathSelectCodebookRows   = 248320;
-inline constexpr std::int32_t kDflash2PathSelectShortlistRows  = 131072;
-inline constexpr std::int32_t kDflash2PathSelectMaxBatch       = 8;
+inline constexpr std::int32_t kDflash2PathSelectTopK                = 16;
+inline constexpr std::int32_t kDflash2PathSelectRank                = 256;
+inline constexpr std::int32_t kDflash2PathSelectHidden              = 5120;
+inline constexpr std::int32_t kDflash2PathSelectCodebookRows        = 248320;
+inline constexpr std::int32_t kDflash2PathSelectShortlistRows       = 131072;
+inline constexpr std::int32_t kDflash2PathSelectMaxBatch            = 8;
 inline constexpr std::int32_t kDflash2PathSelectMaxWidthWhenBatched = 16;
-inline constexpr int kDflash2PathSelectRngPurpose              = 16;
-inline constexpr std::int32_t kDflash2TreeFrontier             = 2;
-inline constexpr std::int32_t kDflash2TreeExpandWidth          = 16;
-inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
+inline constexpr int kDflash2PathSelectRngPurpose                   = 16;
+inline constexpr std::int32_t kDflash2TreeFrontier                  = 2;
+inline constexpr std::int32_t kDflash2TreeExpandWidth               = 16;
+inline constexpr std::int32_t kDflash2VerifyWidth                   = 12;
 
 /**
  * Op: dflash2_path_select
@@ -43,11 +43,11 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  *   configs is a device-resident SamplingConfig[B] (same buffer the round copies into ingress).
  *   The draft temperature is configs[b].draft_temperature * p_less_draft_temperature_scale when
  *   configs[b].p_less != 0, else configs[b].temperature (force_greedy makes it 0). The caller's
- *   scale calibrates the p-less draft temperature to the drafted block length. P-less temperature parameterizes the target
- *   distribution in sampling.h, not these draft scores: a 16-way softmax at the product p-less
- *   T=2 is nearly uniform, so p-less drafts use their own draft_temperature. If the draft
- *   temperature is <= 0, path[t,b] is the candidate with the greatest score; equal scores select
- *   the lower token id. Otherwise the 16 scores are softmax-normalized after dividing by the
+ *   scale calibrates the p-less draft temperature to the drafted block length. P-less temperature
+ * parameterizes the target distribution in sampling.h, not these draft scores: a 16-way softmax at
+ * the product p-less T=2 is nearly uniform, so p-less drafts use their own draft_temperature. If
+ * the draft temperature is <= 0, path[t,b] is the candidate with the greatest score; equal scores
+ * select the lower token id. Otherwise the 16 scores are softmax-normalized after dividing by the
  *   draft temperature and one candidate is drawn by inverse-CDF using
  *
  *     u = splitmix64(configs[b].seed ^ seed_xor,
@@ -91,8 +91,8 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
  * Numeric:
  *   Top-k and greedy path ids are exact functions of the represented BF16 logits/scores. The
  *   score formula is evaluated by the oracle in FP64 from represented inputs and the logical FP32
- *   dequantized W_h. Stochastic draws are a function of (seeds[b], logical position, purpose); the Op does
- *   not promise a particular host RNG bitstream as a public numeric output.
+ *   dequantized W_h. Stochastic draws are a function of (seeds[b], logical position, purpose); the
+ * Op does not promise a particular host RNG bitstream as a public numeric output.
  *
  * Effects:
  *   Writes all of path. When selector tensors are provided, writes all of them. Inputs are
@@ -111,14 +111,13 @@ inline constexpr std::int32_t kDflash2VerifyWidth              = 12;
 void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Weight& hidden_projection, const Tensor& pred_code,
                          const Tensor& succ_code, const Tensor& anchors,
-                         const Tensor& logical_positions,
-                         const SamplingConfig* configs, Tensor& path, WorkspaceArena& workspace,
-                         cudaStream_t stream, const Tensor* logit_token_ids = nullptr,
+                         const Tensor& logical_positions, const SamplingConfig* configs,
+                         Tensor& path, WorkspaceArena& workspace, cudaStream_t stream,
+                         const Tensor* logit_token_ids = nullptr,
                          const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr,
                          Tensor* selector_ids = nullptr, Tensor* selector_q = nullptr,
                          unsigned long long seed_xor = 0, std::int32_t position_offset = 0,
-                         bool force_greedy = false,
-                         float p_less_draft_temperature_scale = 1.0f);
+                         bool force_greedy = false, float p_less_draft_temperature_scale = 1.0f);
 
 /**
  * Op: dflash2_tree_select

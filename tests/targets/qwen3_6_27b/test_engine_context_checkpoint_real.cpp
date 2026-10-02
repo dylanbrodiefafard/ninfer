@@ -12,17 +12,17 @@
 
 namespace {
 
-constexpr std::uint32_t kMark            = 24576;
-constexpr std::uint32_t kSecondMark      = 36864;
-constexpr std::uint32_t kHundredMark     = 102400;
-constexpr std::uint32_t k150Mark         = 151552;
-constexpr std::uint32_t kCatchStart      = 8000;
+constexpr std::uint32_t kMark        = 24576;
+constexpr std::uint32_t kSecondMark  = 36864;
+constexpr std::uint32_t kHundredMark = 102400;
+constexpr std::uint32_t k150Mark     = 151552;
+constexpr std::uint32_t kCatchStart  = 8000;
 // Resume 8000, then five 4096 chunks: 12096, 16192, 20288, 24384, 28480.
 // Prompt is one token past that last chunk end so prefill commits 28480.
-constexpr std::uint32_t kCatchFreeze     = 28481;
-constexpr std::uint32_t kCatchFreezeF    = 28480;
-constexpr std::uint32_t kDecodeStart     = 24000;
-constexpr std::uint32_t kDecodeOutputs   = 800;
+constexpr std::uint32_t kCatchFreeze   = 28481;
+constexpr std::uint32_t kCatchFreezeF  = 28480;
+constexpr std::uint32_t kDecodeStart   = 24000;
+constexpr std::uint32_t kDecodeOutputs = 800;
 // One generated token leaves E == F, so a suffix of the frozen prefix is
 // AppendAtFrontier. Two outputs move E past F and make RestoreContextCheckpoint
 // observable on a probe that matches F but not E.
@@ -30,53 +30,53 @@ constexpr std::uint32_t kPastFreezeOutputs = 2;
 // 24k INT8-G64 Main+MTP plus current/rewrite GDN and one ladder head is already
 // >1 GiB. Catch-up at ~28k and two-mark at 36k need more; keep a 4 GiB FIFO so
 // an eviction dump actually lands instead of returning FullReset.
-constexpr std::size_t kRamBytes          = 4ULL * 1024ULL * 1024ULL * 1024ULL;
-constexpr ninfer::TokenId kPadA          = 198;
-constexpr ninfer::TokenId kPadB          = 199;
-constexpr ninfer::TokenId kPadC          = 201;
-constexpr ninfer::TokenId kPadCatch      = 202;
-constexpr ninfer::TokenId kPadCancel     = 203;
-constexpr ninfer::TokenId kPadC2A        = 210;
-constexpr ninfer::TokenId kPadC2B        = 211;
-constexpr ninfer::TokenId kPadC2C        = 212;
-constexpr ninfer::TokenId kPadC2D        = 213;
-constexpr ninfer::TokenId kPadC2E        = 214;
-constexpr ninfer::TokenId kPadDecode     = 215;
-constexpr ninfer::TokenId kPadEvict      = 216;
-constexpr ninfer::TokenId kPadC3A        = 220;
-constexpr ninfer::TokenId kPadC3B        = 221;
-constexpr ninfer::TokenId kPadC3C        = 222;
-constexpr ninfer::TokenId kPadC3D        = 223;
-constexpr ninfer::TokenId kPadC3E        = 224;
-constexpr ninfer::TokenId kPadEq         = 225;
-constexpr ninfer::TokenId kPadEq2        = 226;
-constexpr ninfer::TokenId kPadTwoMark    = 227;
-constexpr ninfer::TokenId kPadMtpOff     = 228;
-constexpr ninfer::TokenId kPadRb1        = 230;
-constexpr ninfer::TokenId kPadRb2        = 231;
-constexpr ninfer::TokenId kPadRb3        = 232;
-constexpr ninfer::TokenId kPadRbEvict    = 233;
-constexpr ninfer::TokenId kPadRbC2       = 234;
-constexpr ninfer::TokenId kPadRbC3       = 235;
-constexpr ninfer::TokenId kPadRbCold     = 236;
-constexpr ninfer::TokenId kPadOracle     = 237;
-constexpr ninfer::TokenId kPadRamShort   = 238;
-constexpr ninfer::TokenId kPadC3F        = 239;
-constexpr ninfer::TokenId kPad150        = 240;
-constexpr ninfer::TokenId kPadDropA      = 241;
-constexpr ninfer::TokenId kPadDropB      = 242;
-constexpr ninfer::TokenId kPadCtl        = 243;
-constexpr ninfer::TokenId kPadCtlOff     = 244;
-constexpr ninfer::TokenId kPadCtlHit     = 245;
-constexpr ninfer::TokenId kPadCtlRam     = 247;
-constexpr ninfer::TokenId kDiverge       = 200;
-constexpr ninfer::TokenId kFlip          = 197;
+constexpr std::size_t kRamBytes        = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr ninfer::TokenId kPadA        = 198;
+constexpr ninfer::TokenId kPadB        = 199;
+constexpr ninfer::TokenId kPadC        = 201;
+constexpr ninfer::TokenId kPadCatch    = 202;
+constexpr ninfer::TokenId kPadCancel   = 203;
+constexpr ninfer::TokenId kPadC2A      = 210;
+constexpr ninfer::TokenId kPadC2B      = 211;
+constexpr ninfer::TokenId kPadC2C      = 212;
+constexpr ninfer::TokenId kPadC2D      = 213;
+constexpr ninfer::TokenId kPadC2E      = 214;
+constexpr ninfer::TokenId kPadDecode   = 215;
+constexpr ninfer::TokenId kPadEvict    = 216;
+constexpr ninfer::TokenId kPadC3A      = 220;
+constexpr ninfer::TokenId kPadC3B      = 221;
+constexpr ninfer::TokenId kPadC3C      = 222;
+constexpr ninfer::TokenId kPadC3D      = 223;
+constexpr ninfer::TokenId kPadC3E      = 224;
+constexpr ninfer::TokenId kPadEq       = 225;
+constexpr ninfer::TokenId kPadEq2      = 226;
+constexpr ninfer::TokenId kPadTwoMark  = 227;
+constexpr ninfer::TokenId kPadMtpOff   = 228;
+constexpr ninfer::TokenId kPadRb1      = 230;
+constexpr ninfer::TokenId kPadRb2      = 231;
+constexpr ninfer::TokenId kPadRb3      = 232;
+constexpr ninfer::TokenId kPadRbEvict  = 233;
+constexpr ninfer::TokenId kPadRbC2     = 234;
+constexpr ninfer::TokenId kPadRbC3     = 235;
+constexpr ninfer::TokenId kPadRbCold   = 236;
+constexpr ninfer::TokenId kPadOracle   = 237;
+constexpr ninfer::TokenId kPadRamShort = 238;
+constexpr ninfer::TokenId kPadC3F      = 239;
+constexpr ninfer::TokenId kPad150      = 240;
+constexpr ninfer::TokenId kPadDropA    = 241;
+constexpr ninfer::TokenId kPadDropB    = 242;
+constexpr ninfer::TokenId kPadCtl      = 243;
+constexpr ninfer::TokenId kPadCtlOff   = 244;
+constexpr ninfer::TokenId kPadCtlHit   = 245;
+constexpr ninfer::TokenId kPadCtlRam   = 247;
+constexpr ninfer::TokenId kDiverge     = 200;
+constexpr ninfer::TokenId kFlip        = 197;
 
-ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t max_concurrency = 1,
-                                     std::uint32_t kv_tokens = 32768, bool vision = false,
-                                     std::uint32_t max_context = 32768,
-                                     ninfer::SpeculativeBackend spec =
-                                         ninfer::SpeculativeBackend::Mtp) {
+ninfer::EngineOptions
+engine_options(const char* artifact, std::uint32_t max_concurrency = 1,
+               std::uint32_t kv_tokens = 32768, bool vision = false,
+               std::uint32_t max_context       = 32768,
+               ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = max_context;
@@ -87,9 +87,9 @@ ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t max_con
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend       = spec;
     options.speculative.draft_tokens  = spec == ninfer::SpeculativeBackend::None ? 0 : 3;
-    options.speculative.proposal_head =
-        spec == ninfer::SpeculativeBackend::None ? ninfer::ProposalHead::Full
-                                                 : ninfer::ProposalHead::Optimized;
+    options.speculative.proposal_head = spec == ninfer::SpeculativeBackend::None
+                                            ? ninfer::ProposalHead::Full
+                                            : ninfer::ProposalHead::Optimized;
     options.enable_vision             = vision;
     options.use_cuda_graph            = true;
     return options;
@@ -97,11 +97,11 @@ ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t max_con
 
 ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse, bool pin = false) {
     ninfer::RequestOptions options;
-    options.execution.requested_output_tokens = outputs;
-    options.execution.sampling.temperature    = 0.0F;
-    options.execution.allow_prefix_reuse      = reuse;
+    options.execution.requested_output_tokens    = outputs;
+    options.execution.sampling.temperature       = 0.0F;
+    options.execution.allow_prefix_reuse         = reuse;
     options.execution.capture_context_checkpoint = pin;
-    options.stop.include_model_defaults       = false;
+    options.stop.include_model_defaults          = false;
     return options;
 }
 
@@ -277,9 +277,8 @@ int wait_committed_decode(ninfer::Engine& engine, std::uint64_t minimum, const c
 
 int verify_loaded(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    const bool ok_target =
-        (load.target == "qwen3_8_27b" || load.target == "qwen3_6_27b") &&
-        (load.weights_id == "nvfp4" || load.weights_id == "groupwise-int");
+    const bool ok_target = (load.target == "qwen3_8_27b" || load.target == "qwen3_6_27b") &&
+                           (load.weights_id == "nvfp4" || load.weights_id == "groupwise-int");
     if (!ok_target || load.host_to_device_bytes == 0) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
                   << " weights=" << load.weights_id << '\n';
@@ -322,8 +321,8 @@ int exercise_decode_past_mark(ninfer::Engine& engine) {
     if (hit.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
         hit.reused_prompt_tokens != 0) {
         std::cerr << "decode-only past 24576 still reused prefix state: path="
-                  << path_name(hit.prefix_reuse_path)
-                  << " reused=" << hit.reused_prompt_tokens << '\n';
+                  << path_name(hit.prefix_reuse_path) << " reused=" << hit.reused_prompt_tokens
+                  << '\n';
         return 1;
     }
     return 0;
@@ -373,14 +372,12 @@ int exercise_single_lane(const char* artifact,
     eq2_diverge.insert(eq2_diverge.end(), 8, kDiverge);
     const ninfer::GenerationResult eq2_ram =
         engine.generate(engine.prepare_tokens(eq2_diverge), greedy(4, true));
-    if (const int rc = expect_append(eq2_ram, ninfer::PrefixReuseSource::HostRam, kMark,
-                                     "E==F RAM suffix");
+    if (const int rc =
+            expect_append(eq2_ram, ninfer::PrefixReuseSource::HostRam, kMark, "E==F RAM suffix");
         rc != 0) {
         return rc;
     }
-    if (eq2_ram.kv_ram_load_seconds <= 0.0) {
-        return fail("RAM append reported no H2D load_ms");
-    }
+    if (eq2_ram.kv_ram_load_seconds <= 0.0) { return fail("RAM append reported no H2D load_ms"); }
 
     const auto prompt_a = padded(kPadA, kMark);
     const ninfer::GenerationResult capture =
@@ -401,9 +398,7 @@ int exercise_single_lane(const char* artifact,
         rc != 0) {
         return rc;
     }
-    if (vram.kv_ram_load_seconds != 0.0) {
-        return fail("E>F VRAM restore billed a RAM load");
-    }
+    if (vram.kv_ram_load_seconds != 0.0) { return fail("E>F VRAM restore billed a RAM load"); }
 
     const auto prompt_b = padded(kPadB, kMark);
     const ninfer::GenerationResult evict =
@@ -419,9 +414,7 @@ int exercise_single_lane(const char* artifact,
         rc != 0) {
         return rc;
     }
-    if (ram.kv_ram_load_seconds <= 0.0) {
-        return fail("E>F RAM restore reported no H2D load_ms");
-    }
+    if (ram.kv_ram_load_seconds <= 0.0) { return fail("E>F RAM restore reported no H2D load_ms"); }
 
     const ninfer::GenerationResult keep_f =
         engine.generate(engine.prepare_tokens(prompt_a), greedy(1, true));
@@ -431,14 +424,13 @@ int exercise_single_lane(const char* artifact,
         return rc;
     }
 
-    auto flipped = prompt_a;
+    auto flipped   = prompt_a;
     flipped.back() = kFlip;
     const ninfer::GenerationResult miss =
         engine.generate(engine.prepare_tokens(flipped), greedy(1, true));
     if (miss.prefix_reuse_path != ninfer::PrefixReusePath::FullReset ||
         miss.reused_prompt_tokens != 0) {
-        std::cerr << "last-token hash miss reused F: path="
-                  << path_name(miss.prefix_reuse_path)
+        std::cerr << "last-token hash miss reused F: path=" << path_name(miss.prefix_reuse_path)
                   << " reused=" << miss.reused_prompt_tokens << '\n';
         return 1;
     }
@@ -518,8 +510,9 @@ int exercise_catch_up(const char* artifact, ninfer::SpeculativeBackend spec) {
     rollback_edit.insert(rollback_edit.end(), 8, kDiverge);
     const ninfer::GenerationResult rollback =
         engine.generate(engine.prepare_tokens(rollback_edit), greedy(kPastFreezeOutputs, true));
-    if (const int rc = expect_rollback(rollback, ninfer::PrefixReuseSource::VramResident, e1,
-                                       "catch-up rollback D2D after ladder freeze borrowed staging");
+    if (const int rc =
+            expect_rollback(rollback, ninfer::PrefixReuseSource::VramResident, e1,
+                            "catch-up rollback D2D after ladder freeze borrowed staging");
         rc != 0) {
         return rc;
     }
@@ -564,8 +557,8 @@ int exercise_cancel(const char* artifact, ninfer::SpeculativeBackend spec) {
         const ninfer::GenerationResult cancelled =
             engine.generate(engine.prepare_tokens(prompt), greedy(1, true), nullptr, cancel);
         if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
-            std::cerr << label << " finish_reason is "
-                      << static_cast<int>(cancelled.finish_reason) << ", expected Cancelled\n";
+            std::cerr << label << " finish_reason is " << static_cast<int>(cancelled.finish_reason)
+                      << ", expected Cancelled\n";
             return 1;
         }
         if (extra_tokens < kMark && cancelled.captured_context_checkpoint_tokens != 0) {
@@ -583,8 +576,7 @@ int exercise_cancel(const char* artifact, ninfer::SpeculativeBackend spec) {
         const ninfer::GenerationResult after =
             engine.generate(engine.prepare_tokens(diverge), greedy(4, true));
         if (after.prefix_reuse_path == ninfer::PrefixReusePath::RestoreContextCheckpoint) {
-            std::cerr << label
-                      << " left a hittable ladder head after abort: path="
+            std::cerr << label << " left a hittable ladder head after abort: path="
                       << path_name(after.prefix_reuse_path)
                       << " reused=" << after.reused_prompt_tokens << '\n';
             return 1;
@@ -613,9 +605,8 @@ int exercise_cancel(const char* artifact, ninfer::SpeculativeBackend spec) {
                       pin_r1.generated_token_ids.end());
     pin_follow.resize(8192, 198);
     const auto before_pin = engine.runtime_stats().computed_prefill_tokens;
-    ninfer::CancellationView pin_cancel([&] {
-        return engine.runtime_stats().computed_prefill_tokens >= before_pin + 4096;
-    });
+    ninfer::CancellationView pin_cancel(
+        [&] { return engine.runtime_stats().computed_prefill_tokens >= before_pin + 4096; });
     const ninfer::GenerationResult pin_cancelled =
         engine.generate(engine.prepare_tokens(pin_follow), greedy(1, true), nullptr, pin_cancel);
     if (pin_cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
@@ -686,7 +677,7 @@ int exercise_c2(const char* artifact, ninfer::SpeculativeBackend spec) {
 
     const auto prompt_c = padded(kPadC2C, kMark);
     auto restore_a      = engine.submit(engine.prepare_tokens(diverge_a), greedy(4, true));
-    auto cold_c         = engine.submit(engine.prepare_tokens(prompt_c), greedy(kPastFreezeOutputs, true));
+    auto cold_c = engine.submit(engine.prepare_tokens(prompt_c), greedy(kPastFreezeOutputs, true));
     const ninfer::GenerationResult mixed_restore = restore_a.wait();
     const ninfer::GenerationResult mixed_cold    = cold_c.wait();
     if (const int rc = expect_restore(mixed_restore, ninfer::PrefixReuseSource::VramResident, kMark,
@@ -769,8 +760,8 @@ ninfer::PromptInput vision_user(const std::string& before, bool with_image,
     }
     if (with_image) { message.parts.push_back(ppm_part(ppm, "inline.ppm")); }
     if (!after.empty()) {
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = after, .media = {}});
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = after, .media = {}});
     }
     ninfer::PromptInput input;
     input.messages.push_back(std::move(message));
@@ -794,7 +785,7 @@ int exercise_vision(const char* artifact) {
     if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
     const auto image_bytes = gradient_ppm();
 
-    std::size_t hi = 1024;
+    std::size_t hi       = 1024;
     auto count_image_pad = [&](std::size_t units) {
         return engine.count_tokens(vision_user({}, true, image_bytes, pad_units(units)));
     };
@@ -811,11 +802,10 @@ int exercise_vision(const char* artifact) {
             hi = mid;
         }
     }
-    const std::size_t mark_units    = hi;
-    const std::size_t capture_units = mark_units + 2048;
-    const std::string capture_text = pad_units(capture_units);
-    ninfer::PromptInput complete_input =
-        vision_user({}, true, image_bytes, capture_text);
+    const std::size_t mark_units       = hi;
+    const std::size_t capture_units    = mark_units + 2048;
+    const std::string capture_text     = pad_units(capture_units);
+    ninfer::PromptInput complete_input = vision_user({}, true, image_bytes, capture_text);
     const ninfer::GenerationResult complete_capture =
         engine.generate(engine.prepare(complete_input), greedy(kPastFreezeOutputs, true));
     if (complete_capture.generated_token_ids.size() != kPastFreezeOutputs ||
@@ -826,10 +816,9 @@ int exercise_vision(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    std::string probe_text = capture_text;
-    probe_text.back()      = 'z';
-    ninfer::PromptInput complete_probe =
-        vision_user({}, true, image_bytes, probe_text);
+    std::string probe_text             = capture_text;
+    probe_text.back()                  = 'z';
+    ninfer::PromptInput complete_probe = vision_user({}, true, image_bytes, probe_text);
     const ninfer::GenerationResult complete_hit =
         engine.generate(engine.prepare(std::move(complete_probe)), greedy(4, true));
     if (const int rc = expect_restore(complete_hit, ninfer::PrefixReuseSource::VramResident, kMark,
@@ -842,8 +831,7 @@ int exercise_vision(const char* artifact) {
     if (vision_evict.generated_token_ids.size() != 1) {
         return fail("vision RAM eviction did not complete");
     }
-    ninfer::PromptInput complete_ram_probe =
-        vision_user({}, true, image_bytes, capture_text);
+    ninfer::PromptInput complete_ram_probe = vision_user({}, true, image_bytes, capture_text);
     const ninfer::GenerationResult complete_ram =
         engine.generate(engine.prepare(std::move(complete_ram_probe)), greedy(4, true));
     if (const int rc = expect_restore(complete_ram, ninfer::PrefixReuseSource::HostRam, kMark,
@@ -899,18 +887,17 @@ int exercise_vision(const char* artifact) {
         engine.generate(engine.prepare(std::move(split_replay)), greedy(4, true));
     if (split_complete_hit.reused_prompt_tokens < split_f) {
         std::cerr << "vision split exact replay reused " << split_complete_hit.reused_prompt_tokens
-                  << ", expected at least freeze " << split_f << " path="
-                  << path_name(split_complete_hit.prefix_reuse_path) << '\n';
+                  << ", expected at least freeze " << split_f
+                  << " path=" << path_name(split_complete_hit.prefix_reuse_path) << '\n';
         return 1;
     }
-    if (split_complete_hit.prefix_reuse_path ==
-        ninfer::PrefixReusePath::RestoreContextCheckpoint) {
+    if (split_complete_hit.prefix_reuse_path == ninfer::PrefixReusePath::RestoreContextCheckpoint) {
         if (split_complete_hit.reused_prompt_tokens != split_f ||
             split_complete_hit.restored_context_checkpoint_tokens != split_f) {
             std::cerr << "vision split ladder exact replay reused "
                       << split_complete_hit.reused_prompt_tokens << " restored "
-                      << split_complete_hit.restored_context_checkpoint_tokens
-                      << ", expected " << split_f << '\n';
+                      << split_complete_hit.restored_context_checkpoint_tokens << ", expected "
+                      << split_f << '\n';
             return 1;
         }
     } else if (split_complete_hit.prefix_reuse_path ==
@@ -920,8 +907,7 @@ int exercise_vision(const char* artifact) {
         // Same-F tie keeps rewrite; a later TurnClosure also beats the catch-up head.
         if (split_complete_hit.restored_context_checkpoint_tokens != 0) {
             std::cerr << "vision split rewrite exact replay restored "
-                      << split_complete_hit.restored_context_checkpoint_tokens
-                      << ", expected 0\n";
+                      << split_complete_hit.restored_context_checkpoint_tokens << ", expected 0\n";
             return 1;
         }
     } else {
@@ -1002,9 +988,8 @@ int exercise_c3(const char* artifact, ninfer::SpeculativeBackend spec) {
     const auto prompt_d = padded(kPadC3D, kMark);
     const auto prompt_e = padded(kPadC3E, kMark);
     auto restore_a      = engine.submit(engine.prepare_tokens(diverge_a), greedy(4, true));
-    auto cold_d =
-        engine.submit(engine.prepare_tokens(prompt_d), greedy(kPastFreezeOutputs, true));
-    auto cold_e         = engine.submit(engine.prepare_tokens(prompt_e), greedy(1, false));
+    auto cold_d = engine.submit(engine.prepare_tokens(prompt_d), greedy(kPastFreezeOutputs, true));
+    auto cold_e = engine.submit(engine.prepare_tokens(prompt_e), greedy(1, false));
     const ninfer::GenerationResult mixed_restore = restore_a.wait();
     const ninfer::GenerationResult mixed_cold_d  = cold_d.wait();
     const ninfer::GenerationResult mixed_cold_e  = cold_e.wait();
@@ -1018,8 +1003,8 @@ int exercise_c3(const char* artifact, ninfer::SpeculativeBackend spec) {
         mixed_cold_e.generated_token_ids.size() != 1 ||
         mixed_cold_e.prefix_reuse_path != ninfer::PrefixReusePath::FullReset) {
         std::cerr << "C=3 companion full chats were not cold prefills: d_path="
-                  << path_name(mixed_cold_d.prefix_reuse_path) << " e_path="
-                  << path_name(mixed_cold_e.prefix_reuse_path) << '\n';
+                  << path_name(mixed_cold_d.prefix_reuse_path)
+                  << " e_path=" << path_name(mixed_cold_e.prefix_reuse_path) << '\n';
         return 1;
     }
     if (const int rc = expect_captured(mixed_cold_d, kMark, "C=3 freeze during concurrent restore");
@@ -1082,8 +1067,8 @@ int exercise_restore_matches_cold(const char* artifact, ninfer::SpeculativeBacke
     }
     const ninfer::GenerationResult ram =
         engine.generate(engine.prepare_tokens(diverge), greedy(4, true));
-    if (const int rc = expect_restore(ram, ninfer::PrefixReuseSource::HostRam, kMark,
-                                      "restore-vs-cold RAM");
+    if (const int rc =
+            expect_restore(ram, ninfer::PrefixReuseSource::HostRam, kMark, "restore-vs-cold RAM");
         rc != 0) {
         return rc;
     }
@@ -1136,8 +1121,8 @@ int exercise_ram_shorter_ladder(const char* artifact, ninfer::SpeculativeBackend
     if (dropped.reused_prompt_tokens == kSecondMark) {
         return fail("RAM shorter occupy still restored the evicted 36864 head");
     }
-    if (const int rc = expect_captured(dropped, kSecondMark,
-                                       "RAM shorter occupy recaptured 36864 after drop");
+    if (const int rc =
+            expect_captured(dropped, kSecondMark, "RAM shorter occupy recaptured 36864 after drop");
         rc != 0) {
         return rc;
     }
@@ -1187,9 +1172,8 @@ int exercise_c3_cancel_during_decode(const char* artifact, ninfer::SpeculativeBa
     }
 
     const auto before_prefill = engine.runtime_stats().computed_prefill_tokens;
-    ninfer::CancellationView cancel([&] {
-        return engine.runtime_stats().computed_prefill_tokens >= before_prefill + 4096;
-    });
+    ninfer::CancellationView cancel(
+        [&] { return engine.runtime_stats().computed_prefill_tokens >= before_prefill + 4096; });
     const ninfer::GenerationResult cancelled = engine.generate(
         engine.prepare_tokens(padded(kPadC3F, kMark)), greedy(1, true), nullptr, cancel);
     if (cancelled.finish_reason != ninfer::FinishReason::Cancelled) {
@@ -1294,7 +1278,7 @@ int exercise_rewrite_same_f(const char* artifact, ninfer::SpeculativeBackend spe
     ninfer::Engine engine(engine_options(artifact, 1, 32768, false, 32768, spec));
     if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
     auto text_preserve = [](const std::string& text) {
-        ninfer::PromptInput input = text_user(text);
+        ninfer::PromptInput input       = text_user(text);
         input.options.preserve_thinking = true;
         return input;
     };
@@ -1319,8 +1303,8 @@ int exercise_rewrite_same_f(const char* artifact, ninfer::SpeculativeBackend spe
         std::cerr << "rewrite same-F cannot land exactly on 24576 (got " << count_pad(hi) << ")\n";
         return 1;
     }
-    const ninfer::GenerationResult capture =
-        engine.generate(engine.prepare(text_preserve(pad_units(hi))), greedy(kPastFreezeOutputs, true));
+    const ninfer::GenerationResult capture = engine.generate(
+        engine.prepare(text_preserve(pad_units(hi))), greedy(kPastFreezeOutputs, true));
     if (capture.generated_token_ids.size() != kPastFreezeOutputs) {
         return fail("rewrite same-F capture did not complete");
     }
@@ -1365,7 +1349,8 @@ int exercise_c2_drop_during_decode(const char* artifact, ninfer::SpeculativeBack
     restore_b.insert(restore_b.end(), 8, kDiverge);
     constexpr std::uint32_t kDecodeHold = 64;
     auto hold_b = engine.submit(engine.prepare_tokens(restore_b), greedy(kDecodeHold, true));
-    if (const int rc = wait_committed_decode(engine, 1, "C=2 drop-during-decode B never entered decode");
+    if (const int rc =
+            wait_committed_decode(engine, 1, "C=2 drop-during-decode B never entered decode");
         rc != 0) {
         return rc;
     }
@@ -1438,8 +1423,9 @@ int exercise_150k(const char* artifact, ninfer::SpeculativeBackend spec) {
     }
     const ninfer::GenerationResult hit_dropped =
         engine.generate(engine.prepare_tokens(long_hit), greedy(4, true));
-    if (const int rc = expect_restore(hit_dropped, ninfer::PrefixReuseSource::VramResident,
-                                      kHundredMark, "150k later head dropped after restoring 102400");
+    if (const int rc =
+            expect_restore(hit_dropped, ninfer::PrefixReuseSource::VramResident, kHundredMark,
+                           "150k later head dropped after restoring 102400");
         rc != 0) {
         return rc;
     }
@@ -1450,8 +1436,8 @@ int exercise_150k(const char* artifact, ninfer::SpeculativeBackend spec) {
 }
 
 int exercise_mtp_off(const char* artifact) {
-    ninfer::Engine engine(engine_options(artifact, 1, 32768, false, 32768,
-                                         ninfer::SpeculativeBackend::None));
+    ninfer::Engine engine(
+        engine_options(artifact, 1, 32768, false, 32768, ninfer::SpeculativeBackend::None));
     if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
     const auto prompt = padded(kPadMtpOff, kMark);
     const ninfer::GenerationResult capture =
@@ -1471,9 +1457,7 @@ int exercise_mtp_off(const char* artifact) {
     }
     const ninfer::GenerationResult evict =
         engine.generate(engine.prepare_tokens(padded(kPadEvict, 8)), greedy(1, false));
-    if (evict.generated_token_ids.size() != 1) {
-        return fail("MTP-off eviction did not complete");
-    }
+    if (evict.generated_token_ids.size() != 1) { return fail("MTP-off eviction did not complete"); }
     std::vector<ninfer::TokenId> suffix = prompt;
     suffix.insert(suffix.end(), 8, kDiverge);
     const ninfer::GenerationResult hit =
@@ -1488,7 +1472,9 @@ int exercise_chat_rewrite_tie(const char* artifact, ninfer::SpeculativeBackend s
     ninfer::Engine engine(engine_options(artifact, 1, 32768, false, 32768, spec));
     if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
     std::size_t hi = 1024;
-    auto count_pad = [&](std::size_t units) { return engine.count_tokens(text_user(pad_units(units))); };
+    auto count_pad = [&](std::size_t units) {
+        return engine.count_tokens(text_user(pad_units(units)));
+    };
     while (count_pad(hi) < kMark) {
         hi *= 2;
         if (hi > 65536) { return fail("chat rewrite-tie pad search exceeded 65536 units"); }
@@ -1523,8 +1509,7 @@ int exercise_chat_rewrite_tie(const char* artifact, ninfer::SpeculativeBackend s
     if (replay.prefix_reuse_path != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
         replay.reused_prompt_tokens != kMark ||
         replay.restored_context_checkpoint_tokens != kMark) {
-        std::cerr << "chat exact replay after freeze: path="
-                  << path_name(replay.prefix_reuse_path)
+        std::cerr << "chat exact replay after freeze: path=" << path_name(replay.prefix_reuse_path)
                   << " reused=" << replay.reused_prompt_tokens
                   << " restored=" << replay.restored_context_checkpoint_tokens << '\n';
         return 1;
@@ -1535,7 +1520,7 @@ int exercise_chat_rewrite_tie(const char* artifact, ninfer::SpeculativeBackend s
 int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
     constexpr std::uint32_t kCustom = 8192;
     {
-        ninfer::EngineOptions options = engine_options(artifact, 1, 32768, false, 32768, spec);
+        ninfer::EngineOptions options    = engine_options(artifact, 1, 32768, false, 32768, spec);
         options.context_checkpoint_marks = std::vector<std::uint32_t>{kCustom};
         ninfer::Engine engine(std::move(options));
         if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
@@ -1576,13 +1561,14 @@ int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
             engine.generate(engine.prepare_tokens(frozen), greedy(1, true));
         if (ladder.prefix_reuse_path != ninfer::PrefixReusePath::RestoreContextCheckpoint ||
             ladder.restored_context_checkpoint_tokens != kCustom) {
-            std::cerr << "custom ladder after later pin: path=" << path_name(ladder.prefix_reuse_path)
+            std::cerr << "custom ladder after later pin: path="
+                      << path_name(ladder.prefix_reuse_path)
                       << " restored=" << ladder.restored_context_checkpoint_tokens << '\n';
             return 1;
         }
     }
     {
-        ninfer::EngineOptions options = engine_options(artifact, 1, 32768, false, 32768, spec);
+        ninfer::EngineOptions options    = engine_options(artifact, 1, 32768, false, 32768, spec);
         options.context_checkpoint_marks = std::vector<std::uint32_t>{};
         ninfer::Engine engine(std::move(options));
         if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
@@ -1618,8 +1604,8 @@ int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
         edit.insert(edit.end(), 32, 198);
         const ninfer::GenerationResult ram =
             engine.generate(engine.prepare_tokens(edit), greedy(1, true));
-        if (const int rc = expect_rollback(ram, ninfer::PrefixReuseSource::HostRam, e1,
-                                           "off RAM restore");
+        if (const int rc =
+                expect_rollback(ram, ninfer::PrefixReuseSource::HostRam, e1, "off RAM restore");
             rc != 0) {
             return rc;
         }
@@ -1630,7 +1616,7 @@ int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
         }
     }
     {
-        ninfer::EngineOptions options = engine_options(artifact, 1, 32768, false, 32768, spec);
+        ninfer::EngineOptions options    = engine_options(artifact, 1, 32768, false, 32768, spec);
         options.context_checkpoint_marks = std::vector<std::uint32_t>{};
         ninfer::Engine engine(std::move(options));
         if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
@@ -1657,8 +1643,7 @@ int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
         const ninfer::GenerationResult restore =
             engine.generate(engine.prepare_tokens(at_e), greedy(1, true));
         if (restore.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnRollback ||
-            restore.restored_context_checkpoint_tokens !=
-                static_cast<std::uint32_t>(at_e.size())) {
+            restore.restored_context_checkpoint_tokens != static_cast<std::uint32_t>(at_e.size())) {
             std::cerr << "exact-hit restore: path=" << path_name(restore.prefix_reuse_path)
                       << " restored=" << restore.restored_context_checkpoint_tokens << '\n';
             return 1;
@@ -1679,7 +1664,7 @@ int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
 }
 
 int exercise_turn_rollback(const char* artifact,
-                            ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
+                           ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
     constexpr std::uint32_t kRb = 256;
     const auto p1               = padded(kPadRb1, kRb);
     std::vector<ninfer::TokenId> follow;
@@ -1746,8 +1731,9 @@ int exercise_turn_rollback(const char* artifact,
         }
         const ninfer::GenerationResult vram_oracle =
             engine.generate(engine.prepare_tokens(edit), greedy(kPastFreezeOutputs, false));
-        if (const int rc = expect_same_tokens(hit.generated_token_ids, vram_oracle.generated_token_ids,
-                                              "VRAM rollback GDN vs cold prefill");
+        if (const int rc =
+                expect_same_tokens(hit.generated_token_ids, vram_oracle.generated_token_ids,
+                                   "VRAM rollback GDN vs cold prefill");
             rc != 0) {
             return rc;
         }
@@ -1766,8 +1752,9 @@ int exercise_turn_rollback(const char* artifact,
         }
         const ninfer::GenerationResult ram_oracle =
             engine.generate(engine.prepare_tokens(edit), greedy(kPastFreezeOutputs, false));
-        if (const int rc = expect_same_tokens(ram.generated_token_ids, ram_oracle.generated_token_ids,
-                                              "RAM rollback GDN vs cold prefill");
+        if (const int rc =
+                expect_same_tokens(ram.generated_token_ids, ram_oracle.generated_token_ids,
+                                   "RAM rollback GDN vs cold prefill");
             rc != 0) {
             return rc;
         }
@@ -1776,8 +1763,8 @@ int exercise_turn_rollback(const char* artifact,
     {
         ninfer::Engine denied_engine(engine_options(artifact, 1, 32768, false, 32768, spec));
         if (const int rc = verify_loaded(denied_engine); rc != 0) { return rc; }
-        const ninfer::GenerationResult denied_first =
-            denied_engine.generate(denied_engine.prepare_tokens(p1), greedy(kPastFreezeOutputs, true));
+        const ninfer::GenerationResult denied_first = denied_engine.generate(
+            denied_engine.prepare_tokens(p1), greedy(kPastFreezeOutputs, true));
         if (denied_first.generated_token_ids.size() != kPastFreezeOutputs) {
             return fail("no-prefix-reuse first visit did not generate");
         }
@@ -1824,8 +1811,8 @@ int exercise_turn_rollback(const char* artifact,
             rc != 0) {
             return rc;
         }
-        std::vector<ninfer::TokenId> c2_edit(c2_follow.begin(),
-                                             c2_follow.begin() + static_cast<std::ptrdiff_t>(c2_e1));
+        std::vector<ninfer::TokenId> c2_edit(
+            c2_follow.begin(), c2_follow.begin() + static_cast<std::ptrdiff_t>(c2_e1));
         c2_edit.push_back(kPadRb3);
         c2_edit.insert(c2_edit.end(), 32, 198);
         const ninfer::GenerationResult c2_hit =
@@ -1856,9 +1843,8 @@ int exercise_turn_rollback(const char* artifact,
         }
 
         const auto before_cold = c2.runtime_stats().computed_prefill_tokens;
-        ninfer::CancellationView cold_cancel([&] {
-            return c2.runtime_stats().computed_prefill_tokens >= before_cold + 4096;
-        });
+        ninfer::CancellationView cold_cancel(
+            [&] { return c2.runtime_stats().computed_prefill_tokens >= before_cold + 4096; });
         const ninfer::GenerationResult cold = c2.generate(
             c2.prepare_tokens(padded(kPadRbCold, 8192)), greedy(1, false), nullptr, cold_cancel);
         if (cold.finish_reason != ninfer::FinishReason::Cancelled) {
@@ -1880,17 +1866,17 @@ int exercise_turn_rollback(const char* artifact,
 // Exercise the Program acquisition boundary, not just the head's event helper:
 // an allocation failure must occur before DMA can borrow this head's buffers.
 int exercise_event_allocation(const char* artifact, ninfer::SpeculativeBackend spec) {
-    using Head = ninfer::targets::qwen3_6::detail::ContextCheckpointHead;
+    using Head                   = ninfer::targets::qwen3_6::detail::ContextCheckpointHead;
     constexpr std::uint32_t mark = 128;
-    auto options = [&] {
-        auto value = engine_options(artifact, 1, 2048, false, 2048, spec);
-        value.prefill_chunk = mark;
+    auto options                 = [&] {
+        auto value                     = engine_options(artifact, 1, 2048, false, 2048, spec);
+        value.prefill_chunk            = mark;
         value.context_checkpoint_marks = std::vector<std::uint32_t>{mark};
-        value.kv_cache = ninfer::KvCacheStorage::Nvfp4;
+        value.kv_cache                 = ninfer::KvCacheStorage::Nvfp4;
         return value;
     };
     const auto failed_prompt = padded(kPadCtl, mark);
-    const auto retry_prompt = padded(kPadCtlHit, mark);
+    const auto retry_prompt  = padded(kPadCtlHit, mark);
     std::vector<ninfer::TokenId> failed_tokens;
     std::vector<ninfer::TokenId> restored_tokens;
     {
@@ -1900,12 +1886,11 @@ int exercise_event_allocation(const char* artifact, ninfer::SpeculativeBackend s
         // One prefill chunk gives exactly one capture opportunity. A retry at a
         // later chunk would hide failure to preserve the optional-capture boundary.
         const auto failed = engine.generate(engine.prepare_tokens(failed_prompt), greedy(1, true));
-        if (Head::test_copy_event_allocation_pending() ||
-            failed.generated_token_ids.size() != 1 ||
+        if (Head::test_copy_event_allocation_pending() || failed.generated_token_ids.size() != 1 ||
             failed.captured_context_checkpoint_tokens != 0) {
             return fail("checkpoint event OOM did not drop only the optional Program capture");
         }
-        failed_tokens = failed.generated_token_ids;
+        failed_tokens       = failed.generated_token_ids;
         const auto captured = engine.generate(engine.prepare_tokens(retry_prompt), greedy(2, true));
         if (captured.generated_token_ids.size() != 2 ||
             captured.captured_context_checkpoint_tokens != mark) {
@@ -1923,8 +1908,10 @@ int exercise_event_allocation(const char* artifact, ninfer::SpeculativeBackend s
     // both the failed acquisition and the surviving/restored checkpoint state.
     {
         ninfer::Engine oracle(options());
-        const auto failed_cold = oracle.generate(oracle.prepare_tokens(failed_prompt), greedy(1, false));
-        const auto retry_cold = oracle.generate(oracle.prepare_tokens(retry_prompt), greedy(1, false));
+        const auto failed_cold =
+            oracle.generate(oracle.prepare_tokens(failed_prompt), greedy(1, false));
+        const auto retry_cold =
+            oracle.generate(oracle.prepare_tokens(retry_prompt), greedy(1, false));
         if (failed_tokens != failed_cold.generated_token_ids ||
             restored_tokens != retry_cold.generated_token_ids) {
             return fail("checkpoint event allocation recovery differs from fresh cold next token");
@@ -1961,45 +1948,42 @@ int exercise_artifact(const char* artifact, ninfer::SpeculativeBackend spec) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool single_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                             std::string(argv[2]) == "single";
-    const bool event_only = argc == 3 && std::string(argv[1]) == "--case" &&
-                            std::string(argv[2]) == "event-allocation";
+    const bool single_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "single";
+    const bool event_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "event-allocation";
     if (argc != 1 && !single_only && !event_only) {
         return fail("usage: checkpoint_real [--case single|event-allocation]");
     }
-    const auto run = [single_only, event_only](const char* artifact, ninfer::SpeculativeBackend spec) {
+    const auto run = [single_only, event_only](const char* artifact,
+                                               ninfer::SpeculativeBackend spec) {
         if (event_only) { return exercise_event_allocation(artifact, spec); }
-        return single_only ? exercise_single_lane(artifact, spec) : exercise_artifact(artifact, spec);
+        return single_only ? exercise_single_lane(artifact, spec)
+                           : exercise_artifact(artifact, spec);
     };
     try {
         const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
         const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
         const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-        if ((groupwise == nullptr || *groupwise == '\0') &&
-            (nvfp4 == nullptr || *nvfp4 == '\0') && (dflash == nullptr || *dflash == '\0')) {
+        if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
+            (dflash == nullptr || *dflash == '\0')) {
             std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
                          "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
                          "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
             return 77;
         }
         if (groupwise != nullptr && *groupwise != '\0') {
-            if (const int result =
-                    run(groupwise, ninfer::SpeculativeBackend::Mtp);
-                result != 0) {
+            if (const int result = run(groupwise, ninfer::SpeculativeBackend::Mtp); result != 0) {
                 return result;
             }
         }
         if (nvfp4 != nullptr && *nvfp4 != '\0') {
-            if (const int result = run(nvfp4, ninfer::SpeculativeBackend::Mtp);
-                result != 0) {
+            if (const int result = run(nvfp4, ninfer::SpeculativeBackend::Mtp); result != 0) {
                 return result;
             }
         }
         if (dflash != nullptr && *dflash != '\0') {
-            if (const int result =
-                    run(dflash, ninfer::SpeculativeBackend::DFlash);
-                result != 0) {
+            if (const int result = run(dflash, ninfer::SpeculativeBackend::DFlash); result != 0) {
                 return result;
             }
         }

@@ -66,7 +66,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity,
-                                                          const artifact::Binder& binder) {
+                                                 const artifact::Binder& binder) {
     (void)binder;
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
@@ -83,10 +83,10 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
 
 std::unique_ptr<Package::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
-    if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+    const LoadPlan consumed = std::move(plan);
+    if (consumed.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
     auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
-    plan.impl_.reset();
+        consumed.impl_->weights_profile, consumed.impl_->plan.bindings, std::move(materialized));
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
@@ -106,9 +106,9 @@ std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
                         std::unique_ptr<HostPinnedArena> kv_ram_arena) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(
-        model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device,
-        std::move(kv_ram_arena));
+    return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
+                                                    model.impl_->weights_profile, std::move(plan),
+                                                    device, std::move(kv_ram_arena));
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b

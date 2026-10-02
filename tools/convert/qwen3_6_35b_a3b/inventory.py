@@ -18,14 +18,13 @@ from tools.convert.qwen3_6.common.inventory import (
     Q6,
     RESOURCE_SPECS,
     ROW_SPLIT_LAYOUT,
+    W8,
     ResourceSpec,
     StoredObjectSpec,
     TensorSpec,
-    W8,
     build_vision_specs,
     tensor_spec,
 )
-
 
 MODEL_ID = "qwen3.6-35b-a3b"
 WEIGHTS_ID = "groupwise-int"
@@ -114,9 +113,7 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
         tensor_spec("mtp/embedding_norm", (2048,), BF16),
         tensor_spec("mtp/hidden_norm", (2048,), BF16),
         tensor_spec("mtp/layer/input_norm", (2048,), BF16),
-        tensor_spec(
-            "mtp/layer/attention/query_key_gate_value", (9216, 2048), W8
-        ),
+        tensor_spec("mtp/layer/attention/query_key_gate_value", (9216, 2048), W8),
         tensor_spec("mtp/layer/attention/query_norm", (256,), BF16),
         tensor_spec("mtp/layer/attention/key_norm", (256,), BF16),
         tensor_spec("mtp/layer/attention/output", (2048, 4096), W8),
@@ -177,8 +174,7 @@ FORMAT_COUNTS = {
     for numeric_format in FORMAT_NAMES
 }
 LAYOUT_COUNTS = {
-    layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
-    for layout in LAYOUT_NAMES
+    layout: sum(spec.layout == layout for spec in TENSOR_SPECS) for layout in LAYOUT_NAMES
 }
 
 
@@ -205,13 +201,13 @@ __all__ = [
     "Q6_ROUTED_DOWN_LAYERS",
     "RESOURCE_SPECS",
     "ROW_SPLIT_LAYOUT",
-    "ResourceSpec",
-    "StoredObjectSpec",
     "TARGET_KEY",
     "TENSOR_SPECS",
     "TEXT_CORE_TENSOR_SPECS",
     "TEXT_LAYERS",
-    "TensorSpec",
     "VISION_TENSOR_SPECS",
     "W8",
+    "ResourceSpec",
+    "StoredObjectSpec",
+    "TensorSpec",
 ]

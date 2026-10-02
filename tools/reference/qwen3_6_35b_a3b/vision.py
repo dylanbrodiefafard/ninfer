@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -154,9 +154,7 @@ class VisionEncoder:
             )
             offset = end
         if offset != pixels.shape[0]:
-            raise ValueError(
-                f"{modality} grid describes {offset} patches, got {pixels.shape[0]}"
-            )
+            raise ValueError(f"{modality} grid describes {offset} patches, got {pixels.shape[0]}")
         return items
 
     def _encode_item(
@@ -173,9 +171,7 @@ class VisionEncoder:
         weight = self._weight(vision.patch_embedding)
         x = add_bias(linear(x, weight), self._weight(vision.patch_embedding_bias))
         del weight
-        position = interpolate_position_embedding(
-            self._weight(vision.position_embedding), grid
-        )
+        position = interpolate_position_embedding(self._weight(vision.position_embedding), grid)
         x = residual_add(x, position)
         pos_ids = vision_position_ids(grid)
         cu_seqlens = vision_cu_seqlens(grid)
@@ -194,9 +190,7 @@ class VisionEncoder:
             qkv = qkv.reshape(-1, 3, VISION_CFG.heads, VISION_CFG.head_dim)
             q, k, v = qkv.unbind(1)
             q, k = apply_vision_rope(q, k, pos_ids)
-            attended = vision_attention(q, k, v, cu_seqlens).reshape(
-                -1, VISION_CFG.hidden
-            )
+            attended = vision_attention(q, k, v, cu_seqlens).reshape(-1, VISION_CFG.hidden)
             del qkv, q, k, v
             weight = self._weight(layer.attention_output)
             projected = add_bias(
@@ -256,9 +250,7 @@ class VisionEncoder:
         tap: Callable[[str, torch.Tensor], None] | None = None,
     ) -> VisionOutput:
         image_items = self._item_slices(pixel_values, image_grid_thw, "image")
-        video_items = self._item_slices(
-            pixel_values_videos, video_grid_thw, "video"
-        )
+        video_items = self._item_slices(pixel_values_videos, video_grid_thw, "video")
         items = image_items + video_items
         if not items:
             raise ValueError("vision encode requires image or video pixels and matching grids")
@@ -274,12 +266,10 @@ class VisionEncoder:
 
         started = time.perf_counter()
         image_outputs = [
-            self._encode_item(pixels, grid, name, tap)
-            for name, pixels, grid in image_items
+            self._encode_item(pixels, grid, name, tap) for name, pixels, grid in image_items
         ]
         video_outputs = [
-            self._encode_item(pixels, grid, name, tap)
-            for name, pixels, grid in video_items
+            self._encode_item(pixels, grid, name, tap) for name, pixels, grid in video_items
         ]
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -287,11 +277,7 @@ class VisionEncoder:
         image_embeddings = torch.cat(image_outputs) if image_outputs else None
         video_embeddings = torch.cat(video_outputs) if video_outputs else None
         elapsed = time.perf_counter() - started
-        peak = (
-            torch.cuda.max_memory_allocated(self.device)
-            if self.device.type == "cuda"
-            else 0
-        )
+        peak = torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
         stats = VisionStats(
             images=len(image_items),
             videos=len(video_items),
@@ -307,7 +293,7 @@ class VisionEncoder:
     def close(self) -> None:
         self.weights.close()
 
-    def __enter__(self) -> "VisionEncoder":
+    def __enter__(self) -> VisionEncoder:
         return self
 
     def __exit__(self, *_args) -> None:

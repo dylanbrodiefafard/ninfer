@@ -20,12 +20,14 @@ _LINE_RE = re.compile(
 def _parse(text: str) -> list:
     rows = []
     for match in _LINE_RE.finditer(text):
-        rows.append({
-            "point": match.group("label").strip(),
-            "median_us": float(match.group("median")),
-            "gbps": float(match.group("gbps")),
-            "roofline_pct": float(match.group("roofline")),
-        })
+        rows.append(
+            {
+                "point": match.group("label").strip(),
+                "median_us": float(match.group("median")),
+                "gbps": float(match.group("gbps")),
+                "roofline_pct": float(match.group("roofline")),
+            }
+        )
     return rows
 
 

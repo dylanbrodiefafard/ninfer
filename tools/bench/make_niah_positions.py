@@ -47,6 +47,7 @@ Usage:
     python3 tools/bench/make_niah_positions.py --length 8k --position mid \
         --out examples/cli/messages/long_niah_8k.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -83,9 +84,9 @@ LENGTH_CHARS = {
     "100k": 429_959,
     "128k": 554_226,
     "150k": 644_938,
-    "200k": 822_000,   # ~200k tokens
-    "240k": 1_022_700, # ~240k tokens, the opencode compaction point
-    "260k": 1_108_548, # whole master stream: ~260.1k tokens, ~261.1k with --multikey
+    "200k": 822_000,  # ~200k tokens
+    "240k": 1_022_700,  # ~240k tokens, the opencode compaction point
+    "260k": 1_108_548,  # whole master stream: ~260.1k tokens, ~261.1k with --multikey
 }
 # Position name -> fraction of document depth at which the needle is spliced.
 POS_FRACTION = {
@@ -103,17 +104,58 @@ NEEDLE_LINE_RE = re.compile(r"[^\n]*OFFICIAL RECORD[^\n]*")
 MULTIKEY_DISTRACTORS = 32
 MULTIKEY_NEAR_MISS = ("ORCHARD", "ORCA", "ORCHIS", "ORACLE")
 MULTIKEY_NAMES = (
-    "TULIP", "LOTUS", "IRIS", "DAHLIA", "ASTER", "LILAC", "POPPY", "VIOLET", "MAGNOLIA",
-    "CAMELLIA", "ZINNIA", "PEONY", "JASMINE", "HIBISCUS", "AZALEA", "BEGONIA", "FREESIA",
-    "GARDENIA", "HYACINTH", "LAVENDER", "MARIGOLD", "PRIMROSE", "SAFFRON", "THISTLE",
-    "VERBENA", "WISTERIA", "YARROW", "CLOVER")
-MULTIKEY_COLORS = ("CRIMSON", "AMBER", "JADE", "INDIGO", "SCARLET", "TEAL", "OCHRE", "SILVER",
-                   "IVORY", "MAROON", "OLIVE", "CERULEAN", "COPPER", "VIRIDIAN")
+    "TULIP",
+    "LOTUS",
+    "IRIS",
+    "DAHLIA",
+    "ASTER",
+    "LILAC",
+    "POPPY",
+    "VIOLET",
+    "MAGNOLIA",
+    "CAMELLIA",
+    "ZINNIA",
+    "PEONY",
+    "JASMINE",
+    "HIBISCUS",
+    "AZALEA",
+    "BEGONIA",
+    "FREESIA",
+    "GARDENIA",
+    "HYACINTH",
+    "LAVENDER",
+    "MARIGOLD",
+    "PRIMROSE",
+    "SAFFRON",
+    "THISTLE",
+    "VERBENA",
+    "WISTERIA",
+    "YARROW",
+    "CLOVER",
+)
+MULTIKEY_COLORS = (
+    "CRIMSON",
+    "AMBER",
+    "JADE",
+    "INDIGO",
+    "SCARLET",
+    "TEAL",
+    "OCHRE",
+    "SILVER",
+    "IVORY",
+    "MAROON",
+    "OLIVE",
+    "CERULEAN",
+    "COPPER",
+    "VIRIDIAN",
+)
 
 
 def _record(name: str, code: int, color: str) -> str:
-    return (f"OFFICIAL RECORD: The recovery code for the {name} relay is {code:06d}, "
-            f"and its registered status color is {color}.")
+    return (
+        f"OFFICIAL RECORD: The recovery code for the {name} relay is {code:06d}, "
+        f"and its registered status color is {color}."
+    )
 
 
 def multikey_distractors() -> list[str]:
@@ -142,6 +184,7 @@ def _repo_root() -> Path:
 
 # --- Master stream -----------------------------------------------------------
 
+
 def extract_master(master_path: Path) -> str:
     """The clean master stream = the master fixture's document with the needle
     line removed (and 3+ consecutive newlines collapsed to two). This is the
@@ -150,17 +193,18 @@ def extract_master(master_path: Path) -> str:
     msgs = raw if isinstance(raw, list) else raw.get("messages", [])
     user = next(m["content"] for m in msgs if m.get("role") == "user")
     i, e = user.find("<document>"), user.find("</document>")
-    doc = user[i + len("<document>"):e]
+    doc = user[i + len("<document>") : e]
     return re.sub(r"\n{3,}", "\n\n", NEEDLE_LINE_RE.sub("", doc))
 
 
 # --- Fixture construction ----------------------------------------------------
 
+
 def _line_boundary(text: str, pos: int) -> int:
     """The newline index at or before `pos` (the line boundary just before it),
     or 0 if there is none. Used to splice the needle at a clean line boundary."""
     j = text.rfind("\n", 0, max(1, pos))
-    return j if j > 0 else 0
+    return max(0, j)
 
 
 def _splice(essay: str, frac: float) -> str:
@@ -172,10 +216,10 @@ def _splice(essay: str, frac: float) -> str:
         return NEEDLE + "\n\n" + essay
     if frac >= 1.0:
         return essay.rstrip("\n") + "\n\n" + NEEDLE
-    j = _line_boundary(essay, int(round(len(essay) * frac)))
+    j = _line_boundary(essay, round(len(essay) * frac))
     if j <= 0:
         return NEEDLE + "\n\n" + essay
-    return essay[:j] + "\n\n" + NEEDLE + "\n\n" + essay[j + 1:]
+    return essay[:j] + "\n\n" + NEEDLE + "\n\n" + essay[j + 1 :]
 
 
 def _splice_line(essay: str, frac: float, line: str) -> str:
@@ -184,14 +228,15 @@ def _splice_line(essay: str, frac: float, line: str) -> str:
         return line + "\n\n" + essay
     if frac >= 1.0:
         return essay.rstrip("\n") + "\n\n" + line
-    j = _line_boundary(essay, int(round(len(essay) * frac)))
+    j = _line_boundary(essay, round(len(essay) * frac))
     if j <= 0:
         return line + "\n\n" + essay
-    return essay[:j] + "\n\n" + line + "\n\n" + essay[j + 1:]
+    return essay[:j] + "\n\n" + line + "\n\n" + essay[j + 1 :]
 
 
-def build_fixture(master: str, length_name: str, pos_name: str,
-                  multikey: bool = False) -> list[dict]:
+def build_fixture(
+    master: str, length_name: str, pos_name: str, multikey: bool = False
+) -> list[dict]:
     """A NIAH fixture for (length, position): a deterministic function of the
     (length, position) coordinates. Returns [system, user]."""
     target = LENGTH_CHARS[length_name]
@@ -226,8 +271,7 @@ def default_path(length_name: str, pos_name: str, multikey: bool = False) -> str
 
 def write_fixture(fixture: list[dict], rel_path: str, length_name: str, pos_name: str) -> None:
     root = _repo_root()
-    out = (Path(rel_path) if Path(rel_path).is_absolute()
-         else (Path(_repo_root()) / rel_path))
+    out = Path(rel_path) if Path(rel_path).is_absolute() else (Path(root) / rel_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(fixture, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"wrote {out}  (length={length_name}, needle {pos_name})")
@@ -235,14 +279,24 @@ def write_fixture(fixture: list[dict], rel_path: str, length_name: str, pos_name
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Deterministic NIAH position-fixture generator")
-    ap.add_argument("--master", default="examples/cli/messages/long_niah_256k.json",
-                    help="master (longest) fixture providing the clean stream")
-    ap.add_argument("--length", choices=sorted(LENGTH_CHARS), default="200k",
-                    help="target document length preset")
-    ap.add_argument("--position", default="mid", choices=sorted(POS_FRACTION) + ["all"])
+    ap.add_argument(
+        "--master",
+        default="examples/cli/messages/long_niah_256k.json",
+        help="master (longest) fixture providing the clean stream",
+    )
+    ap.add_argument(
+        "--length",
+        choices=sorted(LENGTH_CHARS),
+        default="200k",
+        help="target document length preset",
+    )
+    ap.add_argument("--position", default="mid", choices=[*sorted(POS_FRACTION), "all"])
     ap.add_argument("--out", default="", help="explicit output path (relative to repo root)")
-    ap.add_argument("--multikey", action="store_true",
-                    help="add same-form distractor records (RULER-style multi-key retrieval)")
+    ap.add_argument(
+        "--multikey",
+        action="store_true",
+        help="add same-form distractor records (RULER-style multi-key retrieval)",
+    )
     args = ap.parse_args()
 
     root = _repo_root()

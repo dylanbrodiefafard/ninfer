@@ -235,8 +235,7 @@ std::size_t LinearAttentionStatePool::conv_slot_bytes() const noexcept {
 }
 
 std::size_t LinearAttentionStatePool::recurrent_slot_bytes() const noexcept {
-    return Tensor(nullptr, DType::FP32,
-                  {spec.key_head_dim, spec.value_head_dim, spec.value_heads})
+    return Tensor(nullptr, DType::FP32, {spec.key_head_dim, spec.value_head_dim, spec.value_heads})
         .bytes();
 }
 
@@ -255,9 +254,9 @@ void LinearAttentionStatePool::pack_slot_to_host(std::int32_t slot, void* conv_d
         (recurrent_dst == nullptr && recurrent_host_image_bytes() != 0)) {
         throw std::invalid_argument("LinearAttentionStatePool host pack destination is null");
     }
-    const std::uint32_t layers     = layer_count();
-    const std::size_t conv_bytes   = conv_slot_bytes();
-    const std::size_t rec_bytes    = recurrent_slot_bytes();
+    const std::uint32_t layers   = layer_count();
+    const std::size_t conv_bytes = conv_slot_bytes();
+    const std::size_t rec_bytes  = recurrent_slot_bytes();
     if (layers == 1) {
         CUDA_CHECK(cudaMemcpyAsync(conv_dst, conv_slot(0, slot).data, conv_bytes,
                                    cudaMemcpyDeviceToHost, stream));

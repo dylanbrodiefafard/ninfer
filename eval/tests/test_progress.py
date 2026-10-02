@@ -18,19 +18,13 @@ class ProgressTest(unittest.TestCase):
         stream = NonTTY()
         renderer = ProgressRenderer(enabled=True, heartbeat_seconds=60, stream=stream)
         renderer.handle(
-            RunEvent(
-                kind="job_start", run_id="r", job_id="j", phase="planning", completed=0
-            )
+            RunEvent(kind="job_start", run_id="r", job_id="j", phase="planning", completed=0)
         )
         renderer.handle(
-            RunEvent(
-                kind="progress", run_id="r", job_id="j", phase="inference", completed=1
-            )
+            RunEvent(kind="progress", run_id="r", job_id="j", phase="inference", completed=1)
         )
         renderer.handle(
-            RunEvent(
-                kind="job_end", run_id="r", job_id="j", phase="reporting", completed=2
-            )
+            RunEvent(kind="job_end", run_id="r", job_id="j", phase="reporting", completed=2)
         )
         renderer.close()
         output = stream.getvalue()

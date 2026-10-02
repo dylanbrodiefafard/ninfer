@@ -23,8 +23,9 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -35,8 +36,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 KERNELS: list[dict[str, Any]] = [
     {"name": "cpasync", "env": {}, "ppl_args": []},
     {"name": "tma-s2", "env": {"NINFER_S3_TMA": "1"}, "ppl_args": ["--s3-tma"]},
-    {"name": "tma-s3", "env": {"NINFER_S3_TMA": "1", "NINFER_TMA_STAGES": "3"},
-     "ppl_args": ["--s3-tma"]},
+    {
+        "name": "tma-s3",
+        "env": {"NINFER_S3_TMA": "1", "NINFER_TMA_STAGES": "3"},
+        "ppl_args": ["--s3-tma"],
+    },
     # {"name": "wsync", "env": {"NINFER_S3_WSYNC": "1"}, "ppl_args": []},
 ]
 
@@ -51,13 +55,34 @@ SHARED_CELLS = {"kv-bf16"}
 
 # Speed-bench cases for ninfer_bench (same arg style as run_ninfer_bench_matrix.py).
 SPEED_CASES_CORE: list[tuple[str, str, list[str]]] = [
-    ("prefill", "prefill_p8192_k3", ["-p", "8192", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    (
+        "prefill",
+        "prefill_p8192_k3",
+        ["-p", "8192", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"],
+    ),
     ("decode", "tg64_k3", ["-n", "64", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
-    ("ctx", "ctx_p8192_g64_k3",
-     ["-pg", "8192,64", "--max-ctx", "8256", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    (
+        "ctx",
+        "ctx_p8192_g64_k3",
+        [
+            "-pg",
+            "8192,64",
+            "--max-ctx",
+            "8256",
+            "--spec",
+            "mtp",
+            "--draft-tokens",
+            "3",
+            "--lm-head-draft",
+        ],
+    ),
 ]
 SPEED_CASES_SMOKE: list[tuple[str, str, list[str]]] = [
-    ("prefill", "prefill_p1024_k3", ["-p", "1024", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    (
+        "prefill",
+        "prefill_p1024_k3",
+        ["-p", "1024", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"],
+    ),
     ("decode", "tg16_k3", ["-n", "16", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
 ]
 
@@ -89,8 +114,9 @@ def run(cmd: list[str], env: dict[str, str], log: Path) -> int:
     with log.open("w", encoding="utf-8") as handle:
         handle.write("$ " + " ".join(cmd) + "\nenv: " + json.dumps(env, sort_keys=True) + "\n")
         handle.flush()
-        process = subprocess.run(cmd, env=env, cwd=REPO_ROOT, stdout=handle, stderr=subprocess.STDOUT,
-                                 check=False)
+        process = subprocess.run(
+            cmd, env=env, cwd=REPO_ROOT, stdout=handle, stderr=subprocess.STDOUT, check=False
+        )
     return process.returncode
 
 
@@ -100,8 +126,12 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bin-dir", type=Path, default=REPO_ROOT / "build",
-                        help="dir containing ninfer-ppl and bench/ninfer_bench")
+    parser.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=REPO_ROOT / "build",
+        help="dir containing ninfer-ppl and bench/ninfer_bench",
+    )
     parser.add_argument("--kernels", default=None, help="comma-separated KERNELS names")
     parser.add_argument("--bench", choices=("ppl", "speed", "both"), default="both")
     parser.add_argument("--weights", type=Path, default=None)
@@ -149,8 +179,11 @@ def main() -> int:
     out_dir = args.out or Path("/tmp") / f"kernel-sweep-{utc_stamp()}"
     out_dir.mkdir(parents=True, exist_ok=True)
     speed_cases = (
-        SPEED_CASES_CORE if args.speed_cases == "core"
-        else SPEED_CASES_SMOKE if args.speed_cases == "smoke" else []
+        SPEED_CASES_CORE
+        if args.speed_cases == "core"
+        else SPEED_CASES_SMOKE
+        if args.speed_cases == "smoke"
+        else []
     )
 
     summary: dict[str, Any] = {
@@ -173,14 +206,32 @@ def main() -> int:
                     path = cell_cache[scheme]
                 else:
                     path = out_dir / name / f"ppl-{scheme}.json"
-                    cmd = [str(ppl_bin), "--weights", str(weights), "--ids", str(ppl_corpus),
-                           "--scheme", scheme, "--kv-dtype", kv_dtype,
-                           "--schedule", args.ppl_schedule, "--tokens", str(args.ppl_tokens),
-                           "--skip", "half", "--out-json", str(path)] + list(extra) + list(
-                               kernel.get("ppl_args", []))
+                    cmd = [
+                        str(ppl_bin),
+                        "--weights",
+                        str(weights),
+                        "--ids",
+                        str(ppl_corpus),
+                        "--scheme",
+                        scheme,
+                        "--kv-dtype",
+                        kv_dtype,
+                        "--schedule",
+                        args.ppl_schedule,
+                        "--tokens",
+                        str(args.ppl_tokens),
+                        "--skip",
+                        "half",
+                        "--out-json",
+                        str(path),
+                        *extra,
+                        *kernel.get("ppl_args", []),
+                    ]
                     rc = run(cmd, env, out_dir / name / f"ppl-{scheme}.log")
                     if rc != 0:
-                        print(f"  PPL {scheme}: FAILED (rc={rc}); see {out_dir / name / (scheme + '.log')}")
+                        print(
+                            f"  PPL {scheme}: FAILED (rc={rc}); see {out_dir / name / (scheme + '.log')}"
+                        )
                         continue
                     if scheme in SHARED_CELLS:
                         cell_cache[scheme] = path
@@ -195,10 +246,22 @@ def main() -> int:
         if args.bench in ("speed", "both") and speed_cases:
             for suite, case_name, case_args in speed_cases:
                 path = out_dir / name / f"speed-{suite}-{case_name}.json"
-                cmd = [str(speed_bin), "--weights", str(weights), "--corpus", str(bench_corpus),
-                       "--device", "0", *case_args,
-                       "-r", str(args.reps), "--warmup", str(args.warmup),
-                       "--output", str(path)]
+                cmd = [
+                    str(speed_bin),
+                    "--weights",
+                    str(weights),
+                    "--corpus",
+                    str(bench_corpus),
+                    "--device",
+                    "0",
+                    *case_args,
+                    "-r",
+                    str(args.reps),
+                    "--warmup",
+                    str(args.warmup),
+                    "--output",
+                    str(path),
+                ]
                 rc = run(cmd, env, out_dir / name / f"speed-{suite}-{case_name}.log")
                 if rc != 0:
                     print(f"  SPEED {case_name}: FAILED (rc={rc})")
@@ -212,9 +275,11 @@ def main() -> int:
                         "decode_tok_s": test.get("decode_output_tok_s_mean"),
                         "accept_rate": spec.get("acceptance_rate"),
                     }
-                    print(f"  SPEED {case_name}: prefill={record['speed'][case_name]['prefill_tok_s']}"
-                          f" decode={record['speed'][case_name]['decode_tok_s']}"
-                          f" accept={record['speed'][case_name]['accept_rate']}")
+                    print(
+                        f"  SPEED {case_name}: prefill={record['speed'][case_name]['prefill_tok_s']}"
+                        f" decode={record['speed'][case_name]['decode_tok_s']}"
+                        f" accept={record['speed'][case_name]['accept_rate']}"
+                    )
 
         summary["results"][name] = record
 
@@ -233,20 +298,42 @@ def main() -> int:
     lines.append("|---" * (len(kernels) + 1) + "|")
 
     def row(label: str, getter) -> None:
-        lines.append(f"| {label} | " + " | ".join(
-            fmt(getter(summary["results"].get(name, {}))) for name in (k["name"] for k in kernels))
-         + " |")
+        lines.append(
+            f"| {label} | "
+            + " | ".join(
+                fmt(getter(summary["results"].get(name, {})))
+                for name in (k["name"] for k in kernels)
+            )
+            + " |"
+        )
 
     row("ppl:bf16 mean_nll", lambda r: r.get("ppl", {}).get("kv-bf16", {}).get("mean_nll"))
     row("ppl:sage mean_nll", lambda r: r.get("ppl", {}).get("attn-sage", {}).get("mean_nll"))
     if speed_cases:
-        row("prefill tok/s (8k)", lambda r: r.get("speed", {}).get("prefill_p8192_k3", {}).get("prefill_tok_s")
-            if args.speed_cases == "core" else
-            r.get("speed", {}).get("prefill_p1024_k3", {}).get("prefill_tok_s"))
-        row("decode tok/s", lambda r: r.get("speed", {}).get(
-            "tg64_k3" if args.speed_cases == "core" else "tg16_k3", {}).get("decode_tok_s"))
-        row("accept rate", lambda r: r.get("speed", {}).get(
-            "ctx_p8192_g64_k3" if args.speed_cases == "core" else "tg16_k3", {}).get("accept_rate"))
+        row(
+            "prefill tok/s (8k)",
+            lambda r: (
+                r.get("speed", {}).get("prefill_p8192_k3", {}).get("prefill_tok_s")
+                if args.speed_cases == "core"
+                else r.get("speed", {}).get("prefill_p1024_k3", {}).get("prefill_tok_s")
+            ),
+        )
+        row(
+            "decode tok/s",
+            lambda r: (
+                r.get("speed", {})
+                .get("tg64_k3" if args.speed_cases == "core" else "tg16_k3", {})
+                .get("decode_tok_s")
+            ),
+        )
+        row(
+            "accept rate",
+            lambda r: (
+                r.get("speed", {})
+                .get("ctx_p8192_g64_k3" if args.speed_cases == "core" else "tg16_k3", {})
+                .get("accept_rate")
+            ),
+        )
 
     table = "\n".join(lines)
     print("\n=== sweep table ===\n" + table)

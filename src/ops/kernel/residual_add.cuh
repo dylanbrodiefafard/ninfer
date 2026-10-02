@@ -16,7 +16,8 @@ namespace ninfer::ops {
 
 inline constexpr int kResidualAddPairsPerThread = 4;
 
-__device__ __forceinline__ __nv_bfloat162 residual_add_pair(__nv_bfloat162 y, __nv_bfloat162 x) {
+__device__ __forceinline__ __nv_bfloat162 residual_add_pair(const __nv_bfloat162& y,
+                                                            const __nv_bfloat162& x) {
     const float r0 = __low2float(x) + __low2float(y);
     const float r1 = __high2float(x) + __high2float(y);
     return __floats2bfloat162_rn(r0, r1);

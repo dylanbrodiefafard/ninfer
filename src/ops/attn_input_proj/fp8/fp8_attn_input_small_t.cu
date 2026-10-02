@@ -15,7 +15,7 @@ namespace {
 
 using Geometry = Fp8AttnInputGeometry;
 using Launch   = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
-                        cudaStream_t);
+                          cudaStream_t);
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,

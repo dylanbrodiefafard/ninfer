@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import mmap
 import struct
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence, TypeAlias
+from typing import TypeAlias
 
 from .layouts import align_up, encoded_size, get_layout
-
 
 MAGIC = b"NINFER\x00\x02"
 _V1_MAGIC = b"NINFER\x00\x01"
@@ -21,9 +21,7 @@ RAW_BYTES_V1 = "raw-bytes-v1"
 
 _ROOT_MEMBERS = frozenset({"identity", "objects"})
 _IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
-_TENSOR_MEMBERS = frozenset(
-    {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
-)
+_TENSOR_MEMBERS = frozenset({"name", "kind", "shape", "format", "layout", "offset", "bytes"})
 _RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
 
 
@@ -153,7 +151,9 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             raise ArtifactError(f"duplicate object name: {name}")
         names.add(name)
         if isinstance(spec, TensorSpec):
-            shape = tuple(_require_integer(dim, "shape dimension", positive=True) for dim in spec.shape)
+            shape = tuple(
+                _require_integer(dim, "shape dimension", positive=True) for dim in spec.shape
+            )
             layout = get_layout(_require_string(spec.layout, "tensor layout"))
             payload_bytes = encoded_size(layout, spec.format, shape)
             offset = align_up(cursor, layout.alignment)
@@ -187,9 +187,7 @@ def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
     )
 
 
-def encode_directory(
-    identity: ArtifactIdentity, objects: Sequence[ArtifactObject]
-) -> bytes:
+def encode_directory(identity: ArtifactIdentity, objects: Sequence[ArtifactObject]) -> bytes:
     checked_identity = _require_identity(identity)
     if not objects:
         raise ArtifactError("objects must not be empty")
@@ -247,13 +245,8 @@ def parse_directory(
     if not isinstance(value, dict) or frozenset(value) != _ROOT_MEMBERS:
         raise ArtifactError("directory root must contain exactly identity and objects")
     raw_identity = value["identity"]
-    if (
-        not isinstance(raw_identity, dict)
-        or frozenset(raw_identity) != _IDENTITY_MEMBERS
-    ):
-        raise ArtifactError(
-            "artifact identity must contain exactly model_id and weights_id"
-        )
+    if not isinstance(raw_identity, dict) or frozenset(raw_identity) != _IDENTITY_MEMBERS:
+        raise ArtifactError("artifact identity must contain exactly model_id and weights_id")
     identity = ArtifactIdentity(
         model_id=_require_string(raw_identity["model_id"], "model_id"),
         weights_id=_require_string(raw_identity["weights_id"], "weights_id"),
@@ -331,7 +324,7 @@ class Artifact:
             raise
 
     @classmethod
-    def open(cls, path: str | Path) -> "Artifact":
+    def open(cls, path: str | Path) -> Artifact:
         return cls(path)
 
     def find(self, name: str) -> ArtifactObject:
@@ -352,7 +345,7 @@ class Artifact:
         if not self._file.closed:
             self._file.close()
 
-    def __enter__(self) -> "Artifact":
+    def __enter__(self) -> Artifact:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -428,7 +421,7 @@ class ArtifactWriter:
         if not self._file.closed:
             self._file.close()
 
-    def __enter__(self) -> "ArtifactWriter":
+    def __enter__(self) -> ArtifactWriter:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:

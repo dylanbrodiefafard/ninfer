@@ -27,16 +27,12 @@ def attention_mixer(model, layer, x, positions, start, tap, context) -> torch.Te
     h = rmsnorm(x, model.weight(layer_weights.input_norm))
     qk = linear(h, model.block_weight(attention_weights.query_key))
     gatev = linear(h, model.block_weight(attention_weights.gate_value))
-    q = qk[:, :CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
-    k = qk[:, CFG.q_size:].reshape(-1, CFG.kv_heads, CFG.head_dim)
-    gate = gatev[:, :CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
-    v = gatev[:, CFG.q_size:].reshape(-1, CFG.kv_heads, CFG.head_dim)
-    q = apply_rope(
-        rmsnorm(q, model.weight(attention_weights.query_norm)), positions
-    )
-    k = apply_rope(
-        rmsnorm(k, model.weight(attention_weights.key_norm)), positions
-    )
+    q = qk[:, : CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
+    k = qk[:, CFG.q_size :].reshape(-1, CFG.kv_heads, CFG.head_dim)
+    gate = gatev[:, : CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
+    v = gatev[:, CFG.q_size :].reshape(-1, CFG.kv_heads, CFG.head_dim)
+    q = apply_rope(rmsnorm(q, model.weight(attention_weights.query_norm)), positions)
+    k = apply_rope(rmsnorm(k, model.weight(attention_weights.key_norm)), positions)
     if tap.level == "op":
         for name, value in (("q", q), ("k", k), ("v", v), ("gate", gate)):
             model._tap(tap, f"layer_{layer:02d}/op/{name}", value, **context)
@@ -56,7 +52,7 @@ def gdn_mixer(model, layer, x, tap, context) -> torch.Tensor:
     h = rmsnorm(x, model.weight(layer_weights.input_norm))
     qk = linear(h, model.block_weight(gdn_weights.query_key))
     value = linear(h, model.block_weight(gdn_weights.value))
-    qkv = torch.cat((qk[:, :CFG.key_dim], qk[:, CFG.key_dim:], value), dim=-1)
+    qkv = torch.cat((qk[:, : CFG.key_dim], qk[:, CFG.key_dim :], value), dim=-1)
     a = linear(h, model.weight(gdn_weights.a_projection))
     b = linear(h, model.weight(gdn_weights.b_projection))
     qkv, state.conv[index] = causal_conv1d(
@@ -70,17 +66,11 @@ def gdn_mixer(model, layer, x, tap, context) -> torch.Tensor:
         model.weight(gdn_weights.a_log),
         model.weight(gdn_weights.dt_bias),
     )
-    q = l2norm(qkv[:, :CFG.key_dim].reshape(-1, CFG.gdn_k_heads, CFG.gdn_k_dim))
-    k = l2norm(
-        qkv[:, CFG.key_dim:2 * CFG.key_dim].reshape(
-            -1, CFG.gdn_k_heads, CFG.gdn_k_dim
-        )
-    )
-    value = qkv[:, 2 * CFG.key_dim:].reshape(-1, CFG.gdn_v_heads, CFG.gdn_v_dim)
+    q = l2norm(qkv[:, : CFG.key_dim].reshape(-1, CFG.gdn_k_heads, CFG.gdn_k_dim))
+    k = l2norm(qkv[:, CFG.key_dim : 2 * CFG.key_dim].reshape(-1, CFG.gdn_k_heads, CFG.gdn_k_dim))
+    value = qkv[:, 2 * CFG.key_dim :].reshape(-1, CFG.gdn_v_heads, CFG.gdn_v_dim)
     out, state.ssm[index] = gated_delta_net(q, k, value, g, beta, state.ssm[index])
-    z = linear(h, model.weight(gdn_weights.z)).reshape(
-        -1, CFG.gdn_v_heads, CFG.gdn_v_dim
-    )
+    z = linear(h, model.weight(gdn_weights.z)).reshape(-1, CFG.gdn_v_heads, CFG.gdn_v_dim)
     if tap.level == "op":
         for name, tensor in (("conv", qkv), ("g", g), ("beta", beta), ("gdn", out)):
             model._tap(tap, f"layer_{layer:02d}/op/{name}", tensor, **context)

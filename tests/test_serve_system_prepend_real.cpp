@@ -84,8 +84,9 @@ std::string joined_text(const ninfer::ChatMessage& message) {
 
 void attach_weather_tool(GenerationRequest& request) {
     ToolDefinition tool;
-    tool.name            = "get_weather";
-    tool.definition_json = R"({"type":"function","function":{"name":"get_weather","description":"Fetch weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}})";
+    tool.name = "get_weather";
+    tool.definition_json =
+        R"({"type":"function","function":{"name":"get_weather","description":"Fetch weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}})";
     request.tools.push_back(std::move(tool));
 }
 
@@ -124,7 +125,7 @@ int exercise_artifact(const char* artifact) {
     const ninfer::RequestOptions options = request_options();
     int failures                         = 0;
 
-    const GenerationRequest hello          = request_from_turns({{ninfer::ChatRole::User, "hello"}});
+    const GenerationRequest hello = request_from_turns({{ninfer::ChatRole::User, "hello"}});
     const ninfer::PromptInput with_prepend = translate(hello, kPrepend);
     const ninfer::PromptInput without      = translate(hello, {});
     const std::uint32_t count_with         = engine.count_tokens(with_prepend);
@@ -142,7 +143,7 @@ int exercise_artifact(const char* artifact) {
     failures += require_eight_tokens(first, "turn 1");
     if (failures != 0) { return failures; }
 
-    GenerationRequest turn2_req = request_from_turns({
+    GenerationRequest turn2_req             = request_from_turns({
         {ninfer::ChatRole::User, "q1"},
         {ninfer::ChatRole::Assistant, first.content},
         {ninfer::ChatRole::User, "q2"},
@@ -154,9 +155,9 @@ int exercise_artifact(const char* artifact) {
     failures += check(second.prefix_reuse_source == ninfer::PrefixReuseSource::VramResident,
                       "turn 2 did not reuse the prepended prefix from VRAM");
     failures += check(second.reused_prompt_tokens > 0, "turn 2 did not reuse a prepended prefix");
-    ninfer::PromptInput closed               = turn1;
-    closed.options.add_generation_prompt     = false;
-    const std::uint32_t closed_tokens        = engine.count_tokens(closed);
+    ninfer::PromptInput closed           = turn1;
+    closed.options.add_generation_prompt = false;
+    const std::uint32_t closed_tokens    = engine.count_tokens(closed);
     failures += check(second.reused_prompt_tokens >= closed_tokens,
                       "turn 2 reused fewer tokens than the closed turn-1 prompt");
     failures += check(turn2.messages[0].role == ninfer::ChatRole::System &&
@@ -167,8 +168,8 @@ int exercise_artifact(const char* artifact) {
     const ninfer::PromptInput miss        = translate(turn2_req, {});
     const ninfer::GenerationResult missed = engine.generate(engine.prepare(miss), options);
     failures += require_eight_tokens(missed, "miss control");
-    failures +=
-        check(missed.reused_prompt_tokens == 0, "empty-prepend turn 2 unexpectedly reused a prefix");
+    failures += check(missed.reused_prompt_tokens == 0,
+                      "empty-prepend turn 2 unexpectedly reused a prefix");
     if (failures != 0) { return failures; }
 
     const ninfer::PromptInput tool_turn1 = translate(weather_user_request(), kPrepend);
@@ -235,7 +236,7 @@ int exercise_ram_artifact(const char* artifact) {
         return fail("RAM evictor did not capture the prepended first chat");
     }
 
-    GenerationRequest turn2_req = request_from_turns({
+    GenerationRequest turn2_req             = request_from_turns({
         {ninfer::ChatRole::User, "q1"},
         {ninfer::ChatRole::Assistant, first.content},
         {ninfer::ChatRole::User, "q2"},

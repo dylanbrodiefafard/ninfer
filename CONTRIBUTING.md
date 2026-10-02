@@ -71,6 +71,10 @@ Use the existing project workflows instead of inventing parallel verification pa
 
 - `./scripts/run-unit-tests.sh` for the full C++ unit suite before a commit or push of
   substantial work;
+- [`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md) for the mandatory quality
+  gates: the `-Werror` build, `pre-commit run` (formatting, ruff, shellcheck, typos, file
+  hygiene), the whole-tree `./scripts/run-clang-tidy.py`, and compute-sanitizer for changed
+  kernels;
 - [`tests/README.md`](tests/README.md) for test organization and commands;
 - [`bench/README.md`](bench/README.md) for product and operator benchmarks; and
 - [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op
@@ -87,7 +91,7 @@ A pull request description must include:
 - the concrete problem being solved;
 - the design and why it is the appropriate solution;
 - the affected behavior or contract;
-- the exact verification commands and summarized results;
+- the exact verification commands and summarized results, including the quality gates;
 - the workload, hardware, and toolchain for any performance claim;
 - any relevant check that was not run and the resulting limitation; and
 - for an entirely AI-generated implementation, the exact model and version used.
@@ -103,6 +107,7 @@ a line-by-line review when it:
 
 - violates an applicable requirement in `AGENTS.md`;
 - contains evident correctness, boundary, lifetime, state, or error-handling problems;
+- fails a quality gate, or suppresses a finding without a stated reason;
 - lacks relevant verification or makes unsupported numerical or performance claims;
 - is generated without adequate contributor review;
 - changes an established contract without prior agreement; or

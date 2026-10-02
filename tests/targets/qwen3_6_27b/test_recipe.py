@@ -18,8 +18,7 @@ def test_recipe_exactly_covers_inventory() -> None:
         item.name for item in inventory.TENSOR_SPECS
     )
     assert all(
-        recipe.expression_shape(item.expression)
-        == inventory.TENSOR_SPECS[index].shape
+        recipe.expression_shape(item.expression) == inventory.TENSOR_SPECS[index].shape
         for index, item in enumerate(recipe.RECIPE_SPECS)
     )
 
@@ -57,12 +56,16 @@ def test_fused_mtp_attention_recipe_materializes_runtime_row_order() -> None:
         TensorReader({q_name: q_source, k_name: k_source, v_name: v_source}),
     )
 
-    query_rows = torch.cat(
-        [torch.arange(head * 512, head * 512 + 256) for head in range(24)]
-    ).remainder(251).to(torch.uint8)
-    gate_rows = torch.cat(
-        [torch.arange(head * 512 + 256, head * 512 + 512) for head in range(24)]
-    ).remainder(251).to(torch.uint8)
+    query_rows = (
+        torch.cat([torch.arange(head * 512, head * 512 + 256) for head in range(24)])
+        .remainder(251)
+        .to(torch.uint8)
+    )
+    gate_rows = (
+        torch.cat([torch.arange(head * 512 + 256, head * 512 + 512) for head in range(24)])
+        .remainder(251)
+        .to(torch.uint8)
+    )
 
     assert fused.shape == (14336, 5120)
     assert torch.equal(fused[:6144, 0], query_rows)

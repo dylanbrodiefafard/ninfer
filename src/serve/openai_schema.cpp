@@ -39,9 +39,8 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-const Json& require_object(const Json& body) {
+void require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
-    return body;
 }
 
 bool get_bool(const Json& obj, const char* key, bool fallback) {
@@ -473,9 +472,9 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
     Json out = Json::array();
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const ToolCall& call = tool_calls[i];
-        Json item            = {{"id", call.id},
-                                {"type", "function"},
-                                {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
+        Json item = {{"id", call.id},
+                     {"type", "function"},
+                     {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
         if (include_index) { item["index"] = static_cast<int>(i); }
         out.push_back(std::move(item));
     }
@@ -585,42 +584,41 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
     // Downstream proxies normalize OpenAI usage (e.g. LiteLLM drops unknown top-level
     // usage keys) but forward the standard details sub-objects, so every stat lives
     // exactly once, here:
-//  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
+    //  - prompt_tokens_details: the OpenAI-standard `cached_tokens` plus engine stats
     //    under the `ninfer` vendor namespace (ttft_ms, prefill/decode rates, reuse source,
     //    prefix_reuse_path, context_checkpoint restored/captured head frontiers, KV RAM tier).
     //  - completion_tokens_details: OpenAI-standard keys only, so they survive proxy
     //    normalization (reasoning + speculative-decoding token breakdowns).
-    Json ptd = {{"cached_tokens", timings->prompt_reused_n}};
-    Json ninfer = {{"reuse_source", prefix_reuse_source_name(timings->prefix_reuse_source)},
-                   {"prefix_reuse_path", prefix_reuse_path_name(timings->prefix_reuse_path)},
-                   {"context_checkpoint",
-                    {{"restored_tokens",
-                      static_cast<int>(timings->restored_context_checkpoint_tokens)},
-                     {"captured_tokens",
-                      static_cast<int>(timings->captured_context_checkpoint_tokens)}}},
-                   {"ttft_ms", json_decimal3(timings->ttft_ms)},
-                   {"prefill",
-                    {{"tokens", prefill_eval_tokens(timings->prompt_n, timings->prompt_reused_n)},
-                     {"ms", json_decimal3(timings->prompt_ms)},
-                     {"tok_s", json_decimal3(timings->prompt_per_second)},
-                     {"ms_per_token", json_decimal3(timings->prompt_per_token_ms)},
-                     {"tail_tok_s", json_decimal3(timings->prefill_tail_tok_s)},
-                     {"tail_window_s", json_decimal3(timings->prefill_tail_window_s)}}},
-                   {"decode",
-                    {{"tokens", timings->predicted_n},
-                     {"ms", json_decimal3(timings->predicted_ms)},
-                     {"tok_s", json_decimal3(timings->predicted_per_second)},
-                     {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
+    Json ptd    = {{"cached_tokens", timings->prompt_reused_n}};
+    Json ninfer = {
+        {"reuse_source", prefix_reuse_source_name(timings->prefix_reuse_source)},
+        {"prefix_reuse_path", prefix_reuse_path_name(timings->prefix_reuse_path)},
+        {"context_checkpoint",
+         {{"restored_tokens", static_cast<int>(timings->restored_context_checkpoint_tokens)},
+          {"captured_tokens", static_cast<int>(timings->captured_context_checkpoint_tokens)}}},
+        {"ttft_ms", json_decimal3(timings->ttft_ms)},
+        {"prefill",
+         {{"tokens", prefill_eval_tokens(timings->prompt_n, timings->prompt_reused_n)},
+          {"ms", json_decimal3(timings->prompt_ms)},
+          {"tok_s", json_decimal3(timings->prompt_per_second)},
+          {"ms_per_token", json_decimal3(timings->prompt_per_token_ms)},
+          {"tail_tok_s", json_decimal3(timings->prefill_tail_tok_s)},
+          {"tail_window_s", json_decimal3(timings->prefill_tail_window_s)}}},
+        {"decode",
+         {{"tokens", timings->predicted_n},
+          {"ms", json_decimal3(timings->predicted_ms)},
+          {"tok_s", json_decimal3(timings->predicted_per_second)},
+          {"ms_per_token", json_decimal3(timings->predicted_per_token_ms)}}}};
     if (timings->recovery.discarded_tool_calls != 0 ||
         timings->recovery.discarded_reasoning_tokens != 0) {
         const auto& recovery = timings->recovery;
-        ninfer["recovery"] = {{"attempts", recovery.attempts},
-                              {"discarded_tool_calls", recovery.discarded_tool_calls},
-                              {"discarded_reasoning_tokens", recovery.discarded_reasoning_tokens},
-                              {"prefill_tokens", recovery.prefill_tokens},
-                              {"prefill_samples", recovery.prefill_samples},
-                              {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
-                              {"prefill_ms", json_decimal3(recovery.prefill_seconds * 1000.0)}};
+        ninfer["recovery"]   = {{"attempts", recovery.attempts},
+                                {"discarded_tool_calls", recovery.discarded_tool_calls},
+                                {"discarded_reasoning_tokens", recovery.discarded_reasoning_tokens},
+                                {"prefill_tokens", recovery.prefill_tokens},
+                                {"prefill_samples", recovery.prefill_samples},
+                                {"prepare_ms", json_decimal3(recovery.prepare_seconds * 1000.0)},
+                                {"prefill_ms", json_decimal3(recovery.prefill_seconds * 1000.0)}};
     }
     if (timings->kv_ram_save_ms != 0.0 || timings->kv_ram_load_ms != 0.0) {
         ninfer["kv_ram"] = {{"save_ms", json_decimal3(timings->kv_ram_save_ms)},
@@ -632,13 +630,14 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
                              {"load_ms", json_decimal3(timings->kv_disk_load_ms)},
                              {"h2d_ms", json_decimal3(timings->kv_disk_h2d_ms)}};
     }
-    ptd["ninfer"] = std::move(ninfer);
+    ptd["ninfer"]                = std::move(ninfer);
     out["prompt_tokens_details"] = std::move(ptd);
 
     Json ctd = {{"reasoning_tokens", timings->reasoning_tokens}};
     if (timings->draft_n > 0) {
         ctd["accepted_prediction_tokens"] = timings->draft_n_accepted;
-        ctd["rejected_prediction_tokens"] = std::max(0, timings->draft_n - timings->draft_n_accepted);
+        ctd["rejected_prediction_tokens"] =
+            std::max(0, timings->draft_n - timings->draft_n_accepted);
     }
     out["completion_tokens_details"] = std::move(ctd);
     return out;
@@ -647,38 +646,37 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
 } // namespace
 
 CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
-                                           double prefill_seconds, double decode_seconds,
-                                           int draft_n, int draft_n_accepted,
-                                           double prefill_tail_tok_s,
-                                           double prefill_tail_window_s, int prompt_reused,
-                                           const ninfer::GenerationRecoveryStats& recovery) {
+                                          double prefill_seconds, double decode_seconds,
+                                          int draft_n, int draft_n_accepted,
+                                          double prefill_tail_tok_s, double prefill_tail_window_s,
+                                          int prompt_reused,
+                                          const ninfer::GenerationRecoveryStats& recovery) {
     CompletionTimings out;
-    out.recovery = recovery;
-    out.prompt_n            = prompt_tokens;
-    out.prompt_reused_n     = std::max(0, std::min(prompt_reused, prompt_tokens));
-    out.prompt_ms           = prefill_seconds * 1000.0;
+    out.recovery        = recovery;
+    out.prompt_n        = prompt_tokens;
+    out.prompt_reused_n = std::max(0, std::min(prompt_reused, prompt_tokens));
+    out.prompt_ms       = prefill_seconds * 1000.0;
     // Prefill rates cover the computed (non-reused) suffix only: a cached prefix is
     // not re-prefilled, so counting it would inflate the rate by the reuse ratio.
     const int computed_prompt_tokens = prefill_eval_tokens(prompt_tokens, out.prompt_reused_n);
     out.prompt_per_token_ms =
         computed_prompt_tokens > 0 ? out.prompt_ms / computed_prompt_tokens : 0.0;
-    out.prompt_per_second =
-        prefill_seconds > 0.0 && computed_prompt_tokens > 0
-            ? static_cast<double>(computed_prompt_tokens) / prefill_seconds
-            : 0.0;
+    out.prompt_per_second     = prefill_seconds > 0.0 && computed_prompt_tokens > 0
+                                    ? static_cast<double>(computed_prompt_tokens) / prefill_seconds
+                                    : 0.0;
     out.prefill_tail_tok_s    = prefill_tail_tok_s;
     out.prefill_tail_window_s = prefill_tail_window_s;
     // First completion token is sampled during prefill; decode.ms is later rounds only.
     const int decode_tokens = decode_eval_tokens(completion_tokens, recovery.prefill_samples);
-    out.predicted_n  = decode_tokens;
-    out.predicted_ms = decode_seconds * 1000.0;
+    out.predicted_n         = decode_tokens;
+    out.predicted_ms        = decode_seconds * 1000.0;
     out.predicted_per_token_ms =
         decode_tokens > 0 ? out.predicted_ms / static_cast<double>(decode_tokens) : 0.0;
     out.predicted_per_second = decode_seconds > 0.0 && decode_tokens > 0
                                    ? static_cast<double>(decode_tokens) / decode_seconds
                                    : 0.0;
-    out.draft_n          = draft_n;
-    out.draft_n_accepted = draft_n_accepted;
+    out.draft_n              = draft_n;
+    out.draft_n_accepted     = draft_n_accepted;
     return out;
 }
 
@@ -762,7 +760,7 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
                     "max",
                     "reasoning_effort");
     }
-    out.reasoning_effort       = *effort;
+    out.reasoning_effort       = effort;
     out.reasoning_effort_param = "reasoning_effort";
 }
 
@@ -803,7 +801,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
     if (const std::optional<bool> enable_thinking = parse_openai_enable_thinking(body)) {
-        out.enable_thinking = *enable_thinking;
+        out.enable_thinking = enable_thinking;
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
@@ -829,15 +827,14 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
                                           const CompletionTimings* timings) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    Json payload = {
-        {"id", id},
-        {"object", "chat.completion"},
-        {"created", created},
-        {"model", model},
-        {"choices",
-         Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
-         {"usage", usage_to_json(usage, timings)}};
+    Json payload = {{"id", id},
+                    {"object", "chat.completion"},
+                    {"created", created},
+                    {"model", model},
+                    {"choices", Json::array({Json{{"index", 0},
+                                                  {"message", std::move(message)},
+                                                  {"finish_reason", finish_reason}}})},
+                    {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
 
@@ -851,15 +848,14 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
                     {"tool_calls", tool_calls_json(tool_calls, false)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    Json payload = {
-        {"id", id},
-        {"object", "chat.completion"},
-        {"created", created},
-        {"model", model},
-        {"choices",
-         Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
-         {"usage", usage_to_json(usage, timings)}};
+    Json payload = {{"id", id},
+                    {"object", "chat.completion"},
+                    {"created", created},
+                    {"model", model},
+                    {"choices", Json::array({Json{{"index", 0},
+                                                  {"message", std::move(message)},
+                                                  {"finish_reason", "tool_calls"}}})},
+                    {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
 

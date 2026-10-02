@@ -73,32 +73,32 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
 };
 
 struct DFlashConfig {
-    static constexpr bool supported        = true;
+    static constexpr bool supported           = true;
     static constexpr qwen3_6::DFlashKind kind = qwen3_6::DFlashKind::DFlash2;
-    static constexpr int layers            = 5;
-    static constexpr int local_layers      = 5;
-    static constexpr int full_layers       = 0;
-    static constexpr int feature_layers    = 5;
-    static constexpr int feature_rows      = feature_layers * TextConfig::hidden;
-    static constexpr int hidden            = TextConfig::hidden;
-    static constexpr int intermediate      = 17408;
-    static constexpr int query_heads       = 32;
-    static constexpr int kv_heads          = 8;
-    static constexpr int head_dim          = 128;
-    static constexpr int query_size        = query_heads * head_dim;
-    static constexpr int kv_size           = kv_heads * head_dim;
-    static constexpr int local_capacity    = 2048;
-    static constexpr int mask_token        = 248070;
-    static constexpr float rms_epsilon     = 1.0e-6F;
-    static constexpr float rope_theta      = 1.0e7F;
-    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr int layers               = 5;
+    static constexpr int local_layers         = 5;
+    static constexpr int full_layers          = 0;
+    static constexpr int feature_layers       = 5;
+    static constexpr int feature_rows         = feature_layers * TextConfig::hidden;
+    static constexpr int hidden               = TextConfig::hidden;
+    static constexpr int intermediate         = 17408;
+    static constexpr int query_heads          = 32;
+    static constexpr int kv_heads             = 8;
+    static constexpr int head_dim             = 128;
+    static constexpr int query_size           = query_heads * head_dim;
+    static constexpr int kv_size              = kv_heads * head_dim;
+    static constexpr int local_capacity       = 2048;
+    static constexpr int mask_token           = 248070;
+    static constexpr float rms_epsilon        = 1.0e-6F;
+    static constexpr float rope_theta         = 1.0e7F;
+    static constexpr float attention_scale    = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
     // Chain verify only: W=k+1. Packed-tree and Spark two-block are off; adaptive k is {3..N}.
-    static constexpr bool tree_verify      = false;
-    static constexpr int verify_width      = 0;
+    static constexpr bool tree_verify = false;
+    static constexpr int verify_width = 0;
     // 1 was A/B'd: greedy 128-tok 4.10 tok/round / 211 tok/s vs keep 4.23 / 239. Leave off.
-    static constexpr int unmask_refine     = 0;
-    static constexpr int two_block_first   = 0;
+    static constexpr int unmask_refine   = 0;
+    static constexpr int two_block_first = 0;
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;

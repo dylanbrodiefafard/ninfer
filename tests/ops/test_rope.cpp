@@ -352,9 +352,10 @@ int run_vision_packed_case() {
         const std::size_t packed_base = static_cast<std::size_t>(token) * kStride;
         std::copy_n(q_bits.data() + dense_base, kPlane, packed.data() + packed_base);
         std::copy_n(k_bits.data() + dense_base, kPlane, packed.data() + packed_base + kPlane);
-        std::copy_n(v_bits.data() + dense_base, kPlane, packed.data() + packed_base + 2 * kPlane);
+        std::copy_n(v_bits.data() + dense_base, kPlane,
+                    packed.data() + packed_base + 2 * static_cast<std::size_t>(kPlane));
     }
-    std::vector<int> positions(2 * kTokens);
+    std::vector<int> positions(2 * static_cast<std::size_t>(kTokens));
     for (int token = 0; token < kTokens; ++token) {
         positions[token]           = token / 4;
         positions[kTokens + token] = token % 4;
@@ -397,7 +398,8 @@ int run_vision_packed_case() {
         const std::size_t packed_base = static_cast<std::size_t>(token) * kStride;
         if (!std::equal(v_bits.begin() + static_cast<std::ptrdiff_t>(dense_base),
                         v_bits.begin() + static_cast<std::ptrdiff_t>(dense_base + kPlane),
-                        got.begin() + static_cast<std::ptrdiff_t>(packed_base + 2 * kPlane))) {
+                        got.begin() + static_cast<std::ptrdiff_t>(
+                                          packed_base + 2 * static_cast<std::size_t>(kPlane)))) {
             std::cerr << "vision packed qkv: V plane changed at token=" << token << '\n';
             ++failures;
             break;

@@ -18,25 +18,18 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 
-
 namespace ninfer::ops::detail {
 namespace {
 
 
 template <typename Geometry, typename CacheView, typename Metadata>
-void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
-                                                float scale, const CacheView& cache,
-                                                Metadata metadata, Tensor& out,
-                                                cudaStream_t stream, float keep_frac = 1.0f,
-                                                float xattn_tau = 1.0f,
-                                                std::int32_t xattn_min_len = 8192,
-                                                GqaS3PrefillDump* dump = nullptr,
-                                                std::uint32_t* dbg_regs = nullptr,
-                                                std::uint8_t* dbg_q = nullptr,
-                                                void* xattn_scratch = nullptr,
-                                                GqaExecutionEnvelope envelope = {
-                                                    1, kGqaAttentionMaximumVisibleKeys},
-                                                const GqaPromptSplit& split = {}) {
+void gqa_attention_prompt_attention_launch_for(
+    const Tensor& q, const Tensor& positions, float scale, const CacheView& cache,
+    Metadata metadata, Tensor& out, cudaStream_t stream, float keep_frac = 1.0f,
+    float xattn_tau = 1.0f, std::int32_t xattn_min_len = 8192, GqaS3PrefillDump* dump = nullptr,
+    std::uint32_t* dbg_regs = nullptr, std::uint8_t* dbg_q = nullptr, void* xattn_scratch = nullptr,
+    GqaExecutionEnvelope envelope = {1, kGqaAttentionMaximumVisibleKeys},
+    const GqaPromptSplit& split   = {}) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
@@ -72,8 +65,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                                   keep_frac, dump, dbg_regs, dbg_q);
         return;
     }
-    if (cache.dtype == DType::U8 &&
-        (keep_frac < 1.0f || xattn_tau < 1.0f || dump != nullptr)) {
+    if (cache.dtype == DType::U8 && (keep_frac < 1.0f || xattn_tau < 1.0f || dump != nullptr)) {
         const bool skip_xattn_to_dense =
             xattn_tau < 1.0f && !(keep_frac < 1.0f) &&
             envelope.max_visible_keys <= static_cast<std::uint32_t>(xattn_min_len);
@@ -191,8 +183,8 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         }
         CUDA_CHECK(cudaGetLastError());
     } else if (cache.dtype == DType::U8) {
-        Tensor& cache_k_scale    = cache.k_scale_pages;
-        Tensor& cache_v_scale    = cache.v_scale_pages;
+        Tensor& cache_k_scale = cache.k_scale_pages;
+        Tensor& cache_v_scale = cache.v_scale_pages;
         if (cache.sage_pv) {
             gqa_s3_prefill_fill_launch<Geometry>(k, v, positions, cache, metadata, stream);
             return;
@@ -258,7 +250,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
 }
 
 // One 512-thread, 87 KiB CTA per SM on the RTX 5090's 170 SMs.
-constexpr std::int32_t kPromptSplitSms = 170;
+constexpr std::int32_t kPromptSplitSms     = 170;
 constexpr std::int32_t kPromptSplitMaximum = 16;
 // A split streams at least this many 64-key tiles, amortizing its Q staging and merge traffic.
 constexpr std::int32_t kPromptSplitMinimumTiles = 8;
@@ -272,7 +264,8 @@ std::int32_t prompt_split_ctas(std::int32_t q_heads, std::int32_t width) {
 }
 
 std::int32_t prompt_key_tiles(std::uint32_t visible_keys) {
-    return static_cast<std::int32_t>(div_up(visible_keys, static_cast<std::uint32_t>(kGqaPrefillNvfp4Bc)));
+    return static_cast<std::int32_t>(
+        div_up(visible_keys, static_cast<std::uint32_t>(kGqaPrefillNvfp4Bc)));
 }
 
 } // namespace
@@ -345,10 +338,10 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream, float keep_frac,
-                                 float xattn_tau, std::int32_t xattn_min_len,
-                                 GqaS3PrefillDump* dump, void* xattn_scratch,
-                                 GqaExecutionEnvelope envelope, const GqaPromptSplit& split) {
+                                 Tensor& out, cudaStream_t stream, float keep_frac, float xattn_tau,
+                                 std::int32_t xattn_min_len, GqaS3PrefillDump* dump,
+                                 void* xattn_scratch, GqaExecutionEnvelope envelope,
+                                 const GqaPromptSplit& split) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -407,8 +400,8 @@ void gqa_kv_compact_path_launch(PagedKVBatchLayerView cache, const Tensor& kv_ta
             launch.template operator()<Geometry, std::int8_t, kGqaCompactHeadDim, __half,
                                        kGqaKvQuantGroups, true>();
         } else {
-            launch.template operator()<Geometry, __nv_bfloat16, kGqaCompactHeadDim, std::uint8_t, 1,
-                                       false>();
+            launch.template
+            operator()<Geometry, __nv_bfloat16, kGqaCompactHeadDim, std::uint8_t, 1, false>();
         }
     };
     if (cache.num_kv_heads == Gqa27Geometry::KVHeads) {

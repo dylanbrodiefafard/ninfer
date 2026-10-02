@@ -1,0 +1,6 @@
+# Mechanical reformatting commits, skipped by `git blame` once configured:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub's blame view reads this file automatically.
+
+# style: apply clang-format 22, ruff format, and file hygiene tree-wide
+ce6ad2d55d60cbad27670863d859219cd6e5cf98

@@ -129,35 +129,29 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         if (compact) {
             state.execution.work.reset();
             auto copy_panel = [&](Tensor src, std::int32_t rows) {
-                Tensor dst =
-                    state.execution.work.alloc(DType::I32, {rows, batch_size});
-                qwen3_6::copy_i32_panel(dst, src.slice(0, 0, rows),
-                                        state.execution.device.stream);
+                Tensor dst = state.execution.work.alloc(DType::I32, {rows, batch_size});
+                qwen3_6::copy_i32_panel(dst, src.slice(0, 0, rows), state.execution.device.stream);
                 return dst;
             };
-            current_drafts   = copy_panel(current_drafts, static_cast<std::int32_t>(k));
-            target_rope      = copy_panel(target_rope, width);
-            Tensor compact_verify =
-                state.execution.work.alloc(DType::I32, {width, batch_size});
-            Tensor compact_pos =
-                state.execution.work.alloc(DType::I32, {width, batch_size});
-            verify_ids       = compact_verify;
-            target_positions = compact_pos;
-            target_tokens    = state.execution.work.alloc(DType::I32, {width, batch_size});
-            licensed_tokens  = state.execution.work.alloc(DType::I32, {width, batch_size});
-            alignment_ids    = state.execution.work.alloc(DType::I32, {width, batch_size});
-            target_logits    = state.execution.work.alloc(
+            current_drafts        = copy_panel(current_drafts, static_cast<std::int32_t>(k));
+            target_rope           = copy_panel(target_rope, width);
+            Tensor compact_verify = state.execution.work.alloc(DType::I32, {width, batch_size});
+            Tensor compact_pos    = state.execution.work.alloc(DType::I32, {width, batch_size});
+            verify_ids            = compact_verify;
+            target_positions      = compact_pos;
+            target_tokens         = state.execution.work.alloc(DType::I32, {width, batch_size});
+            licensed_tokens       = state.execution.work.alloc(DType::I32, {width, batch_size});
+            alignment_ids         = state.execution.work.alloc(DType::I32, {width, batch_size});
+            target_logits         = state.execution.work.alloc(
                 DType::BF16, {TextConfig::output_rows, width, batch_size});
-            target_hidden = state.execution.work.alloc(
-                DType::BF16, {TextConfig::hidden, width, batch_size});
-            alignment_hidden = state.execution.work.alloc(
-                DType::BF16, {TextConfig::hidden, width, batch_size});
+            target_hidden =
+                state.execution.work.alloc(DType::BF16, {TextConfig::hidden, width, batch_size});
+            alignment_hidden =
+                state.execution.work.alloc(DType::BF16, {TextConfig::hidden, width, batch_size});
             if (k > 1) {
-                ar_positions = ar_positions.slice(1, 0, static_cast<std::int32_t>(k) - 1);
-                ar_rope_positions =
-                    ar_rope_positions.slice(1, 0, static_cast<std::int32_t>(k) - 1);
-                ar_valid_columns =
-                    ar_valid_columns.slice(1, 0, static_cast<std::int32_t>(k) - 1);
+                ar_positions      = ar_positions.slice(1, 0, static_cast<std::int32_t>(k) - 1);
+                ar_rope_positions = ar_rope_positions.slice(1, 0, static_cast<std::int32_t>(k) - 1);
+                ar_valid_columns  = ar_valid_columns.slice(1, 0, static_cast<std::int32_t>(k) - 1);
             }
         }
 
@@ -191,8 +185,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         if (compact) {
             Tensor licensed_frame =
                 frame.licensed_tokens.slice(1, 0, batch_size).slice(0, 0, width);
-            qwen3_6::copy_i32_panel(licensed_frame, licensed_tokens,
-                                    state.execution.device.stream);
+            qwen3_6::copy_i32_panel(licensed_frame, licensed_tokens, state.execution.device.stream);
             qwen3_6::copy_strided_width_panel(frame.target_hidden.slice(2, 0, batch_size),
                                               target_hidden, state.execution.device.stream);
         }

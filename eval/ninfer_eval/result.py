@@ -34,7 +34,7 @@ class DatasetResult:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DatasetResult":
+    def from_dict(cls, data: dict[str, Any]) -> DatasetResult:
         value = dict(data)
         value["counts"] = ResultCounts(**value["counts"])
         return cls(**value)
@@ -58,9 +58,7 @@ def write_summary(
         ]
     )
     for result in results:
-        score = (
-            result.metrics.get(result.primary_metric) if result.primary_metric else None
-        )
+        score = result.metrics.get(result.primary_metric) if result.primary_metric else None
         score_text = f"{score:.6f}" if isinstance(score, (int, float)) else "-"
         lines.append(
             f"| {result.job_id} | {result.backend} | {result.dataset} | {result.status} | "
@@ -82,7 +80,5 @@ def load_summary(run_dir: Path) -> dict[str, Any]:
 def _atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(path)

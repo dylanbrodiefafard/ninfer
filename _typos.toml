@@ -1,0 +1,49 @@
+# Spell checking for identifiers, comments, and documentation (https://github.com/crate-ci/typos).
+# The version is pinned in .pre-commit-config.yaml; see docs/maintainer/code-quality.md.
+
+[files]
+extend-exclude = [
+    "third_party/",
+    "cmake/*.patch",
+    ".gitattributes",
+    # Verbatim long-context prompt corpora and request fixtures: their text is data.
+    "examples/cli/messages/",
+    "plans/fixtures/",
+    "tests/fixtures/",
+]
+
+[default]
+extend-ignore-re = [
+    # Abbreviated git commit hashes.
+    "\\b[0-9a-f]{7,40}\\b",
+]
+
+[default.extend-words]
+# Model and format vocabulary.
+BA = "BA"      # Qwen3.6 GDN beta/alpha projection
+UE = "UE"      # UE4M3 / UE8M0 scale formats
+ue = "ue"
+thw = "thw"    # temporal/height/width vision grid
+dout = "dout"
+rin = "rin"
+ptd = "ptd"
+tpos = "tpos"
+relm = "relm"
+thr = "thr"
+pn = "pn"
+ofr = "ofr"
+ths = "ths"
+anc = "anc"
+nothink = "nothink"
+Subtiles = "Subtiles"
+mis = "mis"    # mis-dispatch, mis-sharded
+# External API spellings.
+optin = "optin"    # cudaDevAttrMaxSharedMemoryPerBlockOptin
+Parms = "Parms"    # cudaMemcpy3DParms
+ND = "ND"          # UTF8PROC_CATEGORY_ND
+restat = "restat"  # ninja -t restat
+# Deliberately truncated token fragments in tokenizer and recovery tests.
+thi = "thi"
+clos = "clos"
+inser = "inser"
+functio = "functio"

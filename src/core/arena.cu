@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -91,11 +92,10 @@ void* allocate_registered_host(std::size_t capacity_bytes, std::size_t& mapping_
     (void)::madvise(mapping, mapping_bytes, MADV_NOHUGEPAGE);
 #endif
 
-    const std::size_t requested_workers =
-        1 + (mapping_bytes - 1) / kHostPrefaultBytesPerWorker;
-    const std::size_t worker_count = std::min(kMaximumHostPrefaultWorkers, requested_workers);
-    const std::size_t page_count       = mapping_bytes / page_size;
-    const std::size_t pages_per_worker = 1 + (page_count - 1) / worker_count;
+    const std::size_t requested_workers = 1 + (mapping_bytes - 1) / kHostPrefaultBytesPerWorker;
+    const std::size_t worker_count      = std::min(kMaximumHostPrefaultWorkers, requested_workers);
+    const std::size_t page_count        = mapping_bytes / page_size;
+    const std::size_t pages_per_worker  = 1 + (page_count - 1) / worker_count;
     try {
         std::vector<std::jthread> workers;
         workers.reserve(worker_count);
@@ -180,8 +180,8 @@ void DeviceBuffer::fill(int byte_value) {
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
-    void* destination     = static_cast<std::uint8_t*>(p) + byte_offset;
-    cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
+    void* destination = static_cast<std::uint8_t*>(p) + byte_offset;
+    cudaError_t err   = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
     if (err == cudaSuccess) { err = cudaStreamSynchronize(cudaStreamLegacy); }
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
@@ -343,7 +343,8 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment
         if (err == cudaErrorMemoryAllocation) {
             const cudaError_t pending = cudaGetLastError();
             if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
-                throw std::runtime_error(cuda_error_message("cudaMallocHost pending error", pending));
+                throw std::runtime_error(
+                    cuda_error_message("cudaMallocHost pending error", pending));
             }
             throw std::bad_alloc();
         }
@@ -351,8 +352,11 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, std::size_t alignment
     }
 
     const auto address = reinterpret_cast<std::uintptr_t>(ptr);
-    allocation_ = ptr;
-    data_ = reinterpret_cast<void*>((address + alignment - 1) & ~(alignment - 1));
+    const auto aligned = (address + alignment - 1) & ~(alignment - 1);
+    allocation_        = ptr;
+    // Offsetting the allocation keeps its provenance; the padding is at most the alignment - 1
+    // extra bytes requested above.
+    data_ = static_cast<std::byte*>(ptr) + (aligned - address);
     size_ = size_bytes;
 }
 
@@ -361,8 +365,8 @@ PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(allocation_); }
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
     : allocation_(other.allocation_), data_(other.data_), size_(other.size_) {
     other.allocation_ = nullptr;
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_       = nullptr;
+    other.size_       = 0;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
@@ -370,12 +374,12 @@ PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept
 
     free_pinned(allocation_);
     allocation_ = other.allocation_;
-    data_ = other.data_;
-    size_ = other.size_;
+    data_       = other.data_;
+    size_       = other.size_;
 
     other.allocation_ = nullptr;
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_       = nullptr;
+    other.size_       = 0;
     return *this;
 }
 
@@ -430,8 +434,8 @@ void* HostPinnedArena::try_alloc(std::size_t bytes, std::size_t align) {
 
     const std::uintptr_t base_addr = reinterpret_cast<std::uintptr_t>(base_);
     for (std::size_t index = 0; index < free_.size(); ++index) {
-        const FreeSpan span              = free_[index];
-        const std::uintptr_t span_addr   = checked_add_uintptr(base_addr, span.offset);
+        const FreeSpan span               = free_[index];
+        const std::uintptr_t span_addr    = checked_add_uintptr(base_addr, span.offset);
         const std::uintptr_t aligned_addr = align_up_addr(span_addr, align);
         const std::uintptr_t lead_addr    = aligned_addr - span_addr;
         if (lead_addr > std::numeric_limits<std::size_t>::max()) { continue; }
@@ -444,12 +448,12 @@ void* HostPinnedArena::try_alloc(std::size_t bytes, std::size_t align) {
         // new block before publishing it so every later free is allocation-free,
         // including a fragmented release order under host-memory pressure.
         const std::size_t spans = live_.size() + 2;
-        if (free_.capacity() < spans) {
-            free_.reserve(std::max(spans, free_.capacity() * 2));
-        }
-        void* ptr = static_cast<unsigned char*>(base_) + alloc_offset;
+        if (free_.capacity() < spans) { free_.reserve(std::max(spans, free_.capacity() * 2)); }
+        void* ptr           = static_cast<unsigned char*>(base_) + alloc_offset;
         const bool inserted = live_.emplace(ptr, LiveBlock{alloc_offset, bytes}).second;
-        if (!inserted) { throw std::logic_error("HostPinnedArena allocation overlaps a live block"); }
+        if (!inserted) {
+            throw std::logic_error("HostPinnedArena allocation overlaps a live block");
+        }
         // All potentially allocating work precedes mutation of the free list.
         free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(index));
         if (tail != 0) { insert_free(alloc_offset + bytes, tail); }
@@ -493,7 +497,7 @@ void HostPinnedArena::insert_free(std::size_t offset, std::size_t size) {
     }
     if (it != free_.end() && offset + size == it->offset) {
         it->offset = offset;
-        it->size  += size;
+        it->size += size;
         return;
     }
     free_.insert(it, FreeSpan{offset, size});

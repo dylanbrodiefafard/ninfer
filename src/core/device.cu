@@ -56,8 +56,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     // the entire GPU kernel, which is the 100% CPU seen during requests.
     // Third arg MUST be cudaInitDeviceFlagsAreValid: without that bit the
     // scheduling flag above is silently ignored and the device stays Auto/Spin.
-    err = cudaInitDevice(
-        device_id, cudaDeviceScheduleBlockingSync, cudaInitDeviceFlagsAreValid);
+    err = cudaInitDevice(device_id, cudaDeviceScheduleBlockingSync, cudaInitDeviceFlagsAreValid);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaInitDevice failed", err));
     }
@@ -118,7 +117,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     }
 
     cudaStream_t host = nullptr;
-    err = cudaStreamCreateWithFlags(&host, cudaStreamNonBlocking);
+    err               = cudaStreamCreateWithFlags(&host, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         destroy_event(wait);
         destroy_event(order_event);
@@ -129,7 +128,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaStreamCreateWithFlags(host_stream) failed", err));
     }
 
-    host_stream       = host;
+    host_stream      = host;
     stream           = compute;
     load_stream      = load;
     copy_stream      = copy;
@@ -156,8 +155,7 @@ DeviceContext::~DeviceContext() {
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), load_stream(other.load_stream),
       copy_stream(other.copy_stream), host_stream(other.host_stream),
-      copy_order_event(other.copy_order_event),
-      host_wait(other.host_wait), props(other.props) {
+      copy_order_event(other.copy_order_event), host_wait(other.host_wait), props(other.props) {
     other.stream           = nullptr;
     other.load_stream      = nullptr;
     other.copy_stream      = nullptr;

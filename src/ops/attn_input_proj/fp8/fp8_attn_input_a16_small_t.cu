@@ -19,7 +19,7 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
 
 template <int Capacity>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
-                  Tensor& v, cudaStream_t stream) {
+                 Tensor& v, cudaStream_t stream) {
     using Geometry      = Fp8AttnInputGeometry;
     constexpr int tile  = Capacity;
     constexpr int warps = Capacity <= 8 ? 16 : Capacity <= 24 ? 8 : 4;

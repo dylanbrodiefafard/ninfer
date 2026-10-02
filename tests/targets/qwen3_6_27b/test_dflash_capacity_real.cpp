@@ -4,7 +4,7 @@
 #include "runtime/engine/kv_capacity.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
-#define NINFER_QWEN36_VARIANT ::ninfer::targets::qwen3_6_27b::detail::Variant
+#define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
 #define NINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
 #include "targets/qwen3_6/impl/runtime/program.h"
 
@@ -16,10 +16,10 @@
 #include <vector>
 
 namespace {
-namespace target = ninfer::targets::qwen3_6_27b::detail;
-namespace family = ninfer::targets::qwen3_6;
-namespace execution = family::detail::qwen3_6_27b_runtime;
-using Package = ninfer::targets::qwen3_6_27b::Package;
+namespace target           = ninfer::targets::qwen3_6_27b::detail;
+namespace family           = ninfer::targets::qwen3_6;
+namespace execution        = family::detail::qwen3_6_27b_runtime;
+using Package              = ninfer::targets::qwen3_6_27b::Package;
 constexpr std::size_t kMiB = 1024ULL * 1024ULL;
 
 void require(bool condition, const char* message) {
@@ -35,36 +35,36 @@ std::size_t free_bytes() {
 void exercise(const char* artifact) {
     ninfer::DeviceContext device;
     ninfer::EngineOptions options;
-    options.artifact_path = artifact;
-    options.max_context = 260000;
-    options.max_concurrency = 4;
-    options.kv_capacity = ninfer::KvCapacityPolicy::automatic(1024 * kMiB);
-    options.prefill_chunk = 4096;
-    options.kv_cache = ninfer::KvCacheStorage::Nvfp4;
-    options.enable_vision = false;
-    options.use_cuda_graph = true;
-    options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
-    options.speculative.draft_tokens = 5;
+    options.artifact_path              = artifact;
+    options.max_context                = 260000;
+    options.max_concurrency            = 4;
+    options.kv_capacity                = ninfer::KvCapacityPolicy::automatic(1024 * kMiB);
+    options.prefill_chunk              = 4096;
+    options.kv_cache                   = ninfer::KvCacheStorage::Nvfp4;
+    options.enable_vision              = false;
+    options.use_cuda_graph             = true;
+    options.speculative.backend        = ninfer::SpeculativeBackend::DFlash;
+    options.speculative.draft_tokens   = 5;
     options.speculative.adaptive_draft = true;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
 
     ninfer::artifact::Reader reader(artifact);
     ninfer::artifact::Binder binder(reader);
-    options.model_id = reader.identity().model_id;
-    options.weights_id = reader.identity().weights_id;
+    options.model_id               = reader.identity().model_id;
+    options.weights_id             = reader.identity().weights_id;
     options.artifact_file_identity = reader.file_identity();
-    const auto profile = Package::resolve_weights(reader.identity(), binder);
-    auto load = target::bind_artifact(binder, profile, family::startup_features(options));
+    const auto profile             = Package::resolve_weights(reader.identity(), binder);
+    auto load         = target::bind_artifact(binder, profile, family::startup_features(options));
     auto materialized = ninfer::artifact::materialize(reader, load.materialization, device);
-    target::LoadedModelData model(std::move(load.bindings), std::move(materialized));
+    target::LoadedModelData model(load.bindings, std::move(materialized));
     auto frontend = family::make_frontend(model.frontend, false);
     device.synchronize();
 
     // Use the production candidate builder and resolver at the real post-weight free memory.
-    auto planner = Package::make_sequence_planner(device, options, profile);
+    auto planner     = Package::make_sequence_planner(device, options, profile);
     const auto curve = planner.capacity_curve();
-    const auto resolution = ninfer::runtime::resolve_kv_capacity(
-        options.kv_capacity, curve, free_bytes());
+    const auto resolution =
+        ninfer::runtime::resolve_kv_capacity(options.kv_capacity, curve, free_bytes());
     auto plan = std::move(planner).finalize(resolution.main_page_groups);
     require(plan.device_reservation_bytes() == resolution.runtime_reservation_bytes,
             "finalized capacity differs from the solver reservation");
@@ -72,7 +72,7 @@ void exercise(const char* artifact) {
             "fixture did not exercise memory-limited automatic capacity");
     require(resolution.planned_slack_bytes >= options.kv_capacity.automatic_headroom_bytes &&
                 resolution.planned_slack_bytes < options.kv_capacity.automatic_headroom_bytes +
-                                                    curve.bytes_per_additional_main_page_group,
+                                                     curve.bytes_per_additional_main_page_group,
             "automatic capacity did not consume the available page budget");
 
     // Exercise the real Program directly so timing-dependent policy decisions can be set at
@@ -80,7 +80,7 @@ void exercise(const char* artifact) {
     // workspace, and commit operations below are the production implementation.
     execution::ProgramImplCore program(model.runtime, *plan.impl_, device, nullptr);
     device.synchronize();
-    const auto startup = program.memory_summary();
+    const auto startup      = program.memory_summary();
     const auto startup_free = free_bytes();
     require(startup.cuda_graph_observed_bytes > 0 &&
                 startup.cuda_graph_observed_bytes <= startup.cuda_graph_allowance_bytes,
@@ -93,24 +93,26 @@ void exercise(const char* artifact) {
     require(startup_free >= 768 * kMiB, "startup consumed automatic headroom");
     std::cout << "startup tokens=" << resolution.resolved_tokens
               << " graphs=" << startup.cuda_graph_observed_bytes / kMiB << '/'
-              << startup.cuda_graph_allowance_bytes / kMiB
-              << " MiB free=" << startup_free / kMiB << " MiB\n" << std::flush;
+              << startup.cuda_graph_allowance_bytes / kMiB << " MiB free=" << startup_free / kMiB
+              << " MiB\n"
+              << std::flush;
 
     // Full 4096-token chunks, partial tails, and decode across graph-profile boundaries.
     const std::array<std::size_t, 4> prompt_lengths{4097, 8191, 16383, 260000 - 256};
     ninfer::runtime::ResolvedExecutionOptions request;
     request.requested_output_tokens = 256;
-    request.allow_prefix_reuse = false;
-    request.sampling.temperature = 1.5F;
-    request.sampling.seed = 42;
-    request.sampling.p_less = true;
-    std::size_t full_chunks = 0;
+    request.allow_prefix_reuse      = false;
+    request.sampling.temperature    = 1.5F;
+    request.sampling.seed           = 42;
+    request.sampling.p_less         = true;
+    std::size_t full_chunks         = 0;
     for (std::uint32_t lane = 0; lane < 4; ++lane) {
         std::vector<ninfer::TokenId> tokens(prompt_lengths[lane]);
         constexpr std::array<ninfer::TokenId, 8> text{9707, 11, 358, 1079, 264, 2182, 13, 198};
         for (std::size_t i = 0; i < tokens.size(); ++i) { tokens[i] = text[i % text.size()]; }
-        auto prompt = family::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(tokens)));
-        auto base = program.plan_request_base(prompt, request);
+        auto prompt =
+            family::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(tokens)));
+        auto base      = program.plan_request_base(prompt, request);
         auto lane_plan = program.plan_request_for_lane(lane, prompt, base);
         require(lane_plan.summary().transient_bytes == 0,
                 "text fixture unexpectedly needs request transient storage");
@@ -159,10 +161,9 @@ void exercise(const char* artifact) {
                             "adaptive round returned an invalid token");
                 }
             }
-            program.resolve_pending_batch(std::span(lanes).first(batch),
-                                          std::span(accepted).first(batch),
-                                          std::span(no_flags).first(batch),
-                                          std::span(no_flags).first(batch));
+            program.resolve_pending_batch(
+                std::span(lanes).first(batch), std::span(accepted).first(batch),
+                std::span(no_flags).first(batch), std::span(no_flags).first(batch));
             ++widths_seen[k];
         }
         std::cout << "batch=" << batch << " widths=3,4,5,4,5,3,5,4,3 passed\n" << std::flush;
@@ -182,8 +183,8 @@ void exercise(const char* artifact) {
     }
     std::cout << "ok full_chunks=" << full_chunks
               << " workspace_peak=" << final.workspace.peak_used_bytes / kMiB << '/'
-              << final.workspace.capacity_bytes / kMiB
-              << " MiB final_free=" << final_free / kMiB << " MiB\n";
+              << final.workspace.capacity_bytes / kMiB << " MiB final_free=" << final_free / kMiB
+              << " MiB\n";
 }
 } // namespace
 

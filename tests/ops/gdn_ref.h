@@ -121,7 +121,7 @@ inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
                 const double row_delta     = delta[static_cast<std::size_t>(row)];
                 for (std::int64_t col = 0; col < S; ++col) {
                     const std::size_t index = row_base + static_cast<std::size_t>(col);
-                    state[index]            = alpha * state[index] +
+                    state[index] = alpha * state[index] +
                                    row_delta * k_logical[qk_base + static_cast<std::size_t>(col)];
                 }
             }

@@ -360,7 +360,8 @@ void q6_rowsplit_gemm_mma_kernel(
             cp_commit();
         }
 
-        auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
+        auto load_fragments = [&](int k_step, unsigned (&a_frag)[MT][4],
+                                  unsigned (&b_frag)[NT][2]) {
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int row = warp_row * WM + mi * 16 + a_row_offset;

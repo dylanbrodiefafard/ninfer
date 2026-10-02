@@ -7,7 +7,6 @@
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
-namespace {
 
 auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          ops::GqaExecutionEnvelope envelope) {
@@ -45,8 +44,6 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state.execution.device.stream));
     };
 }
-
-} // namespace
 
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    ops::GqaExecutionEnvelope envelope,

@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from tools.reference.qwen3_6.common.frontend import Frontend
 
-
 MODEL = Path("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16")
 CONFIG_ONLY_TOKENS = {
     "<|audio_start|>": 248070,
@@ -38,15 +37,11 @@ def test_reference_consumes_the_raw_official_resource_pair():
 
     assert len(frontend.tokenizer) == 248077
     assert {
-        token: frontend.tokenizer.convert_tokens_to_ids(token)
-        for token in CONFIG_ONLY_TOKENS
+        token: frontend.tokenizer.convert_tokens_to_ids(token) for token in CONFIG_ONLY_TOKENS
     } == CONFIG_ONLY_TOKENS
     assert frontend.processor.apply_chat_template(
         [{"role": "user", "content": "hello"}],
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=True,
-    ) == (
-        "<|im_start|>user\nhello<|im_end|>\n"
-        "<|im_start|>assistant\n<think>\n"
-    )
+    ) == ("<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n")

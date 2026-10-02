@@ -33,11 +33,11 @@ speed path.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Iterator, Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -46,11 +46,14 @@ from tools.artifact.container import (
     ArtifactIdentity,
     ArtifactWriter,
     ResourceObject,
-    ResourceSpec as ArtifactResourceSpec,
     TensorObject,
+)
+from tools.artifact.container import (
+    ResourceSpec as ArtifactResourceSpec,
+)
+from tools.artifact.container import (
     TensorSpec as ArtifactTensorSpec,
 )
-from tools.artifact.layouts import encode_direct
 from tools.convert.common.nvfp4_quantize import ENCODER_PROFILE, encode_nvfp4_from_bf16
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
@@ -58,7 +61,6 @@ from tools.convert.qwen3_6.common import conversion as family_conversion
 from tools.convert.qwen3_6.common.inventory import TensorSpec
 
 from . import inventory_dflash2 as dflash2
-
 
 RECIPE_ID = "qwen3_8_27b_nvfp4_dflash2-v1"
 _COPY_CHUNK = 64 << 20
@@ -142,9 +144,7 @@ def _artifact_specs(src: Artifact) -> list[ArtifactTensorSpec | ArtifactResource
     specs: list[ArtifactTensorSpec | ArtifactResourceSpec] = []
     for obj in src.objects:
         if isinstance(obj, TensorObject):
-            specs.append(
-                ArtifactTensorSpec(obj.name, obj.shape, obj.format, obj.layout)
-            )
+            specs.append(ArtifactTensorSpec(obj.name, obj.shape, obj.format, obj.layout))
         elif isinstance(obj, ResourceObject):
             specs.append(ArtifactResourceSpec(obj.name, obj.encoding, obj.bytes))
         else:
@@ -166,9 +166,7 @@ def _cat_rows(reader: ShardReader, names: tuple[str, ...]) -> torch.Tensor:
     return torch.cat([reader.get(name) for name in names], dim=0)
 
 
-def _materialize_dflash2(
-    spec: TensorSpec, reader: ShardReader
-) -> torch.Tensor:
+def _materialize_dflash2(spec: TensorSpec, reader: ShardReader) -> torch.Tensor:
     name = spec.name
     if name == "dflash/feature_projection":
         return reader.get("fc.weight")
@@ -222,9 +220,7 @@ def _materialize_dflash2(
         raise ValueError(f"unhandled DFlash2 object: {name}") from exc
 
 
-def _encode_dflash_payload(
-    tensor: torch.Tensor, spec: TensorSpec, device: torch.device
-) -> bytes:
+def _encode_dflash_payload(tensor: torch.Tensor, spec: TensorSpec, device: torch.device) -> bytes:
     if spec.format == dflash2.NVFP4:
         source = tensor.to(device=device)
         expected = tuple(int(dim) for dim in spec.shape)
@@ -246,9 +242,7 @@ def preflight_conversion(
 ) -> ConversionPreflight:
     base = Path(base_artifact)
     dflash_model = Path(dflash_model_dir)
-    codebook_numeric = (
-        dflash2.NVFP4 if codebook_format == "nvfp4" else dflash2.BF16
-    )
+    codebook_numeric = dflash2.NVFP4 if codebook_format == "nvfp4" else dflash2.BF16
     dflash2.build_dflash2_specs(dflash_format, codebook_format=codebook_numeric)
     with Artifact.open(base) as src:
         _require_qwen38_nvfp4(src.identity)
@@ -268,9 +262,7 @@ def preflight_conversion(
         dflash_format=dflash_format,
         codebook_format=codebook_format,
         identity=identity,
-        dflash_specs=dflash2.build_dflash2_specs(
-            dflash_format, codebook_format=codebook_numeric
-        ),
+        dflash_specs=dflash2.build_dflash2_specs(dflash_format, codebook_format=codebook_numeric),
         dflash_config=summary,
     )
 
@@ -299,9 +291,10 @@ def convert(
         flush=True,
     )
 
-    with Artifact.open(preflight.base_artifact) as src, ShardReader.from_file(
-        preflight.dflash_model / "model.safetensors"
-    ) as reader:
+    with (
+        Artifact.open(preflight.base_artifact) as src,
+        ShardReader.from_file(preflight.dflash_model / "model.safetensors") as reader,
+    ):
         specs = _artifact_specs(src)
         specs.extend(_inventory_to_artifact_spec(spec) for spec in preflight.dflash_specs)
         with ArtifactWriter(output, src.identity, specs) as writer:

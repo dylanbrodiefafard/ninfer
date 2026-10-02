@@ -576,9 +576,9 @@ void run_recurrent_point(const Profile& profile, std::int32_t width, std::int32_
     const Measurement record =
         measure_component([&](cudaStream_t stream) { resources.launch_record(stream); }, flush,
                           options.warmup, options.repeat);
-    const Measurement record_overlay = measure_component(
-        [&](cudaStream_t stream) { resources.launch_record_overlay(stream); }, flush,
-        options.warmup, options.repeat);
+    const Measurement record_overlay =
+        measure_component([&](cudaStream_t stream) { resources.launch_record_overlay(stream); },
+                          flush, options.warmup, options.repeat);
     print_recurrent_result(profile, width, batch, valid, "snapshot", snapshot);
     print_recurrent_result(profile, width, batch, valid, "record", record);
     print_recurrent_result(profile, width, batch, valid, "record+overlay", record_overlay);
@@ -595,7 +595,7 @@ void print_result(const Profile& profile, std::int32_t width, std::int32_t batch
     }
     const double state_bytes = static_cast<double>(profile.layers) * updated * profile.value_heads *
                                kStateDim * kStateDim * sizeof(float) * 2.0;
-    const double state_gbs         = state_bytes / (measurement.cold.median_us * 1.0e3);
+    const double state_gbs   = state_bytes / (measurement.cold.median_us * 1.0e3);
     const double ns_per_transition = committed == 0
                                          ? 0.0
                                          : measurement.cold.median_us * 1000.0 /
@@ -612,8 +612,8 @@ int run(const Options& options) {
     DeviceBuffer flush(options.flush_bytes);
     for (const Profile& profile : selected_profiles(options.profiles)) {
         for (const std::int32_t width : selected_widths(profile, options.exact_width)) {
-            const bool run_fold = options.component == ComponentSelection::Fold ||
-                                  options.component == ComponentSelection::All;
+            const bool run_fold      = options.component == ComponentSelection::Fold ||
+                                       options.component == ComponentSelection::All;
             const bool run_recurrent = options.component == ComponentSelection::Recurrent ||
                                        options.component == ComponentSelection::All;
             if (run_fold) {

@@ -29,11 +29,11 @@ namespace ninfer::targets::qwen3_6::detail {
 struct RamLadderHead {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
-    const void* conv       = nullptr;
-    const void* recurrent  = nullptr;
-    const void* hidden     = nullptr;
-    const void* dflash     = nullptr;
+    ContextCheckpointKind kind  = ContextCheckpointKind::Ladder;
+    const void* conv            = nullptr;
+    const void* recurrent       = nullptr;
+    const void* hidden          = nullptr;
+    const void* dflash          = nullptr;
     std::size_t conv_bytes      = 0;
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
@@ -63,11 +63,11 @@ struct RamLadderIndex {
 struct RamLadderImage {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
-    const void* conv       = nullptr;
-    const void* recurrent  = nullptr;
-    const void* hidden     = nullptr;
-    const void* dflash     = nullptr;
+    ContextCheckpointKind kind  = ContextCheckpointKind::Ladder;
+    const void* conv            = nullptr;
+    const void* recurrent       = nullptr;
+    const void* hidden          = nullptr;
+    const void* dflash          = nullptr;
     std::size_t conv_bytes      = 0;
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
@@ -92,10 +92,10 @@ struct RamCaptureSource {
     PrefixHash128 hash_c{};
     bool hash_c_valid = false;
 
-    const PagedKVAllocation* text      = nullptr;
-    const PagedKVPool* text_pool       = nullptr;
-    const PagedKVAllocation* backend   = nullptr;
-    const PagedKVPool* backend_pool    = nullptr;
+    const PagedKVAllocation* text    = nullptr;
+    const PagedKVPool* text_pool     = nullptr;
+    const PagedKVAllocation* backend = nullptr;
+    const PagedKVPool* backend_pool  = nullptr;
     // Leading mapped pages to store; nullopt stores every mapped page.
     std::optional<std::uint32_t> text_pages;
     std::optional<std::uint32_t> backend_pages;
@@ -107,8 +107,8 @@ struct RamCaptureSource {
     // image instead of the device slot and lane (a capture cut at its rewrite checkpoint).
     RewriteStateHostSource current_state;
 
-    const Tensor* tail_hidden                = nullptr;
-    const Tensor* rewrite_checkpoint_hidden  = nullptr;
+    const Tensor* tail_hidden               = nullptr;
+    const Tensor* rewrite_checkpoint_hidden = nullptr;
 
     std::vector<RamLadderHead> ladder_heads;
 
@@ -128,8 +128,8 @@ struct RamRestoreTarget {
     PagedKVAllocation* backend      = nullptr;
     PagedKVPool* backend_pool       = nullptr;
 
-    LinearAttentionStatePool* gdn     = nullptr;
-    std::int32_t gdn_current_slot     = -1;
+    LinearAttentionStatePool* gdn = nullptr;
+    std::int32_t gdn_current_slot = -1;
     RewriteStateHostTarget rewrite_state;
 
     Tensor* tail_hidden               = nullptr;
@@ -164,9 +164,9 @@ struct RamRestoredHost {
 };
 
 struct RamMatch {
-    std::uint64_t entry_id     = 0;
-    PrefixReusePath reuse      = PrefixReusePath::FullReset;
-    std::uint32_t reuse_base   = 0;
+    std::uint64_t entry_id   = 0;
+    PrefixReusePath reuse    = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base = 0;
 };
 
 enum class RamCaptureStatus { Captured, NeedsEviction, Dropped };
@@ -204,35 +204,36 @@ public:
     void pin_for_io(std::uint64_t entry_id);
     void unpin_for_io(std::uint64_t entry_id);
     bool evict_one_unpinned(std::uint64_t entry_id);
-    void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_entry_id);
+    void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_id);
     [[nodiscard]] std::uint64_t disk_entry_id(std::uint64_t entry_id) const;
     [[nodiscard]] const void* host_block(std::uint64_t entry_id) const;
     [[nodiscard]] std::size_t host_bytes(std::uint64_t entry_id) const;
 
     struct HostKvView {
-        std::uint32_t text_pages     = 0;
-        std::uint32_t backend_pages  = 0;
-        const std::uint8_t* text     = nullptr;
-        const std::uint8_t* backend  = nullptr;
-        const std::uint8_t* ledger   = nullptr;
-        std::size_t ledger_bytes     = 0;
-        const std::uint8_t* identity = nullptr;
-        std::size_t identity_bytes   = 0;
-        const std::uint8_t* gdn_conv_current = nullptr;
-        const std::uint8_t* gdn_recurrent_current = nullptr;
-        const std::uint8_t* gdn_conv_checkpoint = nullptr;
+        std::uint32_t text_pages                     = 0;
+        std::uint32_t backend_pages                  = 0;
+        const std::uint8_t* text                     = nullptr;
+        const std::uint8_t* backend                  = nullptr;
+        const std::uint8_t* ledger                   = nullptr;
+        std::size_t ledger_bytes                     = 0;
+        const std::uint8_t* identity                 = nullptr;
+        std::size_t identity_bytes                   = 0;
+        const std::uint8_t* gdn_conv_current         = nullptr;
+        const std::uint8_t* gdn_recurrent_current    = nullptr;
+        const std::uint8_t* gdn_conv_checkpoint      = nullptr;
         const std::uint8_t* gdn_recurrent_checkpoint = nullptr;
-        const std::uint8_t* tail_hidden = nullptr;
-        const std::uint8_t* rewrite_hidden = nullptr;
-        const std::uint8_t* dflash_local = nullptr;
-        const std::uint8_t* dflash_rewrite = nullptr;
-        std::size_t gdn_conv_bytes   = 0;
-        std::size_t gdn_recurrent_bytes = 0;
-        std::size_t hidden_bytes     = 0;
-        std::size_t rewrite_hidden_bytes = 0;
-        std::size_t cyclic_bytes     = 0;
+        const std::uint8_t* tail_hidden              = nullptr;
+        const std::uint8_t* rewrite_hidden           = nullptr;
+        const std::uint8_t* dflash_local             = nullptr;
+        const std::uint8_t* dflash_rewrite           = nullptr;
+        std::size_t gdn_conv_bytes                   = 0;
+        std::size_t gdn_recurrent_bytes              = 0;
+        std::size_t hidden_bytes                     = 0;
+        std::size_t rewrite_hidden_bytes             = 0;
+        std::size_t cyclic_bytes                     = 0;
         std::vector<RamLadderImage> ladder_images;
     };
+
     [[nodiscard]] HostKvView host_kv(std::uint64_t entry_id) const;
     RamRestoredHost unpack_device(std::uint64_t entry_id, const RamRestoreTarget& target);
 
@@ -246,39 +247,54 @@ public:
     void wait_pending_copies();
     // Waits for one entry's device copies without waiting on unrelated entries.
     void wait_entry_copies(std::uint64_t entry_id);
+
     [[nodiscard]] std::uint64_t index_version() const noexcept { return index_version_; }
+
     [[nodiscard]] std::uint64_t exact_comparisons() const noexcept { return exact_comparisons_; }
+
     void record_drop();
 
     void test_tamper_identity_digest(std::uint64_t entry_id, std::uint8_t byte);
     [[nodiscard]] std::size_t test_pending_copy_count() const noexcept;
+
     void test_fail_next_ticket_write() noexcept { fail_next_ticket_write_ = true; }
+
     void test_fail_next_capture() noexcept { fail_next_capture_ = true; }
+
     void test_fail_next_capture_metadata_allocation() noexcept {
         fail_next_capture_metadata_allocation_ = true;
     }
+
     static void test_fail_next_plan_metadata_allocation() noexcept {
         fail_next_plan_metadata_allocation_.store(true, std::memory_order_release);
     }
+
     [[nodiscard]] static bool test_plan_metadata_allocation_pending() noexcept {
         return fail_next_plan_metadata_allocation_.load(std::memory_order_acquire);
     }
+
     static void test_fail_next_restore_metadata_allocation() noexcept {
         fail_next_restore_metadata_allocation_.store(true, std::memory_order_release);
     }
+
     [[nodiscard]] static bool test_restore_metadata_failure_pending() noexcept {
         return fail_next_restore_metadata_allocation_.load(std::memory_order_acquire);
     }
+
     void test_fail_next_copy_snapshot_allocation(int stage = 0) noexcept {
         fail_copy_snapshot_allocation_stage_ = stage;
     }
+
     void test_fail_copy_event_allocation_after(int successful_events) noexcept {
         fail_copy_event_allocation_after_ = successful_events;
     }
+
     [[nodiscard]] bool test_retirement_waiting_for_io() const noexcept {
         return retirement_waiting_for_io_.load(std::memory_order_acquire);
     }
+
     void test_fail_next_copy_sync() noexcept { fail_next_copy_sync_ = true; }
+
     [[nodiscard]] std::uint32_t test_io_pins(std::uint64_t entry_id) const;
     void test_set_copy_sync_stall_ms(int ms);
     [[nodiscard]] bool test_copy_sync_entered() const;
@@ -301,32 +317,32 @@ private:
     };
 
     struct Record {
-        std::uint64_t id               = 0;
+        std::uint64_t id = 0;
         PrefixHash128 hash_f{};
         PrefixHash128 hash_c{};
-        bool hash_c_valid              = false;
-        std::uint32_t execution_frontier = 0;
+        bool hash_c_valid                 = false;
+        std::uint32_t execution_frontier  = 0;
         std::uint32_t checkpoint_frontier = 0;
-        bool checkpoint_valid          = false;
-        PrefixReusePath checkpoint_path = PrefixReusePath::RestoreTurnCheckpoint;
+        bool checkpoint_valid             = false;
+        PrefixReusePath checkpoint_path   = PrefixReusePath::RestoreTurnCheckpoint;
         std::vector<RamLadderIndex> ladders;
-        void* block                    = nullptr;
-        std::size_t bytes              = 0;
-        bool pinned                    = false;
-        std::uint32_t io_pins          = 0;
-        std::uint64_t disk_entry_id    = 0;
-        bool copies_timed              = false;
+        void* block                 = nullptr;
+        std::size_t bytes           = 0;
+        bool pinned                 = false;
+        std::uint32_t io_pins       = 0;
+        std::uint64_t disk_entry_id = 0;
+        bool copies_timed           = false;
         // The timed copy pair belongs to a restore H2D rather than the capture D2H.
-        bool copies_are_load           = false;
-        cudaEvent_t copies_start       = nullptr;
-        cudaEvent_t copies_done        = nullptr;
+        bool copies_are_load     = false;
+        cudaEvent_t copies_start = nullptr;
+        cudaEvent_t copies_done  = nullptr;
     };
 
     struct Layout {
-        std::size_t header_bytes                               = 0;
+        std::size_t header_bytes = 0;
         std::array<std::size_t, static_cast<std::size_t>(Section::Count)> offset{};
         std::array<std::size_t, static_cast<std::size_t>(Section::Count)> length{};
-        std::size_t entry_bytes                                = 0;
+        std::size_t entry_bytes = 0;
     };
 
     [[nodiscard]] Record& require(std::uint64_t entry_id);
@@ -340,7 +356,7 @@ private:
     void wait_copies(Record& record);
     void wait_copies_on_stream(Record& record, cudaStream_t stream);
     void wait_event_unlocked(std::unique_lock<std::mutex>& lock, cudaEvent_t event,
-                              std::uint64_t entry_id);
+                             std::uint64_t entry_id);
     void maybe_copy_sync_stall() const;
     double harvest_record(Record& record);
     [[nodiscard]] double copy_elapsed_seconds(const Record& record) const;
@@ -349,6 +365,7 @@ private:
     void drop_pending_save(std::uint64_t entry_id) noexcept;
     void add_orphaned_seconds(const Record& record, double seconds) noexcept;
     void drop_pending_id(std::uint64_t entry_id) noexcept;
+
     void bump_version() noexcept { ++index_version_; }
 
     HostPinnedArena arena_;
@@ -369,15 +386,15 @@ private:
     double orphaned_load_seconds_    = 0;
     mutable std::mutex io_mutex_;
     std::condition_variable io_cv_;
-    bool fail_next_ticket_write_ = false;
-    bool fail_next_capture_      = false;
+    bool fail_next_ticket_write_                = false;
+    bool fail_next_capture_                     = false;
     bool fail_next_capture_metadata_allocation_ = false;
     std::atomic<bool> retirement_waiting_for_io_{false};
     int fail_copy_event_allocation_after_ = -1;
     inline static std::atomic<bool> fail_next_restore_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
     int fail_copy_snapshot_allocation_stage_ = -1;
-    bool fail_next_copy_sync_   = false;
+    bool fail_next_copy_sync_                = false;
     std::atomic<int> copy_sync_stall_ms_{0};
     mutable std::atomic<bool> copy_sync_entered_{false};
 };

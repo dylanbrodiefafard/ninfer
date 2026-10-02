@@ -22,6 +22,7 @@ RUN apt-get update \
         patch \
         pkg-config \
         python3 \
+        python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     # Host driver supplies libcuda (e.g. 580.x). The image cuda-compat tree (590.x)
     # wins ldconfig on this base and triggers cudaErrorCompatNotSupportedOnDevice
@@ -29,6 +30,12 @@ RUN apt-get update \
     && rm -rf /usr/local/cuda/compat /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat \
     && rm -f /etc/ld.so.conf.d/*compat*.conf \
     && ldconfig
+
+# Pinned static analyzer; must equal CLANG_TIDY_VERSION in scripts/run-clang-tidy.py, which
+# refuses any other version.
+ARG NINFER_CLANG_TIDY_VERSION=22.1.8
+RUN python3 -m venv /opt/ninfer-lint \
+    && /opt/ninfer-lint/bin/pip install --no-cache-dir "clang-tidy==${NINFER_CLANG_TIDY_VERSION}"
 
 WORKDIR /src
 COPY . .

@@ -19,8 +19,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_WEIGHTS = (
-    "/ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-Osfralla-mtp-ninfer/"
-    "qwen3_8_27b_nvfp4.ninfer"
+    "/ssdpool2nvme/local_llm/models/qwen3.8-nvfp4-Osfralla-mtp-ninfer/qwen3_8_27b_nvfp4.ninfer"
 )
 DEFAULT_TOKENS = 8192
 LONG_TOKENS = 32768
@@ -48,11 +47,7 @@ def load_wikitext() -> str | None:
                 load_dataset("wikitext", "wikitext-2-raw-v1", split="test"),
                 load_dataset("wikitext", "wikitext-2-raw-v1", split="validation"),
             ]
-            parts = [
-                str(row.get("text") or "").strip()
-                for split in splits
-                for row in split
-            ]
+            parts = [str(row.get("text") or "").strip() for split in splits for row in split]
             text = "\n\n".join(part for part in parts if part)
             if text:
                 return text

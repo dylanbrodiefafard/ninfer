@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from dataclasses import asdict, dataclass
 import json
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
 
-from safetensors import safe_open
 import torch
+from safetensors import safe_open
 
 from tools.artifact.container import (
     Artifact,
@@ -60,42 +60,30 @@ def _error(message: str) -> None:
 def validate_structure(artifact: Artifact) -> int:
     expected_identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
     if artifact.identity != expected_identity:
-        _error(
-            f"artifact identity is {artifact.identity!r}, expected "
-            f"{expected_identity!r}"
-        )
+        _error(f"artifact identity is {artifact.identity!r}, expected {expected_identity!r}")
     if len(artifact.objects) != len(inventory.OBJECT_SPECS):
         _error(
-            f"artifact has {len(artifact.objects)} objects, "
-            f"expected {len(inventory.OBJECT_SPECS)}"
+            f"artifact has {len(artifact.objects)} objects, expected {len(inventory.OBJECT_SPECS)}"
         )
     cursor = 0
     formats: Counter[str] = Counter()
     layouts: Counter[str] = Counter()
     for position, (actual, expected) in enumerate(
-        zip(artifact.objects, inventory.OBJECT_SPECS)
+        zip(artifact.objects, inventory.OBJECT_SPECS, strict=True)
     ):
         if actual.name != expected.name:
-            _error(
-                f"object {position} is {actual.name!r}, expected {expected.name!r}"
-            )
+            _error(f"object {position} is {actual.name!r}, expected {expected.name!r}")
         expected_offset = align_up(cursor, object_alignment(actual))
         if actual.offset != expected_offset:
-            _error(
-                f"{actual.name}: offset {actual.offset}, expected {expected_offset}"
-            )
+            _error(f"{actual.name}: offset {actual.offset}, expected {expected_offset}")
         if isinstance(expected, inventory.TensorSpec):
             if not isinstance(actual, TensorObject):
                 _error(f"{actual.name}: expected tensor descriptor")
             signature = (actual.shape, actual.format, actual.layout)
             registered = (expected.shape, expected.format, expected.layout)
             if signature != registered:
-                _error(
-                    f"{actual.name}: signature {signature} != {registered}"
-                )
-            if actual.bytes != encoded_size(
-                actual.layout, actual.format, actual.shape
-            ):
+                _error(f"{actual.name}: signature {signature} != {registered}")
+            if actual.bytes != encoded_size(actual.layout, actual.format, actual.shape):
                 _error(f"{actual.name}: encoded byte count is invalid")
             formats[actual.format] += 1
             layouts[actual.layout] += 1
@@ -185,9 +173,7 @@ def _verify_nvfp4_weights(
         obj = artifact.find(selected.object_name)
         if not isinstance(obj, TensorObject):
             _error(f"{selected.object_name}: expected tensor")
-        packed, scales, divisor = recipe.materialize_nvfp4_weight(
-            selected, reader
-        )
+        packed, scales, divisor = recipe.materialize_nvfp4_weight(selected, reader)
         stored_packed, stored_scales, stored_divisor = decode_nvfp4_words(
             artifact.payload(obj), obj.shape
         )
@@ -212,9 +198,7 @@ def _verify_input_divisors(
         word = int(stored.view(torch.int32).item()) & 0xFFFFFFFF
         if not valid_positive_fp32_word(word):
             _error(f"{obj.name}: input divisor is not finite and positive")
-        if not torch.equal(
-            stored.view(torch.int32), expected.view(torch.int32)
-        ):
+        if not torch.equal(stored.view(torch.int32), expected.view(torch.int32)):
             _error(f"{obj.name}: input divisor differs from source")
 
 
@@ -265,9 +249,7 @@ def _verify_bf16_text_matrices(
                 base_recipe.RECIPES_BY_NAME[spec.name], reader
             )
         stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
-        if not torch.equal(
-            stored.view(torch.int16), expected.view(torch.int16)
-        ):
+        if not torch.equal(stored.view(torch.int16), expected.view(torch.int16)):
             _error(f"{obj.name}: BF16 words differ from base source")
 
 
@@ -282,9 +264,7 @@ def verify_artifact(
     convert_nvfp4.preflight_conversion(base, nvfp4)
     _verify_resources(artifact, base)
     with ShardReader(base) as base_reader:
-        w8_endpoint_rows, w8_endpoint_groups = _verify_w8_endpoints(
-            artifact, base_reader
-        )
+        w8_endpoint_rows, w8_endpoint_groups = _verify_w8_endpoints(artifact, base_reader)
         _verify_bf16_text_matrices(artifact, base_reader)
     with ShardReader(nvfp4) as nvfp4_reader:
         _verify_nvfp4_weights(artifact, nvfp4_reader)
@@ -310,9 +290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--nvfp4-model", type=Path, required=True)
     arguments = parser.parse_args(argv)
     with Artifact.open(arguments.artifact) as artifact:
-        summary = verify_artifact(
-            artifact, arguments.model, arguments.nvfp4_model
-        )
+        summary = verify_artifact(artifact, arguments.model, arguments.nvfp4_model)
     print(json.dumps(asdict(summary), indent=2, sort_keys=True))
     return 0
 

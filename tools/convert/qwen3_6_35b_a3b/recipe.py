@@ -6,13 +6,13 @@ from pathlib import Path
 
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common.recipe import (
+    SOURCE_DTYPE,
     Cast,
     Concat,
     DraftHeadTokenIds,
     Expression,
     GatherRows,
     Reshape,
-    SOURCE_DTYPE,
     Slice,
     SourcePreflight,
     SourceTensor,
@@ -26,17 +26,18 @@ from tools.convert.qwen3_6.common.recipe import (
     materialize_recipe,
     preflight_source_reader,
     source,
+)
+from tools.convert.qwen3_6.common.recipe import (
     source_requirements as _common_source_requirements,
+)
+from tools.convert.qwen3_6.common.recipe import (
     validate_recipe_coverage as _common_validate_recipe_coverage,
 )
 
 from . import inventory
 
-
 DRAFT_ROWS = 131072
-DRAFT_RANKING_PATH = (
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
-)
+DRAFT_RANKING_PATH = "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
 
 
 def _attention_part(source_name: str, *, gate: bool) -> Expression:
@@ -337,9 +338,7 @@ def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
         ),
     ]
     recipes.extend(_moe_recipes(source_prefix + "mlp.", object_prefix + "moe/"))
-    recipes.append(
-        TensorRecipe("mtp/final_norm", source("mtp.norm.weight", (2048,)))
-    )
+    recipes.append(TensorRecipe("mtp/final_norm", source("mtp.norm.weight", (2048,))))
     return tuple(recipes)
 
 
@@ -430,9 +429,7 @@ def _build_dflash_recipes() -> tuple[TensorRecipe, ...]:
                 ),
             )
         )
-    recipes.append(
-        TensorRecipe("dflash/final_norm", source("norm.weight", (2048,)))
-    )
+    recipes.append(TensorRecipe("dflash/final_norm", source("norm.weight", (2048,))))
     return tuple(recipes)
 
 
@@ -445,9 +442,7 @@ BASE_RECIPE_SPECS = (
 DFLASH_RECIPE_SPECS = _build_dflash_recipes()
 RECIPE_SPECS = BASE_RECIPE_SPECS + DFLASH_RECIPE_SPECS
 BASE_RECIPES_BY_NAME = {item.object_name: item for item in BASE_RECIPE_SPECS}
-DFLASH_RECIPES_BY_NAME = {
-    item.object_name: item for item in DFLASH_RECIPE_SPECS
-}
+DFLASH_RECIPES_BY_NAME = {item.object_name: item for item in DFLASH_RECIPE_SPECS}
 RECIPES_BY_NAME = {item.object_name: item for item in RECIPE_SPECS}
 
 
@@ -460,19 +455,16 @@ def validate_recipe_coverage() -> None:
     base_requirements = base_source_requirements()
     if len(base_requirements) != 1045:
         raise ValueError(
-            f"35B base recipe covers {len(base_requirements)} unique sources, "
-            "expected 1045"
+            f"35B base recipe covers {len(base_requirements)} unique sources, expected 1045"
         )
     dflash_requirements = dflash_source_requirements()
     if len(dflash_requirements) != 69:
         raise ValueError(
-            f"35B DFlash recipe covers {len(dflash_requirements)} unique sources, "
-            "expected 69"
+            f"35B DFlash recipe covers {len(dflash_requirements)} unique sources, expected 69"
         )
-    if {
-        item.dtype
-        for item in (*base_requirements.values(), *dflash_requirements.values())
-    } != {SOURCE_DTYPE}:
+    if {item.dtype for item in (*base_requirements.values(), *dflash_requirements.values())} != {
+        SOURCE_DTYPE
+    }:
         raise ValueError("35B source recipes must contain only BF16 tensors")
 
 
@@ -532,31 +524,31 @@ def preflight_dflash_sources(model_dir: str | Path) -> SourcePreflight:
 __all__ = [
     "BASE_RECIPES_BY_NAME",
     "BASE_RECIPE_SPECS",
-    "Cast",
-    "Concat",
     "DFLASH_RECIPES_BY_NAME",
     "DFLASH_RECIPE_SPECS",
     "DRAFT_RANKING_PATH",
     "DRAFT_ROWS",
+    "RECIPES_BY_NAME",
+    "RECIPE_SPECS",
+    "SOURCE_DTYPE",
+    "Cast",
+    "Concat",
     "DraftHeadTokenIds",
     "Expression",
     "GatherRows",
-    "RECIPE_SPECS",
-    "RECIPES_BY_NAME",
     "Reshape",
-    "SOURCE_DTYPE",
     "ShardReader",
     "Slice",
     "SourcePreflight",
     "SourceTensor",
     "TensorRecipe",
     "Transpose",
+    "base_source_requirements",
+    "dflash_source_requirements",
     "expression_shape",
     "expression_sources",
     "materialize_expression",
     "materialize_recipe",
-    "base_source_requirements",
-    "dflash_source_requirements",
     "preflight_base_sources",
     "preflight_dflash_sources",
     "validate_recipe_coverage",

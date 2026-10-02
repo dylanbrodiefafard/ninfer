@@ -124,7 +124,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor value_record_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
     ops::gated_delta_net_snapshot(q, k, v, g_tensor, beta_tensor, kScale, true, snapshot_states,
                                   valid, initial, bases, snapshot_output, nullptr);
     ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states, valid,
@@ -208,8 +208,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     }
 
     WorkspaceArena overlay_workspace(std::max<std::size_t>(
-        256, ops::gated_delta_net_replay_record_workspace_capacity_bytes(value_heads, batch,
-                                                                          width)));
+        256,
+        ops::gated_delta_net_replay_record_workspace_capacity_bytes(value_heads, batch, width)));
     DeviceBuffer overlay_state = to_device(state);
     DeviceBuffer overlay_out(value_elements * sizeof(std::uint16_t));
     DeviceBuffer overlay_key(qk_elements * sizeof(std::uint16_t));
@@ -219,34 +219,31 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     overlay_key.fill(0xff);
     overlay_value.fill(0xff);
     overlay_gate.fill(0xff);
-    Tensor overlay_states(overlay_state.p, DType::FP32,
-                          {kStateDim, kStateDim, value_heads, slots});
+    Tensor overlay_states(overlay_state.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
     Tensor overlay_output(overlay_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor overlay_key_t(overlay_key.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
     Tensor overlay_value_t(overlay_value.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor overlay_gate_t(overlay_gate.p, DType::FP32, {2, value_heads, width, batch});
-    ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, overlay_states,
-                                       valid, initial, overlay_key_t, overlay_value_t,
-                                       overlay_gate_t, overlay_output, nullptr, nullptr,
-                                       &overlay_workspace);
+    ops::gated_delta_net_replay_record(
+        q, k, v, g_tensor, beta_tensor, kScale, overlay_states, valid, initial, overlay_key_t,
+        overlay_value_t, overlay_gate_t, overlay_output, nullptr, nullptr, &overlay_workspace);
     cuda_synchronize();
-    const std::vector<float> overlay_state_after = from_device<float>(overlay_state, state_elements);
+    const std::vector<float> overlay_state_after =
+        from_device<float>(overlay_state, state_elements);
     if (overlay_state_after != state) {
         std::cerr << "overlay replay record modified source state" << suffix << "\n";
         ++failures;
     }
     failures += verify_equal("overlay key records" + suffix,
-                             from_device<std::uint16_t>(overlay_key, qk_elements),
-                             key_bits_after);
-    failures += verify_equal("overlay value records" + suffix,
-                             from_device<std::uint16_t>(overlay_value, value_elements),
-                             value_bits_after);
-    failures += verify_equal("overlay gate records" + suffix,
-                             from_device<std::uint32_t>(overlay_gate, gate_elements * 2),
-                             gate_bits_after);
+                             from_device<std::uint16_t>(overlay_key, qk_elements), key_bits_after);
+    failures +=
+        verify_equal("overlay value records" + suffix,
+                     from_device<std::uint16_t>(overlay_value, value_elements), value_bits_after);
+    failures +=
+        verify_equal("overlay gate records" + suffix,
+                     from_device<std::uint32_t>(overlay_gate, gate_elements * 2), gate_bits_after);
 
-    const std::size_t slot_floats =
-        static_cast<std::size_t>(kStateDim) * kStateDim * value_heads;
+    const std::size_t slot_floats = static_cast<std::size_t>(kStateDim) * kStateDim * value_heads;
     DeviceBuffer t1_state(slot_floats * sizeof(float));
     DeviceBuffer t1_initial = to_device(std::vector<std::int32_t>{0});
     DeviceBuffer t1_bases   = to_device(std::vector<std::int32_t>{0});
@@ -261,12 +258,12 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         const std::int32_t initial_slot = initial_slots[static_cast<std::size_t>(row)];
         t1_state.copy_from_host(state.data() + static_cast<std::size_t>(initial_slot) * slot_floats,
                                 slot_floats * sizeof(float));
-        Tensor q_row    = q.slice(3, row, 1);
-        Tensor k_row    = k.slice(3, row, 1);
-        Tensor v_row    = v.slice(3, row, 1);
-        Tensor g_row    = g_tensor.slice(2, row, 1);
-        Tensor beta_row = beta_tensor.slice(2, row, 1);
-        Tensor out_row  = t1_full.slice(3, row, 1);
+        Tensor q_row                    = q.slice(3, row, 1);
+        Tensor k_row                    = k.slice(3, row, 1);
+        Tensor v_row                    = v.slice(3, row, 1);
+        Tensor g_row                    = g_tensor.slice(2, row, 1);
+        Tensor beta_row                 = beta_tensor.slice(2, row, 1);
+        Tensor out_row                  = t1_full.slice(3, row, 1);
         const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
         for (std::int32_t token = 0; token < valid_extent; ++token) {
             Tensor q_t    = q_row.slice(2, token, 1);
@@ -291,12 +288,12 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
     constexpr std::int32_t kWidth   = 3;
     constexpr std::int32_t kBatch   = 1;
     constexpr std::int32_t kSlots   = 2;
-    const std::size_t qk_tree    = static_cast<std::size_t>(kStateDim) * kQkHeads * kWidth;
-    const std::size_t value_tree = static_cast<std::size_t>(kStateDim) * value_heads * kWidth;
-    const std::size_t gate_tree  = static_cast<std::size_t>(value_heads) * kWidth;
-    const std::size_t qk_seq     = static_cast<std::size_t>(kStateDim) * kQkHeads * 2;
-    const std::size_t value_seq  = static_cast<std::size_t>(kStateDim) * value_heads * 2;
-    const std::size_t gate_seq   = static_cast<std::size_t>(value_heads) * 2;
+    const std::size_t qk_tree       = static_cast<std::size_t>(kStateDim) * kQkHeads * kWidth;
+    const std::size_t value_tree    = static_cast<std::size_t>(kStateDim) * value_heads * kWidth;
+    const std::size_t gate_tree     = static_cast<std::size_t>(value_heads) * kWidth;
+    const std::size_t qk_seq        = static_cast<std::size_t>(kStateDim) * kQkHeads * 2;
+    const std::size_t value_seq     = static_cast<std::size_t>(kStateDim) * value_heads * 2;
+    const std::size_t gate_seq      = static_cast<std::size_t>(value_heads) * 2;
     const std::size_t state_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * kSlots;
 
@@ -323,9 +320,9 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
             const std::int32_t src = tokens[static_cast<std::size_t>(dst)];
             for (std::int32_t head = 0; head < kQkHeads; ++head) {
                 const std::size_t src_base =
-                    static_cast<std::size_t>((src * kQkHeads + head) * kStateDim);
+                    (static_cast<std::size_t>(src) * kQkHeads + head) * kStateDim;
                 const std::size_t dst_base =
-                    static_cast<std::size_t>((dst * kQkHeads + head) * kStateDim);
+                    (static_cast<std::size_t>(dst) * kQkHeads + head) * kStateDim;
                 std::copy_n(q_bits.begin() + static_cast<std::ptrdiff_t>(src_base), kStateDim,
                             q_pair.begin() + static_cast<std::ptrdiff_t>(dst_base));
                 std::copy_n(k_bits.begin() + static_cast<std::ptrdiff_t>(src_base), kStateDim,
@@ -333,15 +330,15 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
             }
             for (std::int32_t head = 0; head < value_heads; ++head) {
                 const std::size_t src_base =
-                    static_cast<std::size_t>((src * value_heads + head) * kStateDim);
+                    (static_cast<std::size_t>(src) * value_heads + head) * kStateDim;
                 const std::size_t dst_base =
-                    static_cast<std::size_t>((dst * value_heads + head) * kStateDim);
+                    (static_cast<std::size_t>(dst) * value_heads + head) * kStateDim;
                 std::copy_n(v_bits.begin() + static_cast<std::ptrdiff_t>(src_base), kStateDim,
                             v_pair.begin() + static_cast<std::ptrdiff_t>(dst_base));
-                g_pair[static_cast<std::size_t>(dst * value_heads + head)] =
-                    g[static_cast<std::size_t>(src * value_heads + head)];
-                beta_pair[static_cast<std::size_t>(dst * value_heads + head)] =
-                    beta[static_cast<std::size_t>(src * value_heads + head)];
+                g_pair[static_cast<std::size_t>(dst) * value_heads + head] =
+                    g[static_cast<std::size_t>(src) * value_heads + head];
+                beta_pair[static_cast<std::size_t>(dst) * value_heads + head] =
+                    beta[static_cast<std::size_t>(src) * value_heads + head];
             }
         }
         return std::tuple{q_pair, k_pair, v_pair, g_pair, beta_pair};
@@ -350,14 +347,15 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
     const auto run_record = [&](const std::vector<std::uint16_t>& q_host,
                                 const std::vector<std::uint16_t>& k_host,
                                 const std::vector<std::uint16_t>& v_host,
-                                const std::vector<float>& g_host, const std::vector<float>& beta_host,
-                                std::int32_t width, const Tensor* parent) {
-        DeviceBuffer device_q    = to_device(q_host);
-        DeviceBuffer device_k    = to_device(k_host);
-        DeviceBuffer device_v    = to_device(v_host);
-        DeviceBuffer device_g    = to_device(g_host);
-        DeviceBuffer device_beta = to_device(beta_host);
-        DeviceBuffer device_state = to_device(state);
+                                const std::vector<float>& g_host,
+                                const std::vector<float>& beta_host, std::int32_t width,
+                                const Tensor* parent) {
+        DeviceBuffer device_q       = to_device(q_host);
+        DeviceBuffer device_k       = to_device(k_host);
+        DeviceBuffer device_v       = to_device(v_host);
+        DeviceBuffer device_g       = to_device(g_host);
+        DeviceBuffer device_beta    = to_device(beta_host);
+        DeviceBuffer device_state   = to_device(state);
         DeviceBuffer device_initial = to_device(std::vector<std::int32_t>{initial_slot});
         DeviceBuffer device_parent;
         if (parent != nullptr) { device_parent = to_device(parent_host); }
@@ -393,28 +391,27 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
             parent_tensor = Tensor(device_parent.p, DType::I32, {width});
             parent_arg    = &parent_tensor;
         }
-        constexpr float kScale = 1.0F / std::sqrt(128.0F);
-        WorkspaceArena tile_workspace(std::max<std::size_t>(
-            256, ops::gated_delta_net_replay_record_workspace_capacity_bytes(value_heads, kBatch,
-                                                                              width)));
+        const float kScale = 1.0F / std::sqrt(128.0F);
+        WorkspaceArena tile_workspace(
+            std::max<std::size_t>(256, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
+                                           value_heads, kBatch, width)));
         ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, states, valid,
                                            initial, key_record_tensor, value_record_tensor,
                                            gate_record_tensor, out_tensor, nullptr, parent_arg,
                                            parent_arg != nullptr ? &tile_workspace : nullptr);
         cuda_synchronize();
         const std::vector<float> state_after = from_device<float>(device_state, state_elements);
-        if (state_after != state) {
-            std::cerr << "tree replay record modified source state\n";
-        }
-        return std::tuple{from_device<std::uint16_t>(out, static_cast<std::size_t>(kStateDim) *
-                                                              value_heads * width),
-                          from_device<std::uint16_t>(key_record, static_cast<std::size_t>(kStateDim) *
-                                                                    kQkHeads * width),
-                          from_device<std::uint16_t>(
-                              value_record, static_cast<std::size_t>(kStateDim) * value_heads * width),
-                          from_device<std::uint32_t>(gate_record, static_cast<std::size_t>(value_heads) *
-                                                                     width * 2),
-                          state_after != state};
+        if (state_after != state) { std::cerr << "tree replay record modified source state\n"; }
+        return std::tuple{
+            from_device<std::uint16_t>(out,
+                                       static_cast<std::size_t>(kStateDim) * value_heads * width),
+            from_device<std::uint16_t>(key_record,
+                                       static_cast<std::size_t>(kStateDim) * kQkHeads * width),
+            from_device<std::uint16_t>(value_record,
+                                       static_cast<std::size_t>(kStateDim) * value_heads * width),
+            from_device<std::uint32_t>(gate_record,
+                                       static_cast<std::size_t>(value_heads) * width * 2),
+            state_after != state};
     };
 
     Tensor dummy_parent;
@@ -446,8 +443,7 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
         }
     };
 
-    compare_col("tree out vs sequential parent", tree_out, seq0_out, 0, 0,
-                value_heads * kStateDim);
+    compare_col("tree out vs sequential parent", tree_out, seq0_out, 0, 0, value_heads * kStateDim);
     compare_col("tree out vs sequential child 0", tree_out, seq0_out, 1, 1,
                 value_heads * kStateDim);
     compare_col("tree out vs sequential child 1", tree_out, seq1_out, 2, 1,
@@ -457,18 +453,18 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
     compare_col("tree value record child 0", tree_value, seq0_value, 1, 1, value_heads * kStateDim);
     compare_col("tree value record child 1", tree_value, seq1_value, 2, 1, value_heads * kStateDim);
     for (std::int32_t head = 0; head < value_heads * 2; ++head) {
-        if (tree_gate[static_cast<std::size_t>(1 * value_heads * 2 + head)] !=
-                seq0_gate[static_cast<std::size_t>(1 * value_heads * 2 + head)] ||
-            tree_gate[static_cast<std::size_t>(2 * value_heads * 2 + head)] !=
-                seq1_gate[static_cast<std::size_t>(1 * value_heads * 2 + head)]) {
+        if (tree_gate[1 * static_cast<std::size_t>(value_heads) * 2 + head] !=
+                seq0_gate[1 * static_cast<std::size_t>(value_heads) * 2 + head] ||
+            tree_gate[2 * static_cast<std::size_t>(value_heads) * 2 + head] !=
+                seq1_gate[1 * static_cast<std::size_t>(value_heads) * 2 + head]) {
             std::cerr << "tree gate record mismatch" << suffix << "\n";
             return failures + 1;
         }
     }
     if (seq0_out != seq1_out &&
-        std::equal(tree_out.begin() + static_cast<std::ptrdiff_t>(value_heads * kStateDim),
-                   tree_out.begin() + static_cast<std::ptrdiff_t>(2 * value_heads * kStateDim),
-                   tree_out.begin() + static_cast<std::ptrdiff_t>(2 * value_heads * kStateDim))) {
+        std::equal(tree_out.begin() + static_cast<std::ptrdiff_t>(value_heads) * kStateDim,
+                   tree_out.begin() + 2 * static_cast<std::ptrdiff_t>(value_heads) * kStateDim,
+                   tree_out.begin() + 2 * static_cast<std::ptrdiff_t>(value_heads) * kStateDim)) {
         std::cerr << "tree sibling outputs are identical" << suffix << "\n";
         ++failures;
     }
@@ -477,9 +473,9 @@ int run_tree_case(std::int32_t value_heads, std::uint32_t seed) {
 
 int run_tree_chain_matches_sequential(std::int32_t value_heads, std::int32_t width,
                                       std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
-    constexpr std::int32_t kBatch   = 1;
-    constexpr std::int32_t kSlots   = 2;
+    constexpr std::int32_t kQkHeads  = 16;
+    constexpr std::int32_t kBatch    = 1;
+    constexpr std::int32_t kSlots    = 2;
     const std::size_t qk_elements    = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
     const std::size_t value_elements = static_cast<std::size_t>(kStateDim) * value_heads * width;
     const std::size_t gate_elements  = static_cast<std::size_t>(value_heads) * width;
@@ -537,14 +533,13 @@ int run_tree_chain_matches_sequential(std::int32_t value_heads, std::int32_t wid
             parent_tensor = Tensor(device_parent.p, DType::I32, {width});
             parent_arg    = &parent_tensor;
         }
-        constexpr float kScale = 1.0F / std::sqrt(128.0F);
-        WorkspaceArena tile_workspace(std::max<std::size_t>(
-            256, ops::gated_delta_net_replay_record_workspace_capacity_bytes(value_heads, kBatch,
-                                                                              width)));
-        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, states, valid,
-                                           initial, key_t, value_t, gate_t, out_t, nullptr,
-                                           parent_arg,
-                                           parent_arg != nullptr ? &tile_workspace : nullptr);
+        const float kScale = 1.0F / std::sqrt(128.0F);
+        WorkspaceArena tile_workspace(
+            std::max<std::size_t>(256, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
+                                           value_heads, kBatch, width)));
+        ops::gated_delta_net_replay_record(
+            q, k, v, g_tensor, beta_tensor, kScale, states, valid, initial, key_t, value_t, gate_t,
+            out_t, nullptr, parent_arg, parent_arg != nullptr ? &tile_workspace : nullptr);
         cuda_synchronize();
         return from_device<std::uint16_t>(out, value_elements);
     };

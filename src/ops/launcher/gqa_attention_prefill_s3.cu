@@ -70,11 +70,12 @@ void gqa_s3_prefill_attention_launch(const Tensor& q, const Tensor& positions, f
                 CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                     &occ_legacy, gqa_attention_prefill_nvfp4s3_kernel<Geometry, Metadata>,
                     kGqaPrefillNvfp4s3Threads, kGqaPrefillNvfp4s3SmemBytes));
-                std::fprintf(stderr,
-                             "[s3-prefill] occ2 Br=%d warps=%d smem=%d occ/SM=%d | legacy occ/SM=%d "
-                             "smem=%d\n",
-                             Occ2::Br, Occ2::Warps, Occ2::SmemBytes, occ, occ_legacy,
-                             kGqaPrefillNvfp4s3SmemBytes);
+                std::fprintf(
+                    stderr,
+                    "[s3-prefill] occ2 Br=%d warps=%d smem=%d occ/SM=%d | legacy occ/SM=%d "
+                    "smem=%d\n",
+                    Occ2::Br, Occ2::Warps, Occ2::SmemBytes, occ, occ_legacy,
+                    kGqaPrefillNvfp4s3SmemBytes);
             }
         }
         const dim3 occ2_grid(static_cast<unsigned>(div_up(tokens, Occ2::Br)),
@@ -109,11 +110,11 @@ void gqa_s3_prefill_attention_launch(const Tensor& q, const Tensor& positions, f
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_s3_prefill_fill_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                 CacheView cache, Metadata metadata, cudaStream_t stream) {
-    const auto tokens     = static_cast<std::int32_t>(k.ne[2]);
-    Tensor& cache_k       = cache.k_pages;
-    Tensor& cache_v       = cache.v_pages;
-    Tensor& cache_k_scale = cache.k_scale_pages;
-    Tensor& cache_v_scale = cache.v_scale_pages;
+    const auto tokens              = static_cast<std::int32_t>(k.ne[2]);
+    Tensor& cache_k                = cache.k_pages;
+    Tensor& cache_v                = cache.v_pages;
+    Tensor& cache_k_scale          = cache.k_scale_pages;
+    Tensor& cache_v_scale          = cache.v_scale_pages;
     const std::int64_t kmean_units = cache.k_mean_pages.data != nullptr
                                          ? div_up(tokens, kPagedKVPageSize) *
                                                static_cast<std::int64_t>(Geometry::KVHeads) *
@@ -125,14 +126,13 @@ void gqa_s3_prefill_fill_launch(const Tensor& k, const Tensor& v, const Tensor& 
             (kGqaNvfp4HeadDim / 2) +
         kmean_units;
     const int fill_grid = static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(256)));
-    gqa_attention_prefill_fill_nvfp4s3_kernel<Geometry, Metadata>
-        <<<fill_grid, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            static_cast<const std::int32_t*>(positions.data), metadata,
-            static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
-            static_cast<std::uint8_t*>(cache_k_scale.data),
-            static_cast<std::uint8_t*>(cache_v_scale.data),
-            static_cast<float*>(cache.k_mean_pages.data), tokens);
+    gqa_attention_prefill_fill_nvfp4s3_kernel<Geometry, Metadata><<<fill_grid, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const std::int32_t*>(positions.data), metadata,
+        static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
+        static_cast<std::uint8_t*>(cache_k_scale.data),
+        static_cast<std::uint8_t*>(cache_v_scale.data),
+        static_cast<float*>(cache.k_mean_pages.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 

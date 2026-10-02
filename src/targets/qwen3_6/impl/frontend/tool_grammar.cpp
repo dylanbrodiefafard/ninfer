@@ -9,7 +9,7 @@
 #include <string_view>
 
 #if defined(__GLIBC__)
-#include <malloc.h>
+#    include <malloc.h>
 #endif
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
@@ -18,8 +18,8 @@ using Json = nlohmann::ordered_json;
 
 bool annotation(std::string_view key) {
     return key == "$schema" || key == "$id" || key == "title" || key == "description" ||
-           key == "default" || key == "examples" || key == "deprecated" ||
-           key == "readOnly" || key == "writeOnly" || key == "$comment";
+           key == "default" || key == "examples" || key == "deprecated" || key == "readOnly" ||
+           key == "writeOnly" || key == "$comment";
 }
 
 // Rewrites a client schema into one the grammar compiler enforces, accepting a superset of the
@@ -40,14 +40,15 @@ void relax_schema(Json& schema) {
         if (annotation_siblings) {
             Json inner = std::move(schema["allOf"][0]);
             schema.erase("allOf");
-            for (auto it = inner.begin(); it != inner.end(); ++it) { schema[it.key()] = it.value(); }
+            for (auto it = inner.begin(); it != inner.end(); ++it) {
+                schema[it.key()] = it.value();
+            }
         }
     }
-    for (const char* key :
-         {"format", "contentEncoding", "contentMediaType", "contentSchema", "uniqueItems",
-          "multipleOf", "propertyNames", "not", "contains", "minContains", "maxContains",
-          "dependentRequired", "dependentSchemas", "if", "then", "else", "unevaluatedProperties",
-          "unevaluatedItems"}) {
+    for (const char* key : {"format", "contentEncoding", "contentMediaType", "contentSchema",
+                            "uniqueItems", "multipleOf", "propertyNames", "not", "contains",
+                            "minContains", "maxContains", "dependentRequired", "dependentSchemas",
+                            "if", "then", "else", "unevaluatedProperties", "unevaluatedItems"}) {
         schema.erase(key);
     }
     if (schema.contains("oneOf") && !schema.contains("anyOf")) {
@@ -71,14 +72,34 @@ void relax_schema(Json& schema) {
 
 void check_schema(const Json& schema) {
     if (schema.is_boolean()) { return; }
-    if (!schema.is_object()) { throw std::invalid_argument("tool schema must be an object or boolean"); }
+    if (!schema.is_object()) {
+        throw std::invalid_argument("tool schema must be an object or boolean");
+    }
     // XGrammar warns and ignores several JSON Schema assertions. Reject them at
     // admission instead of claiming that a successful grammar compile enforces them.
-    static const std::set<std::string_view> supported{
-        "type", "properties", "required", "additionalProperties", "items", "prefixItems",
-        "minItems", "maxItems", "minProperties", "maxProperties", "minimum", "maximum",
-        "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "pattern",
-        "enum", "const", "$ref", "$defs", "definitions", "anyOf"};
+    static const std::set<std::string_view> supported{"type",
+                                                      "properties",
+                                                      "required",
+                                                      "additionalProperties",
+                                                      "items",
+                                                      "prefixItems",
+                                                      "minItems",
+                                                      "maxItems",
+                                                      "minProperties",
+                                                      "maxProperties",
+                                                      "minimum",
+                                                      "maximum",
+                                                      "exclusiveMinimum",
+                                                      "exclusiveMaximum",
+                                                      "minLength",
+                                                      "maxLength",
+                                                      "pattern",
+                                                      "enum",
+                                                      "const",
+                                                      "$ref",
+                                                      "$defs",
+                                                      "definitions",
+                                                      "anyOf"};
     for (auto it = schema.begin(); it != schema.end(); ++it) {
         if (!annotation(it.key()) && !supported.contains(it.key())) {
             throw std::invalid_argument("unsupported tool schema assertion: " + it.key());
@@ -99,7 +120,9 @@ void check_schema(const Json& schema) {
                 !annotation(it.key())) {
                 // Common typed enums are checked independently before compilation.
                 if ((std::string_view(branch) == "enum" || std::string_view(branch) == "const") &&
-                    it.key() == "type") { continue; }
+                    it.key() == "type") {
+                    continue;
+                }
                 throw std::invalid_argument("unsupported tool schema assertion sibling of " +
                                             std::string(branch) + ": " + it.key());
             }
@@ -111,14 +134,15 @@ void check_schema(const Json& schema) {
     }
     auto matches_type = [&](const Json& value) {
         const auto& type = schema.at("type");
-        auto one = [&](const std::string& name) {
+        auto one         = [&](const std::string& name) {
             return (name == "string" && value.is_string()) ||
-                   (name == "integer" && (value.is_number_integer() ||
-                       (value.is_number_float() && std::floor(value.get<double>()) == value.get<double>()))) ||
+                   (name == "integer" &&
+                    (value.is_number_integer() ||
+                     (value.is_number_float() &&
+                      std::floor(value.get<double>()) == value.get<double>()))) ||
                    (name == "number" && value.is_number()) ||
                    (name == "boolean" && value.is_boolean()) ||
-                   (name == "null" && value.is_null()) ||
-                   (name == "object" && value.is_object()) ||
+                   (name == "null" && value.is_null()) || (name == "object" && value.is_object()) ||
                    (name == "array" && value.is_array());
         };
         if (type.is_string()) { return one(type.get<std::string>()); }
@@ -144,7 +168,9 @@ void check_schema(const Json& schema) {
     }
     for (const char* map : {"properties", "$defs", "definitions"}) {
         if (!schema.contains(map)) { continue; }
-        if (!schema[map].is_object()) { throw std::invalid_argument("tool schema map must be an object"); }
+        if (!schema[map].is_object()) {
+            throw std::invalid_argument("tool schema map must be an object");
+        }
         for (const auto& child : schema[map]) { check_schema(child); }
     }
     for (const char* child : {"items", "additionalProperties"}) {
@@ -152,7 +178,9 @@ void check_schema(const Json& schema) {
     }
     for (const char* list : {"prefixItems", "anyOf"}) {
         if (!schema.contains(list)) { continue; }
-        if (!schema[list].is_array()) { throw std::invalid_argument("tool schema list must be an array"); }
+        if (!schema[list].is_array()) {
+            throw std::invalid_argument("tool schema list must be an array");
+        }
         for (const auto& child : schema[list]) { check_schema(child); }
     }
 }
@@ -234,8 +262,8 @@ void ToolGrammarState::commit_preview() noexcept {
 void ToolGrammarState::discard_preview() noexcept { preview_.reset(); }
 
 void ToolGrammarState::fill_masks(std::span<const TokenId> tokens,
-                                 std::span<const std::int32_t> parents,
-                                 std::span<std::uint32_t> words) const {
+                                  std::span<const std::int32_t> parents,
+                                  std::span<std::uint32_t> words) const {
     if (tokens.empty() || tokens.size() != parents.size() ||
         words.size() != tokens.size() * mask_words) {
         throw std::invalid_argument("invalid tool grammar verification mask shape");
@@ -261,12 +289,13 @@ void ToolGrammarState::fill_masks(std::span<const TokenId> tokens,
             continue;
         }
         std::int64_t shape = mask_words;
-        DLTensor mask{};
-        mask.data = output.data();
-        mask.device = {kDLCPU, 0};
-        mask.ndim = 1;
-        mask.dtype = {kDLInt, 32, 1};
-        mask.shape = &shape;
+        DLTensor mask{.data        = output.data(),
+                      .device      = {kDLCPU, 0},
+                      .ndim        = 1,
+                      .dtype       = {kDLInt, 32, 1},
+                      .shape       = &shape,
+                      .strides     = nullptr,
+                      .byte_offset = 0};
         (void)nodes[node]->FillNextTokenBitmask(&mask);
     }
 }
@@ -282,9 +311,9 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
     std::set<std::string> names;
     for (const auto& text : tools) {
         try {
-            const auto tool = Json::parse(text);
+            const auto tool      = Json::parse(text);
             const auto& function = tool.at("function");
-            const auto name = function.at("name").get<std::string>();
+            const auto name      = function.at("name").get<std::string>();
             if (name.empty() || name.find_first_of("<>\r\n") != std::string::npos ||
                 !names.insert(name).second) {
                 throw std::invalid_argument("invalid or duplicate tool name: " + name);
@@ -294,10 +323,13 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
             check_schema(schema);
             name_required_properties(schema);
             definitions.push_back({name, schema, std::nullopt});
-            tags.push_back(Json{{"type", "tag"}, {"begin", "<tool_call>\n<function=" + name + ">\n"},
-                {"content", Json{{"type", "json_schema"}, {"style", "qwen_xml"},
-                                 {"any_order", true}, {"json_schema", schema}}},
-                {"end", "\n</function>\n</tool_call>"}});
+            tags.push_back(Json{{"type", "tag"},
+                                {"begin", "<tool_call>\n<function=" + name + ">\n"},
+                                {"content", Json{{"type", "json_schema"},
+                                                 {"style", "qwen_xml"},
+                                                 {"any_order", true},
+                                                 {"json_schema", schema}}},
+                                {"end", "\n</function>\n</tool_call>"}});
         } catch (const Json::exception& error) {
             throw RequestError(RequestErrorKind::InvalidToolSchema,
                                std::string("invalid tool declaration: ") + error.what());
@@ -311,19 +343,28 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
     // the dispatch/free-text region, not to schema-constrained argument values
     // or to a call's actual closing frame. The captured legacy </invoke> tail
     // is also protocol debris, not a supported Qwen invocation envelope.
-    Json format{{"type", "triggered_tags"}, {"triggers", {"<tool_call"}}, {"tags", tags},
-                {"excludes", {"</invoke", "</parameter", "</function", "</tool_call",
-                               "<invoke", "<parameter", "<function"}}};
+    Json format{{"type", "triggered_tags"},
+                {"triggers", {"<tool_call"}},
+                {"tags", tags},
+                {"excludes",
+                 {"</invoke", "</parameter", "</function", "</tool_call", "<invoke", "<parameter",
+                  "<function"}}};
     if (starts_in_reasoning) {
-        format = Json{{"type", "sequence"}, {"elements", Json::array({
-            // A tool envelope belongs to the content/call phase. Without this
-            // exclusion, the model can rehearse complete calls indefinitely
-            // inside reasoning, where they must never be published as calls.
-            Json{{"type", "tag"}, {"begin", ""},
-                 {"content", Json{{"type", "any_text"}, {"excludes", {"<tool_call"}}}},
-                 {"end", "</think>"}}, format})}};
+        format =
+            Json{{"type", "sequence"},
+                 {"elements",
+                  Json::array(
+                      {// A tool envelope belongs to the content/call phase. Without this
+                       // exclusion, the model can rehearse complete calls indefinitely
+                       // inside reasoning, where they must never be published as calls.
+                       Json{{"type", "tag"},
+                            {"begin", ""},
+                            {"content", Json{{"type", "any_text"}, {"excludes", {"<tool_call"}}}},
+                            {"end", "</think>"}},
+                       format})}};
     }
     std::scoped_lock lock(mutex_);
+
     // Compile temporaries are freed before this returns, including a rejected
     // schema. malloc_trim releases the free space at the top of each glibc
     // arena and leaves the compiler cache in place.
@@ -334,6 +375,7 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
 #endif
         }
     } release_compile_heap;
+
     if (!compiler_) {
         std::vector<std::string> vocab(kTokenDomain);
         for (std::size_t id = 0; id < kTokenDomain; ++id) {
@@ -349,9 +391,9 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
         auto compiled = compiler_->CompileStructuralTag(
             Json{{"type", "structural_tag"}, {"format", format}}.dump());
         for (auto& definition : definitions) {
-            definition.arguments_validator = compiler_->CompileJSONSchema(
-                definition.parameters.dump(), true, std::nullopt, std::nullopt, false,
-                std::nullopt, true);
+            definition.arguments_validator =
+                compiler_->CompileJSONSchema(definition.parameters.dump(), true, std::nullopt,
+                                             std::nullopt, false, std::nullopt, true);
         }
         return std::make_shared<const ToolGrammarData>(
             ToolGrammarData{std::move(definitions), std::move(compiled)});
@@ -372,8 +414,12 @@ namespace {
 using Json = nlohmann::ordered_json;
 
 std::string_view trim_parameter(std::string_view text) {
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) { text.remove_prefix(1); }
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) { text.remove_suffix(1); }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
     return text;
 }
 
@@ -382,15 +428,19 @@ Json parse_parameter_json(std::string_view text) {
     // sees the serialized value. Preserve the raw-string alternative, but do
     // not let this lossy parse turn invalid nested JSON into a valid argument.
     std::vector<std::set<std::string>> objects;
-    bool duplicate = false;
-    const auto result = Json::parse(text, [&](int, Json::parse_event_t event, Json& value) {
-        if (event == Json::parse_event_t::object_start) { objects.emplace_back(); }
-        if (event == Json::parse_event_t::key && !objects.back().insert(value.get<std::string>()).second) {
-            duplicate = true;
-        }
-        if (event == Json::parse_event_t::object_end) { objects.pop_back(); }
-        return true;
-    }, false);
+    bool duplicate    = false;
+    const auto result = Json::parse(
+        text,
+        [&](int, Json::parse_event_t event, Json& value) {
+            if (event == Json::parse_event_t::object_start) { objects.emplace_back(); }
+            if (event == Json::parse_event_t::key &&
+                !objects.back().insert(value.get<std::string>()).second) {
+                duplicate = true;
+            }
+            if (event == Json::parse_event_t::object_end) { objects.pop_back(); }
+            return true;
+        },
+        false);
     return duplicate ? Json(Json::value_t::discarded) : result;
 }
 
@@ -410,7 +460,7 @@ std::optional<ToolCall> ToolGrammarData::decode_call(std::string_view text) cons
     if (end == std::string_view::npos) { return std::nullopt; }
     const std::string name(text.substr(0, end));
     auto definition = std::find_if(definitions.begin(), definitions.end(),
-        [&](const Definition& item) { return item.name == name; });
+                                   [&](const Definition& item) { return item.name == name; });
     if (definition == definitions.end()) { return std::nullopt; }
     text.remove_prefix(end + 1);
     // Qwen strings are raw; other values use JSON. The compiled argument
@@ -422,18 +472,20 @@ std::optional<ToolCall> ToolGrammarData::decode_call(std::string_view text) cons
     std::set<std::string> keys;
     auto decode = [&](auto&& self, std::string_view remaining, xgrammar::GrammarMatcher matcher,
                       std::string serialized, std::size_t count) -> std::optional<ToolCall> {
-        remaining = trim_parameter(remaining);
+        remaining                                 = trim_parameter(remaining);
         constexpr std::string_view function_close = "</function>";
-        constexpr std::string_view tool_close = "</tool_call>";
+        constexpr std::string_view tool_close     = "</tool_call>";
         if (remaining.starts_with(function_close)) {
             remaining = trim_parameter(remaining.substr(function_close.size()));
             if (!remaining.starts_with(tool_close) ||
                 !trim_parameter(remaining.substr(tool_close.size())).empty() ||
-                !matcher.AcceptString("}") || !matcher.IsCompleted()) { return std::nullopt; }
+                !matcher.AcceptString("}") || !matcher.IsCompleted()) {
+                return std::nullopt;
+            }
             serialized += '}';
             return ToolCall{.id = {}, .name = name, .arguments_json = std::move(serialized)};
         }
-        constexpr std::string_view parameter_open = "<parameter=";
+        constexpr std::string_view parameter_open  = "<parameter=";
         constexpr std::string_view parameter_close = "</parameter>";
         if (!remaining.starts_with(parameter_open)) { return std::nullopt; }
         remaining.remove_prefix(parameter_open.size());
@@ -447,7 +499,7 @@ std::optional<ToolCall> ToolGrammarData::decode_call(std::string_view text) cons
         serialized += prefix;
         keys.insert(key);
         for (auto close = remaining.find(parameter_close); close != std::string_view::npos;
-             close = remaining.find(parameter_close, close + parameter_close.size())) {
+             close      = remaining.find(parameter_close, close + parameter_close.size())) {
             auto raw = remaining.substr(0, close);
             // Only the two canonical framing LFs are removed; string whitespace
             // and embedded XML-looking text remain data.
@@ -458,7 +510,7 @@ std::optional<ToolCall> ToolGrammarData::decode_call(std::string_view text) cons
             for (int interpretation = 0; interpretation < 2; ++interpretation) {
                 if (interpretation && (parsed.is_discarded() || parsed == Json(raw))) { continue; }
                 const auto value = interpretation ? parsed.dump() : Json(raw).dump();
-                auto candidate = matcher.Fork();
+                auto candidate   = matcher.Fork();
                 if (candidate.AcceptString(value)) {
                     if (auto call = self(self, remaining.substr(close + parameter_close.size()),
                                          std::move(candidate), serialized + value, count + 1)) {

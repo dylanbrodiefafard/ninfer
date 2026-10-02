@@ -31,14 +31,14 @@ std::size_t column_index(std::int32_t d, std::int32_t width, std::int32_t lane, 
 int run_case(const char* label, std::int32_t d, std::int32_t width, std::int32_t capacity,
              const std::vector<std::int32_t>& lanes, const std::vector<std::int32_t>& starts,
              const std::vector<std::int32_t>& ends) {
-    const auto batch = static_cast<std::int32_t>(lanes.size());
-    const auto source =
-        bit_pattern(static_cast<std::size_t>(d) * width * capacity, 0x51ed'c0deu);
+    const auto batch  = static_cast<std::int32_t>(lanes.size());
+    const auto source = bit_pattern(static_cast<std::size_t>(d) * width * capacity, 0x51ed'c0deu);
     std::vector<std::uint16_t> expected_dest(static_cast<std::size_t>(d) * width * batch, 0);
     std::vector<std::int32_t> expected_positions(static_cast<std::size_t>(width) * batch);
     std::vector<std::int32_t> expected_counts(static_cast<std::size_t>(batch));
     for (std::int32_t b = 0; b < batch; ++b) {
-        const std::int32_t n = ends[static_cast<std::size_t>(b)] - starts[static_cast<std::size_t>(b)];
+        const std::int32_t n =
+            ends[static_cast<std::size_t>(b)] - starts[static_cast<std::size_t>(b)];
         expected_counts[static_cast<std::size_t>(b)] = n;
         const std::int32_t lane                      = lanes[static_cast<std::size_t>(b)];
         const std::int32_t start                     = starts[static_cast<std::size_t>(b)];
@@ -80,18 +80,19 @@ int run_case(const char* label, std::int32_t d, std::int32_t width, std::int32_t
                                positions_tensor, counts_tensor, nullptr);
     cuda_synchronize();
 
-    int failures = verify_exact((std::string(label) + " values").c_str(),
-                                from_device<std::uint16_t>(device_dest.data(), expected_dest.size()),
-                                expected_dest);
-    failures += verify_exact((std::string(label) + " positions").c_str(),
-                             from_device<std::int32_t>(device_positions.data(),
-                                                       expected_positions.size()),
-                             expected_positions);
-    failures += verify_exact((std::string(label) + " counts").c_str(),
-                             from_device<std::int32_t>(device_counts.data(), expected_counts.size()),
-                             expected_counts);
-    failures += verify_exact((std::string(label) + " preserves source").c_str(),
-                             from_device<std::uint16_t>(device_source.data(), source.size()), source);
+    int failures = verify_exact(
+        (std::string(label) + " values").c_str(),
+        from_device<std::uint16_t>(device_dest.data(), expected_dest.size()), expected_dest);
+    failures +=
+        verify_exact((std::string(label) + " positions").c_str(),
+                     from_device<std::int32_t>(device_positions.data(), expected_positions.size()),
+                     expected_positions);
+    failures += verify_exact(
+        (std::string(label) + " counts").c_str(),
+        from_device<std::int32_t>(device_counts.data(), expected_counts.size()), expected_counts);
+    failures +=
+        verify_exact((std::string(label) + " preserves source").c_str(),
+                     from_device<std::uint16_t>(device_source.data(), source.size()), source);
     failures += device_source.verify_guards((std::string(label) + " source").c_str());
     failures += device_dest.verify_guards((std::string(label) + " dest").c_str());
     failures += device_positions.verify_guards((std::string(label) + " positions").c_str());
@@ -110,8 +111,8 @@ int main() {
     int failures = 0;
     failures += run_case("prepare_ragged_prefix N=0", 8, 4, 2, {1}, {40}, {40});
     failures += run_case("prepare_ragged_prefix N=W", 8, 4, 2, {0}, {10}, {14});
-    failures += run_case("prepare_ragged_prefix mixed", 64, 4, 4, {2, 0, 3}, {10, 20, 30},
-                         {10, 22, 34});
+    failures +=
+        run_case("prepare_ragged_prefix mixed", 64, 4, 4, {2, 0, 3}, {10, 20, 30}, {10, 22, 34});
     std::cout << (failures ? "FAIL" : "OK") << " prepare_ragged_prefix\n";
     return failures ? 1 : 0;
 }

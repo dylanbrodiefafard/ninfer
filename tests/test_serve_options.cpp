@@ -31,13 +31,11 @@ int main() {
     int failures = 0;
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
-    failures += check(defaults.prefill_chunk == 4096,
-                      "serving prefill chunk default is not 4096");
+    failures += check(defaults.prefill_chunk == 4096, "serving prefill chunk default is not 4096");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
-    failures += check(defaults.system_prepend.empty(),
-                      "system prepend is not empty by default");
+    failures += check(defaults.system_prepend.empty(), "system prepend is not empty by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
@@ -85,9 +83,8 @@ int main() {
     failures += check(dflash.speculative.dflash_verify_width == 0,
                       "DFlash verify width default is not auto");
 
-    const ServeOptions dflash_w6 =
-        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "4",
-               "--dflash-verify-width", "6"});
+    const ServeOptions dflash_w6 = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
+                                          "--draft-tokens", "4", "--dflash-verify-width", "6"});
     failures += check(dflash_w6.speculative.dflash_verify_width == 6,
                       "--dflash-verify-width did not preserve the packed width");
 
@@ -98,9 +95,8 @@ int main() {
     failures += check(dflash_width_without_spec_rejected,
                       "--dflash-verify-width was accepted without --spec dflash");
 
-    const ServeOptions dflash_vision =
-        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
-               "--vision"});
+    const ServeOptions dflash_vision = parse(
+        {"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15", "--vision"});
     failures += check(dflash_vision.enable_vision &&
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash,
                       "DFlash and Vision were not accepted together");
@@ -119,12 +115,12 @@ int main() {
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--adaptive-draft"});
     } catch (const std::invalid_argument&) { adaptive_without_spec_rejected = true; }
-    failures += check(adaptive_without_spec_rejected,
-                      "--adaptive-draft was accepted without --spec");
+    failures +=
+        check(adaptive_without_spec_rejected, "--adaptive-draft was accepted without --spec");
 
-    failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.dflash_p_less_draft_temperature ==
-                          0.4f,
-                      "p-less draft temperature default is not 0.4");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer"}).speculative.dflash_p_less_draft_temperature == 0.4f,
+        "p-less draft temperature default is not 0.4");
     const ServeOptions draft_temperature =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "5",
                "--dflash-p-less-draft-temperature", "0.6"});
@@ -150,9 +146,10 @@ int main() {
                       "--context-checkpoints off did not disable the ladder");
     const ServeOptions custom_marks =
         parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "8192,16384"});
-    failures += check(custom_marks.context_checkpoint_marks ==
-                          std::optional<std::vector<std::uint32_t>>(std::vector<std::uint32_t>{8192u, 16384u}),
-                      "--context-checkpoints custom list was not parsed");
+    failures += check(
+        custom_marks.context_checkpoint_marks ==
+            std::optional<std::vector<std::uint32_t>>(std::vector<std::uint32_t>{8192u, 16384u}),
+        "--context-checkpoints custom list was not parsed");
     bool bad_marks = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--context-checkpoints", "16384,8192"});
@@ -178,8 +175,7 @@ int main() {
 
     const ServeOptions prepended =
         parse({"ninfer-serve", "model.ninfer", "--system-prepend", "Stay terse."});
-    failures += check(prepended.generation_recovery,
-                      "generation recovery must default to enabled");
+    failures += check(prepended.generation_recovery, "generation recovery must default to enabled");
     const ServeOptions no_recovery =
         parse({"ninfer-serve", "model.ninfer", "--no-generation-recovery"});
     failures += check(!no_recovery.generation_recovery,
@@ -199,9 +195,9 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "7"});
     } catch (const std::invalid_argument&) { excessive_concurrency_rejected = true; }
     failures += check(excessive_concurrency_rejected, "--max-concurrency 7 was accepted");
-    failures += check(parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "6"})
-                              .max_concurrency == 6,
-                      "--max-concurrency 6 was rejected");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "6"}).max_concurrency == 6,
+        "--max-concurrency 6 was rejected");
     failures += check(configured.max_context == 4096 &&
                           configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           configured.kv_capacity.explicit_tokens == 8192,
@@ -233,8 +229,7 @@ int main() {
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
 
-    const ServeOptions production =
-        parse({"ninfer-serve", "model.ninfer", "--no-p-less-sampling"});
+    const ServeOptions production = parse({"ninfer-serve", "model.ninfer", "--no-p-less-sampling"});
     failures += check(!production.sampling_overrides.p_less,
                       "--no-p-less-sampling did not reach serving options");
     failures +=
@@ -250,10 +245,9 @@ int main() {
     failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
                       "disabled server policy did not reach Engine options");
     request.capture_context_checkpoint = true;
-    failures +=
-        check(to_request_options(request, defaults).execution.capture_context_checkpoint,
-              "request capture_context_checkpoint did not reach Engine options");
-    request.capture_context_checkpoint = false;
+    failures += check(to_request_options(request, defaults).execution.capture_context_checkpoint,
+                      "request capture_context_checkpoint did not reach Engine options");
+    request.capture_context_checkpoint              = false;
     const ninfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
@@ -302,9 +296,10 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--kv-disk-compress") != std::string::npos,
               "serve help omits --kv-disk-compress");
-    failures += check(serve_usage_text("ninfer-serve").find("pinned host KV prefix-cache capacity in MiB") !=
-                          std::string::npos,
-                      "serve help omits KV RAM MiB wording");
+    failures += check(
+        serve_usage_text("ninfer-serve").find("pinned host KV prefix-cache capacity in MiB") !=
+            std::string::npos,
+        "serve help omits KV RAM MiB wording");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
@@ -326,26 +321,24 @@ int main() {
                       "--kv-capacity auto did not select automatic sizing");
     const ServeOptions headroom = parse(
         {"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512", "--kv-capacity", "auto"});
-    failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                          headroom.kv_capacity.automatic_headroom_bytes == 512ULL * 1024ULL * 1024ULL,
-                      "--kv-capacity-headroom did not set automatic headroom in MiB");
+    failures +=
+        check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                  headroom.kv_capacity.automatic_headroom_bytes == 512ULL * 1024ULL * 1024ULL,
+              "--kv-capacity-headroom did not set automatic headroom in MiB");
     bool headroom_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512"});
-    } catch (const std::invalid_argument&) {
-        headroom_rejected = true;
-    }
+    } catch (const std::invalid_argument&) { headroom_rejected = true; }
     failures += check(headroom_rejected, "--kv-capacity-headroom without auto was accepted");
 
     const ServeOptions ram_off = parse({"ninfer-serve", "model.ninfer"});
-    failures += check(ram_off.kv_ram_capacity_bytes == 0,
-                      "omitted --kv-ram-capacity did not default off");
+    failures +=
+        check(ram_off.kv_ram_capacity_bytes == 0, "omitted --kv-ram-capacity did not default off");
     const ServeOptions ram_explicit_off =
         parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "off"});
     failures += check(ram_explicit_off.kv_ram_capacity_bytes == 0,
                       "--kv-ram-capacity off did not disable the tier");
-    const ServeOptions ram_mib =
-        parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1"});
+    const ServeOptions ram_mib = parse({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1"});
     failures += check(ram_mib.kv_ram_capacity_bytes == 1024ULL * 1024ULL,
                       "--kv-ram-capacity 1 did not convert MiB to bytes");
     auto reject_ram = [&](const char* value, const char* message) {
@@ -383,12 +376,12 @@ int main() {
                 "disk capacity without location was accepted");
     reject_disk({"ninfer-serve", "model.ninfer", "--kv-disk-location", "/tmp/x"},
                 "disk location without capacity was accepted");
-    reject_disk({"ninfer-serve", "model.ninfer", "--kv-disk-capacity", "1", "--kv-disk-location",
-                 "/tmp/x"},
-                "disk without RAM was accepted");
-    reject_disk({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1", "--kv-disk-capacity",
-                 "0"},
-                "--kv-disk-capacity 0 was accepted");
+    reject_disk(
+        {"ninfer-serve", "model.ninfer", "--kv-disk-capacity", "1", "--kv-disk-location", "/tmp/x"},
+        "disk without RAM was accepted");
+    reject_disk(
+        {"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1", "--kv-disk-capacity", "0"},
+        "--kv-disk-capacity 0 was accepted");
     reject_disk({"ninfer-serve", "model.ninfer", "--kv-ram-capacity", "1", "--kv-disk-capacity",
                  "1", "--kv-disk-location", "/tmp/x", "--kv-disk-compress", "lz4"},
                 "unknown --kv-disk-compress was accepted");
@@ -414,8 +407,8 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--xattn-tau") != std::string::npos,
                       "serve help omits --xattn-tau");
     {
-        const ServeOptions skip = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "nvfp4",
-                                         "--keep-frac", "0.5"});
+        const ServeOptions skip =
+            parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "nvfp4", "--keep-frac", "0.5"});
         failures += check(skip.keep_frac == 0.5f, "--keep-frac 0.5 did not parse");
         failures += check(skip.xattn_tau == 1.0f, "xattn_tau default is not 1.0");
     }

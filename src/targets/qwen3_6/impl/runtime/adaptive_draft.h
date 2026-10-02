@@ -47,24 +47,24 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr float kAdaptiveEwma              = 32.0f;
-inline constexpr float kAdaptiveEwmaAlpha         = 2.0f / (kAdaptiveEwma + 1.0f);
-inline constexpr float kAdaptiveDiscount          = 1.0f - kAdaptiveEwmaAlpha;
-inline constexpr float kAdaptiveBetaPrior         = 1.0f;
-inline constexpr std::uint32_t kAdaptiveTBins     = 16;
-inline constexpr std::uint32_t kAdaptiveMaxHops   = 16;
-inline constexpr float kAdaptiveSwitchSeconds     = 0.001f;
+inline constexpr float kAdaptiveEwma                 = 32.0f;
+inline constexpr float kAdaptiveEwmaAlpha            = 2.0f / (kAdaptiveEwma + 1.0f);
+inline constexpr float kAdaptiveDiscount             = 1.0f - kAdaptiveEwmaAlpha;
+inline constexpr float kAdaptiveBetaPrior            = 1.0f;
+inline constexpr std::uint32_t kAdaptiveTBins        = 16;
+inline constexpr std::uint32_t kAdaptiveMaxHops      = 16;
+inline constexpr float kAdaptiveSwitchSeconds        = 0.001f;
 inline constexpr std::uint32_t kAdaptiveHopTableMaxK = 8;
-inline constexpr float kAdaptiveHazardPrior       = 1.0f;
-inline constexpr float kAdaptiveHazardInherit     = 0.5f;
-inline constexpr float kAdaptiveMaxHopRate        = 0.995f;
-inline constexpr std::uint32_t kAdaptiveExploreEvery    = 32;
-inline constexpr float kAdaptivePooledHazardPrior       = 0.35f;
-inline constexpr float kAdaptivePooledHazardTrials      = 4.0f;
-inline constexpr float kAdaptiveBlockRatioPrior         = 64.0f;  // expected failures
-inline constexpr float kAdaptiveCellPriorTrials         = 256.0f;
-inline constexpr float kAdaptiveCellDiscount            = 1.0f - 1.0f / 8192.0f;
-inline constexpr float kAdaptivePooledDiscount          = 1.0f - 1.0f / 1024.0f;
+inline constexpr float kAdaptiveHazardPrior          = 1.0f;
+inline constexpr float kAdaptiveHazardInherit        = 0.5f;
+inline constexpr float kAdaptiveMaxHopRate           = 0.995f;
+inline constexpr std::uint32_t kAdaptiveExploreEvery = 32;
+inline constexpr float kAdaptivePooledHazardPrior    = 0.35f;
+inline constexpr float kAdaptivePooledHazardTrials   = 4.0f;
+inline constexpr float kAdaptiveBlockRatioPrior      = 64.0f; // expected failures
+inline constexpr float kAdaptiveCellPriorTrials      = 256.0f;
+inline constexpr float kAdaptiveCellDiscount         = 1.0f - 1.0f / 8192.0f;
+inline constexpr float kAdaptivePooledDiscount       = 1.0f - 1.0f / 1024.0f;
 
 // The drafter draws argmax for a greedy target, at the scaled draft temperature for a p-less
 // target, and at the target temperature otherwise; each law has its own hop table.
@@ -76,19 +76,19 @@ inline constexpr std::uint32_t kAdaptiveDraftLaws = 3;
 struct AdaptiveHopRates {
     float failures[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK + 1][kAdaptiveHopTableMaxK] = {};
     float trials[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK + 1][kAdaptiveHopTableMaxK]   = {};
-    float pooled_failures[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK] = {};
-    float pooled_trials[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]   = {};
-    std::uint64_t decisions = 0;
+    float pooled_failures[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]                     = {};
+    float pooled_trials[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]                       = {};
+    std::uint64_t decisions                                                              = 0;
 };
 
 struct AdaptiveDraftState {
-    std::uint32_t live_k      = 0;
-    std::uint32_t rounds_at_k = 0;
-    std::uint32_t observed    = 0;
-    float alpha[kAdaptiveMaxHops] = {};
-    float beta[kAdaptiveMaxHops]  = {};
-    std::uint16_t r_seen          = 0;
-    std::uint64_t rounds_hist[16] = {};
+    std::uint32_t live_k                    = 0;
+    std::uint32_t rounds_at_k               = 0;
+    std::uint32_t observed                  = 0;
+    float alpha[kAdaptiveMaxHops]           = {};
+    float beta[kAdaptiveMaxHops]            = {};
+    std::uint16_t r_seen                    = 0;
+    std::uint64_t rounds_hist[16]           = {};
     AdaptiveDraftLaw law                    = AdaptiveDraftLaw::Greedy;
     float hazard_failures[kAdaptiveMaxHops] = {};
     float hazard_expected[kAdaptiveMaxHops] = {};
@@ -133,8 +133,8 @@ adaptive_draft_ks(SpeculativeBackend backend, std::uint32_t n, bool adaptive,
     return out.empty() ? std::vector<std::uint32_t>{n} : out;
 }
 
-[[nodiscard]] inline std::uint32_t
-adaptive_k_index(std::span<const std::uint32_t> captured_ks, std::uint32_t k) {
+[[nodiscard]] inline std::uint32_t adaptive_k_index(std::span<const std::uint32_t> captured_ks,
+                                                    std::uint32_t k) {
     for (std::uint32_t i = 0; i < captured_ks.size(); ++i) {
         if (captured_ks[i] == k) { return i; }
     }
@@ -146,10 +146,11 @@ adaptive_k_index(std::span<const std::uint32_t> captured_ks, std::uint32_t k) {
     return max_concurrency * (1U + max_planned_topology);
 }
 
-[[nodiscard]] inline std::uint32_t
-adaptive_topology_class(std::uint32_t k_index, std::uint32_t k_stride,
-                        std::uint32_t planned_topology, std::uint32_t max_concurrency,
-                        std::uint32_t batch_size) {
+[[nodiscard]] inline std::uint32_t adaptive_topology_class(std::uint32_t k_index,
+                                                           std::uint32_t k_stride,
+                                                           std::uint32_t planned_topology,
+                                                           std::uint32_t max_concurrency,
+                                                           std::uint32_t batch_size) {
     return k_index * k_stride + planned_topology * max_concurrency + (batch_size - 1U);
 }
 
@@ -172,8 +173,8 @@ adaptive_snap_captured_k(std::span<const std::uint32_t> captured_ks, std::uint32
     return captured_ks.back();
 }
 
-[[nodiscard]] inline std::uint32_t
-adaptive_batch_k(std::span<const std::uint32_t> row_k, std::span<const std::uint32_t> captured_ks) {
+[[nodiscard]] inline std::uint32_t adaptive_batch_k(std::span<const std::uint32_t> row_k,
+                                                    std::span<const std::uint32_t> captured_ks) {
     std::uint32_t batch_k = 0;
     for (std::uint32_t k : row_k) { batch_k = std::max(batch_k, k); }
     return adaptive_snap_captured_k(captured_ks, batch_k);
@@ -196,7 +197,7 @@ inline void seed_adaptive_draft_state(AdaptiveDraftState& state, std::uint32_t l
 
 [[nodiscard]] inline float adaptive_pooled_hazard(const AdaptiveHopRates& rates,
                                                   AdaptiveDraftLaw law, std::uint32_t hop) {
-    const auto l = static_cast<std::uint32_t>(law);
+    const auto l          = static_cast<std::uint32_t>(law);
     const std::uint32_t i = std::min(hop, kAdaptiveHopTableMaxK - 1U);
     return (rates.pooled_failures[l][i] +
             kAdaptivePooledHazardTrials * kAdaptivePooledHazardPrior) /
@@ -204,8 +205,8 @@ inline void seed_adaptive_draft_state(AdaptiveDraftState& state, std::uint32_t l
 }
 
 // Hazard ratio of block length k against the pooled hazard, over all of its hops.
-[[nodiscard]] inline float adaptive_block_ratio(const AdaptiveHopRates& rates,
-                                                AdaptiveDraftLaw law, std::uint32_t k) {
+[[nodiscard]] inline float adaptive_block_ratio(const AdaptiveHopRates& rates, AdaptiveDraftLaw law,
+                                                std::uint32_t k) {
     const auto l           = static_cast<std::uint32_t>(law);
     const std::uint32_t kk = std::clamp(k, 1U, kAdaptiveHopTableMaxK);
     float failures         = 0.0f;
@@ -218,9 +219,8 @@ inline void seed_adaptive_draft_state(AdaptiveDraftState& state, std::uint32_t l
 }
 
 // Rejection hazard of hop i in a block of length k.
-[[nodiscard]] inline float adaptive_hop_hazard(const AdaptiveHopRates& rates,
-                                               AdaptiveDraftLaw law, std::uint32_t k,
-                                               std::uint32_t hop) {
+[[nodiscard]] inline float adaptive_hop_hazard(const AdaptiveHopRates& rates, AdaptiveDraftLaw law,
+                                               std::uint32_t k, std::uint32_t hop) {
     const auto l           = static_cast<std::uint32_t>(law);
     const std::uint32_t kk = std::clamp(k, 1U, kAdaptiveHopTableMaxK);
     const std::uint32_t i  = std::min(hop, kk - 1U);
@@ -361,8 +361,8 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
         const std::uint32_t kr = r < row_cap.size() ? std::min(k, row_cap[r]) : k;
         if (kr == 0) { continue; }
         // The batch drafts a block of length k; a capped row uses its first kr hops.
-        sum_e += rates != nullptr ? hop_expected_tokens(*st, *rates, k, kr)
-                                  : expected_tokens(*st, kr);
+        sum_e +=
+            rates != nullptr ? hop_expected_tokens(*st, *rates, k, kr) : expected_tokens(*st, kr);
     }
     return sum_e;
 }
@@ -371,8 +371,8 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
 
 [[nodiscard]] inline float adaptive_t_hat(const AdaptiveRoundTimeState& st, std::uint32_t k,
                                           std::uint32_t length_tokens) {
-    float t        = 0.0f;
-    bool measured  = false;
+    float t       = 0.0f;
+    bool measured = false;
     detail::t_lookup(&st, k, length_tokens, t, measured);
     (void)measured;
     return t;
@@ -405,7 +405,7 @@ inline void adaptive_observe_hazards(AdaptiveDraftState& state, AdaptiveHopRates
                                      std::uint32_t accepted, std::uint32_t drafted,
                                      std::uint32_t round_k, bool explored,
                                      float discount = kAdaptiveDiscount) {
-    const std::uint32_t n = std::min({drafted, accepted + 1U, kAdaptiveMaxHops});
+    const std::uint32_t n          = std::min({drafted, accepted + 1U, kAdaptiveMaxHops});
     float hazard[kAdaptiveMaxHops] = {};
     for (std::uint32_t i = 0; i < n; ++i) {
         hazard[i] = adaptive_hop_hazard(rates, state.law, round_k, i);
@@ -485,15 +485,13 @@ inline void adaptive_assign_live_k(std::span<AdaptiveDraftState*> states, std::u
 // unmeasured arm. Each captured k within the cap is measured once per batch size (T is
 // engine-global), then the policy takes argmax E[Y]/T.
 [[nodiscard]] inline std::uint32_t
-adaptive_select_k(const AdaptiveDraftConfig& cfg,
-                  std::span<const AdaptiveDraftState* const> states,
+adaptive_select_k(const AdaptiveDraftConfig& cfg, std::span<const AdaptiveDraftState* const> states,
                   std::span<const std::uint32_t> row_cap, std::uint32_t cap_k,
                   std::uint32_t live_k) {
     if (cfg.captured_ks.empty() || states.empty()) { return cap_k; }
 
     for (std::uint32_t k : cfg.captured_ks) {
-        if (k <= cap_k &&
-            (cfg.round_time == nullptr || !adaptive_t_measured(*cfg.round_time, k))) {
+        if (k <= cap_k && (cfg.round_time == nullptr || !adaptive_t_measured(*cfg.round_time, k))) {
             return k;
         }
     }
@@ -518,30 +516,30 @@ adaptive_select_k(const AdaptiveDraftConfig& cfg,
     return best != 0 ? best : cfg.captured_ks.front();
 }
 
-[[nodiscard]] inline std::uint32_t
-adaptive_select_batch_k(std::span<const AdaptiveDraftState* const> states,
-                        std::span<const std::uint32_t> row_k,
-                        std::span<const std::uint32_t> captured_ks,
-                        const AdaptiveRoundTimeState* round_time, std::uint32_t length_tokens,
-                        std::uint32_t live_k, AdaptiveHopRates* rates) {
+[[nodiscard]] inline std::uint32_t adaptive_select_batch_k(
+    std::span<const AdaptiveDraftState* const> states, std::span<const std::uint32_t> row_k,
+    std::span<const std::uint32_t> captured_ks, const AdaptiveRoundTimeState* round_time,
+    std::uint32_t length_tokens, std::uint32_t live_k, AdaptiveHopRates* rates) {
     AdaptiveDraftConfig cfg;
-    cfg.captured_ks   = captured_ks;
-    cfg.round_time    = round_time;
-    cfg.length_tokens = length_tokens;
-    cfg.hop_rates     = rates;
+    cfg.captured_ks           = captured_ks;
+    cfg.round_time            = round_time;
+    cfg.length_tokens         = length_tokens;
+    cfg.hop_rates             = rates;
     const std::uint32_t cap_k = adaptive_batch_k(row_k, captured_ks);
     return adaptive_select_k(cfg, states, row_k, cap_k, live_k);
 }
 
 [[nodiscard]] inline std::uint32_t
 adaptive_batch_next(AdaptiveBatchKState& batch, std::span<const AdaptiveDraftState* const> states,
-                    std::span<const std::uint32_t> row_k, std::span<const std::uint32_t> captured_ks,
+                    std::span<const std::uint32_t> row_k,
+                    std::span<const std::uint32_t> captured_ks,
                     const AdaptiveRoundTimeState* round_time, std::uint32_t length_tokens,
                     AdaptiveHopRates* rates) {
     const std::uint32_t next = adaptive_select_batch_k(states, row_k, captured_ks, round_time,
                                                        length_tokens, batch.live_k, rates);
-    if (batch.live_k != 0 && next == batch.live_k) { batch.rounds_at_k += 1; }
-    else {
+    if (batch.live_k != 0 && next == batch.live_k) {
+        batch.rounds_at_k += 1;
+    } else {
         batch.live_k      = next;
         batch.rounds_at_k = 0;
     }
@@ -561,9 +559,9 @@ inline std::uint32_t adaptive_draft_next(const AdaptiveDraftConfig& cfg, Adaptiv
     const std::uint32_t row_cap[] = {budget_extent};
     const std::uint32_t cap_k =
         detail::clamp_to_budget(cfg.captured_ks, budget_extent, budget_extent);
-    const std::uint32_t picked = adaptive_select_k(
-        cfg, std::span<const AdaptiveDraftState* const>(&ptr, 1),
-        std::span<const std::uint32_t>(row_cap, 1), cap_k, state.live_k);
+    const std::uint32_t picked =
+        adaptive_select_k(cfg, std::span<const AdaptiveDraftState* const>(&ptr, 1),
+                          std::span<const std::uint32_t>(row_cap, 1), cap_k, state.live_k);
     const std::uint32_t next = detail::clamp_to_budget(cfg.captured_ks, picked, budget_extent);
     if (next != state.live_k) {
         state.live_k      = next;

@@ -288,8 +288,8 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
             matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens);
         out.finish_dynamic =
             allocator.alloc(DType::BF16, {ops::kGroupedDynamicConvGroups, 2, tokens});
-        out.delta     = matrix(allocator, DType::BF16, Config::hidden, tokens);
-        out.prepared  = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        out.delta    = matrix(allocator, DType::BF16, Config::hidden, tokens);
+        out.prepared = matrix(allocator, DType::BF16, Config::hidden, tokens);
     }
     return out;
 }
@@ -312,7 +312,7 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
         {},
     };
     if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
-        out.gate_up       = matrix(allocator, DType::BF16, 2 * Config::intermediate, tokens);
+        out.gate_up = matrix(allocator, DType::BF16, 2 * Config::intermediate, tokens);
         out.finish_dynamic =
             allocator.alloc(DType::BF16, {ops::kGroupedDynamicConvGroups, 2, tokens});
         out.delta = matrix(allocator, DType::BF16, Config::hidden, tokens);

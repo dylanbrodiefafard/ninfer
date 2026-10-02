@@ -18,6 +18,17 @@ void expect(bool condition, std::string_view message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
+// Records a failure unless `call` throws std::invalid_argument; any other exception escapes and
+// fails the test process.
+template <typename Call>
+void expect_invalid_argument(const Call& call, std::string_view message) {
+    bool thrown = false;
+    try {
+        call();
+    } catch (const std::invalid_argument&) { thrown = true; }
+    expect(thrown, message);
+}
+
 void test_skip() {
     expect(ninfer::resolve_score_skip(2, std::nullopt) == 0, "n=2 default skip is 0");
     expect(ninfer::resolve_score_skip(3, std::nullopt) == 1, "n=3 default skip is 1");
@@ -25,23 +36,16 @@ void test_skip() {
     expect(ninfer::resolve_score_skip(8192, std::nullopt) == 4096, "8k default skip is half");
     expect(ninfer::resolve_score_skip(8, 0) == 0, "explicit skip 0");
     expect(ninfer::resolve_score_skip(8, 6) == 6, "explicit skip n-2");
-    try {
-        (void)ninfer::resolve_score_skip(8, 7);
-        expect(false, "skip n-1 must throw");
-    } catch (const std::invalid_argument&) {}
-    try {
-        (void)ninfer::resolve_score_skip(1, std::nullopt);
-        expect(false, "n<2 must throw");
-    } catch (const std::invalid_argument&) {}
+    expect_invalid_argument([] { (void)ninfer::resolve_score_skip(8, 7); }, "skip n-1 must throw");
+    expect_invalid_argument([] { (void)ninfer::resolve_score_skip(1, std::nullopt); },
+                            "n<2 must throw");
 }
 
 void test_decode_prefix() {
     expect(ninfer::resolve_decode_prefix(8, 4) == 4, "decode prefix follows skip");
     expect(ninfer::resolve_decode_prefix(8, 0) == 1, "decode prefix is at least 1");
-    try {
-        (void)ninfer::resolve_decode_prefix(2, 0);
-        expect(false, "decode n<3 must throw");
-    } catch (const std::invalid_argument&) {}
+    expect_invalid_argument([] { (void)ninfer::resolve_decode_prefix(2, 0); },
+                            "decode n<3 must throw");
 }
 
 void test_chunk_targets() {
@@ -51,15 +55,13 @@ void test_chunk_targets() {
            "full sequence scores n-1 next-token ids");
 
     const std::vector<std::int32_t> half = ninfer::prefill_chunk_targets(ids, 0, 8, 4);
-    expect(half.size() == 3 && half[0] == 15 && half[2] == 17,
-           "skip n/2 scores positions 4..6");
+    expect(half.size() == 3 && half[0] == 15 && half[2] == 17, "skip n/2 scores positions 4..6");
 
     const std::vector<std::int32_t> first = ninfer::prefill_chunk_targets(ids, 0, 4, 4);
     expect(first.empty(), "warmup chunk contributes no targets");
 
     const std::vector<std::int32_t> second = ninfer::prefill_chunk_targets(ids, 4, 4, 4);
-    expect(second.size() == 3 && second[0] == 15,
-           "second chunk starts scoring at skip");
+    expect(second.size() == 3 && second[0] == 15, "second chunk starts scoring at skip");
 
     const std::vector<std::int32_t> cross = ninfer::prefill_chunk_targets(ids, 0, 4, 0);
     expect(cross.size() == 4 && cross.back() == 14,

@@ -163,8 +163,7 @@ ThinkSplit derive_think_split(const std::string& content) {
     // reasoning = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
     std::size_t reasoning_end = first_close;
     while (reasoning_end > 0 && content[reasoning_end - 1] == '\n') { --reasoning_end; }
-    const std::size_t last_open =
-        std::string_view(content).substr(0, reasoning_end).rfind(kOpen);
+    const std::size_t last_open = std::string_view(content).substr(0, reasoning_end).rfind(kOpen);
     std::size_t reasoning_begin = last_open == std::string::npos ? 0 : last_open + kOpen.size();
     while (reasoning_begin < reasoning_end && content[reasoning_begin] == '\n') {
         ++reasoning_begin;
@@ -393,7 +392,7 @@ void append_tojson_value(std::string& out, std::string_view text, std::size_t& i
                 if (index < text.size() && text[index] == '}') { throw JsonWalkError{}; }
                 out += ", ";
             }
-            first               = false;
+            first                 = false;
             const std::string key = decode_json_string(text, index);
             append_json_escaped(out, key);
             skip_json_ws(text, index);
@@ -461,13 +460,17 @@ void append_tojson_value(std::string& out, std::string_view text, std::size_t& i
     }
     if (index < text.size() && text[index] == '.') {
         ++index;
-        if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+        if (index >= text.size() || text[index] < '0' || text[index] > '9') {
+            throw JsonWalkError{};
+        }
         while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
     }
     if (index < text.size() && (text[index] == 'e' || text[index] == 'E')) {
         ++index;
         if (index < text.size() && (text[index] == '+' || text[index] == '-')) { ++index; }
-        if (index >= text.size() || text[index] < '0' || text[index] > '9') { throw JsonWalkError{}; }
+        if (index >= text.size() || text[index] < '0' || text[index] > '9') {
+            throw JsonWalkError{};
+        }
         while (index < text.size() && text[index] >= '0' && text[index] <= '9') { ++index; }
     }
     out.append(text.data() + start, index - start);
@@ -539,7 +542,7 @@ void render_tool_call_from_json(RenderBuffer& out, const ToolCall& call) {
                 throw JsonWalkError{};
             }
         }
-        first = false;
+        first                 = false;
         const std::string key = decode_json_string(call.arguments_json, index);
         skip_json_ws(call.arguments_json, index);
         if (index >= call.arguments_json.size() || call.arguments_json[index] != ':') {
@@ -709,8 +712,8 @@ void append_rendered_messages(RenderBuffer& rendered, const std::vector<ChatMess
         if (!preserve_thinking && turn_closure_offsets != nullptr) {
             turn_closure_offsets->push_back(rendered.size());
         }
-        if (rewrite_checkpoint != nullptr && !preserve_thinking && !rewrite_checkpoint->has_value() &&
-            static_cast<long>(i) > last_query_index) {
+        if (rewrite_checkpoint != nullptr && !preserve_thinking &&
+            !rewrite_checkpoint->has_value() && static_cast<long>(i) > last_query_index) {
             *rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
@@ -799,7 +802,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
-                                          ChatRenderOptions options) const {
+                                          const ChatRenderOptions& options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
@@ -844,19 +847,20 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
     int image_count = 0;
     int video_count = 0;
-    append_rendered_messages(rendered, messages, message_begin, options, effort_template,
-                             preserve_thinking, last_query_index, image_count, video_count,
-                             &rewrite_checkpoint, preserve_thinking ? nullptr : &turn_closure_offsets,
-                             &latest_assistant_has_reasoning);
+    append_rendered_messages(
+        rendered, messages, message_begin, options, effort_template, preserve_thinking,
+        last_query_index, image_count, video_count, &rewrite_checkpoint,
+        preserve_thinking ? nullptr : &turn_closure_offsets, &latest_assistant_has_reasoning);
 
     if (options.add_generation_prompt) {
         rendered.markup("<|im_start|>assistant\n");
         const std::size_t generation_opener = rendered.size();
         if (!preserve_thinking) { turn_closure_offsets.push_back(generation_opener); }
         if (!preserve_thinking && !rewrite_checkpoint) {
-            rewrite_checkpoint = RewriteCheckpointByteSpec{.kind   = RewriteCheckpointKind::TurnClosure,
-                                                           .offset = rendered.size(),
-                                                           .generation_opener = true};
+            rewrite_checkpoint =
+                RewriteCheckpointByteSpec{.kind              = RewriteCheckpointKind::TurnClosure,
+                                          .offset            = rendered.size(),
+                                          .generation_opener = true};
         }
         if (options.enable_thinking) {
             rendered.markup("<think>\n");
@@ -876,7 +880,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             const bool replay_at_opener = options.enable_thinking &&
                                           latest_assistant_has_reasoning.has_value() &&
                                           !*latest_assistant_has_reasoning;
-            rewrite_checkpoint = RewriteCheckpointByteSpec{
+            rewrite_checkpoint          = RewriteCheckpointByteSpec{
                 .kind   = RewriteCheckpointKind::ResponseReplay,
                 .offset = replay_at_opener ? generation_opener : rendered.size()};
         }
@@ -889,7 +893,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 }
 
 RenderedFragment CompiledChatTemplate::render_fragment(const std::vector<ChatMessage>& messages,
-                                                       ChatRenderOptions options) const {
+                                                       const ChatRenderOptions& options) const {
     if (messages.empty()) { return {}; }
     const bool effort_template   = semantics_ == ChatTemplateSemantics::ReasoningEffort;
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
@@ -898,8 +902,8 @@ RenderedFragment CompiledChatTemplate::render_fragment(const std::vector<ChatMes
     int video_count = 0;
     // A fragment is appended after the closed conversation, so each assistant
     // sits past the last user query. last_query_index -1 is that suffix.
-    append_rendered_messages(rendered, messages, 0, options, effort_template, preserve_thinking,
-                             -1, image_count, video_count, nullptr, nullptr);
+    append_rendered_messages(rendered, messages, 0, options, effort_template, preserve_thinking, -1,
+                             image_count, video_count, nullptr, nullptr);
     return std::move(rendered).take();
 }
 

@@ -1,6 +1,6 @@
 """CLI entry point.
 
-Layer 0–3:
+Layer 0-3:
     python3 -m tools.kdev recipe [--preset ... --t T --idea ...]
     python3 -m tools.kdev bound ...
     python3 -m tools.kdev mma
@@ -16,7 +16,7 @@ import argparse
 import json
 import sys
 
-from . import bench, bound, harness, mma, oracle, profile, recipe, registry, san, sage, verdict
+from . import bench, bound, harness, mma, oracle, profile, recipe, registry, sage, san, verdict
 
 _USAGE = """\
 usage: python3 -m tools.kdev <command>
@@ -51,19 +51,38 @@ def _run_op(argv) -> int:
     parser = argparse.ArgumentParser(prog="kdev", description=__doc__)
     parser.add_argument("op", help=f"op name (registered: {', '.join(registry.names())})")
     parser.add_argument("--fast", action="store_true", help="run only the cheapest case (default)")
-    parser.add_argument("--full", action="store_true", help="run the representative matrix (overrides --fast)")
+    parser.add_argument(
+        "--full", action="store_true", help="run the representative matrix (overrides --fast)"
+    )
     parser.add_argument("--bench", action="store_true", help="also run the op bench (median us)")
     parser.add_argument("--profile", action="store_true", help="also run ncu over the bench point")
-    parser.add_argument("--san", action="store_true", help="also run compute-sanitizer (memory axis)")
-    parser.add_argument("--san-tool", default="memcheck",
-                        choices=["memcheck", "racecheck", "initcheck", "synccheck", "leakcheck"])
-    parser.add_argument("--json", action="store_true", help="emit the full JSON verdict (default: human table)")
-    parser.add_argument("--sage", action="store_true",
-                        help="sage (nvfp4s3) quality mode: FP4-P floor + bug-residual decomposition")
-    parser.add_argument("--s3-dump", action="store_true",
-                        help="s3 prefill op-dump: per-stage intermediate localization (score/psf/p_code/v_scale/m/l/acc)")
-    parser.add_argument("--keep-frac", type=float, default=None,
-                        help="rejected with --sage; exact-NVFP4 Sparge skip lives in ninfer-ppl --keep-frac")
+    parser.add_argument(
+        "--san", action="store_true", help="also run compute-sanitizer (memory axis)"
+    )
+    parser.add_argument(
+        "--san-tool",
+        default="memcheck",
+        choices=["memcheck", "racecheck", "initcheck", "synccheck", "leakcheck"],
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit the full JSON verdict (default: human table)"
+    )
+    parser.add_argument(
+        "--sage",
+        action="store_true",
+        help="sage (nvfp4s3) quality mode: FP4-P floor + bug-residual decomposition",
+    )
+    parser.add_argument(
+        "--s3-dump",
+        action="store_true",
+        help="s3 prefill op-dump: per-stage intermediate localization (score/psf/p_code/v_scale/m/l/acc)",
+    )
+    parser.add_argument(
+        "--keep-frac",
+        type=float,
+        default=None,
+        help="rejected with --sage; exact-NVFP4 Sparge skip lives in ninfer-ppl --keep-frac",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -81,8 +100,7 @@ def _run_op(argv) -> int:
             return 2
         if not _build(op, need_bench=args.bench):
             return 2
-        v = sage.run_sage(op.name, fast=args.fast, keep_frac=args.keep_frac,
-                          run_bench=args.bench)
+        v = sage.run_sage(op.name, fast=args.fast, keep_frac=args.keep_frac, run_bench=args.bench)
         if args.json:
             print(json.dumps(v, indent=2))
         else:
@@ -98,6 +116,7 @@ def _run_op(argv) -> int:
         if not _build(op, need_bench=False):
             return 2
         from . import diff as diff_mod
+
         v = diff_mod.run_s3_diff(op.name)
         if args.json:
             print(json.dumps(v, indent=2))
@@ -113,8 +132,11 @@ def _run_op(argv) -> int:
 
     oracle_result = oracle.run_op_test(op, tier)
     v = verdict.assemble(
-        op, tier, oracle_result,
-        git=harness.repo_head(), build=harness.build_stamp(op),
+        op,
+        tier,
+        oracle_result,
+        git=harness.repo_head(),
+        build=harness.build_stamp(op),
     )
     if args.bench:
         v["bench"] = bench.run_op_bench(op, tier)

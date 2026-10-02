@@ -16,11 +16,13 @@ bool is_ascii_whitespace(std::int32_t codepoint) noexcept {
 } // namespace
 
 std::string normalize_nfc(std::string_view text) {
+    // utf8proc_option_t is a flag set: the API takes OR-ed enumerators that name no single value.
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+    const auto options       = static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE);
     utf8proc_uint8_t* mapped = nullptr;
     const utf8proc_ssize_t result =
         utf8proc_map(reinterpret_cast<const utf8proc_uint8_t*>(text.data()),
-                     static_cast<utf8proc_ssize_t>(text.size()), &mapped,
-                     static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE));
+                     static_cast<utf8proc_ssize_t>(text.size()), &mapped, options);
     if (result < 0) {
         throw std::invalid_argument(std::string("failed to normalize UTF-8 text as NFC: ") +
                                     utf8proc_errmsg(result));

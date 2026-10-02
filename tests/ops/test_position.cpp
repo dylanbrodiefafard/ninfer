@@ -83,8 +83,8 @@ int offset_rows_case(std::int32_t width, std::int32_t rows, bool in_place) {
         for (std::int32_t column = 0; column < width; ++column) {
             const auto index = static_cast<std::size_t>(row) * static_cast<std::size_t>(width) +
                                static_cast<std::size_t>(column);
-            source[index]   = 131072 + 7 * column + 101 * row;
-            expected[index] = source[index] + deltas[static_cast<std::size_t>(row)];
+            source[index]    = 131072 + 7 * column + 101 * row;
+            expected[index]  = source[index] + deltas[static_cast<std::size_t>(row)];
         }
     }
 
@@ -105,7 +105,7 @@ int offset_rows_case(std::int32_t width, std::int32_t rows, bool in_place) {
     const std::string label = "offset_i32_position_rows T=" + std::to_string(width) +
                               " B=" + std::to_string(rows) +
                               (in_place ? " in-place" : " out-of-place");
-    int failures = verify_exact(
+    int failures            = verify_exact(
         label.c_str(),
         from_device<std::int32_t>(in_place ? device_source.data() : device_output.data(), count),
         expected);
@@ -113,8 +113,9 @@ int offset_rows_case(std::int32_t width, std::int32_t rows, bool in_place) {
         failures += verify_exact((label + " preserves source").c_str(),
                                  from_device<std::int32_t>(device_source.data(), count), source);
     }
-    failures += verify_exact((label + " preserves deltas").c_str(),
-                             from_device<std::int32_t>(device_deltas.data(), deltas.size()), deltas);
+    failures +=
+        verify_exact((label + " preserves deltas").c_str(),
+                     from_device<std::int32_t>(device_deltas.data(), deltas.size()), deltas);
     failures += device_source.verify_guards((label + " source").c_str());
     failures += device_deltas.verify_guards((label + " deltas").c_str());
     if (!in_place) { failures += device_output.verify_guards((label + " destination").c_str()); }

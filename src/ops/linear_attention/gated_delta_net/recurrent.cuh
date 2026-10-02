@@ -10,12 +10,12 @@
 
 namespace ninfer::ops::detail::gated_delta_net {
 
-inline constexpr int kDvPerWarp     = 4;
-inline constexpr int kNumWarps      = 4;
-inline constexpr int kBlockDv       = kNumWarps * kDvPerWarp;
-inline constexpr int kTreeNumWarps  = 1;
-inline constexpr int kTreeBlockDv   = kTreeNumWarps * kDvPerWarp;
-inline constexpr int kQkPerLane     = kStateDim / kWarpSize;
+inline constexpr int kDvPerWarp    = 4;
+inline constexpr int kNumWarps     = 4;
+inline constexpr int kBlockDv      = kNumWarps * kDvPerWarp;
+inline constexpr int kTreeNumWarps = 1;
+inline constexpr int kTreeBlockDv  = kTreeNumWarps * kDvPerWarp;
+inline constexpr int kQkPerLane    = kStateDim / kWarpSize;
 
 static_assert(kStateDim % kWarpSize == 0);
 static_assert(kQkPerLane == 4);
@@ -469,8 +469,7 @@ struct OverlayAccess {
         return out + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
     }
 
-    __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord,
-                                              std::int32_t token,
+    __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
                                               const RawQkLane& raw) const {
         if (coord.state_tile == 0 && coord.warp == 0 &&
             static_cast<int>(coord.value_head) % heads.group_size() == 0) {
@@ -481,8 +480,7 @@ struct OverlayAccess {
     }
 
     __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
-                                                std::int32_t token,
-                                                const RawValueLane& raw) const {
+                                                std::int32_t token, const RawValueLane& raw) const {
         if (coord.lane < kDvPerWarp) {
             __nv_bfloat16* destination =
                 value_record + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
@@ -491,16 +489,14 @@ struct OverlayAccess {
     }
 
     __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,
-                                               std::int32_t token,
-                                               const RawGatePair& raw) const {
+                                               std::int32_t token, const RawGatePair& raw) const {
         if (coord.state_tile == 0 && coord.warp == 0 && coord.lane == 0) {
             gate_record[column(coord, token) * heads.H_v + coord.value_head] = raw.bits;
         }
     }
 
-    __device__ __forceinline__ void
-    load_tile(const float* head, const RecurrentCoordinates& coord,
-              float (&state)[kDvPerWarp][kQkPerLane]) const {
+    __device__ __forceinline__ void load_tile(const float* head, const RecurrentCoordinates& coord,
+                                              float (&state)[kDvPerWarp][kQkPerLane]) const {
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
             load_qk_lane(state[r], head + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
@@ -508,9 +504,8 @@ struct OverlayAccess {
         }
     }
 
-    __device__ __forceinline__ void
-    store_tile(float* head, const RecurrentCoordinates& coord,
-               const float (&state)[kDvPerWarp][kQkPerLane]) const {
+    __device__ __forceinline__ void store_tile(float* head, const RecurrentCoordinates& coord,
+                                               const float (&state)[kDvPerWarp][kQkPerLane]) const {
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
             store_qk_lane(state[r], head + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
@@ -712,8 +707,8 @@ struct FoldAccess {
                 static_cast<std::uint32_t>(lane * kQkPerLane)};
     }
 
-    __device__ __forceinline__ std::int32_t
-    sequence_column(const RecurrentCoordinates& coord, std::int32_t step) const {
+    __device__ __forceinline__ std::int32_t sequence_column(const RecurrentCoordinates& coord,
+                                                            std::int32_t step) const {
         const std::int32_t path_length = rows.row[coord.batch].path_length;
         if (path_length > 0) { return rows.row[coord.batch].path[step]; }
         return step;
@@ -740,22 +735,19 @@ struct FoldAccess {
 
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
                                                             std::int32_t token) const {
-        const std::int64_t column =
-            record_outer(coord) * width + sequence_column(coord, token);
+        const std::int64_t column = record_outer(coord) * width + sequence_column(coord, token);
         return key_record + (column * Geometry::kQkHeads + coord.qk_head) * kStateDim;
     }
 
     __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
                                                               std::int32_t token) const {
-        const std::int64_t column =
-            record_outer(coord) * width + sequence_column(coord, token);
+        const std::int64_t column = record_outer(coord) * width + sequence_column(coord, token);
         return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
     }
 
     __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
                                                      std::int32_t token) const {
-        const std::int64_t column =
-            record_outer(coord) * width + sequence_column(coord, token);
+        const std::int64_t column = record_outer(coord) * width + sequence_column(coord, token);
         return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
     }
 
@@ -787,9 +779,12 @@ struct FoldAccess {
         const __nv_bfloat16* record =
             conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
 
-        const std::int32_t i0 = sequence_column(coord, commit == 1 ? 0 : (commit == 2 ? 0 : commit - 3));
-        const std::int32_t i1 = sequence_column(coord, commit == 1 ? 0 : (commit == 2 ? 0 : commit - 2));
-        const std::int32_t i2 = sequence_column(coord, commit == 1 ? 0 : (commit == 2 ? 1 : commit - 1));
+        const std::int32_t i0 =
+            sequence_column(coord, commit == 1 ? 0 : (commit == 2 ? 0 : commit - 3));
+        const std::int32_t i1 =
+            sequence_column(coord, commit == 1 ? 0 : (commit == 2 ? 0 : commit - 2));
+        const std::int32_t i2 =
+            sequence_column(coord, commit == 1 ? 0 : (commit == 2 ? 1 : commit - 1));
 
         __nv_bfloat16 h0;
         __nv_bfloat16 h1;
@@ -1001,8 +996,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                 access.output_ptr(coord, token), coord.dqk_base, coord.dv_base,
                                 coord.lane, access.scale);
 
-        access.store_tile(access.overlay_head(access.column_slot(token, coord.batch), coord),
-                          coord, state);
+        access.store_tile(access.overlay_head(access.column_slot(token, coord.batch), coord), coord,
+                          state);
         __syncthreads();
     }
 }

@@ -21,12 +21,14 @@ std::vector<double> nll_oracle(const std::vector<std::uint16_t>& logits,
         const std::size_t base = static_cast<std::size_t>(token) * physical_rows;
         float max_value        = bf16_to_f32(logits[base]);
         for (std::int32_t row = 1; row < valid_rows; ++row) {
-            max_value = std::max(max_value, bf16_to_f32(logits[base + static_cast<std::size_t>(row)]));
+            max_value =
+                std::max(max_value, bf16_to_f32(logits[base + static_cast<std::size_t>(row)]));
         }
         double sum = 0.0;
         for (std::int32_t row = 0; row < valid_rows; ++row) {
-            sum += std::exp(static_cast<double>(bf16_to_f32(logits[base + static_cast<std::size_t>(row)])) -
-                            static_cast<double>(max_value));
+            sum += std::exp(
+                static_cast<double>(bf16_to_f32(logits[base + static_cast<std::size_t>(row)])) -
+                static_cast<double>(max_value));
         }
         const std::int32_t target = targets[static_cast<std::size_t>(token)];
         const double target_logit =
@@ -47,7 +49,7 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
         for (std::int32_t row = 0; row < physical_rows; ++row) {
             const std::uint32_t mixed = static_cast<std::uint32_t>(row) * 1664525u +
                                         static_cast<std::uint32_t>(token + 1) * 1013904223u;
-            const float value  = -8.0f + static_cast<float>(mixed % 2048u) * (1.0f / 256.0f);
+            const float value         = -8.0f + static_cast<float>(mixed % 2048u) * (1.0f / 256.0f);
             logits[base + static_cast<std::size_t>(row)] = f32_to_bf16(value);
         }
         targets[static_cast<std::size_t>(token)] = (token * 17 + 3) % valid_rows;

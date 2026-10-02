@@ -101,9 +101,9 @@ int test_gdn_freeze_prefill_overlaps_d2d(ninfer::DeviceContext& ctx) {
     // C=1: slot 0 = current, 1 = Engine-wide staging. D2D current→staging then immediately
     // overwrite current on the compute stream (next prefill can be shorter/faster than the
     // copy). Staging and the copy-stream host pack after d2d_done must still be the freeze.
-    constexpr unsigned char kFreeze  = 0x11;
-    constexpr unsigned char kNext    = 0x22;
-    auto race_plan                   = plan_state(16, 32, 4, 8, 16, 16, 2);
+    constexpr unsigned char kFreeze = 0x11;
+    constexpr unsigned char kNext   = 0x22;
+    auto race_plan                  = plan_state(16, 32, 4, 8, 16, 16, 2);
     ninfer::DeviceArena arena(race_plan.bytes);
     ninfer::LinearAttentionStatePool pool({arena.base(), arena.capacity()}, race_plan.layout);
     fill_gdn_slot(pool, 0, kFreeze, ctx.stream);
@@ -129,7 +129,8 @@ int test_gdn_freeze_prefill_overlaps_d2d(ninfer::DeviceContext& ctx) {
     ctx.synchronize_all();
 
     int failures = 0;
-    failures += expect_device_byte(pool.conv_slot(0, 1), kFreeze, "staging conv after overlapping prefill");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 1), kFreeze, "staging conv after overlapping prefill");
     failures += expect_device_byte(pool.recurrent_slot(0, 1), kFreeze,
                                    "staging recurrent after overlapping prefill");
     failures += expect_device_byte(pool.conv_slot(15, 1), kFreeze,
@@ -144,8 +145,8 @@ int test_gdn_freeze_prefill_overlaps_d2d(ninfer::DeviceContext& ctx) {
 
     pool.copy_slot_2d(1, 0, ctx.stream);
     ctx.synchronize_all();
-    failures += expect_device_byte(pool.conv_slot(0, 0), kFreeze,
-                                   "staging restore D2D current conv");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 0), kFreeze, "staging restore D2D current conv");
     failures += expect_device_byte(pool.recurrent_slot(0, 0), kFreeze,
                                    "staging restore D2D current recurrent");
     failures += expect_device_byte(pool.conv_slot(0, 1), kFreeze,
@@ -191,9 +192,9 @@ int test_gdn_abort_inflight_host_pack(ninfer::DeviceContext& ctx) {
     CUDA_CHECK(cudaEventRecord(copies_done, ctx.copy_stream));
     fill_gdn_slot(pool, 0, kNext, ctx.stream);
     CUDA_CHECK(cudaEventSynchronize(copies_done));
-    std::vector<unsigned char> first(
-        static_cast<unsigned char*>(conv_host.data()),
-        static_cast<unsigned char*>(conv_host.data()) + conv_host.size());
+    std::vector<unsigned char> first(static_cast<unsigned char*>(conv_host.data()),
+                                     static_cast<unsigned char*>(conv_host.data()) +
+                                         conv_host.size());
     conv_host = ninfer::PinnedHostBuffer(1);
     rec_host  = ninfer::PinnedHostBuffer(1);
     pool.copy_slot_2d(0, 1, ctx.stream);
@@ -207,9 +208,9 @@ int test_gdn_abort_inflight_host_pack(ninfer::DeviceContext& ctx) {
     CUDA_CHECK(cudaEventDestroy(copies_done));
     int failures = 0;
     failures += expect_host_fill(first, kFreeze, "aborted freeze host GDN completed");
-    std::vector<unsigned char> second(
-        static_cast<unsigned char*>(conv_second.data()),
-        static_cast<unsigned char*>(conv_second.data()) + conv_second.size());
+    std::vector<unsigned char> second(static_cast<unsigned char*>(conv_second.data()),
+                                      static_cast<unsigned char*>(conv_second.data()) +
+                                          conv_second.size());
     failures += expect_host_fill(second, kNext, "staging reused after abort wait");
     return failures;
 }
@@ -300,25 +301,30 @@ int test_gdn_c3_shared_staging(ninfer::DeviceContext& ctx) {
     freeze_lane(2, lane2_conv, lane2_rec);
 
     int failures = 0;
-    failures += expect_host_fill(lane0_conv, kLane0, "C=3 lane 0 host GDN after later staging reuse");
+    failures +=
+        expect_host_fill(lane0_conv, kLane0, "C=3 lane 0 host GDN after later staging reuse");
     failures += expect_host_fill(lane0_rec, kLane0, "C=3 lane 0 host recurrent after later reuse");
     failures += expect_host_fill(lane1_conv, kLane1, "C=3 lane 1 host GDN after lane 2 reuse");
     failures += expect_host_fill(lane1_rec, kLane1, "C=3 lane 1 host recurrent after lane 2 reuse");
     failures += expect_host_fill(lane2_conv, kLane2, "C=3 lane 2 staging pack");
     failures += expect_host_fill(lane2_rec, kLane2, "C=3 lane 2 staging recurrent pack");
-    failures += expect_device_byte(pool.conv_slot(0, 0), kLane0, "C=3 lane 0 current survived staging");
-    failures += expect_device_byte(pool.conv_slot(0, 1), kLane1, "C=3 lane 1 current survived staging");
-    failures += expect_device_byte(pool.conv_slot(0, 2), kLane2, "C=3 lane 2 current survived staging");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 0), kLane0, "C=3 lane 0 current survived staging");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 1), kLane1, "C=3 lane 1 current survived staging");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 2), kLane2, "C=3 lane 2 current survived staging");
     return failures;
 }
 
 int test_gdn_pin_source_not_leftover(ninfer::DeviceContext& ctx) {
     // C=1: pin copies current→staging slot 1 then packs it. A leftover staging pattern must not
-    // become the published image. Suffix/BeforeSuffix may then mutate current; staging stays the pin.
-    constexpr unsigned char kCurrent = 0xa1;
+    // become the published image. Suffix/BeforeSuffix may then mutate current; staging stays the
+    // pin.
+    constexpr unsigned char kCurrent  = 0xa1;
     constexpr unsigned char kLeftover = 0xc3;
-    constexpr unsigned char kSuffix  = 0xd4;
-    auto plan                        = plan_state(16, 32, 4, 8, 16, 16, 2);
+    constexpr unsigned char kSuffix   = 0xd4;
+    auto plan                         = plan_state(16, 32, 4, 8, 16, 16, 2);
     ninfer::DeviceArena arena(plan.bytes);
     ninfer::LinearAttentionStatePool pool({arena.base(), arena.capacity()}, plan.layout);
     fill_gdn_slot(pool, 0, kCurrent, ctx.stream);
@@ -339,20 +345,24 @@ int test_gdn_pin_source_not_leftover(ninfer::DeviceContext& ctx) {
     ctx.synchronize_all();
 
     int failures = 0;
-    failures += expect_device_byte(pool.conv_slot(0, 1), kCurrent, "pin staging conv is current not leftover");
+    failures += expect_device_byte(pool.conv_slot(0, 1), kCurrent,
+                                   "pin staging conv is current not leftover");
     failures += expect_device_byte(pool.recurrent_slot(15, 1), kCurrent,
                                    "pin staging last-layer recurrent is current");
-    failures += expect_device_byte(pool.conv_slot(0, 0), kSuffix, "suffix mutated current after pin");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 0), kSuffix, "suffix mutated current after pin");
     failures += expect_host_fill(host_conv, kCurrent, "pin host conv is current not leftover");
     failures += expect_host_fill(host_rec, kCurrent, "pin host recurrent is current");
 
     CUDA_CHECK(cudaStreamWaitEvent(ctx.stream, copies_done, 0));
     pool.copy_slot_2d(1, 0, ctx.stream);
     ctx.synchronize_all();
-    failures += expect_device_byte(pool.conv_slot(0, 0), kCurrent, "restore D2D current from pin staging");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 0), kCurrent, "restore D2D current from pin staging");
     failures += expect_device_byte(pool.recurrent_slot(15, 0), kCurrent,
                                    "restore D2D last-layer recurrent from pin");
-    failures += expect_device_byte(pool.conv_slot(0, 1), kCurrent, "staging still holds pin after restore");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 1), kCurrent, "staging still holds pin after restore");
     CUDA_CHECK(cudaEventDestroy(d2d_done));
     CUDA_CHECK(cudaEventDestroy(copies_done));
     return failures;
@@ -362,8 +372,8 @@ void fill_cyclic_lane(ninfer::CyclicKVCache& cache, std::int32_t lane, unsigned 
                       cudaStream_t stream) {
     for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
         const ninfer::CyclicKVCacheLayerView view = cache.layer_view(layer);
-        ninfer::Tensor k = view.k.slice(3, lane, 1);
-        ninfer::Tensor v = view.v.slice(3, lane, 1);
+        ninfer::Tensor k                          = view.k.slice(3, lane, 1);
+        ninfer::Tensor v                          = view.v.slice(3, lane, 1);
         CUDA_CHECK(cudaMemsetAsync(k.data, value, k.bytes(), stream));
         CUDA_CHECK(cudaMemsetAsync(v.data, value, v.bytes(), stream));
     }
@@ -372,10 +382,10 @@ void fill_cyclic_lane(ninfer::CyclicKVCache& cache, std::int32_t lane, unsigned 
 int test_dflash_cyclic_pin_packs_staging_not_live(ninfer::DeviceContext& ctx) {
     // Pin D2Ds live lane → 1-lane staging, then D2H from staging on copy_stream.
     // Suffix may mutate live; the host image and staging must stay the freeze.
-    constexpr unsigned char kFreeze   = 0xa1;
+    constexpr unsigned char kFreeze    = 0xa1;
     constexpr unsigned char kOtherLane = 0xb2;
-    constexpr unsigned char kLeftover = 0xc3;
-    constexpr unsigned char kSuffix   = 0xd4;
+    constexpr unsigned char kLeftover  = 0xc3;
+    constexpr unsigned char kSuffix    = 0xd4;
     ninfer::LayoutBuilder builder;
     const auto local_layout   = ninfer::plan_cyclic_kv_cache(builder, 2, 16, 2, 8, 2);
     const auto staging_layout = ninfer::plan_cyclic_kv_cache(builder, 2, 16, 2, 8, 1);
@@ -599,10 +609,11 @@ int test_gdn_freeze_borrow_reload_restore_bytes(ninfer::DeviceContext& ctx) {
     failures += expect_device_byte(pool.recurrent_slot(15, 0), kRollback,
                                    "restore last-layer recurrent is rollback");
     failures += expect_device_byte(pool.conv_slot(0, 2), kRollback, "reloaded staging is rollback");
-    failures += expect_device_byte(pool.conv_slot(0, 1), kLadder, "lane 1 current survived restore");
-    std::vector<unsigned char> ladder_host(
-        static_cast<unsigned char*>(ladder_conv.data()),
-        static_cast<unsigned char*>(ladder_conv.data()) + ladder_conv.size());
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 1), kLadder, "lane 1 current survived restore");
+    std::vector<unsigned char> ladder_host(static_cast<unsigned char*>(ladder_conv.data()),
+                                           static_cast<unsigned char*>(ladder_conv.data()) +
+                                               ladder_conv.size());
     failures += expect_host_fill(ladder_host, kLadder, "ladder host pack during borrow");
     CUDA_CHECK(cudaEventDestroy(d2d_done));
     CUDA_CHECK(cudaEventDestroy(occupant_copies));
@@ -641,10 +652,12 @@ int test_gdn_abort_host_unpack_ignores_stale_staging(ninfer::DeviceContext& ctx)
     CUDA_CHECK(cudaEventDestroy(d2d_done));
 
     int failures = 0;
-    failures += expect_device_byte(pool.conv_slot(0, 0), kPin, "abort restore current from host pin");
+    failures +=
+        expect_device_byte(pool.conv_slot(0, 0), kPin, "abort restore current from host pin");
     failures += expect_device_byte(pool.recurrent_slot(0, 0), kPin,
                                    "abort restore recurrent from host pin");
-    failures += expect_device_byte(pool.conv_slot(0, 1), kStale, "stale staging was not the restore source");
+    failures += expect_device_byte(pool.conv_slot(0, 1), kStale,
+                                   "stale staging was not the restore source");
     return failures;
 }
 
@@ -739,7 +752,8 @@ int main() {
     CUDA_CHECK(cudaMemsetAsync(recurrent0.data, 0x5c, recurrent0.bytes(), ctx.stream));
     CUDA_CHECK(cudaMemsetAsync(recurrent1.data, 0x4d, recurrent1.bytes(), ctx.stream));
     CUDA_CHECK(cudaMemsetAsync(conv1_layer1.data, 0x3c, conv1_layer1.bytes(), ctx.stream));
-    CUDA_CHECK(cudaMemsetAsync(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes(), ctx.stream));
+    CUDA_CHECK(
+        cudaMemsetAsync(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes(), ctx.stream));
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();
@@ -759,18 +773,20 @@ int main() {
     slotted.copy_slot_2d(0, 1, ctx.stream);
     ctx.synchronize();
     failures += expect_device_byte(slotted.conv_slot(0, 0), 0xaa, "2d copy left source conv");
-    failures += expect_device_byte(slotted.recurrent_slot(0, 0), 0xbb,
-                                   "2d copy left source recurrent");
-    failures += expect_device_byte(slotted.conv_slot(1, 0), 0xcc, "2d copy left source conv layer1");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(0, 0), 0xbb, "2d copy left source recurrent");
+    failures +=
+        expect_device_byte(slotted.conv_slot(1, 0), 0xcc, "2d copy left source conv layer1");
     failures += expect_device_byte(slotted.recurrent_slot(1, 0), 0xdd,
                                    "2d copy left source recurrent layer1");
     failures += expect_device_byte(slotted.conv_slot(0, 1), 0xaa, "2d copied conv slot");
     failures += expect_device_byte(slotted.recurrent_slot(0, 1), 0xbb, "2d copied recurrent slot");
     failures += expect_device_byte(slotted.conv_slot(1, 1), 0xcc, "2d copied conv layer1");
-    failures += expect_device_byte(slotted.recurrent_slot(1, 1), 0xdd, "2d copied recurrent layer1");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(1, 1), 0xdd, "2d copied recurrent layer1");
     failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "2d copy kept other conv slot");
-    failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d,
-                                   "2d copy kept other recurrent slot");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "2d copy kept other recurrent slot");
     failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "2d copy kept other conv layer1");
     failures += expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d,
                                    "2d copy kept other recurrent layer1");
@@ -780,7 +796,8 @@ int main() {
     failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "zeroed conv slot0");
     failures += expect_device_byte(slotted.recurrent_slot(0, 0), 0, "zeroed recurrent slot0");
     failures += expect_device_byte(slotted.conv_slot(0, 1), 0xaa, "zero kept 2d conv dest");
-    failures += expect_device_byte(slotted.recurrent_slot(0, 1), 0xbb, "zero kept 2d recurrent dest");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(0, 1), 0xbb, "zero kept 2d recurrent dest");
     failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "zero kept conv slot2");
     failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "zero kept recurrent slot2");
 

@@ -26,7 +26,7 @@ inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
 inline constexpr int kSamplerMaxColumns          = 16;
 // Enough CTAs to cover the RTX 5090 through the exp-heavy admitted-mass wave,
 // while bounding the device-branch no-op cost for greedy/truncated replay.
-inline constexpr int kSamplerPLessTargetBlocks   = 1024;
+inline constexpr int kSamplerPLessTargetBlocks = 1024;
 
 static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
               "group merge tile must hold one group's candidates");
@@ -37,8 +37,7 @@ __host__ __device__ inline int sampler_group_count(int partial_blocks) {
 
 // `columns` is the per-row column count (speculative W or K+1, or sample_batch B). Do not
 // multiply by batch: C>1 would then use fewer workers per column than sequential C=1.
-__host__ __device__ inline int sampler_p_less_workers_per_column(int partial_blocks,
-                                                                 int columns) {
+__host__ __device__ inline int sampler_p_less_workers_per_column(int partial_blocks, int columns) {
     int workers = columns > 0 ? kSamplerPLessTargetBlocks / columns : 1;
     if (workers < 1) { workers = 1; }
     if (workers > partial_blocks) { workers = partial_blocks; }

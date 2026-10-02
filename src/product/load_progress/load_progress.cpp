@@ -5,11 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <exception>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ninfer::product {
 namespace {
@@ -50,11 +52,11 @@ std::string format_bytes(std::uint64_t bytes) {
 
 std::string format_line(std::string_view phase, std::uint64_t done, std::uint64_t total,
                         double seconds) {
-    std::string_view category = "load";
-    std::string_view detail   = phase;
+    std::string_view category              = "load";
+    std::string_view detail                = phase;
     constexpr std::string_view kDiskPrefix = "kv-disk ";
-    const bool disk_counts = phase.size() > kDiskPrefix.size() &&
-                              phase.substr(0, kDiskPrefix.size()) == kDiskPrefix;
+    const bool disk_counts =
+        phase.size() > kDiskPrefix.size() && phase.substr(0, kDiskPrefix.size()) == kDiskPrefix;
     if (disk_counts) {
         category = "kv-disk";
         detail   = phase.substr(kDiskPrefix.size());
@@ -89,7 +91,7 @@ LoadProgressRendererOptions stderr_load_progress_options() noexcept {
 
 LoadProgressRenderer::LoadProgressRenderer(std::ostream& output,
                                            LoadProgressRendererOptions options)
-    : output_(&output), options_(options) {}
+    : output_(&output), options_(std::move(options)) {}
 
 LoadProgressRenderer::~LoadProgressRenderer() { finish(); }
 
@@ -102,10 +104,13 @@ LoadProgress LoadProgressRenderer::callback() {
 
 void LoadProgressRenderer::finish() noexcept {
     if (!line_open_) { return; }
+    // finish() runs from the destructor: an output stream configured to throw cannot report a
+    // failed final newline anywhere, and the renderer state is reset either way.
     try {
         *output_ << '\n';
         output_->flush();
-    } catch (...) {}
+        // NOLINTNEXTLINE(bugprone-empty-catch): unreportable final newline; see above.
+    } catch (const std::exception&) {}
     line_open_      = false;
     terminal_width_ = 0;
 }
@@ -124,11 +129,10 @@ void LoadProgressRenderer::update(std::string_view phase, std::uint64_t done, st
         return;
     }
 
-    last_done_       = done;
-    last_total_      = total;
-    const bool final = total != 0 && done >= total;
-    const bool disk_counts =
-        phase.size() > 8 && phase.substr(0, 8) == std::string_view{"kv-disk "};
+    last_done_             = done;
+    last_total_            = total;
+    const bool final       = total != 0 && done >= total;
+    const bool disk_counts = phase.size() > 8 && phase.substr(0, 8) == std::string_view{"kv-disk "};
     if (!new_phase && !final && !disk_counts &&
         now - last_rendered_ < options_.min_refresh_interval) {
         return;

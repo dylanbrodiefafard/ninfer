@@ -21,8 +21,7 @@ struct Response;
 
 namespace ninfer::serve {
 
-inline constexpr const char* kPrometheusContentType =
-    "text/plain; version=0.0.4; charset=utf-8";
+inline constexpr const char* kPrometheusContentType = "text/plain; version=0.0.4; charset=utf-8";
 
 // Rendered family inventory, in exposition order.
 inline constexpr std::string_view kMetricFamilies[] = {
@@ -136,8 +135,7 @@ struct HttpRouteClass {
 [[nodiscard]] MetricsProtocol metrics_protocol(std::string_view request_log_protocol);
 // Closed Prometheus cause. `kind` is the recovery event kind name. Exhausted
 // details collapse to their decision; JSONL keeps the raw string.
-[[nodiscard]] const char* prometheus_recovery_cause(std::string_view kind,
-                                                    std::string_view cause);
+[[nodiscard]] const char* prometheus_recovery_cause(std::string_view kind, std::string_view cause);
 
 struct ScrapeInputs {
     ninfer::RuntimeStats stats;
@@ -149,14 +147,14 @@ struct ScrapeInputs {
 // One HTTP generation terminal or reject. `outcome` is set for a finished run.
 // `recovery` is set when the error path has stats and no outcome.
 struct GenerationObservation {
-    MetricsProtocol protocol = MetricsProtocol::OpenAiChat;
-    bool stream              = false;
-    GenerationResult result  = GenerationResult::Success;
-    bool thinking            = false;
-    bool tools               = false;
-    bool capture_requested   = false;
-    bool has_media           = false;
-    const GenerationOutcome* outcome = nullptr;
+    MetricsProtocol protocol                        = MetricsProtocol::OpenAiChat;
+    bool stream                                     = false;
+    GenerationResult result                         = GenerationResult::Success;
+    bool thinking                                   = false;
+    bool tools                                      = false;
+    bool capture_requested                          = false;
+    bool has_media                                  = false;
+    const GenerationOutcome* outcome                = nullptr;
     const ninfer::GenerationRecoveryStats* recovery = nullptr;
 };
 

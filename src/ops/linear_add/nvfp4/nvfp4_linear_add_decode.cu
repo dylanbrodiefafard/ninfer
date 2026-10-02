@@ -16,11 +16,11 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
     nvfp4_gemv_kernel<Geometry, Schedule>
         <<<dim3(kBlocks, x.ne[1]), Schedule::kThreads, 0, stream>>>(
-        Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse,
-        Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
-        Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
+            Nvfp4PackedActivation<Geometry>{static_cast<const __nv_bfloat16*>(x.data)},
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), inverse,
+            Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
+            Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
     CUDA_CHECK(cudaGetLastError());
 }
 

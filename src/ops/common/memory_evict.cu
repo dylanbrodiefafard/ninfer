@@ -8,4 +8,4 @@ __device__ __noinline__ void cp_async_evict_first_16_noinline(void* smem_dst,
     cp_async_evict_first_16(smem_dst, gmem_src, pol);
 }
 
-}  // namespace ninfer::ops
+} // namespace ninfer::ops

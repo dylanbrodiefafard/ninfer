@@ -12,7 +12,6 @@ from tools.reference.qwen3_6_35b_a3b.weights import (
     estimate_fixed_bytes,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -100,10 +99,7 @@ def test_real_artifact_binding_and_selected_expert_rows(
     )
     try:
         assert dflash_weights.plan.streamed_blocks == 53
-        assert (
-            dflash_weights.representation(binding.dflash.feature_projection)
-            == "stream"
-        )
+        assert dflash_weights.representation(binding.dflash.feature_projection) == "stream"
     finally:
         dflash_weights.close()
 

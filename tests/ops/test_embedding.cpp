@@ -208,10 +208,10 @@ public:
                     (row->high[static_cast<std::size_t>(group) * 16 + bit / 8] >> (bit & 7)) &
                     0x03u;
                 const std::uint32_t encoded = low | (high << 4);
-                const int code = (encoded & 0x20u) != 0 ? static_cast<int>(encoded) - 64
-                                                        : static_cast<int>(encoded);
-                const double scale =
-                    static_cast<double>(f16_to_f32(load_u16_le(row->scales, group * 2)));
+                const int code     = (encoded & 0x20u) != 0 ? static_cast<int>(encoded) - 64
+                                                            : static_cast<int>(encoded);
+                const double scale = static_cast<double>(
+                    f16_to_f32(load_u16_le(row->scales, static_cast<std::size_t>(group) * 2)));
                 result[t * static_cast<std::size_t>(kQ6D) + d] = static_cast<double>(code) * scale;
             }
         }
@@ -399,8 +399,9 @@ double decode_e4m3fn(std::uint8_t word) {
     const unsigned exponent = (word >> 3) & 15;
     const unsigned fraction = word & 7;
     if (exponent == 15 && fraction == 7) throw std::invalid_argument("FP8 NaN code");
-    const double magnitude = exponent == 0 ? fraction / 512.0 :
-        std::ldexp(1.0 + fraction / 8.0, static_cast<int>(exponent) - 7);
+    const double magnitude = exponent == 0
+                                 ? fraction / 512.0
+                                 : std::ldexp(1.0 + fraction / 8.0, static_cast<int>(exponent) - 7);
     return (word & 128) ? -magnitude : magnitude;
 }
 
@@ -554,9 +555,8 @@ int test_fp8() {
         cuda_synchronize();
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
-        definition.capture(device.stream, [&] {
-            ops::embedding(input, weight, result, device.stream);
-        });
+        definition.capture(device.stream,
+                           [&] { ops::embedding(input, weight, result, device.stream); });
         graph.instantiate(definition);
         for (int replay = 0; replay < 2; ++replay) {
             if (replay) std::reverse(ids.begin(), ids.end());

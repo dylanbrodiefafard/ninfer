@@ -91,7 +91,7 @@ void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
     if (d == table.padded_shape[1] && d % kEmbedGatherQ6Group == 0) {
         embed_gather_q6_grouped_kernel<<<grid_for_q6_grouped(d, T), kQ6GroupedBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), codes, high, scales,
-            static_cast<__nv_bfloat16*>(out.data), d, T);
+            static_cast<__nv_bfloat16*>(out.data), d);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

@@ -69,16 +69,16 @@ gdn_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     in.tokens      = test_case.tokens;
 
     const std::size_t qk_size =
-        static_cast<std::size_t>(kStateDim * test_case.qk_heads * test_case.tokens);
+        static_cast<std::size_t>(kStateDim) * test_case.qk_heads * test_case.tokens;
     const std::size_t value_size =
-        static_cast<std::size_t>(kStateDim * test_case.value_heads * test_case.tokens);
+        static_cast<std::size_t>(kStateDim) * test_case.value_heads * test_case.tokens;
     const std::size_t state_size =
-        static_cast<std::size_t>(kStateDim * kStateDim * test_case.value_heads);
+        static_cast<std::size_t>(kStateDim) * kStateDim * test_case.value_heads;
     in.q.resize(qk_size);
     in.k.resize(qk_size);
     in.v.resize(value_size);
-    in.g.resize(static_cast<std::size_t>(test_case.value_heads * test_case.tokens));
-    in.beta.resize(static_cast<std::size_t>(test_case.value_heads * test_case.tokens));
+    in.g.resize(static_cast<std::size_t>(test_case.value_heads) * test_case.tokens);
+    in.beta.resize(static_cast<std::size_t>(test_case.value_heads) * test_case.tokens);
     in.state.resize(state_size);
 
     std::mt19937 generator(seed);
@@ -345,8 +345,8 @@ int partition_case(const Case& test_case, std::initializer_list<std::int32_t> ch
                                   ref.final_state, gated_delta_net_state_fp32_criterion());
     failures += verify_recurrence(label + " output delta", partition_output, full_output,
                                   gated_delta_net_output_bf16_criterion());
-    failures += verify_recurrence(label + " state delta", partition_state_values,
-                                  full_state_values, gated_delta_net_state_fp32_criterion());
+    failures += verify_recurrence(label + " state delta", partition_state_values, full_state_values,
+                                  gated_delta_net_state_fp32_criterion());
     failures += full_state.verify_guards((label + " full state").c_str());
     failures += partition_state.verify_guards((label + " partition state").c_str());
     failures += full_out.verify_guards((label + " full out").c_str());
@@ -434,12 +434,12 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
     const bool masked = !valid_columns.empty();
     const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const std::size_t qk_row_size =
-        static_cast<std::size_t>(kStateDim * test_case.qk_heads * width);
+        static_cast<std::size_t>(kStateDim) * test_case.qk_heads * width;
     const std::size_t value_row_size =
-        static_cast<std::size_t>(kStateDim * test_case.value_heads * width);
-    const std::size_t gate_row_size = static_cast<std::size_t>(test_case.value_heads * width);
+        static_cast<std::size_t>(kStateDim) * test_case.value_heads * width;
+    const std::size_t gate_row_size = static_cast<std::size_t>(test_case.value_heads) * width;
     const std::size_t state_size =
-        static_cast<std::size_t>(kStateDim * kStateDim * test_case.value_heads);
+        static_cast<std::size_t>(kStateDim) * kStateDim * test_case.value_heads;
 
     gdn_ref::Inputs aggregate;
     aggregate.head_dim    = kStateDim;
@@ -478,18 +478,18 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
         const int valid = masked ? valid_columns[static_cast<std::size_t>(row)] : width;
         gdn_ref::Inputs oracle_input = rows[static_cast<std::size_t>(row)];
         oracle_input.tokens          = valid;
-        oracle_input.q.resize(static_cast<std::size_t>(kStateDim * test_case.qk_heads * valid));
-        oracle_input.k.resize(static_cast<std::size_t>(kStateDim * test_case.qk_heads * valid));
-        oracle_input.v.resize(static_cast<std::size_t>(kStateDim * test_case.value_heads * valid));
-        oracle_input.g.resize(static_cast<std::size_t>(test_case.value_heads * valid));
-        oracle_input.beta.resize(static_cast<std::size_t>(test_case.value_heads * valid));
+        oracle_input.q.resize(static_cast<std::size_t>(kStateDim) * test_case.qk_heads * valid);
+        oracle_input.k.resize(static_cast<std::size_t>(kStateDim) * test_case.qk_heads * valid);
+        oracle_input.v.resize(static_cast<std::size_t>(kStateDim) * test_case.value_heads * valid);
+        oracle_input.g.resize(static_cast<std::size_t>(test_case.value_heads) * valid);
+        oracle_input.beta.resize(static_cast<std::size_t>(test_case.value_heads) * valid);
         gdn_ref::Result reference = gdn_ref::evaluate(oracle_input, static_cast<double>(scale),
                                                       test_case.normalize_qk, true);
         std::copy(reference.out.begin(), reference.out.end(),
                   expected_output.begin() + static_cast<std::size_t>(row) * value_row_size);
         for (int column = 0; column < valid; ++column) {
-            written_slots[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)] +
-                                                   column)] = true;
+            written_slots[static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)]) +
+                          column] = true;
         }
         references.push_back(std::move(reference));
     }
@@ -520,9 +520,9 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
                                   valid_tensor, initial_tensor, bases_tensor, out_tensor, nullptr);
     cuda_synchronize();
 
-    const std::string label = std::string(test_case.name) +
-                              " batched snapshot B=" + std::to_string(batch) +
-                              (masked ? " masked" : " dense");
+    const std::string label              = std::string(test_case.name) +
+                                           " batched snapshot B=" + std::to_string(batch) +
+                                           (masked ? " masked" : " dense");
     int failures                         = 0;
     const std::vector<double> got_output = from_device_bf16(out.data(), aggregate.v.size());
     failures += verify_recurrence(label + " out", got_output, expected_output,
@@ -590,13 +590,14 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
 }
 
 int contract_rejection_cases() {
-    DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
-    DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
-    DeviceBuffer v_buffer(kStateDim * 8 * sizeof(std::uint16_t));
+    constexpr std::size_t kHeadDimElems = kStateDim;
+    DeviceBuffer q_buffer(kHeadDimElems * 8 * sizeof(std::uint16_t));
+    DeviceBuffer k_buffer(kHeadDimElems * 8 * sizeof(std::uint16_t));
+    DeviceBuffer v_buffer(kHeadDimElems * 8 * sizeof(std::uint16_t));
     DeviceBuffer g_buffer(8 * sizeof(float));
     DeviceBuffer beta_buffer(8 * sizeof(float));
-    DeviceBuffer state_buffer(kStateDim * kStateDim * 8 * sizeof(float));
-    DeviceBuffer out_buffer(kStateDim * 8 * sizeof(std::uint16_t));
+    DeviceBuffer state_buffer(kHeadDimElems * kStateDim * 8 * sizeof(float));
+    DeviceBuffer out_buffer(kHeadDimElems * 8 * sizeof(std::uint16_t));
     WorkspaceArena workspace(256);
     const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
 
@@ -651,16 +652,12 @@ int main() {
             ++failures;
         }
     }
-    try {
-        (void)ops::gated_delta_net_workspace_capacity_bytes(16, 48, true, 0, 65);
-        std::cerr << "gated_delta_net accepted an invalid token interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
-    try {
-        (void)ops::gated_delta_net_workspace_capacity_bytes(4, 6, true, 1, 65);
-        std::cerr << "gated_delta_net workspace accepted a non-divisible head map\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] { return ops::gated_delta_net_workspace_capacity_bytes(16, 48, true, 0, 65); },
+        "gated_delta_net accepted an invalid token interval");
+    failures += expect_invalid_argument(
+        [&] { return ops::gated_delta_net_workspace_capacity_bytes(4, 6, true, 1, 65); },
+        "gated_delta_net workspace accepted a non-divisible head map");
     failures += contract_rejection_cases();
 
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
@@ -673,8 +670,8 @@ int main() {
     failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
-    failures += distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true},
-                                    15404u);
+    failures +=
+        distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true}, 15404u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += partition_case({"27b chunk boundary", 16, 48, 128, true}, {64, 64}, 12428u);
     failures += partition_case({"27b chunk tail", 16, 48, 65, true}, {64, 1}, 12465u);

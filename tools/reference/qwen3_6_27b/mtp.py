@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import torch
 
@@ -68,19 +68,15 @@ def forward(
     )
     h = rmsnorm(x, model.weight(layer_weights.input_norm))
     qk_gatev = linear(h, model.block_weight(attention_weights.query_key_gate_value))
-    q = qk_gatev[:, :CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
+    q = qk_gatev[:, : CFG.q_size].reshape(-1, CFG.q_heads, CFG.head_dim)
     k0 = CFG.q_size
     k1 = k0 + CFG.kv_size
     g1 = k1 + CFG.q_size
     k = qk_gatev[:, k0:k1].reshape(-1, CFG.kv_heads, CFG.head_dim)
     gate = qk_gatev[:, k1:g1].reshape(-1, CFG.q_heads, CFG.head_dim)
     v = qk_gatev[:, g1:].reshape(-1, CFG.kv_heads, CFG.head_dim)
-    q = apply_rope(
-        rmsnorm(q, model.weight(attention_weights.query_norm)), positions
-    )
-    k = apply_rope(
-        rmsnorm(k, model.weight(attention_weights.key_norm)), positions
-    )
+    q = apply_rope(rmsnorm(q, model.weight(attention_weights.query_norm)), positions)
+    k = apply_rope(rmsnorm(k, model.weight(attention_weights.key_norm)), positions)
     attended = model._gqa(q, k, v, 0, start, mtp=True)
     x = residual_add(
         x,
@@ -98,11 +94,7 @@ def forward(
     )
     out = rmsnorm(x, model.weight(mtp_weights.final_norm))
     token = (
-        int(
-            torch.argmax(
-                model.logits_last(out, draft=model.draft_head)[: CFG.token_domain]
-            ).item()
-        )
+        int(torch.argmax(model.logits_last(out, draft=model.draft_head)[: CFG.token_domain]).item())
         if sample
         else None
     )

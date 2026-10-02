@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -207,9 +207,7 @@ class VisionEncoder:
                 tap(prefix + "q_rope", q)
                 tap(prefix + "k_rope", k)
                 tap(prefix + "value", v)
-            attended = vision_attention(q, k, v, cu_seqlens).reshape(
-                -1, VISION_CFG.hidden
-            )
+            attended = vision_attention(q, k, v, cu_seqlens).reshape(-1, VISION_CFG.hidden)
             if tap:
                 tap(prefix + "attention", attended)
             del qkv, q, k, v
@@ -295,11 +293,7 @@ class VisionEncoder:
         image_embeddings = x[:image_tokens] if image_tokens else None
         video_embeddings = x[image_tokens:] if video_tokens else None
         elapsed = time.perf_counter() - started
-        peak = (
-            torch.cuda.max_memory_allocated(self.device)
-            if self.device.type == "cuda"
-            else 0
-        )
+        peak = torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
         stats = VisionStats(
             images=0 if image_grid_thw is None else int(image_grid_thw.shape[0]),
             videos=0 if video_grid_thw is None else int(video_grid_thw.shape[0]),
@@ -315,7 +309,7 @@ class VisionEncoder:
     def close(self) -> None:
         self.weights.close()
 
-    def __enter__(self) -> "VisionEncoder":
+    def __enter__(self) -> VisionEncoder:
         return self
 
     def __exit__(self, *_args) -> None:

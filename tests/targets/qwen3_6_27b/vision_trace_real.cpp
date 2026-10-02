@@ -38,7 +38,6 @@ namespace {
 using Json = nlohmann::json;
 using ninfer::targets::qwen3_6_27b::detail::ArtifactLoadPlan;
 using ninfer::targets::qwen3_6_27b::detail::LoadedModelData;
-using ninfer::targets::qwen3_6_27b::detail::Variant;
 using ninfer::targets::qwen3_6_27b::detail::WeightsProfile;
 namespace runtime = ninfer::targets::qwen3_6::detail::qwen3_6_27b_runtime;
 
@@ -70,16 +69,15 @@ std::vector<std::byte> copy_logical(const ninfer::Tensor& value, cudaStream_t st
     const std::size_t element = ninfer::dtype_size(value.dtype);
     std::vector<std::byte> host(static_cast<std::size_t>(value.numel()) * element);
     if (value.is_contiguous()) {
-        CUDA_CHECK(cudaMemcpyAsync(host.data(), value.data, host.size(), cudaMemcpyDeviceToHost,
-                                   stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(host.data(), value.data, host.size(), cudaMemcpyDeviceToHost, stream));
     } else if (value.ne[3] == 1 && value.nb[0] == static_cast<std::int64_t>(element) &&
                value.nb[1] == value.nb[0] * value.ne[0]) {
-        const std::size_t row = static_cast<std::size_t>(value.ne[0]) *
-                                static_cast<std::size_t>(value.ne[1]) * element;
-        CUDA_CHECK(cudaMemcpy2DAsync(host.data(), row, value.data,
-                                     static_cast<std::size_t>(value.nb[2]), row,
-                                     static_cast<std::size_t>(value.ne[2]),
-                                     cudaMemcpyDeviceToHost, stream));
+        const std::size_t row =
+            static_cast<std::size_t>(value.ne[0]) * static_cast<std::size_t>(value.ne[1]) * element;
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            host.data(), row, value.data, static_cast<std::size_t>(value.nb[2]), row,
+            static_cast<std::size_t>(value.ne[2]), cudaMemcpyDeviceToHost, stream));
     } else {
         throw std::invalid_argument("Vision trace encountered an unsupported strided tensor");
     }
@@ -92,7 +90,9 @@ void write_bytes(const std::filesystem::path& path, std::span<const std::byte> b
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(bytes.data()),
                  static_cast<std::streamsize>(bytes.size()));
-    if (!output) { throw std::runtime_error("failed to write Vision trace tensor: " + path.string()); }
+    if (!output) {
+        throw std::runtime_error("failed to write Vision trace tensor: " + path.string());
+    }
 }
 
 class FileTrace final : public runtime::schedule::VisionTraceSink {
@@ -100,8 +100,7 @@ public:
     FileTrace(std::filesystem::path root, Json& records, std::size_t item)
         : root_(std::move(root)), records_(records), item_(item) {}
 
-    void capture(std::string_view name, const ninfer::Tensor& value,
-                 cudaStream_t stream) override {
+    void capture(std::string_view name, const ninfer::Tensor& value, cudaStream_t stream) override {
         const std::string relative = "item_" + (item_ < 10 ? std::string("0") : "") +
                                      std::to_string(item_) + "/" + std::string(name) + ".bin";
         const std::vector<std::byte> bytes = copy_logical(value, stream);
@@ -120,9 +119,8 @@ private:
 };
 
 Json item_json(const ninfer::targets::qwen3_6::VisionItemControl& item) {
-    return {{"modality", item.modality == ninfer::targets::qwen3_6::PromptModality::Image
-                              ? "image"
-                              : "video"},
+    return {{"modality",
+             item.modality == ninfer::targets::qwen3_6::PromptModality::Image ? "image" : "video"},
             {"grid", {item.grid.temporal, item.grid.height, item.grid.width}},
             {"patch_begin", item.patch_begin},
             {"patch_count", item.patch_count},
@@ -136,9 +134,11 @@ Json item_json(const ninfer::targets::qwen3_6::VisionItemControl& item) {
             {"position_table_weights", item.position_table_weights}};
 }
 
-ninfer::targets::qwen3_6::VisionItemControl aggregate_controls(
-    std::span<const ninfer::targets::qwen3_6::VisionItemControl> items) {
-    if (items.empty()) { throw std::invalid_argument("cannot aggregate an empty Vision item list"); }
+ninfer::targets::qwen3_6::VisionItemControl
+aggregate_controls(std::span<const ninfer::targets::qwen3_6::VisionItemControl> items) {
+    if (items.empty()) {
+        throw std::invalid_argument("cannot aggregate an empty Vision item list");
+    }
     ninfer::targets::qwen3_6::VisionItemControl out;
     out.modality    = items.front().modality;
     out.patch_begin = items.front().patch_begin;
@@ -146,8 +146,8 @@ ninfer::targets::qwen3_6::VisionItemControl aggregate_controls(
     std::int32_t patch_base = 0;
     for (int axis = 0; axis < 2; ++axis) {
         for (const auto& item : items) {
-            const auto begin = item.position_ids.begin() +
-                               static_cast<std::ptrdiff_t>(axis * item.patch_count);
+            const auto begin =
+                item.position_ids.begin() + static_cast<std::ptrdiff_t>(axis * item.patch_count);
             out.position_ids.insert(out.position_ids.end(), begin,
                                     begin + static_cast<std::ptrdiff_t>(item.patch_count));
         }
@@ -180,21 +180,20 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
     }
     std::filesystem::create_directories(output_root);
 
-    ninfer::PromptInput input =
-        ninfer::product::prompt_from_messages(messages_path, false, true);
+    ninfer::PromptInput input = ninfer::product::prompt_from_messages(messages_path, false, true);
     ninfer::DeviceContext device(0);
     ninfer::artifact::Reader reader(artifact_path);
     ninfer::artifact::Binder binder(reader);
     const WeightsProfile profile =
         ninfer::targets::qwen3_6_27b::Package::resolve_weights(reader.identity(), binder);
-    ArtifactLoadPlan load = ninfer::targets::qwen3_6_27b::detail::bind_artifact(
-        binder, profile, {.vision = true});
+    ArtifactLoadPlan load =
+        ninfer::targets::qwen3_6_27b::detail::bind_artifact(binder, profile, {.vision = true});
     ninfer::artifact::MaterializedArtifact materialized =
         ninfer::artifact::materialize(reader, load.materialization, device);
-    LoadedModelData model(std::move(load.bindings), std::move(materialized));
+    LoadedModelData model(load.bindings, std::move(materialized));
     auto frontend = ninfer::targets::qwen3_6::make_frontend(model.frontend, true);
     auto prepared = frontend.prepare(std::move(input));
-    auto prompt = ninfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(prepared));
+    auto prompt   = ninfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(prepared));
     const ninfer::targets::qwen3_6::VisionControl control =
         ninfer::targets::qwen3_6::build_vision_control(prompt);
     if (control.items.empty()) { throw std::invalid_argument("Vision trace prompt has no media"); }
@@ -216,9 +215,11 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
         const auto& item = control.items[index];
         manifest["items"].push_back(item_json(item));
         const std::size_t patch_offset =
-            item.patch_begin * static_cast<std::size_t>(runtime::schedule::VisionScheduleConfig::patch_dim);
+            item.patch_begin *
+            static_cast<std::size_t>(runtime::schedule::VisionScheduleConfig::patch_dim);
         const std::size_t patch_elements =
-            item.patch_count * static_cast<std::size_t>(runtime::schedule::VisionScheduleConfig::patch_dim);
+            item.patch_count *
+            static_cast<std::size_t>(runtime::schedule::VisionScheduleConfig::patch_dim);
         if (patch_offset > prompt.patches.size() ||
             patch_elements > prompt.patches.size() - patch_offset) {
             throw std::logic_error("Vision trace item patch range exceeds prepared prompt");
@@ -230,9 +231,9 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
                               {runtime::schedule::VisionScheduleConfig::out_hidden,
                                static_cast<std::int32_t>(item.merged_count)});
         FileTrace trace(output_root, manifest["captures"], index);
-        context.encode({std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements),
-                        &item},
-                       output, workspace, &trace);
+        context.encode(
+            {std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements), &item},
+            output, workspace, &trace);
         const std::vector<std::byte> traced_output = copy_logical(output, device.stream);
         individual_outputs.insert(individual_outputs.end(), traced_output.begin(),
                                   traced_output.end());
@@ -245,9 +246,9 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
         ninfer::Tensor plain_output(plain_output_buffer.p, ninfer::DType::BF16,
                                     {runtime::schedule::VisionScheduleConfig::out_hidden,
                                      static_cast<std::int32_t>(item.merged_count)});
-        context.encode({std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements),
-                        &item},
-                       plain_output, plain_workspace);
+        context.encode(
+            {std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements), &item},
+            plain_output, plain_workspace);
         if (copy_logical(plain_output, device.stream) != traced_output) {
             throw std::runtime_error("Vision trace changed the production output");
         }
@@ -259,19 +260,19 @@ int run(const std::filesystem::path& artifact_path, const std::filesystem::path&
             runtime::schedule::VisionContext::workspace_bytes(aggregate));
         ninfer::DeviceBuffer aggregate_output_buffer(
             runtime::schedule::VisionContext::output_transient_bytes(aggregate.merged_count));
-        ninfer::Tensor aggregate_output(
-            aggregate_output_buffer.p, ninfer::DType::BF16,
-            {runtime::schedule::VisionScheduleConfig::out_hidden,
-             static_cast<std::int32_t>(aggregate.merged_count)});
+        ninfer::Tensor aggregate_output(aggregate_output_buffer.p, ninfer::DType::BF16,
+                                        {runtime::schedule::VisionScheduleConfig::out_hidden,
+                                         static_cast<std::int32_t>(aggregate.merged_count)});
         const std::size_t patch_offset =
             aggregate.patch_begin *
             static_cast<std::size_t>(runtime::schedule::VisionScheduleConfig::patch_dim);
         const std::size_t patch_elements =
             aggregate.patch_count *
             static_cast<std::size_t>(runtime::schedule::VisionScheduleConfig::patch_dim);
-        context.encode({std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements),
-                        &aggregate},
-                       aggregate_output, aggregate_workspace);
+        context.encode(
+            {std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements),
+             &aggregate},
+            aggregate_output, aggregate_workspace);
         manifest["aggregate_matches_individual"] =
             copy_logical(aggregate_output, device.stream) == individual_outputs;
         if (!manifest["aggregate_matches_individual"].get<bool>()) {

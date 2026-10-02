@@ -7,27 +7,27 @@ roles to tensors.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
-from math import prod
 import operator
 import struct
 import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from functools import lru_cache
+from math import prod
 from types import MappingProxyType
-from typing import Sequence, TypeAlias
+from typing import TypeAlias
 
 import torch
 
 from .numeric import (
     DirectFormat,
     Fp8RowFormat,
-    Nvfp4Format,
     NumericFormat,
+    Nvfp4Format,
     QuantFormat,
     get_format,
     valid_positive_fp32_word,
 )
-
 
 PLANE_ALIGNMENT = 256
 K_ALIGNMENT = 128
@@ -98,9 +98,7 @@ class RowPlanes:
     rows: int
 
 
-CONTIGUOUS_LE_V1 = Layout(
-    "contiguous-le-v1", 256, frozenset(("BF16", "FP32", "I32"))
-)
+CONTIGUOUS_LE_V1 = Layout("contiguous-le-v1", 256, frozenset(("BF16", "FP32", "I32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row-split-k128-v1",
     256,
@@ -179,9 +177,7 @@ def _shape(value: Sequence[int], *, rank: int | None = None) -> tuple[int, ...]:
     return result
 
 
-def row_split_geometry(
-    format: str | QuantFormat, shape: Sequence[int]
-) -> RowSplitGeometry:
+def row_split_geometry(format: str | QuantFormat, shape: Sequence[int]) -> RowSplitGeometry:
     spec = _format(format)
     if not isinstance(spec, QuantFormat):
         raise ValueError("row-split-k128-v1 requires a grouped quantized format")
@@ -189,9 +185,7 @@ def row_split_geometry(
     k_pad = align_up(k, K_ALIGNMENT)
     groups_per_row = k_pad // spec.group_size
     base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
-    high_bytes_per_group = (
-        0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
-    )
+    high_bytes_per_group = 0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
     scale_row_bytes = groups_per_row * 2
@@ -220,17 +214,14 @@ def row_split_geometry(
     )
 
 
-def block_scale_geometry(
-    format: str | Nvfp4Format, shape: Sequence[int]
-) -> BlockScaleGeometry:
+def block_scale_geometry(format: str | Nvfp4Format, shape: Sequence[int]) -> BlockScaleGeometry:
     spec = _format(format)
     if not isinstance(spec, Nvfp4Format):
         raise ValueError("blockscale-k16-m128x4-v1 requires NVFP4")
     n, k = _shape(shape, rank=2)
     if n % 128 != 0 or k % 64 != 0:
         raise ValueError(
-            "blockscale-k16-m128x4-v1 requires N divisible by 128 "
-            "and K divisible by 64"
+            "blockscale-k16-m128x4-v1 requires N divisible by 128 and K divisible by 64"
         )
     code_plane_bytes = n * k // 2
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
@@ -249,9 +240,7 @@ def block_scale_geometry(
     )
 
 
-def row_scale_geometry(
-    format: str | Fp8RowFormat, shape: Sequence[int]
-) -> RowScaleGeometry:
+def row_scale_geometry(format: str | Fp8RowFormat, shape: Sequence[int]) -> RowScaleGeometry:
     spec = _format(format)
     if not isinstance(spec, Fp8RowFormat):
         raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
@@ -317,9 +306,7 @@ def encode_direct(tensor: torch.Tensor, format: str | DirectFormat) -> bytes:
         raise ValueError("direct encoding requires BF16, FP32, or I32")
     expected_dtype = _DIRECT_DTYPES[spec.name]
     if tensor.dtype != expected_dtype:
-        raise TypeError(
-            f"{spec.name} encoding requires {expected_dtype}, got {tensor.dtype}"
-        )
+        raise TypeError(f"{spec.name} encoding requires {expected_dtype}, got {tensor.dtype}")
     if tensor.dim() > 16 or any(dim <= 0 for dim in tensor.shape):
         raise ValueError("contiguous-le-v1 requires rank 0..16 with positive dimensions")
     host = tensor.detach().contiguous().cpu().reshape(-1)
@@ -364,7 +351,9 @@ def decode_direct(
         raise ValueError("contiguous-le-v1 supports rank 0 through 16")
     expected = prod(dims) * spec.word_bytes
     if _payload_length(payload) != expected:
-        raise ValueError(f"direct payload has {_payload_length(payload)} bytes, expected {expected}")
+        raise ValueError(
+            f"direct payload has {_payload_length(payload)} bytes, expected {expected}"
+        )
     target = torch.device(device)
     raw = _payload_tensor(payload, target)
     if sys.byteorder != "little" and target.type == "cpu":
@@ -372,9 +361,7 @@ def decode_direct(
     return raw.view(_DIRECT_DTYPES[spec.name]).reshape(dims)
 
 
-def _exact_uint8_matrix(
-    tensor: torch.Tensor, shape: tuple[int, int], label: str
-) -> torch.Tensor:
+def _exact_uint8_matrix(tensor: torch.Tensor, shape: tuple[int, int], label: str) -> torch.Tensor:
     if tensor.dtype != torch.uint8 or tuple(tensor.shape) != shape:
         raise TypeError(f"{label} must be uint8 with shape {shape}")
     return tensor.detach().contiguous().cpu()
@@ -390,9 +377,7 @@ def _validate_fp8_row_words(codes: torch.Tensor, scales: torch.Tensor) -> None:
     if bool(((codes & 0x7F) == 0x7F).any()):
         raise ValueError("row-scaled FP8 codes must be finite E4M3FN words")
     scale_words = scales.view(torch.int16).to(torch.int32) & 0xFFFF
-    invalid_scales = ((scale_words & 0x8000) != 0) | (
-        (scale_words & 0x7F80) == 0x7F80
-    )
+    invalid_scales = ((scale_words & 0x8000) != 0) | ((scale_words & 0x7F80) == 0x7F80)
     if bool(invalid_scales.any()):
         raise ValueError("row-scaled FP8 scales must be nonnegative finite BF16 words")
     zero_scale = scale_words == 0
@@ -423,9 +408,7 @@ def encode_fp8_row_scaled(
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
     scale_begin = geometry.scale_plane_offset
-    payload[scale_begin : scale_begin + geometry.scale_plane_bytes] = encode_direct(
-        scales, "BF16"
-    )
+    payload[scale_begin : scale_begin + geometry.scale_plane_bytes] = encode_direct(scales, "BF16")
     return bytes(payload)
 
 
@@ -458,14 +441,10 @@ def dequantize_fp8_row_scaled(
     """Reconstruct a row-scaled FP8 matrix from its exact stored words."""
 
     codes, scales = decode_fp8_row_scaled_words(payload, shape)
-    return (codes.view(torch.float8_e4m3fn).float() * scales.float().unsqueeze(1)).to(
-        dtype
-    )
+    return (codes.view(torch.float8_e4m3fn).float() * scales.float().unsqueeze(1)).to(dtype)
 
 
-def swizzle_nvfp4_scales(
-    natural_scales: torch.Tensor, shape: Sequence[int]
-) -> torch.Tensor:
+def swizzle_nvfp4_scales(natural_scales: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
     """Map natural ``[N,K/16]`` E4M3FN words to the registered scale layout."""
 
     geometry = block_scale_geometry("NVFP4", shape)
@@ -482,9 +461,7 @@ def swizzle_nvfp4_scales(
     )
 
 
-def unswizzle_nvfp4_scales(
-    stored_scales: torch.Tensor, shape: Sequence[int]
-) -> torch.Tensor:
+def unswizzle_nvfp4_scales(stored_scales: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
     """Recover natural ``[N,K/16]`` E4M3FN words from registered layout bytes."""
 
     geometry = block_scale_geometry("NVFP4", shape)
@@ -548,8 +525,7 @@ def encode_nvfp4(
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
     payload[
-        geometry.scale_plane_offset :
-        geometry.scale_plane_offset + geometry.scale_plane_bytes
+        geometry.scale_plane_offset : geometry.scale_plane_offset + geometry.scale_plane_bytes
     ] = swizzled.numpy().tobytes()
     payload[geometry.weight_divisor_offset :] = divisor
     return bytes(payload)
@@ -564,16 +540,12 @@ def decode_nvfp4_words(
     geometry = block_scale_geometry("NVFP4", shape)
     if _payload_length(payload) != geometry.payload_bytes:
         raise ValueError(
-            f"NVFP4 payload has {_payload_length(payload)} bytes, "
-            f"expected {geometry.payload_bytes}"
+            f"NVFP4 payload has {_payload_length(payload)} bytes, expected {geometry.payload_bytes}"
         )
     raw = _payload_tensor(payload, torch.device("cpu"))
-    codes = raw[: geometry.code_plane_bytes].clone().reshape(
-        geometry.n, geometry.k // 2
-    )
+    codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k // 2)
     stored_scales = raw[
-        geometry.scale_plane_offset :
-        geometry.scale_plane_offset + geometry.scale_plane_bytes
+        geometry.scale_plane_offset : geometry.scale_plane_offset + geometry.scale_plane_bytes
     ]
     scales = unswizzle_nvfp4_scales(stored_scales, shape)
     invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
@@ -594,9 +566,7 @@ def _pack_low_nibbles(codes: torch.Tensor) -> torch.Tensor:
     for begin in range(0, groups, chunk):
         end = min(groups, begin + chunk)
         unsigned = codes[begin:end].to(torch.int16) & 0x0F
-        out[begin:end] = (
-            unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)
-        ).to(torch.uint8)
+        out[begin:end] = (unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)).to(torch.uint8)
     return out
 
 
@@ -614,12 +584,8 @@ def _pack_high_bits(codes: torch.Tensor, bits: int) -> torch.Tensor:
     mask = (1 << bits) - 1
     for begin in range(0, groups, chunk):
         end = min(groups, begin + chunk)
-        upper = ((codes[begin:end].to(torch.int32) & mask) >> 4) & (
-            (1 << high_bits) - 1
-        )
-        unpacked = ((upper.unsqueeze(-1) >> shifts) & 1).reshape(
-            end - begin, bytes_per_group, 8
-        )
+        upper = ((codes[begin:end].to(torch.int32) & mask) >> 4) & ((1 << high_bits) - 1)
+        unpacked = ((upper.unsqueeze(-1) >> shifts) & 1).reshape(end - begin, bytes_per_group, 8)
         out[begin:end] = (unpacked * bit_weights).sum(-1).to(torch.uint8)
     return out
 
@@ -775,8 +741,7 @@ def gather_row_planes(
         if row_bytes == 0:
             return b""
         return b"".join(
-            plane[index * row_bytes : (index + 1) * row_bytes]
-            for index in indices_list
+            plane[index * row_bytes : (index + 1) * row_bytes] for index in indices_list
         )
 
     return RowPlanes(
@@ -830,28 +795,26 @@ def assemble_row_planes(
         assert isinstance(planes.scale, torch.Tensor)
         if planes.high.device != planes.base.device or planes.scale.device != planes.base.device:
             raise ValueError("tensor row planes must be on the same device")
-        payload = torch.zeros(
-            geometry.payload_bytes, dtype=torch.uint8, device=planes.base.device
-        )
+        payload = torch.zeros(geometry.payload_bytes, dtype=torch.uint8, device=planes.base.device)
         payload[: geometry.base_bytes].copy_(planes.base)
         if geometry.high_bytes:
-            payload[
-                geometry.high_offset : geometry.high_offset + geometry.high_bytes
-            ].copy_(planes.high)
-        payload[
-            geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes
-        ].copy_(planes.scale)
+            payload[geometry.high_offset : geometry.high_offset + geometry.high_bytes].copy_(
+                planes.high
+            )
+        payload[geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes].copy_(
+            planes.scale
+        )
         return payload
 
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.base_bytes] = bytes(planes.base)
     if geometry.high_bytes:
-        payload[
-            geometry.high_offset : geometry.high_offset + geometry.high_bytes
-        ] = bytes(planes.high)
-    payload[
-        geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes
-    ] = bytes(planes.scale)
+        payload[geometry.high_offset : geometry.high_offset + geometry.high_bytes] = bytes(
+            planes.high
+        )
+    payload[geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes] = bytes(
+        planes.scale
+    )
     return bytes(payload)
 
 
@@ -895,8 +858,10 @@ def _high_indices(
     bits: int,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = torch.device(device_type) if device_index is None else torch.device(
-        device_type, device_index
+    device = (
+        torch.device(device_type)
+        if device_index is None
+        else torch.device(device_type, device_index)
     )
     if bits in (4, 8):
         empty = torch.empty(0, dtype=torch.long, device=device)
@@ -914,9 +879,7 @@ def _unpack_codes(
     assert isinstance(planes.high, torch.Tensor)
     assert isinstance(planes.scale, torch.Tensor)
     groups = geometry.n * geometry.groups_per_row
-    scales = planes.scale.view(torch.float16).reshape(
-        geometry.n, geometry.groups_per_row
-    )
+    scales = planes.scale.view(torch.float16).reshape(geometry.n, geometry.groups_per_row)
     if spec.bits == 8:
         codes = planes.base.view(torch.int8).reshape(
             geometry.n, geometry.groups_per_row, spec.group_size
@@ -974,9 +937,7 @@ def _scales(scale: torch.Tensor) -> torch.Tensor:
 
 def _low_g64(base: torch.Tensor, groups: int) -> torch.Tensor:
     packed = base.reshape(groups, 32).to(torch.int16)
-    return torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).reshape(
-        groups, 64
-    )
+    return torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).reshape(groups, 64)
 
 
 def _dequant4(base, _high, scale, _byte_indices, _shifts):
@@ -989,9 +950,7 @@ def _dequant4(base, _high, scale, _byte_indices, _shifts):
 def _dequant5(base, high, scale, byte_indices, shifts):
     scales = _scales(scale)
     groups = scales.numel()
-    upper = (
-        high.reshape(groups, 8).index_select(1, byte_indices).to(torch.int16) >> shifts
-    ) & 1
+    upper = (high.reshape(groups, 8).index_select(1, byte_indices).to(torch.int16) >> shifts) & 1
     unsigned = _low_g64(base, groups) | (upper << 4)
     codes = torch.where((unsigned & 16) != 0, unsigned - 32, unsigned).float()
     return (codes * scales).to(torch.bfloat16)
@@ -1000,9 +959,7 @@ def _dequant5(base, high, scale, byte_indices, shifts):
 def _dequant6(base, high, scale, byte_indices, shifts):
     scales = _scales(scale)
     groups = scales.numel()
-    upper = (
-        high.reshape(groups, 16).index_select(1, byte_indices).to(torch.int16) >> shifts
-    ) & 3
+    upper = (high.reshape(groups, 16).index_select(1, byte_indices).to(torch.int16) >> shifts) & 3
     unsigned = _low_g64(base, groups) | (upper << 4)
     codes = torch.where((unsigned & 32) != 0, unsigned - 64, unsigned).float()
     return (codes * scales).to(torch.bfloat16)
@@ -1047,9 +1004,7 @@ def dequantize_row_split(
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
     if dtype == torch.bfloat16:
-        byte_indices, shifts = _high_indices(
-            target.type, target.index, spec.bits, spec.group_size
-        )
+        byte_indices, shifts = _high_indices(target.type, target.index, spec.bits, spec.group_size)
         function = (
             _compiled_dequantizer(spec.bits)
             if compiled and target.type == "cuda"
@@ -1058,27 +1013,25 @@ def dequantize_row_split(
         assert isinstance(planes.base, torch.Tensor)
         assert isinstance(planes.high, torch.Tensor)
         assert isinstance(planes.scale, torch.Tensor)
-        physical = function(
-            planes.base, planes.high, planes.scale, byte_indices, shifts
-        ).reshape(geometry.n, geometry.k_pad)
+        physical = function(planes.base, planes.high, planes.scale, byte_indices, shifts).reshape(
+            geometry.n, geometry.k_pad
+        )
         return physical[:, : geometry.k]
     scales, codes = _unpack_codes(planes, spec, geometry)
-    physical = (
-        codes.float() * scales.float().unsqueeze(-1)
-    ).reshape(geometry.n, geometry.k_pad)
+    physical = (codes.float() * scales.float().unsqueeze(-1)).reshape(geometry.n, geometry.k_pad)
     return physical[:, : geometry.k].to(dtype)
 
 
 __all__ = [
     "BLOCKSCALE_K16_M128X4_V1",
-    "BlockScaleGeometry",
     "CONTIGUOUS_LE_V1",
     "K_ALIGNMENT",
     "LAYOUTS",
-    "Layout",
     "PLANE_ALIGNMENT",
-    "ROW_SPLIT_K128_V1",
     "ROW_SCALE_V1",
+    "ROW_SPLIT_K128_V1",
+    "BlockScaleGeometry",
+    "Layout",
     "RowPlanes",
     "RowScaleGeometry",
     "RowSplitGeometry",

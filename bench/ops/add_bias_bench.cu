@@ -125,9 +125,9 @@ int main(int argc, char** argv) {
     bool control         = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--d") && i + 1 < argc) {
-            selected_d = std::atoi(argv[++i]);
+            selected_d = parse_number<int>(argv[++i], "--d");
         } else if (!std::strcmp(argv[i], "--columns") && i + 1 < argc) {
-            selected_columns = std::atoi(argv[++i]);
+            selected_columns = parse_number<int>(argv[++i], "--columns");
         } else if (!std::strcmp(argv[i], "--control")) {
             control = true;
         } else {

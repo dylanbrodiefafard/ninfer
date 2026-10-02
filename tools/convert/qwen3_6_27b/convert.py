@@ -10,11 +10,11 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
-from pathlib import Path
 import time
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -29,7 +29,6 @@ from tools.convert.qwen3_6.common import conversion as family_conversion
 from tools.convert.qwen3_6.common import official_resources
 
 from . import draft_head, inventory, recipe
-
 
 RECIPE_ID = "qwen3_6_27b-v2"
 
@@ -122,16 +121,12 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("config.json must contain text_config and vision_config")
     _check_members("text_config", text, _TEXT_CONFIG)
     expected_layer_types = tuple(
-        "full_attention"
-        if layer in inventory.FULL_ATTENTION_LAYERS
-        else "linear_attention"
+        "full_attention" if layer in inventory.FULL_ATTENTION_LAYERS else "linear_attention"
         for layer in range(64)
     )
     layer_types = text.get("layer_types")
     if not isinstance(layer_types, list) or tuple(layer_types) != expected_layer_types:
-        raise ValueError(
-            "text_config.layer_types does not match the registered 64-layer schedule"
-        )
+        raise ValueError("text_config.layer_types does not match the registered 64-layer schedule")
     rope = text.get("rope_parameters")
     if not isinstance(rope, Mapping):
         raise ValueError("text_config.rope_parameters is missing")
@@ -179,9 +174,7 @@ def preflight_inventory() -> None:
 
 
 def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
-    return official_resources.load_official_resources(
-        model_dir, inventory.RESOURCE_SPECS
-    )
+    return official_resources.load_official_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
 def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
@@ -234,9 +227,7 @@ def materialize_tensor(
         derived,
     )
     if tuple(tensor.shape) != spec.shape:
-        raise ValueError(
-            f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"
-        )
+        raise ValueError(f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}")
     return tensor
 
 
@@ -309,27 +300,29 @@ def convert(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    with ShardReader(model) as reader:
-        with ArtifactWriter(
+    with (
+        ShardReader(model) as reader,
+        ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
-        ) as writer:
-            if writer.objects != preflight.object_plan.objects:
-                raise RuntimeError("writer object plan differs from completed preflight")
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
-                if isinstance(spec, inventory.ResourceSpec):
-                    payload = resources[spec.name]
-                else:
-                    tensor = materialize_tensor(spec, reader, preflight.draft)
-                    payload = encode_tensor_payload(tensor, spec, resolved_device)
-                    del tensor
-                writer.write(spec.name, payload)
-                del payload
-                print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
-                    flush=True,
-                )
+        ) as writer,
+    ):
+        if writer.objects != preflight.object_plan.objects:
+            raise RuntimeError("writer object plan differs from completed preflight")
+        for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            if isinstance(spec, inventory.ResourceSpec):
+                payload = resources[spec.name]
+            else:
+                tensor = materialize_tensor(spec, reader, preflight.draft)
+                payload = encode_tensor_payload(tensor, spec, resolved_device)
+                del tensor
+            writer.write(spec.name, payload)
+            del payload
+            print(
+                f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
+                flush=True,
+            )
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size

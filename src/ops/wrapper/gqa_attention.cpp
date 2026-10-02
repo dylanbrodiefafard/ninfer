@@ -74,7 +74,9 @@ void validate_cache_dtype(DType dtype, std::int32_t quant_group, const char* op)
     }
 }
 
-std::int32_t cache_code_leading(DType dtype) { return dtype == DType::U8 ? kNvfp4CodeWidth : kHeadDim; }
+std::int32_t cache_code_leading(DType dtype) {
+    return dtype == DType::U8 ? kNvfp4CodeWidth : kHeadDim;
+}
 
 DType cache_code_dtype(DType dtype) {
     if (dtype == DType::I8) { return DType::I8; }
@@ -84,8 +86,9 @@ DType cache_code_dtype(DType dtype) {
 
 void validate_scale_planes(const Tensor& k_scale, const Tensor& v_scale, DType dtype,
                            std::int32_t kv_heads, std::int32_t physical_pages, const char* op) {
-    const std::int32_t groups = dtype == DType::U8 ? kHeadDim / kNvfp4Group : kHeadDim / kQuantGroup;
-    const DType scale_dtype   = dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16;
+    const std::int32_t groups =
+        dtype == DType::U8 ? kHeadDim / kNvfp4Group : kHeadDim / kQuantGroup;
+    const DType scale_dtype = dtype == DType::U8 ? DType::FP8_E4M3FN : DType::FP16;
     if (k_scale.dtype != scale_dtype || v_scale.dtype != scale_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
@@ -104,7 +107,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     validate_cache_dtype(cache.dtype, cache.quant_group, op);
     if (cache.sage_pv && cache.dtype != DType::U8) {
-        throw std::invalid_argument(std::string(op) + ": --sage (FP4-PV) requires NVFP4 KV storage");
+        throw std::invalid_argument(std::string(op) +
+                                    ": --sage (FP4-PV) requires NVFP4 KV storage");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -152,7 +156,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     validate_cache_dtype(cache.dtype, cache.quant_group, op);
     if (cache.sage_pv && cache.dtype != DType::U8) {
-        throw std::invalid_argument(std::string(op) + ": --sage (FP4-PV) requires NVFP4 KV storage");
+        throw std::invalid_argument(std::string(op) +
+                                    ": --sage (FP4-PV) requires NVFP4 KV storage");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -458,9 +463,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    bool tree_verify, float xattn_tau,
                                                    bool sage_pv) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) || batch_size <= 0 ||
-        batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
-        (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
+        batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
+        max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         (tree_verify && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
@@ -480,7 +485,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         // through the layout builder so the arena's 256B alignment padding is
         // modeled exactly (a flat byte sum undercounts and overflows the arena).
         if (keep_frac < 1.0f && cache_dtype == DType::U8 && width == 1) {
-            const std::int32_t kv_rows  =
+            const std::int32_t kv_rows =
                 launch_batch * kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
             const std::int32_t max_keep =
                 (static_cast<std::int32_t>(envelope.max_visible_keys) + 31) / 32;
@@ -499,8 +504,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                     kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
                 const int n_br = div_up(width, kGqaXattnPrefillBr);
                 const int n_kb = gqa_xattn_n_kb(kGqaXattnRankTiles, envelope.max_visible_keys);
-                (void)layout.alloc_bytes(
-                    gqa_xattn_scratch_bytes(q_heads, kv_heads, n_br, n_kb));
+                (void)layout.alloc_bytes(gqa_xattn_scratch_bytes(q_heads, kv_heads, n_br, n_kb));
                 maximum = layout.peak_bytes(1);
             }
             // XAttention stays dense up to its runtime minimum length, which this query does
@@ -517,7 +521,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             return maximum;
         }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
-        std::size_t maximum = 0;
+        std::size_t maximum             = 0;
         const std::int32_t chunk_tokens = detail::gqa_attention_small_t_max_tokens(q_heads);
         for (std::int32_t begin = 0; begin < width; begin += chunk_tokens) {
             maximum = std::max(maximum, chunk_capacity(std::min(chunk_tokens, width - begin)));
@@ -550,11 +554,10 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     // peak includes the largest Prompt width. Context-split partials peak at W * splits and
     // chunked widths reach past W=16, neither monotone in W, so every such width is evaluated.
     if (max_width > kMaximumVerifyTokens) {
-        maximum = std::max(maximum, exact_capacity(max_width));
+        maximum                  = std::max(maximum, exact_capacity(max_width));
         const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
         for (std::int32_t width = first; width < max_width; ++width) {
-            if (width > std::max(kMaximumChunkedPromptWidth,
-                                 detail::kGqaPromptSplitMaximumWidth)) {
+            if (width > std::max(kMaximumChunkedPromptWidth, detail::kGqaPromptSplitMaximumWidth)) {
                 break;
             }
             maximum = std::max(maximum, exact_capacity(width));
@@ -577,7 +580,8 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         throw std::invalid_argument("gqa_attention: xattn_tau must be in (0, 1]");
     }
     if (keep_frac < 1.0f && xattn_tau < 1.0f) {
-        throw std::invalid_argument("gqa_attention: keep_frac and xattn_tau are mutually exclusive");
+        throw std::invalid_argument(
+            "gqa_attention: keep_frac and xattn_tau are mutually exclusive");
     }
     if (cache.sage_pv && (keep_frac < 1.0f || xattn_tau < 1.0f)) {
         throw std::invalid_argument(
@@ -637,21 +641,20 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     if (xattn_tau < 1.0f && cache.dtype == DType::U8 &&
         envelope.max_visible_keys > static_cast<std::uint32_t>(xattn_min_len)) {
         const int n_br = div_up(width, kGqaXattnPrefillBr);
-        const int n_kb = gqa_xattn_n_kb(static_cast<int>(cache.block_tables.ne[0]),
-                                        envelope.max_visible_keys);
-        xattn_scratch = workspace
-                            .alloc_bytes(gqa_xattn_scratch_bytes(q.ne[1], kv_heads, n_br, n_kb))
-                            .data;
+        const int n_kb =
+            gqa_xattn_n_kb(static_cast<int>(cache.block_tables.ne[0]), envelope.max_visible_keys);
+        xattn_scratch =
+            workspace.alloc_bytes(gqa_xattn_scratch_bytes(q.ne[1], kv_heads, n_br, n_kb)).data;
     }
     detail::GqaPromptSplit split;
     if (dump == nullptr && prompt_split_eligible(cache.dtype, cache.sage_pv, keep_frac, xattn_tau,
                                                  envelope.max_visible_keys, xattn_min_len)) {
-        const std::int32_t capacity = detail::gqa_attention_prompt_split_capacity(
-            q.ne[1], width, envelope.max_visible_keys);
+        const std::int32_t capacity =
+            detail::gqa_attention_prompt_split_capacity(q.ne[1], width, envelope.max_visible_keys);
         if (capacity > 1) {
-            split        = allocate_prompt_split(workspace, q.ne[1], width, capacity);
-            split.splits = detail::gqa_attention_prompt_splits(q.ne[1], width,
-                                                               envelope.max_visible_keys);
+            split = allocate_prompt_split(workspace, q.ne[1], width, capacity);
+            split.splits =
+                detail::gqa_attention_prompt_splits(q.ne[1], width, envelope.max_visible_keys);
         }
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -717,12 +720,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     }
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
-    auto scope = workspace.scope();
+    auto scope       = workspace.scope();
     const bool dense = dense_nvfp4_profile(cache.dtype, cache.sage_pv, keep_frac, 1.0f);
     if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope, false, dense) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {
-        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out,
-                                      stream);
+        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
         return;
     }
     if (detail::gqa_attention_uses_small_t(q.ne[1], q.ne[2])) {
@@ -730,8 +732,8 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
-                                                    partial.acc, partial.m, partial.l, out,
-                                                    stream, 1.0f, {}, rank_dump);
+                                                    partial.acc, partial.m, partial.l, out, stream,
+                                                    1.0f, {}, rank_dump);
         return;
     }
     detail::GqaPromptSplit split;
@@ -740,9 +742,9 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         const std::int32_t capacity = detail::gqa_attention_prompt_split_capacity(
             q.ne[1], q.ne[2], envelope.max_visible_keys);
         if (capacity > 1) {
-            split        = allocate_prompt_split(workspace, q.ne[1], q.ne[2], capacity);
-            split.splits = detail::gqa_attention_prompt_splits(q.ne[1], q.ne[2],
-                                                               envelope.max_visible_keys);
+            split = allocate_prompt_split(workspace, q.ne[1], q.ne[2], capacity);
+            split.splits =
+                detail::gqa_attention_prompt_splits(q.ne[1], q.ne[2], envelope.max_visible_keys);
         }
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream, 1.0f,
@@ -780,7 +782,7 @@ void gqa_attention_s3_dump(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     auto scope = workspace.scope();
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                       cache, out, stream, keep_frac, 1.0f, 8192, &dump);
+                                        cache, out, stream, keep_frac, 1.0f, 8192, &dump);
 }
 
 } // namespace ninfer::ops

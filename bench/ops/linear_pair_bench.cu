@@ -95,7 +95,7 @@ std::vector<std::int32_t> parse_sweep(std::string_view text) {
     const std::int32_t begin = parse_positive_i32(text.substr(0, first), "sweep start");
     const std::int32_t end   = parse_positive_i32(
         text.substr(first + 1, second == std::string_view::npos ? text.size() - first - 1
-                                                                  : second - first - 1),
+                                                                : second - first - 1),
         "sweep end");
     const std::int32_t step = second == std::string_view::npos
                                   ? 1

@@ -20,7 +20,7 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
-    bool help_requested = false;
+    bool help_requested      = false;
     bool generation_recovery = true;
     std::string artifact_path;
     std::string host = "127.0.0.1";
@@ -28,14 +28,14 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
-    std::uint32_t max_context              = 8192;
-    KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t max_pending_requests     = 16;
-    std::uint32_t pending_timeout_ms       = 30000;
-    std::uint32_t prefill_chunk            = 4096;
-    std::size_t kv_ram_capacity_bytes      = 0;
-    std::size_t kv_disk_capacity_bytes     = 0;
+    std::uint32_t max_context          = 8192;
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    std::uint32_t max_concurrency      = 1;
+    std::uint32_t max_pending_requests = 16;
+    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t prefill_chunk        = 4096;
+    std::size_t kv_ram_capacity_bytes  = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress        = KvDiskCompress::Off;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs

@@ -38,14 +38,19 @@ namespace ninfer::targets::qwen3_6::detail {
 
 struct UninitializedBytes {
     UninitializedBytes() = default;
+
     ~UninitializedBytes() { std::free(data_); }
+
     UninitializedBytes(const UninitializedBytes& other) { assign(other); }
+
     UninitializedBytes& operator=(const UninitializedBytes& other) {
         if (this != &other) { assign(other); }
         return *this;
     }
+
     UninitializedBytes(UninitializedBytes&& other) noexcept
         : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
+
     UninitializedBytes& operator=(UninitializedBytes&& other) noexcept {
         if (this != &other) {
             std::free(data_);
@@ -54,6 +59,7 @@ struct UninitializedBytes {
         }
         return *this;
     }
+
     void resize(std::size_t size) {
         if (size == size_) { return; }
         void* next = nullptr;
@@ -64,9 +70,13 @@ struct UninitializedBytes {
         data_ = static_cast<std::uint8_t*>(next);
         size_ = size;
     }
+
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
     [[nodiscard]] std::uint8_t* data() noexcept { return data_; }
+
     [[nodiscard]] const std::uint8_t* data() const noexcept { return data_; }
 
 private:
@@ -74,17 +84,18 @@ private:
         resize(other.size_);
         if (size_ != 0) { std::memcpy(data_, other.data_, size_); }
     }
+
     std::uint8_t* data_ = nullptr;
     std::size_t size_   = 0;
 };
 
 struct DiskMatch {
     std::uint64_t committed_generation = 0;
-    std::uint64_t entry_id              = 0;
-    PrefixReusePath reuse               = PrefixReusePath::FullReset;
-    std::uint32_t reuse_base            = 0;
+    std::uint64_t entry_id             = 0;
+    PrefixReusePath reuse              = PrefixReusePath::FullReset;
+    std::uint32_t reuse_base           = 0;
     PrefixHash128 hash_f{};
-    std::uint32_t execution_frontier    = 0;
+    std::uint32_t execution_frontier = 0;
 };
 
 struct DiskLadderImage {
@@ -113,7 +124,7 @@ struct DiskRestoredHost {
     ResidentPrefixIdentity identity;
     std::vector<RamLadderIndex> ladders;
     std::vector<DiskLadderImage> ladder_images;
-    std::uint64_t disk_entry_id           = 0;
+    std::uint64_t disk_entry_id = 0;
 };
 
 struct DiskRestoreTarget {
@@ -124,8 +135,8 @@ struct DiskRestoreTarget {
     PagedKVAllocation* backend      = nullptr;
     PagedKVPool* backend_pool       = nullptr;
 
-    LinearAttentionStatePool* gdn    = nullptr;
-    std::int32_t gdn_current_slot    = -1;
+    LinearAttentionStatePool* gdn = nullptr;
+    std::int32_t gdn_current_slot = -1;
     RewriteStateHostTarget rewrite_state;
 
     Tensor* tail_hidden               = nullptr;
@@ -142,11 +153,11 @@ struct DiskRestoreTarget {
 
 // Outcome of freeing one host-RAM entry for a new capture.
 enum class RamReclaim : std::uint8_t {
-    Evicted,   // one entry left RAM; retry the capture
-    Retry,     // the chosen entry changed state; choose again
-    NoVictim,  // every entry is claimed or in I/O
-    Failed,    // the blocking spill of the chosen entry failed
-    Pending,   // no entry is durable yet; the disk worker is spilling one
+    Evicted,  // one entry left RAM; retry the capture
+    Retry,    // the chosen entry changed state; choose again
+    NoVictim, // every entry is claimed or in I/O
+    Failed,   // the blocking spill of the chosen entry failed
+    Pending,  // no entry is durable yet; the disk worker is spilling one
 };
 
 enum class DiskFaultPoint : std::uint8_t {
@@ -183,20 +194,20 @@ enum class DiskFaultPoint : std::uint8_t {
 
 struct DiskOpenConfig {
     std::filesystem::path location;
-    std::size_t capacity_bytes          = 0;
-    KvDiskCompress compress             = KvDiskCompress::Off;
-    std::uint32_t max_context           = 0;
-    KVRamCache* ram                     = nullptr;
+    std::size_t capacity_bytes = 0;
+    KvDiskCompress compress    = KvDiskCompress::Off;
+    std::uint32_t max_context  = 0;
+    KVRamCache* ram            = nullptr;
     DiskFingerprint fingerprint;
-    const PagedKVPool* text_pool        = nullptr;
-    const PagedKVPool* backend_pool     = nullptr;
-    std::size_t logical_page_bytes      = 0;
-    std::uint64_t hidden_bytes           = 0;
-    std::uint32_t max_index_entries     = 1u << 18;
+    const PagedKVPool* text_pool       = nullptr;
+    const PagedKVPool* backend_pool    = nullptr;
+    std::size_t logical_page_bytes     = 0;
+    std::uint64_t hidden_bytes         = 0;
+    std::uint32_t max_index_entries    = 1u << 18;
     std::uint32_t restore_window_slots = 2;
-    std::uint32_t restore_io_threads    = 1;
-    std::uint32_t pack_page_batch       = 4;
-    DiskFaultPoint test_fault_point     = DiskFaultPoint::None;
+    std::uint32_t restore_io_threads   = 1;
+    std::uint32_t pack_page_batch      = 4;
+    DiskFaultPoint test_fault_point    = DiskFaultPoint::None;
 };
 
 class KVDiskCache {
@@ -211,7 +222,7 @@ public:
 
     [[nodiscard]] std::optional<DiskMatch> plan_match(const PreparedPromptData& prompt,
                                                       std::span<const PrefixHash128> hash_chain,
-                                                     const ReuseBackendPolicy& policy = {});
+                                                      const ReuseBackendPolicy& policy = {});
     [[nodiscard]] std::optional<DiskRestoredHost> load_host(std::uint64_t entry_id) const;
     [[nodiscard]] bool populate_checkpoint_images(DiskRestoredHost& host);
     [[nodiscard]] DiskRestoredHost take_restore_checkpoints();
@@ -219,7 +230,7 @@ public:
     bool claim(std::uint64_t entry_id);
     bool claim(std::uint64_t entry_id, PrefixHash128 expected_hash_f,
                std::uint32_t expected_frontier, std::uint32_t expected_reuse_base = 0,
-               PrefixReusePath expected_reuse = PrefixReusePath::FullReset,
+               PrefixReusePath expected_reuse              = PrefixReusePath::FullReset,
                std::uint64_t expected_committed_generation = 0);
     void release(std::uint64_t entry_id);
     void consume(std::uint64_t entry_id);
@@ -269,6 +280,7 @@ public:
     // Non-blocking read for stats observers: empty while compaction or a tombstone fsync holds
     // the index lock, so a scrape never waits behind disk I/O.
     [[nodiscard]] std::optional<KvDiskSnapshot> try_snapshot() const noexcept;
+
     [[nodiscard]] std::uint64_t index_version() const noexcept {
         return index_version_.load(std::memory_order_relaxed);
     }
@@ -278,6 +290,7 @@ public:
         const std::function<void(std::uint64_t done, std::uint64_t total)>& on_progress = {});
 
     [[nodiscard]] std::uint64_t exact_comparisons() const noexcept { return exact_comparisons_; }
+
     [[nodiscard]] static std::uint32_t test_crc32c(std::span<const std::uint8_t> bytes) noexcept;
     void test_break_object(std::uint64_t object_id, DiskObjectKind kind);
     [[nodiscard]] std::uint64_t test_object_refcount(std::uint64_t object_id) const;
@@ -297,42 +310,50 @@ public:
     void test_arm_fail_object_unlink();
     void test_arm_fail_entry_unlink();
     void test_arm_fail_prepare_spill();
+
     void test_before_branch_refs(void (*hook)()) {
         std::lock_guard lock(mutex_);
         before_branch_refs_ = hook;
     }
+
     void test_fail_spill_enqueue_after(int successful_jobs) {
         std::lock_guard lock(mutex_);
         fail_spill_enqueue_after_ = successful_jobs;
     }
+
     bool test_spill_enqueue_fault_pending() const {
         std::lock_guard lock(mutex_);
         return fail_spill_enqueue_after_ >= 0;
     }
+
     void test_arm_fail_ram_note_allocation();
     void test_arm_fail_idle_snapshot_allocation();
     bool test_fifo_evict_one_unpersisted();
     bool test_flush_pending_unlinks(bool unlock);
     [[nodiscard]] bool test_meta_renamed() const;
+
     bool test_claim_waited_for_idle() const {
         return claim_waited_for_idle_.load(std::memory_order_acquire);
     }
+
     [[nodiscard]] bool test_objects_fsynced_before_meta() const;
     [[nodiscard]] std::uint32_t test_disk_io_pins(std::uint64_t entry_id) const;
     void test_force_zstd_fail();
     void test_set_payload_io_stall_ms(int ms);
     [[nodiscard]] bool test_payload_io_entered() const;
     void test_set_manifest_io_stall_ms(int ms);
+
     void test_set_compaction_copy_stall_ms(int ms) {
         compaction_copy_stall_ms_.store(ms, std::memory_order_release);
     }
+
     [[nodiscard]] bool test_compaction_copy_entered() const {
         return compaction_copy_entered_.load(std::memory_order_acquire);
     }
+
     [[nodiscard]] bool test_manifest_io_entered() const;
     void test_set_free_bytes_override(std::optional<std::uint64_t> bytes);
-    void test_set_pack_position(DiskObjectKind kind, std::uint32_t segment,
-                                std::uint64_t tail);
+    void test_set_pack_position(DiskObjectKind kind, std::uint32_t segment, std::uint64_t tail);
     void test_arm_partial_pwritev(std::size_t max_bytes);
     void test_arm_fault(DiskFaultPoint point);
     void test_arm_fault_sequence(DiskFaultPoint first, DiskFaultPoint second);
@@ -345,9 +366,11 @@ public:
     [[nodiscard]] bool test_restore_job_dequeued() const;
     [[nodiscard]] std::uint64_t test_restore_epoch() const;
     [[nodiscard]] bool test_waiting_h2d_drain() const;
+
     [[nodiscard]] bool test_waiting_reader_drain() const {
         return waiting_reader_drain_.load(std::memory_order_acquire);
     }
+
     void test_gate_state_h2d(cudaEvent_t gate);
     void test_release_restore_job_barrier();
     void test_arm_restore_state_barrier();
@@ -361,9 +384,11 @@ public:
     void test_arm_fail_page_read();
     void test_arm_fail_restore_job();
     void test_fail_prefetch_enqueue_after(int successful_jobs);
+
     static void test_fail_next_restore_setup_allocation() noexcept {
         fail_next_restore_setup_allocation_.store(true, std::memory_order_release);
     }
+
     static bool test_restore_setup_allocation_failure_pending() noexcept {
         return fail_next_restore_setup_allocation_.load(std::memory_order_acquire);
     }
@@ -371,18 +396,23 @@ public:
     static void test_fail_next_restore_event_allocation() noexcept {
         fail_next_restore_event_allocation_.store(true, std::memory_order_release);
     }
+
     static bool test_restore_event_allocation_pending() noexcept {
         return fail_next_restore_event_allocation_.load(std::memory_order_acquire);
     }
+
     static void test_fail_next_plan_metadata_allocation() noexcept {
         fail_next_plan_metadata_allocation_.store(true, std::memory_order_release);
     }
+
     static bool test_plan_metadata_allocation_pending() noexcept {
         return fail_next_plan_metadata_allocation_.load(std::memory_order_acquire);
     }
+
     static void test_fail_next_load_host_allocation() noexcept {
         fail_next_load_host_allocation_.store(true, std::memory_order_release);
     }
+
     static bool test_load_host_allocation_failure_pending() noexcept {
         return fail_next_load_host_allocation_.load(std::memory_order_acquire);
     }
@@ -390,6 +420,7 @@ public:
     static void test_fail_next_checkpoint_metadata_allocation() noexcept {
         fail_next_checkpoint_metadata_allocation_.store(true, std::memory_order_release);
     }
+
     static bool test_checkpoint_metadata_allocation_failure_pending() noexcept {
         return fail_next_checkpoint_metadata_allocation_.load(std::memory_order_acquire);
     }
@@ -397,16 +428,20 @@ public:
     static void test_startup_allocation_hook(void (*hook)(int)) noexcept {
         startup_allocation_hook_.store(hook, std::memory_order_release);
     }
+
     void test_fail_publication_allocation() noexcept {
         fail_publication_allocation_.store(true, std::memory_order_release);
     }
+
     void test_publication_install_hook(void (*hook)(bool) noexcept) {
         std::lock_guard lock(mutex_);
         publication_install_hook_ = hook;
     }
+
     [[nodiscard]] bool test_publication_allocation_pending() const noexcept {
         return fail_publication_allocation_.load(std::memory_order_acquire);
     }
+
     void test_arm_fail_restore_state_setup();
     void test_arm_fail_restore_state_invariant();
     void test_arm_fail_after_checkpoint_prepare_start();
@@ -446,12 +481,15 @@ public:
     [[nodiscard]] bool test_reader_claim(std::uint32_t pool, std::uint32_t logical) const;
     [[nodiscard]] bool test_window_assigned(std::uint32_t pool, std::uint32_t logical) const;
     void test_arm_fail_after_payload_take();
+
     std::size_t test_failed_page_batch_size() const {
         return failed_page_batch_size_.load(std::memory_order_acquire);
     }
+
     void test_arm_fail_page_batch_allocation() {
         fail_page_batch_allocation_.store(true, std::memory_order_release);
     }
+
     [[nodiscard]] std::uint32_t test_payload_io_inflight() const;
     [[nodiscard]] std::uint64_t test_prefetch_preempted_idle() const;
     [[nodiscard]] bool test_emergency_queued() const;
@@ -474,18 +512,18 @@ private:
     };
 
     struct Job {
-        JobKind kind                 = JobKind::Stop;
-        std::uint64_t disk_entry_id  = 0;
-        std::uint64_t ram_entry_id   = 0;
-        std::uint64_t spill_epoch     = 0;
-        std::uint64_t restore_epoch = 0;
-        std::uint64_t claim_generation = 0;
+        JobKind kind                       = JobKind::Stop;
+        std::uint64_t disk_entry_id        = 0;
+        std::uint64_t ram_entry_id         = 0;
+        std::uint64_t spill_epoch          = 0;
+        std::uint64_t restore_epoch        = 0;
+        std::uint64_t claim_generation     = 0;
         std::uint64_t committed_generation = 0;
-        std::uint32_t pool           = 0;
-        std::uint32_t logical_index  = 0;
-        std::uint32_t window_slot    = 0;
-        std::uint32_t text_extent    = 0;
-        std::uint32_t backend_extent = 0;
+        std::uint32_t pool                 = 0;
+        std::uint32_t logical_index        = 0;
+        std::uint32_t window_slot          = 0;
+        std::uint32_t text_extent          = 0;
+        std::uint32_t backend_extent       = 0;
     };
 
     struct IndexEntry {
@@ -493,14 +531,15 @@ private:
         std::vector<TokenId> ledger;
         ResidentPrefixIdentity identity;
         std::vector<std::uint64_t> uncertainty_ids;
-        bool pinned       = false;
-        bool unavailable  = false;
-        std::uint32_t io_pins = 0;
-        std::uint64_t claim_generation = 0;
+        bool pinned                        = false;
+        bool unavailable                   = false;
+        std::uint32_t io_pins              = 0;
+        std::uint64_t claim_generation     = 0;
         std::uint64_t committed_generation = 0;
     };
 
     using EntryIndex = std::unordered_map<std::uint64_t, IndexEntry>;
+
     struct PreparedPublication {
         EntryIndex::node_type node;
         DiskMeta replaced;
@@ -517,63 +556,69 @@ private:
     };
 
     struct WindowSlot {
-        void* io                       = nullptr;
-        void* host                     = nullptr;
-        cudaEvent_t h2d_arrived        = nullptr;
-        cudaEvent_t h2d_event          = nullptr;
-        std::uint32_t pool           = 0;
-        std::uint32_t logical_index  = 0;
-        std::uint64_t object_id      = 0;
-        std::uint64_t disk_entry_id  = 0;
-        std::uint64_t epoch          = 0;
-        std::uint64_t claim_generation = 0;
+        void* io                           = nullptr;
+        void* host                         = nullptr;
+        cudaEvent_t h2d_arrived            = nullptr;
+        cudaEvent_t h2d_event              = nullptr;
+        std::uint32_t pool                 = 0;
+        std::uint32_t logical_index        = 0;
+        std::uint64_t object_id            = 0;
+        std::uint64_t disk_entry_id        = 0;
+        std::uint64_t epoch                = 0;
+        std::uint64_t claim_generation     = 0;
         std::uint64_t committed_generation = 0;
-        bool filled                  = false;
-        bool h2d_done                = false;
-        bool assigned                = false;
+        bool filled                        = false;
+        bool h2d_done                      = false;
+        bool assigned                      = false;
     };
 
     struct EncodedStateBlob {
-        DiskStateKind kind = DiskStateKind::CurrentGdn;
-        DiskCodec codec = DiskCodec::Raw;
-        const void* first = nullptr;
-        std::size_t first_bytes = 0;
-        const void* second = nullptr;
+        DiskStateKind kind       = DiskStateKind::CurrentGdn;
+        DiskCodec codec          = DiskCodec::Raw;
+        const void* first        = nullptr;
+        std::size_t first_bytes  = 0;
+        const void* second       = nullptr;
         std::size_t second_bytes = 0;
         std::vector<std::uint8_t> compressed;
+
         [[nodiscard]] std::size_t uncompressed_bytes() const noexcept {
             return first_bytes + second_bytes;
         }
+
         [[nodiscard]] std::size_t payload_bytes() const noexcept {
             return codec == DiskCodec::Zstd ? compressed.size() : uncompressed_bytes();
         }
     };
 
     struct SpillSession {
-        bool ram_pin_owned = false;
-        std::uint64_t ram_id         = 0;
-        std::uint64_t ticket         = 0;
-        std::uint64_t parent_id      = 0;
-        std::uint64_t child_id       = 0;
-        bool emergency               = false;
+        bool ram_pin_owned      = false;
+        std::uint64_t ram_id    = 0;
+        std::uint64_t ticket    = 0;
+        std::uint64_t parent_id = 0;
+        std::uint64_t child_id  = 0;
+        bool emergency          = false;
         // Emergency priority on behalf of a non-blocking reclaim; nobody waits on
         // it, so idle cancellation and entry exclusions still cancel it.
-        bool reclaim                 = false;
-        bool cancelled               = false;
-        bool failed                  = false;
-        bool committed               = false;
-        bool meta_installed          = false;
-        std::uint64_t epoch          = 0;
-        enum class Action : std::uint8_t { Create, Extend, Branch, Refresh } action =
-            Action::Create;
-        std::uint32_t share_tokens   = 0;
+        bool reclaim        = false;
+        bool cancelled      = false;
+        bool failed         = false;
+        bool committed      = false;
+        bool meta_installed = false;
+        std::uint64_t epoch = 0;
+        enum class Action : std::uint8_t {
+            Create,
+            Extend,
+            Branch,
+            Refresh
+        } action                   = Action::Create;
+        std::uint32_t share_tokens = 0;
         DiskMeta draft;
         std::vector<std::uint64_t> new_object_ids;
         std::vector<DiskObjectKind> new_object_kinds;
-        std::uint32_t next_main      = 0;
-        std::uint32_t next_backend   = 0;
-        std::uint32_t main_pages     = 0;
-        std::uint32_t backend_pages  = 0;
+        std::uint32_t next_main     = 0;
+        std::uint32_t next_backend  = 0;
+        std::uint32_t main_pages    = 0;
+        std::uint32_t backend_pages = 0;
         KVRamCache::HostKvView image;
         RamRestoredHost host;
         std::vector<EncodedStateBlob> encoded_state;
@@ -586,6 +631,7 @@ private:
         int direct   = -1;
         ~PackDescriptor();
     };
+
     struct PackGeneration {
         std::uint64_t number = 0;
         std::filesystem::path root;
@@ -596,13 +642,14 @@ private:
     struct ObjectRef {
         struct Location {
             std::shared_ptr<PackGeneration> generation;
-            std::uint32_t segment = 0;
-            std::uint64_t offset = 0;
-            std::uint64_t extent_bytes = 0;
-            std::uint64_t stored_bytes = 0;
+            std::uint32_t segment       = 0;
+            std::uint64_t offset        = 0;
+            std::uint64_t extent_bytes  = 0;
+            std::uint64_t stored_bytes  = 0;
             std::uint64_t logical_bytes = 0;
             std::uint32_t record_crc32c = 0;
         } location;
+
         DiskObjectKind kind     = DiskObjectKind::Main;
         std::uint64_t bytes     = 0;
         std::uint32_t live_refs = 0;
@@ -616,10 +663,12 @@ private:
             std::uint64_t id = 0;
             ObjectRef ref;
         };
+
         struct Move {
             std::uint64_t id = 0;
             ObjectRef::Location location;
         };
+
         std::uint64_t new_generation = 0;
         std::shared_ptr<PackGeneration> source;
         std::shared_ptr<PackGeneration> target;
@@ -640,7 +689,7 @@ private:
 
     struct StartupObjectValidation {
         DiskObjectKind kind = DiskObjectKind::Main;
-        bool page = false;
+        bool page           = false;
         std::optional<DiskStateKind> state_kind;
     };
 
@@ -672,13 +721,12 @@ private:
     [[nodiscard]] bool page_job_is_live_restore(const Job& job) const noexcept;
     [[nodiscard]] bool slot_is_live_restore_page(const WindowSlot& slot) const noexcept;
     [[nodiscard]] bool restore_state_is_live(std::uint64_t epoch, std::uint64_t entry,
-                                              PrefixReusePath reuse,
-                                              std::uint32_t reuse_base) const noexcept;
+                                             PrefixReusePath reuse,
+                                             std::uint32_t reuse_base) const noexcept;
     [[nodiscard]] bool restore_state_is_live(std::uint64_t epoch, std::uint64_t entry,
-                                              std::uint64_t committed_generation,
-                                              std::uint64_t claim_generation,
-                                              PrefixReusePath reuse,
-                                              std::uint32_t reuse_base) const noexcept;
+                                             std::uint64_t committed_generation,
+                                             std::uint64_t claim_generation, PrefixReusePath reuse,
+                                             std::uint32_t reuse_base) const noexcept;
     void maybe_restore_job_barrier();
     void maybe_restore_state_barrier();
     void maybe_direct_state_read_barrier();
@@ -696,20 +744,24 @@ private:
     void record_restore_join_locked(cudaStream_t stream);
     void bill_post_disk_h2d();
     void fsync_new_objects(const SpillSession& session) const;
+
     [[nodiscard]] std::uint32_t window_slots() const noexcept {
         return static_cast<std::uint32_t>(window_.size());
     }
+
     void ensure_live_copies_event_locked();
     void retire_copies_event_locked();
     void release_copy_event(cudaEvent_t event);
     cudaEvent_t lease_copy_event_locked(std::uint64_t epoch);
     void finish_window_inflight(std::uint32_t slot, bool keep_slot) noexcept;
     void maybe_copy_lease_barrier();
+
     // Caller holds the mutex, except in the destructor.
     void note_drop(KvDiskDropReason reason) noexcept {
         ++drops_;
         ++drop_reasons_[static_cast<std::size_t>(reason)];
     }
+
     void maybe_wait_epoch_barrier();
     void maybe_page_read_barrier();
     void maybe_payload_take_barrier();
@@ -719,17 +771,15 @@ private:
     void harvest_retired_timing_locked();
     void try_harvest_copy_pair_locked(cudaEvent_t start, cudaEvent_t done, bool& timed);
     void note_live_host_load_locked(std::chrono::steady_clock::time_point started,
-                                     std::chrono::steady_clock::time_point ended);
+                                    std::chrono::steady_clock::time_point ended);
     void ensure_copies_start_locked();
     [[nodiscard]] bool populate_checkpoint_images(DiskRestoredHost& host, std::uint64_t epoch,
                                                   std::uint64_t entry, PrefixReusePath reuse,
                                                   std::uint32_t reuse_base, bool check_live);
-    [[nodiscard]] bool populate_checkpoint_images(DiskRestoredHost& host, std::uint64_t epoch,
-                                                  std::uint64_t entry,
-                                                  std::uint64_t committed_generation,
-                                                  std::uint64_t claim_generation,
-                                                  PrefixReusePath reuse, std::uint32_t reuse_base,
-                                                  bool check_live);
+    [[nodiscard]] bool
+    populate_checkpoint_images(DiskRestoredHost& host, std::uint64_t epoch, std::uint64_t entry,
+                               std::uint64_t committed_generation, std::uint64_t claim_generation,
+                               PrefixReusePath reuse, std::uint32_t reuse_base, bool check_live);
     void load_restore_state_locked(std::unique_lock<std::mutex>& lock);
     void reset_window_slot_keep_host(WindowSlot& slot) noexcept;
     void open_directory();
@@ -775,8 +825,9 @@ private:
     [[nodiscard]] std::uint32_t backend_tokens_required(const DiskMeta& meta) const noexcept;
     void queue_unlink(const std::filesystem::path& path);
     [[nodiscard]] bool unlink_path(const std::filesystem::path& path);
-    void write_entry_tombstone(
-        std::uint64_t id, const std::vector<std::pair<DiskObjectKind, std::uint64_t>>& objects);
+    void
+    write_entry_tombstone(std::uint64_t id,
+                          const std::vector<std::pair<DiskObjectKind, std::uint64_t>>& objects);
     void clear_entry_tombstone(std::uint64_t id) const;
     void queue_tombstone_object_unlinks();
     [[nodiscard]] bool tombstone_objects_remain(
@@ -789,13 +840,11 @@ private:
     bool flush_queued_unlinks(std::unique_lock<std::mutex>& lock);
 
     [[nodiscard]] std::filesystem::path pack_path(const PackGeneration& generation,
-                                                   DiskObjectKind kind,
-                                                   std::uint32_t segment) const;
-    [[nodiscard]] std::filesystem::path pack_path(DiskObjectKind kind,
-                                                   std::uint32_t segment) const;
-    [[nodiscard]] std::shared_ptr<PackDescriptor> acquire_pack_descriptor(
-        const std::shared_ptr<PackGeneration>& generation, DiskObjectKind kind,
-        std::uint32_t segment, bool require_direct) const;
+                                                  DiskObjectKind kind, std::uint32_t segment) const;
+    [[nodiscard]] std::filesystem::path pack_path(DiskObjectKind kind, std::uint32_t segment) const;
+    [[nodiscard]] std::shared_ptr<PackDescriptor>
+    acquire_pack_descriptor(const std::shared_ptr<PackGeneration>& generation, DiskObjectKind kind,
+                            std::uint32_t segment, bool require_direct) const;
     void reap_retired_generations();
     [[nodiscard]] std::filesystem::path entry_dir(std::uint64_t id) const;
     [[nodiscard]] std::uint64_t allocate_object(DiskObjectKind kind, std::uint64_t bytes);
@@ -817,14 +866,15 @@ private:
     void invalidate_ram_notes_for_disk_entry(std::uint64_t disk_id);
     [[nodiscard]] IndexEntry& require(std::uint64_t entry_id);
     [[nodiscard]] const IndexEntry& require(std::uint64_t entry_id) const;
-    void bump_version() noexcept {
-        index_version_.fetch_add(1, std::memory_order_relaxed);
-    }
+
+    void bump_version() noexcept { index_version_.fetch_add(1, std::memory_order_relaxed); }
 
     void promote_idle_spill_to_emergency();
     void promote_spill_for_reclaim_locked();
     void demote_reclaim_spill_locked();
-    [[nodiscard]] bool spill_live_locked() const noexcept;
+    // RAM entry id of the installed spill session while it is neither cancelled, failed, nor
+    // committed; empty when no live session is installed.
+    [[nodiscard]] std::optional<std::uint64_t> live_spill_ram_locked() const noexcept;
     [[nodiscard]] bool reclaim_target_live_locked() const;
     // Worker-side pin and prepare of one RAM entry's spill; `urgent` spills a
     // reclaim target at emergency priority.
@@ -837,8 +887,8 @@ private:
     void commit_spill(SpillSession& session, std::unique_lock<std::mutex>& lock);
     PreparedPublication prepare_publication(const SpillSession& session);
     void install_committed_entry(SpillSession& session, PreparedPublication& publication,
-                                 std::unique_lock<std::mutex>& lock,
-                                 bool mark_durable = true, bool retain_replaced = false);
+                                 std::unique_lock<std::mutex>& lock, bool mark_durable = true,
+                                 bool retain_replaced = false);
     void release_spill_pins(SpillSession& session, bool mark_failed);
     // Releases the session's pins and draft objects under the held mutex; it never unlocks,
     // so the caller resets spill_ before flushing the unlinks it queued.
@@ -855,8 +905,8 @@ private:
     void write_new_object(DiskObjectKind kind, std::uint64_t id, const void* data,
                           std::uint64_t bytes, std::unique_lock<std::mutex>* lock);
     void write_new_object_parts(DiskObjectKind kind, std::uint64_t id,
-                               std::span<const std::pair<const void*, std::uint64_t>> parts,
-                               std::uint64_t bytes, std::unique_lock<std::mutex>* lock);
+                                std::span<const std::pair<const void*, std::uint64_t>> parts,
+                                std::uint64_t bytes, std::unique_lock<std::mutex>* lock);
     [[nodiscard]] std::size_t take_test_partial_pwritev_bytes() noexcept;
     void maybe_test_fault(DiskFaultPoint point) const;
     [[nodiscard]] EncodedStateBlob encode_state_blob(DiskStateKind kind, const void* a,
@@ -877,9 +927,11 @@ private:
     void discard_prefetch_queue();
     void purge_prefetch_of(std::uint64_t entry_id);
     void publish_page_job_failure(const Job& job);
+
     void bump_durable_generation() noexcept { ++durable_generation_; }
-    std::uint32_t share_pages(SpeculativeBackend backend, bool main, std::uint32_t share_tokens)
-        const;
+
+    std::uint32_t share_pages(SpeculativeBackend backend, bool main,
+                              std::uint32_t share_tokens) const;
 
     bool read_object(DiskObjectKind kind, std::uint64_t id, void* dst, std::uint64_t bytes);
     bool read_page_payload(DiskObjectKind kind, std::uint64_t id, void* io, void* dst,
@@ -895,6 +947,7 @@ private:
         void* dst2         = nullptr;
         std::size_t bytes2 = 0;
     };
+
     struct CheckpointDecodePlan {
         DiskMeta meta;
         std::unordered_map<std::uint64_t, DecodedCheckpointState> decoded;
@@ -902,32 +955,33 @@ private:
         bool skip[3]{};
         std::size_t hidden_bytes[3]{};
     };
-    bool decode_state_parts(std::uint64_t id, DiskStateKind expected, void* dst,
-                            std::size_t bytes, void* dst2, std::size_t bytes2,
-                            std::uint32_t read_workers = 1);
+
+    bool decode_state_parts(std::uint64_t id, DiskStateKind expected, void* dst, std::size_t bytes,
+                            void* dst2, std::size_t bytes2, std::uint32_t read_workers = 1);
     bool decode_state_parallel(std::vector<StateDecodeJob>& jobs);
-    [[nodiscard]] bool enqueue_unique_decode(
-        std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
-        std::vector<StateDecodeJob>& jobs, std::uint64_t id, DiskStateKind kind,
-        std::size_t first_bytes, std::size_t second_bytes = 0);
+    [[nodiscard]] bool
+    enqueue_unique_decode(std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
+                          std::vector<StateDecodeJob>& jobs, std::uint64_t id, DiskStateKind kind,
+                          std::size_t first_bytes, std::size_t second_bytes = 0);
     [[nodiscard]] bool collect_checkpoint_decode_jobs(
-        const DiskMeta& meta,
-        std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
+        const DiskMeta& meta, std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
         std::vector<StateDecodeJob>& jobs, bool skip[3], std::size_t hid_n[3]);
-    [[nodiscard]] bool assemble_checkpoint_images(
-        DiskRestoredHost& host, const DiskMeta& meta,
-        std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded, const bool skip[3],
-        const std::size_t hid_n[3]);
-    [[nodiscard]] bool prepare_checkpoint_decode(
-        DiskRestoredHost& host, CheckpointDecodePlan& plan, std::uint64_t epoch,
-        std::uint64_t entry, std::uint64_t committed_generation,
-        std::uint64_t claim_generation, PrefixReusePath reuse, std::uint32_t reuse_base,
-        bool check_live);
-    [[nodiscard]] bool finish_checkpoint_decode(
-        DiskRestoredHost& host, CheckpointDecodePlan& plan, std::uint64_t epoch,
-        std::uint64_t entry, std::uint64_t committed_generation,
-        std::uint64_t claim_generation, PrefixReusePath reuse, std::uint32_t reuse_base,
-        bool check_live);
+    [[nodiscard]] bool
+    assemble_checkpoint_images(DiskRestoredHost& host, const DiskMeta& meta,
+                               std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
+                               const bool skip[3], const std::size_t hid_n[3]);
+    [[nodiscard]] bool prepare_checkpoint_decode(DiskRestoredHost& host, CheckpointDecodePlan& plan,
+                                                 std::uint64_t epoch, std::uint64_t entry,
+                                                 std::uint64_t committed_generation,
+                                                 std::uint64_t claim_generation,
+                                                 PrefixReusePath reuse, std::uint32_t reuse_base,
+                                                 bool check_live);
+    [[nodiscard]] bool finish_checkpoint_decode(DiskRestoredHost& host, CheckpointDecodePlan& plan,
+                                                std::uint64_t epoch, std::uint64_t entry,
+                                                std::uint64_t committed_generation,
+                                                std::uint64_t claim_generation,
+                                                PrefixReusePath reuse, std::uint32_t reuse_base,
+                                                bool check_live);
 
     void fill_window_slot(std::uint32_t slot, DiskObjectKind kind, std::uint64_t object_id,
                           std::uint32_t pool, std::uint32_t logical);
@@ -938,7 +992,7 @@ private:
 
     DiskOpenConfig config_;
     static constexpr std::uint64_t kPackSegmentBytes = 1ULL << 30;
-    std::uint64_t pack_generation_ = 1;
+    std::uint64_t pack_generation_                   = 1;
     std::shared_ptr<PackGeneration> active_generation_;
     std::vector<std::shared_ptr<PackGeneration>> retired_generations_;
     bool packset_publication_pending_sync_ = false;
@@ -948,28 +1002,29 @@ private:
     std::atomic<bool> compaction_copy_entered_{false};
     // A failed rewrite is not retried until the durable generation changes.
     std::uint64_t compaction_failed_generation_ = 0;
-    std::uint64_t object_id_reservation_limit_ = 1;
+    std::uint64_t object_id_reservation_limit_  = 1;
     std::array<std::uint32_t, 5> pack_active_segment_{};
     std::array<std::uint64_t, 5> pack_active_tail_{};
-    int lock_fd_ = -1;
-    void* restore_window_allocation_                   = nullptr;
-    void* restore_window_mem_                          = nullptr;
-    std::size_t restore_window_bytes_                  = 0;
-    std::size_t restore_window_stride_                 = 0;
-    void* page_staging_                                = nullptr;
-    std::size_t page_staging_bytes_                    = 0;
-    std::size_t page_staging_stride_                   = 0;
-    cudaStream_t page_scatter_stream_                  = nullptr;
-    cudaStream_t scatter_test_gate_stream_             = nullptr;
-    cudaEvent_t scatter_test_gate_                     = nullptr;
-    PagedKVScatterPlane* text_scatter_planes_          = nullptr;
-    std::size_t text_scatter_plane_count_              = 0;
-    std::size_t text_scatter_max_plane_bytes_          = 0;
-    std::size_t text_scatter_page_bytes_               = 0;
-    PagedKVScatterPlane* backend_scatter_planes_       = nullptr;
-    std::size_t backend_scatter_plane_count_           = 0;
-    std::size_t backend_scatter_max_plane_bytes_       = 0;
-    std::size_t backend_scatter_page_bytes_            = 0;
+    int lock_fd_                                 = -1;
+    void* restore_window_allocation_             = nullptr;
+    void* restore_window_mem_                    = nullptr;
+    std::size_t restore_window_bytes_            = 0;
+    std::size_t restore_window_stride_           = 0;
+    void* page_staging_                          = nullptr;
+    std::size_t page_staging_bytes_              = 0;
+    std::size_t page_staging_stride_             = 0;
+    cudaStream_t page_scatter_stream_            = nullptr;
+    cudaStream_t scatter_test_gate_stream_       = nullptr;
+    cudaEvent_t scatter_test_gate_               = nullptr;
+    PagedKVScatterPlane* text_scatter_planes_    = nullptr;
+    std::size_t text_scatter_plane_count_        = 0;
+    std::size_t text_scatter_max_plane_bytes_    = 0;
+    std::size_t text_scatter_page_bytes_         = 0;
+    PagedKVScatterPlane* backend_scatter_planes_ = nullptr;
+    std::size_t backend_scatter_plane_count_     = 0;
+    std::size_t backend_scatter_max_plane_bytes_ = 0;
+    std::size_t backend_scatter_page_bytes_      = 0;
+
     struct ImmediateStateSlices {
         std::span<std::uint8_t> gdn_conv;
         std::span<std::uint8_t> gdn_rec;
@@ -980,13 +1035,14 @@ private:
         std::span<std::uint8_t> rewrite_hidden;
         std::span<std::uint8_t> rewrite_cyclic;
     };
-    void* restore_state_allocation_ = nullptr;
-    void* restore_state_mem_ = nullptr;
+
+    void* restore_state_allocation_        = nullptr;
+    void* restore_state_mem_               = nullptr;
     std::size_t restore_state_arena_bytes_ = 0;
     ImmediateStateSlices restore_state_capacity_{};
     ImmediateStateSlices restore_state_slices_{};
-    cudaEvent_t state_arena_idle_ = nullptr;
-    bool state_arena_h2d_pending_ = false;
+    cudaEvent_t state_arena_idle_  = nullptr;
+    bool state_arena_h2d_pending_  = false;
     cudaStream_t state_h2d_stream_ = nullptr;
 
     std::atomic<bool> fail_publication_allocation_{false};
@@ -1004,17 +1060,17 @@ private:
     std::uint64_t next_entry_id_    = 1;
     std::uint64_t next_spill_epoch_ = 1;
     std::atomic<std::uint64_t> index_version_{1};
-    std::uint64_t captures_         = 0;
-    std::uint64_t restores_         = 0;
-    std::uint64_t evictions_        = 0;
-    std::uint64_t drops_            = 0;
+    std::uint64_t captures_  = 0;
+    std::uint64_t restores_  = 0;
+    std::uint64_t evictions_ = 0;
+    std::uint64_t drops_     = 0;
     std::array<std::uint64_t, kKvDiskDropReasonCount> drop_reasons_{};
-    std::uint64_t exact_comparisons_ = 0;
+    std::uint64_t exact_comparisons_  = 0;
     std::uint64_t durable_generation_ = 1;
-    double save_seconds_            = 0;
-    double load_seconds_            = 0;
-    double pending_save_seconds_    = 0;
-    double pending_h2d_seconds_     = 0;
+    double save_seconds_              = 0;
+    double load_seconds_              = 0;
+    double pending_save_seconds_      = 0;
+    double pending_h2d_seconds_       = 0;
     std::optional<std::chrono::steady_clock::time_point> load_host_start_;
     std::optional<std::chrono::steady_clock::time_point> load_host_end_;
     std::optional<std::uint64_t> test_free_bytes_override_;
@@ -1032,68 +1088,72 @@ private:
     std::thread io_thread_;
     std::vector<std::thread> restore_threads_{};
     std::uint32_t restore_io_threads_ = 1;
-    bool stopping_ = false;
+    bool stopping_                    = false;
     std::deque<Job> restore_q_;
     std::deque<Job> emergency_q_;
     std::deque<Job> idle_q_;
     std::deque<Job> prefetch_q_;
+
     struct ReaderClaim {
-        std::uint64_t disk_entry_id         = 0;
+        std::uint64_t disk_entry_id        = 0;
         std::uint64_t restore_epoch        = 0;
-        std::uint64_t claim_generation       = 0;
-        std::uint64_t committed_generation  = 0;
+        std::uint64_t claim_generation     = 0;
+        std::uint64_t committed_generation = 0;
         std::uint32_t pool                 = 0;
         std::uint32_t logical_index        = 0;
     };
+
     std::vector<ReaderClaim> reader_claims_{};
 
     // One executor performs a single RAM claim/eviction/emergency scope at a time.
-    std::uint64_t idle_cancel_ram_ = 0;
+    std::uint64_t idle_cancel_ram_  = 0;
     bool idle_pinning_              = false;
     std::uint64_t idle_pinning_ram_ = 0;
     bool emergency_preparing_       = false;
     // RAM entry a non-blocking reclaim waits on; the worker spills it at
     // emergency priority. Cleared by any commit, or when its spill cannot start.
-    std::uint64_t reclaim_ram_      = 0;
-    bool idle_cancel_all_           = false;
+    std::uint64_t reclaim_ram_       = 0;
+    bool idle_cancel_all_            = false;
     std::uint64_t idle_cancel_epoch_ = 0;
     std::optional<SpillSession> spill_;
     std::optional<DiskRestoreTarget> restore_target_;
     std::uint64_t restore_entry_id_ = 0;
     bool restore_failed_            = false;
     std::exception_ptr restore_worker_error_;
-    bool restore_kv_done_           = false;
-    bool restore_state_done_        = false;
-    std::uint32_t restore_next_main_ = 0;
+    bool restore_kv_done_               = false;
+    bool restore_state_done_            = false;
+    std::uint32_t restore_next_main_    = 0;
     std::uint32_t restore_next_backend_ = 0;
-    std::uint32_t restore_h2d_main_      = 0;
-    std::uint32_t restore_h2d_backend_   = 0;
+    std::uint32_t restore_h2d_main_     = 0;
+    std::uint32_t restore_h2d_backend_  = 0;
     std::vector<WindowSlot> window_{};
-    cudaEvent_t copies_start_ = nullptr;
-    cudaEvent_t copies_done_  = nullptr;
+    cudaEvent_t copies_start_          = nullptr;
+    cudaEvent_t copies_done_           = nullptr;
     std::uint64_t copies_record_epoch_ = 0;
     std::uint32_t copies_done_waiters_ = 0;
-    std::uint32_t copies_ticket_refs_   = 0;
+    std::uint32_t copies_ticket_refs_  = 0;
+
     struct RetiredCopyEvent {
-        cudaEvent_t event     = nullptr;
-        cudaEvent_t start     = nullptr;
-        std::uint64_t epoch   = 0;
-        std::uint32_t waiters = 0;
+        cudaEvent_t event         = nullptr;
+        cudaEvent_t start         = nullptr;
+        std::uint64_t epoch       = 0;
+        std::uint32_t waiters     = 0;
         std::uint32_t ticket_refs = 0;
-        bool timed            = false;
+        bool timed                = false;
     };
+
     std::vector<RetiredCopyEvent> retired_copy_events_;
-    bool copies_timed_        = false;
-    bool copies_join_recorded_ = false;
-    bool h2d_billed_          = false;
-    bool restore_active_      = false;
-    bool restore_state_loaded_ = false;
-    bool restore_use_context_head_ = false;
-    bool restore_unpack_rewrite_ = true;
-    std::uint64_t restore_epoch_     = 1;
-    std::uint64_t wait_ticket_epoch_  = 0;
-    std::uint32_t window_inflight_   = 0;
-    std::uint32_t payload_io_inflight_ = 0;
+    bool copies_timed_                    = false;
+    bool copies_join_recorded_            = false;
+    bool h2d_billed_                      = false;
+    bool restore_active_                  = false;
+    bool restore_state_loaded_            = false;
+    bool restore_use_context_head_        = false;
+    bool restore_unpack_rewrite_          = true;
+    std::uint64_t restore_epoch_          = 1;
+    std::uint64_t wait_ticket_epoch_      = 0;
+    std::uint32_t window_inflight_        = 0;
+    std::uint32_t payload_io_inflight_    = 0;
     std::uint32_t restore_state_inflight_ = 0;
     std::atomic<int> payload_io_stall_ms_{0};
     mutable std::atomic<bool> payload_io_entered_{false};
@@ -1104,9 +1164,9 @@ private:
     std::atomic<bool> restore_job_barrier_armed_{false};
     std::atomic<bool> fail_restore_job_{false};
     std::atomic<bool> fail_restore_state_invariant_{false};
-    bool fail_ram_note_allocation_ = false;
+    bool fail_ram_note_allocation_      = false;
     bool fail_idle_snapshot_allocation_ = false;
-    int fail_prefetch_enqueue_after_ = -1;
+    int fail_prefetch_enqueue_after_    = -1;
     inline static std::atomic<bool> fail_next_restore_setup_allocation_{false};
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_restore_event_allocation_{false};
@@ -1146,7 +1206,7 @@ private:
     std::atomic<std::size_t> failed_page_batch_size_{0};
     std::atomic<std::uint64_t> prefetch_preempted_idle_{0};
     cudaEvent_t last_wait_copy_event_ = nullptr;
-    std::uint32_t timing_harvests_     = 0;
+    std::uint32_t timing_harvests_    = 0;
     std::atomic<int> state_decode_stall_ms_{0};
     mutable std::atomic<int> state_decode_count_{0};
     std::atomic<bool> fail_next_page_read_{false};
@@ -1164,29 +1224,29 @@ private:
     std::atomic<bool> meta_renamed_{false};
     std::atomic<bool> objects_dir_fsynced_{false};
     DiskRestoredHost restore_checkpoint_host_{};
-    bool idle_requested_      = false;
-    bool crash_before_meta_   = false;
+    bool idle_requested_          = false;
+    bool crash_before_meta_       = false;
     bool stall_after_meta_rename_ = false;
     std::atomic<bool> claim_waited_for_idle_{false};
-    bool fail_after_meta_rename_  = false;
-    bool fail_rollback_meta_      = false;
+    bool fail_after_meta_rename_     = false;
+    bool fail_rollback_meta_         = false;
     bool fail_after_rollback_rename_ = false;
-    bool fail_tombstone_              = false;
-    mutable bool fail_object_write_         = false;
-    bool fail_object_unlink_                = false;
-    bool fail_entry_unlink_                 = false;
-    bool fail_prepare_spill_               = false;
-    int fail_spill_enqueue_after_ = -1;
-    void (*before_branch_refs_)() = nullptr;
-    bool force_zstd_fail_     = false;
+    bool fail_tombstone_             = false;
+    mutable bool fail_object_write_  = false;
+    bool fail_object_unlink_         = false;
+    bool fail_entry_unlink_          = false;
+    bool fail_prepare_spill_         = false;
+    int fail_spill_enqueue_after_    = -1;
+    void (*before_branch_refs_)()    = nullptr;
+    bool force_zstd_fail_            = false;
     std::filesystem::path canonical_location_;
     std::vector<std::uint64_t> branch_shared_ids_;
 };
 
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
-                                      std::string artifact_file_identity,
-                                      KvCacheStorage kv_cache, SpeculativeBackend speculative,
-                                      const PagedKVPool& text, const PagedKVPool* backend,
+                                      std::string artifact_file_identity, KvCacheStorage kv_cache,
+                                      SpeculativeBackend speculative, const PagedKVPool& text,
+                                      const PagedKVPool* backend,
                                       const LinearAttentionStatePool* gdn,
                                       const CyclicKVCache* cyclic);
 

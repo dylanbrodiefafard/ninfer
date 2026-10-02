@@ -104,7 +104,7 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     }
     if (t <= 64) {
         dispatch_medium_shape<64, 8, 4, 1>(x, weight, residual_out, stream);
-    } else if (t == 65) {
+    } else if (t == 65) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
         dispatch_medium_shape<80, 8, 2, 1>(x, weight, residual_out, stream);
     } else if (t <= 72) {
         dispatch_medium_shape<72, 8, 3, 1>(x, weight, residual_out, stream);

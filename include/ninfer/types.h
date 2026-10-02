@@ -20,7 +20,7 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency = 6;
+inline constexpr std::uint32_t kMaximumConcurrency      = 6;
 inline constexpr std::size_t kMaxContextCheckpointMarks = 16;
 
 [[nodiscard]] inline std::vector<std::uint32_t>
@@ -104,8 +104,8 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
-[[nodiscard]] constexpr bool context_checkpoint_capture_available(
-    bool allow_prefix_reuse, SpeculativeBackend spec) noexcept {
+[[nodiscard]] constexpr bool
+context_checkpoint_capture_available(bool allow_prefix_reuse, SpeculativeBackend spec) noexcept {
     return allow_prefix_reuse && spec != SpeculativeBackend::None;
 }
 
@@ -140,16 +140,16 @@ struct EngineOptions {
     std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
-    KvDiskCompress kv_disk_compress    = KvDiskCompress::Off;
+    KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.
     std::string model_id;
     std::string weights_id;
     std::string artifact_file_identity;
     // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
     std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
-    KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;
+    KvCacheStorage kv_cache = KvCacheStorage::Nvfp4;
     // Sage3-style FP4-PV compute recipe (SageAttention3): only issuable with KvCacheStorage::Nvfp4.
-    bool sage_attn                     = false;
+    bool sage_attn = false;
     // Prefill tile-skip on exact NVFP4 (not Sage3). 1.0 = dense. Mutually exclusive
     // with xattn_tau < 1. Requires kv_cache == Nvfp4 and sage_attn == false.
     float keep_frac = 1.0f;
@@ -170,7 +170,7 @@ struct EngineOptions {
 inline constexpr std::int32_t kDefaultXattnMinLen = 8192;
 
 inline float parse_unit_interval_flag(const char* raw, const char* flag) {
-    char* end = nullptr;
+    char* end          = nullptr;
     const float parsed = std::strtof(raw, &end);
     if (end == raw || *end != '\0' || !(parsed > 0.0f && parsed <= 1.0f)) {
         throw std::invalid_argument(std::string(flag) + " must be a float in (0, 1]");
@@ -456,7 +456,12 @@ enum class OutputDelivery : std::uint8_t {
 };
 
 enum class RecoveryEventKind : std::uint8_t {
-    CycleExclusion, RetryTriggered, RetryStarted, RetryPrefillComplete, Finished, Exhausted,
+    CycleExclusion,
+    RetryTriggered,
+    RetryStarted,
+    RetryPrefillComplete,
+    Finished,
+    Exhausted,
 };
 
 // Host-only diagnostics, never model output. Delivered by wait() on its caller thread,
@@ -464,18 +469,19 @@ enum class RecoveryEventKind : std::uint8_t {
 struct RecoveryEvent {
     RecoveryEventKind kind = RecoveryEventKind::CycleExclusion;
     std::string cause;
-    std::uint32_t attempts = 0;
-    std::uint32_t cycle_exclusions = 0;
-    std::uint32_t discarded_tool_calls = 0;
+    std::uint32_t attempts                   = 0;
+    std::uint32_t cycle_exclusions           = 0;
+    std::uint32_t discarded_tool_calls       = 0;
     std::uint32_t discarded_reasoning_tokens = 0;
-    std::size_t generated_tokens = 0;
-    std::uint32_t remaining_tokens = 0;
+    std::size_t generated_tokens             = 0;
+    std::uint32_t remaining_tokens           = 0;
 };
 
 class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
+
     virtual void recovery_event(const RecoveryEvent&) {}
 };
 
@@ -502,8 +508,8 @@ struct GenerationTimings {
     // steady-state rate once warm. Degenerates to the overall prefill average when the
     // prefill is shorter than the window. 0 when prefill did not process prompt tokens
     // (fully reused prefix).
-    double prefill_tail_tok_s     = 0.0;
-    double prefill_tail_window_s  = 0.0;
+    double prefill_tail_tok_s    = 0.0;
+    double prefill_tail_window_s = 0.0;
     // Wall from Engine submit until the request leaves the pending FIFO with a lane.
     // A cache-restore fallback that requeues adds the later pending interval and
     // does not include copy-hold.
@@ -544,15 +550,15 @@ enum class PrefixReuseSource : std::uint8_t {
 };
 
 struct GenerationRecoveryStats {
-    std::uint32_t attempts = 0;
+    std::uint32_t attempts             = 0;
     std::uint32_t discarded_tool_calls = 0;
     // Generated reasoning omitted from internal retry context, not retracted
     // from the published response or removed from completion-token usage.
     std::uint32_t discarded_reasoning_tokens = 0;
-    std::uint32_t prefill_samples = 0;
-    std::uint64_t prefill_tokens = 0;
-    double prepare_seconds = 0.0;
-    double prefill_seconds = 0.0;
+    std::uint32_t prefill_samples            = 0;
+    std::uint64_t prefill_tokens             = 0;
+    double prepare_seconds                   = 0.0;
+    double prefill_seconds                   = 0.0;
     // True exclusion count for the request. RecoveryEvent CycleExclusion lines are
     // powers-of-two samples and are not this total.
     std::uint32_t cycle_exclusions = 0;
@@ -560,10 +566,12 @@ struct GenerationRecoveryStats {
 
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message, GenerationRecoveryStats recovery = {})
-        : std::invalid_argument(std::move(message)), kind_(kind), recovery_(std::move(recovery)) {}
+    RequestError(RequestErrorKind kind, const std::string& message,
+                 const GenerationRecoveryStats& recovery = {})
+        : std::invalid_argument(message), kind_(kind), recovery_(recovery) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+
     [[nodiscard]] const GenerationRecoveryStats& recovery() const noexcept { return recovery_; }
 
 private:
@@ -581,10 +589,10 @@ struct GenerationResult {
     // Diagnostic names only when tools were not declared; never executable.
     std::vector<std::string> undeclared_tool_call_names;
     GenerationRecoveryStats recovery;
-    std::uint32_t reasoning_tokens     = 0;
-    FinishReason finish_reason         = FinishReason::None;
-    std::uint32_t reused_prompt_tokens = 0;
-    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    std::uint32_t reasoning_tokens        = 0;
+    FinishReason finish_reason            = FinishReason::None;
+    std::uint32_t reused_prompt_tokens    = 0;
+    PrefixReusePath prefix_reuse_path     = PrefixReusePath::FullReset;
     PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
     // Absolute staged-checkpoint head frontiers this request restored or wrote;
     // 0 if none. restored is the matching ladder or turn-rollback F (the same
@@ -640,11 +648,11 @@ struct MemorySummary {
     std::size_t kv_ram_capacity_bytes             = 0;
     // Live host-RAM residents only (claimed included). Not pinned-arena occupancy;
     // a retired copy may still occupy the pin until its D2H/H2D event is reaped.
-    std::size_t kv_ram_used_bytes                 = 0;
-    std::size_t kv_ram_entry_count                = 0;
-    std::size_t kv_disk_capacity_bytes            = 0;
-    std::size_t kv_disk_used_bytes                = 0;
-    std::size_t kv_disk_entry_count               = 0;
+    std::size_t kv_ram_used_bytes      = 0;
+    std::size_t kv_ram_entry_count     = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::size_t kv_disk_used_bytes     = 0;
+    std::size_t kv_disk_entry_count    = 0;
 };
 
 // Monotonic execution counters plus fieldwise-concurrent live scheduler gauges. A returned value is
@@ -668,19 +676,31 @@ enum class KvDiskDropReason : std::uint8_t {
 inline constexpr std::size_t kKvDiskDropReasonCount =
     static_cast<std::size_t>(KvDiskDropReason::Count);
 
-[[nodiscard]] constexpr std::string_view kv_disk_drop_reason_name(KvDiskDropReason reason) noexcept {
+[[nodiscard]] constexpr std::string_view
+kv_disk_drop_reason_name(KvDiskDropReason reason) noexcept {
     switch (reason) {
-    case KvDiskDropReason::IndexLoad: return "index_load";
-    case KvDiskDropReason::Persist: return "persist";
-    case KvDiskDropReason::NoteAlloc: return "note_alloc";
-    case KvDiskDropReason::SpillNoRoom: return "spill_no_room";
-    case KvDiskDropReason::SpillNoCapacity: return "spill_no_capacity";
-    case KvDiskDropReason::SpillFailed: return "spill_failed";
-    case KvDiskDropReason::ReclaimUnsaved: return "reclaim_unsaved";
-    case KvDiskDropReason::OptionalAlloc: return "optional_alloc";
-    case KvDiskDropReason::PageJob: return "page_job";
-    case KvDiskDropReason::RestoreFailed: return "restore_failed";
-    case KvDiskDropReason::Count: break;
+    case KvDiskDropReason::IndexLoad:
+        return "index_load";
+    case KvDiskDropReason::Persist:
+        return "persist";
+    case KvDiskDropReason::NoteAlloc:
+        return "note_alloc";
+    case KvDiskDropReason::SpillNoRoom:
+        return "spill_no_room";
+    case KvDiskDropReason::SpillNoCapacity:
+        return "spill_no_capacity";
+    case KvDiskDropReason::SpillFailed:
+        return "spill_failed";
+    case KvDiskDropReason::ReclaimUnsaved:
+        return "reclaim_unsaved";
+    case KvDiskDropReason::OptionalAlloc:
+        return "optional_alloc";
+    case KvDiskDropReason::PageJob:
+        return "page_job";
+    case KvDiskDropReason::RestoreFailed:
+        return "restore_failed";
+    case KvDiskDropReason::Count:
+        break;
     }
     return "unknown";
 }
@@ -711,11 +731,11 @@ struct RuntimeStats {
     std::uint64_t kv_disk_evictions     = 0;
     std::uint64_t kv_disk_drops         = 0;
     std::array<std::uint64_t, kKvDiskDropReasonCount> kv_disk_drop_reasons{};
-    double kv_disk_save_seconds         = 0;
-    double kv_disk_load_seconds         = 0;
-    std::size_t kv_disk_capacity_bytes  = 0;
-    std::size_t kv_disk_used_bytes      = 0;
-    std::size_t kv_disk_entry_count     = 0;
+    double kv_disk_save_seconds        = 0;
+    double kv_disk_load_seconds        = 0;
+    std::size_t kv_disk_capacity_bytes = 0;
+    std::size_t kv_disk_used_bytes     = 0;
+    std::size_t kv_disk_entry_count    = 0;
     // Physical page groups in each pool. capacity is the pool size, entitled is
     // the admission reservation, mapped is materialized pages, and free is the
     // unmapped remainder. spec is the MTP/DFlash pool and stays 0 without one.
@@ -760,17 +780,17 @@ struct ScoreOptions {
 inline constexpr double kScoreTerribleNll = 10.0;
 
 struct ScoreResult {
-    ScoreSchedule schedule      = ScoreSchedule::Prefill;
-    std::uint32_t prompt_tokens = 0;
-    std::uint32_t skip_tokens   = 0;
-    std::uint32_t tokens_scored = 0;
-    std::uint32_t non_finite    = 0;
+    ScoreSchedule schedule        = ScoreSchedule::Prefill;
+    std::uint32_t prompt_tokens   = 0;
+    std::uint32_t skip_tokens     = 0;
+    std::uint32_t tokens_scored   = 0;
+    std::uint32_t non_finite      = 0;
     std::uint32_t terrible_tokens = 0;
-    double sum_nll              = 0.0;
-    double mean_nll             = 0.0;
-    double max_nll              = 0.0;
-    double perplexity           = 0.0;
-    double score_seconds        = 0.0;
+    double sum_nll                = 0.0;
+    double mean_nll               = 0.0;
+    double max_nll                = 0.0;
+    double perplexity             = 0.0;
+    double score_seconds          = 0.0;
     std::vector<float> token_nlls;
 };
 

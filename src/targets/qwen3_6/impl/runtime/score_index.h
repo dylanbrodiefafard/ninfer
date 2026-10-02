@@ -43,9 +43,10 @@ namespace ninfer {
 
 // Next-token ids for scored columns in one prefill chunk. Column `position` is scored iff
 // skip <= position && position + 1 < ids.size().
-[[nodiscard]] inline std::vector<std::int32_t>
-prefill_chunk_targets(std::span<const TokenId> ids, std::uint32_t chunk_begin,
-                      std::uint32_t chunk_tokens, std::uint32_t skip) {
+[[nodiscard]] inline std::vector<std::int32_t> prefill_chunk_targets(std::span<const TokenId> ids,
+                                                                     std::uint32_t chunk_begin,
+                                                                     std::uint32_t chunk_tokens,
+                                                                     std::uint32_t skip) {
     const auto n = static_cast<std::uint32_t>(ids.size());
     std::vector<std::int32_t> targets;
     if (chunk_tokens == 0 || chunk_begin >= n) { return targets; }

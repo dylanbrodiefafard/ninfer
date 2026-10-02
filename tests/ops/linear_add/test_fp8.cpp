@@ -150,7 +150,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
                 CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
-                    cudaMemcpyHostToDevice, stream));
+                                           cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaGraphLaunch(executable, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }

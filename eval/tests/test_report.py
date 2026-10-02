@@ -24,9 +24,7 @@ class ReportTest(unittest.TestCase):
             payload = json.loads((root / "summary.json").read_text())
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["results"][0]["counts"]["planned"], 30)
-            self.assertIn(
-                "| aime25 | mock | aime25 |", (root / "summary.md").read_text()
-            )
+            self.assertIn("| aime25 | mock | aime25 |", (root / "summary.md").read_text())
 
 
 if __name__ == "__main__":

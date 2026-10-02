@@ -184,7 +184,7 @@ DeviceBuffer make_batch_configs(DeviceBuffer& counts, int batch, Mode mode, bool
         config.seed                 = 20260716ull + static_cast<unsigned long long>(row);
         config.token_counts         = mode == Mode::Stochastic && counts_active
                                           ? static_cast<std::int32_t*>(counts.p) +
-                                        static_cast<std::size_t>(row) * kTokenDomain
+                                                static_cast<std::size_t>(row) * kTokenDomain
                                           : nullptr;
         configure_suppression(config, suppress_stop);
     }
@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
         const Options options = parse_args(argc, argv);
         const int max_cols    = options.matrix ? 8
                                                : std::max(options.sample ? options.batch : 1,
-                                                       options.mtp ? options.mtp_k + 1 : 1);
+                                                          options.mtp ? options.mtp_k + 1 : 1);
         DeviceBuffer logits   = make_logits(max_cols);
         const int count_rows  = options.matrix ? 8 : (options.sample ? options.batch : 1);
         DeviceBuffer counts(static_cast<std::size_t>(kTokenDomain) * count_rows *
@@ -321,15 +321,13 @@ int main(int argc, char** argv) {
                 run_sample(logits, counts, batch, Mode::Stochastic, true, 20,
                            options.suppress_stop);
             }
-            run_sample(logits, counts, 1, Mode::Stochastic, false, 20,
-                       options.suppress_stop);
+            run_sample(logits, counts, 1, Mode::Stochastic, false, 20, options.suppress_stop);
             run_sample(logits, counts, 1, Mode::PLess, false, 20, options.suppress_stop);
             run_sample(logits, counts, 8, Mode::PLess, false, 20, options.suppress_stop);
             run_mtp(logits, counts, 3, Mode::PLess, false, 20, options.suppress_stop);
             for (int k = 1; k <= 5; ++k) {
                 run_mtp(logits, counts, k, Mode::Greedy, false, 1, options.suppress_stop);
-                run_mtp(logits, counts, k, Mode::Stochastic, true, 20,
-                        options.suppress_stop);
+                run_mtp(logits, counts, k, Mode::Stochastic, true, 20, options.suppress_stop);
             }
         } else {
             if (options.sample) {

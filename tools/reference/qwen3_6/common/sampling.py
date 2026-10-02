@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import torch
 
@@ -117,21 +117,22 @@ class Sampler:
         values, indices = torch.topk(adjusted, candidate_count, sorted=True)
         probabilities = torch.softmax(values / cfg.temperature, dim=0)
         if cfg.top_p < 1.0:
-            support = int(
-                torch.searchsorted(
-                    torch.cumsum(probabilities, dim=0),
-                    torch.tensor(cfg.top_p, device=logits.device),
-                ).item()
-            ) + 1
+            support = (
+                int(
+                    torch.searchsorted(
+                        torch.cumsum(probabilities, dim=0),
+                        torch.tensor(cfg.top_p, device=logits.device),
+                    ).item()
+                )
+                + 1
+            )
             probabilities = probabilities[:support]
             indices = indices[:support]
             probabilities = probabilities / probabilities.sum()
         return TruncatedDistribution(indices, probabilities)
 
     def _uniform(self) -> float:
-        return float(
-            torch.rand((), device=self.counts.device, generator=self.generator).item()
-        )
+        return float(torch.rand((), device=self.counts.device, generator=self.generator).item())
 
     def accept_draft(
         self,

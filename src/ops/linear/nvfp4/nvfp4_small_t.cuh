@@ -51,14 +51,15 @@ load_nvfp4_activation_pack(const __nv_bfloat16* pointer) {
 }
 
 template <class Geometry, int ActiveTokens, class Schedule, class Activation>
-__device__ __forceinline__ void compute_nvfp4_small_t_rows(
-    Activation activation, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales,
-    Nvfp4SmallTSharedStorage<Geometry, ActiveTokens, Schedule>& shared,
-    float inverse_weight_divisor, const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0,
-    int token0, int warp_in_row, int lane,
-    float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kTokenTile]
-                         [Schedule::kAccumulatorChains]) {
+__device__ __forceinline__ void
+compute_nvfp4_small_t_rows(Activation activation, const std::uint8_t* __restrict__ codes,
+                           const std::uint8_t* __restrict__ scales,
+                           Nvfp4SmallTSharedStorage<Geometry, ActiveTokens, Schedule>& shared,
+                           float inverse_weight_divisor,
+                           const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0,
+                           int token0, int warp_in_row, int lane,
+                           float (&accumulators)[Schedule::kRowsPerWarp][Schedule::kTokenTile]
+                                                [Schedule::kAccumulatorChains]) {
     constexpr int kValuesPerWarpPhase = 32 * Schedule::kValuesPerLane;
     constexpr int kValuesPerPhase     = Schedule::kWarpsPerRow * kValuesPerWarpPhase;
     constexpr int kPhases             = Geometry::kInputRows / kValuesPerPhase;
@@ -79,8 +80,8 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                 const int local_pack  = task - local_token * kPacksPerToken;
                 const int token       = token0 + local_token;
                 if (token < ActiveTokens) {
-                    const __nv_bfloat16* source = activation.values(
-                        token, phase * kValuesPerPhase + local_pack * 8);
+                    const __nv_bfloat16* source =
+                        activation.values(token, phase * kValuesPerPhase + local_pack * 8);
                     destination[task] = load_vec<uint4>(source);
                 }
             }
@@ -112,7 +113,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
                     const int value_begin = phase * kValuesPerPhase +
                                             warp_in_row * kValuesPerWarpPhase +
                                             lane * Schedule::kValuesPerLane;
-                    staged[local_token] = load_nvfp4_activation_pack<Schedule::kValuesPerLane>(
+                    staged[local_token]   = load_nvfp4_activation_pack<Schedule::kValuesPerLane>(
                         activation.values(token, value_begin));
                 }
             }
@@ -205,7 +206,7 @@ __device__ __forceinline__ void compute_nvfp4_small_t_rows(
 
 template <class Geometry, int ActiveTokens, class Schedule, class Epilogue, class OutputPolicy,
           Nvfp4SmallTFinalization Finalization = Nvfp4SmallTFinalization::Elementwise,
-          class Activation                    = Nvfp4PackedActivation<Geometry>>
+          class Activation                     = Nvfp4PackedActivation<Geometry>>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_small_t_kernel(
     Activation activation, const std::uint8_t* __restrict__ codes,

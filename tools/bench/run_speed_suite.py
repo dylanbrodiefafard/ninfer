@@ -24,6 +24,7 @@ repo root (auto-detected) unless given as an absolute path.
 
     python3 tools/bench/run_speed_suite.py --label LABEL --runs 2 --warmup 1
 """
+
 from __future__ import annotations
 
 import argparse
@@ -163,7 +164,7 @@ def post_stream(base: str, key: str, body: dict, timeout: float) -> tuple[dict, 
             line = raw.decode("utf-8", errors="replace").strip()
             if not line.startswith("data:"):
                 continue
-            chunk = line[len("data:"):].strip()
+            chunk = line[len("data:") :].strip()
             if chunk == "[DONE]":
                 break
             try:
@@ -183,8 +184,12 @@ def post_stream(base: str, key: str, body: dict, timeout: float) -> tuple[dict, 
                 if (content or reasoning) and ttft_ms is None:
                     ttft_ms = (time.perf_counter() - t0) * 1000.0
     wall = time.perf_counter() - t0
-    return final, {"ttft_ms": ttft_ms, "wall_s": wall, "text": "".join(text_parts),
-                   "reasoning": "".join(reasoning_parts)}
+    return final, {
+        "ttft_ms": ttft_ms,
+        "wall_s": wall,
+        "text": "".join(text_parts),
+        "reasoning": "".join(reasoning_parts),
+    }
 
 
 def num(*values) -> float | None:
@@ -245,13 +250,18 @@ def extract_metrics(resp: dict, extra: dict, streamed: bool) -> dict:
         text = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
         m["finish_reason"] = choice.get("finish_reason")
-    m["output_sha"] = hashlib.sha256(
-        (reasoning + "\x00" + text).encode("utf-8")
-    ).hexdigest()[:16]
+    m["output_sha"] = hashlib.sha256((reasoning + "\x00" + text).encode("utf-8")).hexdigest()[:16]
     return m
 
 
-AGG_METRICS = ("prefill_tok_s", "prefill_tail_tok_s", "decode_tok_s", "verify_rounds_s", "ttft_ms", "wall_s")
+AGG_METRICS = (
+    "prefill_tok_s",
+    "prefill_tail_tok_s",
+    "decode_tok_s",
+    "verify_rounds_s",
+    "ttft_ms",
+    "wall_s",
+)
 
 
 def aggregate(records: list[dict]) -> dict:
@@ -262,7 +272,9 @@ def aggregate(records: list[dict]) -> dict:
         "output_sha": records[-1].get("output_sha"),
         "accept_rate_mean": statistics.fmean(
             r["accept_rate"] for r in records if r.get("accept_rate") is not None
-        ) if any(r.get("accept_rate") is not None for r in records) else None,
+        )
+        if any(r.get("accept_rate") is not None for r in records)
+        else None,
     }
     for name in AGG_METRICS:
         values = [r[name] for r in records if r.get(name) is not None]
@@ -281,19 +293,34 @@ def fmt(x: float | None, digits: int = 1) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", default="http://127.0.0.1:8081")
-    ap.add_argument("--model", default=None, help="served model id (default: first from /v1/models)")
-    ap.add_argument("--api-key", default=None, help="override bearer key (else NINFER_API_KEY/.env)")
-    ap.add_argument("--cases", type=Path, default=ROOT / "tools" / "bench" / "speed_suite_cases.json")
-    ap.add_argument("--suite", default=None,
-                    help="comma list: smoke,small,multiturn,tools,context,decode")
+    ap.add_argument(
+        "--model", default=None, help="served model id (default: first from /v1/models)"
+    )
+    ap.add_argument(
+        "--api-key", default=None, help="override bearer key (else NINFER_API_KEY/.env)"
+    )
+    ap.add_argument(
+        "--cases", type=Path, default=ROOT / "tools" / "bench" / "speed_suite_cases.json"
+    )
+    ap.add_argument(
+        "--suite", default=None, help="comma list: smoke,small,multiturn,tools,context,decode"
+    )
     ap.add_argument("--include-slow", action="store_true")
     ap.add_argument("--runs", type=int, default=2, help="measured trials per case (in-session)")
     ap.add_argument("--warmup", type=int, default=1)
-    ap.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True,
-                    help="stream for client-side TTFT (default on)")
-    ap.add_argument("--cache-bust", action=argparse.BooleanOptionalAction, default=True,
-                    help="inject a per-request nonce so prefix reuse cannot shortcut prefill "
-                         "(default on; --no-cache-bust measures production reuse-on behavior)")
+    ap.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="stream for client-side TTFT (default on)",
+    )
+    ap.add_argument(
+        "--cache-bust",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="inject a per-request nonce so prefix reuse cannot shortcut prefill "
+        "(default on; --no-cache-bust measures production reuse-on behavior)",
+    )
     ap.add_argument("--label", default="")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "profiles" / "bench" / "speed-suite")
     ap.add_argument("--timeout", type=float, default=900.0)
@@ -301,8 +328,10 @@ def main() -> int:
 
     key = load_key(args.api_key)
     if not key:
-        print("missing API key (set NINFER_API_KEY or LLAMA_CPP_LOCAL_API_KEY, "
-              "or pass --api-key)", file=sys.stderr)
+        print(
+            "missing API key (set NINFER_API_KEY or LLAMA_CPP_LOCAL_API_KEY, or pass --api-key)",
+            file=sys.stderr,
+        )
         return 2
     model = args.model
     if not model:
@@ -390,16 +419,40 @@ def main() -> int:
 
     csv_path = args.out_dir / f"speed-suite-{label}.csv"
     fields = [
-        "case", "suite", "desc", "thinking", "max_tokens", "runs",
-        "prompt_tokens", "completion_tokens",
-        "prefill_tok_s_mean", "prefill_tok_s_median", "prefill_tok_s_min",
-        "prefill_tail_tok_s_mean", "prefill_tail_tok_s_median", "prefill_tail_tok_s_min",
-        "prefill_tail_tok_s_max", "prefill_tail_window_s_mean",
-        "ttft_ms_mean", "ttft_ms_median", "ttft_ms_min", "ttft_ms_max",
-        "decode_tok_s_mean", "decode_tok_s_median", "decode_tok_s_min", "decode_tok_s_max",
-        "verify_rounds_s_mean", "verify_rounds_s_median", "verify_rounds_s_min", "verify_rounds_s_max",
-        "wall_s_mean", "wall_s_median", "wall_s_min", "wall_s_max",
-        "accept_rate_mean", "output_sha",
+        "case",
+        "suite",
+        "desc",
+        "thinking",
+        "max_tokens",
+        "runs",
+        "prompt_tokens",
+        "completion_tokens",
+        "prefill_tok_s_mean",
+        "prefill_tok_s_median",
+        "prefill_tok_s_min",
+        "prefill_tail_tok_s_mean",
+        "prefill_tail_tok_s_median",
+        "prefill_tail_tok_s_min",
+        "prefill_tail_tok_s_max",
+        "prefill_tail_window_s_mean",
+        "ttft_ms_mean",
+        "ttft_ms_median",
+        "ttft_ms_min",
+        "ttft_ms_max",
+        "decode_tok_s_mean",
+        "decode_tok_s_median",
+        "decode_tok_s_min",
+        "decode_tok_s_max",
+        "verify_rounds_s_mean",
+        "verify_rounds_s_median",
+        "verify_rounds_s_min",
+        "verify_rounds_s_max",
+        "wall_s_mean",
+        "wall_s_median",
+        "wall_s_min",
+        "wall_s_max",
+        "accept_rate_mean",
+        "output_sha",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -410,32 +463,39 @@ def main() -> int:
             for name in AGG_METRICS:
                 for suffix in ("_mean", "_median", "_min", "_max"):
                     row[f"{name}{suffix}"] = agg.get(f"{name}{suffix}")
-            row.update({
-                "case": record["id"], "suite": record.get("suite"), "desc": record.get("desc"),
-                "thinking": record.get("thinking"), "max_tokens": record.get("max_tokens"),
-                "runs": len(record.get("runs") or []),
-                "prompt_tokens": agg.get("prompt_tokens"),
-                "completion_tokens": agg.get("completion_tokens"),
-                "accept_rate_mean": agg.get("accept_rate_mean"),
-                "output_sha": agg.get("output_sha"),
-            })
+            row.update(
+                {
+                    "case": record["id"],
+                    "suite": record.get("suite"),
+                    "desc": record.get("desc"),
+                    "thinking": record.get("thinking"),
+                    "max_tokens": record.get("max_tokens"),
+                    "runs": len(record.get("runs") or []),
+                    "prompt_tokens": agg.get("prompt_tokens"),
+                    "completion_tokens": agg.get("completion_tokens"),
+                    "accept_rate_mean": agg.get("accept_rate_mean"),
+                    "output_sha": agg.get("output_sha"),
+                }
+            )
             writer.writerow(row)
 
-    print(f"\n{'case':<16} {'suite':<10} {'think':<5} {'prompt':>7} {'gen':>6} "
-          f"{'pre-t/s':>8} {'tail-t/s':>9} {'ttft-ms':>8} {'dec-t/s':>8} {'rounds/s':>8} {'wall-s':>7} {'acc%':>6}")
+    print(
+        f"\n{'case':<16} {'suite':<10} {'think':<5} {'prompt':>7} {'gen':>6} "
+        f"{'pre-t/s':>8} {'tail-t/s':>9} {'ttft-ms':>8} {'dec-t/s':>8} {'rounds/s':>8} {'wall-s':>7} {'acc%':>6}"
+    )
     for record in report["cases"]:
         agg = record.get("aggregate")
         if not agg:
             continue
         acc = agg.get("accept_rate_mean")
         print(
-            f"{record['id']:<16} {str(record.get('suite')):<10} "
+            f"{record['id']:<16} {record.get('suite')!s:<10} "
             f"{'on' if record.get('thinking') else 'off':<5} "
-            f"{str(agg.get('prompt_tokens')):>7} {str(agg.get('completion_tokens')):>6} "
+            f"{agg.get('prompt_tokens')!s:>7} {agg.get('completion_tokens')!s:>6} "
             f"{fmt(agg.get('prefill_tok_s_mean')):>8} {fmt(agg.get('prefill_tail_tok_s_mean')):>9} "
             f"{fmt(agg.get('ttft_ms_mean')):>8} "
             f"{fmt(agg.get('decode_tok_s_mean')):>8} {fmt(agg.get('verify_rounds_s_mean')):>8} {fmt(agg.get('wall_s_mean'), 2):>7} "
-            f"{('' if acc is None else f'{100*acc:.0f}'):>6}"
+            f"{('' if acc is None else f'{100 * acc:.0f}'):>6}"
         )
     print(f"\njson: {json_path}\ncsv:  {csv_path}")
     return 0

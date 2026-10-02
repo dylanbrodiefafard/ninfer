@@ -12,9 +12,7 @@ def create_run_logger(run_dir: Path, debug: bool = False) -> logging.Logger:
     handler = logging.FileHandler(run_dir / "run.log", encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S%z"
-        )
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S%z")
     )
     logger.addHandler(handler)
     return logger

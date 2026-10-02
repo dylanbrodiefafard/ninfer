@@ -75,7 +75,11 @@ __global__ __launch_bounds__(WarpsPerCta * 32) void nvfp4_gdn_conv_post_kernel(
     for (int tile = warp; tile < token_tiles; tile += WarpsPerCta) {
         const int token0        = tile * TokenTile;
         const auto load_history = [&](int token) {
-            if (token < 0) { return shared.initial[token + 3][lane]; }
+            if (token < 0) {
+                // Tiles start at token 0 and read at most three tokens back.
+                __builtin_assume(token >= -3);
+                return shared.initial[token + 3][lane];
+            }
             return __bfloat162float(
                 projected[static_cast<std::int64_t>(token) * kNvfp4GdnChannels + row]);
         };

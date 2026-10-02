@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from ..config import ConfigError, JobConfig
 from ..events import EventSink, RunEvent
@@ -81,23 +81,25 @@ class EvalScopeBackend:
     name = "evalscope"
     _serpapi_lock = threading.Lock()
 
-    _ALLOWED_ARGS = {
-        "subset_list",
-        "dataset_args",
-        "few_shot_num",
-        "shuffle",
-        "judge_strategy",
-        "judge_model_args",
-        "dataset_hub",
-        "dataset_dir",
-        "collect_perf",
-        "ignore_errors",
-        "debug",
-        "is_fc_model",
-        "underscore_to_dot",
-        "serpapi_api_key_env",
-        "allow_network_downloads",
-    }
+    _ALLOWED_ARGS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "subset_list",
+            "dataset_args",
+            "few_shot_num",
+            "shuffle",
+            "judge_strategy",
+            "judge_model_args",
+            "dataset_hub",
+            "dataset_dir",
+            "collect_perf",
+            "ignore_errors",
+            "debug",
+            "is_fc_model",
+            "underscore_to_dot",
+            "serpapi_api_key_env",
+            "allow_network_downloads",
+        }
+    )
 
     def validate(
         self, job: JobConfig, target: ResolvedTarget | None, for_run: bool = False
@@ -119,9 +121,7 @@ class EvalScopeBackend:
             or not subsets
             or not all(isinstance(value, str) for value in subsets)
         ):
-            raise ConfigError(
-                f"EvalScope job {job.id} subset_list must be a non-empty string list"
-            )
+            raise ConfigError(f"EvalScope job {job.id} subset_list must be a non-empty string list")
         if job.dataset == "bfcl_v4":
             self._validate_bfcl(job, for_run)
         if for_run:
@@ -131,9 +131,7 @@ class EvalScopeBackend:
         subsets = set(job.backend_args.get("subset_list") or _DATASET_COUNTS["bfcl_v4"])
         unknown = sorted(subsets - set(_DATASET_COUNTS["bfcl_v4"]))
         if unknown:
-            raise ConfigError(
-                f"BFCL-v4 job {job.id} has unknown subsets: {', '.join(unknown)}"
-            )
+            raise ConfigError(f"BFCL-v4 job {job.id} has unknown subsets: {', '.join(unknown)}")
         if for_run:
             self._require_package("bfcl-eval", "2025.10.27.1")
             self._require_package("soundfile", "0.14.0")
@@ -173,10 +171,8 @@ class EvalScopeBackend:
             per_subset = int(params.get("context_lengths_num_intervals", 10)) * int(
                 params.get("document_depth_percent_intervals", 10)
             )
-            counts = {subset: per_subset for subset in ("english", "chinese")}
-        subsets = tuple(
-            job.backend_args.get("subset_list") or (counts.keys() if counts else ())
-        )
+            counts = dict.fromkeys(("english", "chinese"), per_subset)
+        subsets = tuple(job.backend_args.get("subset_list") or (counts.keys() if counts else ()))
         total = None
         if counts:
             total = 0
@@ -198,9 +194,7 @@ class EvalScopeBackend:
                 requirements.append("SerpAPI key")
             if "memory_vector" in subsets:
                 requirements.append("network access for the BFCL memory-vector model")
-            warnings.append(
-                "BFCL multi-turn samples may issue more than one model request"
-            )
+            warnings.append("BFCL multi-turn samples may issue more than one model request")
         elif job.dataset == "ifbench":
             requirements.append("EvalScope ifbench extra (emoji, nltk>=3.9, syllapy)")
         return WorkPlan(
@@ -304,9 +298,7 @@ class EvalScopeBackend:
             "retry_interval", context.target.config.request.retry_interval_seconds
         )
         if context.target.config.request.headers:
-            generation.setdefault(
-                "extra_headers", context.target.config.request.headers
-            )
+            generation.setdefault("extra_headers", context.target.config.request.headers)
         seed = generation.get("seed", 42)
         task: dict[str, Any] = {
             "model": context.target.config.model,
@@ -389,8 +381,7 @@ class EvalScopeBackend:
         elif context.job.dataset == "bfcl_v4":
             metrics.update(self._bfcl_metrics(report))
             full_subsets = set(
-                context.job.backend_args.get("subset_list")
-                or _DATASET_COUNTS["bfcl_v4"]
+                context.job.backend_args.get("subset_list") or _DATASET_COUNTS["bfcl_v4"]
             )
             is_formal_full = (
                 full_subsets == set(_DATASET_COUNTS["bfcl_v4"])
@@ -418,9 +409,7 @@ class EvalScopeBackend:
             elif isinstance(score, (int, float)):
                 metrics["prompt_level_strict"] = float(score)
         if primary == "accuracy":
-            metrics["accuracy"] = (
-                float(score) if isinstance(score, (int, float)) else 0.0
-            )
+            metrics["accuracy"] = float(score) if isinstance(score, (int, float)) else 0.0
         report_path = self._find_report_file(context.job_dir, context.job.dataset)
         artifacts = [
             str(path.relative_to(context.job_dir.parent.parent))
@@ -429,12 +418,9 @@ class EvalScopeBackend:
         ]
         if (
             report_path
-            and str(report_path.relative_to(context.job_dir.parent.parent))
-            not in artifacts
+            and str(report_path.relative_to(context.job_dir.parent.parent)) not in artifacts
         ):
-            artifacts.append(
-                str(report_path.relative_to(context.job_dir.parent.parent))
-            )
+            artifacts.append(str(report_path.relative_to(context.job_dir.parent.parent)))
         failed = self._prediction_failures(context.job_dir)
         return DatasetResult(
             job_id=context.job.id,
@@ -454,9 +440,7 @@ class EvalScopeBackend:
         )
 
     @staticmethod
-    def _named_metrics(
-        report: dict[str, Any], names: set[str]
-    ) -> dict[str, float]:
+    def _named_metrics(report: dict[str, Any], names: set[str]) -> dict[str, float]:
         values: dict[str, float] = {}
         for metric in report.get("metrics", []):
             name = str(metric.get("name", "")).lower()
@@ -543,17 +527,13 @@ class EvalScopeBackend:
     def _report_dict(self, context: RunContext, raw: Any) -> dict[str, Any]:
         if isinstance(raw, dict):
             candidate = raw.get(context.job.dataset)
-            if isinstance(candidate, dict) and (
-                "score" in candidate or "metrics" in candidate
-            ):
+            if isinstance(candidate, dict) and ("score" in candidate or "metrics" in candidate):
                 return candidate
             if raw.get("dataset_name") == context.job.dataset:
                 return raw
         report_path = self._find_report_file(context.job_dir, context.job.dataset)
         if report_path is None:
-            raise RuntimeError(
-                f"EvalScope did not produce a report for {context.job.dataset}"
-            )
+            raise RuntimeError(f"EvalScope did not produce a report for {context.job.dataset}")
         return json.loads(report_path.read_text(encoding="utf-8"))
 
     @staticmethod
@@ -568,20 +548,14 @@ class EvalScopeBackend:
             for category in metric.get("categories", []):
                 for subset in category.get("subsets", []):
                     name = str(subset.get("name", "")).lower()
-                    if name in _BFCL_AGGREGATES and isinstance(
-                        subset.get("score"), (int, float)
-                    ):
+                    if name in _BFCL_AGGREGATES and isinstance(subset.get("score"), (int, float)):
                         values[name] = float(subset["score"])
         return values
 
     @classmethod
     @contextmanager
     def _bfcl_environment(cls, job: JobConfig):
-        env_name = (
-            job.backend_args.get("serpapi_api_key_env")
-            if job.dataset == "bfcl_v4"
-            else None
-        )
+        env_name = job.backend_args.get("serpapi_api_key_env") if job.dataset == "bfcl_v4" else None
         if not env_name:
             yield
             return

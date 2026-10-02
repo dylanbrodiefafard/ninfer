@@ -52,7 +52,7 @@ __device__ __forceinline__ V load_ldg(const T* ptr) {
 }
 
 template <class T, class V>
-__device__ __forceinline__ void store_vec(T* ptr, V value) {
+__device__ __forceinline__ void store_vec(T* ptr, const V& value) {
     static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
                   sizeof(V) == 16);
     *reinterpret_cast<V*>(ptr) = value;
@@ -69,7 +69,7 @@ __device__ __forceinline__ unsigned long long l2_evict_first_policy() {
 }
 
 __device__ __forceinline__ void cp_async_evict_first_16(void* smem_dst, const void* gmem_src,
-                                                       unsigned long long pol) {
+                                                        unsigned long long pol) {
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
                  :
                  : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(pol));

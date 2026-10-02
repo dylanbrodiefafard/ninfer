@@ -98,9 +98,9 @@ __device__ __forceinline__ void bf16_small_t_compute_rows(
     static_assert((Geometry::kInputRows % kValuesPerPhase) == 0);
     constexpr int kPhases = Geometry::kInputRows / kValuesPerPhase;
     using Pack            = Bf16GemvPack<Schedule::kValuesPerLane>;
-    const int phase0      = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
-                                ? 0
-                                : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
+    const int phase0 = Schedule::kPhaseOrder == Bf16PhaseOrder::Sequential
+                           ? 0
+                           : ((row0 / Schedule::kRowsPerWarp) * Schedule::kPhaseStride) % kPhases;
 
     if constexpr (Schedule::kActivationAccess == Bf16SmallTActivationAccess::WarpPacked) {
 #pragma unroll Schedule::kPhaseUnroll

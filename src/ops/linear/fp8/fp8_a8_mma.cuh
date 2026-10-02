@@ -208,8 +208,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
         __syncthreads();
 
-        auto load_fragments = [&](int k_step, unsigned(&a_fragments)[Schedule::kMmaTokens][4],
-                                  unsigned(&b_fragments)[Schedule::kMmaRows][2]) {
+        auto load_fragments = [&](int k_step, unsigned (&a_fragments)[Schedule::kMmaTokens][4],
+                                  unsigned (&b_fragments)[Schedule::kMmaRows][2]) {
 #pragma unroll
             for (int mma_token = 0; mma_token < Schedule::kMmaTokens; ++mma_token) {
                 const int row = warp_token * Schedule::kWarpTokens + mma_token * 16 + a_row_offset;

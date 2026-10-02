@@ -18,7 +18,8 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
     if (policy == LinearPolicy::A16Only) { return Nvfp4GdnInputRoute::A16; }
     if (policy == LinearPolicy::AllowA4) {
-        return tokens >= kNvfp4FirstW4a4GdnInput ? Nvfp4GdnInputRoute::W4A4 : Nvfp4GdnInputRoute::A16;
+        return tokens >= kNvfp4FirstW4a4GdnInput ? Nvfp4GdnInputRoute::W4A4
+                                                 : Nvfp4GdnInputRoute::A16;
     }
     throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported policy");
 }
@@ -30,7 +31,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     constexpr std::int32_t kZRows   = 6144;
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
         const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
-        auto* input               = static_cast<std::uint8_t*>(x.data) +
+        auto* input = static_cast<std::uint8_t*>(x.data) +
                       static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
         auto* qkv_output =
             static_cast<std::uint8_t*>(qkv.data) +

@@ -77,8 +77,8 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
                           Nvfp4SwiGluRows<Schedule>, true, Cache::cg>
         <<<grid, Schedule::kThreads, 0, stream>>>(
             activation, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
-            Nvfp4IdentityEpilogue{}, output, row_policy);
+            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
+            output, row_policy);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -94,17 +94,18 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 
 } // namespace
 
-void nvfp4_linear_swiglu_a8_project(const Weight& weight, Tensor& out,
-                                  Fp8A8Workspace scratch, cudaStream_t stream) {
+void nvfp4_linear_swiglu_a8_project(const Weight& weight, Tensor& out, Fp8A8Workspace scratch,
+                                    cudaStream_t stream) {
     using Schedule = Nvfp4W4a4MmaSchedule<32, 64, 128, 1, 4, 2, 1>;
     launch_nvfp4_w4a8_mma<Geometry, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
-        Nvfp4SwiGluRows<Schedule>, true>(weight, out.ne[1], scratch, Nvfp4IdentityEpilogue{},
-            Nvfp4SwiGluOutput{static_cast<__nv_bfloat16*>(out.data)}, stream);
+                          Nvfp4SwiGluRows<Schedule>, true>(
+        weight, out.ne[1], scratch, Nvfp4IdentityEpilogue{},
+        Nvfp4SwiGluOutput{static_cast<__nv_bfloat16*>(out.data)}, stream);
 }
 
 void nvfp4_linear_swiglu_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
-                                       WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope = workspace.scope();
+                                     WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
     nvfp4_linear_swiglu_a8_project(weight, out, scratch, stream);
@@ -120,14 +121,14 @@ void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tens
 }
 
 void nvfp4_rmsnorm_linear_swiglu_launch(const Tensor& x, const Tensor& norm_weight, float eps,
-                          const Weight& gate_up, Tensor& out, WorkspaceArena& workspace,
-                          cudaStream_t stream) {
-    auto scope = workspace.scope();
+                                        const Weight& gate_up, Tensor& out,
+                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope         = workspace.scope();
     const auto scratch = detail::allocate_fp8_a8_workspace(workspace, x.ne[1], 5120);
     rmsnorm_cta_bf16x2_kernel<RmsEpilogue::Offset, 512, 8, true>
         <<<x.ne[1], 512, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
-            static_cast<const __nv_bfloat162*>(norm_weight.data), nullptr, nullptr,
-            5120, x.ne[1], eps, scratch.codes, scratch.scales);
+                                      static_cast<const __nv_bfloat162*>(norm_weight.data), nullptr,
+                                      nullptr, 5120, x.ne[1], eps, scratch.codes, scratch.scales);
     CUDA_CHECK(cudaGetLastError());
     detail::nvfp4_linear_swiglu_a8_project(gate_up, out, scratch, stream);
 }

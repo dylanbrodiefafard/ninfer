@@ -42,9 +42,9 @@ unsigned long long host_splitmix64(unsigned long long x) {
 
 float host_sampling_uniform(unsigned long long seed, int position, int purpose, unsigned int sub) {
     unsigned long long key = seed;
-    key                        = host_splitmix64(
-        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
-               0xD1B54A32D192ED03ull));
+    key = host_splitmix64(key ^
+                          (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
+                           0xD1B54A32D192ED03ull));
     key = host_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21) ^
         (static_cast<unsigned long long>(sub) * 0x2545F4914F6CDD1Dull));
@@ -68,12 +68,11 @@ struct VerifyInputsExpected {
 VerifyInputsExpected verify_inputs_oracle(std::int32_t token,
                                           const std::vector<std::int32_t>& drafts,
                                           std::int32_t length) {
-    VerifyInputsExpected expected{
-        .verify_ids = std::vector<std::int32_t>(drafts.size() + 1),
-        .positions  = std::vector<std::int32_t>(drafts.size() + 1),
-    };
-    expected.verify_ids[0] = token;
-    for (std::size_t i = 0; i < drafts.size(); ++i) expected.verify_ids[i + 1] = drafts[i];
+    VerifyInputsExpected expected;
+    expected.verify_ids.reserve(drafts.size() + 1);
+    expected.verify_ids.push_back(token);
+    expected.verify_ids.insert(expected.verify_ids.end(), drafts.begin(), drafts.end());
+    expected.positions.resize(expected.verify_ids.size());
     for (std::size_t i = 0; i < expected.positions.size(); ++i) {
         expected.positions[i] = length + static_cast<std::int32_t>(i);
     }
@@ -135,6 +134,9 @@ struct AcceptExpected {
 AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std::int32_t accepted,
                                    std::int32_t terminal_token, std::int32_t initial_length) {
     const int k = static_cast<int>(drafts.size());
+    if (accepted < 0 || accepted > k) {
+        throw std::invalid_argument("accept oracle accepted count exceeds the draft count");
+    }
     AcceptExpected expected{
         .sampled     = std::vector<std::int32_t>(static_cast<std::size_t>(k + 1), 0),
         .num_sampled = accepted + 1,
@@ -156,7 +158,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                         const std::vector<std::int32_t>& initial_token_counts,
                         const AcceptExpected& expected,
                         const std::vector<std::int32_t>* selector_ids = nullptr,
-                        const std::vector<float>* selector_q = nullptr) {
+                        const std::vector<float>* selector_q          = nullptr) {
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
     DeviceBuffer d_logits    = to_device(logits_bits);
@@ -205,10 +207,10 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::speculative_accept_greedy_drafts(
-        targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
-        sel_ids_arg, sel_q_arg);
+    ops::speculative_accept_greedy_drafts(targets, logits, draft_tensor, extent, length, token,
+                                          sampled, num_sampled, accepted, token_domain,
+                                          static_cast<const ops::SamplingConfig*>(d_config.p),
+                                          workspace, nullptr, sel_ids_arg, sel_q_arg);
     cuda_synchronize();
 
     int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
@@ -283,25 +285,25 @@ int greedy_accept_case(int k, int accepted_count, int token_domain = 64) {
 }
 
 int greedy_tree_extent_case(int extent, int expected_accepted) {
-    constexpr int kWidth        = 4;
-    constexpr int kTokenDomain  = 64;
-    constexpr int kInitialLen   = 40;
+    constexpr int kWidth       = 4;
+    constexpr int kTokenDomain = 64;
+    constexpr int kInitialLen  = 40;
     const std::vector<std::int32_t> parent{-1, 0, 0, 1};
     const std::vector<std::int32_t> verify_ids{7, 10, 11, 12};
     const std::vector<std::int32_t> targets{10, 99, 0, 0};
     std::vector<std::uint16_t> logits(static_cast<std::size_t>(kTokenDomain) * kWidth, 0x3f00u);
     std::vector<std::int32_t> token_counts(kTokenDomain, 0);
 
-    DeviceBuffer d_targets   = to_device(targets);
-    DeviceBuffer d_logits    = to_device(logits);
-    DeviceBuffer d_ids       = to_device(verify_ids);
-    DeviceBuffer d_parent    = to_device(parent);
-    DeviceBuffer d_valid     = to_device<std::int32_t>({kWidth});
-    DeviceBuffer d_extent    = to_device<std::int32_t>({extent});
-    DeviceBuffer d_counts    = to_device(token_counts);
+    DeviceBuffer d_targets = to_device(targets);
+    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_ids     = to_device(verify_ids);
+    DeviceBuffer d_parent  = to_device(parent);
+    DeviceBuffer d_valid   = to_device<std::int32_t>({kWidth});
+    DeviceBuffer d_extent  = to_device<std::int32_t>({extent});
+    DeviceBuffer d_counts  = to_device(token_counts);
     ops::SamplingConfig config{};
-    config.token_counts      = static_cast<std::int32_t*>(d_counts.p);
-    DeviceBuffer d_config    = device_config(config);
+    config.token_counts   = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config = device_config(config);
 
     GuardedDeviceBuffer d_length(sizeof(std::int32_t));
     GuardedDeviceBuffer d_anchors(sizeof(std::int32_t));
@@ -354,15 +356,15 @@ int greedy_tree_extent_case(int extent, int expected_accepted) {
     }
     int failures = verify_exact((label + " accepted").c_str(), read<std::int32_t>(d_accepted, 1),
                                 {expected_accepted});
-    failures += verify_exact((label + " licensed count").c_str(), read<std::int32_t>(d_lic_count, 1),
-                             {expected_accepted + 1});
+    failures += verify_exact((label + " licensed count").c_str(),
+                             read<std::int32_t>(d_lic_count, 1), {expected_accepted + 1});
+    failures += verify_exact((label + " licensed").c_str(), read<std::int32_t>(d_licensed, kWidth),
+                             want_lic);
     failures +=
-        verify_exact((label + " licensed").c_str(), read<std::int32_t>(d_licensed, kWidth), want_lic);
-    failures += verify_exact((label + " path").c_str(), read<std::int32_t>(d_path, kWidth), want_path);
+        verify_exact((label + " path").c_str(), read<std::int32_t>(d_path, kWidth), want_path);
     failures += verify_exact((label + " column").c_str(), read<std::int32_t>(d_column, 1),
                              {expected_accepted});
-    failures +=
-        verify_exact((label + " bonus").c_str(), read<std::int32_t>(d_anchors, 1), {bonus});
+    failures += verify_exact((label + " bonus").c_str(), read<std::int32_t>(d_anchors, 1), {bonus});
     failures += verify_exact((label + " length").c_str(), read<std::int32_t>(d_length, 1),
                              {kInitialLen + expected_accepted + 1});
     return failures;
@@ -370,8 +372,8 @@ int greedy_tree_extent_case(int extent, int expected_accepted) {
 
 std::vector<std::uint16_t> peaked_column_logits(int physical_rows, int width,
                                                 const std::vector<std::int32_t>& peak_by_col) {
-    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(width),
-                              -20.0f);
+    std::vector<float> logits(
+        static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(width), -20.0f);
     for (int col = 0; col < width; ++col) {
         const int tok = peak_by_col[static_cast<std::size_t>(col)];
         if (tok >= 0 && tok < physical_rows) {
@@ -387,19 +389,19 @@ std::vector<std::uint16_t> peaked_column_logits(int physical_rows, int width,
 
 int execute_tree_case(const std::string& label, int token_domain, int physical_rows, int width,
                       const std::vector<std::int32_t>& parent, const std::vector<std::int32_t>& ids,
-                      const std::vector<std::int32_t>& targets, const std::vector<std::uint16_t>& logits,
-                      int extent, int valid, const ops::SamplingConfig& config_in,
+                      const std::vector<std::int32_t>& targets,
+                      const std::vector<std::uint16_t>& logits, int extent, int valid,
+                      const ops::SamplingConfig& config_in,
                       const std::vector<std::int32_t>& initial_counts,
-                      const std::vector<std::int32_t>& want_lic, int want_accepted,
-                      int want_column, const std::vector<std::int32_t>& want_path,
-                      int initial_length = 40) {
-    DeviceBuffer d_targets = to_device(targets);
-    DeviceBuffer d_logits  = to_device(logits);
-    DeviceBuffer d_ids     = to_device(ids);
-    DeviceBuffer d_parent  = to_device(parent);
-    DeviceBuffer d_valid   = to_device<std::int32_t>({valid});
-    DeviceBuffer d_extent  = to_device<std::int32_t>({extent});
-    DeviceBuffer d_counts  = to_device(initial_counts);
+                      const std::vector<std::int32_t>& want_lic, int want_accepted, int want_column,
+                      const std::vector<std::int32_t>& want_path, int initial_length = 40) {
+    DeviceBuffer d_targets     = to_device(targets);
+    DeviceBuffer d_logits      = to_device(logits);
+    DeviceBuffer d_ids         = to_device(ids);
+    DeviceBuffer d_parent      = to_device(parent);
+    DeviceBuffer d_valid       = to_device<std::int32_t>({valid});
+    DeviceBuffer d_extent      = to_device<std::int32_t>({extent});
+    DeviceBuffer d_counts      = to_device(initial_counts);
     ops::SamplingConfig config = config_in;
     config.token_counts        = static_cast<std::int32_t*>(d_counts.p);
     DeviceBuffer d_config      = device_config(config);
@@ -444,13 +446,14 @@ int execute_tree_case(const std::string& label, int token_domain, int physical_r
 
     int failures = verify_exact((label + " accepted").c_str(), read<std::int32_t>(d_accepted, 1),
                                 {want_accepted});
-    failures += verify_exact((label + " licensed count").c_str(), read<std::int32_t>(d_lic_count, 1),
-                             {want_accepted + 1});
+    failures += verify_exact((label + " licensed count").c_str(),
+                             read<std::int32_t>(d_lic_count, 1), {want_accepted + 1});
+    failures += verify_exact((label + " licensed").c_str(), read<std::int32_t>(d_licensed, width),
+                             want_lic);
     failures +=
-        verify_exact((label + " licensed").c_str(), read<std::int32_t>(d_licensed, width), want_lic);
-    failures += verify_exact((label + " path").c_str(), read<std::int32_t>(d_path, width), want_path);
-    failures += verify_exact((label + " column").c_str(), read<std::int32_t>(d_column, 1),
-                             {want_column});
+        verify_exact((label + " path").c_str(), read<std::int32_t>(d_path, width), want_path);
+    failures +=
+        verify_exact((label + " column").c_str(), read<std::int32_t>(d_column, 1), {want_column});
     failures += verify_exact((label + " anchor").c_str(), read<std::int32_t>(d_anchors, 1),
                              {want_lic[static_cast<std::size_t>(want_accepted)]});
     failures += verify_exact((label + " length").c_str(), read<std::int32_t>(d_length, 1),
@@ -461,9 +464,9 @@ int execute_tree_case(const std::string& label, int token_domain, int physical_r
             ++expected_counts[static_cast<std::size_t>(want_lic[static_cast<std::size_t>(i)])];
         }
     }
-    failures += verify_exact((label + " token counts").c_str(),
-                             from_device<std::int32_t>(d_counts, expected_counts.size()),
-                             expected_counts);
+    failures +=
+        verify_exact((label + " token counts").c_str(),
+                     from_device<std::int32_t>(d_counts, expected_counts.size()), expected_counts);
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
@@ -496,10 +499,10 @@ int tree_sampling_membership_cases(int token_domain) {
     cfg.top_k       = 1;
     cfg.seed        = 1ull;
     std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
-    counts[10] = 3;
-    counts[11] = 4;
-    counts[5]  = 9;
-    counts[50] = 1;
+    counts[10]            = 3;
+    counts[11]            = 4;
+    counts[5]             = 9;
+    counts[50]            = 1;
     const std::string tag = " V=" + std::to_string(token_domain);
 
     int failures = 0;
@@ -515,9 +518,9 @@ int tree_sampling_membership_cases(int token_domain) {
         const auto logits = peaked_column_logits(token_domain, kWidth, {11, 0, 50, 0});
         std::vector<std::int32_t> want_lic{11, 50, 0, 0};
         std::vector<std::int32_t> want_path{0, 2, 0, 0};
-        failures += execute_tree_case("tree sampling second child" + tag, token_domain, token_domain,
-                                      kWidth, parent, verify_ids, targets, logits, 7, kWidth, cfg,
-                                      counts, want_lic, 1, 2, want_path);
+        failures += execute_tree_case("tree sampling second child" + tag, token_domain,
+                                      token_domain, kWidth, parent, verify_ids, targets, logits, 7,
+                                      kWidth, cfg, counts, want_lic, 1, 2, want_path);
     }
     {
         const auto logits = peaked_column_logits(token_domain, kWidth, {5, 0, 0, 0});
@@ -528,16 +531,15 @@ int tree_sampling_membership_cases(int token_domain) {
                                       counts, want_lic, 0, 0, want_path);
     }
     {
-        ops::SamplingConfig suppressed_cfg = cfg;
+        ops::SamplingConfig suppressed_cfg    = cfg;
         suppressed_cfg.suppressed_token_count = 1;
         suppressed_cfg.suppressed_tokens[0]   = 11;
         const auto logits = peaked_column_logits(token_domain, kWidth, {11, 0, 0, 0});
         std::vector<std::int32_t> want_lic{0, 0, 0, 0};
         std::vector<std::int32_t> want_path{0, 0, 0, 0};
-        failures += execute_tree_case("tree sampling rejects suppressed draft" + tag,
-                                      token_domain, token_domain, kWidth, parent, verify_ids,
-                                      targets, logits, 7, kWidth, suppressed_cfg, counts, want_lic,
-                                      0, 0, want_path);
+        failures += execute_tree_case("tree sampling rejects suppressed draft" + tag, token_domain,
+                                      token_domain, kWidth, parent, verify_ids, targets, logits, 7,
+                                      kWidth, suppressed_cfg, counts, want_lic, 0, 0, want_path);
     }
     return failures;
 }
@@ -548,7 +550,7 @@ int tree_sampling_presence_overlay_case(int token_domain) {
     const std::vector<std::int32_t> verify_ids{0, 10};
     const std::vector<std::int32_t> targets{0, 0};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * kWidth, -20.0f);
-    logits[10] = 20.0f;
+    logits[10]                                          = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 10] = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 20] = 20.0f;
     round_to_bf16(logits);
@@ -599,11 +601,11 @@ int deterministic_sampling_case() {
     token_counts[static_cast<std::size_t>(correction)] = 7;
 
     ops::SamplingConfig config{};
-    config.temperature = 1.0f;
-    config.top_k       = 1;
-    config.top_p       = 0.9f;
-    config.min_p       = 0.5f;
-    config.seed        = 0x123456789abcdef0ull;
+    config.temperature            = 1.0f;
+    config.top_k                  = 1;
+    config.top_p                  = 0.9f;
+    config.min_p                  = 0.5f;
+    config.seed                   = 0x123456789abcdef0ull;
     config.suppressed_token_count = 1;
     config.suppressed_tokens[0]   = 13;
     return execute_accept_case("speculative sampling deterministic support", targets, logits_bits,
@@ -841,9 +843,9 @@ int p_less_tree_membership_cases(int token_domain) {
                                       counts, want_lic, 1, 2, want_path);
     }
     {
-        ops::SamplingConfig suppressed_cfg        = cfg;
-        suppressed_cfg.suppressed_token_count     = 1;
-        suppressed_cfg.suppressed_tokens[0]       = 11;
+        ops::SamplingConfig suppressed_cfg    = cfg;
+        suppressed_cfg.suppressed_token_count = 1;
+        suppressed_cfg.suppressed_tokens[0]   = 11;
         std::vector<float> logits_f(static_cast<std::size_t>(token_domain) * kWidth, -20.0f);
         logits_f[11] = 20.0f;
         logits_f[5]  = 19.0f;
@@ -864,8 +866,8 @@ int p_less_dflash2_product_tree_multiblock_case() {
     constexpr int token_domain  = 248077;
     constexpr int kWidth        = 12;
     const std::vector<std::int32_t> parent{-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5};
-    const std::vector<std::int32_t> verify_ids{
-        7, 17, 7919, 65537, 131071, 200003, 240001, 29, 3001, 50021, 170003, 230003};
+    const std::vector<std::int32_t> verify_ids{7,      17, 7919, 65537, 131071, 200003,
+                                               240001, 29, 3001, 50021, 170003, 230003};
     constexpr std::int32_t correction = 150001;
 
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * kWidth, -20.0f);
@@ -988,7 +990,8 @@ int p_less_tree_batch_row_isolation_case(int physical_rows, int token_domain, co
 
     GuardedDeviceBuffer d_length(kBatch * sizeof(std::int32_t));
     GuardedDeviceBuffer d_anchors(kBatch * sizeof(std::int32_t));
-    GuardedDeviceBuffer d_licensed(static_cast<std::size_t>(kWidth) * kBatch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_licensed(static_cast<std::size_t>(kWidth) * kBatch *
+                                   sizeof(std::int32_t));
     GuardedDeviceBuffer d_lic_count(kBatch * sizeof(std::int32_t));
     GuardedDeviceBuffer d_accepted(kBatch * sizeof(std::int32_t));
     GuardedDeviceBuffer d_column(kBatch * sizeof(std::int32_t));
@@ -1025,12 +1028,12 @@ int p_less_tree_batch_row_isolation_case(int physical_rows, int token_domain, co
     cuda_synchronize();
 
     std::vector<std::int32_t> want_lic(static_cast<std::size_t>(kWidth) * kBatch, 0);
-    want_lic[0]                                      = peak0[0];
-    want_lic[1]                                      = peak0[1];
-    want_lic[2]                                      = peak0[2];
-    want_lic[static_cast<std::size_t>(kWidth)]       = peak1[0];
-    want_lic[static_cast<std::size_t>(kWidth) + 1]   = peak1[1];
-    want_lic[static_cast<std::size_t>(kWidth) + 2]   = peak1[2];
+    want_lic[0]                                    = peak0[0];
+    want_lic[1]                                    = peak0[1];
+    want_lic[2]                                    = peak0[2];
+    want_lic[static_cast<std::size_t>(kWidth)]     = peak1[0];
+    want_lic[static_cast<std::size_t>(kWidth) + 1] = peak1[1];
+    want_lic[static_cast<std::size_t>(kWidth) + 2] = peak1[2];
     std::vector<std::int32_t> want_path(static_cast<std::size_t>(kWidth) * kBatch, 0);
     want_path[0]                                    = 0;
     want_path[1]                                    = 2;
@@ -1039,9 +1042,9 @@ int p_less_tree_batch_row_isolation_case(int physical_rows, int token_domain, co
     want_path[static_cast<std::size_t>(kWidth) + 1] = 2;
     want_path[static_cast<std::size_t>(kWidth) + 2] = 6;
 
-    int failures = verify_exact((std::string(label) + " licensed").c_str(),
-                                read<std::int32_t>(d_licensed, static_cast<std::size_t>(kWidth) * kBatch),
-                                want_lic);
+    int failures = verify_exact(
+        (std::string(label) + " licensed").c_str(),
+        read<std::int32_t>(d_licensed, static_cast<std::size_t>(kWidth) * kBatch), want_lic);
     failures += verify_exact((std::string(label) + " path").c_str(),
                              read<std::int32_t>(d_path, static_cast<std::size_t>(kWidth) * kBatch),
                              want_path);
@@ -1117,20 +1120,22 @@ int p_less_tree_batch_flat_support_isolation_case(int physical_rows, int token_d
 
     DeviceBuffer d_targets =
         to_device(std::vector<std::int32_t>(static_cast<std::size_t>(kWidth) * kBatch, 0));
-    DeviceBuffer d_logits = to_device(bits);
-    DeviceBuffer d_ids    = to_device(ids_batch);
-    DeviceBuffer d_parent = to_device(parent_batch);
-    DeviceBuffer d_valid  = to_device<std::int32_t>({kWidth, kWidth});
-    DeviceBuffer d_extent = to_device<std::int32_t>({1, 1});
-    DeviceBuffer d_length = to_device<std::int32_t>({40, 80});
+    DeviceBuffer d_logits  = to_device(bits);
+    DeviceBuffer d_ids     = to_device(ids_batch);
+    DeviceBuffer d_parent  = to_device(parent_batch);
+    DeviceBuffer d_valid   = to_device<std::int32_t>({kWidth, kWidth});
+    DeviceBuffer d_extent  = to_device<std::int32_t>({1, 1});
+    DeviceBuffer d_length  = to_device<std::int32_t>({40, 80});
     DeviceBuffer d_anchors = to_device<std::int32_t>({-1, -1});
     DeviceBuffer d_licensed(static_cast<std::size_t>(kWidth) * kBatch * sizeof(std::int32_t));
     DeviceBuffer d_lic_count(kBatch * sizeof(std::int32_t));
     DeviceBuffer d_accepted(kBatch * sizeof(std::int32_t));
     DeviceBuffer d_column(kBatch * sizeof(std::int32_t));
     DeviceBuffer d_path(static_cast<std::size_t>(kWidth) * kBatch * sizeof(std::int32_t));
-    DeviceBuffer d_counts0 = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(token_domain), 0));
-    DeviceBuffer d_counts1 = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(token_domain), 0));
+    DeviceBuffer d_counts0 =
+        to_device(std::vector<std::int32_t>(static_cast<std::size_t>(token_domain), 0));
+    DeviceBuffer d_counts1 =
+        to_device(std::vector<std::int32_t>(static_cast<std::size_t>(token_domain), 0));
 
     Tensor target_t(d_targets.p, DType::I32, {kWidth, kBatch});
     Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, kWidth, kBatch});
@@ -1160,8 +1165,8 @@ int p_less_tree_batch_flat_support_isolation_case(int physical_rows, int token_d
         DeviceBuffer d_configs  = to_device(configs);
         WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
         ops::speculative_accept_tree_drafts(
-            target_t, logits_t, ids_t, parent_t, valid_t, extent_t, length_t, anchors_t,
-            licensed_t, lic_count_t, accepted_t, column_t, path_t, token_domain,
+            target_t, logits_t, ids_t, parent_t, valid_t, extent_t, length_t, anchors_t, licensed_t,
+            lic_count_t, accepted_t, column_t, path_t, token_domain,
             static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
         cuda_synchronize();
         const auto licensed =
@@ -1170,8 +1175,8 @@ int p_less_tree_batch_flat_support_isolation_case(int physical_rows, int token_d
         for (int row = 0; row < kBatch; ++row) {
             const int n = counts[static_cast<std::size_t>(row)];
             if (n < 1 || n > kWidth) {
-                std::cerr << label << " seed=" << seed << " row=" << row
-                          << " licensed_count=" << n << '\n';
+                std::cerr << label << " seed=" << seed << " row=" << row << " licensed_count=" << n
+                          << '\n';
                 ++failures;
                 continue;
             }
@@ -1250,9 +1255,10 @@ int batched_sampling_workspace_stride_case() {
         token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
     cuda_synchronize();
 
-    int failures = verify_exact("speculative sampling B=2 licensed",
-                                from_device<std::int32_t>(d_licensed, columns * batch),
-                                {10, 20, 0, 0, 30, 31, 32, 33});
+    int failures = verify_exact(
+        "speculative sampling B=2 licensed",
+        from_device<std::int32_t>(d_licensed, static_cast<std::size_t>(columns) * batch),
+        {10, 20, 0, 0, 30, 31, 32, 33});
     failures += verify_exact("speculative sampling B=2 counts",
                              from_device<std::int32_t>(d_counts, batch), {2, 4});
     failures += verify_exact("speculative sampling B=2 accepted",
@@ -1270,9 +1276,9 @@ make_chain_selector(const std::vector<std::int32_t>& drafts, float q_draft, int 
     std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k));
     std::vector<float> q(static_cast<std::size_t>(cap) * static_cast<std::size_t>(k), 0.0f);
     for (int i = 0; i < k; ++i) {
-        const std::size_t base                    = static_cast<std::size_t>(cap) * i;
-        ids[base]                                 = drafts[static_cast<std::size_t>(i)];
-        q[base]                                   = q_draft;
+        const std::size_t base = static_cast<std::size_t>(cap) * i;
+        ids[base]              = drafts[static_cast<std::size_t>(i)];
+        q[base]                = q_draft;
         for (int c = 1; c < cap; ++c) {
             ids[base + static_cast<std::size_t>(c)] = 2000 + c + 32 * i;
         }
@@ -1290,10 +1296,9 @@ int greedy_ignores_selector_case() {
         targets[static_cast<std::size_t>(i)] = 3 + 2 * i;
         if (i < k) { drafts[static_cast<std::size_t>(i)] = targets[static_cast<std::size_t>(i)]; }
     }
-    drafts[static_cast<std::size_t>(accepted)] =
-        targets[static_cast<std::size_t>(accepted)] + 1;
-    const std::int32_t initial_length = 200 + k;
-    const auto expected               = accept_state_oracle(
+    drafts[static_cast<std::size_t>(accepted)] = targets[static_cast<std::size_t>(accepted)] + 1;
+    const std::int32_t initial_length          = 200 + k;
+    const auto expected                        = accept_state_oracle(
         drafts, accepted, targets[static_cast<std::size_t>(accepted)], initial_length);
     std::vector<std::uint16_t> logits(static_cast<std::size_t>(token_domain) * (k + 1));
     for (std::size_t i = 0; i < logits.size(); ++i) {
@@ -1338,11 +1343,11 @@ int onehot_selector_matches_null_case() {
     token_counts[static_cast<std::size_t>(correction)] = 7;
 
     ops::SamplingConfig config{};
-    config.temperature = 1.0f;
-    config.top_k       = 1;
-    config.top_p       = 0.9f;
-    config.min_p       = 0.5f;
-    config.seed        = 0x123456789abcdef0ull;
+    config.temperature  = 1.0f;
+    config.top_k        = 1;
+    config.top_p        = 0.9f;
+    config.min_p        = 0.5f;
+    config.seed         = 0x123456789abcdef0ull;
     const auto [ids, q] = make_chain_selector(drafts, 1.0f);
     return execute_accept_case("speculative sampling one-hot selector q", targets, logits_bits,
                                physical_rows, drafts, initial_length, token_domain, config,
@@ -1354,7 +1359,7 @@ int zero_q_rejects_and_corrects_case(int token_domain) {
     const std::vector<std::int32_t> drafts{7};
     const std::vector<std::int32_t> targets{3, 11};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
-    logits[3]                                = 20.0f;
+    logits[3]                                           = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
     round_to_bf16(logits);
     std::vector<std::uint16_t> logits_bits(logits.size());
@@ -1379,7 +1384,7 @@ int fractional_q_accepts_when_p_covers_q() {
     const std::vector<std::int32_t> drafts{7};
     const std::vector<std::int32_t> targets{7, 11};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
-    logits[7]                                          = 20.0f;
+    logits[7]                                           = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
     round_to_bf16(logits);
     std::vector<std::uint16_t> logits_bits(logits.size());
@@ -1403,7 +1408,7 @@ int fractional_q_rejects_when_p_is_zero() {
     const std::vector<std::int32_t> drafts{7};
     const std::vector<std::int32_t> targets{3, 11};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
-    logits[3]                                          = 20.0f;
+    logits[3]                                           = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
     round_to_bf16(logits);
     std::vector<std::uint16_t> logits_bits(logits.size());
@@ -1427,8 +1432,8 @@ int residual_p_minus_q_prefers_uncovered_mass() {
     const std::vector<std::int32_t> drafts{7};
     const std::vector<std::int32_t> targets{3, 11};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * (k + 1), -20.0f);
-    logits[3]  = 20.0f;
-    logits[11] = 20.0f;
+    logits[3]                                           = 20.0f;
+    logits[11]                                          = 20.0f;
     logits[static_cast<std::size_t>(token_domain) + 11] = 20.0f;
     round_to_bf16(logits);
     std::vector<std::uint16_t> logits_bits(logits.size());
@@ -1464,12 +1469,12 @@ int p_less_fractional_q_residual_does_not_reemit_draft(int physical_rows, int to
     const std::vector<std::int32_t> drafts{draft};
     const std::vector<std::int32_t> targets{3, 11};
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
-    logits[draft]                                              = 20.0f;
-    logits[uncovered]                                          = 20.0f;
+    logits[draft]                                               = 20.0f;
+    logits[uncovered]                                           = 20.0f;
     logits[static_cast<std::size_t>(physical_rows) + uncovered] = 20.0f;
     if (physical_rows > token_domain) {
-        logits[token_domain]                                     = 100.0f;
-        logits[physical_rows - 1]                                = 200.0f;
+        logits[token_domain]                                                = 100.0f;
+        logits[physical_rows - 1]                                           = 200.0f;
         logits[static_cast<std::size_t>(physical_rows) + token_domain]      = 100.0f;
         logits[static_cast<std::size_t>(physical_rows) + physical_rows - 1] = 200.0f;
     }
@@ -1484,10 +1489,9 @@ int p_less_fractional_q_residual_does_not_reemit_draft(int physical_rows, int to
     config.temperature = 2.0f;
     config.p_less      = 1;
     // Block verification's hop-1 uniform: h_1 = p_1 = min(p'(draft)/q(draft), 1) = 0.625.
-    config.seed        = seed_with_uniform_in(initial_length + 1,
-                                              ops::kSamplePurposeSpeculativeBlockAccept, 1u, 0.625f,
-                                              1.0f);
-    constexpr int cap  = 16;
+    config.seed = seed_with_uniform_in(initial_length + 1,
+                                       ops::kSamplePurposeSpeculativeBlockAccept, 1u, 0.625f, 1.0f);
+    constexpr int cap = 16;
     std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k, 0);
     std::vector<float> q(static_cast<std::size_t>(cap) * k, 0.0f);
     ids[0] = draft;
@@ -1499,7 +1503,8 @@ int p_less_fractional_q_residual_does_not_reemit_draft(int physical_rows, int to
 }
 
 bool p_less_token_suppressed(const ops::SamplingConfig& config, int token) {
-    const int count = std::min(config.suppressed_token_count, ops::SamplingConfig::kMaximumSuppressedTokens);
+    const int count =
+        std::min(config.suppressed_token_count, ops::SamplingConfig::kMaximumSuppressedTokens);
     for (int i = 0; i < count; ++i) {
         if (config.suppressed_tokens[i] == token) { return true; }
     }
@@ -1508,13 +1513,14 @@ bool p_less_token_suppressed(const ops::SamplingConfig& config, int token) {
 
 std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int physical_rows, int col,
                                        int token_domain, const ops::SamplingConfig& config) {
-    const std::size_t base = static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
-    double max_scaled      = 0.0;
-    bool have_max          = false;
+    const std::size_t base =
+        static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+    double max_scaled = 0.0;
+    bool have_max     = false;
     for (int token = 0; token < token_domain; ++token) {
         if (p_less_token_suppressed(config, token)) { continue; }
-        const double scaled =
-            static_cast<double>(logits[base + static_cast<std::size_t>(token)]) / config.temperature;
+        const double scaled = static_cast<double>(logits[base + static_cast<std::size_t>(token)]) /
+                              config.temperature;
         if (!have_max || scaled > max_scaled) {
             max_scaled = scaled;
             have_max   = true;
@@ -1524,9 +1530,10 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
     double total = 0.0;
     for (int token = 0; token < token_domain; ++token) {
         if (p_less_token_suppressed(config, token)) { continue; }
-        const double w = std::exp(
-            static_cast<double>(logits[base + static_cast<std::size_t>(token)]) / config.temperature -
-            max_scaled);
+        const double w =
+            std::exp(static_cast<double>(logits[base + static_cast<std::size_t>(token)]) /
+                         config.temperature -
+                     max_scaled);
         weights[static_cast<std::size_t>(token)] = w;
         total += w;
     }
@@ -1545,13 +1552,12 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
         if (p >= cut) { support.push_back(token); }
     }
     if (support.empty()) {
-        int argmax = -1;
+        int argmax  = -1;
         double best = 0.0;
         bool have   = false;
         for (int token = 0; token < token_domain; ++token) {
             if (p_less_token_suppressed(config, token)) { continue; }
-            const double x =
-                static_cast<double>(logits[base + static_cast<std::size_t>(token)]);
+            const double x = static_cast<double>(logits[base + static_cast<std::size_t>(token)]);
             if (!have || x > best || (x == best && token < argmax)) {
                 best   = x;
                 argmax = token;
@@ -1561,8 +1567,7 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
         if (argmax >= 0) { support.push_back(argmax); }
     }
     if (config.typical_exclude >= 0) {
-        const auto found =
-            std::find(support.begin(), support.end(), config.typical_exclude);
+        const auto found = std::find(support.begin(), support.end(), config.typical_exclude);
         if (found != support.end()) {
             if (support.size() == 1) {
                 const int mode = support[0];
@@ -1592,20 +1597,21 @@ std::vector<int> p_less_support_oracle(const std::vector<float>& logits, int phy
 // first token's distribution with the independent p-less oracle p' (chi-square over the support,
 // plus zero mass outside it). Holds for any q; greedy drafts are the one-hot special case.
 int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int token_domain,
-                                                        float draft_temperature_tag) {
-    constexpr int active        = 64;  // tokens with live logits; the rest sit far below p-less
-    constexpr int k             = 1;
-    constexpr int cap           = 16;
-    constexpr int trials        = 40000;
+                                                       float draft_temperature_tag) {
+    constexpr int active = 64; // tokens with live logits; the rest sit far below p-less
+    constexpr int k      = 1;
+    constexpr int cap    = 16;
+    constexpr int trials = 40000;
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
     for (int t = 0; t < active; ++t) {
-        const float v = 2.5f * std::sin(0.7f * static_cast<float>(t)) + 0.04f * static_cast<float>(t);
-        logits[static_cast<std::size_t>(t)]                                             = v;
+        const float v =
+            2.5f * std::sin(0.7f * static_cast<float>(t)) + 0.04f * static_cast<float>(t);
+        logits[static_cast<std::size_t>(t)]                                           = v;
         logits[static_cast<std::size_t>(physical_rows) + static_cast<std::size_t>(t)] = v;
     }
     // Padding rows past the public domain must never be sampled.
     for (int t = token_domain; t < physical_rows; ++t) {
-        logits[static_cast<std::size_t>(t)]                                             = 100.0f;
+        logits[static_cast<std::size_t>(t)]                                           = 100.0f;
         logits[static_cast<std::size_t>(physical_rows) + static_cast<std::size_t>(t)] = 100.0f;
     }
     round_to_bf16(logits);
@@ -1615,15 +1621,19 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
     ops::SamplingConfig config{};
     config.temperature = 1.5f;
     config.p_less      = 1;
-    const std::vector<int> support = p_less_support_oracle(logits, physical_rows, 0, token_domain, config);
+    const std::vector<int> support =
+        p_less_support_oracle(logits, physical_rows, 0, token_domain, config);
     std::vector<double> target(token_domain, 0.0);
     {
         double max_scaled = -1e30;
         for (int t = 0; t < token_domain; ++t) {
-            max_scaled = std::max(max_scaled, static_cast<double>(logits[static_cast<std::size_t>(t)]) / 1.5);
+            max_scaled = std::max(max_scaled,
+                                  static_cast<double>(logits[static_cast<std::size_t>(t)]) / 1.5);
         }
         double z = 0.0;
-        for (const int t : support) { z += std::exp(logits[static_cast<std::size_t>(t)] / 1.5 - max_scaled); }
+        for (const int t : support) {
+            z += std::exp(logits[static_cast<std::size_t>(t)] / 1.5 - max_scaled);
+        }
         for (const int t : support) {
             target[static_cast<std::size_t>(t)] =
                 std::exp(logits[static_cast<std::size_t>(t)] / 1.5 - max_scaled) / z;
@@ -1637,8 +1647,10 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
     double qsum = 0.0;
     for (int c = 0; c < cap; ++c) {
         ids[static_cast<std::size_t>(c)] = (c * 5 + 3) % active;
-        const double w = std::exp(logits[static_cast<std::size_t>(ids[static_cast<std::size_t>(c)])] /
-                                  (1.0 + draft_temperature_tag) + 0.3 * std::cos(static_cast<double>(c)));
+        const double w =
+            std::exp(logits[static_cast<std::size_t>(ids[static_cast<std::size_t>(c)])] /
+                         (1.0 + draft_temperature_tag) +
+                     0.3 * std::cos(static_cast<double>(c)));
         q[static_cast<std::size_t>(c)] = static_cast<float>(w);
         qsum += w;
     }
@@ -1671,7 +1683,8 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
     Tensor sel_ids_t(d_sel_ids.p, DType::I32, {cap, k});
     Tensor sel_q_t(d_sel_q.p, DType::FP32, {cap, k});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1)));
+        256,
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1)));
 
     std::mt19937_64 rng(0x5eedULL);
     std::discrete_distribution<int> draw(q.begin(), q.end());
@@ -1681,13 +1694,14 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
         const std::int32_t draft = ids[static_cast<std::size_t>(draw(rng))];
         cuda_check(cudaMemcpy(d_drafts.p, &draft, sizeof(draft), cudaMemcpyHostToDevice), "draft");
         config.seed = 0x9e3779b97f4a7c15ULL * static_cast<unsigned long long>(trial + 1);
-        cuda_check(cudaMemcpy(d_config.p, &config, sizeof(config), cudaMemcpyHostToDevice), "config");
+        cuda_check(cudaMemcpy(d_config.p, &config, sizeof(config), cudaMemcpyHostToDevice),
+                   "config");
         initialize(d_length, std::vector<std::int32_t>{40});
         workspace.reset();
-        ops::speculative_accept_greedy_drafts(
-            targets, logits_t, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-            token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
-            &sel_ids_t, &sel_q_t);
+        ops::speculative_accept_greedy_drafts(targets, logits_t, draft_tensor, extent, length,
+                                              token, sampled, num_sampled, accepted, token_domain,
+                                              static_cast<const ops::SamplingConfig*>(d_config.p),
+                                              workspace, nullptr, &sel_ids_t, &sel_q_t);
         const auto first = read<std::int32_t>(d_sampled, 1);
         const auto acc   = read<std::int32_t>(d_accepted, 1);
         accepted_total += acc[0];
@@ -1698,7 +1712,7 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
         ++observed[static_cast<std::size_t>(first[0])];
     }
     double chi2 = 0.0;
-    int outside  = 0;
+    int outside = 0;
     for (int t = 0; t < token_domain; ++t) {
         const double expected = target[static_cast<std::size_t>(t)] * trials;
         if (expected <= 0.0) {
@@ -1715,23 +1729,24 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
     // sum_d q(d) p'(d) when it treats the draft as a point mass.
     double expected_acceptance = 0.0;
     for (int c = 0; c < cap; ++c) {
-        expected_acceptance += std::min(target[static_cast<std::size_t>(ids[static_cast<std::size_t>(c)])],
-                                        static_cast<double>(q[static_cast<std::size_t>(c)]));
+        expected_acceptance +=
+            std::min(target[static_cast<std::size_t>(ids[static_cast<std::size_t>(c)])],
+                     static_cast<double>(q[static_cast<std::size_t>(c)]));
     }
     const double acceptance = static_cast<double>(accepted_total) / trials;
     const double acceptance_tolerance =
         6.0 * std::sqrt(expected_acceptance * (1.0 - expected_acceptance) / trials) + 1e-3;
-    std::cout << "p-less sampled draft V=" << token_domain << ": support=" << support.size() << " chi2=" << chi2
-              << " (limit " << limit << ") acceptance=" << acceptance << " (expected "
-              << expected_acceptance << ") outside=" << outside << "\n";
+    std::cout << "p-less sampled draft V=" << token_domain << ": support=" << support.size()
+              << " chi2=" << chi2 << " (limit " << limit << ") acceptance=" << acceptance
+              << " (expected " << expected_acceptance << ") outside=" << outside << "\n";
     if (outside == 0 && chi2 < limit &&
         std::abs(acceptance - expected_acceptance) < acceptance_tolerance) {
         return 0;
     }
-    std::cerr << "p-less speculative sampling with a sampled draft changed the target distribution\n";
+    std::cerr
+        << "p-less speculative sampling with a sampled draft changed the target distribution\n";
     return 1;
 }
-
 
 // Block verification exactness over a two-draft chain. Drafts come from two different 16-way q
 // that leave real target mass uncovered. The first two emitted tokens (the second drawn from the
@@ -1741,20 +1756,22 @@ int p_less_sampled_draft_preserves_target_distribution(int physical_rows, int to
 // second starting where the first ended: its accepted length must also match, which fails if a
 // round reuses a uniform the previous round's acceptance conditioned on.
 int p_less_block_verification_case(int physical_rows, int token_domain, bool chained) {
-    constexpr int active = 64;
-    constexpr int k      = 2;
-    constexpr int cap    = 16;
-    constexpr int trials = 60000;
+    constexpr int active        = 64;
+    constexpr int k             = 2;
+    constexpr int cap           = 16;
+    constexpr int trials        = 60000;
     constexpr float temperature = 1.5f;
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
     for (int col = 0; col <= k; ++col) {
         const float shift = chained ? 0.0f : 0.13f * static_cast<float>(col);
         for (int t = 0; t < active; ++t) {
             logits[static_cast<std::size_t>(col) * physical_rows + static_cast<std::size_t>(t)] =
-                2.5f * std::sin((0.7f + shift) * static_cast<float>(t)) + 0.04f * static_cast<float>(t);
+                2.5f * std::sin((0.7f + shift) * static_cast<float>(t)) +
+                0.04f * static_cast<float>(t);
         }
         for (int t = token_domain; t < physical_rows; ++t) {
-            logits[static_cast<std::size_t>(col) * physical_rows + static_cast<std::size_t>(t)] = 100.0f;
+            logits[static_cast<std::size_t>(col) * physical_rows + static_cast<std::size_t>(t)] =
+                100.0f;
         }
     }
     round_to_bf16(logits);
@@ -1774,7 +1791,9 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
             max_scaled = std::max(max_scaled, static_cast<double>(logits[base + t]) / temperature);
         }
         double z = 0.0;
-        for (const int t : support[col]) { z += std::exp(logits[base + t] / temperature - max_scaled); }
+        for (const int t : support[col]) {
+            z += std::exp(logits[base + t] / temperature - max_scaled);
+        }
         for (const int t : support[col]) {
             target[col][static_cast<std::size_t>(t)] =
                 std::exp(logits[base + t] / temperature - max_scaled) / z;
@@ -1787,38 +1806,42 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     for (int h = 0; h < k; ++h) {
         double qsum = 0.0;
         for (int c = 0; c < cap; ++c) {
-            const int token = (c * (5 + 2 * h) + 3 + h) % active;
-            ids[static_cast<std::size_t>(h * cap + c)] = token;
-            const double w = std::exp(logits[static_cast<std::size_t>(h) * physical_rows + token] / 0.8 +
-                                      0.3 * std::cos(static_cast<double>(c + h)));
-            q[static_cast<std::size_t>(h * cap + c)] = static_cast<float>(w);
+            const int token                            = (c * (5 + 2 * h) + 3 + h) % active;
+            ids[static_cast<std::size_t>(h) * cap + c] = token;
+            const double w =
+                std::exp(logits[static_cast<std::size_t>(h) * physical_rows + token] / 0.8 +
+                         0.3 * std::cos(static_cast<double>(c + h)));
+            q[static_cast<std::size_t>(h) * cap + c] = static_cast<float>(w);
             qsum += w;
         }
         for (int c = 0; c < cap; ++c) {
-            q[static_cast<std::size_t>(h * cap + c)] =
-                static_cast<float>(q[static_cast<std::size_t>(h * cap + c)] / qsum);
+            q[static_cast<std::size_t>(h) * cap + c] =
+                static_cast<float>(q[static_cast<std::size_t>(h) * cap + c] / qsum);
         }
     }
     const auto q_at = [&](int h, int token) {
         for (int c = 0; c < cap; ++c) {
-            if (ids[static_cast<std::size_t>(h * cap + c)] == token) {
-                return static_cast<double>(q[static_cast<std::size_t>(h * cap + c)]);
+            if (ids[static_cast<std::size_t>(h) * cap + c] == token) {
+                return static_cast<double>(q[static_cast<std::size_t>(h) * cap + c]);
             }
         }
         return 0.0;
     };
     double uncovered = 1.0;
-    for (int c = 0; c < cap; ++c) { uncovered -= target[1][static_cast<std::size_t>(ids[static_cast<std::size_t>(cap + c)])]; }
+    for (int c = 0; c < cap; ++c) {
+        uncovered -= target[1][static_cast<std::size_t>(ids[static_cast<std::size_t>(cap) + c])];
+    }
 
-    // Independent Algorithm 2 over dense laws: E[tau] = 2 h2 + (1 - h2) h1, E[tau^2] = 4 h2 + (1 - h2) h1.
-    double mean_tau = 0.0;
+    // Independent Algorithm 2 over dense laws: E[tau] = 2 h2 + (1 - h2) h1, E[tau^2] = 4 h2 + (1 -
+    // h2) h1.
+    double mean_tau  = 0.0;
     double mean_tau2 = 0.0;
     for (int c0 = 0; c0 < cap; ++c0) {
         for (int c1 = 0; c1 < cap; ++c1) {
-            const int d0   = ids[static_cast<std::size_t>(c0)];
-            const int d1   = ids[static_cast<std::size_t>(cap + c1)];
-            const double w = static_cast<double>(q[static_cast<std::size_t>(c0)]) *
-                             static_cast<double>(q[static_cast<std::size_t>(cap + c1)]);
+            const int d0    = ids[static_cast<std::size_t>(c0)];
+            const int d1    = ids[static_cast<std::size_t>(cap) + c1];
+            const double w  = static_cast<double>(q[static_cast<std::size_t>(c0)]) *
+                              static_cast<double>(q[static_cast<std::size_t>(cap) + c1]);
             const double p1 = std::min(target[0][static_cast<std::size_t>(d0)] / q_at(0, d0), 1.0);
             double z1       = 0.0;
             for (int x = 0; x < token_domain; ++x) {
@@ -1826,7 +1849,8 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
             }
             const double denom = z1 + 1.0 - p1;
             const double h1    = denom > 0.0 ? z1 / denom : 1.0;
-            const double h2 = std::min(p1 * target[1][static_cast<std::size_t>(d1)] / q_at(1, d1), 1.0);
+            const double h2 =
+                std::min(p1 * target[1][static_cast<std::size_t>(d1)] / q_at(1, d1), 1.0);
             mean_tau += w * (2.0 * h2 + (1.0 - h2) * h1);
             mean_tau2 += w * (4.0 * h2 + (1.0 - h2) * h1);
         }
@@ -1860,7 +1884,8 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     Tensor sel_ids_t(d_sel_ids.p, DType::I32, {cap, k});
     Tensor sel_q_t(d_sel_q.p, DType::FP32, {cap, k});
     WorkspaceArena workspace(std::max<std::size_t>(
-        256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1)));
+        256,
+        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1)));
 
     std::mt19937_64 rng(chained ? 0xc4a1ULL : 0xb10cULL);
     std::discrete_distribution<int> draw0(q.begin(), q.begin() + cap);
@@ -1869,16 +1894,16 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     const auto run_round = [&](std::int32_t start, std::vector<std::int32_t>& out, int& produced,
                                int& acc) {
         const std::vector<std::int32_t> drafts{ids[static_cast<std::size_t>(draw0(rng))],
-                                               ids[static_cast<std::size_t>(cap + draw1(rng))]};
+                                               ids[static_cast<std::size_t>(cap) + draw1(rng)]};
         cuda_check(cudaMemcpy(d_drafts.p, drafts.data(), drafts.size() * sizeof(std::int32_t),
                               cudaMemcpyHostToDevice),
                    "drafts");
         initialize(d_length, std::vector<std::int32_t>{start});
         workspace.reset();
-        ops::speculative_accept_greedy_drafts(
-            targets, logits_t, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-            token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
-            &sel_ids_t, &sel_q_t);
+        ops::speculative_accept_greedy_drafts(targets, logits_t, draft_tensor, extent, length,
+                                              token, sampled, num_sampled, accepted, token_domain,
+                                              static_cast<const ops::SamplingConfig*>(d_config.p),
+                                              workspace, nullptr, &sel_ids_t, &sel_q_t);
         out      = read<std::int32_t>(d_sampled, k + 1);
         produced = read<std::int32_t>(d_num, 1)[0];
         acc      = read<std::int32_t>(d_accepted, 1)[0];
@@ -1887,14 +1912,15 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     const auto top3 = [&](int col) {
         std::vector<int> order = support[col];
         std::sort(order.begin(), order.end(), [&](int a, int b) {
-            return target[col][static_cast<std::size_t>(a)] > target[col][static_cast<std::size_t>(b)];
+            return target[col][static_cast<std::size_t>(a)] >
+                   target[col][static_cast<std::size_t>(b)];
         });
         order.resize(std::min<std::size_t>(3, order.size()));
         return order;
     };
     const std::vector<int> top0 = top3(0);
     const std::vector<int> top1 = top3(1);
-    const auto bucket = [](const std::vector<int>& top, int t) {
+    const auto bucket           = [](const std::vector<int>& top, int t) {
         const auto it = std::find(top.begin(), top.end(), t);
         return it == top.end() ? static_cast<int>(top.size()) : static_cast<int>(it - top.begin());
     };
@@ -1908,7 +1934,8 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
     int outside           = 0;
     for (int trial = 0; trial < trials; ++trial) {
         config.seed = 0x9e3779b97f4a7c15ULL * static_cast<unsigned long long>(trial + 1);
-        cuda_check(cudaMemcpy(d_config.p, &config, sizeof(config), cudaMemcpyHostToDevice), "config");
+        cuda_check(cudaMemcpy(d_config.p, &config, sizeof(config), cudaMemcpyHostToDevice),
+                   "config");
         std::vector<std::int32_t> out;
         int produced = 0;
         int acc      = 0;
@@ -1931,20 +1958,20 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
         outside += target[1][static_cast<std::size_t>(t1)] <= 0.0;
         ++marginal0[static_cast<std::size_t>(t0)];
         ++marginal1[static_cast<std::size_t>(t1)];
-        ++observed[static_cast<std::size_t>(bucket(top0, t0) * b1 + bucket(top1, t1))];
+        ++observed[static_cast<std::size_t>(bucket(top0, t0)) * b1 + bucket(top1, t1)];
     }
     const auto chi2_marginal = [&](const std::vector<std::int64_t>& obs, int col, double& dof) {
         double chi2 = 0.0;
         for (const int t : support[col]) {
             const double expected = target[col][static_cast<std::size_t>(t)] * trials;
-            const double diff     = static_cast<double>(obs[static_cast<std::size_t>(t)]) - expected;
+            const double diff = static_cast<double>(obs[static_cast<std::size_t>(t)]) - expected;
             chi2 += diff * diff / expected;
         }
         dof = std::max(1.0, static_cast<double>(support[col].size()) - 1.0);
         return chi2;
     };
-    double dof0 = 0.0;
-    double dof1 = 0.0;
+    double dof0       = 0.0;
+    double dof1       = 0.0;
     const double chi0 = chi2_marginal(marginal0, 0, dof0);
     const double chi1 = chi2_marginal(marginal1, 1, dof1);
     double chij       = 0.0;
@@ -1961,21 +1988,22 @@ int p_less_block_verification_case(int physical_rows, int token_domain, bool cha
             const double expected = pa * pb * trials;
             if (expected <= 0.0) { continue; }
             const double diff =
-                static_cast<double>(observed[static_cast<std::size_t>(a * b1 + b)]) - expected;
+                static_cast<double>(observed[static_cast<std::size_t>(a) * b1 + b]) - expected;
             chij += diff * diff / expected;
         }
     }
-    const double dofj   = static_cast<double>(b0 * b1 - 1);
-    const auto limit    = [](double dof) { return dof + 6.0 * std::sqrt(2.0 * dof); };
+    const double dofj          = static_cast<double>(b0 * b1 - 1);
+    const auto limit           = [](double dof) { return dof + 6.0 * std::sqrt(2.0 * dof); };
     const double tau_tolerance = 5.0 * sd_tau / std::sqrt(static_cast<double>(trials));
     const double mean_observed = tau_sum / trials;
     const double second_mean   = second_tau_sum / trials;
-    const bool tau_ok = std::abs(mean_observed - mean_tau) < tau_tolerance &&
-                        (!chained || std::abs(second_mean - mean_tau) < tau_tolerance);
+    const bool tau_ok          = std::abs(mean_observed - mean_tau) < tau_tolerance &&
+                                 (!chained || std::abs(second_mean - mean_tau) < tau_tolerance);
     std::cout << "p-less block verification V=" << token_domain << (chained ? " chained" : "")
               << ": chi2 t0=" << chi0 << " (" << limit(dof0) << ") t1=" << chi1 << " ("
-              << limit(dof1) << ") joint=" << chij << " (" << limit(dofj) << ") E[tau]="
-              << mean_observed << (chained ? " / round2 " + std::to_string(second_mean) : "")
+              << limit(dof1) << ") joint=" << chij << " (" << limit(dofj)
+              << ") E[tau]=" << mean_observed
+              << (chained ? " / round2 " + std::to_string(second_mean) : "")
               << " exact=" << mean_tau << " tol=" << tau_tolerance << " uncovered=" << uncovered
               << " outside=" << outside << "\n";
     if (outside == 0 && chi0 < limit(dof0) && chi1 < limit(dof1) && chij < limit(dofj) && tau_ok &&
@@ -1998,28 +2026,29 @@ struct ChainAcceptObserved {
     std::int32_t anchor   = 0;
 };
 
-ChainAcceptObserved run_chain_accept(const std::vector<std::uint16_t>& logits_bits, int physical_rows,
-                                     const std::vector<std::int32_t>& drafts,
+ChainAcceptObserved run_chain_accept(const std::vector<std::uint16_t>& logits_bits,
+                                     int physical_rows, const std::vector<std::int32_t>& drafts,
                                      std::int32_t initial_length, int token_domain,
                                      ops::SamplingConfig config,
                                      const std::vector<std::int32_t>* selector_ids,
                                      const std::vector<float>* selector_q) {
-    const int k            = static_cast<int>(drafts.size());
-    const int cols         = k + 1;
+    const int k    = static_cast<int>(drafts.size());
+    const int cols = k + 1;
     std::vector<std::int32_t> targets(static_cast<std::size_t>(cols), 0);
     DeviceBuffer d_targets = to_device(targets);
     DeviceBuffer d_logits  = to_device(logits_bits);
     DeviceBuffer d_drafts  = to_device(drafts);
     std::vector<std::int32_t> token_counts(static_cast<std::size_t>(token_domain), 0);
-    DeviceBuffer d_counts  = to_device(token_counts);
-    config.token_counts    = static_cast<std::int32_t*>(d_counts.p);
-    DeviceBuffer d_config  = device_config(config);
-    DeviceBuffer d_length  = to_device<std::int32_t>({initial_length});
-    DeviceBuffer d_token   = to_device<std::int32_t>({-1});
-    DeviceBuffer d_sampled = to_device(std::vector<std::int32_t>(static_cast<std::size_t>(cols), 0));
-    DeviceBuffer d_num     = to_device<std::int32_t>({-11});
+    DeviceBuffer d_counts = to_device(token_counts);
+    config.token_counts   = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_config = device_config(config);
+    DeviceBuffer d_length = to_device<std::int32_t>({initial_length});
+    DeviceBuffer d_token  = to_device<std::int32_t>({-1});
+    DeviceBuffer d_sampled =
+        to_device(std::vector<std::int32_t>(static_cast<std::size_t>(cols), 0));
+    DeviceBuffer d_num      = to_device<std::int32_t>({-11});
     DeviceBuffer d_accepted = to_device<std::int32_t>({-13});
-    DeviceBuffer d_extent  = to_device<std::int32_t>({k});
+    DeviceBuffer d_extent   = to_device<std::int32_t>({k});
 
     Tensor target_t(d_targets.p, DType::I32, {cols});
     Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, cols});
@@ -2048,10 +2077,10 @@ ChainAcceptObserved run_chain_accept(const std::vector<std::uint16_t>& logits_bi
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::speculative_accept_greedy_drafts(
-        target_t, logits_t, draft_t, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr,
-        sel_ids_arg, sel_q_arg);
+    ops::speculative_accept_greedy_drafts(target_t, logits_t, draft_t, extent, length, token,
+                                          sampled, num_sampled, accepted, token_domain,
+                                          static_cast<const ops::SamplingConfig*>(d_config.p),
+                                          workspace, nullptr, sel_ids_arg, sel_q_arg);
     cuda_synchronize();
 
     ChainAcceptObserved out;
@@ -2067,7 +2096,7 @@ int check_p_less_chain_invariants(const char* label, const ChainAcceptObserved& 
                                   const std::vector<float>& logits, int physical_rows,
                                   const std::vector<std::int32_t>& drafts, int token_domain,
                                   const ops::SamplingConfig& config, std::int32_t initial_length) {
-    const int k = static_cast<int>(drafts.size());
+    const int k  = static_cast<int>(drafts.size());
     int failures = 0;
     auto fail    = [&](const std::string& msg) {
         std::cerr << label << ": " << msg << '\n';
@@ -2095,8 +2124,7 @@ int check_p_less_chain_invariants(const char* label, const ChainAcceptObserved& 
         }
         ops::SamplingConfig hop_cfg = config;
         if (i > 0) { hop_cfg.typical_exclude = -1; }
-        const auto support =
-            p_less_support_oracle(logits, physical_rows, i, token_domain, hop_cfg);
+        const auto support = p_less_support_oracle(logits, physical_rows, i, token_domain, hop_cfg);
         if (support.empty() || !p_less_support_contains(support, token)) {
             fail("licensed token " + std::to_string(token) + " is outside p-less support at hop " +
                  std::to_string(i));
@@ -2113,7 +2141,7 @@ int check_p_less_chain_invariants(const char* label, const ChainAcceptObserved& 
         }
     }
     if (got.accepted < k) {
-        const int rejected = drafts[static_cast<std::size_t>(got.accepted)];
+        const int rejected          = drafts[static_cast<std::size_t>(got.accepted)];
         ops::SamplingConfig hop_cfg = config;
         if (got.accepted > 0) { hop_cfg.typical_exclude = -1; }
         const auto support =
@@ -2129,10 +2157,11 @@ int check_p_less_chain_invariants(const char* label, const ChainAcceptObserved& 
 
 std::vector<float> peaked_p_less_chain_logits(int physical_rows, int token_domain, int cols,
                                               const std::vector<int>& survivors, float peak) {
-    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(cols),
-                              -20.0f);
+    std::vector<float> logits(
+        static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(cols), -20.0f);
     for (int col = 0; col < cols; ++col) {
-        const std::size_t base = static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+        const std::size_t base =
+            static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
         for (int token : survivors) {
             if (token >= 0 && token < token_domain) {
                 logits[base + static_cast<std::size_t>(token)] = peak;
@@ -2150,10 +2179,11 @@ std::vector<float> peaked_p_less_chain_logits(int physical_rows, int token_domai
 std::vector<float> peaked_p_less_per_column_logits(int physical_rows, int token_domain,
                                                    const std::vector<std::vector<int>>& survivors) {
     const int cols = static_cast<int>(survivors.size());
-    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(cols),
-                              -20.0f);
+    std::vector<float> logits(
+        static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(cols), -20.0f);
     for (int col = 0; col < cols; ++col) {
-        const std::size_t base = static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+        const std::size_t base =
+            static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
         for (int token : survivors[static_cast<std::size_t>(col)]) {
             if (token >= 0 && token < token_domain) {
                 logits[base + static_cast<std::size_t>(token)] = 20.0f;
@@ -2199,7 +2229,8 @@ int p_less_chain_token_invariants_case(int physical_rows, int token_domain, int 
     if (k > 2) { drafts[2] = 19; }
     if (k > 3) { drafts[3] = 7; }
     if (k > 4) { drafts[4] = 11; }
-    auto logits_f = peaked_p_less_chain_logits(physical_rows, token_domain, k + 1, survivors, 20.0f);
+    auto logits_f =
+        peaked_p_less_chain_logits(physical_rows, token_domain, k + 1, survivors, 20.0f);
     std::vector<std::uint16_t> logits_bits(logits_f.size());
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
@@ -2222,9 +2253,9 @@ int p_less_chain_token_invariants_case(int physical_rows, int token_domain, int 
     int failures                          = 0;
     int rejected_hops                     = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
-        config.seed           = seed;
-        const auto got        = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
-                                                 token_domain, config, ids_arg, q_arg);
+        config.seed    = seed;
+        const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
+                                          token_domain, config, ids_arg, q_arg);
         failures += check_p_less_chain_invariants(label, got, logits_f, physical_rows, drafts,
                                                   token_domain, config, initial_length);
         if (got.accepted < k) { ++rejected_hops; }
@@ -2247,14 +2278,13 @@ int p_less_flat_column_c1_accept_case() {
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
     const std::vector<std::int32_t> drafts{draft};
     ops::SamplingConfig config{};
-    config.temperature                = 2.0f;
-    config.p_less                     = 1;
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
     constexpr std::int32_t initial_length = 40;
-    const auto support =
-        p_less_support_oracle(logits_f, physical_rows, 0, token_domain, config);
+    const auto support = p_less_support_oracle(logits_f, physical_rows, 0, token_domain, config);
     if (support != std::vector<int>{0} || p_less_support_contains(support, draft)) {
-        std::cerr << "flat C=1 p-less support was not Dirac on min-argmax; |V*|="
-                  << support.size() << '\n';
+        std::cerr << "flat C=1 p-less support was not Dirac on min-argmax; |V*|=" << support.size()
+                  << '\n';
         return 1;
     }
     int failures = 0;
@@ -2280,14 +2310,15 @@ int p_less_out_of_domain_draft_never_licensed_case(int physical_rows, int token_
     const std::vector<int> survivors{3, 11};
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), token_domain + 16);
     if (token_domain + 16 >= physical_rows) { drafts.assign(static_cast<std::size_t>(k), -1); }
-    auto logits_f = peaked_p_less_chain_logits(physical_rows, token_domain, k + 1, survivors, 20.0f);
+    auto logits_f =
+        peaked_p_less_chain_logits(physical_rows, token_domain, k + 1, survivors, 20.0f);
     std::vector<std::uint16_t> logits_bits(logits_f.size());
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
     ops::SamplingConfig config{};
-    config.temperature = 2.0f;
-    config.p_less      = 1;
-    auto sel           = greedy_selector_q(drafts);
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
+    auto sel                              = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -2316,9 +2347,9 @@ int p_less_two_token_rejection_emits_other_survivor(int physical_rows, int token
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
     ops::SamplingConfig config{};
-    config.temperature = 2.0f;
-    config.p_less      = 1;
-    auto sel           = greedy_selector_q(drafts);
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
+    auto sel                              = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     int rejections                        = 0;
@@ -2351,9 +2382,8 @@ int p_less_typical_exclude_singleton_never_accepts_cycle(int physical_rows, int 
     constexpr int cycle  = 7;
     constexpr int runner = 11;
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), cycle);
-    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) *
-                                    static_cast<std::size_t>(k + 1),
-                                -20.0f);
+    std::vector<float> logits_f(
+        static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(k + 1), -20.0f);
     for (int col = 0; col <= k; ++col) {
         const std::size_t base =
             static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
@@ -2364,10 +2394,10 @@ int p_less_typical_exclude_singleton_never_accepts_cycle(int physical_rows, int 
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
     ops::SamplingConfig config{};
-    config.temperature     = 2.0f;
-    config.p_less          = 1;
-    config.typical_exclude = cycle;
-    auto sel               = greedy_selector_q(drafts);
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
+    config.typical_exclude                = cycle;
+    auto sel                              = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -2375,8 +2405,9 @@ int p_less_typical_exclude_singleton_never_accepts_cycle(int physical_rows, int 
         const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
                                           token_domain, config, &sel.first, &sel.second);
         if (got.accepted != 0) {
-            std::cerr << label << ": hop 0 accepted cyclic draft under typical_exclude seed="
-                      << seed << '\n';
+            std::cerr << label
+                      << ": hop 0 accepted cyclic draft under typical_exclude seed=" << seed
+                      << '\n';
             ++failures;
         }
         if (got.count != 1 || got.licensed[0] != runner) {
@@ -2401,10 +2432,10 @@ int p_less_typical_exclude_multi_never_emits_continuation(int physical_rows, int
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
     ops::SamplingConfig config{};
-    config.temperature     = 2.0f;
-    config.p_less          = 1;
-    config.typical_exclude = cycle;
-    auto sel               = greedy_selector_q(drafts);
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
+    config.typical_exclude                = cycle;
+    auto sel                              = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -2432,11 +2463,10 @@ int p_less_typical_exclude_later_hops_keep_argmax(int physical_rows, int token_d
     constexpr int later  = 20;
     constexpr int runner = 21;
     std::vector<std::int32_t> drafts{hop0_a, 99};
-    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) *
-                                    static_cast<std::size_t>(k + 1),
-                                -20.0f);
+    std::vector<float> logits_f(
+        static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(k + 1), -20.0f);
     {
-        const std::size_t base = 0;
+        const std::size_t base  = 0;
         logits_f[base + hop0_a] = 8.0f;
         logits_f[base + hop0_b] = 8.0f;
     }
@@ -2450,10 +2480,10 @@ int p_less_typical_exclude_later_hops_keep_argmax(int physical_rows, int token_d
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
     ops::SamplingConfig config{};
-    config.temperature     = 2.0f;
-    config.p_less          = 1;
-    config.typical_exclude = later;
-    auto sel               = greedy_selector_q(drafts);
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
+    config.typical_exclude                = later;
+    auto sel                              = greedy_selector_q(drafts);
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     int hop1_seen                         = 0;
@@ -2612,7 +2642,7 @@ int check_p_less_tree_invariants(const char* label, const TreeAcceptObserved& go
                  " is outside p-less support at packed column " + std::to_string(node));
         }
         if (i < got.accepted) {
-            const int child = got.path[static_cast<std::size_t>(i + 1)];
+            const int child = got.path[static_cast<std::size_t>(i) + 1];
             if (verify_ids[static_cast<std::size_t>(child)] != token) {
                 fail("accepted hop does not match the child verify id");
             }
@@ -2630,7 +2660,8 @@ int independent_p_less_sample(const std::vector<std::uint16_t>& packed_logits, i
                               int col, int token_domain, ops::SamplingConfig config,
                               std::int32_t position, std::int32_t purpose) {
     std::vector<std::uint16_t> col_bits(static_cast<std::size_t>(physical_rows));
-    const std::size_t base = static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
+    const std::size_t base =
+        static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
     for (int i = 0; i < physical_rows; ++i) {
         col_bits[static_cast<std::size_t>(i)] = packed_logits[base + static_cast<std::size_t>(i)];
     }
@@ -2638,9 +2669,9 @@ int independent_p_less_sample(const std::vector<std::uint16_t>& packed_logits, i
     DeviceBuffer d_out    = to_device<std::int32_t>({-1});
     DeviceBuffer d_pos    = to_device<std::int32_t>({position});
     std::vector<std::int32_t> counts(static_cast<std::size_t>(token_domain), 0);
-    DeviceBuffer d_counts          = to_device(counts);
-    config.token_counts            = static_cast<std::int32_t*>(d_counts.p);
-    DeviceBuffer d_cfg             = device_config(config);
+    DeviceBuffer d_counts = to_device(counts);
+    config.token_counts   = static_cast<std::int32_t*>(d_counts.p);
+    DeviceBuffer d_cfg    = device_config(config);
     Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, 1});
     Tensor out_t(d_out.p, DType::I32, {1});
     Tensor pos_t(d_pos.p, DType::I32, {1});
@@ -2657,9 +2688,8 @@ int p_less_typical_exclude_tree_hop0_matches_sample(int physical_rows, int token
     constexpr int kWidth = 4;
     const std::vector<std::int32_t> parent{-1, 0, 0, 1};
     const std::vector<std::int32_t> verify_ids{7, 50, 51, 52};
-    std::vector<float> logits_f(static_cast<std::size_t>(physical_rows) *
-                                    static_cast<std::size_t>(kWidth),
-                                -20.0f);
+    std::vector<float> logits_f(
+        static_cast<std::size_t>(physical_rows) * static_cast<std::size_t>(kWidth), -20.0f);
     for (int col = 0; col < kWidth; ++col) {
         const std::size_t base =
             static_cast<std::size_t>(col) * static_cast<std::size_t>(physical_rows);
@@ -2670,9 +2700,9 @@ int p_less_typical_exclude_tree_hop0_matches_sample(int physical_rows, int token
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
 
     ops::SamplingConfig config{};
-    config.temperature     = 2.0f;
-    config.p_less          = 1;
-    config.typical_exclude = 7;
+    config.temperature                    = 2.0f;
+    config.p_less                         = 1;
+    config.typical_exclude                = 7;
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
     for (unsigned long long seed = 1; seed <= seeds; ++seed) {
@@ -2684,9 +2714,9 @@ int p_less_typical_exclude_tree_hop0_matches_sample(int physical_rows, int token
             ++failures;
             continue;
         }
-        const int independent = independent_p_less_sample(
-            logits_bits, physical_rows, 0, token_domain, config, initial_length + 1,
-            ops::kSamplePurposeSpeculativeAccept);
+        const int independent =
+            independent_p_less_sample(logits_bits, physical_rows, 0, token_domain, config,
+                                      initial_length + 1, ops::kSamplePurposeSpeculativeAccept);
         if (got.licensed[0] != independent) {
             std::cerr << label << ": tree correction " << got.licensed[0]
                       << " != independent sample() " << independent << " seed=" << seed << '\n';
@@ -2697,7 +2727,7 @@ int p_less_typical_exclude_tree_hop0_matches_sample(int physical_rows, int token
 }
 
 int p_less_sample_matches_tree_correction_when_no_child(int physical_rows, int token_domain,
-                                                         const char* label) {
+                                                        const char* label) {
     constexpr int kWidth = 4;
     const std::vector<std::int32_t> parent{-1, 0, 0, 1};
     const std::vector<std::int32_t> verify_ids{7, 50, 51, 52};
@@ -2716,18 +2746,18 @@ int p_less_sample_matches_tree_correction_when_no_child(int physical_rows, int t
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 3,
                                          kWidth, initial_length, token_domain, config, nullptr);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 3, kWidth, token_domain, config,
-                                                 initial_length);
+        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth,
+                                                 parent, verify_ids, 3, kWidth, token_domain,
+                                                 config, initial_length);
         if (got.accepted != 0) {
             std::cerr << label << ": accepted a child outside p-less support\n";
             ++failures;
             continue;
         }
 
-        const int independent = independent_p_less_sample(
-            logits_bits, physical_rows, 0, token_domain, config, initial_length + 1,
-            ops::kSamplePurposeSpeculativeAccept);
+        const int independent =
+            independent_p_less_sample(logits_bits, physical_rows, 0, token_domain, config,
+                                      initial_length + 1, ops::kSamplePurposeSpeculativeAccept);
         if (got.licensed[0] != independent) {
             std::cerr << label << ": tree correction " << got.licensed[0]
                       << " != independent sample() " << independent << " seed=" << seed << '\n';
@@ -2759,12 +2789,12 @@ int p_less_tree_hop0_matches_sample_with_live_children(int physical_rows, int to
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 3,
                                          kWidth, initial_length, token_domain, config, nullptr);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 3, kWidth, token_domain, config,
-                                                 initial_length);
-        const int independent = independent_p_less_sample(
-            logits_bits, physical_rows, 0, token_domain, config, initial_length + 1,
-            ops::kSamplePurposeSpeculativeAccept);
+        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth,
+                                                 parent, verify_ids, 3, kWidth, token_domain,
+                                                 config, initial_length);
+        const int independent =
+            independent_p_less_sample(logits_bits, physical_rows, 0, token_domain, config,
+                                      initial_length + 1, ops::kSamplePurposeSpeculativeAccept);
         if (got.licensed[0] != independent) {
             std::cerr << label << ": hop 0 " << got.licensed[0] << " != sample() " << independent
                       << " seed=" << seed << '\n';
@@ -2783,7 +2813,8 @@ int p_less_tree_support_spans_tiles_case(int physical_rows, int token_domain,
                                          unsigned long long seeds, const char* label) {
     constexpr int kWidth = 4;
     const std::vector<std::int32_t> parent{-1, 0, 0, 1};
-    const int high = token_domain > 200000 ? 200003 : (token_domain > 1800 ? 1800 : token_domain - 1);
+    const int high =
+        token_domain > 200000 ? 200003 : (token_domain > 1800 ? 1800 : token_domain - 1);
     const std::vector<int> survivors{7, 600, high};
     const std::vector<std::int32_t> verify_ids{1, 7, 600, high};
     auto logits_f =
@@ -2802,12 +2833,12 @@ int p_less_tree_support_spans_tiles_case(int physical_rows, int token_domain,
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 3,
                                          kWidth, initial_length, token_domain, config, nullptr);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 3, kWidth, token_domain, config,
-                                                 initial_length);
-        const int independent = independent_p_less_sample(
-            logits_bits, physical_rows, 0, token_domain, config, initial_length + 1,
-            ops::kSamplePurposeSpeculativeAccept);
+        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth,
+                                                 parent, verify_ids, 3, kWidth, token_domain,
+                                                 config, initial_length);
+        const int independent =
+            independent_p_less_sample(logits_bits, physical_rows, 0, token_domain, config,
+                                      initial_length + 1, ops::kSamplePurposeSpeculativeAccept);
         if (got.licensed[0] != independent) {
             std::cerr << label << ": hop 0 " << got.licensed[0] << " != sample() " << independent
                       << " seed=" << seed << '\n';
@@ -2848,9 +2879,9 @@ int p_less_tree_valid_columns_hides_later_children(int physical_rows, int token_
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 7,
                                          kValid, initial_length, token_domain, config, nullptr);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 7, kValid, token_domain, config,
-                                                 initial_length);
+        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth,
+                                                 parent, verify_ids, 7, kValid, token_domain,
+                                                 config, initial_length);
         if (got.accepted != 0) {
             std::cerr << label << ": accepted a child at column " << got.path[1]
                       << " outside valid_columns=" << kValid << '\n';
@@ -2873,10 +2904,10 @@ int p_less_tree_column_local_support_case(int physical_rows, int token_domain,
     const std::vector<std::int32_t> parent{-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5};
     const std::vector<std::int32_t> verify_ids{1, 600, 1200, 1800, 50, 51, 52, 53, 54, 55, 56, 57};
     std::vector<std::vector<int>> survivors(kWidth);
-    survivors[0]  = {600, 1200};
-    survivors[1]  = {1800};
-    survivors[2]  = {7};
-    survivors[3]  = {11};
+    survivors[0] = {600, 1200};
+    survivors[1] = {1800};
+    survivors[2] = {7};
+    survivors[3] = {11};
     for (int col = 4; col < kWidth; ++col) { survivors[static_cast<std::size_t>(col)] = {19}; }
     auto logits_f = peaked_p_less_per_column_logits(physical_rows, token_domain, survivors);
     std::vector<std::uint16_t> logits_bits(logits_f.size());
@@ -2892,12 +2923,12 @@ int p_less_tree_column_local_support_case(int physical_rows, int token_domain,
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 7,
                                          kWidth, initial_length, token_domain, config, nullptr);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 7, kWidth, token_domain, config,
-                                                 initial_length);
-        const int hop0 = independent_p_less_sample(
-            logits_bits, physical_rows, 0, token_domain, config, initial_length + 1,
-            ops::kSamplePurposeSpeculativeAccept);
+        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth,
+                                                 parent, verify_ids, 7, kWidth, token_domain,
+                                                 config, initial_length);
+        const int hop0 =
+            independent_p_less_sample(logits_bits, physical_rows, 0, token_domain, config,
+                                      initial_length + 1, ops::kSamplePurposeSpeculativeAccept);
         if (got.licensed[0] != hop0) {
             std::cerr << label << ": hop 0 " << got.licensed[0] << " != sample() " << hop0
                       << " seed=" << seed << '\n';
@@ -2907,13 +2938,14 @@ int p_less_tree_column_local_support_case(int physical_rows, int token_domain,
             ++accepted_first;
             if (got.licensed[0] == 600) {
                 if (got.licensed[1] != 1800) {
-                    std::cerr << label << ": after accepting child 600, hop 1 used another column's "
+                    std::cerr << label
+                              << ": after accepting child 600, hop 1 used another column's "
                               << got.licensed[1] << '\n';
                     ++failures;
                 }
-                const int hop1 = independent_p_less_sample(
-                    logits_bits, physical_rows, 1, token_domain, config, initial_length + 2,
-                    ops::kSamplePurposeSpeculativeAccept);
+                const int hop1 = independent_p_less_sample(logits_bits, physical_rows, 1,
+                                                           token_domain, config, initial_length + 2,
+                                                           ops::kSamplePurposeSpeculativeAccept);
                 if (got.licensed[1] != hop1) {
                     std::cerr << label << ": after 600, hop 1 " << got.licensed[1]
                               << " != sample(col 1) " << hop1 << " seed=" << seed << '\n';
@@ -2922,9 +2954,9 @@ int p_less_tree_column_local_support_case(int physical_rows, int token_domain,
             }
         }
         if (got.licensed[0] < 512 &&
-            !p_less_support_contains(p_less_support_oracle(logits_f, physical_rows, 0, token_domain,
-                                                           config),
-                                     got.licensed[0])) {
+            !p_less_support_contains(
+                p_less_support_oracle(logits_f, physical_rows, 0, token_domain, config),
+                got.licensed[0])) {
             std::cerr << label << ": hop 0 emitted tile-0 token " << got.licensed[0] << '\n';
             ++failures;
         }
@@ -2936,7 +2968,8 @@ int p_less_tree_column_local_support_case(int physical_rows, int token_domain,
     return failures;
 }
 
-int p_less_tree_dirty_workspace_replay_case(int physical_rows, int token_domain, const char* label) {
+int p_less_tree_dirty_workspace_replay_case(int physical_rows, int token_domain,
+                                            const char* label) {
     constexpr int kWidth = 12;
     const std::vector<std::int32_t> parent{-1, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5};
     const std::vector<std::int32_t> verify_ids{1, 7, 11, 19, 7, 11, 19, 7, 11, 19, 7, 11};
@@ -2955,16 +2988,16 @@ int p_less_tree_dirty_workspace_replay_case(int physical_rows, int token_domain,
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
     cuda_check(cudaMemset(workspace.base(), 0xFF, workspace.capacity()), "dirty tree workspace");
 
-    int failures                          = 0;
-    std::int32_t length                   = 40;
+    int failures        = 0;
+    std::int32_t length = 40;
     for (unsigned long long seed = 1; seed <= 8ull; ++seed) {
         config.seed = seed;
         workspace.reset();
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 7,
                                          kWidth, length, token_domain, config, &workspace);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 7, kWidth, token_domain, config,
-                                                 length);
+        failures +=
+            check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
+                                         verify_ids, 7, kWidth, token_domain, config, length);
         length = got.length;
     }
     return failures;
@@ -3012,16 +3045,15 @@ int p_less_chain_column_local_support_case(int physical_rows, int token_domain,
     return failures;
 }
 
-int p_less_tree_later_hops_sample_target(int physical_rows, int token_domain,
-                                                 const char* label) {
+int p_less_tree_later_hops_sample_target(int physical_rows, int token_domain, const char* label) {
     constexpr int kWidth = 4;
     const std::vector<std::int32_t> parent{-1, 0, 1, 1};
     const std::vector<std::int32_t> verify_ids{1, 7, 11, 19};
     std::vector<std::vector<int>> survivors(kWidth);
-    survivors[0] = {7};
-    survivors[1] = {3, 11};
-    survivors[2] = {19};
-    survivors[3] = {19};
+    survivors[0]  = {7};
+    survivors[1]  = {3, 11};
+    survivors[2]  = {19};
+    survivors[3]  = {19};
     auto logits_f = peaked_p_less_per_column_logits(physical_rows, token_domain, survivors);
     std::vector<std::uint16_t> logits_bits(logits_f.size());
     for (std::size_t i = 0; i < logits_f.size(); ++i) { logits_bits[i] = f32_to_bf16(logits_f[i]); }
@@ -3031,17 +3063,17 @@ int p_less_tree_later_hops_sample_target(int physical_rows, int token_domain,
     config.p_less                         = 1;
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
-    int second = 0;
+    int second                            = 0;
     for (unsigned long long seed = 1; seed <= 64ull; ++seed) {
         config.seed    = seed;
         const auto got = run_tree_accept(logits_bits, physical_rows, kWidth, parent, verify_ids, 3,
                                          kWidth, initial_length, token_domain, config, nullptr);
-        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth, parent,
-                                                 verify_ids, 3, kWidth, token_domain, config,
-                                                 initial_length);
+        failures += check_p_less_tree_invariants(label, got, logits_f, physical_rows, kWidth,
+                                                 parent, verify_ids, 3, kWidth, token_domain,
+                                                 config, initial_length);
         if (got.licensed[0] != 7) {
-            std::cerr << label << ": hop 0 " << got.licensed[0] << " != unique child 7 seed="
-                      << seed << '\n';
+            std::cerr << label << ": hop 0 " << got.licensed[0]
+                      << " != unique child 7 seed=" << seed << '\n';
             ++failures;
         }
         second += got.licensed[1] == 11;
@@ -3050,15 +3082,16 @@ int p_less_tree_later_hops_sample_target(int physical_rows, int token_domain,
     // logits have probability 1/2 each. A greedy later hop has zero second draws.
     const auto support = p_less_support_oracle(logits_f, physical_rows, 1, token_domain, config);
     if (support != std::vector<int>{3, 11} || second < 16 || second > 48) {
-        std::cerr << label << ": later-hop distribution differs from equiprobable target: "
-                  << second << "/64 second-token draws\n";
+        std::cerr << label
+                  << ": later-hop distribution differs from equiprobable target: " << second
+                  << "/64 second-token draws\n";
         ++failures;
     }
     return failures;
 }
 
-int p_less_chain_later_hops_sample_target(int physical_rows, int token_domain,
-                                         const char* label, bool bonus = false) {
+int p_less_chain_later_hops_sample_target(int physical_rows, int token_domain, const char* label,
+                                          bool bonus = false) {
     constexpr int k = 5;
     std::vector<std::int32_t> drafts(static_cast<std::size_t>(k), 11);
     drafts[0] = 7;
@@ -3080,27 +3113,28 @@ int p_less_chain_later_hops_sample_target(int physical_rows, int token_domain,
     config.p_less                         = 1;
     constexpr std::int32_t initial_length = 40;
     int failures                          = 0;
-    int second = 0;
+    int second                            = 0;
     for (unsigned long long seed = 1; seed <= 64ull; ++seed) {
         config.seed    = seed;
         const auto got = run_chain_accept(logits_bits, physical_rows, drafts, initial_length,
-                                         token_domain, config, nullptr, nullptr);
+                                          token_domain, config, nullptr, nullptr);
         failures += check_p_less_chain_invariants(label, got, logits_f, physical_rows, drafts,
                                                   token_domain, config, initial_length);
         if (got.licensed[0] != 7) {
-            std::cerr << label << ": hop 0 " << got.licensed[0] << " != unique draft 7 seed="
-                      << seed << '\n';
+            std::cerr << label << ": hop 0 " << got.licensed[0]
+                      << " != unique draft 7 seed=" << seed << '\n';
             ++failures;
         }
         second += got.licensed[sampled_column] == 11;
     }
     // Independent FP64 support oracle plus symmetry: the two equal represented
     // logits have probability 1/2 each. A greedy later hop has zero second draws.
-    const auto support = p_less_support_oracle(logits_f, physical_rows, sampled_column,
-                                              token_domain, config);
+    const auto support =
+        p_less_support_oracle(logits_f, physical_rows, sampled_column, token_domain, config);
     if (support != std::vector<int>{3, 11} || second < 16 || second > 48) {
-        std::cerr << label << ": later-hop distribution differs from equiprobable target: "
-                  << second << "/64 second-token draws\n";
+        std::cerr << label
+                  << ": later-hop distribution differs from equiprobable target: " << second
+                  << "/64 second-token draws\n";
         ++failures;
     }
     return failures;
@@ -3115,9 +3149,9 @@ int batched_selector_row_isolation_case() {
     const std::vector<std::int32_t> drafts{7, 9};
     const std::vector<std::int32_t> targets{7, 11, 3, 11};
     std::vector<float> logits(static_cast<std::size_t>(token_domain) * columns * batch, -20.0f);
-    logits[7]                                                                = 20.0f;
-    logits[static_cast<std::size_t>(token_domain) + 11]                       = 20.0f;
-    logits[static_cast<std::size_t>(columns) * token_domain + 3]              = 20.0f;
+    logits[7]                                                                    = 20.0f;
+    logits[static_cast<std::size_t>(token_domain) + 11]                          = 20.0f;
+    logits[static_cast<std::size_t>(columns) * token_domain + 3]                 = 20.0f;
     logits[static_cast<std::size_t>(columns) * token_domain + token_domain + 11] = 20.0f;
     round_to_bf16(logits);
     std::vector<std::uint16_t> logits_bits(logits.size());
@@ -3125,10 +3159,10 @@ int batched_selector_row_isolation_case() {
 
     std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k * batch, 0);
     std::vector<float> q(static_cast<std::size_t>(cap) * k * batch, 0.0f);
-    ids[0]      = 7;
-    q[0]        = 0.5f;
-    ids[cap]    = 9;
-    q[cap]      = 0.5f;
+    ids[0]   = 7;
+    q[0]     = 0.5f;
+    ids[cap] = 9;
+    q[cap]   = 0.5f;
 
     DeviceBuffer d_targets = to_device(targets);
     DeviceBuffer d_logits  = to_device(logits_bits);
@@ -3166,19 +3200,20 @@ int batched_selector_row_isolation_case() {
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch,
                                                                        batch);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::speculative_accept_greedy_drafts(
-        targets_t, logits_t, draft_t, extents, lengths, anchors, licensed, lic_counts, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr,
-        &sel_ids_t, &sel_q_t);
+    ops::speculative_accept_greedy_drafts(targets_t, logits_t, draft_t, extents, lengths, anchors,
+                                          licensed, lic_counts, accepted, token_domain,
+                                          static_cast<const ops::SamplingConfig*>(d_configs.p),
+                                          workspace, nullptr, &sel_ids_t, &sel_q_t);
     cuda_synchronize();
 
-    int failures = verify_exact("batched selector licensed",
-                                from_device<std::int32_t>(d_licensed, columns * batch),
-                                {7, 11, 3, 0});
+    int failures = verify_exact(
+        "batched selector licensed",
+        from_device<std::int32_t>(d_licensed, static_cast<std::size_t>(columns) * batch),
+        {7, 11, 3, 0});
     failures += verify_exact("batched selector accepted",
                              from_device<std::int32_t>(d_accepted, batch), {1, 0});
-    failures += verify_exact("batched selector counts", from_device<std::int32_t>(d_counts, batch),
-                             {2, 1});
+    failures +=
+        verify_exact("batched selector counts", from_device<std::int32_t>(d_counts, batch), {2, 1});
     failures += verify_exact("batched selector lengths",
                              from_device<std::int32_t>(d_lengths, batch), {42, 81});
     failures += verify_exact("batched selector anchors",
@@ -3246,8 +3281,8 @@ int remap_case(int token_count) {
     cuda_synchronize();
 
     const std::string label = "proposal remap T=" + std::to_string(token_count);
-    int failures            = verify_exact((label + " in-place output").c_str(),
-                                           read<std::int32_t>(d_proposals, proposals.size()), expected);
+    int failures = verify_exact((label + " in-place output").c_str(),
+                                read<std::int32_t>(d_proposals, proposals.size()), expected);
     failures += verify_exact((label + " map unchanged").c_str(),
                              from_device<std::int32_t>(d_map, id_map.size()), id_map);
     failures += d_proposals.verify_guards((label + " guards").c_str());
@@ -3256,44 +3291,46 @@ int remap_case(int token_count) {
 
 int column_eligibility_cases(int domain, int physical) {
     const int stride = (domain + 31) / 32 + 3;
-    std::vector<std::uint32_t> masks(5 * stride, 0);
+    std::vector<std::uint32_t> masks(5 * static_cast<std::size_t>(stride), 0);
     const std::vector<int> allowed{22, 31, 44, 41, 55};
     for (int col = 0; col < 5; ++col) {
-        masks[col * stride + allowed[col] / 32] |= 1u << (allowed[col] % 32);
-        masks[col * stride] |= 1u << 8; // explicitly suppressed despite grammar eligibility
+        const std::size_t mask_base = static_cast<std::size_t>(col) * stride;
+        masks[mask_base + allowed[col] / 32] |= 1u << (allowed[col] % 32);
+        masks[mask_base] |= 1u << 8; // explicitly suppressed despite grammar eligibility
     }
     DeviceBuffer device_masks = to_device(masks);
     std::vector<std::int32_t> counts(domain, 0);
     int failures = 0;
     for (int p_less : {0, 1}) {
         ops::SamplingConfig cfg{};
-        cfg.temperature = 2;
-        cfg.p_less = p_less;
-        cfg.seed = 42;
-        cfg.allowed_token_words = static_cast<const std::uint32_t*>(device_masks.p);
+        cfg.temperature                 = 2;
+        cfg.p_less                      = p_less;
+        cfg.seed                        = 42;
+        cfg.allowed_token_words         = static_cast<const std::uint32_t*>(device_masks.p);
         cfg.allowed_token_column_stride = stride;
-        cfg.suppressed_token_count = 1;
-        cfg.suppressed_tokens[0] = 8;
-        const std::string label = "column eligibility V=" + std::to_string(domain) +
-                                  " p_less=" + std::to_string(p_less);
+        cfg.suppressed_token_count      = 1;
+        cfg.suppressed_tokens[0]        = 8;
+        const std::string label =
+            "column eligibility V=" + std::to_string(domain) + " p_less=" + std::to_string(p_less);
         // The independent expected law is a singleton after intersecting eligibility
         // and explicit suppression. A much larger forbidden logit must have no mass.
         const auto chain_logits = peaked_column_logits(physical, 3, {0, 0, 0});
         const std::vector<std::int32_t> drafts{22, 31};
-        failures += execute_accept_case(label + " chain", {0, 0, 0}, chain_logits,
-            physical, drafts, 40, domain, cfg, counts, accept_state_oracle(drafts, 2, 44, 40));
+        failures +=
+            execute_accept_case(label + " chain", {0, 0, 0}, chain_logits, physical, drafts, 40,
+                                domain, cfg, counts, accept_state_oracle(drafts, 2, 44, 40));
         const std::vector<std::int32_t> invalid_drafts{22, 8};
-        failures += execute_accept_case(label + " correction", {0, 0, 0}, chain_logits,
-            physical, invalid_drafts, 40, domain, cfg, counts,
-            accept_state_oracle(invalid_drafts, 1, 31, 40));
+        failures += execute_accept_case(label + " correction", {0, 0, 0}, chain_logits, physical,
+                                        invalid_drafts, 40, domain, cfg, counts,
+                                        accept_state_oracle(invalid_drafts, 1, 31, 40));
         // Traversal 0 -> 2 -> 4: selecting a mask by depth instead of node is wrong.
-        failures += execute_tree_case(label + " tree", domain, physical, 5,
-            {-1, 0, 0, 1, 2}, {7, 11, 22, 33, 44}, {0, 0, 0, 0, 0},
-            peaked_column_logits(physical, 5, {0, 0, 0, 0, 0}), 4, 5, cfg, counts,
-            {22, 44, 55, 0, 0}, 2, 4, {0, 2, 4, 0, 0});
+        failures += execute_tree_case(label + " tree", domain, physical, 5, {-1, 0, 0, 1, 2},
+                                      {7, 11, 22, 33, 44}, {0, 0, 0, 0, 0},
+                                      peaked_column_logits(physical, 5, {0, 0, 0, 0, 0}), 4, 5, cfg,
+                                      counts, {22, 44, 55, 0, 0}, 2, 4, {0, 2, 4, 0, 0});
     }
     failures += verify_exact("eligibility masks unchanged",
-        from_device<std::uint32_t>(device_masks, masks.size()), masks);
+                             from_device<std::uint32_t>(device_masks, masks.size()), masks);
     return failures;
 }
 
@@ -3319,11 +3356,11 @@ int main() {
         std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
         ++failures;
     }
-    try {
-        (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
-        std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
+        },
+        "speculative accept workspace accepted an invalid draft interval");
     const std::size_t tree12 =
         ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 1);
     if (tree12 == 0 || tree12 != ops::sampling_workspace_capacity_bytes(257, 12, 12) ||
@@ -3333,11 +3370,11 @@ int main() {
         std::cerr << "speculative tree accept workspace did not close over packed width\n";
         ++failures;
     }
-    try {
-        (void)ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
-        std::cerr << "speculative tree accept workspace accepted W<2\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
+        },
+        "speculative tree accept workspace accepted W<2");
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
@@ -3364,10 +3401,10 @@ int main() {
     failures += p_less_tree_membership_cases(64);
     failures += p_less_tree_membership_cases(257);
     failures += p_less_dflash2_product_tree_multiblock_case();
-    failures += p_less_tree_batch_row_isolation_case(
-        257, 257, "p-less tree B=2 row isolation V=257");
-    failures += p_less_tree_batch_row_isolation_case(
-        248320, 248077, "DFlash2 p-less tree B=2 row isolation");
+    failures +=
+        p_less_tree_batch_row_isolation_case(257, 257, "p-less tree B=2 row isolation V=257");
+    failures += p_less_tree_batch_row_isolation_case(248320, 248077,
+                                                     "DFlash2 p-less tree B=2 row isolation");
     failures += p_less_tree_batch_flat_support_isolation_case(
         257, 257, 48ull, "p-less tree B=2 flat-support isolation V=257");
     failures += p_less_tree_batch_flat_support_isolation_case(
@@ -3403,8 +3440,7 @@ int main() {
     failures += p_less_chain_token_invariants_case(
         64, 64, 5, false, 32ull, "p-less adaptive-DFlash k=5 one-hot q token invariants V=64");
     failures += p_less_chain_token_invariants_case(
-        248320, 248077, 5, true, 8ull,
-        "DFlash2 p-less adaptive k=5 selector q token invariants");
+        248320, 248077, 5, true, 8ull, "DFlash2 p-less adaptive k=5 selector q token invariants");
     failures += p_less_out_of_domain_draft_never_licensed_case(
         64, 64, 16ull, "p-less out-of-domain draft is never licensed V=64");
     failures += p_less_out_of_domain_draft_never_licensed_case(

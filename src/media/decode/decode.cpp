@@ -130,7 +130,7 @@ public:
         }
     }
 
-    ~AvImageBuffer() { av_freep(data_.data()); }
+    ~AvImageBuffer() { av_freep(static_cast<void*>(data_.data())); }
 
     AvImageBuffer(const AvImageBuffer&)            = delete;
     AvImageBuffer& operator=(const AvImageBuffer&) = delete;
@@ -186,9 +186,8 @@ public:
             int rc               = avformat_open_input(&raw, nullptr, nullptr, nullptr);
             format_              = raw;
             if (rc < 0) { throw std::invalid_argument("failed to open media: " + av_error(rc)); }
-            if ((rc = avformat_find_stream_info(format_, nullptr)) < 0) {
-                throw std::invalid_argument("failed to inspect media: " + av_error(rc));
-            }
+            rc = avformat_find_stream_info(format_, nullptr);
+            if (rc < 0) { throw std::invalid_argument("failed to inspect media: " + av_error(rc)); }
             stream_index_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
             if (stream_index_ < 0) {
                 throw std::invalid_argument("media has no decodable video stream");
@@ -198,8 +197,9 @@ public:
             if (codec == nullptr) { throw std::invalid_argument("media codec is not supported"); }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
-            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
-                (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
+            rc = avcodec_parameters_to_context(codec_, stream_->codecpar);
+            if (rc >= 0) { rc = avcodec_open2(codec_, codec, nullptr); }
+            if (rc < 0) {
                 throw std::invalid_argument("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
@@ -283,8 +283,8 @@ public:
         out.height = height;
         const AVPixFmtDescriptor* descriptor =
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-        const bool alpha = composite_alpha && descriptor != nullptr &&
-                           (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool alpha                       = composite_alpha && descriptor != nullptr &&
+                                                 (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
         const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
         sws_ = sws_getCachedContext(sws_, width, height, static_cast<AVPixelFormat>(frame->format),
@@ -473,7 +473,7 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     Decoder probe(bytes, policy.max_decoded_pixels);
     const double fps      = fps_of(probe.stream());
     int total             = probe.stream()->nb_frames > 0 &&
-                        probe.stream()->nb_frames <= std::numeric_limits<int>::max()
+                                    probe.stream()->nb_frames <= std::numeric_limits<int>::max()
                                 ? static_cast<int>(probe.stream()->nb_frames)
                                 : 0;
     const double duration = probe.duration_seconds();

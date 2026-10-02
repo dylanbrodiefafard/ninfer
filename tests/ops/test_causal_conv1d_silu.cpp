@@ -201,7 +201,7 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
 
     const std::string tag = "causal_conv1d_silu C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " " + call_name(call);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " final state",
@@ -222,11 +222,11 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
 }
 
 int split_case(std::int32_t T, std::uint32_t seed) {
-    constexpr std::int32_t C  = 10240;
-    constexpr std::int32_t Cq = 2048;
-    constexpr std::int32_t Ck = 2048;
-    constexpr std::int32_t Cv = 6144;
-    const LogicalInput input   = make_input(C, T, seed);
+    constexpr std::int32_t C       = 10240;
+    constexpr std::int32_t Cq      = 2048;
+    constexpr std::int32_t Ck      = 2048;
+    constexpr std::int32_t Cv      = 6144;
+    const LogicalInput input       = make_input(C, T, seed);
     const std::vector<float> state = make_state(C, seed + 2U);
     const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
 
@@ -237,8 +237,7 @@ int split_case(std::int32_t T, std::uint32_t seed) {
         const auto* source = oracle.output.data() + static_cast<std::size_t>(t) * C;
         std::copy_n(source, Cq, expected_q.data() + static_cast<std::size_t>(t) * Cq);
         std::copy_n(source + Cq, Ck, expected_k.data() + static_cast<std::size_t>(t) * Ck);
-        std::copy_n(source + Cq + Ck, Cv,
-                    expected_v.data() + static_cast<std::size_t>(t) * Cv);
+        std::copy_n(source + Cq + Ck, Cv, expected_v.data() + static_cast<std::size_t>(t) * Cv);
     }
 
     const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
@@ -269,12 +268,12 @@ int split_case(std::int32_t T, std::uint32_t seed) {
 
     const std::string tag = "causal_conv1d_silu split T=" + std::to_string(T);
     int failures          = 0;
-    failures += verify_output(tag + " query",
-                              from_device_bf16(query.data(), expected_q.size()), expected_q);
-    failures += verify_output(tag + " key", from_device_bf16(key.data(), expected_k.size()),
-                              expected_k);
-    failures += verify_output(tag + " value",
-                              from_device_bf16(value.data(), expected_v.size()), expected_v);
+    failures += verify_output(tag + " query", from_device_bf16(query.data(), expected_q.size()),
+                              expected_q);
+    failures +=
+        verify_output(tag + " key", from_device_bf16(key.data(), expected_k.size()), expected_k);
+    failures += verify_output(tag + " value", from_device_bf16(value.data(), expected_v.size()),
+                              expected_v);
     failures += verify_bits(tag + " final state", conv_state.data(), final_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
     failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
@@ -336,7 +335,7 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
 
     const std::string tag = "causal_conv1d_silu continuation C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " read_slot=" + std::to_string(read_slot);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -405,7 +404,7 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
                             " T=" + std::to_string(T) + " slots=" + std::to_string(slots) +
                             " initial_slot=" + std::to_string(initial_slot) +
                             " snapshot_base_slot=" + std::to_string(snapshot_base_slot);
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
@@ -503,7 +502,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +
                             " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
                             (masked ? " masked" : " dense");
-    int failures = 0;
+    int failures          = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);

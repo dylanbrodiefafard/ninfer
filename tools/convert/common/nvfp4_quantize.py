@@ -8,7 +8,7 @@ the matrix, one nonnegative finite E4M3FN scale per K=16 group, and E2M1 codes.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -27,7 +27,9 @@ def _quantize_e2m1_codes(values: torch.Tensor) -> torch.Tensor:
     abs_values = values.abs()
     index = (abs_values.unsqueeze(-1) - magnitudes).abs().argmin(dim=-1).to(torch.uint8)
     codes = index.clone()
-    codes = torch.where(values < 0, codes | torch.tensor(0x08, dtype=torch.uint8, device=values.device), codes)
+    codes = torch.where(
+        values < 0, codes | torch.tensor(0x08, dtype=torch.uint8, device=values.device), codes
+    )
     return codes
 
 
@@ -70,7 +72,9 @@ def quantize_nvfp4_matrix(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return packed, scale_words.cpu().reshape(rows, columns // _GROUP), divisor.detach().cpu()
 
 
-def decode_nvfp4_logical(packed: torch.Tensor, scales: torch.Tensor, divisor: torch.Tensor) -> torch.Tensor:
+def decode_nvfp4_logical(
+    packed: torch.Tensor, scales: torch.Tensor, divisor: torch.Tensor
+) -> torch.Tensor:
     """Host decode of ``e2m1 * e4m3 / d_w`` matching A16 Linear / codebook gather."""
 
     rows, packed_k = int(packed.shape[0]), int(packed.shape[1])

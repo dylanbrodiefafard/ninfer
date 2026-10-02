@@ -51,6 +51,7 @@ Runtime and Op references:
 - [DFlash2 chain verify speed and historical tree A/Bs](maintainer/dflash2-tree-speed.md)
 - [ReplaySSM GDN technical reference](maintainer/replayssm-gdn.md)
 - [Linear benchmark contract and registered suites](maintainer/linear-benchmark.md)
+- [Code-quality gates: warnings, clang-tidy, formatters, linters, sanitizers](maintainer/code-quality.md)
 - [Upstream (Neroued/ninfer) sync log and review watermark](maintainer/upstream-sync.md)
 
 Artifact and model references:

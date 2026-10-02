@@ -117,7 +117,7 @@ class ModelState:
             for _ in range(CFG.gdn_layers)
         ]
 
-    def snapshot(self) -> "StateSnapshot":
+    def snapshot(self) -> StateSnapshot:
         return StateSnapshot(
             position=self.position,
             rope_delta=self.rope_delta,
@@ -128,7 +128,7 @@ class ModelState:
             ssm=[tensor.clone() for tensor in self.ssm],
         )
 
-    def restore(self, snapshot: "StateSnapshot") -> None:
+    def restore(self, snapshot: StateSnapshot) -> None:
         if snapshot.position < 0 or snapshot.position > self.capacity:
             raise ValueError("snapshot position is outside state capacity")
         self.position = snapshot.position

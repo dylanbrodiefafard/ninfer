@@ -295,9 +295,7 @@ Options parse_options(int argc, char** argv) {
 
 std::int32_t align_context(std::int32_t visible) { return ((visible + 127) / 128) * 128; }
 
-std::int32_t cache_code_width(DType dtype) {
-    return dtype == DType::U8 ? kNvfp4CodeW : kHeadDim;
-}
+std::int32_t cache_code_width(DType dtype) { return dtype == DType::U8 ? kNvfp4CodeW : kHeadDim; }
 
 std::int32_t cache_quant_group(DType dtype) {
     if (dtype == DType::I8) { return kKvGroup; }
@@ -310,12 +308,11 @@ DType cache_scale_dtype(DType dtype) {
 }
 
 std::size_t cache_plane_bytes(const Geometry& geometry, DType dtype, std::int32_t physical_pages) {
-    return static_cast<std::size_t>(cache_code_width(dtype)) * geometry.kv_heads * kPagedKVPageSize *
-           physical_pages * dtype_size(dtype);
+    return static_cast<std::size_t>(cache_code_width(dtype)) * geometry.kv_heads *
+           kPagedKVPageSize * physical_pages * dtype_size(dtype);
 }
 
-std::size_t scale_plane_bytes(const Geometry& geometry, DType dtype,
-                              std::int32_t physical_pages) {
+std::size_t scale_plane_bytes(const Geometry& geometry, DType dtype, std::int32_t physical_pages) {
     return static_cast<std::size_t>(kHeadDim / cache_quant_group(dtype)) * geometry.kv_heads *
            kPagedKVPageSize * physical_pages * dtype_size(cache_scale_dtype(dtype));
 }
@@ -418,14 +415,12 @@ public:
           table_rows_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
           cache_k_(bench::make_zeros(cache_plane_bytes(geometry, dtype, physical_pages_))),
           cache_v_(bench::make_zeros(cache_plane_bytes(geometry, dtype, physical_pages_))),
-          cache_k_scale_(bench::make_zeros(
-              dtype == DType::I8 || dtype == DType::U8
-                  ? scale_plane_bytes(geometry, dtype, physical_pages_)
-                  : std::size_t{1})),
-          cache_v_scale_(bench::make_zeros(
-              dtype == DType::I8 || dtype == DType::U8
-                  ? scale_plane_bytes(geometry, dtype, physical_pages_)
-                  : std::size_t{1})),
+          cache_k_scale_(bench::make_zeros(dtype == DType::I8 || dtype == DType::U8
+                                               ? scale_plane_bytes(geometry, dtype, physical_pages_)
+                                               : std::size_t{1})),
+          cache_v_scale_(bench::make_zeros(dtype == DType::I8 || dtype == DType::U8
+                                               ? scale_plane_bytes(geometry, dtype, physical_pages_)
+                                               : std::size_t{1})),
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
@@ -551,12 +546,12 @@ std::string profile_name(std::span<const std::int32_t> values) {
 }
 
 double cache_vector_bytes(DType dtype) {
-    if (dtype == DType::BF16) {
-        return static_cast<double>(kHeadDim * dtype_size(DType::BF16));
-    }
+    if (dtype == DType::BF16) { return static_cast<double>(kHeadDim * dtype_size(DType::BF16)); }
+    const std::int32_t quant_group = cache_quant_group(dtype);
+    if (quant_group == 0) { throw std::invalid_argument("cache dtype has no quantization group"); }
+    const auto scale_groups = static_cast<std::size_t>(kHeadDim / quant_group);
     return static_cast<double>(cache_code_width(dtype) * dtype_size(dtype) +
-                               (kHeadDim / cache_quant_group(dtype)) *
-                                   dtype_size(cache_scale_dtype(dtype)));
+                               scale_groups * dtype_size(cache_scale_dtype(dtype)));
 }
 
 double causal_key_sum(std::int32_t tokens, std::int32_t context) {
@@ -581,7 +576,7 @@ double logical_bytes(Entry entry, const Geometry& geometry, DType dtype,
     const double valid_tokens = static_cast<double>(valid_token_count);
     const double q_and_output = 2.0 * kHeadDim * geometry.query_heads * valid_tokens * 2.0;
     const double cache_reads  = causal_key_sum(contexts, valid_columns) * geometry.kv_heads * 2.0 *
-                               cache_vector_bytes(dtype);
+                                cache_vector_bytes(dtype);
     if (entry == Entry::Cached) { return q_and_output + cache_reads; }
     const double input_kv     = 2.0 * kHeadDim * geometry.kv_heads * valid_tokens * 2.0;
     const double cache_writes = 2.0 * geometry.kv_heads * valid_tokens * cache_vector_bytes(dtype);

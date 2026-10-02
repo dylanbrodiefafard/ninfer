@@ -64,7 +64,7 @@ ninfer::test::artifact_fixture::TemporaryArtifact write_fixture() {
 }
 
 ninfer::test::artifact_fixture::TemporaryArtifact write_parallel_fixture() {
-    using Json = ninfer::test::artifact_fixture::Json;
+    using Json   = ninfer::test::artifact_fixture::Json;
     Json objects = Json::array();
     for (std::uint64_t i = 0; i < 9; ++i) {
         objects.push_back({
@@ -188,15 +188,13 @@ int main() {
         ninfer::artifact::Binder mapped_binder(reader);
         mapped_binder.retain_on_host(mapped_binder.require_resource(
             "frontend/test.json", ninfer::artifact::ResourceEncoding::RawBytesV1));
-        const auto mapped =
-            mapped_binder.require_tensor("weights/test", ninfer::artifact::NumericFormat::BF16,
-                                         ninfer::artifact::StorageLayout::ContiguousLeV1,
-                                         tensor_shape);
+        const auto mapped = mapped_binder.require_tensor(
+            "weights/test", ninfer::artifact::NumericFormat::BF16,
+            ninfer::artifact::StorageLayout::ContiguousLeV1, tensor_shape);
         mapped_binder.materialize_on_mapped_host(mapped);
-        const auto mapped_device =
-            mapped_binder.require_tensor("weights/second", ninfer::artifact::NumericFormat::BF16,
-                                         ninfer::artifact::StorageLayout::ContiguousLeV1,
-                                         second_shape);
+        const auto mapped_device = mapped_binder.require_tensor(
+            "weights/second", ninfer::artifact::NumericFormat::BF16,
+            ninfer::artifact::StorageLayout::ContiguousLeV1, second_shape);
         mapped_binder.materialize_on_device(mapped_device);
         const auto mapped_plan = mapped_binder.finish();
         require(mapped_plan.device_capacity_bytes == kSecondTensor.size() &&
@@ -206,15 +204,16 @@ int main() {
         auto mapped_materialized = ninfer::artifact::materialize(reader, mapped_plan, device);
         cudaPointerAttributes attributes{};
         CUDA_CHECK(cudaPointerGetAttributes(&attributes, mapped_materialized.device_data(mapped)));
-        require(attributes.type == cudaMemoryTypeHost && attributes.devicePointer ==
-                                                             mapped_materialized.device_data(mapped),
+        require(attributes.type == cudaMemoryTypeHost &&
+                    attributes.devicePointer == mapped_materialized.device_data(mapped),
                 "mapped host tensor is not pinned at its unified device address");
         std::array<std::byte, kTensor.size()> mapped_copied{};
         CUDA_CHECK(cudaMemcpy(mapped_copied.data(), mapped_materialized.device_data(mapped),
                               mapped_copied.size(), cudaMemcpyDefault));
         require(mapped_copied == kTensor, "mapped host tensor payload differs from the artifact");
         const auto& mapped_stats = mapped_materialized.stats();
-        require(mapped_stats.tensor_count == 2 && mapped_stats.mapped_host_bytes == kTensor.size() &&
+        require(mapped_stats.tensor_count == 2 &&
+                    mapped_stats.mapped_host_bytes == kTensor.size() &&
                     mapped_stats.h2d_bytes == kSecondTensor.size(),
                 "mapped host materialization statistics are incomplete");
 
@@ -225,8 +224,7 @@ int main() {
         constexpr std::array<std::uint64_t, 1> parallel_shape = {1};
         for (std::size_t i = 0; i < 9; ++i) {
             const auto handle = parallel_binder.require_tensor(
-                "weights/parallel-" + std::to_string(i),
-                ninfer::artifact::NumericFormat::BF16,
+                "weights/parallel-" + std::to_string(i), ninfer::artifact::NumericFormat::BF16,
                 ninfer::artifact::StorageLayout::ContiguousLeV1, parallel_shape);
             parallel_binder.materialize_on_device(handle);
             parallel_handles.push_back(handle);

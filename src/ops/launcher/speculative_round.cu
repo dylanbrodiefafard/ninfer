@@ -57,11 +57,10 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
                                              const SamplingConfig* configs, DeviceSpan workspace,
                                              cudaStream_t stream, const Tensor* selector_ids,
                                              const Tensor* selector_q) {
-    const std::int32_t physical_rows     = logits.ne[0];
-    const std::int32_t cols              = drafts.ne[0] + 1;
-    const std::int32_t batch             = drafts.ne[1];
-    const std::int32_t selector_k =
-        selector_ids != nullptr ? selector_ids->ne[0] : 0;
+    const std::int32_t physical_rows = logits.ne[0];
+    const std::int32_t cols          = drafts.ne[0] + 1;
+    const std::int32_t batch         = drafts.ne[1];
+    const std::int32_t selector_k    = selector_ids != nullptr ? selector_ids->ne[0] : 0;
     const std::int32_t* selector_id_ptr =
         selector_ids != nullptr ? static_cast<const std::int32_t*>(selector_ids->data) : nullptr;
     const float* selector_q_ptr =
@@ -145,18 +144,15 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
-                                           const Tensor& verify_ids, const Tensor& parent_index,
-                                           const Tensor& valid_columns,
-                                           const Tensor& current_extents, Tensor& lengths,
-                                           Tensor& anchors, Tensor& licensed_tokens,
-                                           Tensor& licensed_counts, Tensor& accepted,
-                                           Tensor& accepted_column, Tensor& fold_path,
-                                           std::int32_t token_domain, const SamplingConfig* configs,
-                                           DeviceSpan workspace, cudaStream_t stream) {
-    const std::int32_t batch         = verify_ids.ne[1];
-    const std::int32_t width         = verify_ids.ne[0];
-    const std::int32_t physical_rows = logits.ne[0];
+void speculative_accept_tree_drafts_launch(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& verify_ids,
+    const Tensor& parent_index, const Tensor& valid_columns, const Tensor& current_extents,
+    Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted, Tensor& accepted_column, Tensor& fold_path, std::int32_t token_domain,
+    const SamplingConfig* configs, DeviceSpan workspace, cudaStream_t stream) {
+    const std::int32_t batch             = verify_ids.ne[1];
+    const std::int32_t width             = verify_ids.ne[0];
+    const std::int32_t physical_rows     = logits.ne[0];
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, width);
     if (!layout.multiblock) {
         speculative_accept_tree_drafts_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0,

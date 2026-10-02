@@ -29,25 +29,26 @@ struct Variant {
     using VisionWeights                  = qwen3_6::VisionWeights;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
-    static constexpr float attention_scale                     = kAttentionScale;
-    static constexpr float gdn_scale                           = kGdnScale;
-    static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;
-    static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
-    static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
-    static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens =
-        kMaximumDFlashDraftTokens;
+    static constexpr float attention_scale                              = kAttentionScale;
+    static constexpr float gdn_scale                                    = kGdnScale;
+    static constexpr std::uint32_t prefill_chunk_alignment              = kPrefillChunkAlignment;
+    static constexpr std::uint32_t maximum_mtp_draft_tokens             = kMaximumMtpDraftTokens;
+    static constexpr std::uint32_t maximum_dflash_draft_tokens          = kMaximumDFlashDraftTokens;
+    static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens = kMaximumDFlashDraftTokens;
+
     // The DFlash2 drafter is trained at block eight (k=7). Its block attention is bidirectional,
     // so the untruncated block gives flatter per-position selector laws; the p-less draft
     // temperature (set for k<=5) is scaled down for longer blocks: 0.4 -> 0.35 (k=6), 0.3 (k=7).
     [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_scale(std::uint32_t k) {
         return k <= 5 ? 1.0f : (k == 6 ? 0.875f : 0.75f);
     }
-    static constexpr std::uint32_t maximum_context             = kNativeContext;
-    static constexpr bool supports_dflash                      = DFlashConfig::supported;
-    static constexpr std::int32_t draft_head_rows              = 131072;
 
-    [[nodiscard]] static constexpr bool supports_dflash_vision(
-        std::string_view model_id, std::string_view weights_id) {
+    static constexpr std::uint32_t maximum_context = kNativeContext;
+    static constexpr bool supports_dflash          = DFlashConfig::supported;
+    static constexpr std::int32_t draft_head_rows  = 131072;
+
+    [[nodiscard]] static constexpr bool supports_dflash_vision(std::string_view model_id,
+                                                               std::string_view weights_id) {
         return model_id == "qwen3.8-27b" && weights_id == "nvfp4";
     }
 
@@ -75,9 +76,9 @@ struct Variant {
     static void mtp_q_gate_projection(const Tensor& hidden,
                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm, const Weight& weight,
-                       Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
-                       std::int32_t route_tokens = 0);
+    static void mtp_fc(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                       const Weight& weight, Tensor& residual, WorkspaceArena& workspace,
+                       cudaStream_t stream, std::int32_t route_tokens = 0);
     static void mtp_attention_output(const Tensor& attention, const Weight& weight,
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream, std::int32_t route_tokens = 0);
@@ -108,8 +109,8 @@ struct Variant {
     // Normalize the raw residual for the post-mixer; hidden is caller-owned scratch.
     static void post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
                            const PostMixerWeights& weights, Tensor& residual,
-                           qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream, std::int32_t route_tokens = 0);
+                           qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
+                           std::int32_t route_tokens = 0);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream,
                                std::int32_t route_tokens = 0);

@@ -26,7 +26,9 @@ Binder::Binder(const Reader& reader)
     materialization_.object_count = reader.objects().size();
 }
 
-bool Binder::contains(std::string_view name) const noexcept { return reader_.find(name) != nullptr; }
+bool Binder::contains(std::string_view name) const noexcept {
+    return reader_.find(name) != nullptr;
+}
 
 const ObjectDescriptor* Binder::find(std::string_view name) const noexcept {
     return reader_.find(name);

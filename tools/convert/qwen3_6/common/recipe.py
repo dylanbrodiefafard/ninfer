@@ -7,17 +7,16 @@ geometry; only checkpoint-invariant Vision recipes are built here.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
-from typing import Mapping, Sequence
 
 import torch
 
 from tools.convert.common.safetensors import ShardReader
 
-from .inventory import FP32, TensorSpec, VISION_LAYERS
-
+from .inventory import FP32, VISION_LAYERS, TensorSpec
 
 SOURCE_DTYPE = "BF16"
 
@@ -78,14 +77,7 @@ class GatherRows:
 
 
 Expression = (
-    SourceTensor
-    | Slice
-    | Reshape
-    | Transpose
-    | Concat
-    | Cast
-    | DraftHeadTokenIds
-    | GatherRows
+    SourceTensor | Slice | Reshape | Transpose | Concat | Cast | DraftHeadTokenIds | GatherRows
 )
 
 
@@ -165,7 +157,7 @@ def expression_shape(expression: Expression) -> tuple[int, ...]:
         for shape in shapes:
             if len(shape) != rank:
                 raise ValueError("concat sources have different ranks")
-            for axis, (got, expected) in enumerate(zip(shape, shapes[0])):
+            for axis, (got, expected) in enumerate(zip(shape, shapes[0], strict=True)):
                 if axis != expression.axis and got != expected:
                     raise ValueError("concat sources have incompatible shapes")
             output[expression.axis] += shape[expression.axis]
@@ -189,11 +181,7 @@ def expression_sources(expression: Expression) -> tuple[SourceTensor, ...]:
     if isinstance(expression, (Slice, Reshape, Transpose, Cast)):
         return expression_sources(expression.source)
     if isinstance(expression, Concat):
-        return tuple(
-            item
-            for part in expression.sources
-            for item in expression_sources(part)
-        )
+        return tuple(item for part in expression.sources for item in expression_sources(part))
     if isinstance(expression, GatherRows):
         return (expression.source,)
     if isinstance(expression, DraftHeadTokenIds):
@@ -279,9 +267,7 @@ def validate_recipe_coverage(
         expected = inventory_by_name[recipe.object_name].shape
         actual = expression_shape(recipe.expression)
         if actual != expected:
-            raise ValueError(
-                f"{recipe.object_name}: recipe shape {actual} != inventory {expected}"
-            )
+            raise ValueError(f"{recipe.object_name}: recipe shape {actual} != inventory {expected}")
 
 
 def source_requirements(
@@ -357,8 +343,7 @@ def materialize_expression(
 
     if isinstance(expression, Concat):
         tensors = [
-            materialize_expression(part, reader, derived_tensors)
-            for part in expression.sources
+            materialize_expression(part, reader, derived_tensors) for part in expression.sources
         ]
         return torch.cat(tensors, dim=expression.axis)
 
@@ -398,13 +383,13 @@ def materialize_recipe(
 
 
 __all__ = [
+    "SOURCE_DTYPE",
     "Cast",
     "Concat",
     "DraftHeadTokenIds",
     "Expression",
     "GatherRows",
     "Reshape",
-    "SOURCE_DTYPE",
     "ShardReader",
     "Slice",
     "SourcePreflight",

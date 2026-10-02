@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from tools.convert.qwen3_6_27b import inventory as qwen3_6_inventory
 
-
 MODEL_ID = "qwen3.8-27b"
 WEIGHTS_ID = "groupwise-int"
 TARGET_KEY = "qwen3_8_27b"
@@ -40,18 +39,14 @@ def _w8_vocabulary_endpoint(spec: TensorSpec) -> TensorSpec:
 
 
 TEXT_CORE_TENSOR_SPECS = tuple(
-    _w8_vocabulary_endpoint(spec)
-    for spec in qwen3_6_inventory.TEXT_CORE_TENSOR_SPECS
+    _w8_vocabulary_endpoint(spec) for spec in qwen3_6_inventory.TEXT_CORE_TENSOR_SPECS
 )
 DRAFT_HEAD_TENSOR_SPECS = qwen3_6_inventory.DRAFT_HEAD_TENSOR_SPECS
 MTP_TENSOR_SPECS = qwen3_6_inventory.MTP_TENSOR_SPECS
 VISION_TENSOR_SPECS = qwen3_6_inventory.VISION_TENSOR_SPECS
 
 TENSOR_SPECS = (
-    TEXT_CORE_TENSOR_SPECS
-    + DRAFT_HEAD_TENSOR_SPECS
-    + MTP_TENSOR_SPECS
-    + VISION_TENSOR_SPECS
+    TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + MTP_TENSOR_SPECS + VISION_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
@@ -60,8 +55,7 @@ FORMAT_COUNTS = {
     for numeric_format in FORMAT_NAMES
 }
 LAYOUT_COUNTS = {
-    layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
-    for layout in LAYOUT_NAMES
+    layout: sum(spec.layout == layout for spec in TENSOR_SPECS) for layout in LAYOUT_NAMES
 }
 
 LOGICAL_ROW_VIEW_SPECS = qwen3_6_inventory.LOGICAL_ROW_VIEW_SPECS

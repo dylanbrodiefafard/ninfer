@@ -41,18 +41,12 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     }
     assert report["target_key"] == inventory.TARGET_KEY
     assert report["recipe_id"] == convert.RECIPE_ID
-    assert report["source"]["base_model_path"] == str(
-        (tmp_path / "model").resolve()
-    )
-    assert report["source"]["dflash_model_path"] == str(
-        (tmp_path / "dflash").resolve()
-    )
+    assert report["source"]["base_model_path"] == str((tmp_path / "model").resolve())
+    assert report["source"]["dflash_model_path"] == str((tmp_path / "dflash").resolve())
     assert report["source_preflight"]["base"]["tensors"] == 1045
     assert report["source_preflight"]["dflash"]["tensors"] == 69
     assert report["source_preflight"]["combined"]["tensors"] == 1114
-    assert report["source"]["gguf_evidence_path"] == str(
-        convert.GGUF_EVIDENCE_PATH
-    )
+    assert report["source"]["gguf_evidence_path"] == str(convert.GGUF_EVIDENCE_PATH)
     assert report["draft_head"] == {
         "rows": 131072,
         "tokenizer_vocab_size": 248077,

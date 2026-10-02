@@ -59,15 +59,17 @@ std::vector<ninfer::TokenId> load_ids(const std::string& path, std::uint32_t lim
     std::vector<ninfer::TokenId> ids;
     std::string word;
     while (input >> word) {
-        char* end                      = nullptr;
-        const unsigned long value      = std::strtoul(word.c_str(), &end, 10);
+        char* end                 = nullptr;
+        const unsigned long value = std::strtoul(word.c_str(), &end, 10);
         if (end == word.c_str() || *end != '\0' || value > 2147483647ul) {
             throw std::invalid_argument("invalid corpus token id: " + word);
         }
         ids.push_back(static_cast<ninfer::TokenId>(value));
         if (limit > 0 && ids.size() >= limit) { break; }
     }
-    if (ids.size() < 2) { throw std::invalid_argument("corpus must contain at least two token ids"); }
+    if (ids.size() < 2) {
+        throw std::invalid_argument("corpus must contain at least two token ids");
+    }
     return ids;
 }
 
@@ -100,12 +102,11 @@ void write_token_nlls(const std::string& json_path, const std::vector<float>& va
 }
 
 void write_cell_json(const std::string& path, const std::string& scheme, const std::string& weights,
-                      const ninfer::LoadSummary& load, ninfer::KvCacheStorage kv_dtype,
-                      std::uint32_t prefill_chunk, bool use_cuda_graph,
-                      ninfer::SpeculativeBackend spec, std::uint32_t draft_tokens,
-                       bool sage_attn, std::optional<float> keep_frac,
-                       std::optional<float> xattn_tau, bool s3_tma,
-                       const ninfer::ScoreResult& score) {
+                     const ninfer::LoadSummary& load, ninfer::KvCacheStorage kv_dtype,
+                     std::uint32_t prefill_chunk, bool use_cuda_graph,
+                     ninfer::SpeculativeBackend spec, std::uint32_t draft_tokens, bool sage_attn,
+                     std::optional<float> keep_frac, std::optional<float> xattn_tau, bool s3_tma,
+                     const ninfer::ScoreResult& score) {
     std::ostringstream body;
     body << std::setprecision(17);
     body << "{\n"
@@ -118,11 +119,11 @@ void write_cell_json(const std::string& path, const std::string& scheme, const s
          << "  \"spec\": " << json_escape(ninfer::product::speculative_backend_name(spec)) << ",\n"
          << "  \"draft_tokens\": " << draft_tokens << ",\n"
          << "  \"cuda_graph\": " << (use_cuda_graph ? "true" : "false") << ",\n"
-          << "  \"prefill_chunk\": " << prefill_chunk << ",\n"
-           << "  \"sage_attn\": " << (sage_attn ? "true" : "false") << ",\n"
-           << "  \"s3_tma\": " << (s3_tma ? "true" : "false") << ",\n"
-           << "  \"keep_frac\": " << keep_frac.value_or(1.0f) << ",\n"
-           << "  \"xattn_tau\": " << xattn_tau.value_or(1.0f) << ",\n"
+         << "  \"prefill_chunk\": " << prefill_chunk << ",\n"
+         << "  \"sage_attn\": " << (sage_attn ? "true" : "false") << ",\n"
+         << "  \"s3_tma\": " << (s3_tma ? "true" : "false") << ",\n"
+         << "  \"keep_frac\": " << keep_frac.value_or(1.0f) << ",\n"
+         << "  \"xattn_tau\": " << xattn_tau.value_or(1.0f) << ",\n"
          << "  \"skip_tokens\": " << score.skip_tokens << ",\n"
          << "  \"prompt_tokens\": " << score.prompt_tokens << ",\n"
          << "  \"tokens_scored\": " << score.tokens_scored << ",\n"
@@ -198,25 +199,27 @@ int main(int argc, char** argv) {
         ninfer::KvCacheStorage kv_dtype = ninfer::KvCacheStorage::Nvfp4;
         ninfer::ScoreOptions score_options;
         ninfer::SpeculativeOptions speculative;
-        std::uint32_t tokens            = 0;
-        std::uint32_t max_context       = 4096;
-        std::uint32_t prefill_chunk     = 4096;
-        int device                      = 0;
-        bool sage_attn                  = false;
-        bool s3_tma                     = false;
+        std::uint32_t tokens        = 0;
+        std::uint32_t max_context   = 4096;
+        std::uint32_t prefill_chunk = 4096;
+        int device                  = 0;
+        bool sage_attn              = false;
+        bool s3_tma                 = false;
         std::optional<float> keep_frac;
         std::optional<float> xattn_tau;
-        bool help                       = false;
-        bool encode                     = false;
-        bool enable_vision              = false;
-        bool enable_thinking            = false;
-        bool score_last_message         = false;
-        bool skip_set                   = false;
-        bool use_cuda_graph             = true;
+        bool help               = false;
+        bool encode             = false;
+        bool enable_vision      = false;
+        bool enable_thinking    = false;
+        bool score_last_message = false;
+        bool skip_set           = false;
+        bool use_cuda_graph     = true;
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg(argv[i]);
             auto value = [&](const char* flag) -> const char* {
-                if (i + 1 >= argc) { throw std::invalid_argument(std::string(flag) + " requires a value"); }
+                if (i + 1 >= argc) {
+                    throw std::invalid_argument(std::string(flag) + " requires a value");
+                }
                 return argv[++i];
             };
             if (arg == "-h" || arg == "--help") {
@@ -251,7 +254,8 @@ int main(int argc, char** argv) {
             } else if (arg == "--spec") {
                 speculative.backend = ninfer::product::parse_speculative_backend(value("--spec"));
             } else if (arg == "--draft-tokens") {
-                speculative.draft_tokens = static_cast<std::uint32_t>(std::stoul(value("--draft-tokens")));
+                speculative.draft_tokens =
+                    static_cast<std::uint32_t>(std::stoul(value("--draft-tokens")));
             } else if (arg == "--dflash-verify-width") {
                 speculative.dflash_verify_width =
                     static_cast<std::uint32_t>(std::stoul(value("--dflash-verify-width")));
@@ -284,14 +288,19 @@ int main(int argc, char** argv) {
         if (help) {
             std::cout
                 << "Usage: ninfer-ppl --weights <artifact.ninfer> --ids <corpus.ids> [options]\n"
-                << "       ninfer-ppl --weights <artifact.ninfer> --messages <messages.json> [--vision] [options]\n"
-                << "       ninfer-ppl --encode --weights <artifact.ninfer> --text <file> --ids <out.ids>\n"
+                << "       ninfer-ppl --weights <artifact.ninfer> --messages <messages.json> "
+                   "[--vision] [options]\n"
+                << "       ninfer-ppl --encode --weights <artifact.ninfer> --text <file> --ids "
+                   "<out.ids>\n"
                 << "  --scheme <name>             cell name (default: kv-bf16)\n"
                 << "  --kv-dtype <bf16|int8|nvfp4>  default: nvfp4\n"
-                 << "  --sage                  sage_attn FP4-PV recipe (requires --kv-dtype nvfp4)\n"
-                 << "  --s3-tma                run the S3 prefill kernel via TMA + mbarrier (NINFER_S3_TMA; requires --sage, keep_frac 1.0)\n"
-                 << "  --keep-frac <f>         Sparge keep fraction (0,1] on exact NVFP4; <1 forbids --sage\n"
-                 << "  --xattn-tau <f>         XAttention mass threshold (0,1] on exact NVFP4; exclusive with --keep-frac <1\n"
+                << "  --sage                  sage_attn FP4-PV recipe (requires --kv-dtype nvfp4)\n"
+                << "  --s3-tma                run the S3 prefill kernel via TMA + mbarrier "
+                   "(NINFER_S3_TMA; requires --sage, keep_frac 1.0)\n"
+                << "  --keep-frac <f>         Sparge keep fraction (0,1] on exact NVFP4; <1 "
+                   "forbids --sage\n"
+                << "  --xattn-tau <f>         XAttention mass threshold (0,1] on exact NVFP4; "
+                   "exclusive with --keep-frac <1\n"
                 << "  --schedule <prefill|decode> default prefill (prompt-route GQA)\n"
                 << "  --skip <half|n>             warmup tokens not scored (default: half)\n"
                 << "  --spec <mtp|dflash>         load a speculative backend (decode score: mtp;\n"
@@ -352,28 +361,27 @@ int main(int argc, char** argv) {
                 "(keep_frac < 1) stays on the cp.async kernel");
         }
         if (s3_tma && xattn_tau && *xattn_tau < 1.0f) {
-            throw std::invalid_argument("--s3-tma is exact S3 only; do not combine with --xattn-tau");
+            throw std::invalid_argument(
+                "--s3-tma is exact S3 only; do not combine with --xattn-tau");
         }
         ninfer::EngineOptions options;
-        options.artifact_path    = weights;
-        options.device           = device;
-        options.max_context      = ids.empty() ? max_context : static_cast<std::uint32_t>(ids.size());
-        options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
-        options.max_concurrency  = 1;
-        options.prefill_chunk    = prefill_chunk;
-        options.kv_cache         = kv_dtype;
-        options.sage_attn        = sage_attn;
-        options.keep_frac        = keep_frac.value_or(1.0f);
-        options.xattn_tau        = xattn_tau.value_or(1.0f);
-        options.speculative      = speculative;
-        options.enable_vision    = enable_vision;
-        options.use_cuda_graph   = use_cuda_graph;
+        options.artifact_path = weights;
+        options.device        = device;
+        options.max_context   = ids.empty() ? max_context : static_cast<std::uint32_t>(ids.size());
+        options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.max_concurrency = 1;
+        options.prefill_chunk   = prefill_chunk;
+        options.kv_cache        = kv_dtype;
+        options.sage_attn       = sage_attn;
+        options.keep_frac       = keep_frac.value_or(1.0f);
+        options.xattn_tau       = xattn_tau.value_or(1.0f);
+        options.speculative     = speculative;
+        options.enable_vision   = enable_vision;
+        options.use_cuda_graph  = use_cuda_graph;
         ninfer::validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                            options.xattn_tau);
 
-        if (s3_tma) {
-            setenv("NINFER_S3_TMA", "1", 1);
-        }
+        if (s3_tma) { setenv("NINFER_S3_TMA", "1", 1); }
 
         ninfer::Engine engine(std::move(options));
         ninfer::PreparedPrompt prompt;
@@ -394,7 +402,7 @@ int main(int argc, char** argv) {
                 if (prefix_tokens == 0) {
                     throw std::logic_error("assistant scoring prefix is empty");
                 }
-                score_options.skip_tokens = prefix_tokens - 1;
+                score_options.skip_tokens           = prefix_tokens - 1;
                 input.options.add_generation_prompt = false;
             }
             prompt = engine.prepare(std::move(input));

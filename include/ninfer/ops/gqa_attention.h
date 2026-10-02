@@ -49,14 +49,15 @@ struct GqaS3PrefillDump;
  * that result.
  *
  * The registered INT8 implementation defines Q8-G64, paired with INT8-G64 K, as its native query
- * compute profile. The registered NVFP4 implementation defines Q-NVFP4-G16, paired with NVFP4-G16 K,
- * as its native query compute profile using m16n8k64 hardware block scales. Those profile-defined
- * query quantizations and any narrower staging do not replace BF16 Q in the ideal oracle. BF16-cache,
- * INT8-cache, and NVFP4-cache compute profiles therefore have separate named numerical criteria
- * owned by the GQA conformance test. Those envelopes apply to the registered geometries, tested
- * token extents, conformance matrix, and target-representative activation range; they are not a
- * universal error bound for arbitrary adversarial BF16 tensors. A1 and A3 are each qualified
- * directly against the ideal oracle. A1-versus-A3 parity is only an additional consistency check.
+ * compute profile. The registered NVFP4 implementation defines Q-NVFP4-G16, paired with NVFP4-G16
+ * K, as its native query compute profile using m16n8k64 hardware block scales. Those
+ * profile-defined query quantizations and any narrower staging do not replace BF16 Q in the ideal
+ * oracle. BF16-cache, INT8-cache, and NVFP4-cache compute profiles therefore have separate named
+ * numerical criteria owned by the GQA conformance test. Those envelopes apply to the registered
+ * geometries, tested token extents, conformance matrix, and target-representative activation range;
+ * they are not a universal error bound for arbitrary adversarial BF16 tensors. A1 and A3 are each
+ * qualified directly against the ideal oracle. A1-versus-A3 parity is only an additional
+ * consistency check.
  */
 
 /**
@@ -74,12 +75,10 @@ struct GqaS3PrefillDump;
  * small-T / chunked-small-T scratch for packed-tree A1, including B=1 W=7..16 where ordinary
  * causal A1 would use the Prompt route.
  */
-[[nodiscard]] std::size_t
-gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
-                                       GqaExecutionEnvelope envelope, std::int32_t batch_size,
-                                       std::int32_t min_width, std::int32_t max_width,
-                                       float keep_frac = 1.0f, bool tree_verify = false,
-                                       float xattn_tau = 1.0f, bool sage_pv = false);
+[[nodiscard]] std::size_t gqa_attention_workspace_capacity_bytes(
+    std::int32_t q_heads, DType cache_dtype, GqaExecutionEnvelope envelope, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width, float keep_frac = 1.0f,
+    bool tree_verify = false, float xattn_tau = 1.0f, bool sage_pv = false);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let
@@ -96,8 +95,9 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
  * call topology; it is not inferred by copying device metadata to the host. B=1 accepts every
  * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16,
- * INT8-G64, or NVFP4-G16 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
- * planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence b.
+ * INT8-G64, or NVFP4-G16 under the shared numerical contract above. PagedKVBatchLayerView supplies
+ * shared planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence
+ * b.
  *
  * In masked form, every row's valid columns are the prefix [0,valid_columns[b]); positions in that
  * prefix are sequential and address populated causal histories. Each nonempty row repeats its
@@ -143,8 +143,8 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
- * contiguous sequential I32 [T], and every addressed code and quantized scale is overwritten. It reads
- * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
+ * contiguous sequential I32 [T], and every addressed code and quantized scale is overwritten. It
+ * reads no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                    PagedKVLayerView cache, cudaStream_t stream);
@@ -171,7 +171,7 @@ void gqa_kv_compact_path(PagedKVBatchLayerView cache, const Tensor& kv_table_row
  * attention.
  */
 struct GqaS3DecodeRankDump {
-    std::int32_t max_tiles; // [kv-row] keep-list stride (>= div_up(window, 32))
+    std::int32_t max_tiles;   // [kv-row] keep-list stride (>= div_up(window, 32))
     std::int32_t* keep_tiles; // [batch*KVHeads][max_tiles] kept key-tile index
     std::int32_t* keep_count; // [batch*KVHeads] kept key-tile count
     std::int32_t splits;      // launch split count (0 when skip did not engage)
@@ -209,15 +209,16 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
  */
 struct GqaS3PrefillDump {
     int max_tiles; // [h][t] stride (>= the actual key-tile count)
-    float* score; // [h][t][128 rows][64 keys] raw QK dot (pre-scale); -INFINITY = causally masked key
-    std::uint8_t* p_code; // [h][t][128][64] e2m1 P-quant nibble (0..7); 0xFF = masked key
-    std::uint8_t* psf; // [h][t][128][4] e4m3 P-block scale byte (per 16-key block)
+    float*
+        score; // [h][t][128 rows][64 keys] raw QK dot (pre-scale); -INFINITY = causally masked key
+    std::uint8_t* p_code;  // [h][t][128][64] e2m1 P-quant nibble (0..7); 0xFF = masked key
+    std::uint8_t* psf;     // [h][t][128][4] e4m3 P-block scale byte (per 16-key block)
     std::uint8_t* v_scale; // [h][t][256 d][4] e4m3 V-block scale byte (per (d, 16-key block))
-    std::uint8_t* v_t; // [h][t][256 d][32] transposed V-code B operand (per tile)
-    float* m; // [h][t][128] running max after the tile (raw score domain)
-    float* l; // [h][t][128] running L after the tile (amplified, tile frame)
+    std::uint8_t* v_t;     // [h][t][256 d][32] transposed V-code B operand (per tile)
+    float* m;              // [h][t][128] running max after the tile (raw score domain)
+    float* l;              // [h][t][128] running L after the tile (amplified, tile frame)
     float* acc; // [h][t][128][256] PV accumulator after the tile (tile frame, pre-normalize)
-    std::int32_t* keep_list; // [h][max_tiles] kept key-tile index (valid up to tile_count)
+    std::int32_t* keep_list;  // [h][max_tiles] kept key-tile index (valid up to tile_count)
     std::int32_t* tile_count; // [h] tiles actually processed
 };
 
@@ -227,9 +228,8 @@ struct GqaS3PrefillDump {
 // prefill kernel does not run and the dump would silently stay empty.
 void gqa_attention_s3_dump(const Tensor& q, const Tensor& k, const Tensor& v,
                            const Tensor& positions, const Tensor& valid_columns,
-                           const Tensor& kv_table_rows, float scale,
-                           PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
-                           float keep_frac, GqaS3PrefillDump& dump);
+                           const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
+                           GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                           cudaStream_t stream, float keep_frac, GqaS3PrefillDump& dump);
 
 } // namespace ninfer::ops

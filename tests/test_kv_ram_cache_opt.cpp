@@ -17,8 +17,8 @@
 
 namespace {
 
-constexpr int kWarmup = 2;
-constexpr int kIters  = 8;
+constexpr int kWarmup                       = 2;
+constexpr int kIters                        = 8;
 constexpr double kMinFractionOfPinnedMemcpy = 0.50;
 
 int fail(const char* message) {
@@ -116,9 +116,9 @@ int capture_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::P
     source.tail_hidden_valid  = hidden != nullptr;
     source.ledger             = retained.token_ids;
     source.identity           = &identity;
-    source.hash_f             = ninfer::targets::qwen3_6::detail::prefix_hash_at(
-        retained.token_ids, identity, source.execution_frontier);
-    source.text             = &alloc;
+    source.hash_f = ninfer::targets::qwen3_6::detail::prefix_hash_at(retained.token_ids, identity,
+                                                                     source.execution_frontier);
+    source.text   = &alloc;
     source.text_pool        = &pool;
     source.gdn              = gdn;
     source.gdn_current_slot = gdn != nullptr ? 0 : -1;
@@ -126,7 +126,8 @@ int capture_entry(ninfer::targets::qwen3_6::detail::KVRamCache& cache, ninfer::P
     source.stream           = stream;
     return cache.capture(source).status ==
                    ninfer::targets::qwen3_6::detail::RamCaptureStatus::Captured
-               ? 0 : 1;
+               ? 0
+               : 1;
 }
 
 double gbs(std::size_t bytes, double ms, int copies) {
@@ -150,14 +151,15 @@ int main() {
     ninfer::DeviceContext ctx(0);
     constexpr std::uint32_t kPages = 128;
     ninfer::LayoutBuilder builder;
-    auto layout = ninfer::plan_paged_kv_pool(builder, {.page_group_count      = kPages * 2,
-                                                       .logical_page_capacity = kPages,
-                                                       .table_rows            = 2,
-                                                       .plane_order           = ninfer::PagedKVPlaneOrder::PageMajor,
-                                                       .planes                = {{ninfer::DType::I8, 64, 2},
-                                                                                  {ninfer::DType::I8, 64, 2},
-                                                                                  {ninfer::DType::FP16, 1, 2},
-                                                                                  {ninfer::DType::FP16, 1, 2}}});
+    auto layout =
+        ninfer::plan_paged_kv_pool(builder, {.page_group_count      = kPages * 2,
+                                             .logical_page_capacity = kPages,
+                                             .table_rows            = 2,
+                                             .plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                                             .planes      = {{ninfer::DType::I8, 64, 2},
+                                                             {ninfer::DType::I8, 64, 2},
+                                                             {ninfer::DType::FP16, 1, 2},
+                                                             {ninfer::DType::FP16, 1, 2}}});
     ninfer::DeviceArena arena(builder.finish(256));
     ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout);
 
@@ -178,7 +180,7 @@ int main() {
     source.materialize_pages(kPages, ctx.stream);
     fill_logical_pages(pool, source, 21);
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-    const auto ids = source.page_ids();
+    const auto ids  = source.page_ids();
     bool fragmented = false;
     for (std::size_t i = 1; i < ids.size(); ++i) {
         if (ids[i] != ids[i - 1] + 1) {
@@ -200,19 +202,19 @@ int main() {
 
     ninfer::DeviceBuffer bulk(image_bytes);
     for (int i = 0; i < kWarmup; ++i) {
-        CUDA_CHECK(cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost,
-                                   ctx.stream));
-        CUDA_CHECK(cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice,
-                                   ctx.stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost, ctx.stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice, ctx.stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
 
     CUDA_CHECK(cudaEventRecord(start, ctx.stream));
     for (int i = 0; i < kIters; ++i) {
-        CUDA_CHECK(cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost,
-                                   ctx.stream));
-        CUDA_CHECK(cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice,
-                                   ctx.stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost, ctx.stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice, ctx.stream));
     }
     CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
     CUDA_CHECK(cudaEventSynchronize(stop));
@@ -268,8 +270,8 @@ int main() {
     dest.materialize_pages(kPages, ctx.stream);
     // KV-only fixture has no sampled tail hidden; a suffix regenerates it.
     const auto continuation = text_prompt({1, 2, 3, 4, 5});
-    const auto match =
-        cache.plan_match(continuation, ninfer::targets::qwen3_6::detail::prefix_hash_chain(continuation));
+    const auto match        = cache.plan_match(
+        continuation, ninfer::targets::qwen3_6::detail::prefix_hash_chain(continuation));
     if (!match) { return fail("opt capture did not index before copy completion"); }
     ninfer::targets::qwen3_6::detail::RamRestoreTarget target;
     target.text           = &dest;
@@ -296,15 +298,15 @@ int main() {
     dest.release();
 
     ninfer::LayoutBuilder gdn_builder;
-    const auto gdn_layout = ninfer::plan_linear_attention_state_pool(
-        gdn_builder, {.layers         = 8,
-                      .conv_channels  = 16,
-                      .conv_width     = 4,
-                      .value_heads    = 2,
-                      .value_head_dim = 8,
-                      .key_head_dim   = 4,
-                      .slot_count     = 2,
-                      .conv_dtype     = ninfer::DType::BF16});
+    const auto gdn_layout =
+        ninfer::plan_linear_attention_state_pool(gdn_builder, {.layers         = 8,
+                                                               .conv_channels  = 16,
+                                                               .conv_width     = 4,
+                                                               .value_heads    = 2,
+                                                               .value_head_dim = 8,
+                                                               .key_head_dim   = 4,
+                                                               .slot_count     = 2,
+                                                               .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     const std::size_t gdn_bytes = gdn.conv_host_image_bytes() + gdn.recurrent_host_image_bytes();
@@ -316,8 +318,8 @@ int main() {
         conv_pattern[i] = static_cast<unsigned char>(i * 5 + 1);
     }
     for (std::uint32_t layer = 0; layer < gdn.layer_count(); ++layer) {
-        CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 0).data, conv_pattern.data(), conv_pattern.size(),
-                               cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gdn.conv_slot(layer, 0).data, conv_pattern.data(),
+                              conv_pattern.size(), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
     ninfer::DeviceBuffer hidden_buf(256);
@@ -354,11 +356,11 @@ int main() {
     if (expect_logical_pages(pool, gdn_dest, 24) != 0) { return fail("GDN restore KV mismatch"); }
     std::vector<unsigned char> conv_out(conv_pattern.size());
     CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(7, 1).data, conv_out.size(),
-                           cudaMemcpyDeviceToHost));
+                          cudaMemcpyDeviceToHost));
     if (conv_out != conv_pattern) { return fail("8-layer GDN conv did not round-trip"); }
     std::vector<unsigned char> hidden_host(256);
     CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
-                           cudaMemcpyDeviceToHost));
+                          cudaMemcpyDeviceToHost));
     if (hidden_host != std::vector<unsigned char>(256, 0x5a)) {
         return fail("tail hidden did not round-trip through RAM");
     }
