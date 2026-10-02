@@ -83,6 +83,9 @@ struct Geometry {
     std::int32_t kv_heads;
 
     [[nodiscard]] std::int32_t query_group() const { return q_heads / kv_heads; }
+
+    // Widths the small-T decode route covers: three 16-row MMA tiles of (token, group-query).
+    [[nodiscard]] std::int32_t small_t_tokens() const { return 48 / query_group(); }
 };
 
 constexpr Geometry kGeometries[] = {
@@ -996,7 +999,7 @@ std::vector<double> sage_step_emulation(const std::vector<float>& q, const HostC
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
-            const bool smooth          = tokens > 6;
+            const bool smooth          = tokens > geometry.small_t_tokens();
             SageSmoothQ sq;
             if (smooth) {
                 sq = sage_smooth_q(geometry, q, q_head, token, tokens, sage_prefill_q_br());
@@ -1191,7 +1194,7 @@ std::vector<double> sage_ideal_attention(const std::vector<float>& q, const Host
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
-            const bool smooth          = tokens > 6;
+            const bool smooth          = tokens > geometry.small_t_tokens();
             SageSmoothQ sq;
             if (smooth) {
                 sq = sage_smooth_q(geometry, q, q_head, token, tokens, sage_prefill_q_br());
@@ -1286,7 +1289,7 @@ std::vector<double> sage_pwidth_reference(const std::vector<float>& q, const Hos
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
-            const bool smooth          = tokens > 6;
+            const bool smooth          = tokens > geometry.small_t_tokens();
             SageSmoothQ sq;
             if (smooth) {
                 sq = sage_smooth_q(geometry, q, q_head, token, tokens, sage_prefill_q_br());
@@ -2264,10 +2267,10 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u, sage);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
-    // Strict P/PV is the sage decode default (small-T, tokens <= 6). Prefill-routed
+    // Strict P/PV is the sage decode default (small-T widths). Prefill-routed
     // sage cases keep the S3 FP4-PV recipe, so the strict reference/criterion apply
     // to the decode cases only. NINFER_S3_STRICT_PV=0 restores FP4-P decode.
-    const bool strict_pv                = s3_strict_pv() && test_case.tokens <= 6;
+    const bool strict_pv = s3_strict_pv() && test_case.tokens <= geometry.small_t_tokens();
     const std::vector<double> reference = (sage && !strict_pv)
                                               ? sage_ideal_attention(q, expected, positions)
                                               : ideal_attention(q, expected, positions);
@@ -3209,7 +3212,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
         // signed codes and stored scales rather than comparing to unquantized KV.
         append_cache(cache_host, captured_k, captured_v, captured_positions);
     }
-    const bool strict_pv                = s3_strict_pv() && test_case.tokens <= 6;
+    const bool strict_pv = s3_strict_pv() && test_case.tokens <= geometry.small_t_tokens();
     const std::vector<double> reference = (sage && !strict_pv)
                                               ? sage_ideal_attention(q, cache_host, positions)
                                               : ideal_attention(q, cache_host, positions);
@@ -4179,6 +4182,23 @@ int run_batch_cases(bool full) {
                                {128, {4000}, {77}, {0}, MappingPattern::Identity, 509u});
     failures += run_batch_case(kGeometries[1], DType::U8,
                                {300, {1800}, {211}, {0}, MappingPattern::Fragmented, 510u});
+    // 27B DFlash k=6/7 verify batches (W=7/8) on the small-T route, with masked short rows.
+    failures += run_batch_case(
+        kGeometries[0], DType::U8,
+        {8, {37, 128, 2048, 4096}, {8, 7, 5, 1}, {3, 0, 2, 1}, MappingPattern::Fragmented, 513u});
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {7,
+                                {9000, 12000, 61, 300, 5000, 700},
+                                {7, 7, 3, 7, 6, 7},
+                                {5, 0, 4, 1, 3, 2},
+                                MappingPattern::Identity,
+                                514u});
+    failures += run_batch_case(
+        kGeometries[0], DType::I8,
+        {8, {61, 127, 6000}, {8, 4, 8}, {2, 0, 1}, MappingPattern::Fragmented, 515u});
+    failures +=
+        run_batch_case(kGeometries[0], DType::BF16,
+                       {7, {16, 300, 16}, {7, 7, 2}, {0, 1, 2}, MappingPattern::Identity, 516u});
     return failures;
 }
 
@@ -4329,6 +4349,25 @@ int run_geometry(const Geometry& geometry, bool full) {
                                                  XattnPlant::PaperInverse);
                     failures += run_a1_skip_case(geometry, {12, 384, 512, 542u}, 1.0f, 0.9f, 0);
                 }
+            }
+        }
+
+        if (geometry.q_heads == 24 && !sage_only) {
+            // DFlash chain verify W=7/8 (k=6/7) on the three-row-tile small-T route: short, 2K
+            // dynamic-arena, 8K and pipelined (8198, 32768] windows.
+            failures += run_a1_case(geometry, dtype, {8, 61, 69, 420u}, MappingPattern::Fragmented);
+            failures += run_a1_case(geometry, dtype, {7, 140, 150, 421u}, MappingPattern::Identity);
+            failures +=
+                run_a3_case(geometry, dtype, {8, 3000, 3008, 422u}, MappingPattern::Identity);
+            failures +=
+                run_a3_case(geometry, dtype, {7, 6000, 6007, 423u}, MappingPattern::Fragmented);
+            failures +=
+                run_a1_case(geometry, dtype, {8, 12280, 12288, 424u}, MappingPattern::Identity);
+            if (full) {
+                failures +=
+                    run_a3_case(geometry, dtype, {7, 20000, 20007, 425u}, MappingPattern::Identity);
+                failures +=
+                    run_a3_case(geometry, dtype, {8, 33000, 33008, 426u}, MappingPattern::Identity);
             }
         }
 

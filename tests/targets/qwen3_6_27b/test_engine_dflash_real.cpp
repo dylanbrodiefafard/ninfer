@@ -1890,7 +1890,7 @@ int main() {
         }
     }
 
-    // Packed verify is T=W (SmallT GQA at T<=6; Prompt GQA at T>6 on 24 heads). Ordinary
+    // Packed verify is T=W (SmallT GQA at T<=8 on 24 heads). Ordinary
     // decode stays T=1 GEMV. The separately qualified floating-point schedules can flip a
     // later greedy boundary (k=1 and k=4, prompt 0, token 21). C>1 must still match saved C=1
     // DFlash of the same k exactly (row isolation), and the C=6 run below crosses that point.
@@ -2177,11 +2177,17 @@ int main() {
     if (only_k == nullptr || std::string(only_k) == "3") {
         if (const int result = run_k(3, "DFlash2 k=3 chain C=6"); result != 0) { return result; }
     }
-    if (only_k == nullptr || std::string(only_k) == "4" || std::string(only_k) == "7") {
+    if (only_k == nullptr || std::string(only_k) == "4") {
         if (const int result = run_k(4, "DFlash2 k=4 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "5") {
         if (const int result = run_k(5, "DFlash2 k=5 chain C=6"); result != 0) { return result; }
+    }
+    if (only_k == nullptr || std::string(only_k) == "6") {
+        if (const int result = run_k(6, "DFlash2 k=6 chain C=6"); result != 0) { return result; }
+    }
+    if (only_k == nullptr || std::string(only_k) == "7") {
+        if (const int result = run_k(7, "DFlash2 k=7 chain C=6"); result != 0) { return result; }
     }
 
     {

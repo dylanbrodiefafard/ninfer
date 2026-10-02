@@ -19,12 +19,13 @@ int main() {
         failures += run_profile(
             "rmsnorm_linear_swiglu/nvfp4-a8",
             Profile{QType::NVFP4, 34816, 5120, 17408, 0x8317U, ActivationCompute::A8, true},
-            std::array<std::int32_t, 15>{1, 3, 4, 5, 6, 8, 12, 16, 20, 24, 25, 30, 32, 33, 36},
-            std::array<std::int32_t, 4>{4, 5, 24, 36});
-        failures += run_profile(
-            "LinearSwiGLU NVFP4_A8",
-            {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A8},
-            std::array<std::int32_t, 15>{4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24, 25, 30, 33, 36});
+            std::array<std::int32_t, 18>{1, 3, 4, 5, 6, 8, 12, 16, 20, 24, 25, 30, 32, 33, 36, 40,
+                                         42, 48},
+            std::array<std::int32_t, 5>{4, 5, 24, 36, 48});
+        failures += run_profile("LinearSwiGLU NVFP4_A8",
+                                {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A8},
+                                std::array<std::int32_t, 17>{4, 5, 6, 8, 10, 12, 15, 16, 18, 20, 24,
+                                                             25, 30, 33, 36, 42, 48});
         // Every verify width uses A8; aggregated C=2..6 rows equal their W-panels.
         for (const bool fused_norm : {false, true}) {
             const Profile a8{QType::NVFP4,          34816,     5120, 17408, 1805U,
@@ -41,6 +42,10 @@ int main() {
                                                   std::array<std::int32_t, 5>{10, 15, 20, 25, 30});
             failures += run_packed_matches_panels(std::string(name) + " W6 panels", a8, 6,
                                                   std::array<std::int32_t, 5>{12, 18, 24, 30, 36});
+            failures += run_packed_matches_panels(std::string(name) + " W7 panels", a8, 7,
+                                                  std::array<std::int32_t, 5>{14, 21, 28, 35, 42});
+            failures += run_packed_matches_panels(std::string(name) + " W8 panels", a8, 8,
+                                                  std::array<std::int32_t, 5>{16, 24, 32, 40, 48});
         }
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},

@@ -706,8 +706,8 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
         ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
     const std::size_t norm_witness =
         std::max(ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
-                                                                    geometry.heads == 48 ? 36 : 16,
-                                                                    geometry.heads == 48 ? 36 : 16),
+                                                                    geometry.heads == 48 ? 48 : 16,
+                                                                    geometry.heads == 48 ? 48 : 16),
                  ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
                                                                     64, 64));
     if (norm_interval != norm_witness) {
@@ -744,14 +744,14 @@ int main() {
     }
 
     int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {36, 1024, 2048, 4096, 4097});
+    failures += verify_workspace_capacity_contract(kQwen27, {48, 1024, 2048, 4096, 4097});
     failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
     failures += verify_packed_workspace_rejections();
 
     // Every registered 27B projection route, including predicated and full token tiles.
-    // Narrow MMA tile boundaries and the T=36/37 transition to the long-context schedule.
+    // Narrow MMA tile boundaries and the T=48/49 transition to the long-context schedule.
     for (const std::int32_t tokens :
-         {1, 2, 6, 8, 9, 12, 16, 17, 32, 33, 36, 37, 1024, 1025, 2049, 4097}) {
+         {1, 2, 6, 8, 9, 12, 16, 17, 32, 33, 36, 37, 48, 49, 1024, 1025, 2049, 4097}) {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }
@@ -779,6 +779,11 @@ int main() {
     failures += run_norm_packed_columns_match_decode(kQwen27, 24, 0x6218u, 4);
     failures += run_norm_packed_columns_match_decode(kQwen27, 12, 0x620du, 6);
     failures += run_norm_packed_columns_match_decode(kQwen27, 36, 0x6224u, 6);
+    // DFlash k=6/7 verify: W=7/8 across C=4..6 reaches the 48-column split-40 tile.
+    failures += run_norm_packed_columns_match_decode(kQwen27, 28, 0x621cu, 7);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 42, 0x622au, 7);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 40, 0x6228u, 8);
+    failures += run_norm_packed_columns_match_decode(kQwen27, 48, 0x6230u, 8);
     failures += run_norm_packed_columns_match_decode(kQwen27, 24, 0x6118u, 12);
     failures += run_norm_packed_columns_match_decode(kQwen27, 34, 0x6122u, 17);
     failures += run_norm_packed_columns_match_decode(kQwen27, 6, 0x6126u, 1);

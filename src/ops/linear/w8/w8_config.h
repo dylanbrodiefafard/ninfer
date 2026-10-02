@@ -31,20 +31,23 @@ struct W8LinearGeometry {
 
 template <int KWarps, int TileTokens, int MinBlocksPerSm, W8SmallTMmaScaleAccess ScaleAccess,
           Cache ActivationCache = Cache::ca, Cache WeightCache = Cache::cg,
-          W8SmallTMmaActivationStage ActivationStage = W8SmallTMmaActivationStage::ActiveOnly>
+          W8SmallTMmaActivationStage ActivationStage = W8SmallTMmaActivationStage::ActiveOnly,
+          bool DynamicShared                         = false>
 struct W8SmallTMmaSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
                   TileTokens == 40 || TileTokens == 48);
     static_assert(MinBlocksPerSm > 0);
 
-    static constexpr int kKWarps            = KWarps;
-    static constexpr int kTileTokens        = TileTokens;
-    static constexpr int kMinBlocksPerSm    = MinBlocksPerSm;
-    static constexpr auto kScaleAccess      = ScaleAccess;
-    static constexpr auto kActivationCache  = ActivationCache;
-    static constexpr auto kWeightCache      = WeightCache;
-    static constexpr auto kActivationStage  = ActivationStage;
+    static constexpr int kKWarps           = KWarps;
+    static constexpr int kTileTokens       = TileTokens;
+    static constexpr int kMinBlocksPerSm   = MinBlocksPerSm;
+    static constexpr auto kScaleAccess     = ScaleAccess;
+    static constexpr auto kActivationCache = ActivationCache;
+    static constexpr auto kWeightCache     = WeightCache;
+    static constexpr auto kActivationStage = ActivationStage;
+    // Tiles whose staging exceeds the 48 KiB static limit opt into launch-time dynamic storage.
+    static constexpr bool kDynamicShared    = DynamicShared;
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kGroupK            = KWarps * kTileKPerWarp;
@@ -67,7 +70,7 @@ using W8MtpDownProjectionGeometry      = W8LinearGeometry<5120, 17408>;
 using W835bMtpProjectionGeometry       = W8LinearGeometry<2048, 4096>;
 
 inline constexpr std::int32_t kW8VocabularyFirstSmallT         = 1;
-inline constexpr std::int32_t kW8VocabularyLastSmallT          = 33;
+inline constexpr std::int32_t kW8VocabularyLastSmallT          = 48;
 inline constexpr std::int32_t kW8MtpInputFirstSmallT           = 1;
 inline constexpr std::int32_t kW8MtpInputLastSmallT            = 48;
 inline constexpr std::int32_t kW8MtpAttentionFirstSmallT       = 1;
@@ -89,15 +92,19 @@ struct W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry, ActiveTo
     static_assert(ActiveTokens >= kW8VocabularyFirstSmallT);
     static_assert(ActiveTokens <= kW8VocabularyLastSmallT);
 
+    // One eight-K-warp reduction through T=48 lets packed verify share one weight pass; tiles
+    // above 32 tokens exceed static shared memory and launch with dynamic shared memory.
     static constexpr int kTileTokens = ActiveTokens <= 8    ? 8
                                        : ActiveTokens <= 16 ? 16
                                        : ActiveTokens <= 24 ? 24
                                        : ActiveTokens <= 32 ? 32
-                                                            : 40;
-    static constexpr int kKWarps     = ActiveTokens <= 32 ? 8 : 4;
+                                       : ActiveTokens <= 40 ? 40
+                                                            : 48;
+    static constexpr int kKWarps     = 8;
     static constexpr auto kScaleAccess =
         ActiveTokens > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess>;
+    using Type = W8SmallTMmaSchedule<kKWarps, kTileTokens, 2, kScaleAccess, Cache::ca, Cache::cg,
+                                     W8SmallTMmaActivationStage::ActiveOnly, (kTileTokens > 32)>;
 };
 
 template <int ActiveTokens>
