@@ -28,12 +28,12 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 5> k27Routes{{
     // A fixed split-40 reduction covers decode and compact verify batches. The narrow token
-    // tiles share identical arithmetic, including packed C=1..6 execution through T=36.
-    {{1, 36}, Bf16GdnGatingScheduleId::MmaCooperativeSplit40},
+    // tiles share identical arithmetic, including packed C=1..6 x W<=8 execution through T=48.
+    {{1, 48}, Bf16GdnGatingScheduleId::MmaCooperativeSplit40},
     // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
     // of making T a launch limit. Once the unsplit grid has enough independent work, it also
     // removes the cooperative-residency constraint.
-    {{37, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{49, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
@@ -147,7 +147,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
             // 120 CTAs, at most six warps and 20 KiB shared per CTA: one CTA/SM suffices
             // on the 170-SM RTX 5090, independently of the token-tile specialization.
-            return problem.cols <= 36;
+            return problem.cols <= 48;
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
@@ -348,7 +348,7 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_packed_plan(const Bf16GdnGatingProblem& problem) {
     if (!is_27(problem) || problem.cols < 2 || problem.cols > kBf16GdnGatingPackedMaxCols) {
-        throw std::invalid_argument("BF16 GDN gating: packed plan requires 27B T=2..36");
+        throw std::invalid_argument("BF16 GDN gating: packed plan requires 27B T=2..48");
     }
     return make_plan(Bf16GdnGatingScheduleId::MmaCooperativeSplit40, problem);
 }

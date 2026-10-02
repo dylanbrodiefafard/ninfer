@@ -52,12 +52,12 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     if (quantized && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::DecodeSplitScale);
     }
-    if (quantized && tokens == 6 && window > 128 && window <= 160) {
+    if (quantized && tokens >= 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (quantized && tokens == 6 && window > 5000 && window <= 8198) {
+    if (quantized && tokens >= 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
@@ -171,7 +171,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
-    if constexpr (TokenTile == 6) {
+    if constexpr (TokenTile >= 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
         if (implementation_window > 128 && implementation_window <= 160) {
@@ -219,7 +219,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
-// T=6 windows in (8198, 32768] use the two-stage pipelined NVFP4 kernel. Its double buffers
+// T>=6 windows in (8198, 32768] use the two-stage pipelined NVFP4 kernel. Its double buffers
 // admit one CTA per SM, which wins only while the grid fits one wave, so these launches cap the
 // split count to one wave of the batch grid. Wider windows keep two single-stage CTAs per SM.
 constexpr std::int32_t kRtx5090SmCount = 170;
@@ -293,7 +293,7 @@ void launch_tc_partial_nvfp4(const Tensor& q, CacheInput input, const Tensor& po
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
-    if constexpr (TokenTile == 6) {
+    if constexpr (TokenTile >= 6) {
         if (implementation_window > 128 && implementation_window <= 160) {
             launch.template operator()<24, 1, 32, false, false>();
         } else if (implementation_window <= 2054) {
@@ -355,11 +355,19 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 } // namespace
 
-bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
+std::int32_t gqa_attention_small_t_max_tokens(std::int32_t q_heads) {
+    if (q_heads == Gqa27Geometry::QHeads) { return Gqa27Geometry::SmallTMaxTokens; }
+    if (q_heads == Gqa35Geometry::QHeads) { return Gqa35Geometry::SmallTMaxTokens; }
+    throw std::invalid_argument("gqa_attention small-T: unsupported head geometry");
+}
+
+bool gqa_attention_uses_small_t(std::int32_t q_heads, std::int32_t tokens) {
+    return tokens >= 1 && tokens <= gqa_attention_small_t_max_tokens(q_heads);
+}
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 ||
+    if (!gqa_attention_uses_small_t(q_heads, tokens) ||
         (cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
@@ -389,7 +397,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const std::int32_t splits_base =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
     const std::int32_t splits =
-        cache.dtype == DType::U8 && !cache.sage_pv && invocation.width == 6 &&
+        cache.dtype == DType::U8 && !cache.sage_pv && invocation.width >= 6 &&
                 nvfp4_pipelined_window(implementation_window)
             ? nvfp4_pipelined_splits<Geometry>(splits_base, implementation_window,
                                                static_cast<std::int32_t>(invocation.batch_size))
@@ -463,6 +471,18 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     case 6:
         NINFER_GQA_SMALL_T_DISPATCH(6, 4);
         break;
+    case 7:
+        if constexpr (Geometry::SmallTMaxTokens >= 7) {
+            NINFER_GQA_SMALL_T_DISPATCH(7, 4);
+            break;
+        }
+        throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
+    case 8:
+        if constexpr (Geometry::SmallTMaxTokens >= 8) {
+            NINFER_GQA_SMALL_T_DISPATCH(8, 4);
+            break;
+        }
+        throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }

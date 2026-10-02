@@ -653,7 +653,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                              logit_token_ids,
                                              dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                              dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
-                                             selector_ids, selector_q, seed_xor, position_offset);
+                                             selector_ids, selector_q, seed_xor, position_offset,
+                                             false,
+                                             V::dflash_p_less_draft_temperature_scale(k));
                 };
                 if (state.execution.proposal_head == ProposalHead::Full) {
                     Tensor logits = state.execution.work.alloc(
@@ -807,7 +809,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         frame.sampling + row_begin, drafts, state.execution.work,
                         state.execution.device.stream, logit_token_ids,
                         dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
-                        dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids, &sel_q);
+                        dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids, &sel_q,
+                        0, 0, false, V::dflash_p_less_draft_temperature_scale(k));
                 } else {
                     for (std::int32_t row = 0; row < batch_size; ++row) {
                         Tensor logits_row = logits_batch.slice(2, row, 1);
@@ -824,7 +827,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                             state.execution.work, state.execution.device.stream, logit_token_ids,
                             dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                             dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids_row,
-                            &sel_q_row);
+                            &sel_q_row, 0, 0, false,
+                            V::dflash_p_less_draft_temperature_scale(k));
                     }
                 }
             };
@@ -1014,8 +1018,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         state.execution.work.reset();
         const std::int32_t w_ceil = frame.verify_ids.ne[0];
         const bool compact        = vw < w_ceil; // LLD Capture/run: no extra nodes when W(k)==W_ceil
-        // pending_features is stored at W_ceil. prepare_ragged_prefix requires dest.ne[1]
-        // == source.ne[1]; compact the live W(k) prefix only for append/verify consumers.
+        // pending_features is stored at W_ceil. The previous round may have used a longer k, so
+        // its committed prefix can exceed the live W(k): append the full W_ceil ragged prefix.
         Tensor prepare_positions =
             frame.append_positions.slice(0, 0, w_ceil).slice(1, 0, batch_size);
         Tensor prefix_features = state.execution.work.alloc(
@@ -1023,19 +1027,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
                                    frontiers, prefix_features, prepare_positions, append_counts,
                                    state.execution.device.stream);
-        Tensor append_features   = prefix_features;
-        Tensor append_positions  = prepare_positions;
-        if (compact) {
-            append_features = state.execution.work.alloc(
-                DType::BF16, {Variant::DFlashConfig::feature_rows, vw, batch_size});
-            qwen3_6::copy_strided_width_panel(append_features, prefix_features,
-                                              state.execution.device.stream);
-            Tensor packed_append = state.execution.work.alloc(DType::I32, {vw, batch_size});
-            qwen3_6::copy_i32_panel(packed_append, prepare_positions.slice(0, 0, vw),
-                                    state.execution.device.stream);
-            append_positions = packed_append;
-        }
-        append_context_impl<Variant>(state, append_features, append_positions, append_counts,
+        append_context_impl<Variant>(state, prefix_features, prepare_positions, append_counts,
                                      lanes, dflash_rows, envelopes.append);
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes, verify_width,

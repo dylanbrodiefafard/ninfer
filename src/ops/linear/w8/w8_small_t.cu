@@ -20,11 +20,17 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+    constexpr std::size_t kSharedBytes = w8_small_t_mma_dynamic_shared_bytes<Schedule>;
+    constexpr auto kernel = w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule, W8ContiguousOutput>;
+    if constexpr (kSharedBytes > 0) {
+        static const cudaError_t attr = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes));
+        CUDA_CHECK(attr);
+    }
+    kernel<<<kBlocks, Schedule::kThreads, kSharedBytes, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},
+        W8SmallTMmaIdentityRows{});
     CUDA_CHECK(cudaGetLastError());
 }
 

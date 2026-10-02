@@ -379,7 +379,8 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                                      std::int32_t* selector_ids, float* selector_q,
                                     std::int32_t tokens, std::int32_t batch,
                                     const SamplingConfig* configs, unsigned long long seed_xor,
-                                     std::int32_t position_offset, bool force_greedy) {
+                                    std::int32_t position_offset, bool force_greedy,
+                                    float p_less_draft_temperature_scale) {
     const int b   = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     if (b >= batch) { return; }
@@ -389,7 +390,9 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
     // their own draft temperature: the shortlist softmax at the p-less target temperature itself
     // accepts less than argmax, while a lower one accepts more.
     const float temperature =
-        force_greedy ? 0.0f : (cfg.p_less != 0 ? cfg.draft_temperature : cfg.temperature);
+        force_greedy ? 0.0f
+                     : (cfg.p_less != 0 ? cfg.draft_temperature * p_less_draft_temperature_scale
+                                        : cfg.temperature);
     const unsigned long long seed  = cfg.seed ^ seed_xor;
 
     __shared__ float scores[kDflash2PathSelectK];
@@ -441,9 +444,9 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__
                     scores[c] = expf((scores[c] - m) * inv_temp);
                     sum += scores[c];
                 }
-                // Keyed by the round's first position and the hop: block verification's accepted
-                // length depends on drafts past it, so the next round must not reuse a draft
-                // uniform at the same absolute position.
+                // Keyed by the round's first position and the hop. Block verification's accepted
+                // length depends on drafts past it, so a draft uniform must not be reused by the
+                // next round's hops at the same absolute position.
                 const int round_start = logical_positions[b] + position_offset + 1;
                 const float u         = dflash2_path_select_uniform(
                     seed, round_start, kDflash2PathSelectRngPurposeDevice,

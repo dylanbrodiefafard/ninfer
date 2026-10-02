@@ -63,8 +63,9 @@ int run_nvfp4_a4() {
         "NVFP4_A4 packed-col0 [5120,17408]", make_nvfp4_weight, 5120, 17408, 725U,
         ops::LinearPolicy::AllowA4, packed_col0);
     constexpr std::array<std::int32_t, 5> dflash_batches{2, 3, 4, 5, 6};
-    // Gate-up/down aggregate every width whose request panel already takes W4A4 (down: W>=3).
-    for (const std::int32_t width : {2, 3, 4, 5, 6}) {
+    // Gate-up/down aggregate every width whose request panel already takes W4A4 (down: W>=3),
+    // including the k=6/7 chains (W=7/8, T<=48).
+    for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
         failures += run_packed_sequences_matches_panels(
             "NVFP4_A4 DFlash gate-up packed", make_nvfp4_weight, 34816, 5120, 731U, width,
             dflash_batches, ops::LinearPolicy::AllowA4, false);

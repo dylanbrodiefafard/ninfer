@@ -402,9 +402,12 @@ One propose block:
    precision from the request-local width through `packed_route_tokens`: W=2..3 retains A16,
    while the selected policy permits A8 for ordinary and GDN verification projections at
    W=4/5/6, independently of concurrency. Prefill and ordinary decode retain their text policy.
-   Qualified NVFP4 MLP, attention-input and residual projections aggregate through W=6;
-   BF16 residual and attention-input aggregation stays at
-   W=5. T=20 retains the T=5 panel reduction profile. GDN control uses its packed-sequence Op.
+   Qualified NVFP4 MLP, attention-input and residual projections aggregate through W=8.
+   BF16 MMA keeps one K-ordered accumulator per output under every tile, so BF16 attention input
+   aggregates for every W and BF16 residuals for W>=5 (W=2..4 panels use the SmallT residual);
+   each request keeps its panel's exact output. The W8 vocabulary and Q4 draft heads share one
+   weight pass of at most 48 columns with the panel reduction. GDN control uses its
+   packed-sequence Op.
    SmallT
    GQA uses one batched launch with request-indexed partial CTAs and a batched reduction, preserving
    each request's arithmetic without taking the generic `MultiBatch=true` route. ReplaySSM records
@@ -427,14 +430,17 @@ One propose block:
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
    accepts the matching prefix.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less uses block verification
-   (Sun et al. 2024) over the chain with the recorded selector `q`: exact, never shorter in
-   expectation than per-hop Leviathan, correction from `max(p_τ p' − q, 0)`, bonus from its
-   column's p-less distribution. Draft and block-accept uniforms are keyed by the round's first
-   position and the hop, so a round never reuses a uniform the previous round conditioned on.
+   (Sun et al. 2024) over the chain with the recorded selector `q`: it accepts the longest prefix
+   the block test admits, which is exact and never shorter in expectation than per-hop Leviathan,
+   and samples the correction from `max(p_τ p' − q, 0)` or the bonus from its column's p-less
+   distribution. DFlash2 p-less drafts are sampled at the draft temperature scaled by the
+   target's block-length calibration (27B: ×1 for k≤5, ×0.875 at k=6, ×0.75 at k=7). Draft and
+   block-accept uniforms are keyed by the round's first position and the hop, so a round never
+   reuses a uniform the previous round's acceptance conditioned on.
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
    single-request recommendation is k=4 (W=5, one SmallT GQA tile); concurrent long-reasoning
    settings are measured in [performance.md](../performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22).
-   Maximum k=5 (W=6). `--adaptive-draft` picks live k in `{3,4,5}` as in
+   Maximum k=7 (W=8). `--adaptive-draft` picks live k in `{3..N}` for `--draft-tokens N>=5` as in
    [§8.1](#81-adaptive-draft-length). Frozen
    `--draft-tokens 4` stays `{4}`. CUDA graphs capture one graph per k; the next k is chosen
    after the round (lagged one round, no post-draft host seam).
@@ -451,9 +457,10 @@ the **next** round. “Lock” means: do not mix k as a bandit; take the current
 
 | State | Lifetime | Role |
 |---|---|---|
-| CUDA graphs for DFlash or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed |
+| CUDA graphs for DFlash `{3..N}` or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed |
 | `T(k,C,L)` | Engine lifetime, one table per concurrency C | seconds for a k-round at this batch size and length |
-| hop chances `r_i` | one request | how far down the draft this prompt still matches |
+| DFlash hop hazards `H[law][k][i]` | Engine lifetime | block-length acceptance, learned from exploration rounds |
+| content factors `c_i` (DFlash) / hop chances `r_i` (MTP) | one request | how far down the draft this prompt still matches |
 | `live_k` | chosen after each round, used next round | which graph to run |
 
 A decode is many rounds. Round *n* runs the `live_k` picked after round *n−1*. Near the end of
@@ -472,23 +479,42 @@ measured times. Each captured k within the cap is measured once per batch size, 
 before the argmax applies; an unmeasured `T(k)` is never extrapolated from other arms. Fallback
 rounds with draft extent 0 do not update T.
 
-The numerator is the prompt. DFlash proposes a chain of k drafts. Hop i can succeed only if
-hops `0..i-1` already matched (Leviathan nested survival):
+The numerator is the prompt. A draft of k proposes a chain; hop i can succeed only if hops
+`0..i-1` already matched (Leviathan nested survival):
 
 `r_i = P(accept hop i | prefix accepted)`, `q_i = r_0 ⋯ r_i`,
 `E[Y(k)] = 1 + q_0 + ⋯ + q_{k-1}`
 
-(The leading 1 is the bonus target token.) Online, each `r_i` is a discounted Beta-Bernoulli,
-updated only if the prefix reached i, so a k-round never observes `r_i` for `i >= k`. For DFlash
-an unseen `r_i` counts as 1 in `E[Y]`: its optimism is bounded by the seen prefix product `q_{i-1}`, and
-the first round that drafts that deep replaces it with the posterior. Omitting unseen hops
-instead gave every k above the deepest observed hop the same `E[Y]` at a higher T, so a request
-that started short could never move up. On a warm C=1 server that locked every new request at
-the cheapest k (k=1 at ~111 tok/s against ~148 tok/s for the fixed k=5 it should find). A new
-request **resets** these coins; it does not inherit the last prompt’s accept rate, and with no
-hops DFlash scores `E[Y(k)] = 1 + k`. MTP keeps the truncated sum (unseen hops add nothing): its
-draft cost grows with k, the truncation lands on its cheapest arm k=3, which is also its best
-fixed k on most prompts, and counting unseen hops measured 5% slower at C=1.
+(The leading 1 is the bonus target token.)
+
+**DFlash.** The drafter attends bidirectionally inside its block, so hop acceptance depends on the
+block length k as well as on the prompt. The picker factors the two:
+
+`r_{k,i} = clamp(1 − c_i · H[law][k][i], 0, 0.995)`
+
+`H` is an engine-global rejection hazard per draft law (greedy, p-less, or temperature-sampled
+drafts), block length, and hop. `c_i` is the request's content factor. `H` is learned only from
+exploration rounds: one decode round in 32, chosen by a hash of a Program-wide counter (so
+independent of content), runs a uniformly drawn captured k within the round's cap as a one-round
+override that leaves the incumbent k and its switch cost untouched. Only
+full-extent rows count. Randomizing k gives every k the same content mix; learning `H` from the
+picked rounds instead would credit long k with the easy content that made the picker choose it.
+`H` shrinks in three levels from a cold start: a pooled hop hazard `P_i` over every k (prior 0.35),
+a block-length ratio `ρ_k` = failures over expected failures `Σ trials·P_i` (prior 64 expected
+failures), and `H_{k,i} = (failures + 256·ρ_k·P_i)/(trials + 256)`. Measured per-k differences
+are at most about a tenth of the hazard (greedy: flat in k; p-less: hop 0 fails about 10% more often
+at k=6/7), while content moves it several-fold, and with lighter shrinkage the learned ratios
+were mostly noise. `c_i` is the request's discounted failures at hop i over its discounted
+expected failures `Σ H` (the `H` in force before each round), with prior weight 1. Every round
+decays all of a request's hops, so a hop the picker stops reaching relaxes to its prior, which
+inherits half of `c_{i-1}`'s departure from 1. A new request starts at `c = 1`, so it scores
+the learned hazards.
+
+**MTP** drafts autoregressively, so hop i does not depend on k. Each `r_i` is a discounted
+Beta-Bernoulli per request, updated only if the prefix reached i, and `E[Y]` truncates at the
+first unseen hop: MTP draft cost grows with k, the truncation lands on its cheapest arm k=3,
+which is also its best fixed k on most prompts, and counting unseen hops measured 5% slower at
+C=1.
 
 Then `k* = argmax_k E[Y(k)] / T(k,C,L)`. Switching charges that arm an extra 1 ms so a
 coin-flip lead does not thrash graphs. Ties keep the smaller k. At C≥2 the batch has one k:
@@ -498,16 +524,21 @@ A mixing bandit would keep sampling 3, 4, and 5. Mixing k forks the greedy CUDA-
 and, at C≥2, makes every row wait on the same k. T is engine-global per batch size, and each
 captured k is measured once per batch size before exploitation: shorter arms bound nothing,
 because verify routes and tiles change with T=W×C (a C=4 k=4 round is cheaper than k=3 or k=5).
-After T is measured the policy always takes the current argmax. That is sticky; it may still
-move if hops really change, or if budget cannot afford the locked k.
+After T is measured the policy takes the current argmax, except that DFlash spends one round in
+32 on a uniformly drawn k to learn `H`. That is sticky; it may still move if hops really change,
+or if budget cannot afford the locked k.
 
-On a long-lived serve, T is known after the first requests. A later request starts with empty
-hops (`live_k = 0` on C=1), scores `1 + k` per arm, so it drafts the longest affordable
-competitive k first and learns its deep hops from that round. Host tests cover hop updates,
-dominance, one measurement per arm, the warm-server start, and shared batch k. DFlash captures
-`{3,4,5}` like MTP: on the A8 verify routes k=1/2 never beat k=3 at any C=1..6 (C=1 round time
+On a long-lived serve, T is known after the first requests and `H` keeps learning across
+requests. Host tests cover hop updates, the hazard hierarchy, exploration, dominance, one
+measurement per arm, the warm-server start, and shared batch k. DFlash captures
+`{3..N}` (bounded by the target's adaptive maximum: 27B 7, 35B 5): on the A8 verify routes k=1/2
+never beat k=3 at any C=1..6 (C=1 round time
 is nearly flat in k, 14.6 ms at k=1 to 15.3–15.8 ms at k=3–5; at C≥4 a k=4 round is cheaper than a
 k=1 round), see [performance.md](../performance.md#adaptive-draft-start-and-k-set-2026-09-27).
+The 27B variant's per-k p-less draft temperature scale (x1 for k<=5, x0.875 at k=6, x0.75
+at k=7) restores hop-0 acceptance at k=7 to k=5's (0.51 against 0.49 unscaled); `ρ_k` absorbs
+the remaining differences. See
+[performance.md](../performance.md#dflash2-k6k7-verify-2026-09-29).
 
 ## 9. Speculative round semantics
 

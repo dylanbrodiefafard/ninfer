@@ -68,12 +68,13 @@ int bf16_a16_conformance() {
            bf16_a16_rejections();
 }
 
-int bf16_w5_aggregate_matches_panels() {
+// Packed verify W=5..8 (the MMA panel widths) across C=2..6 must reproduce each panel exactly.
+int bf16_aggregate_matches_panels() {
     constexpr std::int32_t kN        = 5120;
     constexpr std::int32_t kK        = 6144;
-    constexpr std::int32_t kWidth    = 5;
+    constexpr std::int32_t kMaxWidth = 8;
     constexpr std::int32_t kMaxBatch = 6;
-    constexpr std::int32_t kMaxT     = kWidth * kMaxBatch;
+    constexpr std::int32_t kMaxT     = kMaxWidth * kMaxBatch;
     ninfer::test::direct_bf16_weight::DeviceWeight weight(
         ninfer::test::direct_bf16_weight::make_patterned(kN, kK, 449U));
     std::vector<std::uint16_t> activation(static_cast<std::size_t>(kK) * kMaxT);
@@ -90,44 +91,46 @@ int bf16_w5_aggregate_matches_panels() {
     device_activation.copy_from_host(activation.data(), device_activation.bytes);
 
     int failures = 0;
-    for (std::int32_t batch = 2; batch <= kMaxBatch; ++batch) {
-        const std::int32_t tokens       = kWidth * batch;
-        const std::size_t output_words = static_cast<std::size_t>(kN) * tokens;
-        const std::size_t output_bytes = output_words * sizeof(std::uint16_t);
-        ninfer::test::GuardedDeviceBuffer aggregate(output_bytes);
-        ninfer::test::GuardedDeviceBuffer panels(output_bytes);
-        aggregate.copy_from_host(residual.data(), output_bytes);
-        panels.copy_from_host(residual.data(), output_bytes);
-        ninfer::WorkspaceArena workspace(256);
+    for (std::int32_t width = 5; width <= kMaxWidth; ++width) {
+        for (std::int32_t batch = 2; batch <= kMaxBatch; ++batch) {
+            const std::int32_t tokens      = width * batch;
+            const std::size_t output_words = static_cast<std::size_t>(kN) * tokens;
+            const std::size_t output_bytes = output_words * sizeof(std::uint16_t);
+            ninfer::test::GuardedDeviceBuffer aggregate(output_bytes);
+            ninfer::test::GuardedDeviceBuffer panels(output_bytes);
+            aggregate.copy_from_host(residual.data(), output_bytes);
+            panels.copy_from_host(residual.data(), output_bytes);
+            ninfer::WorkspaceArena workspace(256);
 
-        ninfer::Tensor aggregate_x(device_activation.p, ninfer::DType::BF16, {kK, tokens});
-        ninfer::Tensor aggregate_y(aggregate.data(), ninfer::DType::BF16, {kN, tokens});
-        ninfer::ops::linear_add(aggregate_x, weight.view(), aggregate_y, workspace, nullptr);
-        for (std::int32_t row = 0; row < batch; ++row) {
-            auto* input = static_cast<std::uint8_t*>(device_activation.p) +
-                          static_cast<std::int64_t>(row) * kWidth * kK * sizeof(std::uint16_t);
-            auto* output = static_cast<std::uint8_t*>(panels.data()) +
-                           static_cast<std::int64_t>(row) * kWidth * kN * sizeof(std::uint16_t);
-            ninfer::Tensor panel_x(input, ninfer::DType::BF16, {kK, kWidth});
-            ninfer::Tensor panel_y(output, ninfer::DType::BF16, {kN, kWidth});
-            ninfer::ops::linear_add(panel_x, weight.view(), panel_y, workspace, nullptr);
-        }
-        ninfer::test::cuda_check(cudaDeviceSynchronize(), "synchronize BF16 W5 aggregate parity");
+            ninfer::Tensor aggregate_x(device_activation.p, ninfer::DType::BF16, {kK, tokens});
+            ninfer::Tensor aggregate_y(aggregate.data(), ninfer::DType::BF16, {kN, tokens});
+            ninfer::ops::linear_add(aggregate_x, weight.view(), aggregate_y, workspace, nullptr);
+            for (std::int32_t row = 0; row < batch; ++row) {
+                auto* input = static_cast<std::uint8_t*>(device_activation.p) +
+                              static_cast<std::int64_t>(row) * width * kK * sizeof(std::uint16_t);
+                auto* output = static_cast<std::uint8_t*>(panels.data()) +
+                               static_cast<std::int64_t>(row) * width * kN * sizeof(std::uint16_t);
+                ninfer::Tensor panel_x(input, ninfer::DType::BF16, {kK, width});
+                ninfer::Tensor panel_y(output, ninfer::DType::BF16, {kN, width});
+                ninfer::ops::linear_add(panel_x, weight.view(), panel_y, workspace, nullptr);
+            }
+            ninfer::test::cuda_check(cudaDeviceSynchronize(), "synchronize BF16 aggregate parity");
 
-        std::vector<std::uint16_t> aggregate_bits(output_words);
-        std::vector<std::uint16_t> panel_bits(output_words);
-        aggregate.copy_to_host(aggregate_bits.data(), output_bytes);
-        panels.copy_to_host(panel_bits.data(), output_bytes);
-        const std::string label = "BF16 linear_add W5 aggregate parity C=" +
-                                  std::to_string(batch);
-        if (aggregate_bits != panel_bits) {
-            std::cerr << label << ": aggregate and panel outputs differ\n";
-            ++failures;
+            std::vector<std::uint16_t> aggregate_bits(output_words);
+            std::vector<std::uint16_t> panel_bits(output_words);
+            aggregate.copy_to_host(aggregate_bits.data(), output_bytes);
+            panels.copy_to_host(panel_bits.data(), output_bytes);
+            const std::string label = "BF16 linear_add W" + std::to_string(width) +
+                                      " aggregate parity C=" + std::to_string(batch);
+            if (aggregate_bits != panel_bits) {
+                std::cerr << label << ": aggregate and panel outputs differ\n";
+                ++failures;
+            }
+            failures += aggregate.verify_guards(label + " aggregate");
+            failures += panels.verify_guards(label + " panels");
         }
-        failures += aggregate.verify_guards(label + " aggregate");
-        failures += panels.verify_guards(label + " panels");
     }
-    failures += weight.verify_preserved("BF16 W5 aggregate parity weight");
+    failures += weight.verify_preserved("BF16 aggregate parity weight");
     return failures;
 }
 
@@ -140,7 +143,7 @@ int main() {
     }
 
     try {
-        const int failures = bf16_a16_conformance() + bf16_w5_aggregate_matches_panels();
+        const int failures = bf16_a16_conformance() + bf16_aggregate_matches_panels();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 LinearAdd\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
