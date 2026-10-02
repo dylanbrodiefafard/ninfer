@@ -69,12 +69,14 @@ Select evidence according to the claim being made:
 
 Use the existing project workflows instead of inventing parallel verification paths:
 
-- `./scripts/run-unit-tests.sh` for the full C++ unit suite before a commit or push of
-  substantial work;
+- `./scripts/run-unit-tests.sh --fast` often while working, the full
+  `./scripts/run-unit-tests.sh` after substantial work, and `--real` when the change touches
+  Engine, runtime, cache, speculative, or serving behavior;
 - [`docs/maintainer/code-quality.md`](docs/maintainer/code-quality.md) for the mandatory quality
-  gates: the `-Werror` build, `pre-commit run` (formatting, ruff, shellcheck, typos, file
-  hygiene), the whole-tree `./scripts/run-clang-tidy.py`, and compute-sanitizer for changed
-  kernels;
+  gates and the commit hook that formats and lints every commit (enable it with
+  `./scripts/dev-setup.sh` or `git config core.hooksPath .githooks`);
+- [`docs/maintainer/merging-to-master.md`](docs/maintainer/merging-to-master.md) for the full
+  gate set, sanitizers included, that every merge into `master` must pass;
 - [`tests/README.md`](tests/README.md) for test organization and commands;
 - [`bench/README.md`](bench/README.md) for product and operator benchmarks; and
 - [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op

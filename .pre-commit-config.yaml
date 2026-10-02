@@ -1,9 +1,13 @@
 # Pinned formatters, linters, and file checks. Every tool version lives here (clang-tidy, which
 # needs the CUDA build tree, is pinned in scripts/run-clang-tidy.py and runs in the builder).
 #
-#   pre-commit install                          # run the fast hooks on every commit
-#   pre-commit run --all-files                  # whole tree (what CI runs)
-#   pre-commit run clang-tidy --hook-stage manual
+# The commit hook (.githooks/pre-commit) runs these on staged files, folds the automatic fixes
+# into the commit, and fails only when a check still fails. Enable it once per checkout:
+#
+#   git config core.hooksPath .githooks                  # ./scripts/dev-setup.sh does this
+#   pre-commit run --all-files                           # every commit-stage hook, whole tree
+#   pre-commit run clang-tidy-changed --hook-stage manual
+#   pre-commit run clang-tidy-full --hook-stage manual   # whole-tree clang-tidy (master gate)
 #
 # `prek` (https://github.com/j178/prek) is a drop-in, faster runner for this same file.
 # Policy and rationale: docs/maintainer/code-quality.md.
@@ -58,7 +62,15 @@ repos:
 
   - repo: local
     hooks:
-      - id: clang-tidy
+      # clang-tidy needs the running builder and a built tree, so it is not part of the commit
+      # hook. Changed lines while working; the whole tree before a merge into master.
+      - id: clang-tidy-changed
+        name: clang-tidy (lines changed vs. origin/HEAD, builder container)
+        entry: scripts/run-clang-tidy.py --changed
+        language: system
+        pass_filenames: false
+        stages: [manual]
+      - id: clang-tidy-full
         name: clang-tidy (whole tree, builder container)
         entry: scripts/run-clang-tidy.py
         language: system

@@ -21,6 +21,16 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# Every checkout that builds or tests uses the repository commit hook (.githooks/pre-commit):
+# it formats and lints staged files and folds the fixes into the commit.
+if [[ "$(git -C "$ROOT" config --get core.hooksPath || true)" != ".githooks" ]]; then
+  git -C "$ROOT" config core.hooksPath .githooks
+  echo "Enabled the commit hook (core.hooksPath=.githooks)."
+fi
+if ! command -v pre-commit >/dev/null 2>&1 && ! command -v prek >/dev/null 2>&1; then
+  echo "The commit hook needs its runner: python3 -m pip install pre-commit==4.6.2" >&2
+fi
+
 if [[ "${NINFER_REBUILD_BUILDER:-0}" == "1" ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "Building builder image ${IMAGE} from Dockerfile build stage..."
   docker build --target build --tag "$IMAGE" "$ROOT"

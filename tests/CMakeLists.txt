@@ -34,8 +34,10 @@ function(ninfer_add_test name)
   add_test(NAME ${name} COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:${name}>)
 endfunction()
 
+# Op tests carry the `kernel` label: they are the tests compute-sanitizer runs over.
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
+  set_property(TEST ${name} APPEND PROPERTY LABELS kernel)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
@@ -505,3 +507,10 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+# Tests that run for minutes. `./scripts/run-unit-tests.sh --fast` skips them.
+set_property(TEST
+    ninfer_gqa_attention_test
+    ninfer_speculative_round_test
+    ninfer_attn_input_proj_test
+  APPEND PROPERTY LABELS slow)

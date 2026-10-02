@@ -85,8 +85,9 @@ def find_clang_tidy() -> str:
                 f"Install it with: python3 -m pip install clang-tidy=={CLANG_TIDY_VERSION}"
             )
     sys.exit(
-        f"clang-tidy {CLANG_TIDY_VERSION} not found; rebuild the builder image "
-        f"(NINFER_REBUILD_BUILDER=1 ./scripts/dev-setup.sh) or set NINFER_CLANG_TIDY"
+        f"clang-tidy {CLANG_TIDY_VERSION} not found; start the builder (./scripts/dev-setup.sh), "
+        f"rebuild its image (NINFER_REBUILD_BUILDER=1 ./scripts/dev-setup.sh), or set "
+        f"NINFER_CLANG_TIDY"
     )
 
 
