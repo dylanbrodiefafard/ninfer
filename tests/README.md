@@ -105,8 +105,10 @@ real-artifact Engine tests):
 `./scripts/dev-setup.sh` starts `ninfer-builder` from this repository's Dockerfile
 `build` stage when the container is not already running. Extra arguments go to CTest
 (`./scripts/run-unit-tests.sh -R ninfer_sampling_test`). `--fast` skips the tests labelled
-`slow` (each runs for minutes) and is the run to repeat while working; Op tests carry the
-`kernel` label, which selects the tests compute-sanitizer runs over (`-L kernel`). `--real` includes the
+`slow` (each runs for minutes) and is the run to repeat while working. Op tests carry the
+`kernel` label; the `sanitizer` and `racecheck` labels select the sets the compute-sanitizer
+gates run, including the `<test>_sanitizer` registrations that run a suite's reduced
+`--sanitizer` cases. `--real` includes the
 opt-in Engine tests and auto-finds exact `.ninfer` filenames in `models/`, `out/`,
 `/models`, the builder's models mount, and sibling folders of that mount. Override
 with environment variables or `models/weights.env`. `--print-weights` shows what

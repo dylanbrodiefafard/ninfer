@@ -1,6 +1,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ops/op_tester.h"
+#include "ops/sanitizer_scope.h"
 
 #include <algorithm>
 #include <cmath>
@@ -3334,14 +3335,9 @@ int column_eligibility_cases(int domain, int physical) {
     return failures;
 }
 
-} // namespace
-
-int main() {
-    if (cuda_unavailable()) {
-        std::cerr << "FAIL: no usable CUDA device\n";
-        return 1;
-    }
-
+// Every chain-verify route once at its boundary shapes: deterministic and small-sample cases that
+// each issue a handful of launches. This list is the test's `--sanitizer` scope.
+int run_route_cases() {
     int failures = 0;
     failures += column_eligibility_cases(64, 64);
     failures += column_eligibility_cases(4096, 4096);
@@ -3361,33 +3357,11 @@ int main() {
             return ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
         },
         "speculative accept workspace accepted an invalid draft interval");
-    const std::size_t tree12 =
-        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 1);
-    if (tree12 == 0 || tree12 != ops::sampling_workspace_capacity_bytes(257, 12, 12) ||
-        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 2) !=
-            2 * tree12 ||
-        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(64, 4, 4, 1, 1) != 0) {
-        std::cerr << "speculative tree accept workspace did not close over packed width\n";
-        ++failures;
-    }
-    failures += expect_invalid_argument(
-        [&] {
-            return ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
-        },
-        "speculative tree accept workspace accepted W<2");
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
-    failures += greedy_tree_extent_case(7, 1);
-    failures += greedy_tree_extent_case(0, 0);
-    failures += greedy_tree_second_child_case(64);
-    failures += greedy_tree_second_child_case(257);
-    failures += tree_sampling_membership_cases(64);
-    failures += tree_sampling_membership_cases(257);
-    failures += tree_sampling_presence_overlay_case(64);
-    failures += tree_sampling_presence_overlay_case(257);
     failures += deterministic_sampling_case();
     failures += suppressed_bonus_case();
     failures += suppressed_draft_rejection_case(64);
@@ -3398,17 +3372,6 @@ int main() {
     failures += p_less_suppressed_draft_rejection_case(64);
     failures += p_less_suppressed_draft_rejection_case(257);
     failures += p_less_suppressed_distractor_accept_case();
-    failures += p_less_tree_membership_cases(64);
-    failures += p_less_tree_membership_cases(257);
-    failures += p_less_dflash2_product_tree_multiblock_case();
-    failures +=
-        p_less_tree_batch_row_isolation_case(257, 257, "p-less tree B=2 row isolation V=257");
-    failures += p_less_tree_batch_row_isolation_case(248320, 248077,
-                                                     "DFlash2 p-less tree B=2 row isolation");
-    failures += p_less_tree_batch_flat_support_isolation_case(
-        257, 257, 48ull, "p-less tree B=2 flat-support isolation V=257");
-    failures += p_less_tree_batch_flat_support_isolation_case(
-        248320, 248077, 8ull, "DFlash2 p-less tree B=2 flat-support isolation");
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);
@@ -3423,14 +3386,6 @@ int main() {
     failures += fractional_q_accepts_when_p_covers_q();
     failures += fractional_q_rejects_when_p_is_zero();
     failures += residual_p_minus_q_prefers_uncovered_mass();
-    failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 0.0f);
-    failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 1.0f);
-    failures += p_less_sampled_draft_preserves_target_distribution(248320, 248077, 0.0f);
-    // Both verify routes: single-block (small vocabulary) and multi-block finalize (product V).
-    failures += p_less_block_verification_case(64, 64, false);
-    failures += p_less_block_verification_case(64, 64, true);
-    failures += p_less_block_verification_case(248320, 248077, false);
-    failures += p_less_block_verification_case(248320, 248077, true);
     failures += p_less_fractional_q_residual_does_not_reemit_draft(
         64, 64, 11, "p-less fractional q residual does not re-emit draft V=64");
     failures += p_less_fractional_q_residual_does_not_reemit_draft(
@@ -3461,6 +3416,55 @@ int main() {
         64, 64, 48ull, "p-less typical_exclude later hops keep argmax V=64");
     failures += p_less_typical_exclude_later_hops_keep_argmax(
         2048, 2048, 32ull, "p-less typical_exclude later hops keep argmax V=2048");
+    failures += p_less_chain_column_local_support_case(
+        2048, 2048, 32ull, "p-less chain samples each verify column's support V=2048");
+    failures += p_less_chain_column_local_support_case(
+        248320, 248077, 4ull, "DFlash2 p-less chain samples each verify column's support");
+    failures += p_less_chain_later_hops_sample_target(
+        64, 64, "p-less chain later-hop target distribution V=64");
+    failures += p_less_chain_later_hops_sample_target(
+        64, 64, "p-less bonus target distribution V=64", true);
+    failures += batched_selector_row_isolation_case();
+    return failures;
+}
+
+// Tree-verify routes. The qwen3.8-27b DFlash2 flow verifies chains only, so these are outside the
+// `--sanitizer` scope.
+int run_tree_route_cases() {
+    int failures = 0;
+    const std::size_t tree12 =
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 1);
+    if (tree12 == 0 || tree12 != ops::sampling_workspace_capacity_bytes(257, 12, 12) ||
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 12, 12, 1, 2) !=
+            2 * tree12 ||
+        ops::speculative_accept_tree_drafts_workspace_capacity_bytes(64, 4, 4, 1, 1) != 0) {
+        std::cerr << "speculative tree accept workspace did not close over packed width\n";
+        ++failures;
+    }
+    failures += expect_invalid_argument(
+        [&] {
+            return ops::speculative_accept_tree_drafts_workspace_capacity_bytes(257, 1, 12, 1, 1);
+        },
+        "speculative tree accept workspace accepted W<2");
+    failures += greedy_tree_extent_case(7, 1);
+    failures += greedy_tree_extent_case(0, 0);
+    failures += greedy_tree_second_child_case(64);
+    failures += greedy_tree_second_child_case(257);
+    failures += tree_sampling_membership_cases(64);
+    failures += tree_sampling_membership_cases(257);
+    failures += tree_sampling_presence_overlay_case(64);
+    failures += tree_sampling_presence_overlay_case(257);
+    failures += p_less_tree_membership_cases(64);
+    failures += p_less_tree_membership_cases(257);
+    failures += p_less_dflash2_product_tree_multiblock_case();
+    failures +=
+        p_less_tree_batch_row_isolation_case(257, 257, "p-less tree B=2 row isolation V=257");
+    failures += p_less_tree_batch_row_isolation_case(248320, 248077,
+                                                     "DFlash2 p-less tree B=2 row isolation");
+    failures += p_less_tree_batch_flat_support_isolation_case(
+        257, 257, 48ull, "p-less tree B=2 flat-support isolation V=257");
+    failures += p_less_tree_batch_flat_support_isolation_case(
+        248320, 248077, 8ull, "DFlash2 p-less tree B=2 flat-support isolation");
     failures += p_less_typical_exclude_tree_hop0_matches_sample(
         64, 64, 8ull, "p-less tree hop 0 typical_exclude matches sample() V=64");
     failures += p_less_typical_exclude_tree_hop0_matches_sample(
@@ -3487,27 +3491,49 @@ int main() {
         2048, 2048, 32ull, "p-less tree W=12 samples each packed column's support V=2048");
     failures += p_less_tree_column_local_support_case(
         248320, 248077, 4ull, "DFlash2 p-less tree W=12 samples each packed column's support");
-    failures += p_less_chain_column_local_support_case(
-        2048, 2048, 32ull, "p-less chain samples each verify column's support V=2048");
-    failures += p_less_chain_column_local_support_case(
-        248320, 248077, 4ull, "DFlash2 p-less chain samples each verify column's support");
     failures += p_less_tree_later_hops_sample_target(
         64, 64, "p-less tree later-hop target distribution V=64");
-    failures += p_less_tree_later_hops_sample_target(
-        248320, 248077, "p-less tree later-hop target distribution real vocabulary");
-    failures += p_less_chain_later_hops_sample_target(
-        64, 64, "p-less chain later-hop target distribution V=64");
-    failures += p_less_chain_later_hops_sample_target(
-        248320, 248077, "p-less chain later-hop target distribution real vocabulary");
-    failures += p_less_chain_later_hops_sample_target(
-        64, 64, "p-less bonus target distribution V=64", true);
-    failures += p_less_chain_later_hops_sample_target(
-        248320, 248077, "p-less bonus target distribution real vocabulary", true);
     failures += p_less_tree_dirty_workspace_replay_case(
         2048, 2048, "p-less tree W=12 dirty-workspace replay V=2048");
     failures += p_less_tree_dirty_workspace_replay_case(
         248320, 248077, "DFlash2 p-less tree W=12 dirty-workspace replay");
-    failures += batched_selector_row_isolation_case();
+    return failures;
+}
+
+// Distribution criteria over tens of thousands of rounds. They re-run the routes above, so they
+// add statistical evidence and no kernel coverage.
+int run_statistical_cases() {
+    int failures = 0;
+    failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 0.0f);
+    failures += p_less_sampled_draft_preserves_target_distribution(64, 64, 1.0f);
+    failures += p_less_sampled_draft_preserves_target_distribution(248320, 248077, 0.0f);
+    // Both verify routes: single-block (small vocabulary) and multi-block finalize (product V).
+    failures += p_less_block_verification_case(64, 64, false);
+    failures += p_less_block_verification_case(64, 64, true);
+    failures += p_less_block_verification_case(248320, 248077, false);
+    failures += p_less_block_verification_case(248320, 248077, true);
+    failures += p_less_tree_later_hops_sample_target(
+        248320, 248077, "p-less tree later-hop target distribution real vocabulary");
+    failures += p_less_chain_later_hops_sample_target(
+        248320, 248077, "p-less chain later-hop target distribution real vocabulary");
+    failures += p_less_chain_later_hops_sample_target(
+        248320, 248077, "p-less bonus target distribution real vocabulary", true);
+    return failures;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    if (cuda_unavailable()) {
+        std::cerr << "FAIL: no usable CUDA device\n";
+        return 1;
+    }
+
+    int failures = run_route_cases();
+    if (!ninfer::test::sanitizer_scope(argc, argv)) {
+        failures += run_tree_route_cases();
+        failures += run_statistical_cases();
+    }
 
     if (failures != 0) {
         std::cerr << "speculative_round failures=" << failures << '\n';

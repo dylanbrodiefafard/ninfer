@@ -2,6 +2,7 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/op_tester.h"
+#include "ops/sanitizer_scope.h"
 #include "ops/nvfp4_activation_ref.h"
 
 #include <cuda_bf16.h>
@@ -92,6 +93,16 @@ constexpr Geometry kGeometries[] = {
     {"qwen3_6_27b", 24, 4},
     {"qwen3_6_35b_a3b", 16, 2},
 };
+
+// `--sanitizer` scope (tests/ops/sanitizer_scope.h): the qwen3.8-27b geometry with exact NVFP4-G16
+// KV (DType::U8), the only attention layout the DFlash2 flow dispatches by default. Other
+// geometries and KV formats, the sage route, and the sparse-attention options return without
+// launching.
+bool g_sanitizer_scope = false;
+
+[[nodiscard]] bool outside_sanitizer_scope(const Geometry& geometry, DType dtype) {
+    return g_sanitizer_scope && (&geometry != &kGeometries[0] || dtype != DType::U8);
+}
 
 struct AttentionCase {
     std::int32_t tokens;
@@ -2179,6 +2190,8 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
 int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mapping,
                     std::uint32_t seed, std::int32_t tokens = 3, std::int32_t base = 63,
                     bool sage = false) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
+    if (g_sanitizer_scope && sage) { return 0; }
     const std::int32_t max_context = base + tokens + 4;
     const std::size_t elements =
         static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(geometry.kv_heads) * tokens;
@@ -2223,6 +2236,8 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
 
 int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
                 MappingPattern mapping, bool sage = false) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
+    if (g_sanitizer_scope && sage) { return 0; }
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -2824,6 +2839,7 @@ ideal_attention_kept_qblocks(const std::vector<float>& q, const HostCache& cache
 int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, float keep_frac,
                      float xattn_tau, std::int32_t xattn_min_len,
                      XattnPlant plant = XattnPlant::None) {
+    if (g_sanitizer_scope) { return 0; }
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -3088,6 +3104,7 @@ int run_a1_skip_case(const Geometry& geometry, const AttentionCase& test_case, f
 }
 
 int run_sage_skip_rejected(const Geometry& geometry) {
+    if (g_sanitizer_scope) { return 0; }
     const AttentionCase test_case{128, 0, 256, 600u};
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = 256;
@@ -3141,6 +3158,8 @@ int run_sage_skip_rejected(const Geometry& geometry) {
 
 int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
                 MappingPattern mapping, bool sage = false, const char* model_inputs = nullptr) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
+    if (g_sanitizer_scope && sage) { return 0; }
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -3357,6 +3376,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
 }
 
 int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCase& test_case) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
     if (batch <= 0 || test_case.valid_columns.size() != static_cast<std::size_t>(batch) ||
         test_case.table_rows.size() != static_cast<std::size_t>(batch)) {
@@ -3522,6 +3542,7 @@ std::vector<std::int32_t> star_tree_parent(std::int32_t width) {
 
 int run_tree_verify_case(const Geometry& geometry, DType dtype, std::int32_t width,
                          const std::vector<std::int32_t>& parent, const char* topology) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     constexpr std::int32_t kPrefix = 61;
     constexpr std::uint32_t kSeed  = 611u;
     const std::int32_t total       = kPrefix + width;
@@ -3735,6 +3756,7 @@ void assign_cache_position(HostCache& dst, std::int32_t dst_pos, const HostCache
 int run_kv_compact_path_case(const Geometry& geometry, DType dtype, bool identity,
                              std::vector<std::int32_t> branch = {0, 3, 7},
                              std::int32_t prefix              = 61) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     constexpr std::int32_t kWidth = 12;
     constexpr std::uint32_t kSeed = 701u;
     const std::int32_t kPrefix    = prefix;
@@ -3805,6 +3827,7 @@ int run_kv_compact_path_case(const Geometry& geometry, DType dtype, bool identit
 // follow kv_table_rows[b], not blockIdx.x, or one chat's packed tree is folded
 // onto the other chat's pages.
 int run_kv_compact_path_batch_case(const Geometry& geometry, DType dtype) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     constexpr std::int32_t kWidth                 = 12;
     constexpr std::int32_t kBatch                 = 2;
     constexpr std::uint32_t kSeed                 = 811u;
@@ -3890,6 +3913,7 @@ int run_kv_compact_path_cases() {
 
 int run_tree_column0_matches_decode(const Geometry& geometry, DType dtype, std::int32_t prefix,
                                     std::int32_t width) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     constexpr std::uint32_t kSeed                 = 811u;
     const std::vector<std::int32_t> parent        = chain_tree_parent(width);
     const std::vector<std::int32_t> ancestor_mask = ancestor_mask_from_parent(parent);
@@ -3988,6 +4012,7 @@ int run_tree_column0_matches_decode(const Geometry& geometry, DType dtype, std::
 // target argmax from mixed logits; p-less SpecInfer samples the contaminated
 // support. Compact row is not the KV table row: C=2 can occupy tables {1,0}.
 int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype) {
+    if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     constexpr std::int32_t kWidth                   = 12;
     constexpr std::int32_t kBatch                   = 2;
     constexpr std::uint32_t kSeed                   = 911u;
@@ -5482,6 +5507,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    g_sanitizer_scope = ninfer::test::sanitizer_scope(argc, argv);
     const bool full =
         std::getenv("GQA_FULL") != nullptr || (argc > 1 && std::strcmp(argv[1], "--full") == 0);
     int failures = 0;

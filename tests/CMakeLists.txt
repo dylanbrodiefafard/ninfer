@@ -45,6 +45,14 @@ function(ninfer_add_op_test name)
   endif()
 endfunction()
 
+# Registers `<name>_sanitizer`: the test's `--sanitizer` cases (tests/ops/sanitizer_scope.h),
+# labelled `sanitizer` and `racecheck`, the sets the compute-sanitizer gates run.
+function(ninfer_add_sanitizer_cases name)
+  add_test(NAME ${name}_sanitizer
+    COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:${name}> --sanitizer)
+  set_property(TEST ${name}_sanitizer PROPERTY LABELS sanitizer racecheck)
+endfunction()
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
@@ -508,9 +516,64 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
 
-# Tests that run for minutes. `./scripts/run-unit-tests.sh --fast` skips them.
+# Sanitizer set: the tests the compute-sanitizer gates run. It covers the Ops the qwen3.8-27b
+# NVFP4 DFlash2 flow dispatches, text-only with NVFP4 KV. A test whose full sweep is too slow or
+# too large under compute-sanitizer contributes its `--sanitizer` cases instead; the rest run
+# unchanged. An Op added to that flow adds its test here.
+#
+# `sanitizer` (memcheck and initcheck) is the whole set. `racecheck` is the part that is also
+# quick under racecheck, which tracks every shared-memory access; the GEMM-heavy linear and
+# projection sweeps take 5 to 50 minutes each under it and stay outside that label.
+ninfer_add_sanitizer_cases(ninfer_sampling_test)
+ninfer_add_sanitizer_cases(ninfer_speculative_round_test)
+ninfer_add_sanitizer_cases(ninfer_gqa_attention_test)
+ninfer_add_sanitizer_cases(ninfer_attn_input_proj_test)
+set(ninfer_sanitizer_racecheck_tests
+  ninfer_kv_cache_test
+  ninfer_embedding_test
+  ninfer_rmsnorm_test
+  ninfer_gated_rmsnorm_test
+  ninfer_rope_test
+  ninfer_position_test
+  ninfer_scalar_test
+  ninfer_scatter_test
+  ninfer_argmax_test
+  ninfer_sigmoid_mul_test
+  ninfer_silu_mul_test
+  ninfer_residual_add_test
+  ninfer_causal_conv1d_silu_test
+  ninfer_gated_delta_net_test
+  ninfer_gated_delta_net_replay_record_test
+  ninfer_gdn_replay_fold_test
+  ninfer_gdn_gating_proj_test
+  ninfer_kv_cache_append_prefix_test
+  ninfer_prepare_masked_block_test
+  ninfer_prepare_ragged_prefix_test
+  ninfer_grouped_dynamic_conv_test
+  ninfer_swa_test
+  ninfer_dflash2_path_select_test)
+set(ninfer_sanitizer_memcheck_only_tests
+  ninfer_gdn_input_proj_test
+  ninfer_gdn_input_proj_conv_record_test
+  ninfer_linear_nvfp4_a16_test
+  ninfer_linear_nvfp4_a4_test
+  ninfer_linear_nvfp4_a8_test
+  ninfer_linear_bf16_a16_test
+  ninfer_linear_w8_a16_test
+  ninfer_linear_q4_a16_test
+  ninfer_linear_add_nvfp4_test
+  ninfer_linear_add_bf16_a16_test
+  ninfer_linear_swiglu_nvfp4_test)
+set_property(TEST ${ninfer_sanitizer_racecheck_tests}
+  APPEND PROPERTY LABELS sanitizer racecheck)
+set_property(TEST ${ninfer_sanitizer_memcheck_only_tests}
+  APPEND PROPERTY LABELS sanitizer)
+
+# Tests that run for minutes. `./scripts/run-unit-tests.sh --fast` skips them. The attention
+# sanitizer cases stay slow because their host oracle dominates.
 set_property(TEST
     ninfer_gqa_attention_test
+    ninfer_gqa_attention_test_sanitizer
     ninfer_speculative_round_test
     ninfer_attn_input_proj_test
   APPEND PROPERTY LABELS slow)

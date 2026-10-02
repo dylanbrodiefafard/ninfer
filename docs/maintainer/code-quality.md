@@ -76,9 +76,10 @@ changes are mapped to their includers through Ninja's dependency log, so build t
 Runtime checkers are opt-in because they are slow:
 
 ```bash
-./scripts/run-unit-tests.sh --compute-sanitizer memcheck  -R ninfer_arena_test
-./scripts/run-unit-tests.sh --compute-sanitizer racecheck -R ninfer_gqa_attention_test
-./scripts/run-unit-tests.sh --compute-sanitizer initcheck # also synccheck
+./scripts/run-unit-tests.sh --compute-sanitizer memcheck  -L sanitizer   # the sanitizer set
+./scripts/run-unit-tests.sh --compute-sanitizer initcheck -L sanitizer   # also synccheck
+./scripts/run-unit-tests.sh --compute-sanitizer racecheck -L racecheck   # its racecheck part
+./scripts/run-unit-tests.sh --compute-sanitizer racecheck -R ninfer_linear_nvfp4_a8_test
 
 cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON \
   -DNINFER_SANITIZE=address,undefined
@@ -93,6 +94,15 @@ tools does not recompile. CUDA's runtime maps memory inside ASan's shadow gap, h
 `protect_shadow_gap=0`. Run memcheck and racecheck for new or changed kernels with shared-memory
 staging, asynchronous copies, or warp-level synchronization, and initcheck for new workspace or
 arena consumers.
+
+The `sanitizer` label is the set the compute-sanitizer gates run: the Ops the qwen3.8-27b NVFP4
+DFlash2 flow dispatches. Suites whose full oracle sweep is too slow or too large under
+compute-sanitizer contribute `--sanitizer` cases instead, one launch per route at real model
+widths; registered as `<test>_sanitizer`, they also run in the ordinary unit suite, so the mode
+cannot rot. `racecheck` labels the part of the set that is also quick under racecheck, which
+tracks every shared-memory access and takes 5 to 50 minutes on each GEMM-heavy linear or
+projection suite. Run a suite outside these labels by name when its kernels change. The rule for
+keeping the set complete is in [Op development](op-development.md#64-sanitizer-scope).
 
 ## Suppressions
 

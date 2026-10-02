@@ -7,6 +7,7 @@
 // production path as a golden.
 #include "ninfer/ops/sampling.h"
 #include "ops/op_tester.h"
+#include "ops/sanitizer_scope.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1480,12 +1481,35 @@ int masked_p_less_distribution(int domain, int physical) {
     return failures;
 }
 
+// One launch per sampler route at real shapes: the single-block kernel (domains up to 256) and
+// the partial/group/mass pipeline (the 248077-token domain), each for greedy, truncated, and
+// p-less rows, with eligibility masks, suppression, and the typical-exclude fallback.
+int run_sanitizer_cases() {
+    int failures = 0;
+    failures += eligibility_masks(64, 64);
+    failures += eligibility_masks(248077, 248320);
+    failures += greedy_contract();
+    failures += deterministic_stochastic_contract();
+    failures += heterogeneous_batch_contract();
+    failures += suppressed_token_contract();
+    failures += p_less_heterogeneous_batch_contract();
+    failures += p_less_multiblock_heterogeneous_batch_contract();
+    failures += p_less_suppressed_token_contract();
+    failures += p_less_typical_exclude_singleton_runner_up_contract();
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
+    }
+    if (ninfer::test::sanitizer_scope(argc, argv)) {
+        const int sanitizer_failures = run_sanitizer_cases();
+        std::cout << (sanitizer_failures == 0 ? "OK" : "FAIL") << " sample sanitizer cases\n";
+        return sanitizer_failures == 0 ? 0 : 1;
     }
 
     int failures = 0;
