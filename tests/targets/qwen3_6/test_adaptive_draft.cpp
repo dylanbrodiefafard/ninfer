@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <utility>
 #include <iostream>
 #include <span>
 #include <string_view>
@@ -30,16 +31,16 @@ void expect_near(float got, float want, float tol, std::string_view message) {
 
 void plant_r(q36::AdaptiveDraftState& state, std::uint32_t live_k, std::initializer_list<float> rs,
              std::uint32_t n = 256) {
-    q36::seed_adaptive_draft_state(state, live_k);
+    q36::seed_adaptive_draft_state(state, live_k, q36::AdaptiveDraftLaw::Greedy);
     state.observed    = n;
     state.rounds_at_k = 32;
     std::uint32_t i   = 0;
     for (float r : rs) {
-        if (i >= 5) { break; }
+        if (i >= q36::kAdaptiveMaxHops) { break; }
         const float nn = static_cast<float>(n);
         state.alpha[i] = r * nn + 1.0f;
         state.beta[i]  = (1.0f - r) * nn + 1.0f;
-        state.r_seen |= static_cast<std::uint8_t>(1U << i);
+        state.r_seen |= static_cast<std::uint16_t>(1U << i);
         ++i;
     }
 }
@@ -57,7 +58,6 @@ q36::AdaptiveDraftConfig cfg_of(std::span<const std::uint32_t> ks,
     cfg.round_time     = &t;
     cfg.length_tokens  = L;
     cfg.switch_seconds = sw;
-    cfg.unseen         = q36::UnseenHop::Accept;
     return cfg;
 }
 
@@ -74,18 +74,24 @@ void test_capture_set() {
     using ninfer::SpeculativeBackend;
     const auto eq = [](std::vector<std::uint32_t> got, std::vector<std::uint32_t> want,
                        std::string_view msg) { expect(got == want, msg); };
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive {3,4,5}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true), {3, 4, 5},
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false, 7), {5}, "frozen MTP {N}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7), {3, 4, 5},
+       "MTP adaptive {3,4,5}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true, 7), {3, 4, 5},
        "DFlash adaptive {3,4,5}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 4, true), {4}, "DFlash N=4 frozen {4}");
-    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, false), {7}, "frozen DFlash {N}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, true, 7), {3, 4, 5, 6, 7},
+       "DFlash adaptive {3..7}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 15, true, 5), {3, 4, 5},
+       "DFlash adaptive bounded by the target maximum");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 4, true, 7), {4},
+       "DFlash N=4 frozen {4}");
+    eq(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 7, false, 7), {7}, "frozen DFlash {N}");
 }
 
 void test_seed_is_captured_min() {
     using ninfer::SpeculativeBackend;
-    const auto df = q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true);
-    const auto mt = q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true);
+    const auto df = q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true, 7);
+    const auto mt = q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7);
     expect(q36::adaptive_seed_k(df, SpeculativeBackend::DFlash) == 3,
            "seed fallback is captured.front()");
     expect(q36::adaptive_seed_k(mt, SpeculativeBackend::Mtp) == 3,
@@ -107,22 +113,13 @@ void test_y_is_one_plus_product_of_r() {
     const float q0 = 0.80f;
     const float q1 = 0.80f * 0.625f;
     const float q2 = q1 * 0.60f;
-    expect_near(q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept), 1.0f + q0 + q1 + q2,
-                0.02f, "Y(3) = 1 + r0 + r0 r1 + r0 r1 r2");
-}
-
-void test_unseen_r_counts_as_certain_accept() {
-    q36::AdaptiveDraftState state;
-    plant_r(state, 3, {0.80f, 0.625f, 0.60f});
-    const float y3 = q36::detail::expected_tokens(state, 3, q36::UnseenHop::Accept);
-    const float q2 = 0.80f * 0.625f * 0.60f;
-    expect_near(q36::detail::expected_tokens(state, 5, q36::UnseenHop::Accept), y3 + 2.0f * q2,
-                0.02f, "unseen r3,r4 extend the seen prefix product q2 at r=1");
+    expect_near(q36::detail::expected_tokens(state, 3), 1.0f + q0 + q1 + q2, 0.02f,
+                "Y(3) = 1 + r0 + r0 r1 + r0 r1 r2");
 }
 
 void test_r_updates_only_when_prefix_reached() {
     q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
+    q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::Greedy);
     q36::adaptive_observe_hops(state, 2, 5);
     expect((state.r_seen & 0x07U) == 0x07U, "accepted=2 drafted=5 observes r0,r1,r2");
     expect((state.r_seen & 0x18U) == 0, "r3 and r4 are not updated when the prefix died at 2");
@@ -134,16 +131,22 @@ void test_r_updates_only_when_prefix_reached() {
                 "accepted>1 is a success for r1");
     expect_near(q36::detail::r_mean(state, 2), (d * p) / (2.0f * d * p + 1.0f), 1e-5f,
                 "accepted=2 is a failure for r2, not for later r_i");
+
+    q36::AdaptiveDraftState deep;
+    q36::seed_adaptive_draft_state(deep, 0, q36::AdaptiveDraftLaw::Greedy);
+    q36::adaptive_observe_hops(deep, 7, 7);
+    expect(deep.r_seen == 0x7FU, "a fully accepted k=7 round observes r0..r6");
+    expect(q36::detail::r_mean(deep, 6) > 0.5f, "accepted=7 is a success for r6");
 }
 
 void test_pcur_zero_skips_update() {
     q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 4);
+    q36::seed_adaptive_draft_state(state, 4, q36::AdaptiveDraftLaw::Greedy);
     const auto before        = state;
     const std::uint32_t ks[] = {3, 4, 5};
     q36::AdaptiveRoundTimeState t;
     auto cfg = cfg_of(ks, t);
-    expect(q36::adaptive_draft_next(cfg, state, 0, 0, 5, 4) == 4, "pcur==0 keeps live_k");
+    expect(q36::adaptive_draft_next(cfg, state, 0, 0, 5, 4, false) == 4, "pcur==0 keeps live_k");
     expect(state.observed == before.observed && state.r_seen == 0, "pcur==0 skips hop update");
 }
 
@@ -161,7 +164,7 @@ void test_t_ols_shared_slope() {
 
 void test_cold_start_runs_smallest_k() {
     q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
+    q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::Greedy);
     q36::AdaptiveRoundTimeState t;
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
@@ -242,37 +245,19 @@ void test_unmeasured_k4_probed_at_most_once() {
 // MTP keeps the truncated sum: unseen hops add nothing, so a request without hops takes the
 // cheapest measured round.
 void test_mtp_unseen_hop_stops_expected_tokens() {
-    expect(q36::adaptive_unseen_hop(ninfer::SpeculativeBackend::Mtp) == q36::UnseenHop::Stop &&
-               q36::adaptive_unseen_hop(ninfer::SpeculativeBackend::DFlash) ==
-                   q36::UnseenHop::Accept,
-           "only DFlash counts unseen hops as accepted");
     q36::AdaptiveDraftState planted;
     plant_r(planted, 3, {0.80f, 0.625f, 0.60f});
-    expect_near(q36::detail::expected_tokens(planted, 5, q36::UnseenHop::Stop),
-                q36::detail::expected_tokens(planted, 3, q36::UnseenHop::Stop), 1e-5f,
-                "MTP: unseen r3,r4 do not add tokens");
+    expect_near(q36::detail::expected_tokens(planted, 5), q36::detail::expected_tokens(planted, 3),
+                1e-5f, "MTP: unseen r3,r4 do not add tokens");
     q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
+    q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::Greedy);
     q36::AdaptiveRoundTimeState t;
     plant_t(t, 3, 0.056f);
     plant_t(t, 4, 0.049f);
     plant_t(t, 5, 0.055f);
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
-    cfg.unseen               = q36::UnseenHop::Stop;
     expect(pick(cfg, state) == 4, "MTP: no hop data takes the smallest measured T");
-}
-
-void test_no_hops_scores_one_plus_k() {
-    q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
-    q36::AdaptiveRoundTimeState t;
-    plant_t(t, 3, 0.056f);
-    plant_t(t, 4, 0.049f);
-    plant_t(t, 5, 0.055f);
-    const std::uint32_t ks[] = {3, 4, 5};
-    auto cfg                 = cfg_of(ks, t);
-    expect(pick(cfg, state) == 5, "no hop data: E[Y(k)] = 1 + k, not the cheapest T");
 }
 
 void test_ties_keep_smaller_k() {
@@ -303,7 +288,7 @@ void test_switch_cost_holds_live_k() {
 
 void test_stationary_late_hop_does_not_force_k5() {
     q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 4);
+    q36::seed_adaptive_draft_state(state, 4, q36::AdaptiveDraftLaw::Greedy);
     q36::AdaptiveRoundTimeState t;
     plant_t(t, 3, 0.022f);
     plant_t(t, 4, 0.020f);
@@ -311,34 +296,9 @@ void test_stationary_late_hop_does_not_force_k5() {
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
     cfg.switch_seconds       = 0.0f;
-    for (int i = 0; i < 80; ++i) { (void)q36::adaptive_draft_next(cfg, state, 3, 4, 5, 4); }
+    for (int i = 0; i < 80; ++i) { (void)q36::adaptive_draft_next(cfg, state, 3, 4, 5, 4, false); }
     expect(state.live_k == 4, "stationary hop-3 failures do not inject k=5");
     expect((state.r_seen & 0x10U) == 0, "k=4 rounds never observe r4");
-}
-
-// Warm C=1 server: T is known for every k and nearly flat, a new request has no hops. The
-// request must start at the longest k and stay there while later hops keep accepting, instead of
-// locking the cheapest k because deeper hops were never observed.
-void test_warm_server_new_request_is_not_locked_short() {
-    q36::AdaptiveRoundTimeState t;
-    plant_t(t, 3, 0.0153f);
-    plant_t(t, 4, 0.0155f);
-    plant_t(t, 5, 0.0157f);
-    const std::uint32_t ks[] = {3, 4, 5};
-    auto cfg                 = cfg_of(ks, t, 512, 0.0f);
-    q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
-    state.live_k = pick(cfg, state);
-    expect(state.live_k == 5, "fresh request on measured flat T starts at the longest k");
-    for (int round = 0; round < 64; ++round) {
-        // Two of five drafts accepted: hops 0..2 are observed every round, hops 3..4 never.
-        (void)q36::adaptive_draft_next(cfg, state, 2, state.live_k, 5, state.live_k);
-    }
-    expect(state.live_k == 3, "a prefix that dies at hop 2 settles on k=3");
-    for (int round = 0; round < 64; ++round) {
-        (void)q36::adaptive_draft_next(cfg, state, state.live_k, state.live_k, 5, state.live_k);
-    }
-    expect(state.live_k == 5, "once every drafted hop accepts, unseen deeper hops pull k back up");
 }
 
 void test_batch_sum_e_over_t() {
@@ -354,12 +314,12 @@ void test_batch_sum_e_over_t() {
     const q36::AdaptiveDraftState* mid[] = {&hot, &cold};
     const std::uint32_t rows[]           = {5, 5};
     const std::uint32_t picked =
-        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, q36::UnseenHop::Accept);
+        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, nullptr);
     float best_s       = -1.0f;
     std::uint32_t want = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e  = q36::detail::expected_tokens(hot, k, q36::UnseenHop::Accept) +
-                         q36::detail::expected_tokens(cold, k, q36::UnseenHop::Accept);
+        const float e =
+            q36::detail::expected_tokens(hot, k) + q36::detail::expected_tokens(cold, k);
         const float tk = q36::adaptive_t_hat(t, k, 512);
         const float sc = e / tk;
         if (sc > best_s) {
@@ -381,12 +341,12 @@ void test_batch_row_budget_clips_expected_tokens() {
     const q36::AdaptiveDraftState* mid[] = {&hot, &hot};
     const std::uint32_t rows[]           = {5, 3};
     const std::uint32_t picked =
-        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, q36::UnseenHop::Accept);
+        q36::adaptive_select_batch_k(mid, rows, captured, &t, 512, 0, nullptr);
     float best_s       = -1.0f;
     std::uint32_t want = 3;
     for (std::uint32_t k : {3U, 4U, 5U}) {
-        const float e = q36::detail::expected_tokens(hot, std::min(k, 5U), q36::UnseenHop::Accept) +
-                        q36::detail::expected_tokens(hot, std::min(k, 3U), q36::UnseenHop::Accept);
+        const float e  = q36::detail::expected_tokens(hot, std::min(k, 5U)) +
+                         q36::detail::expected_tokens(hot, std::min(k, 3U));
         const float sc = e / q36::adaptive_t_hat(t, k, 512);
         if (sc > best_s) {
             best_s = sc;
@@ -409,8 +369,7 @@ void test_batch_next_writes_executed_k() {
     const q36::AdaptiveDraftState* mid[] = {&a, &b};
     const std::uint32_t rows[]           = {5, 5};
     q36::AdaptiveBatchKState batch;
-    const std::uint32_t k =
-        q36::adaptive_batch_next(batch, mid, rows, captured, &t, 512, q36::UnseenHop::Accept);
+    const std::uint32_t k = q36::adaptive_batch_next(batch, mid, rows, captured, &t, 512, nullptr);
     expect(k == 4 && batch.live_k == 4, "batch live_k is the executed argmax, not a per-row pick");
     q36::AdaptiveDraftState* mut[] = {&a, &b};
     q36::adaptive_assign_live_k(mut, k);
@@ -426,7 +385,7 @@ void test_budget_clamp() {
     plant_t(t, 5, 0.02f);
     const std::uint32_t ks[] = {3, 4, 5};
     auto cfg                 = cfg_of(ks, t);
-    expect(q36::adaptive_draft_next(cfg, state, 5, 5, 3, 5) == 3,
+    expect(q36::adaptive_draft_next(cfg, state, 5, 5, 3, 5, false) == 3,
            "budget_extent=3 clamps to captured k<=3");
 }
 
@@ -434,9 +393,245 @@ void test_t_survives_request_seed() {
     q36::AdaptiveRoundTimeState st;
     plant_t(st, 4, 0.015f);
     q36::AdaptiveDraftState state;
-    q36::seed_adaptive_draft_state(state, 0);
+    q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::Greedy);
     expect(q36::adaptive_t_measured(st, 4) && state.r_seen == 0,
            "T is server-global; hop posterior is per-request");
+}
+
+// DFlash hop model. Exploration rows are recorded directly so the arithmetic stays explicit.
+void explore_rows(q36::AdaptiveHopRates& rates, q36::AdaptiveDraftLaw law, std::uint32_t k,
+                  std::uint32_t accepted, int rows) {
+    q36::AdaptiveDraftState scratch;
+    q36::seed_adaptive_draft_state(scratch, k, law);
+    for (int r = 0; r < rows; ++r) {
+        q36::adaptive_record_round(scratch, accepted, k, k, &rates, true);
+    }
+}
+
+float sum_of_products(std::initializer_list<float> rates) {
+    float e = 1.0f, run = 1.0f;
+    for (float r : rates) {
+        run *= r;
+        e += run;
+    }
+    return e;
+}
+
+void test_hop_cold_table_is_k_independent() {
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::PLess);
+    for (std::uint32_t k = 3; k <= 7; ++k) {
+        expect_near(q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::PLess, k, 0), 0.35f,
+                    1e-6f, "a cold table starts every block length at the pooled prior");
+    }
+    expect_near(q36::detail::hop_expected_tokens(state, rates, 3, 3),
+                sum_of_products({0.65f, 0.65f, 0.65f}), 1e-5f,
+                "a cold request scores the prior hazard with no unseen optimism");
+}
+
+void test_hop_exploration_rows_alone_update_the_table() {
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 5, q36::AdaptiveDraftLaw::Greedy);
+    q36::adaptive_record_round(state, 2, 5, 5, &rates, false);
+    expect(rates.trials[0][5][0] == 0.0f, "an ordinary round leaves the global table");
+    q36::adaptive_record_round(state, 2, 3, 5, &rates, true);
+    expect(rates.trials[0][5][0] == 0.0f, "a budget-clipped exploration row does not count");
+    q36::adaptive_record_round(state, 2, 5, 5, &rates, true);
+    expect(rates.trials[0][5][0] == 1.0f && rates.trials[0][5][2] == 1.0f &&
+               rates.trials[0][5][3] == 0.0f && rates.failures[0][5][2] == 1.0f &&
+               rates.failures[0][5][1] == 0.0f,
+           "a full exploration row counts trials up to the failing hop");
+    expect(state.rounds_at_k == 1, "exploration rounds do not count toward the incumbent k");
+    // Exact hierarchy after that single row.
+    const float p0       = (0.0f + 4.0f * 0.35f) / (1.0f + 4.0f);
+    const float p2       = (1.0f + 4.0f * 0.35f) / (1.0f + 4.0f);
+    const float pr[]     = {p0, p0, p2, 0.35f, 0.35f};
+    const float expected = pr[0] + pr[1] + pr[2];
+    const float a        = q36::kAdaptiveBlockRatioPrior;
+    const float b        = q36::kAdaptiveCellPriorTrials;
+    const float rho      = (1.0f + a) / (expected + a);
+    expect_near(q36::adaptive_block_ratio(rates, q36::AdaptiveDraftLaw::Greedy, 5), rho, 1e-6f,
+                "rho_k = (failures + a) / (sum trials * P_i + a)");
+    expect_near(q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, 5, 2),
+                (1.0f + b * rho * p2) / (1.0f + b), 1e-6f,
+                "H = (failures + b rho P) / (trials + b)");
+}
+
+void test_hop_block_ratio_shares_strength_across_hops() {
+    // k=5 rows fail at hop 0 twice as often as k=4 rows: the ratio separates the two block
+    // lengths at every hop, including hops neither has much data on.
+    q36::AdaptiveHopRates rates;
+    for (int r = 0; r < 1000; ++r) {
+        explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 4, r % 5 == 0 ? 0U : 4U, 1);
+        explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 5, r % 5 < 2 ? 0U : 5U, 1);
+    }
+    const float r4 = q36::adaptive_block_ratio(rates, q36::AdaptiveDraftLaw::Greedy, 4);
+    const float r5 = q36::adaptive_block_ratio(rates, q36::AdaptiveDraftLaw::Greedy, 5);
+    expect(r5 > 1.2f * r4, "the worse block length gets the larger hazard ratio");
+    expect(q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, 5, 3) >
+               q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, 4, 3),
+           "the ratio carries to hops with little direct data");
+    expect_near(q36::adaptive_block_ratio(rates, q36::AdaptiveDraftLaw::Greedy, 7), 1.0f, 1e-6f,
+                "an untried block length keeps ratio 1");
+    expect_near(q36::adaptive_block_ratio(rates, q36::AdaptiveDraftLaw::PLess, 5), 1.0f, 1e-6f,
+                "draft laws are learned separately");
+    expect_near(q36::adaptive_block_ratio(rates, q36::AdaptiveDraftLaw::Sampled, 5), 1.0f, 1e-6f,
+                "temperature-sampled drafts do not share the greedy table");
+}
+
+void test_hop_picker_prefers_better_shorter_block() {
+    const std::uint32_t captured[] = {4, 5};
+    q36::AdaptiveRoundTimeState t;
+    plant_t(t, 4, 0.010f);
+    plant_t(t, 5, 0.010f);
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 4, q36::AdaptiveDraftLaw::Greedy);
+    auto cfg      = cfg_of(captured, t);
+    cfg.hop_rates = &rates;
+    expect(pick(cfg, state, 5, 4) == 5, "k-independent hazards at equal T prefer the longer block");
+    for (int r = 0; r < 400; ++r) {
+        explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 4, r % 4 == 0 ? 1U : 4U, 1);
+        explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 5, r % 4 < 3 ? 0U : 5U, 1);
+    }
+    expect(pick(cfg, state, 5, 4) == 4, "learned block hazards keep k=4 when k=5 accepts less");
+}
+
+void test_hop_content_factor_normalizes_by_block_hazard() {
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 7, q36::AdaptiveDraftLaw::Greedy);
+    q36::adaptive_record_round(state, 7, 7, 7, &rates, false);
+    const float c0 = 1.0f / 1.35f;
+    const float r0 = 1.0f - c0 * 0.35f;
+    const float p1 = 1.0f + 0.5f * (c0 - 1.0f);
+    const float c1 = p1 / 1.35f;
+    const float r1 = 1.0f - c1 * 0.35f;
+    expect_near(q36::detail::hop_expected_tokens(state, rates, 5, 2), 1.0f + r0 + r0 * r1, 1e-5f,
+                "accepted trials lower the content factor on the hazard");
+}
+
+void test_hop_batch_row_uses_block_length() {
+    q36::AdaptiveHopRates rates;
+    for (int r = 0; r < 200; ++r) { explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 5, 0, 1); }
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 5, q36::AdaptiveDraftLaw::Greedy);
+    const q36::AdaptiveDraftState* rows[] = {&state, &state};
+    const std::uint32_t caps[]            = {5, 3};
+    const float e                         = q36::detail::row_sum_e(rows, caps, 5, &rates);
+    expect_near(e,
+                q36::detail::hop_expected_tokens(state, rates, 5, 5) +
+                    q36::detail::hop_expected_tokens(state, rates, 5, 3),
+                1e-5f, "a capped row in a k=5 batch uses the k=5 block hazards over its extent");
+    expect(q36::detail::hop_expected_tokens(state, rates, 5, 3) <
+               q36::detail::hop_expected_tokens(state, rates, 3, 3),
+           "block length, not extent, selects the hazards");
+}
+
+void test_hop_decay_relaxes_unreached_hops() {
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 7, q36::AdaptiveDraftLaw::Greedy);
+    for (int round = 0; round < 8; ++round) {
+        q36::adaptive_record_round(state, 5, 7, 7, &rates, false);
+    }
+    expect(state.hazard_failures[5] > 4.0f, "hop 5 failed every k=7 round");
+    for (int round = 0; round < 200; ++round) {
+        q36::adaptive_record_round(state, 0, 3, 3, &rates, false);
+    }
+    expect(state.hazard_failures[5] < 0.01f && state.hazard_expected[5] < 0.01f,
+           "a hop the picker stops reaching decays back to its prior");
+}
+
+void test_hop_easy_content_does_not_saturate_unseen_hops() {
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 5, q36::AdaptiveDraftLaw::Greedy);
+    for (int round = 0; round < 64; ++round) {
+        q36::adaptive_record_round(state, 5, 5, 5, &rates, false);
+    }
+    const float e3 = q36::detail::hop_expected_tokens(state, rates, 7, 3);
+    const float e4 = q36::detail::hop_expected_tokens(state, rates, 7, 4);
+    const float e5 = q36::detail::hop_expected_tokens(state, rates, 7, 5);
+    const float e6 = q36::detail::hop_expected_tokens(state, rates, 7, 6);
+    const float r4 = (e5 - e4) / (e4 - e3);
+    const float r5 = (e6 - e5) / (e5 - e4);
+    expect(r4 > 0.9f && r4 <= q36::kAdaptiveMaxHopRate + 1e-6f,
+           "a seen easy hop approaches the cap");
+    expect(r5 < r4 && r5 > 0.6f, "the unseen hop inherits half of the easiness, not the cap");
+}
+
+void test_hop_model_warm_server_new_request_is_not_locked_short() {
+    q36::AdaptiveRoundTimeState t;
+    plant_t(t, 3, 0.0150f);
+    plant_t(t, 4, 0.0155f);
+    plant_t(t, 5, 0.0160f);
+    const std::uint32_t ks[] = {3, 4, 5};
+    q36::AdaptiveHopRates rates;
+    auto cfg      = cfg_of(ks, t, 512, 0.0f);
+    cfg.hop_rates = &rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 0, q36::AdaptiveDraftLaw::Greedy);
+    state.live_k = pick(cfg, state);
+    expect(state.live_k == 5, "fresh request on measured near-flat T starts at the longest k");
+    for (int round = 0; round < 64; ++round) {
+        (void)q36::adaptive_draft_next(cfg, state, 2, state.live_k, 5, state.live_k, false);
+    }
+    expect(state.live_k == 3, "a prefix that dies at hop 2 settles on k=3");
+    for (int round = 0; round < 64; ++round) {
+        (void)q36::adaptive_draft_next(cfg, state, state.live_k, state.live_k, 5, state.live_k,
+                                       false);
+    }
+    expect(state.live_k == 5, "once every drafted hop accepts, the deeper hops pull k back up");
+}
+
+void test_exploration_trigger_is_uniform_and_capped() {
+    q36::AdaptiveRoundTimeState t;
+    for (std::uint32_t k = 3; k <= 7; ++k) { plant_t(t, k, 0.015f); }
+    const std::uint32_t ks[] = {3, 4, 5, 6, 7};
+    q36::AdaptiveHopRates rates;
+    std::array<std::uint32_t, 8> hits{};
+    std::uint32_t total = 0;
+    for (int i = 0; i < 64000; ++i) {
+        const std::uint32_t k = q36::adaptive_explore_k(rates, ks, t, 5);
+        if (k != 0) {
+            expect(k >= 3 && k <= 5, "exploration stays within the cap");
+            ++hits[k];
+            ++total;
+        }
+    }
+    expect(total > 1500 && total < 2500, "one round in 32 explores");
+    expect(hits[3] > 500 && hits[4] > 500 && hits[5] > 500, "explored k is uniform over the cap");
+    q36::AdaptiveHopRates replay;
+    q36::AdaptiveHopRates again;
+    bool same = true;
+    for (int i = 0; i < 1000; ++i) {
+        same = same && q36::adaptive_explore_k(replay, ks, t, 7) ==
+                           q36::adaptive_explore_k(again, ks, t, 7);
+    }
+    expect(same, "the trigger is a deterministic function of the decision counter");
+    q36::AdaptiveRoundTimeState partial;
+    plant_t(partial, 3, 0.015f);
+    q36::AdaptiveHopRates probe;
+    std::uint32_t during_probe = 0;
+    for (int i = 0; i < 4000; ++i) {
+        during_probe += q36::adaptive_explore_k(probe, ks, partial, 7);
+    }
+    expect(during_probe == 0, "no exploration while a k within the cap is unmeasured");
+}
+
+void test_content_sums_decay_before_adding() {
+    q36::AdaptiveHopRates rates;
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 3, q36::AdaptiveDraftLaw::Greedy);
+    q36::adaptive_record_round(state, 0, 3, 3, &rates, false);
+    q36::adaptive_record_round(state, 0, 3, 3, &rates, false);
+    expect_near(state.hazard_failures[0], 1.0f + q36::kAdaptiveDiscount, 1e-6f,
+                "two failures: d * 1 + 1 (decay, then add)");
+    expect_near(state.hazard_expected[0], 0.35f * (1.0f + q36::kAdaptiveDiscount), 1e-6f,
+                "expected failures accumulate the hazard in force before each round");
 }
 
 } // namespace
@@ -446,7 +641,6 @@ int main() {
     test_seed_is_captured_min();
     test_topology_class();
     test_y_is_one_plus_product_of_r();
-    test_unseen_r_counts_as_certain_accept();
     test_r_updates_only_when_prefix_reached();
     test_pcur_zero_skips_update();
     test_t_ols_shared_slope();
@@ -457,8 +651,6 @@ int main() {
     test_dominated_arm_is_measured_once_then_dropped();
     test_unmeasured_k4_probed_at_most_once();
     test_mtp_unseen_hop_stops_expected_tokens();
-    test_no_hops_scores_one_plus_k();
-    test_warm_server_new_request_is_not_locked_short();
     test_ties_keep_smaller_k();
     test_switch_cost_holds_live_k();
     test_stationary_late_hop_does_not_force_k5();
@@ -467,6 +659,17 @@ int main() {
     test_batch_next_writes_executed_k();
     test_budget_clamp();
     test_t_survives_request_seed();
+    test_hop_cold_table_is_k_independent();
+    test_hop_exploration_rows_alone_update_the_table();
+    test_hop_block_ratio_shares_strength_across_hops();
+    test_hop_picker_prefers_better_shorter_block();
+    test_hop_content_factor_normalizes_by_block_hazard();
+    test_hop_batch_row_uses_block_length();
+    test_hop_decay_relaxes_unreached_hops();
+    test_hop_easy_content_does_not_saturate_unseen_hops();
+    test_hop_model_warm_server_new_request_is_not_locked_short();
+    test_exploration_trigger_is_uniform_and_capped();
+    test_content_sums_decay_before_adding();
     if (failures != 0) {
         std::cerr << failures << " adaptive draft host checks failed\n";
         return 1;

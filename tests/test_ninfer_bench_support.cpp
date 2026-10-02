@@ -143,7 +143,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash",
-                                  "--draft-tokens", "6"});
+                                  "--draft-tokens", "8"});
         },
         "unsupported DFlash window");
     failures += expect_throws<std::invalid_argument>(

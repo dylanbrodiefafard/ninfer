@@ -93,8 +93,7 @@ struct DFlashConfig {
     static constexpr float rope_theta         = 1.0e7F;
     static constexpr float attention_scale    = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
-    // Chain verify only: W=k+1. Packed-tree and Spark two-block are off; live adaptive k is
-    // {3,4,5}.
+    // Chain verify only: W=k+1. Packed-tree and Spark two-block are off; adaptive k is {3..N}.
     static constexpr bool tree_verify = false;
     static constexpr int verify_width = 0;
     // 1 was A/B'd: greedy 128-tok 4.10 tok/round / 211 tok/s vs keep 4.23 / 239. Leave off.
@@ -106,7 +105,7 @@ inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 5;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

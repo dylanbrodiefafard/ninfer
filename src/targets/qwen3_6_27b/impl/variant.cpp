@@ -69,20 +69,27 @@ bool split_verify_panels(qwen3_6::TextPhase phase, std::int32_t route_tokens,
            route_tokens < aggregate_tokens;
 }
 
-// Chain verify W=2..6 across C<=kMaximumConcurrency requests.
+// Chain verify W=2..k_max+1 across C<=kMaximumConcurrency requests.
+constexpr std::int32_t kMaximumAggregateVerifyWidth =
+    static_cast<std::int32_t>(kMaximumDFlashDraftTokens) + 1;
 constexpr std::int32_t kMaximumAggregateVerifyTokens =
-    6 * static_cast<std::int32_t>(kMaximumConcurrency);
+    kMaximumAggregateVerifyWidth * static_cast<std::int32_t>(kMaximumConcurrency);
 
 bool aggregate_verify_extent(qwen3_6::TextPhase phase, std::int32_t route_tokens,
                              std::int32_t aggregate_tokens) {
     return split_verify_panels(phase, route_tokens, aggregate_tokens) && route_tokens >= 2 &&
-           route_tokens <= 6 && aggregate_tokens <= kMaximumAggregateVerifyTokens;
+           route_tokens <= kMaximumAggregateVerifyWidth &&
+           aggregate_tokens <= kMaximumAggregateVerifyTokens;
 }
 
+// BF16 MMA keeps one K-ordered FP32 accumulator per output under every tile schedule, so a
+// packed batch reproduces each request panel whenever that panel also runs MMA: attention input
+// for every W>=2, residual for W>=5 (W=2..4 panels use the BF16 SmallT residual route).
 bool aggregate_verify_residuals(QType qtype, qwen3_6::TextPhase phase, std::int32_t route_tokens,
                                 std::int32_t aggregate_tokens) {
     return aggregate_verify_extent(phase, route_tokens, aggregate_tokens) &&
-           (route_tokens == 5 || qtype == QType::NVFP4);
+           (route_tokens == 5 || qtype == QType::NVFP4 ||
+            (qtype == QType::BF16_CTRL && route_tokens >= 5));
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
@@ -275,10 +282,9 @@ void Variant::attention_projection(const Tensor& hidden,
                              stream);
         return;
     }
-    const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
-    const bool aggregate =
-        aggregate_verify_extent(phase, route_tokens, hidden.ne[1]) &&
-        (fused.qtype == QType::NVFP4 || (fused.qtype == QType::BF16_CTRL && route_tokens == 5));
+    const Weight& fused  = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
+    const bool aggregate = aggregate_verify_extent(phase, route_tokens, hidden.ne[1]) &&
+                           (fused.qtype == QType::NVFP4 || fused.qtype == QType::BF16_CTRL);
     if (split_verify_panels(phase, route_tokens, hidden.ne[1]) && !aggregate) {
         for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
             Tensor query_panel = query.slice(1, offset, route_tokens);

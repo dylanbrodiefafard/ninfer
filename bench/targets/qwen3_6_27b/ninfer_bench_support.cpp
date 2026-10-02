@@ -304,10 +304,10 @@ std::string usage_text(std::string_view program) {
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
         << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
         << "                              the artifact to contain dflash/ objects\n"
-        << "  --draft-tokens <0..5>     speculative draft window: mtp [0,5] (0 = none),\n"
-        << "                              dflash [1,5] (default: 0)\n"
-        << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {1..5}, MTP {3..5}, "
-           "within the captured set\n"
+        << "  --draft-tokens <0..7>     speculative draft window: mtp [0,5] (0 = none),\n"
+        << "                              dflash [1,7] (default: 0)\n"
+        << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5, "
+           "MTP {3..5}, within the captured set\n"
         << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
         << "                              default (dflash only)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires "
@@ -388,7 +388,7 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens", true);
             if (options.draft_tokens > kMaxDFlashDraftTokens) {
-                throw std::invalid_argument("--draft-tokens must be in [0,5]");
+                throw std::invalid_argument("--draft-tokens must be in [0,7]");
             }
         } else if (arg == "--adaptive-draft") {
             options.adaptive_draft = true;
@@ -438,7 +438,7 @@ BenchOptions parse_args(int argc, char** argv) {
     }
     if (options.spec_backend == SpeculativeBackend::DFlash &&
         (options.draft_tokens == 0 || options.draft_tokens > kMaxDFlashDraftTokens)) {
-        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,5]");
+        throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,7]");
     }
     if (options.dflash_verify_width != 0 && options.spec_backend != SpeculativeBackend::DFlash) {
         throw std::invalid_argument("--dflash-verify-width requires --spec dflash");

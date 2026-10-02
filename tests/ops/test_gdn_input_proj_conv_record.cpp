@@ -1375,12 +1375,12 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
     failures += run_shape(5, 4, {5, 4, 3, 2},
                           {-1, 0, 0, 1, 1, -1, 0, 1, 1, 3, -1, 0, 0, 2, 2, -1, 0, 1, 2, 3}, 2081U);
     // C=5/6 verify covers every chain width, plus ragged tree rows at the widest aggregates
-    // (A8 W=6 B=6 is the 36-token single-tile boundary).
+    // (A8 W=8 B=6 is the 48-token single-tile boundary).
     for (int batch : {5, 6}) {
-        for (int width : {2, 3, 4, 5, 6}) {
+        for (int width : {2, 3, 4, 5, 6, 7, 8}) {
             failures += run_shape(width, batch, {}, {}, 2700U + width * 8 + batch);
         }
-        for (int width : {5, 6}) {
+        for (int width : {5, 6, 7, 8}) {
             std::vector<int> valid(batch), parents(batch * width);
             for (int b = 0; b < batch; ++b) {
                 valid[b] = width - b % width;

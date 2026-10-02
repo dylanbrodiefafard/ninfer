@@ -1364,9 +1364,10 @@ void test_adaptive_capture_and_topology() {
                          std::initializer_list<std::uint32_t> want, std::string_view msg) {
         expect(got.size() == want.size() && std::equal(got.begin(), got.end(), want.begin()), msg);
     };
-    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false), {5}, "frozen MTP {N}");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true), {3, 4, 5}, "MTP adaptive set");
-    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true), {3, 4, 5},
+    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, false, 7), {5}, "frozen MTP {N}");
+    same(q36::adaptive_draft_ks(SpeculativeBackend::Mtp, 5, true, 7), {3, 4, 5},
+         "MTP adaptive set");
+    same(q36::adaptive_draft_ks(SpeculativeBackend::DFlash, 5, true, 7), {3, 4, 5},
          "DFlash adaptive set");
     const std::uint32_t c        = 3;
     const std::uint32_t planned  = 0;
