@@ -9,6 +9,7 @@
 
 #include "ninfer/types.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -704,6 +705,11 @@ private:
     cudaEvent_t lease_copy_event_locked(std::uint64_t epoch);
     void finish_window_inflight(std::uint32_t slot, bool keep_slot) noexcept;
     void maybe_copy_lease_barrier();
+    // Caller holds the mutex, except in the destructor.
+    void note_drop(KvDiskDropReason reason) noexcept {
+        ++drops_;
+        ++drop_reasons_[static_cast<std::size_t>(reason)];
+    }
     void maybe_wait_epoch_barrier();
     void maybe_page_read_barrier();
     void maybe_payload_take_barrier();
@@ -1002,6 +1008,7 @@ private:
     std::uint64_t restores_         = 0;
     std::uint64_t evictions_        = 0;
     std::uint64_t drops_            = 0;
+    std::array<std::uint64_t, kKvDiskDropReasonCount> drop_reasons_{};
     std::uint64_t exact_comparisons_ = 0;
     std::uint64_t durable_generation_ = 1;
     double save_seconds_            = 0;

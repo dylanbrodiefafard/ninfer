@@ -952,7 +952,9 @@ request; disk `load=` is the host wall from the first live SSD read of that rest
 page or state object has arrived in the pinned host window. Disk `h2d=` is the host wall from that
 last host arrival until the restore's page and state H2D complete (extra copy time after SSD is
 idle, not the overlapping first-to-last copy span). `restores=` / `evicts=` / `drops=` are lifetime counters
-on both human lines; lifetime capture counts stay in JSONL.
+on both human lines; lifetime capture counts stay in JSONL. A non-zero disk `drops=` is followed by its
+causes, for example `(spill_no_capacity:1)`, also recorded as `scheduler.kv_disk_drop_reasons` in
+`throughput` JSONL.
 Exact RAM byte occupancy remains in `server_start` and `throughput` JSONL; set
 `NINFER_KV_RAM_LOG_BYTES=1` to print those byte values on the human lines. A new capture may still
 reap or evict while logged `kv-ram=` looks low. An explicit capacity is never silently reduced, and
@@ -1012,7 +1014,11 @@ previous prompt. Two shapes still miss on every turn: thinking off with `preserv
 the Qwen3.8 template (its history omits the empty generation wrapper), and a client that keeps
 reasoning inside a tool loop but strips it at the next user turn (the prompt diverges at the loop's
 first assistant turn). Stable `false` keeps the first assistant opener in the open turn so a newly closed turn can
-be recomputed without its reasoning.
+be recomputed without its reasoning. When such a turn stops (stop token or string) without a tool call
+and its checkpoint is its own generation opener, the host RAM and disk tiers store it cut at that
+checkpoint: one state set and no reply KV per entry, and the next turn reuses it as
+`append_frontier` with the same reuse length. Switching that conversation to `preserve_thinking=true`,
+or continuing that reply as an assistant prefill, then re-prefills the reply.
 
 `preserve_thinking` selects where the next checkpoint should live; it is not a cache-compatibility
 bit. An exact current frontier or matching complete checkpoint remains reusable across a mode

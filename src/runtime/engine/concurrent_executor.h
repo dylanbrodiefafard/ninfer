@@ -341,6 +341,7 @@ private:
         out.kv_disk_restores       = disk.restores;
         out.kv_disk_evictions      = disk.evictions;
         out.kv_disk_drops          = disk.drops;
+        out.kv_disk_drop_reasons   = disk.drop_reasons;
         out.kv_disk_save_seconds   = disk.save_seconds;
         out.kv_disk_load_seconds   = disk.load_seconds;
         out.kv_disk_capacity_bytes = disk.capacity_bytes;
@@ -353,6 +354,7 @@ private:
         out.kv_disk_restores       = in.kv_disk_restores;
         out.kv_disk_evictions      = in.kv_disk_evictions;
         out.kv_disk_drops          = in.kv_disk_drops;
+        out.kv_disk_drop_reasons   = in.kv_disk_drop_reasons;
         out.kv_disk_save_seconds   = in.kv_disk_save_seconds;
         out.kv_disk_load_seconds   = in.kv_disk_load_seconds;
         out.kv_disk_capacity_bytes = in.kv_disk_capacity_bytes;
@@ -750,6 +752,11 @@ private:
         result.reasoning               = std::move(request->reasoning);
         const auto calls = request->output.tool_calls();
         if (reason != FinishReason::Cancelled) { result.tool_calls.assign(calls.begin(), calls.end()); }
+        // A turn that stopped without a tool call is not continued from its frontier.
+        if (request->lane && calls.empty() &&
+            (reason == FinishReason::StopToken || reason == FinishReason::StopString)) {
+            instance_.program->mark_turn_closed(*request->lane);
+        }
         result.recovery = request->recovery;
         result.recovery.cycle_exclusions = request->cycle_exclusions;
         if (!request->output.has_tool_grammar()) {

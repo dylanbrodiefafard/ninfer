@@ -1218,7 +1218,7 @@ KVDiskCache::~KVDiskCache() noexcept {
             flush_queued_unlinks();
             write_manifest();
             fsync_store_dirs();
-        } catch (...) { ++drops_; }
+        } catch (...) { note_drop(KvDiskDropReason::Persist); }
         release_lock();
         unregister_location();
         if (copies_start_ != nullptr) { (void)cudaEventDestroy(copies_start_); }
@@ -1401,12 +1401,14 @@ void KVDiskCache::fsync_store_dirs() const {
 void KVDiskCache::persist_eviction(std::unique_lock<std::mutex>& lock) {
     try {
         write_manifest(lock);
-    } catch (...) { ++drops_; }
+    } catch (...) { note_drop(KvDiskDropReason::Persist); }
     if (lock.owns_lock()) { lock.unlock(); }
+    bool synced = true;
     try {
         fsync_store_dirs();
-    } catch (...) { ++drops_; }
+    } catch (...) { synced = false; }
     if (!lock.owns_lock()) { lock.lock(); }
+    if (!synced) { note_drop(KvDiskDropReason::Persist); }
     reclaim_durable_tombstones();
 }
 
@@ -2569,7 +2571,7 @@ void KVDiskCache::reap_retired_generations() {
             fsync_dir(packs);
             fsync_dir(maps);
         } catch (...) {
-            ++drops_;
+            note_drop(KvDiskDropReason::Persist);
             ++it;
             continue;
         }
@@ -2655,16 +2657,16 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
     if (!std::filesystem::exists(meta_path, ec)) { return false; }
     const auto decoded = try_decode_meta(read_file_bytes(meta_path));
     if (!decoded) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
     const DiskMeta& meta = *decoded;
     if (meta.entry_id != 0 && meta.entry_id != entry_id) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
     if (meta_cannot_restore(meta)) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
     const bool too_long =
@@ -2674,7 +2676,7 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
     if (meta.ledger_id != 0) {
         if (sizeof(TokenId) != 0 &&
             meta.ledger_frontier > kDiskHostFileMaxBytes / sizeof(TokenId)) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
         const std::uint64_t want =
@@ -2682,13 +2684,13 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
         const auto object = objects_.find(meta.ledger_id);
         if (object == objects_.end() || object->second.kind != DiskObjectKind::Ledger ||
             object->second.location.stored_bytes != want) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
         if (!too_long) {
             std::vector<std::uint8_t> bytes(static_cast<std::size_t>(want));
             if (!read_object(DiskObjectKind::Ledger, meta.ledger_id, bytes.data(), want)) {
-                ++drops_;
+                note_drop(KvDiskDropReason::IndexLoad);
                 return false;
             }
             record.ledger.resize(meta.ledger_frontier);
@@ -2699,24 +2701,24 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
         const auto object = objects_.find(meta.identity_id);
         const std::uint64_t sz = object == objects_.end() ? 0 : object->second.location.stored_bytes;
         if (sz == 0 || sz > kDiskHostFileMaxBytes) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
         std::vector<std::uint8_t> bytes(static_cast<std::size_t>(sz));
         if (object->second.kind != DiskObjectKind::Identity ||
             !read_object(DiskObjectKind::Identity, meta.identity_id, bytes.data(), sz)) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
         ResidentPrefixIdentity identity;
         try {
             identity.unpack(bytes.data(), bytes.size());
         } catch (...) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
         if (identity.size() != static_cast<std::size_t>(meta.ledger_frontier)) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
         if (!too_long) { record.identity = std::move(identity); }
@@ -2817,7 +2819,7 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
         (need_cyclic && meta.rewrite_valid && meta.rewrite_cyclic_id == 0) ||
         slot_missing(meta.rollback) || slot_missing(meta.ladders[0]) ||
         slot_missing(meta.ladders[1])) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
     if (need_cyclic) {
@@ -2828,7 +2830,7 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
             (meta.rewrite_gdn_id != 0 && meta.rewrite_cyclic_id == 0) ||
             need_cyclic_with_gdn(meta.rollback) || need_cyclic_with_gdn(meta.ladders[0]) ||
             need_cyclic_with_gdn(meta.ladders[1])) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
     }
@@ -2902,18 +2904,18 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
         objects_ok = false;
     }
     if (!objects_ok) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
     std::vector<std::pair<DiskObjectKind, std::uint64_t>> owned;
     append_meta_objects(owned, meta);
     if (owned_id_kind_conflict(owned)) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
     for (const auto& [kind, id] : owned) {
         if (object_kind_conflict(kind, id)) {
-            ++drops_;
+            note_drop(KvDiskDropReason::IndexLoad);
             return false;
         }
     }
@@ -2960,7 +2962,7 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
     bump_next_id(next_entry_id_, entry_id);
     return true;
     } catch (...) {
-        ++drops_;
+        note_drop(KvDiskDropReason::IndexLoad);
         return false;
     }
 }
@@ -3071,10 +3073,10 @@ void KVDiskCache::load_index() {
     if (trimmed) {
         try {
             write_manifest();
-        } catch (...) { ++drops_; }
+        } catch (...) { note_drop(KvDiskDropReason::Persist); }
         try {
             fsync_store_dirs();
-        } catch (...) { ++drops_; }
+        } catch (...) { note_drop(KvDiskDropReason::Persist); }
         reclaim_durable_tombstones();
     }
     reclaim_orphan_objects();
@@ -4761,7 +4763,7 @@ void KVDiskCache::note_ram_resident(std::uint64_t ram_id, std::uint64_t disk_tic
     } catch (const std::bad_alloc&) {
         // The RAM image is already valid. Missing optional disk bookkeeping
         // leaves it non-durable and must not fail the request that captured it.
-        ++drops_;
+        note_drop(KvDiskDropReason::NoteAlloc);
     }
 }
 
@@ -5154,7 +5156,7 @@ void KVDiskCache::drop_spill(SpillSession& session) noexcept {
         }
     }
     session.failed = true;
-    if (!session.cancelled) { ++drops_; }
+    if (!session.cancelled) { note_drop(KvDiskDropReason::SpillFailed); }
 }
 
 void KVDiskCache::discard_spill(std::unique_lock<std::mutex>& lock) {
@@ -6111,7 +6113,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
         for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
         branch_shared_ids_.clear();
         mark_note_failed();
-        ++drops_;
+        note_drop(KvDiskDropReason::SpillNoRoom);
         flush_queued_unlinks(lock);
         return false;
     }
@@ -6120,7 +6122,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
         for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
         branch_shared_ids_.clear();
         mark_note_failed();
-        ++drops_;
+        note_drop(KvDiskDropReason::SpillNoCapacity);
         flush_queued_unlinks(lock);
         return false;
     }
@@ -6154,7 +6156,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             failed->second.failed_this_generation = true;
             failed->second.generation_stamp       = durable_generation_;
         }
-        ++drops_;
+        note_drop(KvDiskDropReason::SpillFailed);
         idle_cv_.notify_all();
         cv_.notify_all();
         return false;
@@ -6296,7 +6298,7 @@ void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mute
                 fsync_store_dirs();
             } catch (...) { sync_failed = true; }
             if (!lock.owns_lock()) { lock.lock(); }
-            if (sync_failed) { ++drops_; }
+            if (sync_failed) { note_drop(KvDiskDropReason::Persist); }
         }
         return;
     }
@@ -6592,7 +6594,7 @@ RamReclaim KVDiskCache::reclaim_ram_entry(bool may_block, std::span<const std::u
     if (evicted) {
         if (!ram_is_durable(*victim)) {
             std::lock_guard lock(mutex_);
-            ++drops_;
+            note_drop(KvDiskDropReason::ReclaimUnsaved);
         }
         forget_ram_resident(*victim);
     }
@@ -6692,7 +6694,7 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
             it->second.failed_this_generation = true;
             it->second.generation_stamp       = durable_generation_;
         }
-        ++drops_;
+        note_drop(KvDiskDropReason::SpillFailed);
     }
     emergency_preparing_ = false;
     idle_cv_.notify_all();
@@ -6780,7 +6782,7 @@ void KVDiskCache::wait_idle_and_fsync() {
         lock.unlock();
     } catch (...) {
         if (!lock.owns_lock()) { lock.lock(); }
-        ++drops_;
+        note_drop(KvDiskDropReason::Persist);
     }
 }
 
@@ -6800,7 +6802,7 @@ void KVDiskCache::purge_prefetch_of(std::uint64_t entry_id) {
 }
 
 void KVDiskCache::publish_page_job_failure(const Job& job) {
-    ++drops_;
+    note_drop(KvDiskDropReason::PageJob);
     if (page_job_is_live_restore(job)) { restore_failed_ = true; }
 }
 
@@ -6889,13 +6891,13 @@ void KVDiskCache::fill_window_slot(std::uint32_t slot, DiskObjectKind kind, std:
          (win.epoch == restore_epoch_ && win.disk_entry_id == restore_entry_id_));
     if (ok && identity_live) { note_live_host_load_locked(io_started, io_ended); }
     if (!identity_live) {
-        if (!ok) { ++drops_; }
+        if (!ok) { note_drop(KvDiskDropReason::PageJob); }
         reset_window_slot_keep_host(win);
         idle_cv_.notify_all();
         return;
     }
     if (!ok) {
-        ++drops_;
+        note_drop(KvDiskDropReason::PageJob);
         if (slot_is_live_restore_page(win)) { restore_failed_ = true; }
         reset_window_slot_keep_host(win);
         idle_cv_.notify_all();
@@ -6951,7 +6953,7 @@ void KVDiskCache::prefetch_window(std::uint64_t entry_id, std::uint32_t text_dst
     } catch (const std::bad_alloc&) {
         // Prefetch is optional. Successfully queued jobs keep their pins;
         // demanded restore will enqueue every page not already represented.
-        ++drops_;
+        note_drop(KvDiskDropReason::OptionalAlloc);
     }
 }
 
@@ -7050,7 +7052,7 @@ std::uint64_t KVDiskCache::restore_device(std::uint64_t entry_id, const DiskRest
     if (target.text_dst_pages > record.meta.main_page_ids.size() ||
         target.backend_dst_pages > record.meta.backend_page_ids.size()) {
         restore_failed_ = true;
-        ++drops_;
+        note_drop(KvDiskDropReason::RestoreFailed);
         restore_kv_done_    = true;
         restore_state_done_ = true;
         idle_cv_.notify_all();
@@ -7391,7 +7393,7 @@ void KVDiskCache::finish_restore_state_locked(std::unique_lock<std::mutex>& lock
     } catch (...) {
         if (lock.owns_lock() && restore_target_ && !restore_failed_) {
             restore_failed_ = true;
-            ++drops_;
+            note_drop(KvDiskDropReason::RestoreFailed);
         }
         release_h2d();
         throw;
@@ -7414,7 +7416,7 @@ void KVDiskCache::pump_restore_locked(std::unique_lock<std::mutex>& lock, cudaSt
     if (target.text_dst_pages > record.meta.main_page_ids.size() ||
         target.backend_dst_pages > record.meta.backend_page_ids.size()) {
         restore_failed_ = true;
-        ++drops_;
+        note_drop(KvDiskDropReason::RestoreFailed);
         return;
     }
     const std::uint32_t text_n    = target.text_dst_pages;
@@ -7832,6 +7834,7 @@ KvDiskSnapshot KVDiskCache::snapshot_locked() const noexcept {
         .restores       = restores_,
         .evictions      = evictions_,
         .drops          = drops_,
+        .drop_reasons   = drop_reasons_,
         .save_seconds   = save_seconds_,
         .load_seconds   = load_seconds_,
         .sequence       = ++snapshot_sequence_,
@@ -7864,7 +7867,7 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
         const auto it = entries_.find(entry);
         if (it == entries_.end()) {
             restore_failed_ = true;
-            ++drops_;
+            note_drop(KvDiskDropReason::RestoreFailed);
             release_owner();
             return;
         }
@@ -7875,7 +7878,7 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
         release_owner();
         if (restore_state_is_live(epoch, entry, committed, claim, reuse, reuse_base)) {
             if (unexpected) { restore_worker_error_ = unexpected; }
-            if (!restore_failed_) { ++drops_; }
+            if (!restore_failed_) { note_drop(KvDiskDropReason::RestoreFailed); }
             restore_failed_ = true;
         }
     };
@@ -7952,20 +7955,20 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
             slot = meta.ladders[1];
         } else {
             restore_failed_ = true;
-            ++drops_;
+            note_drop(KvDiskDropReason::RestoreFailed);
             release_owner();
             return;
         }
         if (hidden_n != 0 && slot.hidden_id == 0) {
             restore_failed_ = true;
-            ++drops_;
+            note_drop(KvDiskDropReason::RestoreFailed);
             release_owner();
             return;
         }
     } else if (checkpoint_missing_hidden(meta.current_hidden_id, config_.hidden_bytes) ||
                (hidden_n != 0 && meta.current_hidden_id == 0)) {
         restore_failed_ = true;
-        ++drops_;
+        note_drop(KvDiskDropReason::RestoreFailed);
         release_owner();
         return;
     }
@@ -8122,7 +8125,7 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
         // mutex. Finishing its work must not bill that same restore again.
         if (!restore_failed_) {
             restore_failed_ = true;
-            ++drops_;
+            note_drop(KvDiskDropReason::RestoreFailed);
         }
         release_owner();
         return;
@@ -8388,7 +8391,7 @@ void KVDiskCache::restore_loop() {
                         !restore_failed_) {
                         restore_worker_error_ = std::current_exception();
                         restore_failed_ = true;
-                        ++drops_;
+                        note_drop(KvDiskDropReason::RestoreFailed);
                     }
                     idle_cv_.notify_all();
                 }
@@ -8407,7 +8410,7 @@ void KVDiskCache::restore_loop() {
             process_job(job);
         } catch (...) {
             std::unique_lock lock(mutex_);
-            ++drops_;
+            note_drop(KvDiskDropReason::PageJob);
             if (page_job_is_live_restore(job)) {
                 restore_worker_error_ = std::current_exception();
                 restore_failed_ = true;
@@ -8468,7 +8471,7 @@ void KVDiskCache::start_worker_spill(std::unique_lock<std::mutex>& lock, std::ui
             it->second.failed_this_generation = true;
             it->second.generation_stamp       = durable_generation_;
         }
-        ++drops_;
+        note_drop(KvDiskDropReason::SpillFailed);
     }
     if (abort_pin || !prepared) {
         try {
@@ -8558,7 +8561,7 @@ void KVDiskCache::io_loop() {
                         !restore_failed_) {
                         restore_worker_error_ = std::current_exception();
                         restore_failed_ = true;
-                        ++drops_;
+                        note_drop(KvDiskDropReason::RestoreFailed);
                     }
                     idle_cv_.notify_all();
                 }
@@ -8594,7 +8597,7 @@ void KVDiskCache::io_loop() {
                     // No candidate has been pinned yet. Skip this optional idle
                     // attempt while leaving the worker available for later work.
                     idle_requested_ = false;
-                    ++drops_;
+                    note_drop(KvDiskDropReason::OptionalAlloc);
                     idle_cv_.notify_all();
                     continue;
                 }
@@ -8617,7 +8620,7 @@ void KVDiskCache::io_loop() {
                 job.kind == JobKind::EmergencyCommit || job.kind == JobKind::IdleCommit) {
                 finish_payload_io(lock);
             }
-            ++drops_;
+            note_drop(KvDiskDropReason::PageJob);
             if (page_job_is_live_restore(job)) {
                 restore_worker_error_ = std::current_exception();
                 restore_failed_ = true;

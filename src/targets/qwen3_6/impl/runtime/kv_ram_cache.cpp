@@ -1005,8 +1005,19 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
     header.rewrite_kind            = source.rewrite_kind;
     header.hash_c_valid            = source.hash_c_valid;
     header.rewrite_frontier        = source.rewrite_frontier;
-    header.text_mapped_pages       = source.text->mapped_page_count();
-    header.backend_mapped_pages    = source.backend ? source.backend->mapped_page_count() : 0;
+    header.text_mapped_pages = source.text_pages.value_or(source.text->mapped_page_count());
+    header.backend_mapped_pages =
+        source.backend ? source.backend_pages.value_or(source.backend->mapped_page_count()) : 0;
+    if (header.text_mapped_pages > source.text->mapped_page_count() ||
+        (source.backend && header.backend_mapped_pages > source.backend->mapped_page_count())) {
+        throw std::invalid_argument("RAM capture page extent exceeds mapped pages");
+    }
+    const bool current_from_host = source.current_state.conv != nullptr;
+    if (current_from_host &&
+        (source.current_state.recurrent == nullptr ||
+         (source.dflash_local != nullptr && source.current_state.dflash == nullptr))) {
+        throw std::invalid_argument("RAM capture current host image is incomplete");
+    }
     header.text_plane_count        = static_cast<std::uint32_t>(source.text_pool->plane_count());
     header.backend_plane_count     =
         source.backend_pool ? static_cast<std::uint32_t>(source.backend_pool->plane_count()) : 0;
@@ -1182,17 +1193,21 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
         if (lengths[2] != 0) {
             start_device_copies();
             pack_paged_kv_allocation_to_host(*source.text, *source.text_pool, raw + header.offset[2],
-                                             source.stream);
+                                             header.text_mapped_pages, source.stream);
             copies_launched = true;
         }
         if (source.backend != nullptr && lengths[3] != 0) {
             start_device_copies();
             pack_paged_kv_allocation_to_host(*source.backend, *source.backend_pool,
-                                             raw + header.offset[3], source.stream);
+                                             raw + header.offset[3], header.backend_mapped_pages,
+                                             source.stream);
             copies_launched = true;
         }
         if (source.gdn != nullptr) {
-            if (lengths[4] != 0 || lengths[6] != 0) {
+            if (current_from_host) {
+                std::memcpy(raw + header.offset[4], source.current_state.conv, lengths[4]);
+                std::memcpy(raw + header.offset[6], source.current_state.recurrent, lengths[6]);
+            } else if (lengths[4] != 0 || lengths[6] != 0) {
                 start_device_copies();
                 source.gdn->pack_slot_to_host(source.gdn_current_slot, raw + header.offset[4],
                                               raw + header.offset[6], source.stream);
@@ -1219,10 +1234,14 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
             copies_launched = true;
         }
         if (source.dflash_local != nullptr && lengths[10] != 0) {
-            start_device_copies();
-            source.dflash_local->copy_lane_to_host(source.dflash_lane, raw + header.offset[10],
-                                                   source.stream);
-            copies_launched = true;
+            if (current_from_host) {
+                std::memcpy(raw + header.offset[10], source.current_state.dflash, lengths[10]);
+            } else {
+                start_device_copies();
+                source.dflash_local->copy_lane_to_host(source.dflash_lane, raw + header.offset[10],
+                                                       source.stream);
+                copies_launched = true;
+            }
         }
         if (lengths[11] != 0) {
             std::memcpy(raw + header.offset[11], source.rewrite_state.dflash, lengths[11]);

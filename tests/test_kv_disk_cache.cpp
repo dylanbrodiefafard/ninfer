@@ -2748,6 +2748,11 @@ int test_physical_preflight_rejects_before_pack_write(ninfer::DeviceContext& ctx
         alloc.release();
         return fail("pack-preflight admitted a spill with no physical room");
     }
+    if (disk.snapshot().drop_reasons[static_cast<std::size_t>(
+            ninfer::KvDiskDropReason::SpillNoRoom)] != 1) {
+        alloc.release();
+        return fail("pack-preflight refusal was not attributed to spill_no_room");
+    }
     const auto after = read_bytes(active_map_path(dir.path, ".log"));
     if (before != after || disk.snapshot().used_bytes != 0 ||
         disk.plan_match(text_prompt(tokens), q36::detail::prefix_hash_chain(text_prompt(tokens)))) {

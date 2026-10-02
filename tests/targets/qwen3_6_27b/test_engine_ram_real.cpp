@@ -1640,6 +1640,95 @@ int exercise_restore_allocation_fallback(const char* artifact, bool dflash = fal
     return 0;
 }
 
+// A preserve-off turn that stops without a tool call is stored in RAM cut at its turn
+// checkpoint (its generation opener). The next turn appends there, reusing the previous prompt
+// minus the 4-token no-thinking prologue, and decodes exactly what a resident turn-checkpoint
+// restore of the same conversation decodes (control engine without a RAM tier).
+int exercise_closed_turn_cut(const char* artifact, bool dflash) {
+    auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage out;
+        out.role = role;
+        out.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return out;
+    };
+    auto turn_options = [](std::uint32_t outputs, bool reuse) {
+        // Thinking off so the first turn stops on its own well inside the budget.
+        ninfer::RequestOptions out = greedy(outputs, reuse);
+        out.stop.include_model_defaults = true;
+        return out;
+    };
+    const std::string system = "Answer briefly. " + std::string(600, 'x');
+    auto first_turn = [&] {
+        ninfer::PromptInput input;
+        input.messages.push_back(message(ninfer::ChatRole::System, system));
+        input.messages.push_back(message(ninfer::ChatRole::User, "Name three rivers."));
+        input.options.enable_thinking = false;
+        return input;
+    };
+    auto second_turn = [&](const ninfer::GenerationResult& first) {
+        ninfer::PromptInput input = first_turn();
+        input.messages.push_back(message(ninfer::ChatRole::Assistant, first.content));
+        input.messages.push_back(message(ninfer::ChatRole::User, "Now name two mountains."));
+        return input;
+    };
+    auto engine_options = [&](std::size_t ram_bytes) {
+        auto options     = ordinary_options(artifact, 1, 4096, ram_bytes);
+        options.kv_cache = ninfer::KvCacheStorage::Nvfp4;
+        if (dflash) {
+            options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+            options.speculative.draft_tokens  = 4;
+            options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        }
+        return options;
+    };
+
+    ninfer::GenerationResult control_first;
+    ninfer::GenerationResult control;
+    {
+        ninfer::Engine engine(engine_options(0));
+        control_first = engine.generate(engine.prepare(first_turn()), turn_options(256, false));
+        if (!control_first.tool_calls.empty() ||
+            control_first.finish_reason != ninfer::FinishReason::StopToken) {
+            return fail("closed-turn source did not stop as a plain turn");
+        }
+        control = engine.generate(engine.prepare(second_turn(control_first)), turn_options(16, true));
+        if (control.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
+            control.prefix_reuse_path != ninfer::PrefixReusePath::RestoreTurnCheckpoint ||
+            control.reused_prompt_tokens + 4 != control_first.prompt.prompt_tokens) {
+            std::cerr << "closed-turn resident control: path "
+                      << static_cast<int>(control.prefix_reuse_path) << " reused "
+                      << control.reused_prompt_tokens << '\n';
+            return 1;
+        }
+    }
+
+    ninfer::Engine engine(engine_options(4ULL << 30));
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(first_turn()), turn_options(256, false));
+    if (first.generated_token_ids != control_first.generated_token_ids) {
+        return fail("closed-turn source is not deterministic across engines");
+    }
+    (void)engine.generate(engine.prepare_tokens(tokens_c()), greedy(4, false));
+    const ninfer::GenerationResult restored =
+        engine.generate(engine.prepare(second_turn(first)), turn_options(16, true));
+    if (restored.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
+        restored.prefix_reuse_path != ninfer::PrefixReusePath::AppendAtFrontier ||
+        restored.reused_prompt_tokens != control.reused_prompt_tokens) {
+        std::cerr << "closed-turn RAM restore: source "
+                  << static_cast<int>(restored.prefix_reuse_source) << " path "
+                  << static_cast<int>(restored.prefix_reuse_path) << " reused "
+                  << restored.reused_prompt_tokens << ", expected append_at_frontier "
+                  << control.reused_prompt_tokens << " from host RAM\n";
+        return 1;
+    }
+    if (restored.generated_token_ids != control.generated_token_ids) {
+        return fail("closed-turn RAM restore decoded differently from the resident restore");
+    }
+    std::cout << "closed-turn cut dflash=" << dflash << " passed\n";
+    return 0;
+}
+
 int exercise_artifact(const char* artifact) {
     {
         ninfer::Engine engine(ordinary_options(artifact, 1, 4096, kRamHitBytes, 128));
@@ -1696,6 +1785,8 @@ int exercise_artifact(const char* artifact) {
     if (const int rc = exercise_teardown_after_restore(artifact); rc != 0) { return rc; }
     if (const int rc = exercise_restore_allocation_fallback(artifact); rc != 0) { return rc; }
     if (const int rc = exercise_restore_allocation_fallback(artifact, false, true); rc != 0) { return rc; }
+    std::cerr << "ram_real: closed-turn cut\n";
+    if (const int rc = exercise_closed_turn_cut(artifact, false); rc != 0) { return rc; }
     std::cerr << "ram_real: MTP\n";
     if (const int rc = exercise_mtp(artifact); rc != 0) { return rc; }
     return 0;
@@ -1738,6 +1829,9 @@ int main(int argc, char** argv) {
         if (const int result = run(nvfp4); result != 0) { return result; }
     }
     if (dflash != nullptr && *dflash != '\0' && !mtp_only) {
+        if (!planning_only && !fallback_only) {
+            if (const int result = exercise_closed_turn_cut(dflash, true); result != 0) { return result; }
+        }
         if (const int result = exercise_restore_allocation_fallback(dflash, true, planning_only); result != 0) { return result; }
         if (!planning_only && !fallback_only) {
             if (const int result = exercise_restore_allocation_fallback(dflash, true, true); result != 0) { return result; }

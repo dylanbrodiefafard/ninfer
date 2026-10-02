@@ -782,8 +782,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                             : 0U,
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
-    request.lifecycle = Lifecycle::Empty;
-    sequence.retained = false;
+    request.lifecycle    = Lifecycle::Empty;
+    sequence.retained    = false;
+    sequence.turn_closed = false;
+    sequence.closure_frontier =
+        prompt.identity.rewrite_checkpoint &&
+                prompt.identity.rewrite_checkpoint->kind == RewriteCheckpointKind::TurnClosure &&
+                prompt.identity.rewrite_checkpoint->generation_opener
+            ? prompt.identity.rewrite_checkpoint->frontier
+            : 0;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -817,9 +824,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
             drop_context_checkpoints_after(sequence, base);
+            // A tier entry cut at its turn checkpoint is the only one restored without a rewrite
+            // checkpoint at its frontier.
+            const bool cut_restore = (request_plan.reuse_source == PrefixReuseSource::HostRam ||
+                                      request_plan.reuse_source == PrefixReuseSource::HostDisk) &&
+                                     !sequence.rewrite_checkpoint.valid;
             maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
                                         prompt_tokens, request_plan.capture_context_checkpoints,
-                                        request_plan.capture_context_checkpoint);
+                                        request_plan.capture_context_checkpoint, cut_restore);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
@@ -852,7 +864,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             drop_context_checkpoints_after(sequence, base);
             maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
                                         prompt_tokens, request_plan.capture_context_checkpoints,
-                                        request_plan.capture_context_checkpoint);
+                                        request_plan.capture_context_checkpoint, false);
         } else if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error(
@@ -890,7 +902,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             drop_context_checkpoints_after(sequence, base);
             maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
                                         prompt_tokens, request_plan.capture_context_checkpoints,
-                                        request_plan.capture_context_checkpoint);
+                                        request_plan.capture_context_checkpoint, false);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -1476,16 +1488,33 @@ std::uint64_t ProgramImplCore::retained_use_tick(std::uint32_t lane) const noexc
     return has_retained_lane(lane) ? sequences[lane].use_tick : 0;
 }
 
+void ProgramImplCore::mark_turn_closed(std::uint32_t lane) noexcept {
+    if (has_retained_lane(lane)) { sequences[lane].turn_closed = true; }
+}
+
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
 }
 
+bool ProgramImplCore::capture_cuts_at_rewrite(const SequenceState& sequence) const noexcept {
+    const RewriteCheckpoint& checkpoint = sequence.rewrite_checkpoint;
+    return sequence.turn_closed && checkpoint.valid &&
+           checkpoint.kind == RewriteCheckpointKind::TurnClosure && checkpoint.frontier != 0 &&
+           checkpoint.frontier == sequence.closure_frontier &&
+           checkpoint.frontier < sequence.execution_frontier &&
+           checkpoint.frontier <= sequence.text_kv_valid &&
+           checkpoint.frontier < sequence.ledger.size() &&
+           checkpoint.frontier < sequence.prefix_identity.size();
+}
+
 qwen3_6::detail::RamCaptureSource
-ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
+ProgramImplCore::ram_capture_source(const SequenceState& sequence,
+                                    qwen3_6::detail::ResidentPrefixIdentity& cut_identity) {
     if (!sequence.kv || !sequence.retained) {
         throw std::logic_error("RAM capture requires a retained sequence bundle");
     }
+    if (capture_cuts_at_rewrite(sequence)) { return cut_ram_capture_source(sequence, cut_identity); }
     qwen3_6::detail::RamCaptureSource source;
     source.execution_frontier      = sequence.execution_frontier;
     source.ledger_frontier         = sequence.ledger_frontier;
@@ -1560,6 +1589,84 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence) {
     return source;
 }
 
+// The lane as of its turn checkpoint F: ledger, KV and identity end at F (plus the one ledger
+// slot a committed lane keeps past its execution frontier), the checkpoint state and hidden are
+// the current set, and no rewrite set or later head is stored.
+qwen3_6::detail::RamCaptureSource
+ProgramImplCore::cut_ram_capture_source(const SequenceState& sequence,
+                                        qwen3_6::detail::ResidentPrefixIdentity& cut_identity) {
+    const std::uint32_t frontier = sequence.rewrite_checkpoint.frontier;
+    cut_identity                 = sequence.prefix_identity;
+    cut_identity.truncate(frontier + 1);
+
+    qwen3_6::detail::RamCaptureSource source;
+    source.execution_frontier      = frontier;
+    source.ledger_frontier         = frontier + 1;
+    source.rope_delta              = sequence.rope_delta;
+    source.text_kv_valid           = frontier;
+    source.mtp_kv_valid            = speculative_backend == SpeculativeBackend::Mtp ? frontier - 1 : 0;
+    source.dflash_context_frontier = speculative_backend == SpeculativeBackend::DFlash ? frontier : 0;
+    source.tail_hidden_valid       = true;
+    source.ledger   = std::span<const TokenId>(sequence.ledger).first(frontier + 1);
+    source.identity = &cut_identity;
+    source.hash_f   = qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity,
+                                                      frontier);
+    source.text       = &sequence.kv->text;
+    source.text_pool  = &decoder->text_kv.pool();
+    source.text_pages = std::min(ninfer::pages_for_tokens(frontier), sequence.kv->text.mapped_page_count());
+    if (sequence.kv->backend) {
+        source.backend       = &*sequence.kv->backend;
+        source.backend_pool  = &backend_kv_cache()->pool();
+        const std::uint32_t backend_tokens =
+            speculative_backend == SpeculativeBackend::Mtp ? source.mtp_kv_valid
+                                                           : source.dflash_context_frontier;
+        source.backend_pages =
+            std::min(ninfer::pages_for_tokens(backend_tokens), sequence.kv->backend->mapped_page_count());
+    }
+    const ContextCheckpointHead& image = sequence.rewrite_image;
+    image.wait_copies();
+    source.gdn              = &decoder->linear_attention;
+    source.gdn_current_slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+    source.current_state    = qwen3_6::detail::RewriteStateHostSource{
+           .conv      = image.conv->data(),
+           .recurrent = image.recurrent->data(),
+           .dflash    = image.dflash ? image.dflash->data() : nullptr,
+    };
+    source.tail_hidden = &sequence.rewrite_checkpoint_hidden;
+    for (const ContextCheckpointHead& head : sequence.context_checkpoints) {
+        if (head.frontier > frontier) { continue; }
+        head.wait_copies();
+        RamLadderHead view;
+        view.frontier = head.frontier;
+        view.hash     = head.hash;
+        view.kind     = head.kind;
+        if (head.conv) {
+            view.conv       = head.conv->data();
+            view.conv_bytes = head.conv->size();
+        }
+        if (head.recurrent) {
+            view.recurrent       = head.recurrent->data();
+            view.recurrent_bytes = head.recurrent->size();
+        }
+        if (head.hidden) {
+            view.hidden       = head.hidden->data();
+            view.hidden_bytes = head.hidden->size();
+        }
+        if (head.dflash) {
+            view.dflash       = head.dflash->data();
+            view.dflash_bytes = head.dflash->size();
+        }
+        source.ladder_heads.push_back(view);
+    }
+    if (dflash) {
+        source.dflash_local = &dflash->local;
+        source.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
+    }
+    source.disk_entry_id = sequence.disk_entry_id;
+    source.stream        = device.copy_stream;
+    return source;
+}
+
 bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
                                             bool may_block, bool* deferred,
                                             std::span<const std::uint64_t> attempt_ram_ids) {
@@ -1568,8 +1675,9 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
     if (!kv_ram_cache_ || !has_retained_lane(lane)) { return true; }
     device.order_copy_after_compute();
     qwen3_6::detail::RamCaptureSource source;
+    qwen3_6::detail::ResidentPrefixIdentity cut_identity;
     try {
-        source = ram_capture_source(sequences[lane]);
+        source = ram_capture_source(sequences[lane], cut_identity);
     } catch (const std::bad_alloc&) {
         kv_ram_cache_->record_drop();
         return false;
@@ -1988,7 +2096,8 @@ ProgramImplCore::rewrite_state_host_target(SequenceState& sequence) {
 void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, RequestControl& request,
                                                   const PreparedPromptData& prompt, ReusePath reuse,
                                                   std::uint32_t base, std::uint32_t prompt_tokens,
-                                                  bool capture_enabled, bool request_pin) {
+                                                  bool capture_enabled, bool request_pin,
+                                                  bool cut_restore) {
     const bool enabled = capture_enabled && captures_context_checkpoints() &&
                          staging_hidden.data != nullptr;
     const bool already =
@@ -1996,9 +2105,15 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
                     [base](const ContextCheckpointHead& head) { return head.frontier == base; });
     const bool complete =
         qwen3_6::detail::prefix_items_complete_at(prompt.vision_items, base);
-    if (!qwen3_6::detail::should_capture_turn_rollback(reuse, base, prompt_tokens, enabled,
-                                                       sequence.tail_hidden_valid, already,
-                                                       complete) &&
+    // A preserve-off turn (own TurnClosure checkpoint) appending to a cut tier entry is not
+    // pinned automatically: that entry is the previous turn cut at its checkpoint, the restore
+    // point a pre-cut entry offered through restore_turn_checkpoint without a pin, and tiers
+    // store this turn cut at its own checkpoint without later heads.
+    const bool auto_rollback = !(cut_restore && sequence.closure_frontier != 0);
+    if (!(auto_rollback &&
+          qwen3_6::detail::should_capture_turn_rollback(reuse, base, prompt_tokens, enabled,
+                                                        sequence.tail_hidden_valid, already,
+                                                        complete)) &&
         !qwen3_6::detail::should_capture_exact_hit_pin(request_pin, base, prompt_tokens, enabled,
                                                        sequence.tail_hidden_valid, already,
                                                        complete)) {
@@ -2176,6 +2291,8 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         }
         sequence.kv.reset();
         sequence.retained           = false;
+        sequence.turn_closed        = false;
+        sequence.closure_frontier   = 0;
         sequence.mtp_draft_count    = 0;
         sequence.rewrite_checkpoint = {};
 
@@ -2342,6 +2459,8 @@ void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry
         }
         sequence.kv.reset();
         sequence.retained           = false;
+        sequence.turn_closed        = false;
+        sequence.closure_frontier   = 0;
         sequence.mtp_draft_count    = 0;
         sequence.rewrite_checkpoint = {};
 
@@ -2712,6 +2831,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
+    sequence.turn_closed             = false;
+    sequence.closure_frontier        = 0;
     sequence.use_tick                = 0;
     sequence.disk_entry_id           = 0;
     sequence.rewrite_checkpoint      = {};

@@ -49,6 +49,9 @@ enum class RewriteCheckpointKind : std::uint8_t {
 struct RewriteCheckpointSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
+    // The checkpoint is this request's own generation opener, not an earlier assistant turn's
+    // (a TurnClosure checkpoint inside a tool loop sits at the loop's first opener).
+    bool generation_opener = false;
 
     [[nodiscard]] bool operator==(const RewriteCheckpointSpec&) const = default;
 };

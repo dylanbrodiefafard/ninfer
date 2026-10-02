@@ -234,6 +234,7 @@ struct DiskSnapshot {
     std::uint64_t restores     = 0;
     std::uint64_t evictions    = 0;
     std::uint64_t drops        = 0;
+    std::array<std::uint64_t, ninfer::kKvDiskDropReasonCount> drop_reasons{};
     double save_seconds        = 0;
     double load_seconds        = 0;
     std::uint64_t sequence     = 0;
@@ -546,6 +547,7 @@ public:
     [[nodiscard]] std::uint64_t pending_disk_restore_ticket() const noexcept { return 0; }
     [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t) const noexcept { return 0; }
+    void mark_turn_closed(std::uint32_t) noexcept {}
     [[nodiscard]] bool capture_retained_lane(std::uint32_t, std::uint64_t* = nullptr, bool = true,
                                              bool* = nullptr, std::span<const std::uint64_t> = {}) {
         return false;
@@ -1145,6 +1147,248 @@ int run_retry_lifecycle(Frontend& frontend) {
     return failures;
 }
 
+// Admission while another lane decodes and a full RAM tier is spilling on the disk worker
+// (kv_ram_reclaim_pending). Lane 0 decodes; lanes 1 and 2 are retained. The admission picks
+// lane 1, evicts lane 2 as its victim, and captures both. It must wait without claiming or
+// capturing while the reclaim is pending, roll back the victim capture when the lane capture
+// defers, pass its earlier capture as the reclaim keep list, and finish once the spill lands.
+class DeferProgram : public ProbeProgram {
+public:
+    struct Capture {
+        std::uint32_t lane = 0;
+        bool may_block     = true;
+        std::vector<std::uint64_t> keep;
+        std::uint64_t id   = 0;
+        bool deferred      = false;
+    };
+
+    std::atomic<bool> reclaim_pending{false};
+    std::atomic<bool> defer_lane_capture{false};
+    std::atomic<bool> release_decoder{false};
+    std::atomic<std::uint32_t> decode_calls{0};
+    std::atomic<std::uint32_t> prefills{0};
+
+    std::vector<Capture> captures() const {
+        std::lock_guard lock(mu_);
+        return captures_;
+    }
+    std::vector<std::uint64_t> discards() const {
+        std::lock_guard lock(mu_);
+        return discards_;
+    }
+    std::vector<std::uint32_t> closed() const {
+        std::lock_guard lock(mu_);
+        return closed_;
+    }
+
+    [[nodiscard]] AdmissionResources admission_capacity() const noexcept {
+        return AdmissionResources{3, 3, 0};
+    }
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const ProbePlan&) const noexcept {
+        return !has_retained_lane(lane);
+    }
+    [[nodiscard]] bool can_admit_lane_after_retained_eviction(std::uint32_t,
+                                                             const ProbePlan&) const noexcept {
+        return true;
+    }
+    [[nodiscard]] bool can_admit_lane_after_releasing(
+        std::uint32_t, const ProbePlan&, std::span<const std::uint32_t> victims) const noexcept {
+        return !victims.empty();
+    }
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept {
+        return lane < retained_.size() && retained_[lane].load();
+    }
+    [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept {
+        return has_retained_lane(lane) ? 5 + 4 * static_cast<std::uint64_t>(lane) : 0;
+    }
+    void evict_retained_lane(std::uint32_t lane) noexcept {
+        if (lane < retained_.size()) { retained_[lane].store(false); }
+    }
+    [[nodiscard]] bool kv_ram_reclaim_pending() const { return reclaim_pending.load(); }
+    // The admission's captures complete at once, so its copy hold ends at the next boundary.
+    [[nodiscard]] bool kv_copies_ready() const { return true; }
+    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id,
+                                             bool may_block, bool* deferred,
+                                             std::span<const std::uint64_t> keep) {
+        std::lock_guard lock(mu_);
+        Capture capture{.lane = lane, .may_block = may_block,
+                        .keep = std::vector<std::uint64_t>(keep.begin(), keep.end())};
+        if (ram_entry_id != nullptr) { *ram_entry_id = 0; }
+        if (deferred != nullptr) { *deferred = false; }
+        if (lane == 1 && defer_lane_capture.exchange(false)) {
+            capture.deferred = true;
+            if (deferred != nullptr) { *deferred = true; }
+            // The deferral means a spill is in flight; it lands when the test clears the flag.
+            reclaim_pending.store(true);
+            captures_.push_back(std::move(capture));
+            return false;
+        }
+        capture.id = next_id_++;
+        if (ram_entry_id != nullptr) { *ram_entry_id = capture.id; }
+        captures_.push_back(std::move(capture));
+        return true;
+    }
+    void discard_ram_capture(std::uint64_t entry_id) {
+        std::lock_guard lock(mu_);
+        discards_.push_back(entry_id);
+    }
+    void mark_turn_closed(std::uint32_t lane) noexcept {
+        std::lock_guard lock(mu_);
+        closed_.push_back(lane);
+    }
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
+                                                       ProbePlan, TransientRegion,
+                                                       const OutputSession*) {
+        prefills.fetch_add(1);
+        if (lane < retained_.size()) { retained_[lane].store(false); }
+        prefill_token_ = lane == 0 ? kDecodeToken : kCallerStop;
+        PrefillStepResult step;
+        step.complete                = true;
+        step.processed_prompt_tokens = 1;
+        step.round.tokens            = std::span<const TokenId>(&prefill_token_, 1);
+        step.summary.prompt_tokens   = prompt.summary().prompt_tokens;
+        step.summary.prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+        return step;
+    }
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
+                                                     std::span<const RoundBudget>) {
+        decode_calls.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            decode_tokens_[row] = release_decoder.load() ? kCallerStop : kDecodeToken;
+            decode_counts_[row] = 1;
+        }
+        return {.tokens     = std::span<const TokenId>(decode_tokens_.data(), lanes.size()),
+                .row_counts = std::span<const std::int32_t>(decode_counts_.data(), lanes.size()),
+                .row_stride = 1};
+    }
+
+private:
+    static constexpr TokenId kDecodeToken = 23;
+    mutable std::mutex mu_;
+    std::vector<Capture> captures_;
+    std::vector<std::uint64_t> discards_;
+    std::vector<std::uint32_t> closed_;
+    std::uint64_t next_id_ = 101;
+    std::array<std::atomic<bool>, 3> retained_{false, true, true};
+    TokenId prefill_token_ = kCallerStop;
+    std::array<TokenId, 3> decode_tokens_{};
+    std::array<std::int32_t, 3> decode_counts_{};
+};
+
+struct DeferPackage {
+    using Program         = DeferProgram;
+    using RequestBasePlan = ProbePlan;
+    using RequestPlan     = ProbePlan;
+};
+
+struct DeferProbe {
+    using Package = DeferPackage;
+    DeferProgram* program = nullptr;
+    ProbeLoaded* loaded   = nullptr;
+    ProbeMemory request_memory;
+};
+
+int run_admission_defers_for_reclaim(Frontend& frontend) {
+    DeferProgram program;
+    // Plans sized from each request (service quanta cover the long decode); no resident reuse.
+    program.lifecycle_retries = true;
+    program.script            = CacheCase::AdmitRamHit;
+    ProbeLoaded loaded{frontend};
+    DeferProbe instance;
+    instance.program = &program;
+    instance.loaded  = &loaded;
+    auto engine = engine_options();
+    engine.max_concurrency     = 3;
+    engine.max_context         = 32768;
+    engine.generation_recovery = false;
+    ninfer::runtime::ConcurrentExecutor<DeferProbe> executor(instance, engine);
+
+    auto submit = [&](std::uint32_t outputs) {
+        auto prepared = frontend.prepare(thinking_input());
+        const auto summary = prepared.summary();
+        ninfer::runtime::ResolvedRequestOptions options;
+        options.execution.sampling.p_less           = true;
+        options.execution.allow_prefix_reuse        = false;
+        options.execution.requested_output_tokens   = outputs;
+        options.stop.token_ids                      = {kCallerStop};
+        return executor.submit(std::move(prepared), summary, 0.0, std::move(options),
+                               ninfer::OutputDelivery::TerminalOnly);
+    };
+    auto wait_until = [](auto&& predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) { return false; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    ninfer::CancellationView cancel([deadline] {
+        return std::chrono::steady_clock::now() >= deadline;
+    });
+
+    int failures = 0;
+    auto decoder = submit(30000);
+    if (!wait_until([&] { return program.decode_calls.load() >= 2; })) {
+        return check(false, "defer: the decoding request never entered decode");
+    }
+    program.reclaim_pending.store(true);
+    program.defer_lane_capture.store(true);
+    auto admitted = submit(8);
+    const std::uint32_t decode_before = program.decode_calls.load();
+    failures += check(wait_until([&] { return program.decode_calls.load() >= decode_before + 20; }),
+                      "defer: decode stalled behind a pending reclaim");
+    failures += check(program.captures().empty() && program.prefills.load() == 1,
+                      "defer: admission captured or prefilled while a reclaim was pending");
+
+    program.reclaim_pending.store(false);
+    if (!wait_until([&] { return program.captures().size() >= 2; })) {
+        return failures + check(false, "defer: admission did not capture after the reclaim cleared");
+    }
+    {
+        const auto captures = program.captures();
+        failures += check(captures[0].lane == 2 && captures[0].id != 0 && !captures[0].may_block &&
+                              captures[0].keep.empty(),
+                          "defer: the victim capture was not first, non-blocking, with no keep list");
+        failures += check(captures[1].lane == 1 && captures[1].deferred && !captures[1].may_block &&
+                              captures[1].keep == std::vector<std::uint64_t>{captures[0].id},
+                          "defer: the lane capture did not defer with the victim capture kept");
+        failures += check(wait_until([&] { return !program.discards().empty(); }) &&
+                              program.discards() == std::vector<std::uint64_t>{captures[0].id},
+                          "defer: the deferred admission did not roll back the victim capture");
+    }
+    const std::uint32_t deferred_decode = program.decode_calls.load();
+    failures += check(wait_until([&] { return program.decode_calls.load() >= deferred_decode + 20; }),
+                      "defer: decode stalled behind a deferred admission");
+    failures += check(program.captures().size() == 2 && program.prefills.load() == 1,
+                      "defer: admission retried before the spill landed");
+
+    program.reclaim_pending.store(false);
+    const ninfer::GenerationResult admitted_result = admitted.wait(nullptr, cancel);
+    {
+        const auto captures = program.captures();
+        failures += check(captures.size() == 4 && captures[2].lane == 2 && captures[3].lane == 1 &&
+                              !captures[3].deferred &&
+                              captures[3].keep == std::vector<std::uint64_t>{captures[2].id},
+                          "defer: the retried admission did not capture victim then lane");
+        failures += check(program.discards().size() == 1,
+                          "defer: the completed admission rolled back its captures");
+    }
+    failures += check(admitted_result.finish_reason == FinishReason::StopToken,
+                      "defer: the admitted request did not finish");
+    program.release_decoder.store(true);
+    const ninfer::GenerationResult decoder_result = decoder.wait(nullptr, cancel);
+    failures += check(decoder_result.finish_reason == FinishReason::StopToken &&
+                          decoder_result.generated_token_ids.size() > 40,
+                      "defer: the decoding request did not keep decoding to its stop");
+    auto closed = program.closed();
+    std::sort(closed.begin(), closed.end());
+    failures += check(closed == std::vector<std::uint32_t>{0, 1},
+                      "defer: finished turns without tool calls were not marked closed");
+    return failures;
+}
+
 int main() {
     try {
         Frontend frontend = FrontendTestAccess::create_component(resources(), false);
@@ -1165,6 +1409,7 @@ int main() {
         for (const CacheCase script : admission_cases) { failures += run_admission(frontend, script); }
         failures += run_retry_lifecycle(frontend);
         failures += run_idle_poll_does_not_block_submit(frontend);
+        failures += run_admission_defers_for_reclaim(frontend);
         std::cout << "recovery executor failures=" << failures << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

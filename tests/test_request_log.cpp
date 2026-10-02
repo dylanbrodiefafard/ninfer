@@ -652,6 +652,25 @@ int main() {
     failures += check(human_disk_throughput.find("kv-disk=1 MiB n=1 restores=4") !=
                               std::string::npos,
                       "human throughput omits KV disk occupancy");
+    failures += check(human_disk_throughput.find("drops=0 save=") != std::string::npos,
+                      "human throughput prints drop causes without drops");
+    {
+        ThroughputReport dropped = ram_throughput;
+        dropped.scheduler.kv_disk_drops = 3;
+        dropped.scheduler.kv_disk_drop_reasons[static_cast<std::size_t>(
+            ninfer::KvDiskDropReason::SpillNoCapacity)] = 2;
+        dropped.scheduler.kv_disk_drop_reasons[static_cast<std::size_t>(
+            ninfer::KvDiskDropReason::ReclaimUnsaved)] = 1;
+        failures += check(format_throughput(dropped).find(
+                              "drops=3 (spill_no_capacity:2,reclaim_unsaved:1) save=") !=
+                              std::string::npos,
+                          "human throughput omits KV disk drop causes");
+        const Json dropped_json =
+            Json::parse(format_throughput_json("serve-test", 5002, dropped));
+        failures += check(dropped_json.at("scheduler").at("kv_disk_drop_reasons") ==
+                              Json{{"spill_no_capacity", 2}, {"reclaim_unsaved", 1}},
+                          "throughput JSON omits KV disk drop causes");
+    }
     const Json ram_throughput_json =
         Json::parse(format_throughput_json("serve-test", 5001, ram_throughput));
     failures += check(ram_throughput_json.at("scheduler").at("kv_ram_capacity_bytes") == 1048576 &&

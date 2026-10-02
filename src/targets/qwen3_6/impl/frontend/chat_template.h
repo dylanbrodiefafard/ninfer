@@ -90,6 +90,8 @@ struct ChatRenderOptions {
 struct RewriteCheckpointByteSpec {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::size_t offset         = 0;
+    // The checkpoint is this request's own generation opener (not an earlier turn's).
+    bool generation_opener = false;
 };
 
 struct RenderedChat {
