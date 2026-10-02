@@ -4,6 +4,7 @@
 
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/sanitizer_scope.h"
 
 #include <cuda_runtime.h>
 
@@ -710,10 +711,17 @@ int run_fp8_target() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
+    }
+    if (ninfer::test::sanitizer_scope(argc, argv)) {
+        // The qwen3.8-27b NVFP4 flow binds NVFP4 and BF16 attention-input parents only.
+        const int sanitizer_failures = run_bf16_target() + run_nvfp4_target();
+        std::cout << (sanitizer_failures == 0 ? "OK" : "FAIL")
+                  << " attn_input_proj sanitizer cases\n";
+        return sanitizer_failures == 0 ? 0 : 1;
     }
 
     int failures = 0;

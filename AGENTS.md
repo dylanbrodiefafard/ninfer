@@ -274,7 +274,8 @@ affected explicit targets and meaningful tests; Python tooling gets `py_compile`
 Python tests; `.ninfer` reader/converter/binder changes get affected contract tests and a real
 artifact when semantics require it; CUDA math gets an independent numerical oracle at relevant
 shapes; new or changed kernels with shared-memory staging, asynchronous copies, or warp-level
-synchronization get compute-sanitizer memcheck and racecheck on their tests; memory/lifetime
+synchronization get compute-sanitizer memcheck and racecheck on their tests, and a case in the
+`sanitizer` test set when the qwen3.8-27b DFlash2 flow dispatches them; memory/lifetime
 changes get the affected execution, with initcheck or AddressSanitizer for a concrete lifetime
 risk; performance changes get measurement at the claimed scope, with
 attribution tools only when needed; serving changes get affected OpenAI/Anthropic schema tests

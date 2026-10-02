@@ -465,6 +465,25 @@ For a performance change:
 
 Preserve only the context needed to interpret the result, as required by `AGENTS.md`.
 
+### 6.4 Sanitizer scope
+
+The oracle suite and the sanitizer runs want different things. The oracle needs every route
+boundary and a numerical comparison; compute-sanitizer needs each kernel route executed, and its
+cost grows with launches and tracked memory. The compute-sanitizer gates therefore run a
+dedicated set, the tests labelled `sanitizer` in `tests/CMakeLists.txt`, covering the Ops the
+qwen3.8-27b NVFP4 DFlash2 flow dispatches.
+
+- A suite that is quick under compute-sanitizer joins the set unchanged.
+- A suite whose sweep is too slow or too large provides `--sanitizer` cases
+  (`tests/ops/sanitizer_scope.h`): every route that flow dispatches, once, at real model widths
+  and its boundary shapes, with the case count cut and statistical criteria left to the full
+  suite. It is registered with `ninfer_add_sanitizer_cases`.
+- The `racecheck` label marks the part of the set that is also quick under racecheck.
+
+A new Op in that flow, or a new route in an existing one, adds its sanitizer case in the same
+change. Routes outside the flow (other targets, storage profiles, and non-default options) stay in
+the oracle suite and are sanitized when they change.
+
 ## 8. Change checklist
 
 For a new or changed device transformation:
@@ -482,10 +501,12 @@ For a new or changed device transformation:
 6. keep persistent state, graph lifecycle, and schedule policy outside the Op;
 7. qualify every affected public entry and reachable production profile directly against the
    independent oracle;
-8. measure the Op when performance changes; measure a product route only for an explicitly scoped
+8. run compute-sanitizer memcheck and racecheck on the affected suite, and keep the `sanitizer`
+   set covering every route the qwen3.8-27b DFlash2 flow dispatches;
+9. measure the Op when performance changes; measure a product route only for an explicitly scoped
    end-to-end claim;
-9. integrate targets only through semantic contract headers and explicit operands;
-10. give every source and symbol one clear build and link owner.
+10. integrate targets only through semantic contract headers and explicit operands;
+11. give every source and symbol one clear build and link owner.
 
 A contract change updates the authoritative comment, affected implementations, callers whose
 assumptions changed, and tests protecting the changed behavior. A faster private implementation

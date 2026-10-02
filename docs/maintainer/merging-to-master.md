@@ -27,9 +27,9 @@ Cheap gates come first so a failure stops the run early.
 | 3 | clang-tidy, whole tree | `./scripts/run-clang-tidy.py` | `0 diagnostics` |
 | 4 | Unit tests, all of them | `./scripts/run-unit-tests.sh` | every test passes, the tests labelled `slow` included |
 | 5 | Engine tests on real artifacts | `./scripts/run-unit-tests.sh --real` | every Engine test passes with the supported artifacts bound |
-| 6 | compute-sanitizer memcheck | `./scripts/run-unit-tests.sh --compute-sanitizer memcheck -L kernel` | every kernel test passes with `0 errors` |
-| 7 | compute-sanitizer racecheck | `./scripts/run-unit-tests.sh --compute-sanitizer racecheck -L kernel` | every kernel test passes with `0 hazards` |
-| 8 | compute-sanitizer initcheck | `./scripts/run-unit-tests.sh --compute-sanitizer initcheck -L kernel` | every kernel test passes with `0 errors` |
+| 6 | compute-sanitizer memcheck | `./scripts/run-unit-tests.sh --compute-sanitizer memcheck -L sanitizer` | every test in the sanitizer set passes with `0 errors` |
+| 7 | compute-sanitizer racecheck | `./scripts/run-unit-tests.sh --compute-sanitizer racecheck -L racecheck` | every test in the racecheck set passes with `0 hazards` |
+| 8 | compute-sanitizer initcheck | `./scripts/run-unit-tests.sh --compute-sanitizer initcheck -L sanitizer` | every test in the sanitizer set passes with `0 errors` |
 | 9 | AddressSanitizer and UBSan | the three commands below | every test passes with no sanitizer report |
 
 Gate 9 uses its own tree, because an instrumented build is not the warning gate:
@@ -47,25 +47,34 @@ Notes on scope:
 - Gate 5 needs `qwen3_8_27b_nvfp4.ninfer` and its DFlash2 or MTP variant; an Engine test that
   skips because its supported artifact is missing has not run. `--print-weights` shows what is
   bound.
-- Gates 6 to 8 run over the tests labelled `kernel`: every Op test. Host-only tests make no CUDA
-  call, and compute-sanitizer reports that as an error, so they are not part of these gates.
+- Gates 6 to 8 run the sanitizer set: the Ops the qwen3.8-27b NVFP4 DFlash2 flow dispatches,
+  with reduced `--sanitizer` cases for the suites whose full sweep is too slow or too large
+  ([Op development, sanitizer scope](op-development.md#64-sanitizer-scope)). The `racecheck`
+  label is the part of that set that is also quick under racecheck; the GEMM-heavy linear and
+  projection suites are in `sanitizer` only.
+- A change to a kernel outside those sets (another target, storage profile, or non-default
+  option, or a linear or projection kernel for racecheck) also runs the relevant tool on that
+  kernel's own suite: `--compute-sanitizer TOOL -R '<test>'`.
 - Gate 4 stops when the GPU has less than 20 GiB free; stop a resident `ninfer-serve` first.
 
 ## Cost and hazards
 
-Plan for the sanitizer gates. Measured on the RTX 5090 host:
+Measured on the RTX 5090 host:
 
 - the unit suite (gate 4) takes about 14 minutes; the whole-tree clang-tidy run (gate 3) checks
   several hundred translation units and takes longer;
-- memcheck is a few times slower than a plain run for most tests, but
-  `ninfer_speculative_round_test` did not finish in seven hours under it;
-- racecheck is far slower: single linear tests take 25 to 50 minutes, and
-  `ninfer_sampling_test` grew past 54 GB of host memory.
+- memcheck and initcheck over the sanitizer set (gates 6 and 8) take about 8 minutes each;
+- racecheck over the racecheck set (gate 7) takes about 20 minutes.
+
+The sanitizer set exists because the full suites do not fit: under memcheck
+`ninfer_speculative_round_test` did not finish in seven hours, and under racecheck
+`ninfer_sampling_test` grew past 54 GB of host memory and single linear suites take 25 to 50
+minutes.
 
 Run the sanitizer gates only in the builder created by `./scripts/dev-setup.sh`, which caps the
 container's memory so a runaway run is killed instead of exhausting the host, and read the
 warning about `ninfer_attn_input_proj_test` in [`tests/README.md`](../../tests/README.md) before
-running gate 4 or gates 6 to 8 unattended.
+running gate 4 unattended.
 
 ## Recording the result
 
