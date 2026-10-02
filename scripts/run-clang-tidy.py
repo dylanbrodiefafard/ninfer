@@ -193,11 +193,16 @@ def header_includers(build: Path, headers: set[str], sources: set[str]) -> set[s
     return selected
 
 
+# The builder container runs as root over a bind-mounted checkout owned by the host user, which
+# git rejects as dubious ownership unless the directory is declared safe.
+GIT = ["git", "-c", f"safe.directory={ROOT}", "-C", str(ROOT)]
+
+
 def changed_lines(base: str | None) -> dict[str, set[int] | None]:
     """Changed project files mapped to their added or modified lines (None: the whole file)."""
     # The default base is the remote's default branch, so a feature branch is checked as a whole.
     merge_base = subprocess.run(
-        ["git", "-C", str(ROOT), "merge-base", "HEAD", base or "origin/HEAD"],
+        [*GIT, "merge-base", "HEAD", base or "origin/HEAD"],
         capture_output=True,
         text=True,
         check=False,
@@ -209,7 +214,7 @@ def changed_lines(base: str | None) -> dict[str, set[int] | None]:
         )
     merge_base = merge_base.stdout.strip()
     diff = subprocess.run(
-        ["git", "-C", str(ROOT), "diff", "-U0", "--no-color", "--diff-filter=d", merge_base],
+        [*GIT, "diff", "-U0", "--no-color", "--diff-filter=d", merge_base],
         capture_output=True,
         text=True,
         check=True,
@@ -226,7 +231,7 @@ def changed_lines(base: str | None) -> dict[str, set[int] | None]:
             start = int(hunk["start"])
             current.update(range(start, start + int(hunk["count"] or 1)))
     untracked = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "--others", "--exclude-standard"],
+        [*GIT, "ls-files", "--others", "--exclude-standard"],
         capture_output=True,
         text=True,
         check=True,
