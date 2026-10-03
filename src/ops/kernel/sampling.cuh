@@ -344,6 +344,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
     __shared__ int selected_tile;
     __shared__ int picked;
     __shared__ int found;
+    __shared__ SamplingTileChoiceShared choice;
 
     const SamplingPLessMoments moments = sampling_p_less_load_global(workspace, col);
     const SamplingPLessGate gate       = sampling_p_less_gate(moments, 1.0f / cfg.temperature);
@@ -363,40 +364,14 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_p_less_mass_sample_ker
         __syncthreads();
         if (!is_last) { continue; }
 
+        const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
+        const float total = sampling_block_choose_tile(
+            partial_blocks,
+            [&](int p) { return sampling_p_less_load_tile_mass(workspace, col, p); }, u, choice,
+            &selected_tile, &selected_goal);
         if (threadIdx.x == 0) {
-            float total = 0.0f;
-            for (int p = 0; p < partial_blocks; ++p) {
-                total += sampling_p_less_load_tile_mass(workspace, col, p);
-            }
             admitted = total;
             sampling_p_less_store_admitted(workspace, col, total);
-            selected_tile = -1;
-            selected_goal = 0.0f;
-            picked        = sampling_p_less_support_fallback(moments, cfg);
-            if (total > 0.0f) {
-                const float goal =
-                    sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u) * total;
-                float prefix      = 0.0f;
-                int last_nonempty = -1;
-                float last_prefix = 0.0f;
-                for (int p = 0; p < partial_blocks; ++p) {
-                    const float mass = sampling_p_less_load_tile_mass(workspace, col, p);
-                    if (mass > 0.0f) {
-                        last_nonempty = p;
-                        last_prefix   = prefix;
-                    }
-                    if (goal < prefix + mass) {
-                        selected_tile = p;
-                        selected_goal = goal - prefix;
-                        break;
-                    }
-                    prefix += mass;
-                }
-                if (selected_tile < 0 && last_nonempty >= 0) {
-                    selected_tile = last_nonempty;
-                    selected_goal = fmaxf(0.0f, goal - last_prefix);
-                }
-            }
         }
         __syncthreads();
 

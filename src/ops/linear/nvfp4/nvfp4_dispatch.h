@@ -26,9 +26,9 @@ bool is_nvfp4_dflash_mma_aggregate_problem(std::int32_t output_rows, std::int32_
 bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
                                             LinearPolicy policy, std::int32_t sequence_width);
 
-// DFlash conv projection (A16 SmallT), aggregated only for W=5 packed requests.
-bool is_nvfp4_dflash_conv_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                               LinearPolicy policy);
+// DFlash conv projection (A16 SmallT, one lane reduction at every T<=32).
+bool is_nvfp4_dflash_conv_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                            LinearPolicy policy);
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream);

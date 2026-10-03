@@ -486,8 +486,8 @@ cmake --build build --parallel --target ninfer_q5_linear_add_bench
 ## BF16 LinearAdd Op benchmark
 
 `ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
-in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..4`,
-aggregate MMA through `T=48`, and the large-T MMA afterward.
+in-place BF16 residual epilogue. Production uses decode at `T=1`, aggregate MMA at `T=2..48`,
+and the large-T MMA afterward; `--route aggregate-mma` forces the aggregate MMA.
 Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
 the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
 references.

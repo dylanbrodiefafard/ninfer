@@ -183,7 +183,6 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/q5_rowsplit_gemv.cu
   ops/linear_add/bf16/bf16_linear_add_decode.cu
   ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
-  ops/linear_add/bf16/bf16_linear_add_small_t.cu
   ops/linear_add/bf16/bf16_linear_add_plan.cpp
   ops/linear_add/fp8/fp8_linear_add_plan.cpp
   ops/linear_add/fp8/fp8_linear_add_decode.cu

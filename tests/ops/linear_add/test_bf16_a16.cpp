@@ -57,7 +57,7 @@ int bf16_a16_rejections() {
 }
 
 int bf16_a16_conformance() {
-    constexpr std::array<std::int32_t, 3> kRouteStarts{2, 5, 49};
+    constexpr std::array<std::int32_t, 2> kRouteStarts{2, 49};
     constexpr std::array<std::int32_t, 21> kRouteInteriors{
         4, 5, 8, 10, 15, 16, 20, 24, 28, 32, 36, 44, 48, 52, 60, 64, 127, 128, 129, 1024, 1536,
     };
@@ -67,7 +67,7 @@ int bf16_a16_conformance() {
            bf16_a16_rejections();
 }
 
-// Packed verify W=5..8 (the MMA panel widths) across C=2..6 must reproduce each panel exactly.
+// Packed verify W=2..8 across C=2..6 must reproduce each panel exactly.
 int bf16_aggregate_matches_panels() {
     constexpr std::int32_t kN        = 5120;
     constexpr std::int32_t kK        = 6144;
@@ -90,7 +90,7 @@ int bf16_aggregate_matches_panels() {
     device_activation.copy_from_host(activation.data(), device_activation.bytes);
 
     int failures = 0;
-    for (std::int32_t width = 5; width <= kMaxWidth; ++width) {
+    for (std::int32_t width = 2; width <= kMaxWidth; ++width) {
         for (std::int32_t batch = 2; batch <= kMaxBatch; ++batch) {
             const std::int32_t tokens      = width * batch;
             const std::size_t output_words = static_cast<std::size_t>(kN) * tokens;

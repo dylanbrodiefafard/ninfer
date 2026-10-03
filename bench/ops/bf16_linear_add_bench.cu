@@ -39,7 +39,7 @@ constexpr int kDefaultRepeat               = 20;
 enum class Route : std::uint8_t {
     Production,
     Decode,
-    SmallT,
+    AggregateMma,
     Mma,
     All,
 };
@@ -115,10 +115,10 @@ std::vector<std::int32_t> parse_range(std::string_view raw) {
 Route parse_route(std::string_view raw) {
     if (raw == "production") { return Route::Production; }
     if (raw == "decode") { return Route::Decode; }
-    if (raw == "small-t") { return Route::SmallT; }
+    if (raw == "aggregate-mma") { return Route::AggregateMma; }
     if (raw == "mma") { return Route::Mma; }
     if (raw == "all") { return Route::All; }
-    throw std::invalid_argument("--route must be production|decode|small-t|mma|all");
+    throw std::invalid_argument("--route must be production|decode|aggregate-mma|mma|all");
 }
 
 Options parse_options(int argc, char** argv) {
@@ -146,10 +146,11 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--profile") {
             options.profile = true;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,4,... | --sweep BEGIN:END:STEP] "
-                        "[--route production|decode|small-t|mma|all] [--warmup N] [--repeat N] "
-                        "[--flush-bytes N] [--csv-out PATH] [--profile]\n",
-                        argv[0]);
+            std::printf(
+                "Usage: %s [--t-sweep 1,4,... | --sweep BEGIN:END:STEP] "
+                "[--route production|decode|aggregate-mma|mma|all] [--warmup N] [--repeat N] "
+                "[--flush-bytes N] [--csv-out PATH] [--profile]\n",
+                argv[0]);
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
@@ -175,9 +176,8 @@ bool route_supports(Route route, std::int32_t tokens) {
         return tokens > 0;
     case Route::Decode:
         return tokens == 1;
-    case Route::SmallT:
-        return tokens >= ops::detail::kBf16LinearAddSmallTMinTokens &&
-               tokens <= ops::detail::kBf16LinearAddSmallTMaxTokens;
+    case Route::AggregateMma:
+        return tokens > 0 && tokens <= ops::detail::kBf16LinearAddAggregateMmaEnd;
     case Route::All:
         break;
     }
@@ -191,8 +191,8 @@ std::string route_name(Route route, std::int32_t tokens) {
             ops::detail::bf16_linear_add_select(kRows, kHidden, tokens));
     case Route::Decode:
         return "candidate.decode";
-    case Route::SmallT:
-        return "candidate.small_t";
+    case Route::AggregateMma:
+        return "candidate.aggregate_mma";
     case Route::Mma:
         return "candidate.mma";
     case Route::All:
@@ -210,8 +210,8 @@ void launch_route(Route route, const Tensor& x, const Weight& weight, Tensor& re
     case Route::Decode:
         ops::detail::bf16_linear_add_decode_launch(x, weight, residual, stream);
         return;
-    case Route::SmallT:
-        ops::detail::bf16_linear_add_small_t_launch(x, weight, residual, stream);
+    case Route::AggregateMma:
+        ops::detail::bf16_linear_add_aggregate_mma_launch(x, weight, residual, stream);
         return;
     case Route::Mma:
         ops::detail::bf16_linear_add_mma_launch(x, weight, residual, stream);
@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
         constexpr Route kConcreteRoutes[]{
             Route::Production,
             Route::Decode,
-            Route::SmallT,
+            Route::AggregateMma,
             Route::Mma,
         };
         for (const std::int32_t tokens : options.tokens) {

@@ -116,8 +116,8 @@ bool is_nvfp4_dflash_w4a4_aggregate_problem(std::int32_t output_rows, std::int32
            resolve_route(output_rows, input_rows, policy, sequence_width) == Nvfp4LinearRoute::W4A4;
 }
 
-bool is_nvfp4_dflash_conv_w5_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
-                                               LinearPolicy policy) {
+bool is_nvfp4_dflash_conv_aggregate_problem(std::int32_t output_rows, std::int32_t input_rows,
+                                            LinearPolicy policy) {
     return policy == LinearPolicy::A16Only && is_nvfp4_linear_problem(output_rows, input_rows) &&
            resolve_nvfp4_problem(output_rows, input_rows) == Nvfp4Problem::DflashConvProj;
 }

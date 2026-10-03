@@ -18,6 +18,48 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Parallel p-less tile choice and BF16/conv verify aggregation at every width (2026-10-02)
+
+nsys at C=1..6 (k=3..5) put `speculative_sampling_p_less_mass_finalize_kernel` at 1.5–1.95 ms
+per round, 9–11% of GPU time at every C. After the parallel tile-mass pass, one thread per request
+walked all 485 vocabulary tiles twice: once to build residual masses, with an O(16²) hop-list
+dedupe per tile, and once for the inverse-CDF tile walk. Every load in those walks was dependent.
+Changes:
+
+- P-less tile choice is block-cooperative. Each thread owns a contiguous tile chunk, a block scan
+  gives each chunk its [lower, upper) prefix interval, and the thread whose interval holds
+  `u * total` walks its chunk. Ties go to the lowest thread, and a goal past every interval takes
+  the last nonempty tile. Residual masses are evaluated by the owning thread, and the admitted sum
+  is a block reduction. The selection rule is unchanged; only the FP32 association of the prefix
+  sums differs, so a draw that lands on a tile boundary can resolve to the neighboring tile. The
+  ordinary p-less sampler uses the same helper.
+- The BF16 residual projection runs the aggregate MMA at T=2..4 (the SIMT SmallT route is
+  removed, 47 µs either way). BF16 MMA keeps one K-ordered FP32 chain per output, so W=2..4
+  verify now aggregates as W=5..8 already did. This covers DFlash k=1..3 and MTP with three drafts.
+- The DFlash conv projection `[1280,5120]` uses 16 values per lane at every SmallT T and groups
+  W=2..8 in passes of at most 32 columns (previously W=5 only).
+
+The sampling and speculative-round contracts pass, including their racecheck/synccheck cases (0
+hazards). Packed BF16 residual and conv outputs match their per-request panels bit for bit at
+W=2..8, C=2..6.
+
+Engine A/B on RTX 5090, DFlash2 artifact. Warm `ninfer-serve` runs six mixed fixtures with
+thinking enabled, 3072 completion tokens, two measured waves after a warm-up wave, NVFP4 KV,
+temperature 1.5, and p-less draft temperature 0.4. Values are aggregate decode tok/s, base
+`574a8d91` → new:
+
+| C | adaptive max5 | fixed k3 |
+|---:|---:|---:|
+| 1 | 167.3→183.3 (+9.6%) | 158.7→181.6 (+14.4%) |
+| 2 | 319.1→354.0 (+10.9%) | 291.6→333.3 (+14.3%) |
+| 4 | 550.3→597.6 (+8.6%) | 528.4→603.4 (+14.2%) |
+| 6 | 705.2→786.2 (+11.5%) | 709.5→807.3 (+13.8%) |
+
+Fixed k3 also gains from the W=4 BF16 residual aggregation at C>=2. At C=1 its tokens per round
+drew about 4% higher, so the round-rate gain is about 9.5%. Evidence:
+`profiles/nsys/{c6-k45-20260930,c6-after-20261001,cx-after-20261001}`,
+`profiles/bench/pless-tile-choice-20261002`.
+
 ## Short appends to long contexts: chunked and context-split prompt attention (2026-09-30)
 
 A 7..1024-row `gqa_attention` call with no batch took the dense NVFP4 Prompt tile, one 512-thread
@@ -464,7 +506,7 @@ multiply-add instructions. The audit selected these routes:
 
 | Public Op / matrix | Selected execution |
 |---|---|
-| BF16 attention input `[14336,5120]` | New 64-row × 32-column MMA schedule for T=2..36, existing GEMV at T=1 and prefill schedule above 36. W5 packed panels retain one reduction profile. |
+| BF16 attention input `[14336,5120]` | New 64-row × 32-column MMA schedule for T=2..36, existing GEMV at T=1 and prefill schedule above 36. Packed W=2..8 panels share its one reduction profile. |
 | BF16 GDN control, two `[48,5120]` projections | New narrow-token MMA split-40 schedule for T=1..36. Each split reads a disjoint 128-element K slice; FP32 partials and nonlinear control outputs. Packed execution uses the same reduction and caller-owned FP32 partial storage. |
 
 Cold public-Op screening used 256 MiB L2 flushes, eight warmups, and 61 samples. CUDA Graph
@@ -485,12 +527,12 @@ SIMT. At T=5 generic NVFP4 MMA lost: convolution 12.288→14.016 µs and selecto
 10.240→14.336 µs. MMA won in isolated Linear calls at T=12 (20.480→14.304 and
 18.432→14.336 µs), but this target admits k=1..5 and chain width W=k+1<=6. A T>=8
 per-request crossover would therefore be unreachable. Switching only an aggregate to MMA
-would change its reduction relative to its C1 panel. The existing W5 convolution SIMT
-aggregation is retained; the wider winning experimental dispatch was removed. A narrower shared-memory NVFP4 tile
+would change its reduction relative to its C1 panel. The convolution SIMT aggregation is
+retained (W=2..8 since 2026-10-02); the wider winning experimental dispatch was removed. A narrower shared-memory NVFP4 tile
 and a register-fed, within-CTA K-split candidate did not improve the relevant crossover and
 were rejected. The old wide BF16 attention MMA also lost at T=5 (about 102→139 µs); the new
-32-column schedule removed that regression. BF16 residual projection already uses a specialized
-MMA from T=5: forcing generic MMA was substantially slower, and moving the specialized route
+32-column schedule removed that regression. BF16 residual projection uses a specialized
+MMA from T=2 (from T=5 at this audit): forcing generic MMA was substantially slower, and moving the specialized route
 below its crossover gave no reliable gain. Existing GDN split-8/4/2 alternatives were qualified
 and timed; the narrow split-40 route wins. Unsplit GDN failed its numerical criterion and was
 rejected before timing.
@@ -913,15 +955,14 @@ The GDN-control and BF16-attention schedules below describe that measurement bui
 `max_concurrency` admits 1–6. The C=5/6 verify aggregates (T=W×C up to 36) keep every
 request's C=1 arithmetic, so C=1–4 kernels and outputs are unchanged:
 
-- A8 MMA uses one M48 tile for T=33–48 (N=5120 K256×2 stages, wide K128×3), so W=6 C=6 reads
+- A8 MMA uses one M48 tile for T=33–48 (N=5120 K256×3 stages, wide K256×2 since 2026-10-01), so W=6 C=6 reads
   weights once. The fused A8 GDN conv-record epilogue requires that single tile.
 - Aggregate verify extent, fused RMSNorm+SwiGLU, GDN replay/record rows, and GDN gating extend to
   C=6. Gating aggregates every W=2..16 packed verify through T=36 on the T=1-reduction GEMV.
-- The W8 verify LM head and the Q4 proposal head aggregate W=2..6 in passes of at most 32
-  columns (both keep one K-split reduction per column through T=32). BF16 attention routes the
-  W=5 C=5/6 aggregates (T=25/30) to SmallT, which keeps the T=5 panel reduction; the generic
-  crossover sends T>22 to MMA. DFlash W=5 drafter projections, now including the feature
-  projection, run one pass at C=5/6; only A16 T=20 keeps two T=10 groups.
+- The W8 verify LM head and the Q4 proposal head aggregate in one pass of at most 48 columns
+  since 2026-10-01 (at this measurement: 32). BF16 attention input and residual aggregate at
+  every W (one K-ordered MMA chain per column). DFlash drafter projections run one pass at C=5/6;
+  the conv projection groups W=2..8 in passes of at most 32 columns.
 - Adaptive draft measures every captured k once per batch size. Extrapolating an unmeasured
   arm's T from shorter arms is not a bound: before A8 covered W2/W3, a C=6 k=1 round (36 ms)
   cost more than k=4 (24 ms), k=3..5 were never probed, and C=6 locked k=1 (266 tok/s).

@@ -309,6 +309,21 @@ struct Nvfp4LinearSmallTProductionSchedule {
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
+// The DFlash conv projection packs W=2..6 verify requests into passes of up to 32 columns, so
+// every T keeps the 16-value lane reduction of its per-request panels.
+template <int ActiveTokens>
+struct Nvfp4LinearSmallTProductionSchedule<Nvfp4DflashConvProjGeometry, ActiveTokens> {
+    static_assert(ActiveTokens >= kNvfp4FirstSmallT);
+    static_assert(ActiveTokens <= kNvfp4LastSmallT);
+    static constexpr int kWarpsPerCta = ActiveTokens >= 17 ? 4 : (ActiveTokens >= 13 ? 16 : 8);
+    static constexpr auto kActivationAccess = ActiveTokens <= 4
+                                                  ? Nvfp4SmallTActivationAccess::SharedPhase
+                                                  : Nvfp4SmallTActivationAccess::TokenPacked;
+    using Type = Nvfp4SmallTSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
+};
+
 // G1's wider N benefits from keeping four warps per CTA throughout the A16 policy boundary. Only
 // T=2 amortizes activation traffic enough for shared staging to win.
 template <int ActiveTokens>

@@ -82,14 +82,12 @@ bool aggregate_verify_extent(qwen3_6::TextPhase phase, std::int32_t route_tokens
            aggregate_tokens <= kMaximumAggregateVerifyTokens;
 }
 
-// BF16 MMA keeps one K-ordered FP32 accumulator per output under every tile schedule, so a
-// packed batch reproduces each request panel whenever that panel also runs MMA: attention input
-// for every W>=2, residual for W>=5 (W=2..4 panels use the BF16 SmallT residual route).
+// BF16 MMA keeps one K-ordered FP32 accumulator per output under every tile schedule, and every
+// BF16 verify width (T>=2) runs MMA, so a packed batch reproduces each request panel at every W.
 bool aggregate_verify_residuals(QType qtype, qwen3_6::TextPhase phase, std::int32_t route_tokens,
                                 std::int32_t aggregate_tokens) {
     return aggregate_verify_extent(phase, route_tokens, aggregate_tokens) &&
-           (route_tokens == 5 || qtype == QType::NVFP4 ||
-            (qtype == QType::BF16_CTRL && route_tokens >= 5));
+           (route_tokens == 5 || qtype == QType::NVFP4 || qtype == QType::BF16_CTRL);
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a

@@ -403,9 +403,9 @@ One propose block:
    while the selected policy permits A8 for ordinary and GDN verification projections at
    W=4/5/6, independently of concurrency. Prefill and ordinary decode retain their text policy.
    Qualified NVFP4 MLP, attention-input and residual projections aggregate through W=8.
-   BF16 MMA keeps one K-ordered accumulator per output under every tile, so BF16 attention input
-   aggregates for every W and BF16 residuals for W>=5 (W=2..4 panels use the SmallT residual);
-   each request keeps its panel's exact output. The W8 vocabulary and Q4 draft heads share one
+   BF16 MMA keeps one K-ordered accumulator per output under every tile, and every BF16 verify
+   width runs MMA, so BF16 attention input and residuals aggregate for every W; each request keeps
+   its panel's exact output. The W8 vocabulary and Q4 draft heads share one
    weight pass of at most 48 columns with the panel reduction. GDN control uses its
    packed-sequence Op.
    SmallT
