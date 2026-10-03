@@ -19,8 +19,7 @@ inline constexpr std::int32_t kDflash2PathSelectShortlistRows       = 131072;
 inline constexpr std::int32_t kDflash2PathSelectMaxBatch            = 8;
 inline constexpr std::int32_t kDflash2PathSelectMaxWidthWhenBatched = 16;
 inline constexpr int kDflash2PathSelectRngPurpose                   = 16;
-inline constexpr std::int32_t kDflash2TreeFrontier                  = 2;
-inline constexpr std::int32_t kDflash2TreeExpandWidth               = 16;
+inline constexpr std::int32_t kDflash2TreeMaxWidth                  = 16;
 inline constexpr std::int32_t kDflash2VerifyWidth                   = 12;
 
 /**
@@ -123,13 +122,20 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
  * Op: dflash2_tree_select
  *
  * Builds a packed parent-conditioned draft tree from the same DFlash2 shortlist scores as
- * dflash2_path_select, without sampling. Ranking is always greedy on the Markov score. Block
- * size T is logits.ne[1]. The selector expands a kDflash2TreeFrontier-wide beam up to
- * kDflash2TreeExpandWidth nodes, then keeps the BFS prefix of W nodes where W is
- * verify_ids.ne[0] (complete early depths, one truncated last depth). Column 0 is the
- * anchor. Unused columns copy the last live node and are excluded by valid_columns.
- * Historical product k=7 used kDflash2VerifyWidth=12; k=4/5 tree A/B uses W=6.
- * Live DFlash2 verify is chain-only (this Op is not on that path).
+ * dflash2_path_select, without sampling. Block size T is logits.ne[1] and W = verify_ids.ne[0]
+ * in [2, kDflash2TreeMaxWidth]. A child's log-probability is the 16-way log-softmax of its
+ * parent's Markov scores (the selector's unary + bilinear term over column t's top-16, with the
+ * parent token as predecessor); a node's path log-probability is the sum along its root path.
+ * Starting from the anchor (column 0), the selector repeatedly adds the frontier node of greatest
+ * path log-probability until W nodes exist or no frontier remains (depth is bounded by T); ties
+ * select the lower token id. Path log-probabilities never increase along a path, so the W nodes
+ * form the prefix-closed tree of greatest summed path probability under the Markov model.
+ * Columns are emitted in depth-first preorder with children in descending path log-probability,
+ * so the most probable path is a contiguous spine (parent = previous column). Unused columns copy
+ * the last live column and are excluded by valid_columns. configs (device SamplingConfig[B], or
+ * null) selects the per-parent softmax temperature: p_less_tree_temperature for p-less rows,
+ * 1 otherwise; it shapes only which nodes are drafted, since tree drafts are verified by
+ * sample-then-descend.
  *
  * cache_positions[j,b] = frontiers[b] + j. rope_positions[j,b] = frontiers[b] + depth[j].
  * ancestor_mask[j,b] bit i is set iff packed column i is an ancestor of j, including j.
@@ -142,6 +148,8 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
                          Tensor& rope_positions, Tensor& ancestor_mask, Tensor& valid_columns,
                          WorkspaceArena& workspace, cudaStream_t stream,
                          const Tensor* logit_token_ids = nullptr,
-                         const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr);
+                         const Weight* pred_nvfp4 = nullptr, const Weight* succ_nvfp4 = nullptr,
+                         const SamplingConfig* configs = nullptr,
+                         float p_less_tree_temperature = 1.0f);
 
 } // namespace ninfer::ops

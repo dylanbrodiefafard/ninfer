@@ -102,16 +102,18 @@ namespace ninfer::targets::qwen3_6::detail {
 template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
-    std::uint32_t capacity            = 0;
-    std::uint32_t kv_capacity         = 0;
-    std::uint32_t main_page_groups    = 0;
-    std::uint32_t max_concurrency     = 1;
-    std::uint32_t prefill_chunk       = 0;
-    std::uint32_t draft_window        = 0;
+    std::uint32_t capacity         = 0;
+    std::uint32_t kv_capacity      = 0;
+    std::uint32_t main_page_groups = 0;
+    std::uint32_t max_concurrency  = 1;
+    std::uint32_t prefill_chunk    = 0;
+    std::uint32_t draft_window     = 0;
+    // Widest captured DFlash verify width (storage, ReplaySSM records, pending features).
     std::uint32_t dflash_verify_width = 0;
     bool adaptive_draft               = false;
     float p_less_draft_temperature    = 0.0f;
     std::vector<std::uint32_t> captured_ks;
+    std::vector<NINFER_QWEN36_RUNTIME_NS::DFlashRoundShape> dflash_shapes;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;

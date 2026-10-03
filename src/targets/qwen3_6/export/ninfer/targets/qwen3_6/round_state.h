@@ -151,6 +151,7 @@ struct DFlashDecodeStateLayout {
     TensorRegion selector_q;
     TensorRegion verify_ids;
     TensorRegion parent_index;
+    TensorRegion gdn_tree_schedule;
     TensorRegion ancestor_mask;
     TensorRegion cache_positions;
     TensorRegion target_argmax;
@@ -285,6 +286,7 @@ struct DFlashDecodeState {
     Tensor selector_q;
     Tensor verify_ids;
     Tensor parent_index;
+    Tensor gdn_tree_schedule;
     Tensor ancestor_mask;
     Tensor cache_positions;
     Tensor accepted_column;

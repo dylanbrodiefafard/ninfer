@@ -438,6 +438,9 @@ public:
     }
 
     const std::vector<std::uint32_t> captured_ks;
+    const std::vector<DFlashRoundShape> dflash_shapes;
+    // Adaptive DFlash arm ids runnable at each batch size (index B-1).
+    const std::array<std::vector<std::uint32_t>, kMaximumConcurrency> dflash_arms_by_batch;
     std::array<qwen3_6::AdaptiveRoundTimeState, kMaximumConcurrency> adaptive_t_by_batch{};
     std::array<qwen3_6::AdaptiveBatchKState, kMaximumConcurrency> adaptive_batch_k_by_c{};
     const SpeculativeBackend speculative_backend;

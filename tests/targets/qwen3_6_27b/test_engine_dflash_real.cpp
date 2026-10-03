@@ -49,6 +49,11 @@ ninfer::EngineOptions speculative_engine_options(const char* artifact,
     options.speculative.draft_tokens  = draft_tokens;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.max_concurrency           = max_concurrency;
+    // Pin the chain shape: with the product default a one-request round verifies the packed
+    // tree, so concurrency-isolation oracles would compare different verify routes.
+    if (backend == ninfer::SpeculativeBackend::DFlash) {
+        options.speculative.dflash_verify_width = draft_tokens + 1;
+    }
     return options;
 }
 
@@ -1784,6 +1789,41 @@ std::vector<ninfer::TokenId> token_prefix(const std::vector<ninfer::TokenId>& to
     return std::vector<ninfer::TokenId>(tokens.begin(), tokens.begin() + length);
 }
 
+// Packed-tree rounds place sibling subtrees off the spine, where a column's RoPE position is
+// its depth rather than its packed index. Such columns are accepted only occasionally, so short
+// isolation windows rarely observe them. Two long greedy requests run concurrently must still
+// equal their sequential C=1 streams.
+int exercise_tree_long_isolation(ninfer::Engine& engine, const IsolationTokens& prompts,
+                                 const char* label) {
+    constexpr std::uint32_t kTokens = 192;
+    std::array<std::vector<ninfer::TokenId>, 2> sequential;
+    for (std::size_t i = 0; i < sequential.size(); ++i) {
+        const ninfer::GenerationResult seq =
+            engine.generate(engine.prepare_tokens(prompts[i]), greedy_options(kTokens));
+        if (seq.generated_token_ids.size() != kTokens) {
+            std::cerr << label << " long tree C=1 request " << i << " did not complete\n";
+            return 1;
+        }
+        sequential[i] = seq.generated_token_ids;
+    }
+    std::array<ninfer::GenerationHandle, 2> handles;
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        handles[i] = engine.submit(engine.prepare_tokens(prompts[i]), greedy_options(kTokens));
+    }
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        const ninfer::GenerationResult concurrent = handles[i].wait();
+        if (concurrent.generated_token_ids != sequential[i]) {
+            const auto mismatch = std::mismatch(concurrent.generated_token_ids.begin(),
+                                                concurrent.generated_token_ids.end(),
+                                                sequential[i].begin(), sequential[i].end());
+            std::cerr << label << " long tree C=2 request " << i << " diverged from C=1 at token "
+                      << (mismatch.first - concurrent.generated_token_ids.begin()) << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int run_overlapping_requests(ninfer::Engine& engine, const IsolationTokens& prompts,
                              const IsolationTokens& dflash_oracles,
                              const IsolationTokens& target_oracles, const char* label) {
@@ -2057,7 +2097,10 @@ int main() {
         if (std::getenv("NINFER_DFLASH_TEST_LIKELIHOOD_ONLY") != nullptr) { return 0; }
     }
 
-    auto run_k = [&](std::uint32_t draft_tokens, const char* label) -> int {
+    // verify_width pins one round shape for every batch size (W=k+1 chain, wider W tree), so a
+    // C>1 request must reproduce its C=1 stream exactly.
+    auto run_k = [&](std::uint32_t draft_tokens, std::uint32_t verify_width,
+                     const char* label) -> int {
         IsolationTokens target_oracles;
         IsolationTokens dflash_oracles;
         const char* only_prompt = std::getenv("NINFER_DFLASH_TEST_ONLY_PROMPT");
@@ -2082,6 +2125,7 @@ int main() {
         ninfer::EngineOptions dflash_options =
             speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, draft_tokens,
                                        static_cast<std::uint32_t>(kIsolationRequests));
+        dflash_options.speculative.dflash_verify_width = verify_width;
         if (std::getenv("NINFER_DFLASH_TEST_MAX1") != nullptr) {
             dflash_options.max_concurrency = 1;
         }
@@ -2091,13 +2135,13 @@ int main() {
         if (std::getenv("NINFER_DFLASH_TEST_CHAIN") != nullptr) {
             dflash_options.speculative.dflash_verify_width = draft_tokens + 1;
         }
-        if (const char* verify_width = std::getenv("NINFER_DFLASH_TEST_VERIFY_WIDTH")) {
-            const char* const text_end     = verify_width + std::strlen(verify_width);
+        if (const char* width_text = std::getenv("NINFER_DFLASH_TEST_VERIFY_WIDTH")) {
+            const char* const text_end     = width_text + std::strlen(width_text);
             std::uint32_t width            = 0;
-            const auto [parsed_end, error] = std::from_chars(verify_width, text_end, width);
+            const auto [parsed_end, error] = std::from_chars(width_text, text_end, width);
             if (error != std::errc{} || parsed_end != text_end) {
                 std::cerr << "NINFER_DFLASH_TEST_VERIFY_WIDTH is not an unsigned 32-bit integer: '"
-                          << verify_width << "'\n";
+                          << width_text << "'\n";
                 return 1;
             }
             dflash_options.speculative.dflash_verify_width = width;
@@ -2146,8 +2190,12 @@ int main() {
                     0) {
                 failed = 1;
             }
-            if (draft_tokens == 4 && dflash_options.speculative.dflash_verify_width == 0 &&
-                (only_prompt == nullptr || std::string(only_prompt) == "0") &&
+            if (dflash_options.max_concurrency >= 2 && only_prompt == nullptr &&
+                dflash_options.speculative.dflash_verify_width > draft_tokens + 1 &&
+                exercise_tree_long_isolation(engine, prompts, label) != 0) {
+                failed = 1;
+            }
+            if (draft_tokens == 4 && (only_prompt == nullptr || std::string(only_prompt) == "0") &&
                 exercise_p_less_product_tree(engine, prompts[0]) != 0) {
                 failed = 1;
             }
@@ -2169,25 +2217,28 @@ int main() {
 
     const char* only_k = std::getenv("NINFER_DFLASH_TEST_ONLY_K");
     if (only_k == nullptr || std::string(only_k) == "1") {
-        if (const int result = run_k(1, "DFlash2 k=1 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(1, 2, "DFlash2 k=1 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "2") {
-        if (const int result = run_k(2, "DFlash2 k=2 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(2, 3, "DFlash2 k=2 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "3") {
-        if (const int result = run_k(3, "DFlash2 k=3 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(3, 4, "DFlash2 k=3 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "4") {
-        if (const int result = run_k(4, "DFlash2 k=4 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(4, 5, "DFlash2 k=4 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "5") {
-        if (const int result = run_k(5, "DFlash2 k=5 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(5, 6, "DFlash2 k=5 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "6") {
-        if (const int result = run_k(6, "DFlash2 k=6 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(6, 7, "DFlash2 k=6 chain C=6"); result != 0) { return result; }
     }
     if (only_k == nullptr || std::string(only_k) == "7") {
-        if (const int result = run_k(7, "DFlash2 k=7 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(7, 8, "DFlash2 k=7 chain C=6"); result != 0) { return result; }
+        if (const int result = run_k(7, 12, "DFlash2 k=7 tree W=12 C=6"); result != 0) {
+            return result;
+        }
     }
 
     {

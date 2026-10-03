@@ -98,7 +98,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& valid_columns, const Tensor& initial_slots,
                             const Tensor& key_record, const Tensor& value_record,
                             const Tensor& gate_record, const Tensor& out,
-                            const Tensor* parent_index) {
+                            const Tensor* tree_schedule) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
     const std::int32_t value_heads = v.ne[1];
@@ -131,17 +131,10 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
     require_scale(scale, kOp);
 
-    const bool tree = parent_index != nullptr && parent_index->data != nullptr;
+    const bool tree = tree_schedule != nullptr && tree_schedule->data != nullptr;
     if (tree) {
-        const bool batched      = parent_index->ne[0] == width && parent_index->ne[1] == rows &&
-                                  parent_index->ne[2] == 1 && parent_index->ne[3] == 1;
-        const bool dense_single = rows == 1 && parent_index->ne[0] == width &&
-                                  parent_index->ne[1] == 1 && parent_index->ne[2] == 1 &&
-                                  parent_index->ne[3] == 1;
-        if (parent_index->dtype != DType::I32 || !parent_index->is_contiguous() ||
-            !aligned_to(parent_index->data, 4) || (!batched && !dense_single)) {
-            throw std::invalid_argument(std::string(kOp) + ": invalid parent_index");
-        }
+        require_tensor(*tree_schedule, DType::I32, {kGdnTreeScheduleWords, rows}, 4, kOp,
+                       "tree schedule");
     }
 
     const std::array<const Tensor*, 13> tensors{&q,
@@ -156,7 +149,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
                                                 &value_record,
                                                 &gate_record,
                                                 &out,
-                                                tree ? parent_index : nullptr};
+                                                tree ? tree_schedule : nullptr};
     std::vector<MemoryRange> ranges;
     ranges.reserve(tensors.size());
     for (const Tensor* tensor : tensors) {
@@ -315,32 +308,7 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     return packed;
 }
 
-std::size_t checked_mul_size(std::size_t a, std::size_t b, const char* message) {
-    if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
-        throw std::overflow_error(message);
-    }
-    return a * b;
-}
 
-std::size_t replay_record_ssm_pool_bytes(std::int32_t value_heads, std::int32_t slots) {
-    constexpr const char* kOverflow = "gated_delta_net_replay_record workspace overflow";
-    const std::size_t hv            = static_cast<std::size_t>(value_heads);
-    const std::size_t nslots        = static_cast<std::size_t>(slots);
-    constexpr std::size_t kState    = static_cast<std::size_t>(kStateDim);
-    const std::size_t per_slot =
-        checked_mul_size(checked_mul_size(kState, kState, kOverflow), sizeof(float), kOverflow);
-    return checked_mul_size(checked_mul_size(hv, nslots, kOverflow), per_slot, kOverflow);
-}
-
-std::size_t replay_record_overlay_bytes(std::int32_t value_heads, std::int32_t batch,
-                                        std::int32_t width) {
-    constexpr const char* kOverflow = "gated_delta_net_replay_record workspace overflow";
-    const std::int64_t slots        = static_cast<std::int64_t>(batch) * width;
-    if (slots <= 0 || slots > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error(kOverflow);
-    }
-    return replay_record_ssm_pool_bytes(value_heads, static_cast<std::int32_t>(slots));
-}
 
 } // namespace
 
@@ -349,35 +317,34 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream, const Tensor* parent_index,
-                                   WorkspaceArena* workspace) {
+                                   cudaStream_t stream, const Tensor* tree_schedule) {
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                           key_record, value_record, gate_record, out, parent_index);
-    const std::int32_t* parent_ptr = (parent_index != nullptr && parent_index->data != nullptr)
-                                         ? static_cast<const std::int32_t*>(parent_index->data)
-                                         : nullptr;
-    if (workspace != nullptr && parent_ptr != nullptr) {
-        const std::size_t need =
-            gated_delta_net_replay_record_workspace_capacity_bytes(v.ne[1], q.ne[3], q.ne[2]);
-        auto* overlay_states = reinterpret_cast<float*>(workspace->alloc_bytes(need).data);
-        detail::gated_delta_net::launch_recurrent_overlay(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
-            value_record, gate_record, out, overlay_states, parent_ptr, stream);
-    } else {
-        detail::gated_delta_net::launch_recurrent_record(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
-            value_record, gate_record, out, stream, parent_ptr);
-    }
+                           key_record, value_record, gate_record, out, tree_schedule);
+    const std::int32_t* schedule = (tree_schedule != nullptr && tree_schedule->data != nullptr)
+                                       ? static_cast<const std::int32_t*>(tree_schedule->data)
+                                       : nullptr;
+    detail::gated_delta_net::launch_recurrent_record(
+        q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+        value_record, gate_record, out, stream, schedule);
 }
 
-std::size_t gated_delta_net_replay_record_workspace_capacity_bytes(std::int32_t value_heads,
-                                                                   std::int32_t batch,
-                                                                   std::int32_t width) {
-    if (value_heads <= 0 || batch <= 0 || width <= 0) {
-        throw std::invalid_argument(
-            "gated_delta_net_replay_record workspace: invalid heads/batch/width");
+void gated_delta_net_tree_schedule(const Tensor& parent_index, const Tensor& valid_columns,
+                                   Tensor& schedule, cudaStream_t stream) {
+    constexpr const char* kOp = "gated_delta_net_tree_schedule";
+    const std::int32_t width  = parent_index.ne[0];
+    const std::int32_t rows   = parent_index.ne[1];
+    if (width < 2 || width > kGdnTreeMaxColumns || rows <= 0 || rows > kMaximumRows) {
+        throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
-    return replay_record_overlay_bytes(value_heads, batch, width);
+    require_tensor(parent_index, DType::I32, {width, rows}, 4, kOp, "parent_index");
+    if (valid_columns.data != nullptr) {
+        require_tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
+    }
+    require_tensor(schedule, DType::I32, {kGdnTreeScheduleWords, rows}, 4, kOp, "schedule");
+    detail::gated_delta_net::launch_tree_schedule(
+        static_cast<const std::int32_t*>(parent_index.data),
+        static_cast<const std::int32_t*>(valid_columns.data), width, rows,
+        static_cast<std::int32_t*>(schedule.data), stream);
 }
 
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,

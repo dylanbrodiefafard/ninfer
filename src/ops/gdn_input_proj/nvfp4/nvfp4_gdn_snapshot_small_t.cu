@@ -331,8 +331,8 @@ void launch_record_exact(const Tensor& x, const Weight& weight, const Tensor& co
 template <int Width, bool Tree>
 struct A8RecordOutput {
     static_assert(Width >= kNvfp4FirstA8 && Width <= kNvfp4GdnA8FusedRecordMaxWidth);
-    // C<=6 and W<=8 (T<=48) fit the launcher's single M16/M32/M48 tile, so every
-    // request's temporal columns are present here; wider public widths retain global staging.
+    // W*B<=48 fits the launcher's single M16/M32/M48 tile, so every request's temporal columns
+    // are present here; larger launches retain global staging.
     Nvfp4GdnConvOutput<Width, RecordColumnPublish, Tree> output;
 
     template <class Schedule>
@@ -361,20 +361,19 @@ void launch_quantized_record_exact(const Tensor& x, const Weight& weight, const 
     auto scope      = workspace.scope();
     const int batch = x.ne[2];
     if constexpr (A8 && Width <= kNvfp4GdnA8FusedRecordMaxWidth) {
-        if (Width * batch > 48) {
-            throw std::invalid_argument("nvfp4 gdn A8 record: W*B exceeds the single M48 tile");
+        if (Width * batch <= kNvfp4GdnA8FusedRecordMaxTokens) {
+            const auto quantized = allocate_fp8_a8_workspace(workspace, Width * batch, weight.k);
+            launch_fp8_a8_quantize(x.view({weight.k, Width * batch}), weight, quantized, stream);
+            const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
+                                              kNvfp4GdnChannels, Width};
+            const auto output = make_nvfp4_gdn_conv_output<Width, Tree>(
+                conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
+                publish, parent_index);
+            launch_nvfp4_w4a8_mma<Nvfp4GdnInputGeometry>(
+                weight, Width * batch, quantized, Nvfp4IdentityEpilogue{},
+                A8RecordOutput<Width, Tree>{output}, stream);
+            return;
         }
-        const auto quantized = allocate_fp8_a8_workspace(workspace, Width * batch, weight.k);
-        launch_fp8_a8_quantize(x.view({weight.k, Width * batch}), weight, quantized, stream);
-        const RecordColumnPublish publish{static_cast<__nv_bfloat16*>(conv_record.data),
-                                          kNvfp4GdnChannels, Width};
-        const auto output = make_nvfp4_gdn_conv_output<Width, Tree>(
-            conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z, publish,
-            parent_index);
-        launch_nvfp4_w4a8_mma<Nvfp4GdnInputGeometry>(weight, Width * batch, quantized,
-                                                     Nvfp4IdentityEpilogue{},
-                                                     A8RecordOutput<Width, Tree>{output}, stream);
-        return;
     }
     Tensor projected = workspace.alloc(DType::FP32, {kNvfp4GdnChannels, Width, batch}, 256);
     if constexpr (A8) {

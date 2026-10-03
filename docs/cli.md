@@ -135,20 +135,19 @@ For 35B-A3B DFlash v1:
   --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
-For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. Verify is
-chain `W=k+1` for `k` in `1..7`. On RTX 5090, `--draft-tokens 5 --adaptive-draft` is the
-recommendation under the default p-less sampler. `--draft-tokens 7 --adaptive-draft` drafts the
-drafter's trained block of eight at C=1; it is about 6% faster at C=1 with `--greedy` and 1-4%
-slower under p-less ([K7 measurements](performance.md#dflash2-k6k7-verify-2026-09-29)). See the [concurrent long-reasoning measurements](performance.md#dflash2-concurrent-long-reasoning-decode-2026-09-22)
-for C=2–4 settings and the [C=5/6 measurements](performance.md#concurrency-c56-2026-09-25).
-With `--draft-tokens N` (N=5..7), `--adaptive-draft` picks live DFlash k in
-`{3..N}` after each round by
-`argmax E[Y(k)] / T(k,C,L)` (nested hop survival from engine-global per-k hop hazards learned on
-randomized exploration rounds and a per-request content factor, online least-squares round
-time). That
-is a sticky policy, not a once-per-launch latch: see
+For Qwen3.8-27B DFlash2, the NVFP4 artifact must contain the appended `dflash/` objects. A fixed
+draft window verifies the chain `W=k+1` for `k` in `1..7`. On RTX 5090,
+`--draft-tokens 7 --adaptive-draft` is the recommendation for one to two concurrent requests
+under every sampler (at C>=4 under p-less, `--draft-tokens 5` measured 1.6-4.3% higher before the
+tree arm, see [K7 measurements](performance.md#dflash2-k6k7-verify-2026-09-29)): besides the chain
+arms `{3..7}` it captures a packed best-first draft tree of the full window (`W=12`) for batches
+of up to four requests, and learns per batch size which arm maximizes expected tokens per second
+([tree arm measurements](performance.md#dflash2-best-first-tree-arm-2026-10-03)). The picker
+chooses the arm after each round by `argmax E[Y(arm)] / T(arm,C,L)` (nested hop survival from
+engine-global hop hazards and a per-request content factor, exponentially forgetting
+least-squares round time). That is a sticky policy, not a once-per-launch latch: see
 [adaptive draft length](maintainer/qwen3.6-27b-model.md#81-adaptive-draft-length). Frozen
-`--draft-tokens 4` stays `{4}`.
+`--draft-tokens 4` stays `{4}` plus the tree arm when adaptive.
 
 ```bash
 ./build/apps/ninfer out/qwen3_8_27b_nvfp4_dflash_w8.ninfer \
@@ -162,8 +161,8 @@ at bind. Current 3.8 MTP-only files and all 3.6-27B files stay valid MTP artifac
 [performance results](performance.md) use MTP with three draft tokens and DFlash with seven draft
 tokens (block length eight), both with the optimized proposal head. Those DFlash k=7 figures are
 historical chain W=8; product DFlash2 is chain `k≤7`. 35B DFlash v1 accepts up to fifteen draft
-tokens; 3.8 DFlash2 accepts up to seven. The RTX 5090 packed-tree investigation (removed from
-the product) is in [dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
+tokens; 3.8 DFlash2 accepts up to seven. The RTX 5090 tree investigation is in
+[dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
 
 ## Common options
 
@@ -185,9 +184,9 @@ the product) is in [dflash2-tree-speed.md](maintainer/dflash2-tree-speed.md).
 | `--xattn-tau F` | XAttention prompt-prefill block skipping on NVFP4 KV: keep the 128-key blocks covering attention mass `F` `(0,1]` once more than 8,192 keys are visible. `1` is dense; exclusive with `--keep-frac` below `1`; decode and verify stay dense | `1` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
-| `--adaptive-draft` | pick live draft K by `E[Y]/T(k,C,L)` (nested hop acceptance; DFlash learns engine-global per-k hop hazards from one exploration round in 32; least-squares T; each captured k measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures `{3..N}`; DFlash `--draft-tokens 4` stays `{4}`. MTP captures `{3,4,5}` up to its configured limit | off |
-| `--dflash-verify-width N` | DFlash verify width `2..16`; chain-only targets require `W=k+1`. Qwen3.8 DFlash2 is chain `W=k+1` | auto |
-| `--dflash-p-less-draft-temperature T` | DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. At p-less `T=1.5`, `0.4` gave +5.7% C=1 decode (9 prompts x 4 seeds, no prompt slower) and +14-16% aggregate at C=4/6 over greedy drafts | 0.4 |
+| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four. MTP captures `{3,4,5}` up to its configured limit | off |
+| `--dflash-verify-width N` | pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
+| `--dflash-p-less-draft-temperature T` | DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` (scaled by the target's block-length factor) and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Tuned for the default p-less `--temperature 2`: on the 40-prompt corpus `0.8` beat `0.4` by +3.8% (k=7) and +4.8% (k=5) C=1 decode; at `--temperature 1.5` about `0.45` is best ([q-lab measurements](performance.md#dflash2-p-less-proposal-temperature-2026-10-03)) | 0.8 |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

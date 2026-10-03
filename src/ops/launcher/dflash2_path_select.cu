@@ -75,14 +75,13 @@ void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void dflash2_tree_select_launch(const float* cand_val, const int* cand_idx,
-                                const Tensor& hidden_proj, const Tensor* pred_bf16,
-                                const Tensor* succ_bf16, const Weight* pred_nvfp4,
-                                const Weight* succ_nvfp4, const Tensor& anchors,
-                                const Tensor& frontiers, Tensor& verify_ids, Tensor& parent_index,
-                                Tensor& cache_positions, Tensor& rope_positions,
-                                Tensor& ancestor_mask, Tensor& valid_columns, std::int32_t tokens,
-                                std::int32_t batch, std::int32_t out_width, cudaStream_t stream) {
+void dflash2_tree_select_launch(
+    const float* cand_val, const int* cand_idx, const Tensor& hidden_proj, const Tensor* pred_bf16,
+    const Tensor* succ_bf16, const Weight* pred_nvfp4, const Weight* succ_nvfp4,
+    const Tensor& anchors, const Tensor& frontiers, Tensor& verify_ids, Tensor& parent_index,
+    Tensor& cache_positions, Tensor& rope_positions, Tensor& ancestor_mask, Tensor& valid_columns,
+    std::int32_t tokens, std::int32_t batch, std::int32_t out_width, const SamplingConfig* configs,
+    float p_less_tree_temperature, cudaStream_t stream) {
     dflash2_tree_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
                                  stream>>>(
         cand_val, cand_idx, static_cast<const __nv_bfloat16*>(hidden_proj.data),
@@ -93,7 +92,8 @@ void dflash2_tree_select_launch(const float* cand_val, const int* cand_idx,
         static_cast<std::int32_t*>(cache_positions.data),
         static_cast<std::int32_t*>(rope_positions.data),
         static_cast<std::int32_t*>(ancestor_mask.data),
-        static_cast<std::int32_t*>(valid_columns.data), tokens, batch, out_width);
+        static_cast<std::int32_t*>(valid_columns.data), tokens, batch, out_width, configs,
+        p_less_tree_temperature);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -307,7 +307,8 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
                          Tensor& rope_positions, Tensor& ancestor_mask, Tensor& valid_columns,
                          WorkspaceArena& workspace, cudaStream_t stream,
                          const Tensor* logit_token_ids, const Weight* pred_nvfp4,
-                         const Weight* succ_nvfp4) {
+                         const Weight* succ_nvfp4, const SamplingConfig* configs,
+                         float p_less_tree_temperature) {
     require_logits(logits);
     const std::int32_t vocab  = logits.ne[0];
     const std::int32_t tokens = logits.ne[1];
@@ -333,7 +334,7 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
     require_anchors(frontiers, batch);
     require_projection_weight(hidden_projection);
     const std::int32_t width = verify_ids.ne[0];
-    if (width < 2 || width > kDflash2TreeExpandWidth) {
+    if (width < 2 || width > kDflash2TreeMaxWidth) {
         throw std::invalid_argument("dflash2_tree_select: W must be in [2,16]");
     }
     auto require_wb = [&](const Tensor& tensor, const char* name, DType dtype) {
@@ -357,9 +358,6 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
         valid_columns.ne[2] != 1 || valid_columns.ne[3] != 1) {
         throw std::invalid_argument("dflash2_tree_select: valid_columns must be I32 [B]");
     }
-    if (1 + kDflash2TreeFrontier * tokens > kDflash2TreeExpandWidth) {
-        throw std::invalid_argument("dflash2_tree_select: T is too large for the packed tree");
-    }
 
     auto scratch_scope         = workspace.scope();
     const DeviceSpan proj_span = workspace.alloc_bytes(hidden_proj_bytes(tokens, batch));
@@ -372,7 +370,7 @@ void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,
         topk.cand_val, topk.cand_idx, hidden_proj, pred_q == nullptr ? &pred_code : nullptr,
         succ_q == nullptr ? &succ_code : nullptr, pred_q, succ_q, anchors, frontiers, verify_ids,
         parent_index, cache_positions, rope_positions, ancestor_mask, valid_columns, tokens, batch,
-        width, stream);
+        width, configs, p_less_tree_temperature, stream);
 }
 
 } // namespace ninfer::ops

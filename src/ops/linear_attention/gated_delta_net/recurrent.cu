@@ -89,7 +89,7 @@ void launch_recurrent_record_warps(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots,
-                                   const std::int32_t* parent_index, Tensor& key_record,
+                                   const std::int32_t* tree_schedule, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream) {
     constexpr int kDv = NumWarps * kDvPerWarp;
@@ -108,7 +108,7 @@ void launch_recurrent_record_warps(const Tensor& q, const Tensor& k, const Tenso
         static_cast<const float*>(ssm_states.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int32_t*>(initial_state_slots.data),
-        parent_index,
+        tree_schedule,
         static_cast<__nv_bfloat16*>(key_record.data),
         static_cast<__nv_bfloat16*>(value_record.data),
         reinterpret_cast<uint2*>(gate_record.data),
@@ -118,14 +118,7 @@ void launch_recurrent_record_warps(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    if constexpr (ParentIndexed && NumWarps == kTreeNumWarps) {
-        const std::size_t smem =
-            static_cast<std::size_t>(q.ne[2]) * kDv * kStateDim * sizeof(float);
-        recurrent_record_kernel<Masked, true, NumWarps><<<grid, block, smem, stream>>>(access);
-    } else {
-        recurrent_record_kernel<Masked, ParentIndexed, NumWarps>
-            <<<grid, block, 0, stream>>>(access);
-    }
+    recurrent_record_kernel<Masked, ParentIndexed, NumWarps><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -134,18 +127,12 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots,
-                                   const std::int32_t* parent_index, Tensor& key_record,
+                                   const std::int32_t* tree_schedule, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream) {
-    if constexpr (ParentIndexed) {
-        launch_recurrent_record_warps<Masked, true, kTreeNumWarps>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
-            key_record, value_record, gate_record, out, stream);
-    } else {
-        launch_recurrent_record_warps<Masked, false, kNumWarps>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
-            key_record, value_record, gate_record, out, stream);
-    }
+    launch_recurrent_record_warps<Masked, ParentIndexed, kNumWarps>(
+        q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, tree_schedule,
+        key_record, value_record, gate_record, out, stream);
 }
 
 template <class Geometry>
@@ -244,88 +231,37 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream, const std::int32_t* parent_index) {
+                             Tensor& out, cudaStream_t stream, const std::int32_t* tree_schedule) {
     const bool masked = valid_columns.data != nullptr;
-    if (parent_index == nullptr) {
+    if (tree_schedule == nullptr) {
         if (!masked) {
             launch_recurrent_record_fixed<false, false>(
                 q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                parent_index, key_record, value_record, gate_record, out, stream);
+                tree_schedule, key_record, value_record, gate_record, out, stream);
         } else {
             launch_recurrent_record_fixed<true, false>(
                 q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                parent_index, key_record, value_record, gate_record, out, stream);
+                tree_schedule, key_record, value_record, gate_record, out, stream);
         }
         return;
     }
     if (!masked) {
         launch_recurrent_record_fixed<false, true>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, tree_schedule,
             key_record, value_record, gate_record, out, stream);
     } else {
         launch_recurrent_record_fixed<true, true>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, parent_index,
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, tree_schedule,
             key_record, value_record, gate_record, out, stream);
     }
 }
 
-template <bool Masked>
-void launch_recurrent_overlay_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
-                                    const Tensor& g, const Tensor& beta, float scale,
-                                    const Tensor& ssm_states, const Tensor& valid_columns,
-                                    const Tensor& initial_state_slots, Tensor& key_record,
-                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                    float* overlay_states, const std::int32_t* parent_index,
-                                    cudaStream_t stream) {
-    const auto heads = head_map::of(q.ne[1], v.ne[1]);
-    const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
-                    static_cast<unsigned>(kStateDim / kBlockDv));
-    const dim3 block(kWarpSize, kNumWarps, 1);
-    const std::int64_t live_slot_stride =
-        static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const std::int64_t overlay_slot_stride =
-        static_cast<std::int64_t>(kStateDim) * kStateDim * v.ne[1];
-    const OverlayAccess<Masked> access{
-        static_cast<const __nv_bfloat16*>(q.data),
-        static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data),
-        static_cast<const float*>(g.data),
-        static_cast<const float*>(beta.data),
-        static_cast<const float*>(ssm_states.data),
-        overlay_states,
-        Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
-        static_cast<const std::int32_t*>(initial_state_slots.data),
-        parent_index,
-        static_cast<__nv_bfloat16*>(key_record.data),
-        static_cast<__nv_bfloat16*>(value_record.data),
-        reinterpret_cast<uint2*>(gate_record.data),
-        static_cast<__nv_bfloat16*>(out.data),
-        heads,
-        q.ne[2],
-        q.ne[3],
-        live_slot_stride,
-        overlay_slot_stride,
-        scale,
-    };
-    recurrent_overlay_kernel<Masked><<<grid, block, 0, stream>>>(access);
+void launch_tree_schedule(const std::int32_t* parent_index, const std::int32_t* valid_columns,
+                          std::int32_t width, std::int32_t batch, std::int32_t* schedule,
+                          cudaStream_t stream) {
+    tree_schedule_kernel<<<static_cast<unsigned>(batch), 1, 0, stream>>>(
+        parent_index, valid_columns, width, schedule);
     CUDA_CHECK(cudaGetLastError());
-}
-
-void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                              const Tensor& beta, float scale, const Tensor& ssm_states,
-                              const Tensor& valid_columns, const Tensor& initial_state_slots,
-                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                              Tensor& out, float* overlay_states, const std::int32_t* parent_index,
-                              cudaStream_t stream) {
-    if (valid_columns.data == nullptr) {
-        launch_recurrent_overlay_fixed<false>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
-            value_record, gate_record, out, overlay_states, parent_index, stream);
-    } else {
-        launch_recurrent_overlay_fixed<true>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
-            value_record, gate_record, out, overlay_states, parent_index, stream);
-    }
 }
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,

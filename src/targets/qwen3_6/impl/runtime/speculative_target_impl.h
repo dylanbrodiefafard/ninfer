@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 
@@ -14,6 +15,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     }
     const bool tree = frame.tree_verify;
     if (tree != (frame.parent_index.data != nullptr) ||
+        tree != (frame.gdn_tree_schedule.data != nullptr) ||
         tree != (frame.ancestor_mask.data != nullptr) ||
         tree != (frame.prefix_lengths.data != nullptr) ||
         tree != (frame.accepted_column.data != nullptr) ||
@@ -31,7 +33,11 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     }
     card.set_sampling(frame.sampling);
     if (tree) {
-        card.set_tree_verify(&frame.parent_index, &frame.ancestor_mask, &frame.prefix_lengths);
+        // One schedule per round serves every GDN layer's tree record launch.
+        ops::gated_delta_net_tree_schedule(frame.parent_index, frame.valid_columns,
+                                           frame.gdn_tree_schedule, execution.device.stream);
+        card.set_tree_verify(&frame.parent_index, &frame.gdn_tree_schedule, &frame.ancestor_mask,
+                             &frame.prefix_lengths);
     }
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
@@ -53,7 +59,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
             execution.work, execution.device.stream);
         ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_column,
                                                 frame.selected_hidden, execution.device.stream);
-        card.set_tree_verify(nullptr, nullptr, nullptr);
+        card.set_tree_verify(nullptr, nullptr, nullptr, nullptr);
     } else {
         ops::speculative_accept_greedy_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,

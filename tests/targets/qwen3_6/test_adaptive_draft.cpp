@@ -635,6 +635,84 @@ void test_content_sums_decay_before_adding() {
                 "expected failures accumulate the hazard in force before each round");
 }
 
+// Records one ordinary (non-exploration) round of an arm for a fresh request.
+void exploit_rows(q36::AdaptiveHopRates& rates, std::uint32_t arm, std::uint32_t accepted,
+                  int rows) {
+    q36::AdaptiveDraftState scratch;
+    q36::seed_adaptive_draft_state(scratch, arm, q36::AdaptiveDraftLaw::Greedy);
+    for (int r = 0; r < rows; ++r) {
+        q36::adaptive_record_round(scratch, accepted, q36::adaptive_arm_k(arm), arm, &rates, false);
+    }
+}
+
+void test_tree_arm_starts_at_its_chain_hazard() {
+    q36::AdaptiveHopRates rates;
+    for (int r = 0; r < 300; ++r) { explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 7, 2, 1); }
+    const std::uint32_t tree = q36::adaptive_tree_arm(7);
+    for (std::uint32_t hop = 0; hop < 7; ++hop) {
+        expect_near(q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, tree, hop),
+                    q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, 7, hop), 1e-6f,
+                    "an unobserved tree arm predicts its chain's hazard");
+    }
+}
+
+void test_tree_cells_learn_from_ordinary_tree_rounds_only() {
+    q36::AdaptiveHopRates rates;
+    const std::uint32_t tree = q36::adaptive_tree_arm(7);
+    const float chain0       = q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, 7, 0);
+    exploit_rows(rates, tree, 7, 200);
+    exploit_rows(rates, 7, 0, 200);
+    expect(q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, tree, 0) < 0.1f,
+           "fully accepted ordinary tree rounds lower the tree depth hazard");
+    expect_near(q36::adaptive_hop_hazard(rates, q36::AdaptiveDraftLaw::Greedy, 7, 0), chain0, 1e-6f,
+                "ordinary chain rounds leave the chain cells untouched");
+}
+
+void test_picker_learns_tree_against_round_time() {
+    const std::uint32_t tree       = q36::adaptive_tree_arm(7);
+    const std::uint32_t captured[] = {5, 7, tree};
+    q36::AdaptiveHopRates rates;
+    for (int r = 0; r < 300; ++r) {
+        explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 5, r % 2 == 0 ? 2U : 5U, 1);
+        explore_rows(rates, q36::AdaptiveDraftLaw::Greedy, 7, r % 2 == 0 ? 2U : 7U, 1);
+    }
+    exploit_rows(rates, tree, 7, 300);
+    q36::AdaptiveDraftState state;
+    q36::seed_adaptive_draft_state(state, 7, q36::AdaptiveDraftLaw::Greedy);
+
+    q36::AdaptiveRoundTimeState cheap;
+    plant_t(cheap, 5, 0.0150f);
+    plant_t(cheap, 7, 0.0155f);
+    plant_t(cheap, tree, 0.0165f);
+    auto cfg      = cfg_of(captured, cheap);
+    cfg.hop_rates = &rates;
+    expect(pick(cfg, state, 7, 7) == tree, "a cheap tree round with a lower hazard wins");
+
+    q36::AdaptiveRoundTimeState expensive;
+    plant_t(expensive, 5, 0.0150f);
+    plant_t(expensive, 7, 0.0155f);
+    plant_t(expensive, tree, 0.0400f);
+    cfg.round_time = &expensive;
+    expect(pick(cfg, state, 7, 7) != tree, "a measured expensive tree round loses");
+}
+
+void test_arm_budget_clamp_and_snap() {
+    const std::uint32_t tree       = q36::adaptive_tree_arm(7);
+    const std::uint32_t captured[] = {3, 4, 5, 6, 7, tree};
+    expect(q36::adaptive_clamp_arm(captured, tree, 7) == tree, "a tree arm within budget stays");
+    expect(q36::adaptive_clamp_arm(captured, tree, 5) == 5,
+           "a tree arm beyond budget falls back to the largest affordable chain");
+    expect(q36::adaptive_snap_captured_k(captured, 7) == 7, "snapping never selects a tree arm");
+}
+
+void test_round_time_forgets_old_level() {
+    q36::AdaptiveRoundTimeState st;
+    for (int r = 0; r < 4000; ++r) { plant_t(st, 4, 0.020f); }
+    for (int r = 0; r < 4000; ++r) { plant_t(st, 4, 0.030f); }
+    expect_near(q36::adaptive_t_hat(st, 4, 512), 0.030f, 3e-4f,
+                "round time tracks a sustained level shift");
+}
+
 } // namespace
 
 int main() {
@@ -671,6 +749,11 @@ int main() {
     test_hop_model_warm_server_new_request_is_not_locked_short();
     test_exploration_trigger_is_uniform_and_capped();
     test_content_sums_decay_before_adding();
+    test_tree_arm_starts_at_its_chain_hazard();
+    test_tree_cells_learn_from_ordinary_tree_rounds_only();
+    test_picker_learns_tree_against_round_time();
+    test_arm_budget_clamp_and_snap();
+    test_round_time_forgets_old_level();
     if (failures != 0) {
         std::cerr << failures << " adaptive draft host checks failed\n";
         return 1;
