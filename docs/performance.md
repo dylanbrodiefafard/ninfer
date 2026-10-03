@@ -125,6 +125,32 @@ accepted less at hops 1-3 than a k=4 block. That is prompt-specific: on a mixed-
 accepts more (see the [width-factored picker](maintainer/performance_enhancements.md#adaptive-draft-width-factored-acceptance-qwen38-27bnvfp4-dflash2)
 negative result), and the shipped picker is within 0-2% of the best fixed k at C=1..6. Evidence: `profiles/bench/dflash-batched-chain-20260929/`.
 
+## Decode stalls from KV-tier work (2026-10-02)
+
+Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
+CUDA 13.1, base `fd16c8ba`. C3 serve, DFlash2 `--draft-tokens 5 --adaptive-draft
+--lm-head-draft`, NVFP4 KV, context 32768, RAM tier 4 GiB, disk tier 32 GiB on ZFS (about
+80 MB/s with fsync, so one spill takes 5-65 s). Two streams decode 3000 tokens while six
+~12K-token conversations rotate through the third lane for three passes; `cancel` also drops
+every third turn mid-admission (`profiles/bench/kv-stall-20261001/run.sh`). nsys showed one
+condition-variable wait on the scheduler, a RAM claim waiting out the same entry's disk spill
+including its fsync, was 96% of decode-gap time; copy-engine contention and
+`cudaGraphExecUpdate` were below 2 ms per affected round.
+
+Server 5 s intervals with both decode lanes ready and no prefill running, but decode below
+50 tok/s (a frozen scheduler):
+
+| Run | base | fork ports only | all fixes (rerun, slower disk) | base rerun |
+|---|---|---|---|---|
+| churn | 2 of 5 (4.2, 24.8 tok/s) | 0 of 5 | 0 of 8 | 2 of 8 (3.4, 17.0) |
+| cancel | 1 of 7 (13.0) | 1 of 6 (28.8) | 1 of 11 (49.8) | 6 of 10 (four at 0 tok/s) |
+
+Client side (base vs fork ports, first runs), churn's largest decode gap went from 8.8 s to 0.87 s (one cold 12K prefill, which
+excludes decode by design) and time in gaps over 50 ms from 29.8 s to 11.8 s; all 18 greedy
+replies are identical between builds. On the slower disk of the reruns, pass-2 turns still
+wait tens of seconds for disk saves and some expire in admission in both builds; that delays
+the admitted request only, not the decoding lanes.
+
 ## Activation and KV numerics A/B (2026-09-29)
 
 Target `qwen3.8-27b/nvfp4`, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, RTX 5090 / `sm_120a` /
