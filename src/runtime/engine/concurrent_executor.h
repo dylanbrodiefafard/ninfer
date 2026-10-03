@@ -632,6 +632,15 @@ private:
         bool victims_evicted     = false;
         bool restored            = false;
         bool needs_prefill       = false;
+        // Set for a generation-recovery retry: its lane and output stay with the retry,
+        // so a failed host restore cold-prefills the same lane from this base plan.
+        std::optional<BasePlan> recovery_base;
+        // Cancelled while other lanes decode: restore work has stopped and the copies already
+        // queued are fenced; the hold drains once they settle.
+        bool cancel_pending = false;
+        // The host restore failed. While other lanes decode, its copies are fenced the same
+        // way and the failed entry is dropped once they settle; a drain drops it as well.
+        bool restore_failed = false;
     };
 
     [[nodiscard]] static bool membership_contains(const RoundMembership& membership,
@@ -923,107 +932,55 @@ private:
         publish_runtime_stats();
     }
 
-    // Blocking host restore on this lane. Returns false when the caller should
-    // cold-prefill the same lane. Does not requeue, clear the output budget, or
-    // stick force_cold_prefill / cache_fallback.
-    [[nodiscard]] bool prefill_recovery_from_host(const std::shared_ptr<Request>& request,
-                                                  std::uint32_t lane, bool ram, Plan host_plan) {
-        const RequestPlanSummary summary  = host_plan.summary();
-        const std::uint64_t ram_entry_id  = summary.ram_entry_id;
-        const std::uint64_t disk_entry_id = summary.disk_entry_id;
-        bool ram_claimed                  = false;
-        bool disk_claimed                 = false;
-        bool ram_owned                    = false;
-        bool disk_owned                   = false;
-        bool consumed                     = false;
-        auto release_claim                = [&]() noexcept {
-            if (consumed) { return; }
-            if (ram_claimed) {
+    void recovery_cold_prefill(const std::shared_ptr<Request>& request, std::uint32_t lane,
+                               const BasePlan& base) {
+        release_recovery_lane(lane);
+        const auto first = begin_recovery_prefill(
+            request, lane, instance_.program->plan_request_for_lane(lane, request->prompt, base));
+        resolve_recovery_prefill(request, first);
+    }
+
+    // Claims the host entry and parks the retry in copy-hold, so decode-ready lanes keep
+    // running while its RAM or disk prefix restores; admit_complete starts the prefill.
+    // Returns false on a disk claim miss, before anything is held.
+    [[nodiscard]] bool hold_recovery_restore(const std::shared_ptr<Request>& request,
+                                             std::uint32_t lane, bool ram, Plan host_plan,
+                                             BasePlan& base) {
+        const RequestPlanSummary summary = host_plan.summary();
+        if (ram) {
+            instance_.program->claim_ram_entry(summary.ram_entry_id);
+        } else {
+            if (!instance_.program->claim_disk_entry(
+                    summary.disk_entry_id, summary.disk_execution_frontier, summary.disk_hash_f_lo,
+                    summary.disk_hash_f_hi, summary.reusable_prompt_tokens, summary.disk_reuse_path,
+                    summary.disk_committed_generation)) {
+                return false;
+            }
+            try {
+                instance_.program->prefetch_disk_plan(summary.disk_entry_id, host_plan);
+            } catch (...) {
                 detail::run_secondary_cleanup(
-                    [&] { instance_.program->release_ram_entry(ram_entry_id); });
-                ram_claimed = false;
+                    [&] { instance_.program->release_disk_entry(summary.disk_entry_id); });
+                throw;
             }
-            if (disk_claimed) {
-                detail::run_secondary_cleanup(
-                    [&] { instance_.program->release_disk_entry(disk_entry_id); });
-                disk_claimed = false;
-            }
-        };
-        try {
-            if (ram) {
-                instance_.program->claim_ram_entry(ram_entry_id);
-                ram_claimed = true;
-                ram_owned   = true;
-                instance_.program->restore_ram_entry(lane, ram_entry_id, host_plan);
-            } else {
-                if (!instance_.program->claim_disk_entry(
-                        disk_entry_id, summary.disk_execution_frontier, summary.disk_hash_f_lo,
-                        summary.disk_hash_f_hi, summary.reusable_prompt_tokens,
-                        summary.disk_reuse_path, summary.disk_committed_generation)) {
-                    return false;
-                }
-                disk_claimed = true;
-                disk_owned   = true;
-                instance_.program->prefetch_disk_plan(disk_entry_id, host_plan);
-                instance_.program->restore_disk_entry(lane, disk_entry_id, host_plan);
-            }
-            instance_.program->pump_disk_restore();
-            if (instance_.program->kv_disk_restore_failed()) {
-                instance_.program->wait_kv_disk_copies();
-            }
-            if (!instance_.program->kv_copies_ready()) {
-                instance_.program->wait_kv_ram_copies();
-                instance_.program->wait_kv_disk_copies();
-            } else {
-                instance_.program->wait_kv_disk_copies();
-            }
-            instance_.program->wait_kv_ram_copies_on_compute();
-            if (instance_.program->kv_disk_restore_failed()) {
-                throw CacheRestoreFailure("disk cache restore failed");
-            }
-            const auto first  = begin_recovery_prefill(request, lane, std::move(host_plan));
-            const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
-            request->kv_ram_save_seconds += copies.save;
-            request->kv_ram_load_seconds += copies.load;
-            const auto disk_copies = instance_.program->harvest_kv_disk_copy_seconds();
-            request->kv_disk_save_seconds += disk_copies.save;
-            request->kv_disk_load_seconds += disk_copies.load;
-            request->kv_disk_h2d_seconds += disk_copies.h2d;
-            cumulative_stats_.kv_disk_h2d_seconds += disk_copies.h2d;
-            if (ram) {
-                instance_.program->consume_ram_entry(ram_entry_id);
-                ram_claimed = false;
-            } else {
-                instance_.program->consume_disk_entry(disk_entry_id);
-                disk_claimed = false;
-            }
-            consumed = true;
-            // A first-step stop or cancellation publishes the terminal result here.
-            // Account for the restore and finish its claim before publication.
-            resolve_recovery_prefill(request, first);
-            return true;
-        } catch (const CacheRestoreFailure&) {
-            detail::run_secondary_cleanup([&] { instance_.program->cancel_disk_restore(); });
-            detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
-            release_claim();
-            if (ram_owned) {
-                detail::run_secondary_cleanup(
-                    [&] { instance_.program->discard_ram_capture(ram_entry_id); });
-            }
-            if (disk_owned) {
-                detail::run_secondary_cleanup(
-                    [&] { instance_.program->invalidate_disk_entry(disk_entry_id); });
-            }
-            release_recovery_lane(lane);
-            if (!request->prompt) { throw; }
-            return false;
-        } catch (...) {
-            detail::run_secondary_cleanup([&] { instance_.program->cancel_disk_restore(); });
-            detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
-            release_claim();
-            release_recovery_lane(lane);
-            throw;
         }
+        copy_hold_.emplace(CopyHold{
+            .request         = request,
+            .lane            = lane,
+            .plan            = std::move(host_plan),
+            .ram_hit         = ram,
+            .ram_entry_id    = ram ? summary.ram_entry_id : 0,
+            .ram_claimed     = ram,
+            .disk_hit        = !ram,
+            .disk_entry_id   = ram ? 0 : summary.disk_entry_id,
+            .disk_claimed    = !ram,
+            .victims_evicted = true,
+            .needs_prefill   = summary.reusable_prompt_tokens < summary.prompt_tokens,
+            .recovery_base   = std::move(base),
+        });
+        begin_copy_hold(request);
+        if (build_round_membership().empty()) { (void)admit_complete(true); }
+        return true;
     }
 
     // Recovery starts only after the generated round is committed. Tool calls
@@ -1036,204 +993,205 @@ private:
             if (!request->lane || slots_[*request->lane] != request || !request->recovery_pending) {
                 continue;
             }
-            const auto lane                   = *request->lane;
-            const auto attempt                = request->recovery.attempts + 1;
-            auto execution                    = request->options.execution;
-            execution.requested_output_tokens = request->budget->remaining();
-            // Keep the request's reuse setting. capture stays off so a retry does not
-            // pin its frontier as a turn rollback.
-            execution.capture_context_checkpoint = false;
-            execution.suppressed_token_count     = 0;
-
-            const bool reuse_enabled =
-                execution.allow_prefix_reuse && !execution.force_cold_prefill;
-            const bool lane_retained =
-                reuse_enabled && instance_.program->retain_reusable_lane(lane);
-            invalidate_lane_plans(lane);
-            release_planning_state(request);
-
-            const auto started = Clock::now();
-            std::vector<TokenId> prefix;
-            std::uint32_t ignored_frontier = 0;
-            const bool copied              = instance_.program->copy_reusable_prompt(
-                lane, request->resident_prompt_tokens, prefix, ignored_frontier);
-            (void)ignored_frontier;
-            std::vector<TokenId> original_prefix;
-            if (!copied) {
-                auto rebuilt =
-                    instance_.loaded->frontend.prepare(request->recovery_context->input());
-                request->resident_prompt_tokens = rebuilt.summary().prompt_tokens;
-                auto taken      = targets::qwen3_6::PreparedPromptAccess::take(std::move(rebuilt));
-                original_prefix = std::move(taken.token_ids);
-            }
-            const auto selected = targets::qwen3_6::recovery_splice_prefix(
-                copied ? std::span<const TokenId>(prefix) : std::span<const TokenId>{},
-                original_prefix);
-            if (selected.data() != prefix.data()) { prefix = std::move(original_prefix); }
-            const auto insert =
-                request->recovery_context->recovery_insert(request->output.tool_calls(), attempt);
-            auto spliced = instance_.loaded->frontend.splice_recovery_prompt(
-                std::move(prefix), request->recovery_context->input(), insert,
-                request->recovery_context);
-            request->recovery.prepare_seconds +=
-                std::chrono::duration<double>(Clock::now() - started).count();
-
-            const auto route_of = [&](bool splice_accepted, bool budget_ok, bool pages_ok,
-                                      std::uint32_t resident, bool can_admit, std::uint32_t ram,
-                                      std::uint32_t disk, bool restore_failed) {
-                return targets::qwen3_6::route_recovery_prefill(
-                    targets::qwen3_6::RecoveryPrefillInput{
-                        .splice_accepted          = splice_accepted,
-                        .allow_prefix_reuse       = execution.allow_prefix_reuse,
-                        .force_cold_prefill       = execution.force_cold_prefill,
-                        .lane_retained            = lane_retained,
-                        .resident_reusable_tokens = resident,
-                        .can_admit_lane           = can_admit,
-                        .output_budget_preserved  = budget_ok,
-                        .pages_fit                = pages_ok,
-                        .ram_reusable_tokens      = ram,
-                        .disk_reusable_tokens     = disk,
-                        .host_restore_failed      = restore_failed,
-                    });
-            };
-            if (!spliced) {
-                const auto decision = route_of(false, true, true, 0, true, 0, 0, false);
-                recovery_exhausted(request, std::string(decision.detail));
-                return true;
-            }
-
-            const std::uint32_t spliced_tokens = spliced->summary().prompt_tokens;
-            const bool budget_ok               = targets::qwen3_6::recovery_output_budget_preserved(
-                spliced_tokens, context_capacity_, request->budget->remaining());
-            if (!budget_ok) {
-                const auto decision = route_of(true, false, true, 0, true, 0, 0, false);
-                recovery_exhausted(request, std::string(decision.detail));
-                return true;
-            }
-
-            auto session = instance_.loaded->frontend.make_output_session(
-                *spliced, request->options.stop, request->options.output);
-            if (!session.model_stop_tokens_allowed()) {
-                const auto& stops = instance_.loaded->frontend.default_stop_policy().token_ids;
-                execution.suppressed_token_count = static_cast<std::uint32_t>(stops.size());
-                std::copy(stops.begin(), stops.end(), execution.suppressed_token_ids.begin());
-            }
-            auto base = instance_.program->plan_request_base(*spliced, execution);
-            const bool pages_ok =
-                admission_resources_fit(base.summary().admission, request->admission_resources) &&
-                base.summary().effective_output_tokens == request->budget->remaining();
-            if (!pages_ok) {
-                const auto decision = route_of(true, true, false, 0, true, 0, 0, false);
-                recovery_exhausted(request, std::string(decision.detail));
-                return true;
-            }
-
-            std::uint32_t resident = 0;
-            bool can_admit         = true;
-            std::optional<Plan> lane_plan;
-            if (lane_retained) {
-                lane_plan = instance_.program->plan_request_for_lane(lane, *spliced, base);
-                resident  = lane_plan->summary().reusable_prompt_tokens;
-                can_admit = instance_.program->can_admit_lane(lane, *lane_plan);
-            }
-            auto decision = route_of(true, true, true, resident, can_admit, 0, 0, false);
-            std::optional<Plan> ram_plan;
-            std::optional<Plan> disk_plan;
-            if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Cold && reuse_enabled) {
-                ram_plan = optional_host_reuse_plan(
-                    [&] { return instance_.program->plan_ram_reuse(*spliced, base); });
-                disk_plan = optional_host_reuse_plan(
-                    [&] { return instance_.program->plan_disk_reuse(*spliced, base); });
-                const auto host_tokens = [](const std::optional<Plan>& plan,
-                                            PrefixReuseSource source,
-                                            bool ram_source) -> std::uint32_t {
-                    if (!plan) { return 0; }
-                    const RequestPlanSummary& summary = plan->summary();
-                    if (summary.reusable_prompt_tokens == 0 || summary.reuse_source != source) {
-                        return 0;
-                    }
-                    if ((ram_source ? summary.ram_entry_id : summary.disk_entry_id) == 0) {
-                        return 0;
-                    }
-                    return summary.reusable_prompt_tokens;
-                };
-                decision =
-                    route_of(true, true, true, resident, can_admit,
-                             host_tokens(ram_plan, PrefixReuseSource::HostRam, true),
-                             host_tokens(disk_plan, PrefixReuseSource::HostDisk, false), false);
-            }
-            if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Exhaust) {
-                recovery_exhausted(request, std::string(decision.detail));
-                return true;
-            }
-            if (request->cancelled.load(std::memory_order_acquire)) {
-                release_recovery_lane(lane);
-                complete_cancelled(request);
-                return true;
-            }
-
-            const auto previous = instance_.program->generation_timings_lane(lane);
-            if (request->recovery.attempts == 0) { request->initial_timings = previous; }
-            request->previous_decode_seconds += previous.decode_seconds;
-            add_speculative(request->previous_speculative,
-                            instance_.program->speculative_stats_lane(lane));
-            request->previous_reasoning_tokens += request->output.reasoning_tokens();
-            request->prompt                 = std::move(*spliced);
-            request->output                 = std::move(session);
-            request->resident_prompt_tokens = spliced_tokens;
-            request->recovery.attempts      = attempt;
-            request->recovery_pending       = false;
-            publish_recovery(request, RecoveryEventKind::RetryStarted, request->recovery_cause);
-            // The failed attempt may end mid-word. Keep it visible, but do not
-            // concatenate the new attempt onto that unfinished word in SSE/JSON.
-            if (!request->reasoning.empty()) {
-                targets::qwen3_6::PublishedOutput separator;
-                separator.push_back(OutputDelta{OutputChannel::Reasoning, "\n\n"});
-                append_output(request, std::move(separator));
-            }
-            request->recovery_reasoning_begin = request->reasoning.size();
-            request->recovery_generated_begin = request->generated.size();
-            request->reasoning_cycle          = {};
-            request->stop_suppression_active  = execution.suppressed_token_count != 0;
-
-            auto cold_prefill = [&] {
-                release_recovery_lane(lane);
-                const auto first = begin_recovery_prefill(
-                    request, lane,
-                    instance_.program->plan_request_for_lane(lane, request->prompt, base));
-                resolve_recovery_prefill(request, first);
-            };
-            using Route = targets::qwen3_6::RecoveryPrefillRoute;
-            switch (decision.route) {
-            case Route::ResidentSuffix: {
-                const auto first =
-                    begin_recovery_prefill(request, lane, std::move(lane_plan.value()));
-                resolve_recovery_prefill(request, first);
-                return true;
-            }
-            case Route::HostRam:
-            case Route::HostDisk: {
-                release_recovery_lane(lane);
-                const bool ram = decision.route == Route::HostRam;
-                if (!prefill_recovery_from_host(request, lane, ram,
-                                                ram ? std::move(ram_plan.value())
-                                                    : std::move(disk_plan.value()))) {
-                    const auto failed = route_of(true, true, true, 0, true, 0, 0, true);
-                    if (failed.route != Route::Cold) {
-                        throw std::logic_error("recovery host restore failure must cold-prefill");
-                    }
-                    cold_prefill();
+            const auto lane = *request->lane;
+            try {
+                start_recovery_attempt(request, lane);
+            } catch (...) {
+                // A nested admit_complete or failed-restore fallback may already have
+                // failed the request before rethrowing; only classify it then.
+                const std::exception_ptr error = std::current_exception();
+                if (request_done(*request) ? !is_request_local_error(error)
+                                           : !fail_admitted_request(request, lane, error)) {
+                    throw;
                 }
-                return true;
             }
-            case Route::Cold:
-                cold_prefill();
-                return true;
-            case Route::Exhaust:
-                throw std::logic_error("recovery exhaust must stop before prefill");
-            }
+            return true;
         }
         return false;
+    }
+
+    [[nodiscard]] static bool request_done(Request& request) {
+        std::lock_guard lock(request.mutex);
+        return request.done;
+    }
+
+    // One retry from its committed lane. The lane, prompt, and output session are mutated
+    // in stages, so any exception leaves cleanup to the caller's per-request boundary.
+    void start_recovery_attempt(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+        const auto attempt                = request->recovery.attempts + 1;
+        auto execution                    = request->options.execution;
+        execution.requested_output_tokens = request->budget->remaining();
+        // Keep the request's reuse setting. capture stays off so a retry does not
+        // pin its frontier as a turn rollback.
+        execution.capture_context_checkpoint = false;
+        execution.suppressed_token_count     = 0;
+
+        const bool reuse_enabled = execution.allow_prefix_reuse && !execution.force_cold_prefill;
+        const bool lane_retained = reuse_enabled && instance_.program->retain_reusable_lane(lane);
+        invalidate_lane_plans(lane);
+        release_planning_state(request);
+
+        const auto started = Clock::now();
+        std::vector<TokenId> prefix;
+        std::uint32_t ignored_frontier = 0;
+        const bool copied              = instance_.program->copy_reusable_prompt(
+            lane, request->resident_prompt_tokens, prefix, ignored_frontier);
+        (void)ignored_frontier;
+        std::vector<TokenId> original_prefix;
+        if (!copied) {
+            auto rebuilt = instance_.loaded->frontend.prepare(request->recovery_context->input());
+            request->resident_prompt_tokens = rebuilt.summary().prompt_tokens;
+            auto taken      = targets::qwen3_6::PreparedPromptAccess::take(std::move(rebuilt));
+            original_prefix = std::move(taken.token_ids);
+        }
+        const auto selected = targets::qwen3_6::recovery_splice_prefix(
+            copied ? std::span<const TokenId>(prefix) : std::span<const TokenId>{},
+            original_prefix);
+        if (selected.data() != prefix.data()) { prefix = std::move(original_prefix); }
+        const auto insert =
+            request->recovery_context->recovery_insert(request->output.tool_calls(), attempt);
+        auto spliced = instance_.loaded->frontend.splice_recovery_prompt(
+            std::move(prefix), request->recovery_context->input(), insert,
+            request->recovery_context);
+        request->recovery.prepare_seconds +=
+            std::chrono::duration<double>(Clock::now() - started).count();
+
+        const auto route_of = [&](bool splice_accepted, bool budget_ok, bool pages_ok,
+                                  std::uint32_t resident, bool can_admit, std::uint32_t ram,
+                                  std::uint32_t disk) {
+            return targets::qwen3_6::route_recovery_prefill(targets::qwen3_6::RecoveryPrefillInput{
+                .splice_accepted          = splice_accepted,
+                .allow_prefix_reuse       = execution.allow_prefix_reuse,
+                .force_cold_prefill       = execution.force_cold_prefill,
+                .lane_retained            = lane_retained,
+                .resident_reusable_tokens = resident,
+                .can_admit_lane           = can_admit,
+                .output_budget_preserved  = budget_ok,
+                .pages_fit                = pages_ok,
+                .ram_reusable_tokens      = ram,
+                .disk_reusable_tokens     = disk,
+            });
+        };
+        if (!spliced) {
+            const auto decision = route_of(false, true, true, 0, true, 0, 0);
+            recovery_exhausted(request, std::string(decision.detail));
+            return;
+        }
+
+        const std::uint32_t spliced_tokens = spliced->summary().prompt_tokens;
+        const bool budget_ok               = targets::qwen3_6::recovery_output_budget_preserved(
+            spliced_tokens, context_capacity_, request->budget->remaining());
+        if (!budget_ok) {
+            const auto decision = route_of(true, false, true, 0, true, 0, 0);
+            recovery_exhausted(request, std::string(decision.detail));
+            return;
+        }
+
+        auto session = instance_.loaded->frontend.make_output_session(
+            *spliced, request->options.stop, request->options.output);
+        if (!session.model_stop_tokens_allowed()) {
+            const auto& stops = instance_.loaded->frontend.default_stop_policy().token_ids;
+            execution.suppressed_token_count = static_cast<std::uint32_t>(stops.size());
+            std::copy(stops.begin(), stops.end(), execution.suppressed_token_ids.begin());
+        }
+        auto base = instance_.program->plan_request_base(*spliced, execution);
+        const bool pages_ok =
+            admission_resources_fit(base.summary().admission, request->admission_resources) &&
+            base.summary().effective_output_tokens == request->budget->remaining();
+        if (!pages_ok) {
+            const auto decision = route_of(true, true, false, 0, true, 0, 0);
+            recovery_exhausted(request, std::string(decision.detail));
+            return;
+        }
+
+        std::uint32_t resident = 0;
+        bool can_admit         = true;
+        std::optional<Plan> lane_plan;
+        if (lane_retained) {
+            lane_plan = instance_.program->plan_request_for_lane(lane, *spliced, base);
+            resident  = lane_plan->summary().reusable_prompt_tokens;
+            can_admit = instance_.program->can_admit_lane(lane, *lane_plan);
+        }
+        auto decision = route_of(true, true, true, resident, can_admit, 0, 0);
+        std::optional<Plan> ram_plan;
+        std::optional<Plan> disk_plan;
+        if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Cold && reuse_enabled) {
+            ram_plan = optional_host_reuse_plan(
+                [&] { return instance_.program->plan_ram_reuse(*spliced, base); });
+            disk_plan = optional_host_reuse_plan(
+                [&] { return instance_.program->plan_disk_reuse(*spliced, base); });
+            const auto host_tokens = [](const std::optional<Plan>& plan, PrefixReuseSource source,
+                                        bool ram_source) -> std::uint32_t {
+                if (!plan) { return 0; }
+                const RequestPlanSummary& summary = plan->summary();
+                if (summary.reusable_prompt_tokens == 0 || summary.reuse_source != source) {
+                    return 0;
+                }
+                if ((ram_source ? summary.ram_entry_id : summary.disk_entry_id) == 0) { return 0; }
+                return summary.reusable_prompt_tokens;
+            };
+            decision = route_of(true, true, true, resident, can_admit,
+                                host_tokens(ram_plan, PrefixReuseSource::HostRam, true),
+                                host_tokens(disk_plan, PrefixReuseSource::HostDisk, false));
+        }
+        if (decision.route == targets::qwen3_6::RecoveryPrefillRoute::Exhaust) {
+            recovery_exhausted(request, std::string(decision.detail));
+            return;
+        }
+        if (request->cancelled.load(std::memory_order_acquire)) {
+            release_recovery_lane(lane);
+            complete_cancelled(request);
+            return;
+        }
+
+        const auto previous = instance_.program->generation_timings_lane(lane);
+        if (request->recovery.attempts == 0) { request->initial_timings = previous; }
+        request->previous_decode_seconds += previous.decode_seconds;
+        add_speculative(request->previous_speculative,
+                        instance_.program->speculative_stats_lane(lane));
+        request->previous_reasoning_tokens += request->output.reasoning_tokens();
+        request->prompt                 = std::move(*spliced);
+        request->output                 = std::move(session);
+        request->resident_prompt_tokens = spliced_tokens;
+        request->recovery.attempts      = attempt;
+        request->recovery_pending       = false;
+        publish_recovery(request, RecoveryEventKind::RetryStarted, request->recovery_cause);
+        // The failed attempt may end mid-word. Keep it visible, but do not
+        // concatenate the new attempt onto that unfinished word in SSE/JSON.
+        if (!request->reasoning.empty()) {
+            targets::qwen3_6::PublishedOutput separator;
+            separator.push_back(OutputDelta{OutputChannel::Reasoning, "\n\n"});
+            append_output(request, std::move(separator));
+        }
+        request->recovery_reasoning_begin = request->reasoning.size();
+        request->recovery_generated_begin = request->generated.size();
+        request->reasoning_cycle          = {};
+        request->stop_suppression_active  = execution.suppressed_token_count != 0;
+
+        using Route = targets::qwen3_6::RecoveryPrefillRoute;
+        switch (decision.route) {
+        case Route::ResidentSuffix: {
+            const auto first = begin_recovery_prefill(request, lane, std::move(lane_plan.value()));
+            resolve_recovery_prefill(request, first);
+            return;
+        }
+        case Route::HostRam:
+        case Route::HostDisk: {
+            release_recovery_lane(lane);
+            const bool ram = decision.route == Route::HostRam;
+            if (!hold_recovery_restore(
+                    request, lane, ram,
+                    ram ? std::move(ram_plan.value()) : std::move(disk_plan.value()), base)) {
+                recovery_cold_prefill(request, lane, base);
+            }
+            return;
+        }
+        case Route::Cold:
+            recovery_cold_prefill(request, lane, base);
+            return;
+        case Route::Exhaust:
+            throw std::logic_error("recovery exhaust must stop before prefill");
+        }
     }
 
     bool recover_persistent_reasoning(const std::shared_ptr<Request>& request) {
@@ -1382,18 +1340,34 @@ private:
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
-            if (copy_hold_ && copy_hold_->lane == lane) { drain_copy_hold_before_abort(); }
-            if (request->decode_ready) {
-                instance_.program->retain_lane(lane);
-            } else if (!instance_.program->revert_cancelled_prefill_lane(lane)) {
+            if (copy_hold_ && copy_hold_->lane == lane && !build_round_membership().empty()) {
+                // Draining here would wait for the hold's in-flight disk reads and copies
+                // while other lanes decode; the worker loop finishes it once they settle.
+                if (!copy_hold_->cancel_pending) {
+                    instance_.program->begin_copy_hold_cancel();
+                    copy_hold_->cancel_pending = true;
+                }
+                continue;
+            }
+            cancel_lane(lane);
+        }
+    }
+
+    void cancel_lane(std::uint32_t lane) {
+        const std::shared_ptr<Request> request = slots_[lane];
+        if (copy_hold_ && copy_hold_->lane == lane) { drain_copy_hold_before_abort(); }
+        if (request->decode_ready) {
+            if (!instance_.program->retain_reusable_lane(lane)) {
                 instance_.program->abort_lane(lane);
             }
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
-            }
-            complete_cancelled(request);
+        } else if (!instance_.program->revert_cancelled_prefill_lane(lane)) {
+            instance_.program->abort_lane(lane);
         }
+        if (prefill_lane_ && *prefill_lane_ == lane) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+        complete_cancelled(request);
     }
 
     [[nodiscard]] bool expire_pending_requests() {
@@ -1662,6 +1636,18 @@ private:
 
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
+        // Every plan of a request carries its base plan's KV entitlements, so lane feasibility
+        // does not depend on the reuse source. Plan the optional host tiers only when some free
+        // lane can take the request at all.
+        bool lane_feasible = false;
+        for (std::uint32_t lane = 0; lane < max_concurrency_ && !lane_feasible; ++lane) {
+            if (slots_[lane] != nullptr) { continue; }
+            ensure_lane_plan(request, lane);
+            const Plan& plan = request->lane_plans[lane].value();
+            lane_feasible = instance_.program->can_admit_lane(lane, plan) ||
+                            instance_.program->can_admit_lane_after_retained_eviction(lane, plan);
+        }
+        if (!lane_feasible) { return std::nullopt; }
         ensure_ram_candidate(request);
         ensure_disk_candidate(request);
         const Plan* ram_plan = request->ram_plan ? &*request->ram_plan : nullptr;
@@ -1787,18 +1773,21 @@ private:
         });
     }
 
-    [[nodiscard]] static bool is_request_local_admission_error(const std::exception_ptr& error) {
+    // A RequestError rejects one request, and a CacheRestoreFailure is confined to the optional
+    // host bytes one request tried to reuse. Anything else is an Engine invariant or device
+    // failure.
+    [[nodiscard]] static bool is_request_local_error(const std::exception_ptr& error) {
         if (!error) { return false; }
         try {
             std::rethrow_exception(error);
-        } catch (const RequestError&) { return true; } catch (...) {
-            return false;
-        }
+        } catch (const RequestError&) { return true; } catch (const CacheRestoreFailure&) {
+            return true;
+        } catch (...) { return false; }
     }
 
-    void drain_copy_hold_before_abort() noexcept {
-        if (!copy_hold_) { return; }
-        CopyHold& hold = *copy_hold_;
+    // Settles the hold's copies and returns its host claims; a failed restore also drops its
+    // entry so planning stops offering it. Every step is best-effort.
+    void release_copy_hold_host(CopyHold& hold) noexcept {
         detail::run_secondary_cleanup([&] { instance_.program->cancel_disk_restore(); });
         detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
         harvest_kv_copy_seconds(hold.request);
@@ -1807,22 +1796,151 @@ private:
                 [&] { instance_.program->release_ram_entry(hold.ram_entry_id); });
             hold.ram_claimed = false;
         }
+        if (hold.restore_failed && hold.ram_hit && !hold.ram_consumed) {
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->discard_ram_capture(hold.ram_entry_id); });
+        }
         if (hold.disk_claimed && !hold.disk_consumed) {
             detail::run_secondary_cleanup(
                 [&] { instance_.program->release_disk_entry(hold.disk_entry_id); });
             hold.disk_claimed = false;
         }
-        end_copy_hold(hold.request);
-        if (!hold.victims_evicted) {
+        if (hold.restore_failed && hold.disk_hit && !hold.disk_consumed) {
+            detail::run_secondary_cleanup(
+                [&] { instance_.program->invalidate_disk_entry(hold.disk_entry_id); });
+        }
+    }
+
+    // Victims captured for the hold leave VRAM even when the hold ends without its restore:
+    // their bundles already live in the RAM tier. Best-effort, after the hold's copies settled.
+    void evict_copy_hold_victims(CopyHold& hold) noexcept {
+        if (hold.victims_evicted) { return; }
+        detail::run_secondary_cleanup([&] {
             for (const std::uint32_t victim :
                  std::span(hold.victim_lanes).first(hold.victim_count)) {
                 instance_.program->evict_retained_lane(victim);
                 invalidate_lane_plans(victim);
             }
-            hold.victims_evicted = true;
-        }
-        instance_.program->abort_lane(hold.lane);
+        });
+        hold.victims_evicted = true;
+    }
+
+    void drain_copy_hold_before_abort() noexcept {
+        if (!copy_hold_) { return; }
+        CopyHold& hold           = *copy_hold_;
+        const std::uint32_t lane = hold.lane;
+        release_copy_hold_host(hold);
+        end_copy_hold(hold.request);
+        evict_copy_hold_victims(hold);
+        instance_.program->abort_lane(lane);
         copy_hold_.reset();
+    }
+
+    // A request that owns a lane failed: release its copy-hold, lane, staged prefill, and slot,
+    // then fail it. Returns whether the failure is request-local, so the Engine continues.
+    [[nodiscard]] bool fail_admitted_request(const std::shared_ptr<Request>& request,
+                                             std::uint32_t lane, const std::exception_ptr& error) {
+        if (copy_hold_ && copy_hold_->request == request) { drain_copy_hold_before_abort(); }
+        instance_.program->abort_lane(lane);
+        if (prefill_lane_ && *prefill_lane_ == lane) {
+            instance_.request_memory.deactivate();
+            prefill_lane_.reset();
+        }
+        if (slots_[lane] == request) {
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+        }
+        request->decode_ready     = false;
+        request->recovery_pending = false;
+        complete_error(request, error);
+        return is_request_local_error(error);
+    }
+
+    // A host restore that failed before prefill consumed the prompt falls back to computing it.
+    // A new request must not have produced anything yet; a retry keeps its lane and output.
+    [[nodiscard]] static bool is_cache_restore_failure(const std::exception_ptr& error) {
+        if (!error) { return false; }
+        try {
+            std::rethrow_exception(error);
+        } catch (const CacheRestoreFailure&) { return true; } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool restore_failure_falls_back(const std::exception_ptr& error,
+                                                  const Request& request) const {
+        if (!is_cache_restore_failure(error)) { return false; }
+        if (!copy_hold_ || (!copy_hold_->ram_hit && !copy_hold_->disk_hit) || !request.prompt ||
+            prefill_lane_) {
+            return false;
+        }
+        return copy_hold_->recovery_base ||
+               (!request.cache_fallback && !request.begin && request.generated.empty());
+    }
+
+    // Host bytes are optional, so a failed restore drops its entry and recomputes the prefix.
+    // While other lanes decode, the restore's queued copies are fenced and the hold stays parked
+    // until they settle (worker loop), so dropping the entry never waits on disk reads or copies.
+    [[nodiscard]] AdmissionProgress fail_host_restore(bool membership_empty) {
+        copy_hold_.value().restore_failed = true;
+        if (membership_empty) { return finish_failed_restore(); }
+        instance_.program->begin_copy_hold_cancel();
+        return AdmissionProgress::CopyHold;
+    }
+
+    [[nodiscard]] AdmissionProgress finish_failed_restore() {
+        CopyHold& hold                         = copy_hold_.value();
+        const std::shared_ptr<Request> request = hold.request;
+        const std::uint32_t lane               = hold.lane;
+        release_copy_hold_host(hold);
+        end_copy_hold(request);
+        evict_copy_hold_victims(hold);
+        if (hold.recovery_base) {
+            // The retry's lane and output stay with it: cold-prefill the same lane.
+            const BasePlan base = std::move(*hold.recovery_base);
+            copy_hold_.reset();
+            try {
+                recovery_cold_prefill(request, lane, base);
+            } catch (...) {
+                if (!fail_admitted_request(request, lane, std::current_exception())) { throw; }
+                return AdmissionProgress::ControlProgress;
+            }
+            return AdmissionProgress::RanGpuUnit;
+        }
+        // A new request relinquishes its reservation, then normal FIFO admission rechecks the
+        // cold reservation against its peers. It re-enters the queue before anything else
+        // changes, so a failed insert still fails it through its lane.
+        try {
+            std::lock_guard lock(queue_mutex_);
+            const auto position =
+                std::lower_bound(pending_.begin(), pending_.end(), request->queue_order,
+                                 [](const auto& queued, std::uint64_t order) {
+                                     return queued->queue_order < order;
+                                 });
+            pending_.insert(position, request);
+            request->pending_since = Clock::now();
+            published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
+                                              std::memory_order_relaxed);
+        } catch (...) {
+            if (!fail_admitted_request(request, lane, std::current_exception())) { throw; }
+            return AdmissionProgress::ControlProgress;
+        }
+        instance_.program->abort_lane(lane);
+        copy_hold_.reset();
+        slots_[lane].reset();
+        invalidate_lane_plans(lane);
+        release_planning_state(request);
+        request->lane.reset();
+        request->budget.reset();
+        request->admission_resources    = {};
+        request->remaining_service_work = 0;
+        request->backfill_epoch         = 0;
+        request->backfill_class         = BackfillClass::None;
+        request->cache_fallback         = true;
+        ++cumulative_stats_.kv_cache_fallbacks;
+        request->options.execution.force_cold_prefill = true;
+        publish_runtime_stats();
+        return AdmissionProgress::ControlProgress;
     }
 
     [[nodiscard]] AdmissionProgress admit_complete(bool membership_empty) {
@@ -1842,6 +1960,7 @@ private:
 
         auto copies_ready = [&] { return instance_.program->kv_copies_ready(); };
 
+        std::exception_ptr error;
         try {
             if (!hold.victims_evicted) {
                 if (!instance_.program->kv_ram_copies_ready()) {
@@ -1857,6 +1976,11 @@ private:
             }
 
             if (hold.ram_hit && !hold.restored) {
+                // The restore reads the entry's block, which a capture may still be filling;
+                // keep decoding members running until its copies have landed.
+                if (!membership_empty && !instance_.program->ram_restore_ready(hold.ram_entry_id)) {
+                    return AdmissionProgress::CopyHold;
+                }
                 instance_.program->restore_ram_entry(lane, hold.ram_entry_id, hold.plan);
                 hold.restored = true;
             }
@@ -1895,9 +2019,14 @@ private:
                 transient     = instance_.request_memory.region();
             }
             end_copy_hold(request);
+            const auto prefill_started    = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(hold.plan), transient,
                 &request->output);
+            if (hold.recovery_base) {
+                request->recovery.prefill_seconds +=
+                    std::chrono::duration<double>(Clock::now() - prefill_started).count();
+            }
             const auto copies = instance_.program->harvest_kv_ram_copy_seconds();
             request->kv_ram_save_seconds += copies.save;
             request->kv_ram_load_seconds += copies.load;
@@ -1924,86 +2053,26 @@ private:
             (void)resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
             return AdmissionProgress::RanGpuUnit;
-        } catch (const CacheRestoreFailure&) {
-            // Host cache bytes are optional. Before prefill consumes the prompt,
-            // drain partial DMA and relinquish the failed reservation, then let
-            // normal FIFO admission recheck the cold reservation against peers.
-            if (!copy_hold_ || (!copy_hold_->disk_hit && !copy_hold_->ram_hit) ||
-                request->cache_fallback || prefill_lane_ || request->begin ||
-                !request->generated.empty()) {
-                throw;
-            }
-            CopyHold& failed = *copy_hold_;
-            instance_.program->cancel_disk_restore();
-            instance_.program->synchronize_all();
-            harvest_kv_copy_seconds(request);
-            if (failed.ram_claimed && !failed.ram_consumed) {
-                instance_.program->release_ram_entry(ram_entry_id);
-                failed.ram_claimed = false;
-                instance_.program->discard_ram_capture(ram_entry_id);
-            }
-            if (failed.disk_claimed && !failed.disk_consumed) {
-                instance_.program->release_disk_entry(disk_entry_id);
-                failed.disk_claimed = false;
-            }
-            if (failed.disk_hit) { instance_.program->invalidate_disk_entry(disk_entry_id); }
-            instance_.program->abort_lane(lane);
-            end_copy_hold(request);
-            copy_hold_.reset();
-            slots_[lane].reset();
-            invalidate_lane_plans(lane);
-            release_planning_state(request);
-            request->lane.reset();
-            request->budget.reset();
-            request->admission_resources    = {};
-            request->remaining_service_work = 0;
-            request->backfill_epoch         = 0;
-            request->backfill_class         = BackfillClass::None;
-            request->cache_fallback         = true;
-            ++cumulative_stats_.kv_cache_fallbacks;
-            request->options.execution.force_cold_prefill = true;
-            {
-                std::lock_guard lock(queue_mutex_);
-                const auto position =
-                    std::lower_bound(pending_.begin(), pending_.end(), request->queue_order,
-                                     [](const auto& queued, std::uint64_t order) {
-                                         return queued->queue_order < order;
-                                     });
-                pending_.insert(position, request);
-                request->pending_since = Clock::now();
-                published_waiting_requests_.store(static_cast<std::uint32_t>(pending_.size()),
-                                                  std::memory_order_relaxed);
-            }
-            publish_runtime_stats();
-            return AdmissionProgress::ControlProgress;
-        } catch (...) {
-            const std::exception_ptr error = std::current_exception();
-            if (copy_hold_) {
-                drain_copy_hold_before_abort();
-            } else {
-                if (ram_claimed && !ram_consumed) {
-                    detail::run_secondary_cleanup(
-                        [&] { instance_.program->release_ram_entry(ram_entry_id); });
-                }
-                if (disk_claimed && !disk_consumed) {
-                    detail::run_secondary_cleanup(
-                        [&] { instance_.program->release_disk_entry(disk_entry_id); });
-                }
-            }
-            instance_.program->abort_lane(lane);
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
-            }
-            slots_[lane].reset();
-            invalidate_lane_plans(lane);
-            complete_error(request, error);
-            if (is_request_local_admission_error(error)) {
-                publish_runtime_stats();
-                return AdmissionProgress::ControlProgress;
-            }
-            throw;
+        } catch (...) { error = std::current_exception(); }
+        if (restore_failure_falls_back(error, *request)) {
+            return fail_host_restore(membership_empty);
         }
+        if (copy_hold_ && is_cache_restore_failure(error)) {
+            // The drain below drops the failed entry as well.
+            copy_hold_->restore_failed = true;
+        }
+        if (!copy_hold_) {
+            if (ram_claimed && !ram_consumed) {
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->release_ram_entry(ram_entry_id); });
+            }
+            if (disk_claimed && !disk_consumed) {
+                detail::run_secondary_cleanup(
+                    [&] { instance_.program->release_disk_entry(disk_entry_id); });
+            }
+        }
+        if (!fail_admitted_request(request, lane, error)) { std::rethrow_exception(error); }
+        return AdmissionProgress::ControlProgress;
     }
 
     [[nodiscard]] AdmissionProgress admit_planned_request(const std::shared_ptr<Request>& request,
@@ -2231,10 +2300,6 @@ private:
             ram_claimed  = false;
             disk_claimed = false;
             publish_runtime_stats();
-
-            const bool idle = build_round_membership().empty();
-            if (idle) { return admit_complete(true); }
-            return AdmissionProgress::CopyHold;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             detail::run_secondary_cleanup([&] { instance_.program->synchronize_all(); });
@@ -2251,10 +2316,16 @@ private:
                 }
                 slots_[lane].reset();
                 invalidate_lane_plans(lane);
+            } else if (erase_pending(request)) {
+                clear_protection_if_head(request);
             }
             complete_error(request, error);
-            throw;
+            if (!is_request_local_error(error)) { throw; }
+            return AdmissionProgress::ControlProgress;
         }
+        // The copy-hold owns the admission from here; admit_complete cleans up its own failures.
+        if (build_round_membership().empty()) { return admit_complete(true); }
+        return AdmissionProgress::CopyHold;
     }
 
     AdmissionProgress try_admit_one() {
@@ -2409,7 +2480,9 @@ private:
             const auto& request      = slots_[lane];
             if (request != nullptr && request->cancelled.load(std::memory_order_acquire)) {
                 if (copy_hold_ && copy_hold_->lane == lane) { drain_copy_hold_before_abort(); }
-                instance_.program->retain_lane(lane);
+                if (!instance_.program->retain_reusable_lane(lane)) {
+                    instance_.program->abort_lane(lane);
+                }
                 complete_cancelled(request);
                 continue;
             }
@@ -2611,6 +2684,12 @@ private:
                     lock.unlock();
                     {
                         std::scoped_lock execution_lock(execution_mutex_);
+                        // A hold the caller already cancelled finishes as cancelled.
+                        detail::run_secondary_cleanup([&] {
+                            if (copy_hold_ && copy_hold_->cancel_pending) {
+                                cancel_lane(copy_hold_->lane);
+                            }
+                        });
                         drain_copy_hold_before_abort();
                         detail::run_secondary_cleanup(
                             [&] { instance_.program->shutdown_kv_tiers(load_progress_); });
@@ -2639,6 +2718,18 @@ private:
                     run_decode_round(membership);
                     decode_admission_burst.complete_decode();
                 };
+
+                // A cancelled or failed hold's fenced copies settle while the others decode.
+                if (copy_hold_ && (copy_hold_->cancel_pending || copy_hold_->restore_failed)) {
+                    if (!membership.empty() && !instance_.program->copy_hold_cancel_settled()) {
+                        run_membership_decode();
+                    } else if (copy_hold_->cancel_pending) {
+                        cancel_lane(copy_hold_->lane);
+                    } else {
+                        (void)finish_failed_restore();
+                    }
+                    continue;
+                }
 
                 if (copy_hold_) {
                     const bool held_in_membership =

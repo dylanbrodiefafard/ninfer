@@ -82,6 +82,31 @@ private:
                                            const ResidentPrefixIdentity& identity,
                                            std::size_t count);
 
+// prefix_hash_at values of one resident ledger/identity pair, kept so a capture does not rehash
+// the whole context. at(k) == prefix_hash_at(tokens, identity, k); entries past the cached
+// extent are derived from the resident inputs on demand, so appending to the ledger and
+// identity needs no notice. The owner truncates to at most p before changing any token,
+// identity entry, or Vision item at or after position p, and assigns a prompt's
+// prefix_hash_chain together with that prompt.
+class ResidentPrefixHashes {
+public:
+    void reserve(std::size_t tokens);
+
+    void clear() noexcept { hashes_.clear(); }
+
+    void assign(std::span<const PrefixHash128> chain);
+
+    void truncate(std::size_t tokens) noexcept {
+        if (tokens + 1 < hashes_.size()) { hashes_.resize(tokens + 1); }
+    }
+
+    [[nodiscard]] PrefixHash128 at(std::span<const TokenId> tokens,
+                                   const ResidentPrefixIdentity& identity, std::size_t count);
+
+private:
+    std::vector<PrefixHash128> hashes_;
+};
+
 // D17: RAM DFlash checkpoint reuse is gated on a captured backend image, not live sequence.kv.
 [[nodiscard]] constexpr bool dflash_rewrite_checkpoint_ready(bool backend_image_present,
                                                              std::uint32_t dflash_context_frontier,

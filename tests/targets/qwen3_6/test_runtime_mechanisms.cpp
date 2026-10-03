@@ -7,11 +7,6 @@
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
-#include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
-#include "cuda_stream_gate.h"
-#include <atomic>
-#include <chrono>
-#include <future>
 #define NINFER_QWEN36_RUNTIME_NS mechanism_slots
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #undef NINFER_QWEN36_RUNTIME_NS
@@ -33,6 +28,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+ninfer::targets::qwen3_6::PreparedPromptData text_prompt(std::uint32_t tokens);
 
 namespace {
 
@@ -465,10 +462,141 @@ void test_prefix_identity() {
     }
 }
 
+// Independent little-endian encoder of the persisted identity layout: token and item counts,
+// token types, three position axes, then each Vision item.
+std::vector<std::uint8_t> reference_identity_bytes(const q36::PreparedPromptData& prompt) {
+    std::vector<std::uint8_t> out;
+    const auto put = [&out](std::uint64_t value, int bytes) {
+        for (int i = 0; i < bytes; ++i) {
+            out.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
+        }
+    };
+    const std::size_t tokens = prompt.token_ids.size();
+    put(tokens, 4);
+    put(prompt.vision_items.size(), 4);
+    for (const std::uint8_t type : prompt.token_types) { put(type, 1); }
+    for (const std::int32_t position : prompt.positions) {
+        put(static_cast<std::uint32_t>(position), 4);
+    }
+    for (const q36::VisionItem& item : prompt.vision_items) {
+        put(static_cast<std::uint8_t>(item.modality), 1);
+        put(static_cast<std::uint32_t>(item.grid.temporal), 4);
+        put(static_cast<std::uint32_t>(item.grid.height), 4);
+        put(static_cast<std::uint32_t>(item.grid.width), 4);
+        put(item.patch_begin, 8);
+        put(item.patch_count, 8);
+        for (const std::uint8_t byte : item.content_digest) { put(byte, 1); }
+        put(item.timestamps.size(), 4);
+        for (const double timestamp : item.timestamps) {
+            std::uint64_t bits = 0;
+            std::memcpy(&bits, &timestamp, sizeof(bits));
+            put(bits, 8);
+        }
+        put(item.token_spans.size(), 4);
+        for (const q36::TokenSpan& span : item.token_spans) {
+            put(span.begin, 8);
+            put(span.count, 8);
+        }
+    }
+    return out;
+}
+
+void test_prefix_identity_packed_layout() {
+    q36::PreparedPromptData prompt = identity_prompt(7);
+    prompt.positions[5]            = -3;
+    q36::VisionItem video{.modality    = q36::PromptModality::Video,
+                          .grid        = {.temporal = 2, .height = 2, .width = 2},
+                          .patch_begin = 8,
+                          .patch_count = 8,
+                          .timestamps  = {0.5, -1.25},
+                          .token_spans = {{.begin = 5, .count = 1}, {.begin = 7, .count = 1}}};
+    video.content_digest.fill(0xA5);
+    for (std::int32_t position : {4, 5, 6, 7}) { append_text_token(prompt, 248056, position); }
+    prompt.token_types[5] = prompt.token_types[7] =
+        static_cast<std::uint8_t>(q36::PromptModality::Video);
+    prompt.vision_items.push_back(std::move(video));
+
+    q36::detail::ResidentPrefixIdentity identity;
+    identity.assign(prompt);
+    std::vector<std::uint8_t> packed(identity.packed_bytes());
+    identity.pack(packed.data());
+    expect(packed == reference_identity_bytes(prompt),
+           "packed prefix identity keeps the persisted little-endian layout");
+
+    q36::detail::ResidentPrefixIdentity restored;
+    restored.unpack(packed.data(), packed.size());
+    std::vector<std::uint8_t> repacked(restored.packed_bytes());
+    restored.pack(repacked.data());
+    expect(repacked == packed && q36::detail::prefix_matches(prompt, prompt.token_ids, restored,
+                                                             prompt.token_ids.size()),
+           "prefix identity unpack round-trips every field");
+
+    bool truncated_threw = false;
+    try {
+        restored.unpack(packed.data(), packed.size() - 1);
+    } catch (const std::logic_error&) { truncated_threw = true; }
+    expect(truncated_threw, "prefix identity unpack rejects a truncated item");
+}
+
+// The cached resident hashes equal a fresh prefix_hash_at at every frontier, from any cached
+// extent, after truncation, and for Vision item orders that hold the recurrence's item cursor.
+void test_resident_prefix_hashes() {
+    const auto item = [](std::size_t begin, std::size_t count, std::uint8_t digest) {
+        q36::VisionItem value;
+        value.content_digest.fill(digest);
+        value.token_spans = {{.begin = begin, .count = count}};
+        return value;
+    };
+    q36::VisionItem empty;
+    empty.content_digest.fill(9);
+    const std::vector<std::vector<q36::VisionItem>> orders = {
+        {item(3, 2, 1), item(8, 3, 2), item(20, 1, 3)},
+        {item(8, 3, 2), item(3, 2, 1), item(20, 1, 3)},
+        {empty, item(3, 2, 1), empty, item(5, 2, 2)},
+        {item(3, 2, 1), item(4, 1, 2), item(30, 2, 3)},
+        {item(0, 0, 4), item(3, 2, 1)},
+    };
+    for (const auto& items : orders) {
+        q36::PreparedPromptData prompt = text_prompt(40);
+        prompt.vision_items            = items;
+        const auto chain               = q36::detail::prefix_hash_chain(prompt);
+        q36::detail::ResidentPrefixIdentity identity;
+        identity.assign(prompt);
+        std::vector<ninfer::TokenId> ledger = prompt.token_ids;
+        bool exact                          = true;
+        for (std::size_t cached = 0; cached <= prompt.token_ids.size(); ++cached) {
+            q36::detail::ResidentPrefixHashes hashes;
+            hashes.assign(std::span(chain).first(cached + 1));
+            for (std::size_t count = prompt.token_ids.size() + 1; count-- > 0;) {
+                exact = exact && hashes.at(ledger, identity, count) == chain[count];
+            }
+            hashes.truncate(cached / 2);
+            for (std::size_t count = cached / 2; count <= prompt.token_ids.size(); count += 3) {
+                exact = exact && hashes.at(ledger, identity, count) == chain[count];
+            }
+        }
+        expect(exact, "resident prefix hashes extend the prefix hash recurrence exactly");
+
+        q36::detail::ResidentPrefixHashes generated;
+        generated.assign(chain);
+        identity.append_generated(3, prompt.rope_delta);
+        ledger.insert(ledger.end(), {5, 6, 7});
+        expect(generated.at(ledger, identity, ledger.size()) ==
+                   q36::detail::prefix_hash_at(ledger, identity, ledger.size()),
+               "resident prefix hashes extend over generated tokens");
+    }
+}
+
 void test_prefix_hash_and_dflash_gate() {
     q36::PreparedPromptData original = identity_prompt();
     const auto chain                 = q36::detail::prefix_hash_chain(original);
     expect(chain.size() == original.token_ids.size() + 1, "hash chain includes the empty prefix");
+    // Persisted RAM/disk entries are keyed by these values; a recurrence change orphans them.
+    expect(chain[1] == q36::detail::PrefixHash128{0x6262F4B41269B81DULL, 0xBDC2602062B28BFEULL} &&
+               chain[3] ==
+                   q36::detail::PrefixHash128{0xA2C2FE32316E8FD6ULL, 0xA2C6397022371C9FULL} &&
+               chain[4] == q36::detail::PrefixHash128{0x7EFE1C2D333D3CE4ULL, 0xC12A38647DE70FDFULL},
+           "prefix hash values match the persisted key recurrence");
 
     q36::detail::ResidentPrefixIdentity resident;
     resident.assign(original);
@@ -1055,8 +1183,8 @@ q36::detail::PrefillReuseSelection decide(const q36::detail::ResidentReuseState&
                                           const q36::PreparedPromptData& prompt,
                                           ninfer::SpeculativeBackend backend, bool mtp_cache = true,
                                           bool dflash = false, bool dflash_full_layers = false) {
-    return q36::detail::decide_resident_reuse(state, prompt, backend, mtp_cache, dflash,
-                                              dflash_full_layers);
+    return q36::detail::decide_resident_reuse(state, prompt, q36::detail::prefix_hash_chain(prompt),
+                                              backend, mtp_cache, dflash, dflash_full_layers);
 }
 
 // Speculative cancellation folds GDN back to E but cannot restore current tail
@@ -1380,84 +1508,21 @@ void test_adaptive_capture_and_topology() {
            "k_index folds before B");
 }
 
-void test_full_checkpoint_pool_drains_copy() {
-    using Head = q36::detail::ContextCheckpointHead;
-    std::vector<Head> pool;
-    pool.reserve(1);
-    pool.emplace_back();
-    cudaStream_t stream = nullptr;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    std::uint32_t* device_value = nullptr;
-    CUDA_CHECK(cudaMalloc(&device_value, sizeof(std::uint32_t)));
-    CUDA_CHECK(cudaMemsetAsync(device_value, 0x5a, sizeof(std::uint32_t), stream));
-    ninfer::test::StreamCopyGate gate;
-    std::atomic<std::uint32_t> value_at_release{0};
-    Head head;
-    head.hidden = std::shared_ptr<ninfer::PinnedHostBuffer>(
-        new ninfer::PinnedHostBuffer(sizeof(std::uint32_t)), [&](auto* buffer) {
-            std::uint32_t value = 0;
-            std::memcpy(&value, buffer->data(), sizeof(value));
-            value_at_release.store(value, std::memory_order_release);
-            delete buffer;
-        });
-    std::memset(head.hidden->data(), 0, sizeof(std::uint32_t));
-    Head::test_fail_next_copy_event_allocation();
-    bool allocation_failed = false;
-    try {
-        head.prepare_copy_event();
-    } catch (const std::bad_alloc&) { allocation_failed = true; }
-    expect(allocation_failed && head.copies_done == nullptr && head.hidden &&
-               !Head::test_copy_event_allocation_pending(),
-           "checkpoint event exhaustion was not recoverable before DMA");
-    head.prepare_copy_event();
-    gate.launch(stream);
-    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), device_value, sizeof(std::uint32_t),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaEventRecord(head.copies_done, stream));
-    std::promise<void> entered;
-    auto entered_future = entered.get_future();
-    auto retire         = std::async(std::launch::async, [&] {
-        entered.set_value();
-        q36::detail::recycle_checkpoint_image(pool, std::move(head));
-    });
-    entered_future.wait();
-    expect(retire.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout,
-           "full checkpoint pool did not wait for the excess image's DMA");
-    gate.release();
-    retire.get();
-    expect(value_at_release.load(std::memory_order_acquire) == 0x5a5a5a5aU,
-           "full checkpoint pool did not release the completed image");
-    expect(pool.size() == 1 && head.copies_done == nullptr,
-           "full checkpoint pool grew or retained the retired event");
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    pool.clear();
-    CUDA_CHECK(cudaFree(device_value));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-}
-
-void test_context_checkpoint_image_pool_policy() {
-    using q36::detail::ContextCheckpointImageLayout;
-    constexpr ContextCheckpointImageLayout mtp{
-        .conv_bytes = 64, .recurrent_bytes = 128, .hidden_bytes = 32, .dflash_bytes = 0};
-    constexpr ContextCheckpointImageLayout dflash{
-        .conv_bytes = 64, .recurrent_bytes = 128, .hidden_bytes = 32, .dflash_bytes = 96};
-    expect(q36::detail::context_checkpoint_image_layout_matches(mtp, mtp),
-           "exact MTP checkpoint image layout reuses its host image");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(mtp, dflash),
-           "MTP image must not reuse DFlash cyclic-state storage");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(
-               mtp, ContextCheckpointImageLayout{64, 127, 32, 0}),
-           "recurrent-state size mismatch must not reuse a host image");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(
-               mtp, ContextCheckpointImageLayout{63, 128, 32, 0}),
-           "convolution-state size mismatch must not reuse a host image");
-    expect(!q36::detail::context_checkpoint_image_layout_matches(
-               mtp, ContextCheckpointImageLayout{64, 128, 31, 0}),
-           "hidden-state size mismatch must not reuse a host image");
-    expect(q36::detail::context_checkpoint_image_pool_capacity(1, 0) == 1 &&
-               q36::detail::context_checkpoint_image_pool_capacity(1, 3) == 4 &&
-               q36::detail::context_checkpoint_image_pool_capacity(8, 16) == 136,
-           "pool high-water bound is one rollback plus every mark per lane");
+void test_context_checkpoint_image_pool_capacity() {
+    using q36::detail::context_checkpoint_image_pool_capacity;
+    constexpr std::array<std::uint32_t, 6> marks = {24576u, 36864u,  53248u,
+                                                    77824u, 102400u, 151552u};
+    expect(context_checkpoint_image_pool_capacity(1, marks, 262144, 262144) == 7,
+           "one lane owns a rollback plus every reachable mark");
+    expect(context_checkpoint_image_pool_capacity(2, marks, 100000, 1000000) == 10,
+           "marks above the sequence capacity are unreachable");
+    expect(context_checkpoint_image_pool_capacity(6, marks, 262144, 1000000000) == 42,
+           "an unconstrained KV pool lets every lane reach every mark");
+    // 15 ladder images would need under 17476 tokens each; three marks per lane cost 17749.
+    expect(context_checkpoint_image_pool_capacity(6, marks, 262144, 262144) == 20,
+           "the shared KV pool bounds how many marks all lanes reach at once");
+    expect(context_checkpoint_image_pool_capacity(3, {}, 262144, 262144) == 3,
+           "without marks each lane owns only its rollback image");
 }
 
 int main() {
@@ -1470,14 +1535,15 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_prefix_hash_and_dflash_gate();
+    test_prefix_identity_packed_layout();
+    test_resident_prefix_hashes();
     test_prefill_context_marks();
     test_resident_reuse_decision();
     test_recovery_prefix_reuse();
     test_cancelled_dflash_exact_prefix_reuse();
     test_dflash_chain_verify_kv_headroom();
     test_adaptive_capture_and_topology();
-    test_context_checkpoint_image_pool_policy();
-    test_full_checkpoint_pool_drains_copy();
+    test_context_checkpoint_image_pool_capacity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

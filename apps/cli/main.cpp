@@ -278,6 +278,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
+    print_metric("checkpoint host pinned", format_bytes(memory.checkpoint_image_host_bytes) + " (" +
+                                               std::to_string(memory.checkpoint_image_pool_heads) +
+                                               " pooled heads)");
     print_metric("KV RAM capacity", memory.kv_ram_capacity_bytes == 0
                                         ? "off"
                                         : format_kv_ram_size(memory.kv_ram_capacity_bytes));

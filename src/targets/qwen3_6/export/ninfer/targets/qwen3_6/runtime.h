@@ -185,7 +185,6 @@ public:
                                std::span<const std::uint8_t> cancelled,
                                std::span<const std::uint8_t> rejected = {});
     void abort_lane(std::uint32_t lane) noexcept;
-    void retain_lane(std::uint32_t lane);
     [[nodiscard]] bool retain_reusable_lane(std::uint32_t lane);
     [[nodiscard]] bool copy_reusable_prompt(std::uint32_t lane, std::uint32_t prompt_tokens,
                                             std::vector<TokenId>& tokens,
@@ -203,6 +202,8 @@ public:
                            const RequestPlan<Variant>& plan);
     void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
                             const RequestPlan<Variant>& plan);
+    // Whether a RAM entry's capture copies have landed, so its restore starts without waiting.
+    [[nodiscard]] bool ram_restore_ready(std::uint64_t entry_id) const;
     [[nodiscard]] bool disk_restore_ready(std::uint64_t entry_id) const;
     [[nodiscard]] bool kv_ram_reclaim_pending() const;
     void claim_ram_entry(std::uint64_t entry_id);
@@ -221,6 +222,8 @@ public:
     void prefetch_disk_plan(std::uint64_t entry_id, const RequestPlan<Variant>& plan);
     void pump_disk_restore();
     void cancel_disk_restore();
+    void begin_copy_hold_cancel();
+    [[nodiscard]] bool copy_hold_cancel_settled() const;
     void discard_ram_capture(std::uint64_t ram_id);
     void shutdown_kv_tiers(LoadProgress progress = {});
     void request_idle_spill();

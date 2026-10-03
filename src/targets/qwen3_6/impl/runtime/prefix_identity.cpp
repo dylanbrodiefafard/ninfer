@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -79,40 +80,94 @@ std::size_t item_end(const VisionItem& item) {
 
 PrefixHash128 initial_hash() { return PrefixHash128{kFnvOffset64, kFnvOffset64 ^ kChain1Xor}; }
 
+// Represented inputs of one prefix: three position axes and the Vision items whose last
+// consumer completes the hashed token.
+struct HashInputs {
+    const TokenId* tokens       = nullptr;
+    const std::uint8_t* types   = nullptr;
+    const std::int32_t* axis[3] = {};
+    std::span<const VisionItem> items;
+};
+
+// Item cursor of the hash recurrence after it has consumed tokens [0, count). The recurrence
+// visits items in list order: an empty item is skipped when reached, and a nonempty item is
+// mixed at the token where it ends, so an item ending before the cursor reaches it, or after
+// count, holds the cursor.
+std::size_t item_cursor_after(std::span<const VisionItem> items, std::size_t count) {
+    if (count == 0) { return 0; }
+    std::size_t cursor  = 0;
+    std::size_t arrived = 1;
+    while (cursor < items.size()) {
+        const VisionItem& item = items[cursor];
+        if (!item.token_spans.empty()) {
+            const std::size_t end = item_end(item);
+            if (end < arrived || end > count) { break; }
+            arrived = end;
+        }
+        ++cursor;
+    }
+    return cursor;
+}
+
+// Advances `hash` (the hash of tokens [0, from)) through tokens [from, to), calling
+// sink(k, hash) after token k - 1. This is the single hash recurrence of every prefix hash.
+template <class Sink>
+PrefixHash128 extend_hash(PrefixHash128 hash, const HashInputs& in, std::size_t from,
+                          std::size_t to, Sink&& sink) {
+    std::size_t item_cursor = item_cursor_after(in.items, from);
+    for (std::size_t k = from + 1; k <= to; ++k) {
+        const std::size_t i = k - 1;
+        mix_token(hash, in.tokens[i], in.types[i], in.axis[0][i], in.axis[1][i], in.axis[2][i]);
+        while (item_cursor < in.items.size()) {
+            const VisionItem& item = in.items[item_cursor];
+            if (item.token_spans.empty()) {
+                ++item_cursor;
+                continue;
+            }
+            if (item_end(item) != k) { break; }
+            mix_vision_item(hash, item);
+            ++item_cursor;
+        }
+        sink(k, hash);
+    }
+    return hash;
+}
+
+HashInputs resident_inputs(std::span<const TokenId> tokens,
+                           const ResidentPrefixIdentity& identity) {
+    return HashInputs{
+        .tokens = tokens.data(),
+        .types  = identity.token_types().data(),
+        .axis   = {identity.positions(0).data(), identity.positions(1).data(),
+                   identity.positions(2).data()},
+        .items  = identity.vision_items(),
+    };
+}
+
+static_assert(std::endian::native == std::endian::little,
+              "packed prefix identity stores host little-endian integers");
+
+// Serialized identity is little-endian; on this little-endian host every scalar and array is a
+// direct copy, with one bounds check per field.
 struct Writer {
     std::uint8_t* p   = nullptr;
     std::uint8_t* end = nullptr;
 
-    void u8(std::uint8_t value) {
-        if (p >= end) { throw std::logic_error("prefix identity pack overflow"); }
-        *p++ = value;
-    }
-
-    void u32(std::uint32_t value) {
-        u8(static_cast<std::uint8_t>(value));
-        u8(static_cast<std::uint8_t>(value >> 8));
-        u8(static_cast<std::uint8_t>(value >> 16));
-        u8(static_cast<std::uint8_t>(value >> 24));
-    }
-
-    void u64(std::uint64_t value) {
-        for (int shift = 0; shift < 64; shift += 8) {
-            u8(static_cast<std::uint8_t>(value >> shift));
-        }
-    }
-
-    void i32(std::int32_t value) { u32(static_cast<std::uint32_t>(value)); }
-
-    void f64(double value) {
-        std::uint64_t bits = 0;
-        std::memcpy(&bits, &value, sizeof(bits));
-        u64(bits);
-    }
-
     void bytes(const void* data, std::size_t n) {
-        const auto* raw = static_cast<const std::uint8_t*>(data);
-        for (std::size_t i = 0; i < n; ++i) { u8(raw[i]); }
+        if (n > static_cast<std::size_t>(end - p)) {
+            throw std::logic_error("prefix identity pack overflow");
+        }
+        if (n != 0) { std::memcpy(p, data, n); }
+        p += n;
     }
+
+    void u8(std::uint8_t value) { bytes(&value, sizeof(value)); }
+
+    void u32(std::uint32_t value) { bytes(&value, sizeof(value)); }
+
+    void u64(std::uint64_t value) { bytes(&value, sizeof(value)); }
+
+    void i32(std::int32_t value) { bytes(&value, sizeof(value)); }
 };
 
 struct Reader {
@@ -121,40 +176,26 @@ struct Reader {
 
     [[nodiscard]] std::size_t remain() const { return static_cast<std::size_t>(end - p); }
 
-    [[nodiscard]] std::uint8_t u8() {
-        if (p >= end) { throw std::logic_error("prefix identity unpack overflow"); }
-        return *p++;
-    }
-
-    [[nodiscard]] std::uint32_t u32() {
-        const std::uint32_t a = u8();
-        const std::uint32_t b = u8();
-        const std::uint32_t c = u8();
-        const std::uint32_t d = u8();
-        return a | (b << 8) | (c << 16) | (d << 24);
-    }
-
-    [[nodiscard]] std::uint64_t u64() {
-        std::uint64_t value = 0;
-        for (int shift = 0; shift < 64; shift += 8) {
-            value |= static_cast<std::uint64_t>(u8()) << shift;
-        }
-        return value;
-    }
-
-    [[nodiscard]] std::int32_t i32() { return static_cast<std::int32_t>(u32()); }
-
-    [[nodiscard]] double f64() {
-        const std::uint64_t bits = u64();
-        double value             = 0;
-        std::memcpy(&value, &bits, sizeof(value));
-        return value;
-    }
-
     void bytes(void* data, std::size_t n) {
-        auto* raw = static_cast<std::uint8_t*>(data);
-        for (std::size_t i = 0; i < n; ++i) { raw[i] = u8(); }
+        if (n > remain()) { throw std::logic_error("prefix identity unpack overflow"); }
+        if (n != 0) { std::memcpy(data, p, n); }
+        p += n;
     }
+
+    template <class T>
+    [[nodiscard]] T scalar() {
+        T value{};
+        bytes(&value, sizeof(value));
+        return value;
+    }
+
+    [[nodiscard]] std::uint8_t u8() { return scalar<std::uint8_t>(); }
+
+    [[nodiscard]] std::uint32_t u32() { return scalar<std::uint32_t>(); }
+
+    [[nodiscard]] std::uint64_t u64() { return scalar<std::uint64_t>(); }
+
+    [[nodiscard]] std::int32_t i32() { return scalar<std::int32_t>(); }
 };
 
 bool same_grid(const VisionGrid& left, const VisionGrid& right) {
@@ -361,8 +402,8 @@ void ResidentPrefixIdentity::pack(void* dst) const {
     w.u32(static_cast<std::uint32_t>(token_types_.size()));
     w.u32(static_cast<std::uint32_t>(vision_items_.size()));
     w.bytes(token_types_.data(), token_types_.size());
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        for (std::int32_t position : positions_[axis]) { w.i32(position); }
+    for (const auto& axis : positions_) {
+        w.bytes(axis.data(), axis.size() * sizeof(std::int32_t));
     }
     for (const VisionItem& item : vision_items_) {
         w.u8(static_cast<std::uint8_t>(item.modality));
@@ -373,7 +414,7 @@ void ResidentPrefixIdentity::pack(void* dst) const {
         w.u64(static_cast<std::uint64_t>(item.patch_count));
         w.bytes(item.content_digest.data(), item.content_digest.size());
         w.u32(static_cast<std::uint32_t>(item.timestamps.size()));
-        for (double timestamp : item.timestamps) { w.f64(timestamp); }
+        w.bytes(item.timestamps.data(), item.timestamps.size() * sizeof(double));
         w.u32(static_cast<std::uint32_t>(item.token_spans.size()));
         for (const TokenSpan& span : item.token_spans) {
             w.u64(static_cast<std::uint64_t>(span.begin));
@@ -400,9 +441,9 @@ void ResidentPrefixIdentity::unpack(const void* src, std::size_t bytes) {
     }
     token_types_.resize(token_count);
     r.bytes(token_types_.data(), token_types_.size());
-    for (std::size_t axis = 0; axis < 3; ++axis) {
-        positions_[axis].resize(token_count);
-        for (std::uint32_t i = 0; i < token_count; ++i) { positions_[axis][i] = r.i32(); }
+    for (auto& axis : positions_) {
+        axis.resize(token_count);
+        r.bytes(axis.data(), axis.size() * sizeof(std::int32_t));
     }
     constexpr std::uint64_t kMinVisionItemBytes = 1 + 12 + 16 + 32 + 4 + 4;
     if (item_count != 0 && r.remain() / kMinVisionItemBytes < item_count) {
@@ -422,7 +463,7 @@ void ResidentPrefixIdentity::unpack(const void* src, std::size_t bytes) {
             throw std::logic_error("prefix identity unpack timestamps are truncated");
         }
         item.timestamps.resize(timestamp_count);
-        for (double& timestamp : item.timestamps) { timestamp = r.f64(); }
+        r.bytes(item.timestamps.data(), item.timestamps.size() * sizeof(double));
         const std::uint32_t span_count = r.u32();
         if (span_count != 0 && r.remain() / 16 < span_count) {
             throw std::logic_error("prefix identity unpack token spans are truncated");
@@ -448,28 +489,17 @@ std::vector<PrefixHash128> prefix_hash_chain(const PreparedPromptData& prompt) {
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
     }
-    std::vector<PrefixHash128> chain;
-    chain.reserve(tokens + 1);
-    PrefixHash128 hash = initial_hash();
-    chain.push_back(hash);
-    std::size_t item_cursor = 0;
-    for (std::size_t k = 1; k <= tokens; ++k) {
-        const std::size_t i = k - 1;
-        mix_token(hash, prompt.token_ids[i], prompt.token_types[i], prompt.positions[i],
-                  prompt.positions[tokens + i], prompt.positions[2 * tokens + i]);
-        while (item_cursor < prompt.vision_items.size()) {
-            const VisionItem& item = prompt.vision_items[item_cursor];
-            if (item.token_spans.empty()) {
-                ++item_cursor;
-                continue;
-            }
-            const std::size_t end = item_end(item);
-            if (end != k) { break; }
-            mix_vision_item(hash, item);
-            ++item_cursor;
-        }
-        chain.push_back(hash);
-    }
+    const HashInputs inputs{
+        .tokens = prompt.token_ids.data(),
+        .types  = prompt.token_types.data(),
+        .axis   = {prompt.positions.data(), prompt.positions.data() + tokens,
+                   prompt.positions.data() + 2 * tokens},
+        .items  = prompt.vision_items,
+    };
+    std::vector<PrefixHash128> chain(tokens + 1);
+    chain[0] = initial_hash();
+    (void)extend_hash(chain[0], inputs, 0, tokens,
+                      [&chain](std::size_t k, const PrefixHash128& hash) { chain[k] = hash; });
     return chain;
 }
 
@@ -478,26 +508,35 @@ PrefixHash128 prefix_hash_at(std::span<const TokenId> tokens,
     if (count > tokens.size() || count > identity.size()) {
         throw std::out_of_range("prefix hash count exceeds resident identity");
     }
-    PrefixHash128 hash      = initial_hash();
-    std::size_t item_cursor = 0;
-    const auto items        = identity.vision_items();
-    for (std::size_t k = 1; k <= count; ++k) {
-        const std::size_t i = k - 1;
-        mix_token(hash, tokens[i], identity.token_types()[i], identity.positions(0)[i],
-                  identity.positions(1)[i], identity.positions(2)[i]);
-        while (item_cursor < items.size()) {
-            const VisionItem& item = items[item_cursor];
-            if (item.token_spans.empty()) {
-                ++item_cursor;
-                continue;
-            }
-            const std::size_t end = item_end(item);
-            if (end != k) { break; }
-            mix_vision_item(hash, item);
-            ++item_cursor;
-        }
+    return extend_hash(initial_hash(), resident_inputs(tokens, identity), 0, count,
+                       [](std::size_t, const PrefixHash128&) {});
+}
+
+void ResidentPrefixHashes::reserve(std::size_t tokens) {
+    if (tokens == std::numeric_limits<std::size_t>::max()) {
+        throw std::length_error("resident prefix hash reservation overflows size_t");
     }
-    return hash;
+    hashes_.reserve(tokens + 1);
+}
+
+void ResidentPrefixHashes::assign(std::span<const PrefixHash128> chain) {
+    if (chain.empty() || chain.front() != initial_hash()) {
+        throw std::invalid_argument("resident prefix hashes must start at the empty prefix");
+    }
+    hashes_.assign(chain.begin(), chain.end());
+}
+
+PrefixHash128 ResidentPrefixHashes::at(std::span<const TokenId> tokens,
+                                       const ResidentPrefixIdentity& identity, std::size_t count) {
+    if (count > tokens.size() || count > identity.size()) {
+        throw std::out_of_range("prefix hash count exceeds resident identity");
+    }
+    if (count < hashes_.size()) { return hashes_[count]; }
+    if (hashes_.empty()) { hashes_.push_back(initial_hash()); }
+    const std::size_t from = hashes_.size() - 1;
+    hashes_.reserve(count + 1);
+    return extend_hash(hashes_.back(), resident_inputs(tokens, identity), from, count,
+                       [this](std::size_t, const PrefixHash128& hash) { hashes_.push_back(hash); });
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

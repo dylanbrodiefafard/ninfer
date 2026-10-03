@@ -196,7 +196,7 @@ RecoveryPrefillDecision route_recovery_prefill(const RecoveryPrefillInput& input
     if (!input.output_budget_preserved || !input.pages_fit) {
         return {RecoveryPrefillRoute::Exhaust, kRecoveryBudgetExhausted};
     }
-    if (input.force_cold_prefill || !input.allow_prefix_reuse || input.host_restore_failed) {
+    if (input.force_cold_prefill || !input.allow_prefix_reuse) {
         return {RecoveryPrefillRoute::Cold, {}};
     }
     if (input.lane_retained && input.resident_reusable_tokens > 0) {

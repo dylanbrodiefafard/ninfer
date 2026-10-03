@@ -96,6 +96,8 @@ int main(int argc, char** argv) {
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes)
+                 << " ckpt-pin=" << format_bytes(memory.checkpoint_image_host_bytes)
+                 << " ckpt-heads=" << memory.checkpoint_image_pool_heads
                  << " kv-ram=" << ninfer::serve::format_kv_ram_occupancy(memory)
                  << " kv-disk=" << ninfer::serve::format_kv_disk_occupancy(memory);
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());

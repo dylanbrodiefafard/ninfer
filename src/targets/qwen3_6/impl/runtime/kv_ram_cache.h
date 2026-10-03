@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_copy.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
@@ -12,7 +13,6 @@
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -38,20 +38,27 @@ struct RamLadderHead {
     std::size_t recurrent_bytes = 0;
     std::size_t hidden_bytes    = 0;
     std::size_t dflash_bytes    = 0;
+    // The head's fence; capture re-records it after the host-callback reads of the images.
+    cudaEvent_t copies_done = nullptr;
 };
 
 // Lane-owned pinned rewrite-checkpoint images, in the LinearAttentionStatePool slot host-image
-// and CyclicKVCache lane host-image layouts. DFlash is null for non-DFlash engines.
+// and CyclicKVCache lane host-image layouts. DFlash is null for non-DFlash engines. The tiers
+// copy the images by stream-ordered host callbacks after `copies_done`, the images' own fence,
+// and then re-record it on the stream that ran them; the owner's later readers and writers wait
+// on it.
 struct RewriteStateHostSource {
-    const void* conv      = nullptr;
-    const void* recurrent = nullptr;
-    const void* dflash    = nullptr;
+    const void* conv        = nullptr;
+    const void* recurrent   = nullptr;
+    const void* dflash      = nullptr;
+    cudaEvent_t copies_done = nullptr;
 };
 
 struct RewriteStateHostTarget {
-    void* conv      = nullptr;
-    void* recurrent = nullptr;
-    void* dflash    = nullptr;
+    void* conv              = nullptr;
+    void* recurrent         = nullptr;
+    void* dflash            = nullptr;
+    cudaEvent_t copies_done = nullptr;
 };
 
 struct RamLadderIndex {
@@ -191,19 +198,35 @@ public:
                                                      std::span<const PrefixHash128> hash_chain,
                                                      const ReuseBackendPolicy& policy = {});
 
+    // Entries leave the index without waiting: a consumed, discarded or evicted entry is
+    // retired, and its pinned block is freed once its copy and block fences have completed and
+    // its last I/O pin (a disk spill still reading it) has dropped. Every mutating call reaps
+    // the retired entries that became free.
     void claim(std::uint64_t entry_id);
     void release(std::uint64_t entry_id);
+    // Retires a claimed entry after its restore.
     void consume(std::uint64_t entry_id);
+    // Retires an unclaimed entry the caller rolls back, even while a spill still reads it.
+    void discard(std::uint64_t entry_id);
     [[nodiscard]] bool is_claimed(std::uint64_t entry_id) const;
 
     [[nodiscard]] RamCaptureResult capture(const RamCaptureSource& source);
-    [[nodiscard]] std::optional<std::uint64_t> peek_oldest_unpinned() const;
     [[nodiscard]] std::vector<std::uint64_t> fifo_ids() const;
     // Oldest-first ids that are neither claimed nor pinned for I/O.
     [[nodiscard]] std::vector<std::uint64_t> unpinned_ids() const;
+    // Pins a live entry's block for a reader outside the cache; a retired entry cannot be pinned.
     void pin_for_io(std::uint64_t entry_id);
     void unpin_for_io(std::uint64_t entry_id);
+    // Retires an entry that is neither claimed nor I/O-pinned. Its block is free at return
+    // only when its copies have completed.
     bool evict_one_unpinned(std::uint64_t entry_id);
+    // True while a retired block still waits for its fences or an I/O pin.
+    [[nodiscard]] bool retired_pending() const;
+    // True while a retired block holds no I/O pin and waits only for its fences.
+    [[nodiscard]] bool retired_fence_pending() const;
+    // Blocking: waits the fences of retired blocks that hold no I/O pin and frees them.
+    // Returns whether any block was freed.
+    bool wait_retired_copies();
     void set_disk_entry_id(std::uint64_t entry_id, std::uint64_t disk_id);
     [[nodiscard]] std::uint64_t disk_entry_id(std::uint64_t entry_id) const;
     [[nodiscard]] const void* host_block(std::uint64_t entry_id) const;
@@ -236,10 +259,20 @@ public:
 
     [[nodiscard]] HostKvView host_kv(std::uint64_t entry_id) const;
     RamRestoredHost unpack_device(std::uint64_t entry_id, const RamRestoreTarget& target);
+    // Copies out of a restored entry's block on the cache's host-copy stream after
+    // `image_fences` (the destination images' fences, re-recorded after the copies). No stream
+    // joins them and the entry's copy fence, which gates admission, does not cover them: the
+    // destinations' own fences order their readers, and a separate block fence keeps the block
+    // alive until the copies finish. The copies do not wait for the entry's H2D.
+    void copy_from_entry(std::uint64_t entry_id, std::span<const HostCopy> copies,
+                         std::span<const cudaEvent_t> image_fences);
 
     [[nodiscard]] RamRestoredHost load_host(std::uint64_t entry_id) const;
 
     [[nodiscard]] KvRamSnapshot snapshot() const noexcept;
+    // Bills the pending copies whose fences have completed; copies still in flight stay pending
+    // for a later harvest. A copy whose record retires before any harvest billed it counts only
+    // in the lifetime totals. Never waits.
     KvRamCopySeconds harvest_copy_seconds();
     [[nodiscard]] bool copies_ready(std::uint64_t entry_id) const;
     [[nodiscard]] bool pending_copies_ready() const;
@@ -289,14 +322,10 @@ public:
         fail_copy_event_allocation_after_ = successful_events;
     }
 
-    [[nodiscard]] bool test_retirement_waiting_for_io() const noexcept {
-        return retirement_waiting_for_io_.load(std::memory_order_acquire);
-    }
-
-    void test_fail_next_copy_sync() noexcept { fail_next_copy_sync_ = true; }
-
     [[nodiscard]] std::uint32_t test_io_pins(std::uint64_t entry_id) const;
-    void test_set_copy_sync_stall_ms(int ms);
+    // While held, blocking copy waits stop before their CUDA sync until released. Every call
+    // resets the entered observation.
+    void test_hold_copy_sync(bool held);
     [[nodiscard]] bool test_copy_sync_entered() const;
 
 private:
@@ -326,9 +355,11 @@ private:
         bool checkpoint_valid             = false;
         PrefixReusePath checkpoint_path   = PrefixReusePath::RestoreTurnCheckpoint;
         std::vector<RamLadderIndex> ladders;
-        void* block                 = nullptr;
-        std::size_t bytes           = 0;
-        bool pinned                 = false;
+        void* block       = nullptr;
+        std::size_t bytes = 0;
+        bool pinned       = false;
+        // Out of the index; the block waits for its copy fence and I/O pins before it is freed.
+        bool retired                = false;
         std::uint32_t io_pins       = 0;
         std::uint64_t disk_entry_id = 0;
         bool copies_timed           = false;
@@ -336,6 +367,9 @@ private:
         bool copies_are_load     = false;
         cudaEvent_t copies_start = nullptr;
         cudaEvent_t copies_done  = nullptr;
+        // Copies out of the block that admission readiness does not wait for (restored ladder
+        // heads); only the block's lifetime does.
+        cudaEvent_t block_done = nullptr;
     };
 
     struct Layout {
@@ -345,30 +379,36 @@ private:
         std::size_t entry_bytes = 0;
     };
 
+    // Live (unretired) entries only.
     [[nodiscard]] Record& require(std::uint64_t entry_id);
     [[nodiscard]] const Record& require(std::uint64_t entry_id) const;
-    void destroy_record(std::uint64_t entry_id, bool count_eviction,
-                        std::unique_lock<std::mutex>& lock);
+    // Live or retired entries; readers that hold an I/O pin may outlive retirement.
+    [[nodiscard]] const Record& require_block(std::uint64_t entry_id) const;
+    void retire_locked(std::uint64_t entry_id);
+    [[nodiscard]] bool retired_free_locked(const Record& record) const;
+    void free_block_locked(Record& record);
+    void reap_retired_locked();
     void create_copy_event(cudaEvent_t* event, unsigned int flags);
     void begin_copies(Record& record, cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     [[nodiscard]] bool copies_ready_locked(std::uint64_t entry_id) const;
     void wait_copies(Record& record);
     void wait_copies_on_stream(Record& record, cudaStream_t stream);
-    void wait_event_unlocked(std::unique_lock<std::mutex>& lock, cudaEvent_t event,
-                             std::uint64_t entry_id);
-    void maybe_copy_sync_stall() const;
+    void maybe_copy_sync_hold() const;
     double harvest_record(Record& record);
     [[nodiscard]] double copy_elapsed_seconds(const Record& record) const;
     void pin_pending_copy_events(std::vector<cudaEvent_t>& events, std::vector<std::uint64_t>& ids);
     void unpin_copy_events(const std::vector<std::uint64_t>& ids) noexcept;
     void drop_pending_save(std::uint64_t entry_id) noexcept;
-    void add_orphaned_seconds(const Record& record, double seconds) noexcept;
+    void add_unbilled_seconds(const Record& record, double seconds) noexcept;
     void drop_pending_id(std::uint64_t entry_id) noexcept;
 
     void bump_version() noexcept { ++index_version_; }
 
     HostPinnedArena arena_;
+    // Rewrite and ladder image copies into and out of entry blocks. Destroyed (drained) before
+    // the arena its callbacks write.
+    HostCopyStream host_copies_;
     std::deque<std::uint64_t> fifo_;
     std::unordered_map<std::uint64_t, Record> records_;
     std::vector<std::uint64_t> pending_save_ids_;
@@ -382,20 +422,15 @@ private:
     std::uint64_t exact_comparisons_ = 0;
     double save_seconds_             = 0;
     double load_seconds_             = 0;
-    double orphaned_save_seconds_    = 0;
-    double orphaned_load_seconds_    = 0;
     mutable std::mutex io_mutex_;
-    std::condition_variable io_cv_;
     bool fail_next_ticket_write_                = false;
     bool fail_next_capture_                     = false;
     bool fail_next_capture_metadata_allocation_ = false;
-    std::atomic<bool> retirement_waiting_for_io_{false};
-    int fail_copy_event_allocation_after_ = -1;
+    int fail_copy_event_allocation_after_       = -1;
     inline static std::atomic<bool> fail_next_restore_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
     int fail_copy_snapshot_allocation_stage_ = -1;
-    bool fail_next_copy_sync_                = false;
-    std::atomic<int> copy_sync_stall_ms_{0};
+    std::atomic<bool> copy_sync_held_{false};
     mutable std::atomic<bool> copy_sync_entered_{false};
 };
 

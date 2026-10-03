@@ -98,14 +98,24 @@ struct DiskMatch {
     std::uint32_t execution_frontier = 0;
 };
 
-struct DiskLadderImage {
+// A caller-owned pinned image set that the restore decodes one saved checkpoint slot (matched
+// by frontier, kind, and hash) into. Sizes are the caller's layout; a stored object of another
+// size fails the decode, and a zero size skips that part. The decoding worker waits for
+// `writable` (the images' last DMA or host-copy owner) before it writes. The caller keeps the
+// images until the restore has loaded or cancel_restore() has returned.
+struct DiskCheckpointImageTarget {
     std::uint32_t frontier = 0;
     PrefixHash128 hash{};
-    ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
-    std::shared_ptr<PinnedHostBuffer> conv;
-    std::shared_ptr<PinnedHostBuffer> recurrent;
-    std::shared_ptr<PinnedHostBuffer> hidden;
-    std::shared_ptr<PinnedHostBuffer> dflash;
+    ContextCheckpointKind kind  = ContextCheckpointKind::Ladder;
+    void* conv                  = nullptr;
+    std::size_t conv_bytes      = 0;
+    void* recurrent             = nullptr;
+    std::size_t recurrent_bytes = 0;
+    void* hidden                = nullptr;
+    std::size_t hidden_bytes    = 0;
+    void* dflash                = nullptr;
+    std::size_t dflash_bytes    = 0;
+    cudaEvent_t writable        = nullptr;
 };
 
 struct DiskRestoredHost {
@@ -123,7 +133,6 @@ struct DiskRestoredHost {
     std::vector<TokenId> ledger;
     ResidentPrefixIdentity identity;
     std::vector<RamLadderIndex> ladders;
-    std::vector<DiskLadderImage> ladder_images;
     std::uint64_t disk_entry_id = 0;
 };
 
@@ -147,6 +156,13 @@ struct DiskRestoreTarget {
 
     CyclicKVCache* dflash_local = nullptr;
     std::int32_t dflash_lane    = 0;
+
+    // Saved checkpoint slots to decode alongside the restore; each must exist in the entry.
+    std::vector<DiskCheckpointImageTarget> checkpoint_images;
+
+    // The committed generation the restore was planned and claimed against (0: unchecked). A
+    // different generation at setup is a CacheRestoreFailure (cache miss).
+    std::uint64_t committed_generation = 0;
 
     cudaStream_t stream = nullptr;
 };
@@ -192,6 +208,21 @@ enum class DiskFaultPoint : std::uint8_t {
     CompactionAfterRootSync,
 };
 
+// Unlocked disk-I/O windows a test can hold open to show the index mutex stays free there.
+enum class DiskUnlockedIo : std::uint8_t {
+    PageBatchCrc,       // spill page-batch header/CRC build
+    EvictionTombstones, // capacity/quarantine eviction tombstone write and directory fsync
+    GenerationReap,     // retired pack-generation removal and directory fsyncs
+    CompactionPackset,  // compaction PACKSET write, fsync and rename
+    CompactionCopy,     // compaction copy of one live object into the new generation
+    PayloadWrite,       // spill object/page-batch pwrite
+    PayloadRead,        // object, page and state pread
+    StoreDirFsync,      // object-namespace and store directory fsyncs
+    CommitSync,         // spill commit object fsync, before its abandon re-check
+    CommitMetaRenamed,  // spill commit after its meta.bin rename, before directory fsyncs
+    Count,
+};
+
 struct DiskOpenConfig {
     std::filesystem::path location;
     std::size_t capacity_bytes = 0;
@@ -223,9 +254,17 @@ public:
     [[nodiscard]] std::optional<DiskMatch> plan_match(const PreparedPromptData& prompt,
                                                       std::span<const PrefixHash128> hash_chain,
                                                       const ReuseBackendPolicy& policy = {});
-    [[nodiscard]] std::optional<DiskRestoredHost> load_host(std::uint64_t entry_id) const;
-    [[nodiscard]] bool populate_checkpoint_images(DiskRestoredHost& host);
-    [[nodiscard]] DiskRestoredHost take_restore_checkpoints();
+    // A nonzero `expected_committed_generation` that no longer matches the entry (a claim that
+    // landed during an idle rewrite whose rollback failed) throws CacheRestoreFailure.
+    [[nodiscard]] std::optional<DiskRestoredHost>
+    load_host(std::uint64_t entry_id, std::uint64_t expected_committed_generation = 0) const;
+    // Decodes the entry's saved checkpoint slots into `images` outside a restore.
+    [[nodiscard]] bool
+    populate_checkpoint_images(std::uint64_t entry_id,
+                               std::span<const DiskCheckpointImageTarget> images);
+    // Whether the last restore loaded and so decoded every image of its target's
+    // checkpoint_images; its workers no longer write them. Clears the flag.
+    [[nodiscard]] bool take_restore_checkpoints();
 
     bool claim(std::uint64_t entry_id);
     bool claim(std::uint64_t entry_id, PrefixHash128 expected_hash_f,
@@ -234,7 +273,10 @@ public:
                std::uint64_t expected_committed_generation = 0);
     void release(std::uint64_t entry_id);
     void consume(std::uint64_t entry_id);
-    // Caller has drained restore owners and released the entry claim.
+    // Quarantines a failed source without waiting: it is no longer plannable or claimable and
+    // RAM tickets naming it are invalidated. The disk worker evicts it (tombstone, MANIFEST)
+    // once its claim, restore and I/O pins drop; a spill that extends, refreshes or branches
+    // from it abandons its commit.
     void invalidate_entry(std::uint64_t entry_id);
 
     void note_ram_resident(std::uint64_t ram_id, std::uint64_t disk_ticket);
@@ -243,20 +285,25 @@ public:
 
     void request_idle_spill();
     void cancel_idle_spill();
-    void cancel_idle_of_ram(std::uint64_t ram_id);
-    void begin_ram_idle_exclusion(std::uint64_t ram_id);
-    void end_ram_idle_exclusion(std::uint64_t ram_id) noexcept;
+    // The caller rolls this RAM entry back: its idle or reclaim spill is cancelled without
+    // waiting (a worker still encoding or writing it stops at its next cancellation point)
+    // and its note is forgotten. A RAM claim never cancels or waits for a spill: the spill
+    // only reads the entry, whose I/O pin keeps the block alive past consume.
+    void abandon_ram_spill(std::uint64_t ram_id);
     bool emergency_spill_ram(std::uint64_t ram_id);
     // Frees one RAM entry, preferring the oldest disk-durable one. Without a
     // durable entry the in-flight spill, or else the oldest entry, is spilled
     // first: synchronously when `may_block`, otherwise at emergency priority on
     // the disk worker, returning Pending so decoding lanes never wait on a disk
     // write. Only an entry the disk cannot save is dropped unsaved. Without
-    // `may_block`, entries in `keep` (captures the caller would roll back on
-    // Pending) are never waited on or dropped unsaved; if only they remain the
+    // `may_block` nothing is waited on: a victim whose capture copy is still in
+    // flight, a spill still preparing, or a retired block still pinned by a spill
+    // yields Pending; entries in `keep` (captures the caller would roll back on
+    // Pending) are never waited on or dropped unsaved, and if only they remain the
     // result is NoVictim.
     RamReclaim reclaim_ram_entry(bool may_block, std::span<const std::uint64_t> keep = {});
-    // True while a Pending reclaim's spill has neither committed nor failed.
+    // True while a Pending reclaim's spill has neither committed nor failed, or while the
+    // retired RAM blocks it waits for are still pinned.
     [[nodiscard]] bool ram_reclaim_pending() const;
 
     void prefetch_window(std::uint64_t entry_id, std::uint32_t text_dst_pages,
@@ -267,6 +314,10 @@ public:
     [[nodiscard]] bool restore_setup_ready(std::uint64_t entry_id) const;
     void pump_restore(cudaStream_t stream);
     void cancel_restore();
+    // The non-blocking half of cancel_restore: stops issuing restore work. Reads, state decode
+    // and H2D already in flight keep running until restore_cancel_settled().
+    void begin_cancel_restore();
+    [[nodiscard]] bool restore_cancel_settled() const;
 
     [[nodiscard]] bool copies_ready() const;
     [[nodiscard]] bool restore_failed() const;
@@ -277,8 +328,8 @@ public:
     void release_restore_ticket(std::uint64_t epoch);
     KvDiskCopySeconds harvest_copy_seconds();
     [[nodiscard]] KvDiskSnapshot snapshot() const noexcept;
-    // Non-blocking read for stats observers: empty while compaction or a tombstone fsync holds
-    // the index lock, so a scrape never waits behind disk I/O.
+    // Non-blocking read for stats observers: empty while another thread holds the index lock,
+    // so a scrape never waits behind it.
     [[nodiscard]] std::optional<KvDiskSnapshot> try_snapshot() const noexcept;
 
     [[nodiscard]] std::uint64_t index_version() const noexcept {
@@ -332,23 +383,55 @@ public:
     bool test_flush_pending_unlinks(bool unlock);
     [[nodiscard]] bool test_meta_renamed() const;
 
-    bool test_claim_waited_for_idle() const {
-        return claim_waited_for_idle_.load(std::memory_order_acquire);
+    // Quarantined entries not yet evicted, plus eviction rounds still writing tombstones.
+    [[nodiscard]] std::size_t test_pending_invalidations() const {
+        std::lock_guard lock(mutex_);
+        return pending_invalidations_.size() + eviction_rounds_in_flight_;
     }
 
     [[nodiscard]] bool test_objects_fsynced_before_meta() const;
     [[nodiscard]] std::uint32_t test_disk_io_pins(std::uint64_t entry_id) const;
     void test_force_zstd_fail();
+    // Sleeps every payload read and write for `ms`, to inject I/O duration into load/save
+    // accounting. Setting it resets the payload-entered observation. Windows a test must land
+    // inside use the held DiskUnlockedIo::PayloadWrite/PayloadRead gates instead.
     void test_set_payload_io_stall_ms(int ms);
     [[nodiscard]] bool test_payload_io_entered() const;
-    void test_set_manifest_io_stall_ms(int ms);
+    // While held, MANIFEST writes wait before writing until the test releases them.
+    void test_hold_manifest_io(bool held);
 
-    void test_set_compaction_copy_stall_ms(int ms) {
-        compaction_copy_stall_ms_.store(ms, std::memory_order_release);
+    // While held, the worker's unlocked spill encode waits at its first cancellation point
+    // until the test releases it or the prepare is cancelled. Holding resets the entered and
+    // cancelled observations, so they describe prepares that started after the hold.
+    void test_hold_spill_encode(bool held) {
+        if (held) {
+            spill_encode_entered_.store(false, std::memory_order_release);
+            spill_encode_cancelled_.store(false, std::memory_order_release);
+        }
+        spill_encode_held_.store(held, std::memory_order_release);
     }
 
-    [[nodiscard]] bool test_compaction_copy_entered() const {
-        return compaction_copy_entered_.load(std::memory_order_acquire);
+    [[nodiscard]] bool test_spill_encode_entered() const {
+        return spill_encode_entered_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool test_spill_encode_cancelled() const {
+        return spill_encode_cancelled_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::uint64_t test_idle_cancel_epoch();
+
+    // While held, the named unlocked I/O window waits at its start until released. Holding
+    // resets its entered observation.
+    void test_hold_unlocked_io(DiskUnlockedIo window, bool held) {
+        const auto i = static_cast<std::size_t>(window);
+        if (held) { unlocked_io_entered_[i].store(false, std::memory_order_release); }
+        unlocked_io_held_[i].store(held, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool test_unlocked_io_entered(DiskUnlockedIo window) const {
+        return unlocked_io_entered_[static_cast<std::size_t>(window)].load(
+            std::memory_order_acquire);
     }
 
     [[nodiscard]] bool test_manifest_io_entered() const;
@@ -358,8 +441,6 @@ public:
     void test_arm_fault(DiskFaultPoint point);
     void test_arm_fault_sequence(DiskFaultPoint first, DiskFaultPoint second);
     [[nodiscard]] std::shared_ptr<void> test_hold_active_generation() const;
-    void test_set_fsync_stall_ms(int ms);
-    [[nodiscard]] bool test_fsync_entered() const;
     bool test_gc_skipped_one();
     bool test_fifo_evict_one();
     void test_arm_restore_job_barrier();
@@ -415,14 +496,6 @@ public:
 
     static bool test_load_host_allocation_failure_pending() noexcept {
         return fail_next_load_host_allocation_.load(std::memory_order_acquire);
-    }
-
-    static void test_fail_next_checkpoint_metadata_allocation() noexcept {
-        fail_next_checkpoint_metadata_allocation_.store(true, std::memory_order_release);
-    }
-
-    static bool test_checkpoint_metadata_allocation_failure_pending() noexcept {
-        return fail_next_checkpoint_metadata_allocation_.load(std::memory_order_acquire);
     }
 
     static void test_startup_allocation_hook(void (*hook)(int)) noexcept {
@@ -497,10 +570,6 @@ public:
     void test_set_stopping();
 
 private:
-    struct DecodedCheckpointState {
-        std::shared_ptr<PinnedHostBuffer> first;
-        std::shared_ptr<PinnedHostBuffer> second;
-    };
     enum class JobKind : std::uint8_t {
         RestoreRead,
         EmergencySpillPage,
@@ -531,8 +600,10 @@ private:
         std::vector<TokenId> ledger;
         ResidentPrefixIdentity identity;
         std::vector<std::uint64_t> uncertainty_ids;
-        bool pinned                        = false;
-        bool unavailable                   = false;
+        bool pinned      = false;
+        bool unavailable = false;
+        // Selected by an eviction whose tombstone is being written with the mutex released.
+        bool evicting                      = false;
         std::uint32_t io_pins              = 0;
         std::uint64_t claim_generation     = 0;
         std::uint64_t committed_generation = 0;
@@ -580,6 +651,10 @@ private:
         const void* second       = nullptr;
         std::size_t second_bytes = 0;
         std::vector<std::uint8_t> compressed;
+        // Codec header and whole-record CRC32C, sealed by the unlocked encode so the commit
+        // only reserves an extent and writes under the index mutex.
+        std::array<std::uint8_t, kDiskCodecHeaderBytes> header{};
+        std::uint32_t record_crc = 0;
 
         [[nodiscard]] std::size_t uncompressed_bytes() const noexcept {
             return first_bytes + second_bytes;
@@ -637,6 +712,8 @@ private:
         std::filesystem::path root;
         mutable std::mutex descriptor_mu;
         mutable std::unordered_map<std::string, std::shared_ptr<PackDescriptor>> descriptors;
+        // Retired generation being removed with the index mutex released; guarded by mutex_.
+        bool reaping = false;
     };
 
     struct ObjectRef {
@@ -687,6 +764,20 @@ private:
         void close_outputs() noexcept;
     };
 
+    // New objects of a spill commit, copied under the mutex for its unlocked fsync and
+    // object-map append; the scheduler may drop other objects_ entries meanwhile.
+    struct CommitObjects {
+        std::uint64_t generation = 0;
+        std::vector<std::pair<std::uint64_t, ObjectRef>> objects;
+    };
+
+    // One serialized FIFO; sequences order snapshots taken under mutex_ so a stale image
+    // never overwrites a newer MANIFEST.
+    struct ManifestImage {
+        std::vector<std::uint8_t> bytes;
+        std::uint64_t sequence = 0;
+    };
+
     struct StartupObjectValidation {
         DiskObjectKind kind = DiskObjectKind::Main;
         bool page           = false;
@@ -696,6 +787,31 @@ private:
     struct SkippedTree {
         std::uint64_t entry_id = 0;
         std::filesystem::file_time_type mtime{};
+        std::vector<std::pair<DiskObjectKind, std::uint64_t>> objects;
+        bool evicting = false;
+    };
+
+    // Two-phase eviction: victims are made unavailable under mutex_, their tombstones are
+    // written and the tombstone directory fsynced once with the mutex released, and only a
+    // durably tombstoned victim drops its references after relocking.
+    struct EvictionVictim {
+        std::uint64_t entry_id = 0;
+        bool skipped           = false;
+        bool was_unavailable   = false;
+        bool fail_injected     = false;
+        bool attempted         = false;
+        bool staged            = false;
+        bool persisted         = false;
+        std::vector<std::pair<DiskObjectKind, std::uint64_t>> objects;
+    };
+
+    struct EvictionBatch {
+        std::vector<EvictionVictim> victims;
+    };
+
+    // A tombstone whose entry directory was already gone when the tombstones were scanned.
+    struct DeadTombstone {
+        std::uint64_t entry_id = 0;
         std::vector<std::pair<DiskObjectKind, std::uint64_t>> objects;
     };
 
@@ -712,6 +828,7 @@ private:
     [[nodiscard]] bool restore_readers_busy_locked() const noexcept;
     [[nodiscard]] bool restore_or_prefetch_busy_locked() const noexcept;
     [[nodiscard]] bool restore_cancels_idle_locked() const noexcept;
+    void begin_cancel_restore_locked();
     [[nodiscard]] bool emergency_payload_busy_locked() const noexcept;
     void note_reader_claim_locked(const Job& job);
     void drop_reader_claim(const Job& job) noexcept;
@@ -743,7 +860,8 @@ private:
     void record_copies_done_locked(cudaStream_t stream);
     void record_restore_join_locked(cudaStream_t stream);
     void bill_post_disk_h2d();
-    void fsync_new_objects(const SpillSession& session) const;
+    [[nodiscard]] CommitObjects snapshot_new_objects_locked(const SpillSession& session) const;
+    void fsync_new_objects(const CommitObjects& objects) const;
 
     [[nodiscard]] std::uint32_t window_slots() const noexcept {
         return static_cast<std::uint32_t>(window_.size());
@@ -757,9 +875,9 @@ private:
     void maybe_copy_lease_barrier();
 
     // Caller holds the mutex, except in the destructor.
-    void note_drop(KvDiskDropReason reason) noexcept {
-        ++drops_;
-        ++drop_reasons_[static_cast<std::size_t>(reason)];
+    void note_drop(KvDiskDropReason reason, std::uint64_t count = 1) noexcept {
+        drops_ += count;
+        drop_reasons_[static_cast<std::size_t>(reason)] += count;
     }
 
     void maybe_wait_epoch_barrier();
@@ -773,13 +891,6 @@ private:
     void note_live_host_load_locked(std::chrono::steady_clock::time_point started,
                                     std::chrono::steady_clock::time_point ended);
     void ensure_copies_start_locked();
-    [[nodiscard]] bool populate_checkpoint_images(DiskRestoredHost& host, std::uint64_t epoch,
-                                                  std::uint64_t entry, PrefixReusePath reuse,
-                                                  std::uint32_t reuse_base, bool check_live);
-    [[nodiscard]] bool
-    populate_checkpoint_images(DiskRestoredHost& host, std::uint64_t epoch, std::uint64_t entry,
-                               std::uint64_t committed_generation, std::uint64_t claim_generation,
-                               PrefixReusePath reuse, std::uint32_t reuse_base, bool check_live);
     void load_restore_state_locked(std::unique_lock<std::mutex>& lock);
     void reset_window_slot_keep_host(WindowSlot& slot) noexcept;
     void open_directory();
@@ -787,10 +898,10 @@ private:
     void release_lock() noexcept;
     void load_or_write_fingerprint();
     void open_pack_store();
-    void persist_packset(std::uint64_t reserved_next_id) const;
+    void persist_packset(std::uint64_t generation, std::uint64_t reserved_next_id) const;
     void load_pack_map();
     void validate_live_direct_segments() const;
-    void append_pack_map(const SpillSession& session) const;
+    void append_pack_map(const CommitObjects& objects) const;
     void request_compaction_locked() noexcept;
     [[nodiscard]] bool compaction_pending_locked() const;
     [[nodiscard]] bool compaction_runnable_locked() const noexcept;
@@ -810,14 +921,21 @@ private:
     void rebuild_manifest();
     bool load_entry(std::uint64_t entry_id);
     void write_fingerprint_file() const;
+    [[nodiscard]] ManifestImage manifest_image_locked() const;
+    void write_manifest_image(const ManifestImage& image) const;
     void write_manifest() const;
     void write_manifest(std::unique_lock<std::mutex>& lock) const;
     void fsync_path(const std::filesystem::path& path) const;
     void fsync_dir(const std::filesystem::path& dir) const;
-    void fsync_object_namespaces() const;
-    void fsync_store_dirs() const;
+    void fsync_object_namespaces(std::uint64_t pack_generation) const;
+    void fsync_store_dirs(std::uint64_t generation) const;
     void persist_eviction(std::unique_lock<std::mutex>& lock);
+    // Startup only: drops every tombstone whose entry and objects are gone.
     void reclaim_durable_tombstones();
+    [[nodiscard]] std::vector<DeadTombstone> scan_dead_tombstones() const;
+    [[nodiscard]] std::vector<std::uint64_t>
+    reclaimable_tombstones_locked(const std::vector<DeadTombstone>& dead) const;
+    void remove_tombstones(const std::vector<std::uint64_t>& ids) const;
     void adopt_object_ids();
     void bump_next_id(std::uint64_t& next, std::uint64_t seen) const noexcept;
     [[nodiscard]] bool object_kind_conflict(DiskObjectKind kind, std::uint64_t id) const noexcept;
@@ -828,6 +946,10 @@ private:
     void
     write_entry_tombstone(std::uint64_t id,
                           const std::vector<std::pair<DiskObjectKind, std::uint64_t>>& objects);
+    // Tmp write, fsync and rename of one tombstone; the caller fsyncs the directory.
+    void stage_entry_tombstone(
+        std::uint64_t id,
+        const std::vector<std::pair<DiskObjectKind, std::uint64_t>>& objects) const;
     void clear_entry_tombstone(std::uint64_t id) const;
     void queue_tombstone_object_unlinks();
     [[nodiscard]] bool tombstone_objects_remain(
@@ -845,8 +967,15 @@ private:
     [[nodiscard]] std::shared_ptr<PackDescriptor>
     acquire_pack_descriptor(const std::shared_ptr<PackGeneration>& generation, DiskObjectKind kind,
                             std::uint32_t segment, bool require_direct) const;
-    void reap_retired_generations();
+    // Removes retired generations no reader leases; the removal and directory fsyncs run with
+    // the mutex released.
+    void reap_retired_generations(std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] bool generation_reap_in_flight_locked() const noexcept;
     [[nodiscard]] std::filesystem::path entry_dir(std::uint64_t id) const;
+    // Extends the durable object-id reservation so `count` further ids can be allocated; a
+    // PACKSET rewrite runs with the mutex released.
+    void reserve_object_ids_locked(std::uint64_t count, std::unique_lock<std::mutex>& lock);
+    // Takes the next reserved id; never performs I/O.
     [[nodiscard]] std::uint64_t allocate_object(DiskObjectKind kind, std::uint64_t bytes);
     void add_ref(std::uint64_t id);
     void add_skip_ref(std::uint64_t id);
@@ -857,13 +986,29 @@ private:
     void drop_skip_ref(std::uint64_t id);
     void unlink_unreferenced(std::uint64_t id);
     bool make_capacity(std::uint64_t needed, std::unique_lock<std::mutex>& lock);
-    void fifo_evict_one();
+    [[nodiscard]] bool begin_entry_eviction_locked(std::uint64_t entry_id, EvictionBatch& batch);
+    [[nodiscard]] bool begin_skipped_eviction_locked(std::size_t index, EvictionBatch& batch);
+    // FIFO victims until the projected unique bytes fit `available`; without one, every
+    // skipped tree.
+    [[nodiscard]] bool
+    select_capacity_victims_locked(std::uint64_t available,
+                                   const std::unordered_set<std::uint64_t>& failed,
+                                   EvictionBatch& batch);
+    void write_eviction_tombstones(EvictionBatch& batch) const noexcept;
+    bool finish_eviction_locked(EvictionBatch& batch) noexcept;
+    // Writes the batch's tombstones (releasing `lock` when given) and finishes it.
+    bool run_eviction(EvictionBatch& batch, std::unique_lock<std::mutex>* lock);
+    // Single-threaded startup and teardown eviction.
+    bool fifo_evict_one();
     bool evict_entry(std::uint64_t entry_id);
-    bool gc_skipped_one();
 
     void pin_disk(std::uint64_t entry_id);
     void unpin_disk(std::uint64_t entry_id);
     void invalidate_ram_notes_for_disk_entry(std::uint64_t disk_id);
+    [[nodiscard]] bool invalidation_evictable_locked(std::uint64_t entry_id) const noexcept;
+    [[nodiscard]] bool invalidation_ready_locked() const noexcept;
+    // Worker: evicts quarantined entries whose claims, restores and I/O pins have dropped.
+    void evict_invalidated_locked(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] IndexEntry& require(std::uint64_t entry_id);
     [[nodiscard]] const IndexEntry& require(std::uint64_t entry_id) const;
 
@@ -879,6 +1024,11 @@ private:
     // Worker-side pin and prepare of one RAM entry's spill; `urgent` spills a
     // reclaim target at emergency priority.
     void start_worker_spill(std::unique_lock<std::mutex>& lock, std::uint64_t ram_id, bool urgent);
+    // Stops the worker's preparing spill at its next encode cancellation point when it
+    // prepares `ram_id` (0: any entry); an urgent (reclaim) prepare only when `include_urgent`.
+    void cancel_worker_prepare_locked(std::uint64_t ram_id, bool include_urgent) noexcept;
+    void maybe_spill_encode_hold(const std::atomic<bool>* cancel) const;
+    void maybe_hold_unlocked_io(DiskUnlockedIo window) const;
     bool prepare_spill(std::uint64_t ram_id, bool emergency, std::unique_lock<std::mutex>& lock);
     void spill_one_page(SpillSession& session, std::uint32_t pool, std::uint32_t logical,
                         std::unique_lock<std::mutex>& lock);
@@ -909,18 +1059,18 @@ private:
                                 std::uint64_t bytes, std::unique_lock<std::mutex>* lock);
     [[nodiscard]] std::size_t take_test_partial_pwritev_bytes() noexcept;
     void maybe_test_fault(DiskFaultPoint point) const;
-    [[nodiscard]] EncodedStateBlob encode_state_blob(DiskStateKind kind, const void* a,
-                                                     std::size_t na, const void* b,
-                                                     std::size_t nb) const;
+    // Empty when `cancel` is raised between compression chunks.
+    [[nodiscard]] std::optional<EncodedStateBlob>
+    encode_state_blob(DiskStateKind kind, const void* a, std::size_t na, const void* b,
+                      std::size_t nb, const std::atomic<bool>* cancel) const;
     std::uint64_t write_state_blob(const EncodedStateBlob& blob,
                                    std::unique_lock<std::mutex>& lock);
-    std::uint64_t write_page_object(DiskObjectKind kind, const void* payload, std::size_t bytes,
-                                    std::unique_lock<std::mutex>& lock);
     void persist_checkpoints(SpillSession& session, std::unique_lock<std::mutex>& lock);
     void write_meta_bin(std::uint64_t entry_id, const DiskMeta& meta, bool* renamed = nullptr);
     [[nodiscard]] bool idle_rewrite_of(std::uint64_t entry_id) const noexcept;
+    [[nodiscard]] bool spill_source_quarantined(const SpillSession& session) const noexcept;
     [[nodiscard]] bool should_abandon_commit(const SpillSession& session) const noexcept;
-    void maybe_payload_io_stall() const;
+    void maybe_payload_io_stall(DiskUnlockedIo window) const;
     void finish_payload_io(std::unique_lock<std::mutex>& lock);
     void close_restore_session_locked();
     void try_close_restore_session_locked();
@@ -949,39 +1099,32 @@ private:
     };
 
     struct CheckpointDecodePlan {
-        DiskMeta meta;
-        std::unordered_map<std::uint64_t, DecodedCheckpointState> decoded;
         std::vector<StateDecodeJob> jobs;
-        bool skip[3]{};
-        std::size_t hidden_bytes[3]{};
+        // A stored object shared by several images decodes once and is copied to the others.
+        std::vector<HostCopy> duplicates;
+        std::vector<cudaEvent_t> writable;
     };
 
     bool decode_state_parts(std::uint64_t id, DiskStateKind expected, void* dst, std::size_t bytes,
                             void* dst2, std::size_t bytes2, std::uint32_t read_workers = 1);
     bool decode_state_parallel(std::vector<StateDecodeJob>& jobs);
+    [[nodiscard]] static bool enqueue_unique_decode(CheckpointDecodePlan& plan, std::uint64_t id,
+                                                    DiskStateKind kind, void* first,
+                                                    std::size_t first_bytes, void* second = nullptr,
+                                                    std::size_t second_bytes = 0);
     [[nodiscard]] bool
-    enqueue_unique_decode(std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
-                          std::vector<StateDecodeJob>& jobs, std::uint64_t id, DiskStateKind kind,
-                          std::size_t first_bytes, std::size_t second_bytes = 0);
-    [[nodiscard]] bool collect_checkpoint_decode_jobs(
-        const DiskMeta& meta, std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
-        std::vector<StateDecodeJob>& jobs, bool skip[3], std::size_t hid_n[3]);
+    collect_checkpoint_decode_jobs(const DiskMeta& meta,
+                                   std::span<const DiskCheckpointImageTarget> images,
+                                   CheckpointDecodePlan& plan) const;
     [[nodiscard]] bool
-    assemble_checkpoint_images(DiskRestoredHost& host, const DiskMeta& meta,
-                               std::unordered_map<std::uint64_t, DecodedCheckpointState>& decoded,
-                               const bool skip[3], const std::size_t hid_n[3]);
-    [[nodiscard]] bool prepare_checkpoint_decode(DiskRestoredHost& host, CheckpointDecodePlan& plan,
-                                                 std::uint64_t epoch, std::uint64_t entry,
-                                                 std::uint64_t committed_generation,
-                                                 std::uint64_t claim_generation,
-                                                 PrefixReusePath reuse, std::uint32_t reuse_base,
-                                                 bool check_live);
-    [[nodiscard]] bool finish_checkpoint_decode(DiskRestoredHost& host, CheckpointDecodePlan& plan,
-                                                std::uint64_t epoch, std::uint64_t entry,
-                                                std::uint64_t committed_generation,
-                                                std::uint64_t claim_generation,
-                                                PrefixReusePath reuse, std::uint32_t reuse_base,
-                                                bool check_live);
+    prepare_checkpoint_decode(std::span<const DiskCheckpointImageTarget> images,
+                              CheckpointDecodePlan& plan, std::uint64_t epoch, std::uint64_t entry,
+                              std::uint64_t committed_generation, std::uint64_t claim_generation,
+                              PrefixReusePath reuse, std::uint32_t reuse_base, bool check_live);
+    [[nodiscard]] bool
+    finish_checkpoint_decode(CheckpointDecodePlan& plan, std::uint64_t epoch, std::uint64_t entry,
+                             std::uint64_t committed_generation, std::uint64_t claim_generation,
+                             PrefixReusePath reuse, std::uint32_t reuse_base, bool check_live);
 
     void fill_window_slot(std::uint32_t slot, DiskObjectKind kind, std::uint64_t object_id,
                           std::uint32_t pool, std::uint32_t logical);
@@ -996,10 +1139,13 @@ private:
     std::shared_ptr<PackGeneration> active_generation_;
     std::vector<std::shared_ptr<PackGeneration>> retired_generations_;
     bool packset_publication_pending_sync_ = false;
+    // The worker writes and renames a compaction PACKSET with the mutex released; no object
+    // writer may start until the in-memory generation switch completes.
+    bool compaction_publishing_ = false;
+    // Eviction rounds whose tombstones are being written with the mutex released.
+    std::uint32_t eviction_rounds_in_flight_ = 0;
     std::unique_ptr<CompactionRun> compaction_;
     bool compaction_requested_ = false;
-    std::atomic<int> compaction_copy_stall_ms_{0};
-    std::atomic<bool> compaction_copy_entered_{false};
     // A failed rewrite is not retried until the durable generation changes.
     std::uint64_t compaction_failed_generation_ = 0;
     std::uint64_t object_id_reservation_limit_  = 1;
@@ -1109,7 +1255,22 @@ private:
     std::uint64_t idle_cancel_ram_  = 0;
     bool idle_pinning_              = false;
     std::uint64_t idle_pinning_ram_ = 0;
-    bool emergency_preparing_       = false;
+    bool idle_pinning_urgent_       = false;
+    // Disk entry the worker's preparing spill extends, refreshes or branches from (0: none).
+    std::uint64_t idle_pinning_ticket_ = 0;
+    // A blocking emergency spill waits for the worker's prepare; no new idle prepare starts.
+    bool emergency_waiting_ = false;
+    // Raised under mutex_ for the worker's preparing spill; its unlocked encode polls it.
+    std::atomic<bool> worker_prepare_cancelled_{false};
+    // The last Pending reclaim waits for retired RAM blocks still pinned by a spill.
+    bool reclaim_waits_retired_ = false;
+    // The last Pending reclaim waits for retired RAM blocks whose copy fences are in flight.
+    bool reclaim_waits_fence_ = false;
+    // The last Pending reclaim waits for this RAM victim's capture copy to land.
+    std::uint64_t reclaim_waits_copy_ram_ = 0;
+    // Quarantined entries whose physical eviction waits for their pins to drop.
+    std::vector<std::uint64_t> pending_invalidations_;
+    bool emergency_preparing_ = false;
     // RAM entry a non-blocking reclaim waits on; the worker spills it at
     // emergency priority. Cleared by any commit, or when its spill cannot start.
     std::uint64_t reclaim_ram_       = 0;
@@ -1157,10 +1318,19 @@ private:
     std::uint32_t restore_state_inflight_ = 0;
     std::atomic<int> payload_io_stall_ms_{0};
     mutable std::atomic<bool> payload_io_entered_{false};
-    std::atomic<int> manifest_io_stall_ms_{0};
+    std::atomic<bool> manifest_io_held_{false};
     mutable std::atomic<bool> manifest_io_entered_{false};
-    std::atomic<int> fsync_stall_ms_{0};
-    mutable std::atomic<bool> fsync_entered_{false};
+    // Serializes MANIFEST writers (worker commits, scheduler invalidations).
+    mutable std::mutex manifest_mutex_;
+    mutable std::uint64_t manifest_sequence_         = 0; // guarded by mutex_
+    mutable std::uint64_t manifest_written_sequence_ = 0; // guarded by manifest_mutex_
+    std::array<std::atomic<bool>, static_cast<std::size_t>(DiskUnlockedIo::Count)>
+        unlocked_io_held_{};
+    mutable std::array<std::atomic<bool>, static_cast<std::size_t>(DiskUnlockedIo::Count)>
+        unlocked_io_entered_{};
+    std::atomic<bool> spill_encode_held_{false};
+    mutable std::atomic<bool> spill_encode_entered_{false};
+    mutable std::atomic<bool> spill_encode_cancelled_{false};
     std::atomic<bool> restore_job_barrier_armed_{false};
     std::atomic<bool> fail_restore_job_{false};
     std::atomic<bool> fail_restore_state_invariant_{false};
@@ -1171,7 +1341,6 @@ private:
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_restore_event_allocation_{false};
     inline static std::atomic<bool> fail_next_load_host_allocation_{false};
-    inline static std::atomic<bool> fail_next_checkpoint_metadata_allocation_{false};
 
     std::atomic<bool> restore_job_dequeued_{false};
     std::atomic<bool> restore_job_continue_{true};
@@ -1223,11 +1392,10 @@ private:
     std::vector<std::filesystem::path> pending_unlinks_;
     std::atomic<bool> meta_renamed_{false};
     std::atomic<bool> objects_dir_fsynced_{false};
-    DiskRestoredHost restore_checkpoint_host_{};
-    bool idle_requested_          = false;
-    bool crash_before_meta_       = false;
-    bool stall_after_meta_rename_ = false;
-    std::atomic<bool> claim_waited_for_idle_{false};
+    bool restore_checkpoints_loaded_ = false;
+    bool idle_requested_             = false;
+    bool crash_before_meta_          = false;
+    bool stall_after_meta_rename_    = false;
     bool fail_after_meta_rename_     = false;
     bool fail_rollback_meta_         = false;
     bool fail_after_rollback_rename_ = false;
@@ -1238,7 +1406,7 @@ private:
     bool fail_prepare_spill_         = false;
     int fail_spill_enqueue_after_    = -1;
     void (*before_branch_refs_)()    = nullptr;
-    bool force_zstd_fail_            = false;
+    std::atomic<bool> force_zstd_fail_{false};
     std::filesystem::path canonical_location_;
     std::vector<std::uint64_t> branch_shared_ids_;
 };

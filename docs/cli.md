@@ -310,9 +310,22 @@ delta, so other processes on the GPU can move it, and it does not fail startup. 
 `min(12n, 24+6n)` MiB for `n` `(draft length, batch size, topology)` executables (144 MiB for
 adaptive lengths 1/2/3/4/5 and four-way concurrency). All graphs are prepared at startup; changing adaptive draft length or
 processing a full prefill chunk uses the already reserved runtime storage.
-Each lane's turn (rewrite) checkpoint lives in pinned host memory rather than the GPU pool: one
-image per lane of the GDN state (146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V),
-allocated at startup outside `--kv-ram-capacity` and outside the startup memory report. With MTP or
+Checkpoint images live in one pinned host slab that startup allocates, prefaults, and registers
+outside `--kv-ram-capacity`: each lane's turn (rewrite) checkpoint image of the GDN state
+(146.8 MiB on Qwen3.8-27B, plus 40 MiB of DFlash local K/V), and with MTP or DFlash a pool of
+context-checkpoint heads (the same image plus the hidden row) for prefill-ladder and
+turn-rollback heads, including heads restored from the RAM or disk tier. The pool holds one
+rollback head per lane plus the most ladder heads all lanes can hold at once: marks above
+`--max-context` are unreachable, and a lane holding k ladder heads keeps at least the k-th mark's
+tokens of the shared KV capacity. With the default marks, C=3 at a 262144-token max context and
+at least 454656 KV tokens gives 21 heads (3.0 GiB MTP, 3.8 GiB DFlash, plus 0.4/0.5 GiB of
+rewrite images); C=6 with every lane able to reach every mark doubles that to 42 heads
+(6.0/7.7 GiB), while a 262144-token KV capacity bounds C=6 to 20 heads. Serve prints the slab as
+`ckpt-pin=` and `ckpt-heads=` on the KV capacity line and the CLI as `checkpoint host pinned`.
+Serving never allocates or frees pinned checkpoint memory; while every head is owned, an optional
+capture or restored head is skipped. Startup fails with the required size when the slab would leave
+less than 4096 MiB of the host's available memory; `--context-checkpoints off` shrinks the pool to
+one turn-rollback head per lane, and without MTP or DFlash there is no pool. With MTP or
 DFlash, capture copies the state into the Engine-wide device staging slot (a device-to-device copy) and drains
 it to the host image on the copy stream behind later work; a restore while staging still holds that
 image copies it back on the device, otherwise it costs one H2D before the suffix prefill.
@@ -340,14 +353,17 @@ counts as shutdown runs.
 Host RAM is an exclusive FIFO: a bundle lives in VRAM or in this budget, not both. One long MTP
 or DFlash bundle with five context-checkpoint heads is about 6 GiB (Main+backend KV plus GDN and
 DFlash cyclic heads); size the
-budget accordingly. `off` still captures live-lane GDN to ordinary pinned buffers so same-lane
-rollback works; other-lane restore after eviction remains a miss. Startup still
+budget accordingly. `off` still captures live-lane GDN into the startup checkpoint pool so
+same-lane rollback works; other-lane restore after eviction remains a miss. Startup still
 prints capacity plus `used`/`entries`. Serve `[req] done` and throughput lines print live
 host-resident `kv-ram=` used bytes plus `n=` / `restores=` / `evicts=` / `drops=` / `save=` /
 `load=`. When disk is enabled the same lines also print `kv-disk=` occupancy and counters. `kv-ram=` / `n=` exclude a chat after consume following a restore onto a KV lane; a later
 spill recaptures it as a new FIFO tail. RAM `save=` / `load=` are CUDA event elapsed for that request's
-RAM-tier D2H capture and H2D unpack of the FIFO bundle (Main+backend KV, rewrite GDN, and any ladder
-GDN/cyclic images in the same copy span). Disk `save=` is spill-session wall harvested onto the
+RAM-tier D2H capture and H2D unpack of the FIFO bundle (Main+backend KV, rewrite GDN, captured
+ladder GDN/cyclic images, and the restored matched head in the same copy span; restored ladder
+heads installed for later reuse copy outside it). Admission completes only after its copies land,
+so it bills them itself; a capture that a deferred or failed admission rolled back counts only
+toward the lifetime totals, never toward another request. Disk `save=` is spill-session wall harvested onto the
 request; disk `load=` is the host wall from the first live SSD read of that
 restore until the last page or state object has arrived in the pinned host window (not H2D, and not a
 sum of overlapped SSD and copy clocks). Disk `h2d=` is the host wall from that last host arrival until
