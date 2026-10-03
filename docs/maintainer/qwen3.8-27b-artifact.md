@@ -311,8 +311,8 @@ lanes. Packed Linear/GDN-control sites normally launch at the C=1 width via
 T-specialized kernel (NVFP4 SmallT warp count or A16↔W4A4). The DFlash qkv, attention-output
 and feature projections (BF16 activations on tensor cores) and the Q4 draft head reduce every
 column in one T-independent order, so they aggregate packed drafts of any width in one pass.
-Qualified NVFP4 attention-input, residual and MLP routes aggregate through W6; BF16-control
-attention-input/residual aggregation stays at W5. The selected default uses A8
+Qualified NVFP4 and BF16-control attention-input, residual and MLP routes aggregate through
+W8. The selected default uses A8
 for both ordinary and GDN verification projections at every verification width (W2–W6), so a
 request's arithmetic depends on neither its draft width nor the batch. Prefill and ordinary
 decode retain their text policy.

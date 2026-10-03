@@ -68,8 +68,11 @@ int run_nvfp4_a16() {
                                                         make_nvfp4_weight, 5120, 25600, 739U, width,
                                                         dflash_batches, ops::LinearPolicy::AllowA4);
     }
-    failures += run_packed_sequences_matches_panels(
-        "NVFP4_A16 DFlash conv packed", make_nvfp4_weight, 1280, 5120, 731U, 5, dflash_batches);
+    for (const std::int32_t width : {2, 3, 4, 5, 6, 7, 8}) {
+        failures +=
+            run_packed_sequences_matches_panels("NVFP4_A16 DFlash conv packed", make_nvfp4_weight,
+                                                1280, 5120, 731U, width, dflash_batches);
+    }
     return failures;
 }
 
