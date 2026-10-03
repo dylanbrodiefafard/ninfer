@@ -96,7 +96,8 @@ struct DFlashBatchContext {
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     qwen3_6::ToolMaskExchange* tool_masks = nullptr;
-    // DFlash2 chain rounds score the p-less proposal calibration grid into host_egress.
+    // This chain round scores the p-less proposal calibration grid into host_egress; the Program
+    // reads it back exactly when it sets this.
     bool calibrate_p_less_drafts = false;
 };
 
