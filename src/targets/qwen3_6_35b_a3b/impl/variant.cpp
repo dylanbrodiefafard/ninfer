@@ -1,11 +1,14 @@
 #include "targets/qwen3_6_35b_a3b/impl/variant.h"
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/mtp_pack.h"
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/sparse_moe.h"
 
 #include <algorithm>
@@ -127,17 +130,20 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
     return profiles;
 }
 
-void Variant::attention_projection(const Tensor& hidden,
-                                   const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream, std::int32_t) {
+void Variant::attention_projection(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                   Tensor& hidden, const FullAttentionProjectionWeights& weights,
+                                   Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
+                                   qwen3_6::TextPhase, WorkspaceArena&, cudaStream_t stream,
+                                   std::int32_t) {
+    ops::rmsnorm(residual, norm_weight, eps, true, hidden, stream);
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
-void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream,
-                                          std::int32_t) {
+void Variant::attention_output_projection(const Tensor& gate, Tensor& attention,
+                                          const Weight& weight, Tensor& residual,
+                                          qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                          cudaStream_t stream, std::int32_t) {
+    ops::sigmoid_mul(gate, attention, stream);
     ops::linear_add(attention, weight, residual, workspace, stream);
 }
 
@@ -202,7 +208,8 @@ void Variant::gdn_input_projection_snapshot(
                                       value, output_gate_view, workspace, stream);
 }
 
-void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProjectionWeights& weights,
+void Variant::gdn_input_projection_record(const Tensor& hidden, const ops::A8Activation*,
+                                          const GdnProjectionWeights& weights,
                                           const Tensor& conv_weight, const Tensor& conv_states,
                                           const Tensor& valid_columns, const Tensor& initial_slots,
                                           Tensor& conv_record, Tensor& query, Tensor& key,
@@ -218,15 +225,19 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                     output_gate_view, leaf_workspace, stream, parent_index);
 }
 
-void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
-                                    qwen3_6::TextPhase, WorkspaceArena& workspace,
-                                    cudaStream_t stream, std::int32_t) {
-    ops::linear_add(hidden, weight, residual, workspace, stream);
+void Variant::gdn_output_projection(const Tensor& output, const Tensor& norm_weight,
+                                    const Tensor& gate, float eps, Tensor& normalized,
+                                    const Weight& weight, Tensor& residual, qwen3_6::TextPhase,
+                                    WorkspaceArena& workspace, cudaStream_t stream, std::int32_t) {
+    ops::gated_rmsnorm(output, norm_weight, gate, eps, normalized, stream);
+    ops::linear_add(normalized.view({TextConfig::value_dim, output.ne[2]}), weight, residual,
+                    workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const GdnProjectionWeights& weights,
-                                          Tensor& hidden, Tensor& g, Tensor& beta,
+                                          Tensor& hidden, ops::A8Activation*, Tensor& g,
+                                          Tensor& beta, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream,
                                           std::int32_t route_tokens) {
     if (route_tokens > 0 && route_tokens < residual.ne[1]) {

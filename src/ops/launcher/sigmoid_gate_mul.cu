@@ -51,4 +51,19 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
+void sigmoid_gate_mul_a8_launch(const Tensor& gate, const Tensor& x, A8Activation& activation,
+                                cudaStream_t stream) {
+    // One CTA per token column; at verify widths the grid is only T CTAs, so 1024 threads each
+    // evaluate three pairs of the 3072-pair column to keep the dependent expf chain short.
+    constexpr int kRows  = 6144;
+    constexpr int kBlock = 1024;
+    sigmoid_gate_mul_a8_kernel<kRows, kBlock>
+        <<<static_cast<unsigned int>(x.ne[1]), kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(gate.data),
+            static_cast<const __nv_bfloat162*>(x.data),
+            static_cast<std::uint8_t*>(activation.codes.data),
+            static_cast<float*>(activation.scales.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

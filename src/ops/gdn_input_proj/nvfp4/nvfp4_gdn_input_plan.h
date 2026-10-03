@@ -31,6 +31,10 @@ void nvfp4_gdn_input_w4a4_fp32_launch(const Tensor& x, const Weight& weight, Ten
 
 void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       Fp8A8Workspace workspace, cudaStream_t stream);
+// The W4A8 FP32 q/k/v + BF16 z projection of an already quantized [5120, tokens] activation.
+void nvfp4_gdn_input_w4a8_fp32_project(const Weight& weight, std::int32_t tokens,
+                                       Fp8A8Workspace activation, Tensor& qkv, Tensor& z,
+                                       cudaStream_t stream);
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);

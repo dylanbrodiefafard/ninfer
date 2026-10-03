@@ -97,4 +97,46 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+template <RmsOutput Output>
+void launch_rmsnorm_a8_5120(const Tensor& x, const Tensor& weight, float eps, Tensor* out,
+                            A8Activation& activation, cudaStream_t stream) {
+    constexpr std::int32_t kD = 5120;
+    rmsnorm_cta_bf16x2_kernel<RmsEpilogue::Offset, 512, 8, Output>
+        <<<static_cast<unsigned int>(x.ne[1]), 512, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(x.data),
+            static_cast<const __nv_bfloat162*>(weight.data), nullptr,
+            out != nullptr ? static_cast<__nv_bfloat162*>(out->data) : nullptr, kD, x.ne[1], eps,
+            static_cast<std::uint8_t*>(activation.codes.data),
+            static_cast<float*>(activation.scales.data));
+}
+
+} // namespace
+
+void rmsnorm_a8_launch(const Tensor& x, const Tensor& weight, float eps, Tensor* out,
+                       A8Activation& activation, cudaStream_t stream) {
+    if (out != nullptr) {
+        launch_rmsnorm_a8_5120<RmsOutput::Bf16AndA8>(x, weight, eps, out, activation, stream);
+    } else {
+        launch_rmsnorm_a8_5120<RmsOutput::A8>(x, weight, eps, out, activation, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gated_rmsnorm_a8_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                             A8Activation& activation, cudaStream_t stream) {
+    // One CTA per token column. At verify widths the grid is only T CTAs, so the per-head chain
+    // is the latency: 24 warps cover the 48 heads two apiece.
+    constexpr int kBlock = 768;
+    gated_rmsnorm_a8_kernel<128, 48, kBlock>
+        <<<static_cast<unsigned int>(x.ne[2]), kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(x.data),
+            static_cast<const __nv_bfloat162*>(weight.data),
+            static_cast<const __nv_bfloat162*>(z.data),
+            static_cast<std::uint8_t*>(activation.codes.data),
+            static_cast<float*>(activation.scales.data), eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

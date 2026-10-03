@@ -90,11 +90,14 @@ std::size_t nvfp4_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::
             max_tokens * batch_size <= kNvfp4GdnA8FusedRecordMaxTokens) {
             return fp8_a8_workspace_capacity_bytes(max_tokens * batch_size, 5120);
         }
+        // Mirrors the launch order: A8 quantizes before staging the FP32 projection, which the
+        // A8-input form allocates alone; A4 stages the projection first.
         WorkspaceLayoutBuilder layout;
-        (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
         if (policy == LinearPolicy::AllowA8) {
             (void)allocate_fp8_a8_workspace(layout, max_tokens * batch_size, 5120);
+            (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
         } else {
+            (void)layout.alloc(DType::FP32, {kNvfp4RecordChannels, max_tokens, batch_size}, 256);
             (void)allocate_nvfp4_w4a4_workspace(layout, max_tokens * batch_size, 5120);
         }
         return layout.peak_bytes(1);

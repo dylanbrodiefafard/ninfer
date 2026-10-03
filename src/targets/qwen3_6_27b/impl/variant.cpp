@@ -1,6 +1,8 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
@@ -11,6 +13,8 @@
 #include "ninfer/ops/mtp_fc.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
@@ -91,6 +95,35 @@ bool aggregate_verify_residuals(QType qtype, qwen3_6::TextPhase phase, std::int3
                                 std::int32_t aggregate_tokens) {
     return aggregate_verify_extent(phase, route_tokens, aggregate_tokens) &&
            (route_tokens == 5 || qtype == QType::NVFP4 || qtype == QType::BF16_CTRL);
+}
+
+// NVFP4 AllowA8 projections quantize their activation to row-scaled E4M3 from T=2 (the public
+// Linear-family contracts). When every launched panel of a verify projection takes that route,
+// the producer of its input publishes the A8 activation itself and the projection consumes it,
+// replacing a standalone quantize launch with bit-identical codes and scales.
+constexpr std::int32_t kFirstA8Width = 2;
+
+bool verify_consumes_a8(const Weight& weight, qwen3_6::TextPhase phase, std::int32_t route_tokens,
+                        std::int32_t tokens) {
+    const std::int32_t width = route_tokens > 0 ? route_tokens : tokens;
+    return weight.qtype == QType::NVFP4 && width >= kFirstA8Width &&
+           text_policy(weight, phase, width) == ops::LinearPolicy::AllowA8;
+}
+
+// The A8 activation a verify leaf allocates for its producer at the interval's widest T.
+std::size_t verify_a8_activation_capacity_bytes(qwen3_6::TextPhase phase, std::int32_t input_rows,
+                                                std::int32_t last) {
+    if (phase != qwen3_6::TextPhase::Verify) { return 0; }
+    WorkspaceLayoutBuilder layout;
+    (void)ops::allocate_a8_activation(layout, input_rows, last);
+    return layout.peak_bytes(1);
+}
+
+// The NVFP4 record route quantizes under kNvfp4GdnVerifyPolicy at every record width (W>=2).
+bool gdn_record_consumes_a8(const GdnProjectionPayload& weights, qwen3_6::TextPhase phase) {
+    const auto* fused = std::get_if<FusedGdnInputProjectionPayload>(&weights.input_projection);
+    return phase == qwen3_6::TextPhase::Verify && fused != nullptr &&
+           fused->query_key_value_z.qtype == QType::NVFP4;
 }
 
 // Packed verify launches Linear at T=width*B. Pin the C=1 width's NVFP4 family so a
@@ -274,21 +307,62 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
     return graph_profiles_through(capacity - 1, ends);
 }
 
-void Variant::attention_projection(const Tensor& hidden,
-                                   const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value,
+namespace {
+
+// residual += W * x for an A8 activation, in route_tokens-wide request panels when nonzero.
+void residual_project_a8(const ops::A8Activation& activation, const Weight& weight,
+                         Tensor& residual, std::int32_t route_tokens, cudaStream_t stream) {
+    if (route_tokens == 0) {
+        ops::linear_add(activation, weight, residual, stream);
+        return;
+    }
+    for (std::int32_t offset = 0; offset < residual.ne[1]; offset += route_tokens) {
+        Tensor residual_panel = residual.slice(1, offset, route_tokens);
+        ops::linear_add(ops::a8_activation_columns(activation, offset, route_tokens), weight,
+                        residual_panel, stream);
+    }
+}
+
+} // namespace
+
+void Variant::attention_projection(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                   Tensor& hidden, const FullAttentionProjectionWeights& weights,
+                                   Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                    qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                    cudaStream_t stream, std::int32_t route_tokens) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
+        ops::rmsnorm(residual, norm_weight, eps, true, hidden, stream);
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
                              stream);
         return;
     }
     const Weight& fused  = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
-    const bool aggregate = aggregate_verify_extent(phase, route_tokens, hidden.ne[1]) &&
+    const auto tokens    = residual.ne[1];
+    const bool aggregate = aggregate_verify_extent(phase, route_tokens, tokens) &&
                            (fused.qtype == QType::NVFP4 || fused.qtype == QType::BF16_CTRL);
-    if (split_verify_panels(phase, route_tokens, hidden.ne[1]) && !aggregate) {
-        for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
+    const bool panels    = split_verify_panels(phase, route_tokens, tokens) && !aggregate;
+    if (verify_consumes_a8(fused, phase, route_tokens, tokens)) {
+        auto scope = workspace.scope();
+        ops::A8Activation activation =
+            ops::allocate_a8_activation(workspace, TextConfig::hidden, tokens);
+        ops::rmsnorm_a8(residual, norm_weight, eps, nullptr, activation, stream);
+        if (!panels) {
+            ops::attn_input_proj(activation, fused, query, gate, key, value, stream);
+            return;
+        }
+        for (std::int32_t offset = 0; offset < tokens; offset += route_tokens) {
+            Tensor query_panel = query.slice(1, offset, route_tokens);
+            Tensor gate_panel  = gate.slice(1, offset, route_tokens);
+            Tensor key_panel   = key.slice(1, offset, route_tokens);
+            Tensor value_panel = value.slice(1, offset, route_tokens);
+            ops::attn_input_proj(ops::a8_activation_columns(activation, offset, route_tokens),
+                                 fused, query_panel, gate_panel, key_panel, value_panel, stream);
+        }
+        return;
+    }
+    ops::rmsnorm(residual, norm_weight, eps, true, hidden, stream);
+    if (panels) {
+        for (std::int32_t offset = 0; offset < tokens; offset += route_tokens) {
             Tensor query_panel = query.slice(1, offset, route_tokens);
             Tensor gate_panel  = gate.slice(1, offset, route_tokens);
             Tensor key_panel   = key.slice(1, offset, route_tokens);
@@ -301,18 +375,29 @@ void Variant::attention_projection(const Tensor& hidden,
     }
     const ops::LinearPolicy policy =
         aggregate ? text_policy(fused, phase, route_tokens)
-                  : attn_input_packed_policy(fused, phase, route_tokens, hidden.ne[1]);
+                  : attn_input_packed_policy(fused, phase, route_tokens, tokens);
     ops::attn_input_proj(hidden, fused, query, gate, key, value, policy, workspace, stream);
 }
 
-void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_6::TextPhase phase,
-                                          WorkspaceArena& workspace, cudaStream_t stream,
-                                          std::int32_t route_tokens) {
-    if (split_verify_panels(phase, route_tokens, attention.ne[1]) &&
-        (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
-         !aggregate_verify_residuals(weight.qtype, phase, route_tokens, attention.ne[1]))) {
-        for (std::int32_t offset = 0; offset < attention.ne[1]; offset += route_tokens) {
+void Variant::attention_output_projection(const Tensor& gate, Tensor& attention,
+                                          const Weight& weight, Tensor& residual,
+                                          qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                          cudaStream_t stream, std::int32_t route_tokens) {
+    const auto tokens = attention.ne[1];
+    const bool panels = split_verify_panels(phase, route_tokens, tokens) &&
+                        (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+                         !aggregate_verify_residuals(weight.qtype, phase, route_tokens, tokens));
+    if (verify_consumes_a8(weight, phase, route_tokens, tokens)) {
+        auto scope = workspace.scope();
+        ops::A8Activation activation =
+            ops::allocate_a8_activation(workspace, TextConfig::query_size, tokens);
+        ops::sigmoid_mul_a8(gate, attention, activation, stream);
+        residual_project_a8(activation, weight, residual, panels ? route_tokens : 0, stream);
+        return;
+    }
+    ops::sigmoid_mul(gate, attention, stream);
+    if (panels) {
+        for (std::int32_t offset = 0; offset < tokens; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
             ops::linear_add(attention.slice(1, offset, route_tokens), weight, residual_panel,
                             text_policy(weight, phase, route_tokens), workspace, stream);
@@ -320,9 +405,9 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
         return;
     }
     ops::linear_add(attention, weight, residual,
-                    aggregate_verify_residuals(weight.qtype, phase, route_tokens, attention.ne[1])
+                    aggregate_verify_residuals(weight.qtype, phase, route_tokens, tokens)
                         ? text_policy(weight, phase, route_tokens)
-                        : residual_packed_policy(weight, phase, route_tokens, attention.ne[1]),
+                        : residual_packed_policy(weight, phase, route_tokens, tokens),
                     workspace, stream);
 }
 
@@ -443,13 +528,12 @@ void Variant::gdn_input_projection_snapshot(
                                       leaf_workspace, stream);
 }
 
-void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                          const Tensor& conv_weight, const Tensor& conv_states,
-                                          const Tensor& valid_columns, const Tensor& initial_slots,
-                                          Tensor& conv_record, Tensor& query, Tensor& key,
-                                          Tensor& value, Tensor& output_gate,
-                                          qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                                          cudaStream_t stream, const Tensor* parent_index) {
+void Variant::gdn_input_projection_record(
+    const Tensor& hidden, const ops::A8Activation* hidden_activation,
+    const GdnProjectionWeights& weights, const Tensor& conv_weight, const Tensor& conv_states,
+    const Tensor& valid_columns, const Tensor& initial_slots, Tensor& conv_record, Tensor& query,
+    Tensor& key, Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
+    WorkspaceArena& workspace, cudaStream_t stream, const Tensor* parent_index) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
@@ -464,6 +548,15 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
+    if (hidden_activation != nullptr && gdn_record_consumes_a8(weights, phase)) {
+        const ops::A8Activation activation{
+            hidden_activation->codes.view({TextConfig::hidden, hidden.ne[1], hidden.ne[2]}),
+            hidden_activation->scales.view({hidden.ne[1], hidden.ne[2]})};
+        ops::gdn_input_proj_conv_record(activation, fused, conv_weight, conv_states, valid_columns,
+                                        initial_slots, conv_record, query, key, value,
+                                        output_gate_view, leaf_workspace, stream, parent_index);
+        return;
+    }
     ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, valid_columns,
                                     initial_slots, conv_record, query, key, value, output_gate_view,
                                     fused.qtype == QType::NVFP4
@@ -472,13 +565,27 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                     leaf_workspace, stream, parent_index);
 }
 
-void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+void Variant::gdn_output_projection(const Tensor& output, const Tensor& norm_weight,
+                                    const Tensor& gate, float eps, Tensor& normalized,
+                                    const Weight& weight, Tensor& residual,
                                     qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                     cudaStream_t stream, std::int32_t route_tokens) {
-    if (split_verify_panels(phase, route_tokens, hidden.ne[1]) &&
-        (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
-         !aggregate_verify_residuals(weight.qtype, phase, route_tokens, hidden.ne[1]))) {
-        for (std::int32_t offset = 0; offset < hidden.ne[1]; offset += route_tokens) {
+    const auto tokens = output.ne[2];
+    const bool panels = split_verify_panels(phase, route_tokens, tokens) &&
+                        (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+                         !aggregate_verify_residuals(weight.qtype, phase, route_tokens, tokens));
+    if (verify_consumes_a8(weight, phase, route_tokens, tokens)) {
+        auto scope = workspace.scope();
+        ops::A8Activation activation =
+            ops::allocate_a8_activation(workspace, TextConfig::value_dim, tokens);
+        ops::gated_rmsnorm_a8(output, norm_weight, gate, eps, activation, stream);
+        residual_project_a8(activation, weight, residual, panels ? route_tokens : 0, stream);
+        return;
+    }
+    ops::gated_rmsnorm(output, norm_weight, gate, eps, normalized, stream);
+    const Tensor hidden = normalized.view({TextConfig::value_dim, tokens});
+    if (panels) {
+        for (std::int32_t offset = 0; offset < tokens; offset += route_tokens) {
             Tensor residual_panel = residual.slice(1, offset, route_tokens);
             ops::linear_add(hidden.slice(1, offset, route_tokens), weight, residual_panel,
                             text_policy(weight, phase, route_tokens), workspace, stream);
@@ -486,21 +593,34 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
         return;
     }
     ops::linear_add(hidden, weight, residual,
-                    aggregate_verify_residuals(weight.qtype, phase, route_tokens, hidden.ne[1])
+                    aggregate_verify_residuals(weight.qtype, phase, route_tokens, tokens)
                         ? text_policy(weight, phase, route_tokens)
-                        : residual_packed_policy(weight, phase, route_tokens, hidden.ne[1]),
+                        : residual_packed_policy(weight, phase, route_tokens, tokens),
                     workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const GdnProjectionWeights& weights,
-                                          Tensor& hidden, Tensor& g, Tensor& beta,
+                                          Tensor& hidden, ops::A8Activation* hidden_activation,
+                                          Tensor& g, Tensor& beta, qwen3_6::TextPhase phase,
                                           WorkspaceArena& workspace, cudaStream_t stream,
                                           std::int32_t route_tokens) {
+    const bool publish_a8 = hidden_activation != nullptr && gdn_record_consumes_a8(weights, phase);
     if (route_tokens > 0 && route_tokens < residual.ne[1]) {
-        ops::gdn_norm_gating_proj_packed_sequences(
-            residual, norm_weight, eps, weights.a_projection, weights.b_projection, weights.a_log,
-            weights.dt_bias, workspace, hidden, g, beta, stream, route_tokens);
+        if (publish_a8) {
+            ops::gdn_norm_gating_proj_packed_sequences(
+                residual, norm_weight, eps, weights.a_projection, weights.b_projection,
+                weights.a_log, weights.dt_bias, workspace, hidden, *hidden_activation, g, beta,
+                stream, route_tokens);
+        } else {
+            ops::gdn_norm_gating_proj_packed_sequences(
+                residual, norm_weight, eps, weights.a_projection, weights.b_projection,
+                weights.a_log, weights.dt_bias, workspace, hidden, g, beta, stream, route_tokens);
+        }
+    } else if (publish_a8) {
+        ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_projection,
+                                  weights.b_projection, weights.a_log, weights.dt_bias, workspace,
+                                  hidden, *hidden_activation, g, beta, stream);
     } else {
         ops::gdn_norm_gating_proj(residual, norm_weight, eps, weights.a_projection,
                                   weights.b_projection, weights.a_log, weights.dt_bias, workspace,
@@ -673,10 +793,12 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
             QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, ops::LinearPolicy::AllowA8,
             first, last);
     case WeightsProfile::Nvfp4:
-        return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::NVFP4, 14336, TextConfig::hidden,
-            phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
-            last);
+        return std::max(
+            ops::attn_input_proj_workspace_capacity_bytes(
+                QType::NVFP4, 14336, TextConfig::hidden,
+                phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
+                last),
+            verify_a8_activation_capacity_bytes(phase, TextConfig::hidden, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -701,10 +823,12 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
                                                         TextConfig::hidden, TextConfig::query_size,
                                                         ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
-        return ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, TextConfig::hidden, TextConfig::query_size,
-            phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
-            last);
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::query_size,
+                phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
+                last),
+            verify_a8_activation_capacity_bytes(phase, TextConfig::query_size, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -817,10 +941,12 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                         TextConfig::hidden, TextConfig::value_dim,
                                                         ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Nvfp4:
-        return ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, TextConfig::hidden, TextConfig::value_dim,
-            phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
-            last);
+        return std::max(
+            ops::linear_add_workspace_capacity_bytes(
+                QType::NVFP4, TextConfig::hidden, TextConfig::value_dim,
+                phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
+                last),
+            verify_a8_activation_capacity_bytes(phase, TextConfig::value_dim, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }

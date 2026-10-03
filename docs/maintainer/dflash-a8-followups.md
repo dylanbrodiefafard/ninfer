@@ -37,7 +37,7 @@ GPU idle between kernels: 3.6% (C1) / 3.2% (C4); about 1085 kernels per C1 round
 | 2 | N=5120 A8 projections: deeper pipeline and/or deterministic split-K | stages: exact; split-K: FP32 association changes | stages kept (M32 K512×3 added); in-CTA K split and M32 N16 grid lost; cross-CTA split-K not admitted |
 | 3 | Swap-AB A8 MMA (weights on M=16, tokens on N=8) for T≤24 | per-output K16 order unchanged; exact if FMA order kept | kept for wide shapes |
 | 4 | Drafter projections A16 → A8 | acceptance only; target distribution unchanged | not kept; acceptance unresolved |
-| 5 | Remove standalone quantize launches (pre-mixer RMSNorm+A8 fusion, consumer-side quantize) and PDL weight prefetch on A8 kernels | exact if the same row scale/codes are produced | PDL lost; quantize fusion open (bounded ≤~1% per site) |
+| 5 | Remove standalone quantize launches (pre-mixer RMSNorm+A8 fusion, consumer-side quantize) and PDL weight prefetch on A8 kernels | exact if the same row scale/codes are produced | PDL lost; 5120/6144 producer-side A8 kept (2026-10-03); 17408 open |
 | 6 | Verification W2/W3 → A8 across C (keeps precision independent of C) | new PPL qualification required | done: A8 at every verify width (performance.md) |
 | 7 | Defer GDN fold into the next round's overlay (one fewer state pass) | FP32 state transition must stay identical | closed: ≤~1.2% at C4 after 8, large state-transaction change |
 | 8 | Chain GDN verify: register-resident record kernel instead of the scratch T=1 overlay | bit-exact (FP32 store/load identity, same transition) | kept |
@@ -117,11 +117,14 @@ Evidence: `profiles/bench/dflash-a8-followups/`, traces `profiles/nsys/a8-follow
 - **5, PDL (not kept):** A8 kernels launched as programmatic dependents, prefetching all weight
   stages before `griddepcontrol.wait`. Traces grew (C1 span 1106→1128 ms, C4 1475→1497 ms) and the
   Engine regressed: fixed k4 C1 160.05→156.91, C4 450.92→442.97, hashes unchanged.
-  **Quantize fusion (not attempted):** in the SwapAB C1 trace the standalone quantizers cost about
-  308 µs per 13.9 ms round (17408: 141, 6144: 88, 5120: 79). The 5120 site needs pre-quantized
-  inputs on the GDN-record and attention-input Ops; 17408/6144 need a cross-CTA row max (producer
-  atomic max + consumer-side quantization from BF16 doubles L2 activation reads per CTA). Each is
-  bounded at roughly 0.5–1% of round time.
+  **Quantize fusion (kept for 5120/6144, 2026-10-03):** in the SwapAB C1 trace the standalone
+  quantizers cost about 308 µs per 13.9 ms round (17408: 141, 6144: 88, 5120: 79). The 5120 and
+  6144 producers (input RMSNorm, GDN gated RMSNorm, attention sigmoid gate) now publish the A8
+  activation themselves and the projections consume it; see performance.md, "Producer-side A8
+  activations". The 17408 site (MLP down, fed by the gate/up SwiGLU epilogue) still quantizes
+  separately: its producer is the tiled GEMM, so a row max needs a cross-CTA reduction
+  (producer atomic max plus consumer-side quantization from BF16, doubling L2 activation reads
+  per CTA), bounded at about 1% of round time.
 - **2b, in-CTA K split (not kept):** extra warp groups take interleaved global K16 groups
   (T-independent association) and reduce in rank order. Public Linear for N=5120 was worse at
   every width: MLP-down ×2 45–61 µs versus 41–55; ×4 61–63 µs at T≤16. M32 N=5120 is therefore

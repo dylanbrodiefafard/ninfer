@@ -115,3 +115,39 @@ so the AIME drop does not generalise; the best fixed k is 5 at C≤2 and 4 at C�
 picker already tracks it within 0-2%. The width model is 0.2-2% lower at every C (probe rounds at
 a non-best k plus estimate noise), within wave-to-wave noise of 3-6%. Reverted. Reports:
 `profiles/bench/adaptive-width-model-20260930/`.
+
+## Megakernel-style decode-round overlap (`qwen3.8-27b/nvfp4`, DFlash2, 2026-10-03)
+
+Question: would a persistent decode megakernel, or its cheaper building blocks, shorten the
+verify round? RTX 5090, DFlash2 artifact, `ninfer_bench -pg 512,256 --spec dflash
+--draft-tokens 4 --lm-head-draft`, greedy, NVFP4 KV, CUDA Graphs; node and graph-level nsys
+traces in `profiles/nsys/mk-base-c{1,4,6}*`, reports in `profiles/bench/mk-glue/`.
+
+Attribution at `593c2d0c`, C=1 (13.5 ms GPU per round, 963 kernels):
+
+| Bucket | µs/round | Share |
+|---|---:|---:|
+| NVFP4 A8 GEMMs (263 launches) | 9347 | 69% |
+| Kernels under 8 µs (655 launches: norms, quantizers, RoPE, conv, gating) | 1719 | 13% |
+| GPU idle inside graphs | 97 | 0.7% |
+| Host gap between rounds (graph-level trace) | 107 | 0.8% |
+
+CUDA Graphs already remove launch overhead; a megakernel's remaining upside is the glue
+kernels and overlapping weight streaming with latency-bound work. Its cheaper forms were
+measured:
+
+- **PDL weight prefetch on the A8 GEMMs:** lost (`dflash-a8-followups.md`, item 5).
+- **GDN control projection on a concurrent graph branch:** lost (`performance.md`,
+  "NVFP4 decode attention pipelining and overlap candidates").
+- **In-stream L2 prefetch of the next residual projection:** a one-CTA kernel issuing
+  `cp.async.bulk.prefetch.L2` over the 17.7 MB GDN `out_proj` / attention `o_proj` payload,
+  launched before the recurrent step or attention. The kernel stays resident until the fetch
+  completes: 44 µs per launch (about 400 GB/s), 2.7 ms per C=1 round, against 115 µs saved
+  across the 64 projections it fed. Decode tok/s fell 15.7% / 13.5% / 11.8% at C=1/4/6.
+  Even perfectly overlapped on a branch, a 44 µs fetch does not fit the 10–15 µs windows
+  and competes for DRAM, so the upside is below 0.9%.
+
+What was retained is the glue reduction: producer-side A8 activations (`performance.md`,
+2026-10-03). Do not retry PDL, compute branches, or L2 prefetch without a trace showing a
+different mechanism; a whole-model megakernel would recover at most the remaining glue
+(about 10% of the round) at the cost of every graph variant, oracle, and sanitizer case.

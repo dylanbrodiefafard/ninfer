@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -70,5 +71,16 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
+
+/**
+ * LinearAdd of an already quantized activation: the NVFP4 AllowA8 route above with its row-scaled
+ * E4M3 quantization supplied by the producer (ninfer/ops/a8_activation.h). For the same BF16
+ * activation the residual update is bit-identical to linear_add(x, w, residual, AllowA8, ...).
+ * w is NVFP4 [5120,6144] or [5120,17408]; x is [w.k,T] with T >= 2, the widths at which AllowA8
+ * selects W4A8; residual is contiguous, 16-byte aligned BF16 [5120,T] and does not overlap x.
+ * The oracle is LinearAdd's evaluated on the represented activation codes[k,t] * scales[t].
+ * Invalid arguments throw std::invalid_argument. No workspace.
+ */
+void linear_add(const A8Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream);
 
 } // namespace ninfer::ops

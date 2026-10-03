@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -251,6 +252,20 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream, const Tensor* parent_index = nullptr);
+
+/**
+ * NVFP4 AllowA8 single-parent record-producing form over an already quantized activation
+ * (ninfer/ops/a8_activation.h): x.codes is [5120,W,B] and x.scales [W,B], with W in [2,16] and B
+ * in [1,6]. For the same BF16 activation every output is bit-identical to the policy form with
+ * LinearPolicy::AllowA8; all other operands, the workspace capacity, and the oracle (evaluated on
+ * the represented activation codes * scales) are that form's.
+ */
+void gdn_input_proj_conv_record(const A8Activation& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index = nullptr);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

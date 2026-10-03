@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h>
 
@@ -93,6 +94,23 @@ void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_w
                                            const Weight& a_weight, const Weight& b_weight,
                                            const Tensor& A_log, const Tensor& dt_bias,
                                            WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width);
+
+/**
+ * The two-weight 27B forms above that also publish h as an A8 activation
+ * (ninfer/ops/a8_activation.h) of [5120,T]: h_activation encodes exactly the BF16 values written
+ * to h, which with g/beta are bit-identical to the forms without it. h_activation is
+ * caller-owned, 16-byte aligned for codes, and overlaps no other operand.
+ */
+void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
+                          A8Activation& h_activation, Tensor& g, Tensor& beta, cudaStream_t stream);
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h,
+                                           A8Activation& h_activation, Tensor& g, Tensor& beta,
                                            cudaStream_t stream, std::int32_t sequence_width);
 
 /** Qwen3.6-35B-A3B contiguous-parent storage form of gdn_norm_gating_proj. */

@@ -56,8 +56,14 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
 void nvfp4_gdn_input_w4a8_fp32_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+    nvfp4_gdn_input_w4a8_fp32_project(weight, x.ne[1], workspace, qkv, z, stream);
+}
+
+void nvfp4_gdn_input_w4a8_fp32_project(const Weight& weight, std::int32_t tokens,
+                                       Fp8A8Workspace activation, Tensor& qkv, Tensor& z,
+                                       cudaStream_t stream) {
     launch_nvfp4_w4a8_mma<Geometry>(
-        weight, x.ne[1], workspace, Nvfp4IdentityEpilogue{},
+        weight, tokens, activation, Nvfp4IdentityEpilogue{},
         GdnFp32ProjectionOutput{static_cast<float*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)},
         stream);
 }

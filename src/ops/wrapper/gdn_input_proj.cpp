@@ -1,6 +1,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/layout.h"
+#include "ops/common/a8_activation_check.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -1101,6 +1102,67 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
                                   value, z, policy, workspace, stream, parent_index);
+}
+
+void gdn_input_proj_conv_record(const A8Activation& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                                const Tensor* parent_index) {
+    constexpr std::int32_t kHidden       = 5120;
+    constexpr std::int32_t kQueryRows    = 2048;
+    constexpr std::int32_t kKeyRows      = 2048;
+    constexpr std::int32_t kValueRows    = 6144;
+    constexpr std::int32_t kZRows        = 6144;
+    constexpr std::int32_t kChannels     = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kParentRows   = kChannels + kZRows;
+    constexpr std::int32_t kMaximumBatch = 6;
+    constexpr std::int32_t kMaximumWidth = 16;
+    const Weight& weight                 = query_key_value_z_weight;
+    (void)detail::validate_a8_activation(x, kHidden, "gdn_input_proj_conv_record");
+    const ConvGeometry geometry{x.codes.ne[1], x.codes.ne[2], x.codes.ne[1] * x.codes.ne[2]};
+    if (geometry.width < detail::kNvfp4FirstA8 || geometry.width > kMaximumWidth ||
+        geometry.batch <= 0 || geometry.batch > kMaximumBatch || x.codes.ne[3] != 1) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: unsupported A8 B/W domain");
+    }
+    if (weight.qtype != QType::NVFP4) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_record: an A8 activation requires an NVFP4 weight");
+    }
+    detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj_conv_record");
+    if (weight.n != kParentRows || weight.k != kHidden) {
+        throw std::invalid_argument("nvfp4 gdn_input_proj_conv_record: unsupported weight shape");
+    }
+    require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
+                            geometry);
+    require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_record", "conv record");
+    require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_record", "query");
+    require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
+                        "key");
+    require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                        "gdn_input_proj_conv_record", "value");
+    require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
+                        "z");
+    require_record_nonoverlap(x.codes, conv_weight, conv_states, valid_columns, initial_state_slots,
+                              conv_record, query, key, value, z, workspace, parent_index);
+    for (const Tensor* output : {&conv_record, &query, &key, &value, &z}) {
+        if (overlaps(x.scales, *output)) {
+            throw std::invalid_argument("gdn_input_proj_conv_record: A8 scales overlap an output");
+        }
+    }
+    if (overlaps_range(x.scales, workspace.base(), workspace.capacity())) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: A8 scales overlap live workspace");
+    }
+    require_record_parent_index(parent_index, geometry);
+    detail::nvfp4_gdn_record_a8_input_launch(
+        {static_cast<std::uint8_t*>(x.codes.data), static_cast<float*>(x.scales.data)},
+        geometry.width, geometry.batch, weight, conv_weight, conv_states, valid_columns,
+        initial_state_slots, conv_record, query, key, value, z, workspace, stream,
+        parent_index_active(parent_index) ? static_cast<const std::int32_t*>(parent_index->data)
+                                          : nullptr);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

@@ -13,7 +13,6 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -836,7 +835,6 @@ void TextContext::attn_mix(const FullLayerW& weights, Tensor& x, int full_index,
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, *weights.input_norm, kCfg.rms_eps, true, h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -848,8 +846,8 @@ void TextContext::attn_mix(const FullLayerW& weights, Tensor& x, int full_index,
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     const std::int32_t route_tokens =
         packed_route_tokens(active_sequence_batch_, active_sequence_width_);
-    Variant::attention_projection(h, *weights.projection, q_flat, gate_flat, k_flat, v_flat, phase,
-                                  work_, s, route_tokens);
+    Variant::attention_projection(x, *weights.input_norm, kCfg.rms_eps, h, *weights.projection,
+                                  q_flat, gate_flat, k_flat, v_flat, phase, work_, s, route_tokens);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -890,10 +888,9 @@ void TextContext::attn_mix(const FullLayerW& weights, Tensor& x, int full_index,
                            batch_text_kv_->batch_layer_view(full_index), *active_gqa_envelope_,
                            work_, a, s, keep_frac_, xattn_tau_, xattn_min_len_);
     }
-    ops::sigmoid_mul(gate, a, s);
-
     Tensor a_flat = a.view({kCfg.q_size, T});
-    Variant::attention_output_projection(a_flat, *weights.o_proj, x, phase, work_, s, route_tokens);
+    Variant::attention_output_projection(gate_flat, a_flat, *weights.o_proj, x, phase, work_, s,
+                                         route_tokens);
 }
 
 void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase) {
@@ -904,9 +901,17 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
+    // Replay-record verify lets the leaves hand the normalized input to the record projection as
+    // its A8 activation; the layout plan reserves it for that path only.
+    ops::A8Activation hidden_activation;
+    ops::A8Activation* hidden_activation_ptr = nullptr;
+    if (phase == Phase::Verify && gdn_state_action_ == GdnStateAction::RecordForReplay) {
+        hidden_activation     = workspace_recipe::gdn_input_activation<TextConfig>(work_, T);
+        hidden_activation_ptr = &hidden_activation;
+    }
     Variant::gdn_norm_control_projection(
-        x, *weights.input_norm, kCfg.rms_eps, *weights.projection, h, g, beta, work_, s,
-        packed_route_tokens(active_sequence_batch_, active_sequence_width_));
+        x, *weights.input_norm, kCfg.rms_eps, *weights.projection, h, hidden_activation_ptr, g,
+        beta, phase, work_, s, packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -953,9 +958,9 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
                     work_.alloc(DType::FP32, {2, spec.value_heads, width, active_sequence_batch_});
             }
             Variant::gdn_input_projection_record(
-                projection_input, *weights.projection, *weights.conv1d, conv_states, valid,
-                *active_linear_state_slots_, live_records.conv, query_output, key_output,
-                value_output, gate_output, phase, work_, s, active_parent_index_);
+                projection_input, hidden_activation_ptr, *weights.projection, *weights.conv1d,
+                conv_states, valid, *active_linear_state_slots_, live_records.conv, query_output,
+                key_output, value_output, gate_output, phase, work_, s, active_parent_index_);
         } else {
             Variant::gdn_input_projection_snapshot(
                 projection_input, *weights.projection, *weights.conv1d, conv_states, valid,
@@ -997,10 +1002,8 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
 
         Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
             {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-        ops::gated_rmsnorm(o, *weights.gdn_norm, z, kCfg.rms_eps, on, s);
-        Tensor on_flat = on.view({kCfg.value_dim, T});
         Variant::gdn_output_projection(
-            on_flat, *weights.out_proj, x, phase, work_, s,
+            o, *weights.gdn_norm, z, kCfg.rms_eps, on, *weights.out_proj, x, phase, work_, s,
             packed_route_tokens(active_sequence_batch_, active_sequence_width_));
         return;
     }
@@ -1024,11 +1027,8 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    ops::gated_rmsnorm(o, *weights.gdn_norm, z, kCfg.rms_eps, on, s);
-
-    Tensor on_flat = on.view({kCfg.value_dim, T});
     Variant::gdn_output_projection(
-        on_flat, *weights.out_proj, x, phase, work_, s,
+        o, *weights.gdn_norm, z, kCfg.rms_eps, on, *weights.out_proj, x, phase, work_, s,
         packed_route_tokens(active_sequence_batch_, active_sequence_width_));
 }
 

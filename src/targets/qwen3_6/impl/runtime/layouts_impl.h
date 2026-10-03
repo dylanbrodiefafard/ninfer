@@ -313,6 +313,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                std::int32_t max_width) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
+        if (path == GdnWorkspacePath::ReplayRecord) {
+            (void)workspace_recipe::gdn_input_activation<TextConfig>(layout, last);
+        }
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::Snapshot) {

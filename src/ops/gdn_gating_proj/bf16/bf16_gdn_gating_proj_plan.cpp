@@ -466,19 +466,38 @@ void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Wei
     bf16_gdn_gating_execute_plan(plan, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
+namespace {
+
+// The composed schedules' standalone unit-offset RMSNorm, publishing h's A8 activation as well
+// when the caller requests it.
+void normalize(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
+               A8Activation* h_activation, cudaStream_t stream) {
+    if (h_activation != nullptr) {
+        rmsnorm_a8(x, norm_weight, eps, &h, *h_activation, stream);
+    } else {
+        rmsnorm(x, norm_weight, eps, true, h, stream);
+    }
+}
+
+} // namespace
+
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
-                                   const Weight& a_weight, const Weight& b_weight,
-                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
-                                   Tensor& g, Tensor& beta, cudaStream_t stream) {
+                                   A8Activation* h_activation, const Weight& a_weight,
+                                   const Weight& b_weight, const Tensor& A_log,
+                                   const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
+                                   Tensor& beta, cudaStream_t stream) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
     if (plan.schedule == Bf16GdnNormGatingScheduleId::Composed) {
-        rmsnorm(x, norm_weight, eps, true, h, stream);
+        normalize(x, norm_weight, eps, h, h_activation, stream);
         execute_resolved(plan.control, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta,
                          stream);
         return;
     }
 
+    if (h_activation != nullptr) {
+        throw std::invalid_argument("gdn_norm_gating_proj: an A8 h output needs the 27B profile");
+    }
     auto scratch_scope = ws.scope();
     DeviceSpan scratch{};
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
@@ -488,13 +507,14 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
 }
 
 void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_weight, float eps,
-                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          Tensor& h, A8Activation* h_activation,
+                                          const Weight& a_weight, const Weight& b_weight,
                                           const Tensor& A_log, const Tensor& dt_bias,
                                           WorkspaceArena& ws, Tensor& g, Tensor& beta,
                                           cudaStream_t stream) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_packed_plan(problem);
-    rmsnorm(x, norm_weight, eps, true, h, stream);
+    normalize(x, norm_weight, eps, h, h_activation, stream);
     execute_resolved(plan, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
