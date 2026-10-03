@@ -125,7 +125,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling                       = translate_sampling(options.sampling);
     // Only an active p-less target (temperature > 0) samples; a greedy target keeps greedy drafts.
     if (base->sampling.p_less != 0 && base->sampling.temperature > 0.0f) {
-        base->sampling.draft_temperature = p_less_draft_temperature;
+        base->sampling.draft_temperature = p_less_draft_temperature.value_or(
+            Variant::dflash_p_less_draft_temperature_prior(base->sampling.temperature));
     }
     install_suppressed_tokens(base->sampling, options);
     base->allow_prefix_reuse = options.allow_prefix_reuse;

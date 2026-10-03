@@ -135,7 +135,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                      const Tensor* selector_ids, const Tensor* selector_q) {
+                                      const Tensor* selector_ids, const Tensor* selector_q,
+                                      Tensor* proposal_calibration) {
     constexpr const char* op = "speculative_accept_greedy_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -168,14 +169,29 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
     if (configs == nullptr) {
         throw std::invalid_argument("speculative_accept_greedy_drafts: configs must be non-null");
     }
+    if (proposal_calibration != nullptr) {
+        if (selector_ids == nullptr || selector_ids->ne[0] > 32 || !selector_ids->is_contiguous() ||
+            !selector_q->is_contiguous()) {
+            throw std::invalid_argument("speculative_accept_greedy_drafts: proposal calibration "
+                                        "requires contiguous selectors with C<=32");
+        }
+        require_dtype(*proposal_calibration, DType::FP32, op, "proposal_calibration");
+        if (!proposal_calibration->is_contiguous() ||
+            proposal_calibration->ne[0] != kPLessProposalCalibrationTemperatureCount ||
+            proposal_calibration->ne[1] != k || proposal_calibration->ne[2] != batch ||
+            proposal_calibration->ne[3] != 1) {
+            throw std::invalid_argument(
+                "speculative_accept_greedy_drafts: proposal_calibration must be FP32 [G,K,B]");
+        }
+    }
     auto scratch_scope = workspace.scope();
     const std::size_t bytes =
         speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, batch, batch);
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_greedy_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream, selector_ids,
-        selector_q);
+        licensed_counts, accepted, token_domain, configs, scratch, stream, selector_ids, selector_q,
+        proposal_calibration);
 }
 
 void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,

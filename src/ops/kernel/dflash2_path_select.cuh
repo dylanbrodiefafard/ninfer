@@ -378,8 +378,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__ void dflash2_path_select_k
     Dflash2CodebookDevice pred_code, Dflash2CodebookDevice succ_code, const std::int32_t* anchors,
     const std::int32_t* logical_positions, std::int32_t* path, std::int32_t* selector_ids,
     float* selector_q, std::int32_t tokens, std::int32_t batch, const SamplingConfig* configs,
-    unsigned long long seed_xor, std::int32_t position_offset, bool force_greedy,
-    float p_less_draft_temperature_scale) {
+    unsigned long long seed_xor, std::int32_t position_offset, bool force_greedy) {
     const int b   = static_cast<int>(blockIdx.x);
     const int tid = static_cast<int>(threadIdx.x);
     if (b >= batch) { return; }
@@ -389,9 +388,7 @@ __launch_bounds__(kDflash2PathSelectBlock) __global__ void dflash2_path_select_k
     // their own draft temperature: the shortlist softmax at the p-less target temperature itself
     // accepts less than argmax, while a lower one accepts more.
     const float temperature =
-        force_greedy ? 0.0f
-                     : (cfg.p_less != 0 ? cfg.draft_temperature * p_less_draft_temperature_scale
-                                        : cfg.temperature);
+        force_greedy ? 0.0f : (cfg.p_less != 0 ? cfg.draft_temperature : cfg.temperature);
     const unsigned long long seed = cfg.seed ^ seed_xor;
 
     __shared__ float scores[kDflash2PathSelectK];

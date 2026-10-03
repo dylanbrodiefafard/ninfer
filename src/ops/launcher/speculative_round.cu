@@ -49,14 +49,12 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
-                                             const Tensor& drafts, const Tensor& current_extents,
-                                             Tensor& lengths, Tensor& anchors,
-                                             Tensor& licensed_tokens, Tensor& licensed_counts,
-                                             Tensor& accepted, std::int32_t token_domain,
-                                             const SamplingConfig* configs, DeviceSpan workspace,
-                                             cudaStream_t stream, const Tensor* selector_ids,
-                                             const Tensor* selector_q) {
+void speculative_accept_greedy_drafts_launch(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& current_extents, Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+    Tensor& licensed_counts, Tensor& accepted, std::int32_t token_domain,
+    const SamplingConfig* configs, DeviceSpan workspace, cudaStream_t stream,
+    const Tensor* selector_ids, const Tensor* selector_q, Tensor* proposal_calibration) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t cols          = drafts.ne[0] + 1;
     const std::int32_t batch         = drafts.ne[1];
@@ -67,6 +65,10 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         selector_q != nullptr ? static_cast<const float*>(selector_q->data) : nullptr;
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
     if (!layout.multiblock) {
+        if (proposal_calibration != nullptr) {
+            throw std::invalid_argument("speculative_accept_greedy_drafts: proposal calibration "
+                                        "requires the multi-block sampler");
+        }
         speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
             static_cast<const __nv_bfloat16*>(logits.data),
@@ -118,6 +120,21 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
         configs, token_domain, physical_rows, cols, partial_blocks, scratch, layout.bytes,
         selector_id_ptr, selector_q_ptr, selector_k, nullptr, nullptr, nullptr, nullptr, nullptr);
     CUDA_CHECK(cudaGetLastError());
+    if (proposal_calibration != nullptr) {
+        PLessProposalCalibrationGrid grid{};
+        for (int g = 0; g < kPLessProposalCalibrationTemperatureCount; ++g) {
+            grid.temperature[g] =
+                kPLessProposalCalibrationTemperatures[static_cast<std::size_t>(g)];
+        }
+        speculative_p_less_proposal_calibration_kernel<<<dim3(static_cast<unsigned int>(cols - 1),
+                                                              static_cast<unsigned int>(batch)),
+                                                         32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data),
+            static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
+            physical_rows, cols, scratch, layout.bytes, selector_id_ptr, selector_q_ptr, selector_k,
+            grid, static_cast<float*>(proposal_calibration->data));
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,

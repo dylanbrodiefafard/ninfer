@@ -96,6 +96,8 @@ struct DFlashBatchContext {
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    // DFlash2 chain rounds score the p-less proposal calibration grid into host_egress.
+    bool calibrate_p_less_drafts = false;
 };
 
 struct DFlashAppendContext {
@@ -142,6 +144,8 @@ struct TargetVerifyFrameView {
     Tensor fold_path;
     Tensor draft_selector_ids;
     Tensor draft_selector_q;
+    // Optional FP32 [G,k,B] chain proposal calibration output; requires the draft selectors.
+    Tensor proposal_calibration;
     bool tree_verify                       = false;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;

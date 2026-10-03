@@ -3617,14 +3617,13 @@ bool ProgramImplCore::any_tool_grammar(std::span<const std::uint32_t> lanes) con
     });
 }
 
-void ProgramImplCore::bind_tool_mask_batch(std::span<const std::uint32_t> lanes) {
+void ProgramImplCore::bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
+                                           std::span<const ops::SamplingConfig> configs) {
     std::array<const qwen3_6::OutputSession*, kMaximumConcurrency> outputs{};
-    std::array<ops::SamplingConfig, kMaximumConcurrency> configs{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         outputs[row] = requests[lanes[row]].output;
-        configs[row] = requests[lanes[row]].sampling_host;
     }
-    tool_masks->bind({outputs.data(), lanes.size()}, {configs.data(), lanes.size()});
+    tool_masks->bind({outputs.data(), lanes.size()}, configs.first(lanes.size()));
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -4098,7 +4097,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
 
-        bind_tool_mask_batch(lanes);
+        bind_tool_mask_batch(lanes, ordinary_host_ingress->sampling);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             ordinary_host_ingress->sampling[row] = tool_masks->root(row, device.stream);
         }
@@ -4299,7 +4298,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  tail_hidden_store,
                                                  grammar_exchange ? tool_masks.get() : nullptr};
 
-        bind_tool_mask_batch(lanes);
+        bind_tool_mask_batch(lanes, mtp_host_ingress->sampling);
         mark_workspace_usage(workspace_plan.mtp_round);
         const auto started = Clock::now();
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), batch_k,
@@ -4538,6 +4537,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     }
 
     const bool dflash_exchange = kDFlashExchangeVariants == 1 || any_tool_grammar(lanes);
+    // Packed-tree rounds draw at the Variant tree temperature and produce no calibration.
+    const bool calibrate_p_less =
+        calibrates_p_less_drafts() && !dflash_uses_tree_verify(batch_k, live_w);
 
     try {
         DecodeGraphExecutable* executable   = nullptr;
@@ -4582,6 +4584,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->lanes[row]       = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->rope_deltas[row] = sequence.rope_delta;
             dflash_host_ingress->sampling[row]    = request.sampling_host;
+            ops::SamplingConfig& row_sampling     = dflash_host_ingress->sampling[row];
+            if (calibrate_p_less && row_sampling.draft_temperature > 0.0f) {
+                row_sampling.draft_temperature = qwen3_6::p_less_calibrated_draft_temperature(
+                    p_less_calibration, row_sampling.temperature, batch_k,
+                    row_sampling.draft_temperature);
+            }
             materialize_sequence_kv(sequence, std::min(capacity, frontier + dflash_verify_width),
                                     DFlashConfig::full_layers > 0 ? frontier : 0U);
             realized_extent = std::max(realized_extent, extent);
@@ -4597,9 +4605,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *dflash_host_ingress,
             *dflash_host_egress,
             tail_hidden_store,
-            dflash_exchange ? tool_masks.get() : nullptr};
+            dflash_exchange ? tool_masks.get() : nullptr,
+            calibrates_p_less_drafts()};
 
-        bind_tool_mask_batch(lanes);
+        bind_tool_mask_batch(lanes, dflash_host_ingress->sampling);
         mark_workspace_usage(workspace_plan.dflash_round);
         const auto started = Clock::now();
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -4638,6 +4647,23 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     dflash_host_egress->licensed_tokens.data() +
                         static_cast<std::size_t>(row) * static_cast<std::size_t>(w),
                     count, w, static_cast<int>(draft_window));
+            }
+        }
+        if (calibrate_p_less) {
+            const std::size_t row_values =
+                static_cast<std::size_t>(ops::kPLessProposalCalibrationTemperatureCount) * batch_k;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const ops::SamplingConfig& row_sampling = dflash_host_ingress->sampling[row];
+                if (row_sampling.p_less == 0 || !(row_sampling.temperature > 0.0f) ||
+                    !(row_sampling.draft_temperature > 0.0f)) {
+                    continue;
+                }
+                qwen3_6::p_less_calibration_observe(
+                    p_less_calibration, row_sampling.temperature,
+                    std::span<const float>(dflash_host_egress->proposal_calibration.data() +
+                                               row * row_values,
+                                           row_values),
+                    static_cast<std::uint32_t>(dflash_host_ingress->proposal_extents[row]));
             }
         }
         std::array<std::uint32_t, kMaximumConcurrency> next_caps{};

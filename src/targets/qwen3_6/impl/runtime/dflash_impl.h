@@ -679,8 +679,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 logit_token_ids,
                                 dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                 dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
-                                selector_ids, selector_q, seed_xor, position_offset, false,
-                                V::dflash_p_less_draft_temperature_scale(k));
+                                selector_ids, selector_q, seed_xor, position_offset);
                         };
                         if (state.execution.proposal_head == ProposalHead::Full) {
                             Tensor logits = state.execution.work.alloc(
@@ -845,7 +844,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 state.execution.device.stream, logit_token_ids,
                                 dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                 dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids,
-                                &sel_q, 0, 0, false, V::dflash_p_less_draft_temperature_scale(k));
+                                &sel_q);
                             if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats::
                                         selector_dump_path() != nullptr &&
                                 ninfer::targets::qwen3_6::detail::
@@ -880,8 +879,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                     logit_token_ids,
                                     dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                     dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
-                                    &sel_ids_row, &sel_q_row, 0, 0, false,
-                                    V::dflash_p_less_draft_temperature_scale(k));
+                                    &sel_ids_row, &sel_q_row);
                             }
                         }
                     };
@@ -1212,6 +1210,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }
             verify_frame.draft_selector_ids = selector_ids;
             verify_frame.draft_selector_q   = selector_q;
+            if (state.calibrate_p_less_drafts) {
+                verify_frame.proposal_calibration =
+                    Tensor(frame.proposal_calibration.data, DType::FP32,
+                           {ops::kPLessProposalCalibrationTemperatureCount,
+                            static_cast<std::int32_t>(k), batch_size});
+            }
         }
         target_verify_accept(state.execution, state.continuation_hidden_store, card, verify_frame,
                              target_envelope, !compact);

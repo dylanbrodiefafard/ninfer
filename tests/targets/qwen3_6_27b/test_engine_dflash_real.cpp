@@ -50,9 +50,12 @@ ninfer::EngineOptions speculative_engine_options(const char* artifact,
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.max_concurrency           = max_concurrency;
     // Pin the chain shape: with the product default a one-request round verifies the packed
-    // tree, so concurrency-isolation oracles would compare different verify routes.
+    // tree, so concurrency-isolation oracles would compare different verify routes. Pin the p-less
+    // draft temperature too: the online calibration depends on every request the Engine has
+    // verified, so a C=2 run and its sequential C=1 oracle would draw different valid drafts.
     if (backend == ninfer::SpeculativeBackend::DFlash) {
-        options.speculative.dflash_verify_width = draft_tokens + 1;
+        options.speculative.dflash_verify_width             = draft_tokens + 1;
+        options.speculative.dflash_p_less_draft_temperature = 0.6f;
     }
     return options;
 }
@@ -1716,8 +1719,12 @@ int exercise_p_less_target_likelihood(const char* artifact,
     std::vector<ninfer::TokenId> dflash_tokens;
     std::vector<ninfer::TokenId> ordinary_tokens;
     {
-        ninfer::Engine engine(
-            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1));
+        // The product's calibrated p-less draft temperature: a likelihood oracle needs no
+        // history-independent drafts.
+        ninfer::EngineOptions options =
+            adaptive_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 5, 1);
+        options.speculative.dflash_p_less_draft_temperature.reset();
+        ninfer::Engine engine(options);
         const ninfer::GenerationResult generated =
             engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, seed));
         if (generated.generated_token_ids.size() != kTokens ||

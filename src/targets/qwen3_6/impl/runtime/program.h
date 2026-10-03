@@ -11,6 +11,7 @@
 #include <ninfer/targets/qwen3_6/generation_recovery.h>
 
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
+#include "targets/qwen3_6/impl/runtime/p_less_draft_calibration.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint_image.h"
 #include "targets/qwen3_6/impl/runtime/kv_gpu_snapshot.h"
@@ -325,7 +326,10 @@ public:
     void set_suppressed_tokens_lane(std::uint32_t lane, std::span<const TokenId> tokens);
     void clear_suppressed_tokens_lane(std::uint32_t lane);
     void set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled);
-    void bind_tool_mask_batch(std::span<const std::uint32_t> lanes);
+    // Binds the batch's output sessions and the sampling configs the round runs with (its host
+    // ingress), so masked accept configs match the drafted rows.
+    void bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
+                              std::span<const ops::SamplingConfig> configs);
     [[nodiscard]] bool any_tool_grammar(std::span<const std::uint32_t> lanes) const;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
@@ -427,7 +431,16 @@ public:
     const std::uint32_t draft_window;
     const std::uint32_t dflash_verify_width;
     const bool adaptive_draft;
-    const float p_less_draft_temperature;
+    // Pinned DFlash2 p-less draft temperature; unset, chain rounds use p_less_calibration.
+    const std::optional<float> p_less_draft_temperature;
+    qwen3_6::PLessDraftCalibration p_less_calibration{};
+
+    [[nodiscard]] bool calibrates_p_less_drafts() const {
+        return !p_less_draft_temperature.has_value() &&
+               speculative_backend == SpeculativeBackend::DFlash &&
+               DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2;
+    }
+
     // Engine-global adaptive DFlash hop hazards, learned from exploration rounds.
     qwen3_6::AdaptiveHopRates adaptive_hop_rates{};
 

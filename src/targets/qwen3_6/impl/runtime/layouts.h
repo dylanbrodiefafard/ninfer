@@ -67,13 +67,13 @@ struct WorkspacePlan {
 
 struct SequencePlanningInputs {
     WeightsProfile weights_profile;
-    std::uint32_t capacity                 = 0;
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t prefill_chunk            = 0;
-    std::uint32_t draft_window             = 0;
-    std::uint32_t dflash_verify_width      = 0;
-    bool adaptive_draft                    = false;
-    float p_less_draft_temperature         = 0.0f;
+    std::uint32_t capacity            = 0;
+    std::uint32_t max_concurrency     = 1;
+    std::uint32_t prefill_chunk       = 0;
+    std::uint32_t draft_window        = 0;
+    std::uint32_t dflash_verify_width = 0;
+    bool adaptive_draft               = false;
+    std::optional<float> p_less_draft_temperature;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
@@ -111,7 +111,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     // Widest captured DFlash verify width (storage, ReplaySSM records, pending features).
     std::uint32_t dflash_verify_width = 0;
     bool adaptive_draft               = false;
-    float p_less_draft_temperature    = 0.0f;
+    std::optional<float> p_less_draft_temperature;
     std::vector<std::uint32_t> captured_ks;
     std::vector<NINFER_QWEN36_RUNTIME_NS::DFlashRoundShape> dflash_shapes;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;

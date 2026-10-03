@@ -35,8 +35,9 @@ struct Variant {
     // Adaptive DFlash stays within the W<=6 small-T verify routes of the 35B geometry.
     static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens = 5;
 
-    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_scale(std::uint32_t) {
-        return 1.0f;
+    // DFlash v1 drafts without a selector proposal, so no p-less draft temperature applies.
+    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_prior(float) {
+        return 0.0f;
     }
 
     // DFlash v1 has no tree route; the selector temperature is unused.
