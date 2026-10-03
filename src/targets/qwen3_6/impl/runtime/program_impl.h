@@ -4606,7 +4606,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *dflash_host_egress,
             tail_hidden_store,
             dflash_exchange ? tool_masks.get() : nullptr,
-            calibrates_p_less_drafts()};
+            calibrate_p_less};
 
         bind_tool_mask_batch(lanes, dflash_host_ingress->sampling);
         mark_workspace_usage(workspace_plan.dflash_round);
