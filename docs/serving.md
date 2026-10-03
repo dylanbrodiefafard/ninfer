@@ -939,15 +939,17 @@ Automatic sizing evaluates the complete target runtime layout for the chosen con
 dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
 uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
 resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
-slack, actual free memory after complete startup, observed Graph memory, and pinned-host KV RAM
-occupancy in MiB. When `--kv-ram-capacity` is enabled, a post-warmup line reprints occupancy,
+slack, actual free memory after complete startup, observed Graph memory, the pinned
+checkpoint-image slab (`ckpt-pin=`) and its context-checkpoint head count (`ckpt-heads=`), and
+pinned-host KV RAM (`kv-ram=`) and disk (`kv-disk=`) occupancy, sizes in MiB. When `--kv-ram-capacity` is enabled, a post-warmup line reprints occupancy,
 periodic throughput lines print live host-resident `kv-ram=` used bytes plus `n=` / `restores=` /
 `evicts=` / `drops=` / `save=` / `load=`, plus GPU page entitlement and cache-fallback totals when
 they are non-zero. Each `[req] done` line includes `reuse_source=` and this request's copy
 milliseconds when they are non-zero. It does not print process occupancy. When
 `--kv-disk-capacity` is enabled, throughput lines also print `kv-disk=` occupancy and counters. `kv-ram=` / `n=` count chats still in the host FIFO, not chats
 already consumed after a restore onto a KV lane. RAM `save=` / `load=` are CUDA D2H/H2D elapsed for
-that request or the throughput interval. Disk `save=` is spill-session wall harvested onto the
+that request's admission or the throughput interval; the copies of a capture rolled back by a
+deferred or failed admission count only toward lifetime and interval totals. Disk `save=` is spill-session wall harvested onto the
 request; disk `load=` is the host wall from the first live SSD read of that restore until the last
 page or state object has arrived in the pinned host window. Disk `h2d=` is the host wall from that
 last host arrival until the restore's page and state H2D complete (extra copy time after SSD is

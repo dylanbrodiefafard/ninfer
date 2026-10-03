@@ -645,7 +645,12 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
-    std::size_t kv_ram_capacity_bytes             = 0;
+    // Pinned host memory for checkpoint images (per-lane rewrite images plus the
+    // context-checkpoint head pool), allocated and prefaulted at startup, separate from
+    // kv_ram_capacity_bytes.
+    std::size_t checkpoint_image_host_bytes = 0;
+    std::size_t checkpoint_image_pool_heads = 0;
+    std::size_t kv_ram_capacity_bytes       = 0;
     // Live host-RAM residents only (claimed included). Not pinned-arena occupancy;
     // a retired copy may still occupy the pin until its D2H/H2D event is reaped.
     std::size_t kv_ram_used_bytes      = 0;

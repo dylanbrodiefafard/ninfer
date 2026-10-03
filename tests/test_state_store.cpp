@@ -426,8 +426,9 @@ int test_dflash_cyclic_pin_packs_staging_not_live(ninfer::DeviceContext& ctx) {
 }
 
 int test_dflash_cyclic_c2_shared_staging(ninfer::DeviceContext& ctx) {
-    // C=2 local lanes, 1-lane Engine-wide staging. Lane 1 must wait lane 0's D2H
-    // (fence_staging_copies) before clobbering staging; both host images stay distinct.
+    // C=2 local lanes, 1-lane Engine-wide staging. Lane 1's staging D2D waits on the compute
+    // stream for lane 0's staging D2H (the staging copies_done fence, as the Program orders a
+    // freeze), so it cannot clobber staging; both host images stay distinct.
     constexpr unsigned char kLane0 = 0x60;
     constexpr unsigned char kLane1 = 0x70;
     ninfer::LayoutBuilder builder;
@@ -449,7 +450,7 @@ int test_dflash_cyclic_c2_shared_staging(ninfer::DeviceContext& ctx) {
     cudaEvent_t copies_done = nullptr;
     CUDA_CHECK(cudaEventCreateWithFlags(&copies_done, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(copies_done, ctx.copy_stream));
-    CUDA_CHECK(cudaEventSynchronize(copies_done));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream, copies_done, 0));
 
     staging.copy_lane_from(local, 1, 0, ctx.stream);
     CUDA_CHECK(cudaEventRecord(d2d_done, ctx.stream));

@@ -88,7 +88,6 @@ struct RecoveryPrefillInput {
     bool pages_fit                         = false;
     std::uint32_t ram_reusable_tokens      = 0;
     std::uint32_t disk_reusable_tokens     = 0;
-    bool host_restore_failed               = false;
 };
 
 // The only recovery prefill branch. A positive resident reuse does not consult

@@ -193,9 +193,11 @@ enum class CacheCase {
     RecoveryDiskHit,
     RecoveryDiskClaimMiss,
     RecoveryDiskRestoreFails,
+    RecoveryPlanFails,
     AdmitRamHit,
     AdmitDiskLongerThanRam,
     AdmitRamRestoreThenCold,
+    AdmitDiskRestoreThenCold,
 };
 
 const char* cache_case_name(CacheCase script) {
@@ -212,12 +214,16 @@ const char* cache_case_name(CacheCase script) {
         return "recovery disk claim miss";
     case CacheCase::RecoveryDiskRestoreFails:
         return "recovery disk restore failure";
+    case CacheCase::RecoveryPlanFails:
+        return "recovery plan failure";
     case CacheCase::AdmitRamHit:
         return "admission RAM hit";
     case CacheCase::AdmitDiskLongerThanRam:
         return "admission longer disk hit";
     case CacheCase::AdmitRamRestoreThenCold:
         return "admission restore then cold";
+    case CacheCase::AdmitDiskRestoreThenCold:
+        return "admission disk restore then cold";
     }
     return "unknown cache case";
 }
@@ -328,9 +334,26 @@ public:
     bool cancel_on_restore                  = false;
     std::atomic<bool>* request_cancellation = nullptr;
     bool lifecycle_retries                  = false;
+    // Lane 1 decodes beside the retry; its one round must not wait for the host restore.
+    bool peer_decoding = false;
+    // With peer_decoding: the retry is cancelled during its host restore. The hold must stay
+    // parked while the peer decodes, and drain only once its copies settle.
+    bool cancel_held                   = false;
+    std::uint32_t decodes_since_cancel = 0;
+    bool cancel_begun                  = false;
+    // Peer rounds before its stop token, and peer rounds after a hold cancel until the fenced
+    // copies settle. A settle before the peer stops proves the hold finishes beside decoding.
+    std::uint32_t peer_round_limit     = 1;
+    std::uint32_t settle_after_decodes = 1;
+    // With peer_decoding: the retry is cancelled while its failed restore is parked.
+    bool cancel_failed_hold = false;
+    // With peer_decoding: drive a new admission (AdmitRamRestoreThenCold) instead of a retry.
+    bool admit_beside_peer = false;
+    // The cold prefill after a failed recovery restore cannot be planned (request-local).
+    bool cold_plan_fails = false;
     std::vector<std::vector<TokenId>> prefilled_prompts;
-    // Simulates the disk tier holding its mutex (for example during compaction).
-    std::atomic<int> copies_ready_stall_ms{0};
+    // While held, simulates the disk tier holding its mutex (for example during compaction).
+    std::atomic<bool> copies_ready_held{false};
     mutable std::atomic<bool> copies_ready_entered{false};
 
     void note(const char* event) {
@@ -351,6 +374,8 @@ public:
         case CacheCase::RecoveryResidentHit:
         case CacheCase::RecoveryDiskClaimMiss:
         case CacheCase::RecoveryDiskRestoreFails:
+        case CacheCase::RecoveryPlanFails:
+        case CacheCase::AdmitDiskRestoreThenCold:
             return 0;
         }
         return 0;
@@ -362,10 +387,12 @@ public:
         case CacheCase::RecoveryDiskClaimMiss:
         case CacheCase::RecoveryDiskRestoreFails:
         case CacheCase::AdmitDiskLongerThanRam:
+        case CacheCase::AdmitDiskRestoreThenCold:
             return kDiskReuse;
         case CacheCase::RecoveryRamRestoreFails:
         case CacheCase::RecoveryResidentHit:
         case CacheCase::RecoveryRamHit:
+        case CacheCase::RecoveryPlanFails:
         case CacheCase::AdmitRamHit:
         case CacheCase::AdmitRamRestoreThenCold:
             return 0;
@@ -374,7 +401,7 @@ public:
     }
 
     [[nodiscard]] virtual AdmissionResources admission_capacity() const noexcept {
-        return AdmissionResources{1, 1, 0};
+        return AdmissionResources{peer_decoding ? 2U : 1U, 2, 0};
     }
 
     [[nodiscard]] bool retain_reusable_lane(std::uint32_t) {
@@ -402,6 +429,10 @@ public:
     plan_request_base(const PreparedPrompt& prompt,
                       const ninfer::runtime::ResolvedExecutionOptions& options) {
         note("plan_base");
+        if (script == CacheCase::RecoveryPlanFails) {
+            throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+                                       "probe retry prompt does not fit");
+        }
         ProbePlan plan = fitted_plan();
         if (lifecycle_retries) {
             plan.fields.prompt_tokens           = prompt.summary().prompt_tokens;
@@ -417,6 +448,10 @@ public:
     [[nodiscard]] ProbePlan plan_request_for_lane(std::uint32_t, const PreparedPrompt&,
                                                   const ProbePlan& base) {
         note("plan_cold");
+        if (cold_plan_fails) {
+            throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+                                       "probe cold retry does not fit");
+        }
         ProbePlan plan   = lifecycle_retries ? base : fitted_plan();
         plan.force_cold  = base.force_cold;
         plan.allow_reuse = base.allow_reuse;
@@ -509,6 +544,9 @@ public:
     void restore_ram_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_ram");
         ++restore_ram_count;
+        if (cancel_held && request_cancellation != nullptr) {
+            request_cancellation->store(true, std::memory_order_release);
+        }
         if (script == CacheCase::RecoveryRamRestoreFails ||
             (script == CacheCase::AdmitRamRestoreThenCold && restore_ram_count == 1)) {
             throw CacheRestoreFailure("probe host restore failed");
@@ -524,6 +562,18 @@ public:
     }
 
     void cancel_disk_restore() { note("cancel_disk"); }
+
+    void begin_copy_hold_cancel() {
+        note("begin_cancel");
+        cancel_begun = true;
+        if (cancel_failed_hold && request_cancellation != nullptr) {
+            request_cancellation->store(true, std::memory_order_release);
+        }
+    }
+
+    [[nodiscard]] bool copy_hold_cancel_settled() const {
+        return decodes_since_cancel >= settle_after_decodes;
+    }
 
     void synchronize_all() { note("sync"); }
 
@@ -565,9 +615,11 @@ public:
     }
 
     [[nodiscard]] virtual bool kv_copies_ready() const {
-        if (const int ms = copies_ready_stall_ms.load(); ms > 0) {
+        if (copies_ready_held.load()) {
             copies_ready_entered.store(true);
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            while (copies_ready_held.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
         }
         return false;
     }
@@ -636,6 +688,14 @@ public:
 
     [[nodiscard]] virtual BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
                                                              std::span<const RoundBudget>) {
+        if (peer_decoding) {
+            note("decode");
+            if (cancel_begun) { ++decodes_since_cancel; }
+            const bool more = ++peer_rounds_ < peer_round_limit;
+            return {.tokens     = std::span<const TokenId>(more ? &kPeerContinue : &kPeerStop, 1),
+                    .row_counts = std::span<const std::int32_t>(&kPeerCount, 1),
+                    .row_stride = 1};
+        }
         if (lifecycle_retries && prefill_count < 3) {
             return {.tokens     = repeated_tokens_,
                     .row_counts = std::span<const std::int32_t>(&repeated_count_, 1),
@@ -649,6 +709,10 @@ public:
     void invalidate_disk_entry(std::uint64_t) {
         note("invalidate_disk");
         ++invalidate_disk_count;
+        if (script == CacheCase::AdmitDiskRestoreThenCold) {
+            // The disk tier refuses while another session still pins the entry.
+            throw std::logic_error("disk invalidation requires drained and released entry");
+        }
     }
 
     void consume_ram_entry(std::uint64_t) {
@@ -665,6 +729,8 @@ public:
 
     void pump_disk_restore() {}
 
+    [[nodiscard]] bool ram_restore_ready(std::uint64_t) const { return true; }
+
     [[nodiscard]] bool disk_restore_ready(std::uint64_t) const { return true; }
 
     [[nodiscard]] virtual bool kv_ram_reclaim_pending() const { return false; }
@@ -672,7 +738,8 @@ public:
     void restore_disk_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_disk");
         ++restore_disk_count;
-        if (script == CacheCase::RecoveryDiskRestoreFails) {
+        if (script == CacheCase::RecoveryDiskRestoreFails ||
+            (script == CacheCase::AdmitDiskRestoreThenCold && restore_disk_count == 1)) {
             throw CacheRestoreFailure("probe disk restore failed");
         }
         disk_timings_pending_ = true;
@@ -690,8 +757,6 @@ public:
 
     virtual void evict_retained_lane(std::uint32_t) noexcept {}
 
-    void retain_lane(std::uint32_t) {}
-
     void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId>) {}
 
     void clear_suppressed_tokens_lane(std::uint32_t) {}
@@ -703,8 +768,12 @@ public:
                                std::span<const std::uint8_t>) {}
 
 private:
-    bool ram_timings_pending_  = false;
-    bool disk_timings_pending_ = false;
+    static constexpr TokenId kPeerStop       = kCallerStop;
+    static constexpr TokenId kPeerContinue   = 1000 + 'a';
+    std::uint32_t peer_rounds_               = 0;
+    static constexpr std::int32_t kPeerCount = 1;
+    bool ram_timings_pending_                = false;
+    bool disk_timings_pending_               = false;
     std::array<TokenId, 64> repeated_tokens_{};
     std::int32_t repeated_count_ = 64;
     TokenId licensed_            = kCallerStop;
@@ -741,9 +810,10 @@ struct RecoveryProbe {
 };
 
 const char* kExpectedTrace[] = {
-    "retain",    "copy",        "plan_base",   "plan_ram",      "plan_disk",       "abort",
-    "claim_ram", "restore_ram", "cancel_disk", "sync",          "release_ram",     "discard_ram",
-    "abort",     "abort",       "plan_cold",   "start_prefill", "resolve_prefill",
+    "retain",      "copy",      "plan_base",     "plan_ram",
+    "plan_disk",   "abort",     "claim_ram",     "restore_ram",
+    "cancel_disk", "sync",      "release_ram",   "discard_ram",
+    "abort",       "plan_cold", "start_prefill", "resolve_prefill",
 };
 
 struct RecoveryOutcome {
@@ -757,6 +827,7 @@ struct RecoveryOutcome {
     bool cache_fallback            = false;
     bool force_cold                = false;
     FinishReason finish            = FinishReason::None;
+    FinishReason peer_finish       = FinishReason::None;
     bool pending_empty             = false;
     bool recovery_empty            = false;
     bool slot_empty                = false;
@@ -791,6 +862,54 @@ int fail_case(const ProbeProgram& program, bool ok, const char* message) {
 
 int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& outcome) {
     int failures = 0;
+    if (program.cancel_held) {
+        failures += fail_case(
+            program,
+            outcome.finished && outcome.error.empty() &&
+                outcome.finish == FinishReason::Cancelled &&
+                outcome.peer_finish == FinishReason::StopToken && program.prefill_count == 0 &&
+                event_count(program.trace, "release_ram") == 1 &&
+                in_order(program.trace, {"restore_ram", "begin_cancel", "decode", "cancel_disk"}) &&
+                outcome.slot_empty && !outcome.executor_failed,
+            "a cancelled host restore drained while the peer was decoding");
+        if (failures != 0) { dump_trace(program); }
+        return failures;
+    }
+    if (program.cancel_failed_hold) {
+        // Cancelled while its failed restore is parked: the hold drains once its copies settle,
+        // still drops the failed entry, and never prefills.
+        failures += fail_case(
+            program,
+            outcome.finished && outcome.error.empty() &&
+                outcome.finish == FinishReason::Cancelled &&
+                outcome.peer_finish == FinishReason::StopToken && program.prefill_count == 0 &&
+                program.discard_ram_count == 1 && event_count(program.trace, "release_ram") == 1 &&
+                in_order(program.trace, {"restore_ram", "begin_cancel", "decode", "decode",
+                                         "cancel_disk", "discard_ram", "decode"}) &&
+                outcome.slot_empty && !outcome.executor_failed,
+            "a cancelled failed hold did not drain and drop its entry");
+        if (failures != 0) { dump_trace(program); }
+        return failures;
+    }
+    if (program.script == CacheCase::RecoveryPlanFails || program.cold_plan_fails) {
+        // A request-local error fails only the retry; the Engine and its peer continue.
+        failures += fail_case(
+            program,
+            outcome.finished && outcome.error.find("probe") != std::string::npos &&
+                outcome.pending_empty && outcome.recovery_empty && outcome.slot_empty &&
+                !outcome.executor_failed && program.prefill_count == 0 &&
+                (!program.peer_decoding || outcome.peer_finish == FinishReason::StopToken),
+            "a request-local retry error escalated beyond its request");
+        if (program.cold_plan_fails) {
+            failures +=
+                fail_case(program,
+                          in_order(program.trace, {"restore_ram", "discard_ram", "plan_cold"}) &&
+                              event_count(program.trace, "release_ram") == 1,
+                          "the failed restore was not dropped before the cold retry");
+        }
+        if (failures != 0) { dump_trace(program); }
+        return failures;
+    }
     failures +=
         fail_case(program, outcome.finished && outcome.error.empty(),
                   outcome.error.empty() ? "the retry did not finish" : outcome.error.c_str());
@@ -823,16 +942,21 @@ int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& 
                               program.prefill_terminal;
     switch (program.script) {
     case CacheCase::RecoveryRamRestoreFails: {
-        const bool trace_ok =
-            program.trace.size() == std::size(kExpectedTrace) &&
-            std::equal(program.trace.begin(), program.trace.end(), std::begin(kExpectedTrace));
+        // A decoding peer parks the failed hold: its copies are fenced, the peer decodes,
+        // and only then is the entry dropped.
+        std::vector<std::string> expected(std::begin(kExpectedTrace), std::end(kExpectedTrace));
+        if (program.peer_decoding) {
+            const auto restore = std::find(expected.begin(), expected.end(), "restore_ram");
+            expected.insert(restore + 1, {"begin_cancel", "decode"});
+        }
+        const bool trace_ok = program.trace == expected;
         failures += fail_case(program, trace_ok,
                               "host restore failure did not abort, release, and cold-prefill");
         failures += fail_case(program,
                               program.claimed_ram_entry == kRamEntryId &&
-                                  program.aborts_at_prefill == 3 && program.abort_count == 3 &&
+                                  program.aborts_at_prefill == 2 && program.abort_count == 2 &&
                                   cold_compute && program.prefill_tokens > kResidentTokens,
-                              "cold prefill did not follow the three idempotent lane aborts");
+                              "cold prefill did not follow the two idempotent lane aborts");
         failures += fail_case(program, !outcome.cache_fallback && !outcome.force_cold,
                               "the failed recovery restore stuck a cold fallback");
         break;
@@ -889,18 +1013,29 @@ int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& 
     case CacheCase::RecoveryDiskRestoreFails:
         failures +=
             fail_case(program,
-                      program.abort_count == 3 && program.invalidate_disk_count == 1 &&
+                      program.abort_count == 2 && program.invalidate_disk_count == 1 &&
                           program.consume_disk_count == 0 && cold_compute &&
                           in_order(program.trace, {"restore_disk", "invalidate_disk", "plan_cold",
                                                    "start_prefill"}) &&
                           !outcome.cache_fallback && !outcome.force_cold,
                       "a failed disk restore did not invalidate that entry and cold-prefill");
         break;
+    case CacheCase::RecoveryPlanFails:
+        break;
     case CacheCase::AdmitRamHit:
     case CacheCase::AdmitDiskLongerThanRam:
     case CacheCase::AdmitRamRestoreThenCold:
+    case CacheCase::AdmitDiskRestoreThenCold:
         failures += fail_case(program, false, "an admission script was driven as a retry");
         break;
+    }
+    if (program.peer_decoding) {
+        const char* restore = disk_hit ? "restore_disk" : "restore_ram";
+        failures += fail_case(program,
+                              outcome.peer_finish == FinishReason::StopToken &&
+                                  event_count(program.trace, "decode") == 1 &&
+                                  in_order(program.trace, {restore, "decode", "start_prefill"}),
+                              "the retry's host restore stalled the decoding lane");
     }
     if (failures != 0) { dump_trace(program); }
     return failures;
@@ -938,11 +1073,99 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     Frontend& frontend = executor.instance_.loaded->frontend;
     auto input         = thinking_input();
 
+    ninfer::StopPolicy stop;
+    stop.token_ids        = {kCallerStop};
+    const auto now        = ConcurrentExecutor<ProbeInstance>::Clock::now();
+    ProbeProgram& program = *executor.instance_.program;
+
+    // Lane 1 already decodes; its rounds are scripted by the probe's decode_batch.
+    const auto make_peer = [&] {
+        auto peer_prepared                       = frontend.prepare(input);
+        const ninfer::PromptSummary peer_summary = peer_prepared.summary();
+        auto peer_session = frontend.make_output_session(peer_prepared, stop, {});
+        ResolvedRequestOptions peer_options;
+        peer_options.execution.sampling.p_less         = true;
+        peer_options.execution.requested_output_tokens = kOutputBudget;
+        peer_options.stop                              = stop;
+        auto made                                      = std::shared_ptr<Request>(
+            new Request(2, std::move(peer_prepared), std::move(peer_session), peer_summary, 0.0,
+                        std::move(peer_options), ninfer::OutputDelivery::TerminalOnly,
+                        now + std::chrono::hours(1), now, ninfer::HostInputLease{}, false));
+        made->budget.emplace(kOutputBudget, FinishReason::OutputLimit);
+        made->lane                   = 1;
+        made->decode_ready           = true;
+        made->admission_resources    = AdmissionResources{1, 1, 0};
+        made->remaining_service_work = kOutputBudget;
+        return made;
+    };
+    const auto wait_peer = [](const std::shared_ptr<Request>& peer) -> std::optional<FinishReason> {
+        std::unique_lock lock(peer->mutex);
+        if (!peer->cv.wait_for(lock, std::chrono::seconds(5), [&] { return peer->done; })) {
+            return std::nullopt;
+        }
+        return peer->result.finish_reason;
+    };
+
+    if (program.admit_beside_peer) {
+        // A new admission's restore fails while the peer decodes: the hold stays parked
+        // until its copies settle, then the request re-enters admission cold.
+        auto peer          = make_peer();
+        auto prepared      = frontend.prepare(input);
+        const auto summary = prepared.summary();
+        ResolvedRequestOptions options;
+        options.execution.sampling.p_less    = true;
+        options.execution.allow_prefix_reuse = true;
+        options.stop                         = stop;
+        typename ConcurrentExecutor<ProbeInstance>::Submission submission;
+        {
+            // Plant the peer and queue the request together, so the peer is still decoding.
+            std::scoped_lock lock(executor.execution_mutex_);
+            executor.slots_[1] = peer;
+            submission = executor.submit(std::move(prepared), summary, 0.0, std::move(options),
+                                         ninfer::OutputDelivery::TerminalOnly);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        ninfer::CancellationView cancel(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        int failures = 0;
+        try {
+            const ninfer::GenerationResult result = submission.wait(nullptr, cancel);
+            const auto peer_finish                = wait_peer(peer);
+            bool executor_failed                  = false;
+            {
+                std::scoped_lock lock(executor.queue_mutex_);
+                executor_failed = executor.failed_;
+            }
+            const auto& trace    = program.trace;
+            const auto cancel_at = std::find(trace.begin(), trace.end(), "begin_cancel");
+            const auto drop_at   = std::find(cancel_at, trace.end(), "cancel_disk");
+            const auto settled_decodes =
+                static_cast<std::uint32_t>(std::count(cancel_at, drop_at, "decode"));
+            failures += fail_case(
+                program,
+                result.finish_reason == FinishReason::StopToken &&
+                    result.reused_prompt_tokens == 0 && program.prefill_count == 1 &&
+                    program.prefill_reusable == 0 && program.saw_force_cold &&
+                    program.discard_ram_count == 1 && program.consume_ram_count == 0 &&
+                    peer_finish == FinishReason::StopToken && !executor_failed,
+                "a failed admission restore beside a decoding peer did not fall back cold");
+            failures +=
+                fail_case(program,
+                          settled_decodes == program.settle_after_decodes &&
+                              in_order(trace, {"restore_ram", "begin_cancel", "decode",
+                                               "cancel_disk", "discard_ram", "decode"}) &&
+                              in_order(trace, {"discard_ram", "start_prefill"}),
+                          "the failed hold did not wait for its copies beside the decoding peer");
+        } catch (const std::exception& error) {
+            failures += fail_case(program, false, error.what());
+        }
+        if (failures != 0) { dump_trace(program); }
+        return failures;
+    }
+
     auto prepared                       = frontend.prepare(input);
     const ninfer::PromptSummary summary = prepared.summary();
-    ninfer::StopPolicy stop;
-    stop.token_ids = {kCallerStop};
-    auto session   = frontend.make_output_session(prepared, stop, {});
+    auto session                        = frontend.make_output_session(prepared, stop, {});
 
     ResolvedRequestOptions options;
     options.execution.sampling.p_less         = true;
@@ -950,7 +1173,6 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     options.execution.force_cold_prefill      = false;
     options.execution.requested_output_tokens = kOutputBudget;
     options.stop                              = stop;
-    const auto now                            = ConcurrentExecutor<ProbeInstance>::Clock::now();
     auto request                              = std::shared_ptr<Request>(
         new Request(1, std::move(prepared), std::move(session), summary, 0.0, std::move(options),
                     ninfer::OutputDelivery::TerminalOnly, now + std::chrono::hours(1), now,
@@ -965,8 +1187,12 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     request->recovery_cause                          = "repeated_reasoning";
     executor.instance_.program->request_cancellation = &request->cancelled;
 
+    std::shared_ptr<Request> peer;
+    if (program.peer_decoding) { peer = make_peer(); }
+
     {
         std::scoped_lock locks(executor.execution_mutex_, executor.queue_mutex_);
+        if (peer) { executor.slots_[1] = peer; }
         executor.slots_[0] = request;
         executor.recovery_queue_.push_back(request);
         executor.control_dirty_.store(true, std::memory_order_release);
@@ -982,6 +1208,14 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     }
 
     RecoveryOutcome outcome;
+    if (peer) {
+        const auto peer_finish = wait_peer(peer);
+        if (!peer_finish) {
+            failures += check(false, "the decoding lane did not finish");
+            return failures;
+        }
+        outcome.peer_finish = *peer_finish;
+    }
     outcome.finished = true;
     if (request->error != nullptr) {
         try {
@@ -1011,15 +1245,35 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
 
 } // namespace ninfer::runtime
 
-int run_recovery(Frontend& frontend, CacheCase script, bool cancel_on_restore = false) {
+struct ProbeSetup {
+    bool cancel_on_restore             = false;
+    bool peer_decoding                 = false;
+    bool cancel_held                   = false;
+    bool cold_plan_fails               = false;
+    bool cancel_failed_hold            = false;
+    bool admit_beside_peer             = false;
+    std::uint32_t peer_round_limit     = 1;
+    std::uint32_t settle_after_decodes = 1;
+};
+
+int run_recovery(Frontend& frontend, CacheCase script, ProbeSetup setup = {}) {
     ProbeProgram program;
-    program.script            = script;
-    program.cancel_on_restore = cancel_on_restore;
+    program.script               = script;
+    program.cancel_on_restore    = setup.cancel_on_restore;
+    program.peer_decoding        = setup.peer_decoding;
+    program.cancel_held          = setup.cancel_held;
+    program.cold_plan_fails      = setup.cold_plan_fails;
+    program.cancel_failed_hold   = setup.cancel_failed_hold;
+    program.admit_beside_peer    = setup.admit_beside_peer;
+    program.peer_round_limit     = setup.peer_round_limit;
+    program.settle_after_decodes = setup.settle_after_decodes;
     ProbeLoaded loaded{frontend};
     RecoveryProbe instance;
     instance.program = &program;
     instance.loaded  = &loaded;
-    ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine_options());
+    auto engine      = engine_options();
+    if (setup.peer_decoding) { engine.max_concurrency = 2; }
+    ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
     return ninfer::runtime::drive_scripted_recovery(executor);
 }
 
@@ -1086,12 +1340,25 @@ int run_admission(Frontend& frontend, CacheCase script) {
                                                        "start_prefill"}),
                           "a failed admission restore was reused instead of computed cold");
             break;
+        case CacheCase::AdmitDiskRestoreThenCold:
+            // The failed entry cannot be invalidated yet; cleanup is best-effort and the
+            // request still falls back to a cold prefill.
+            failures +=
+                fail_case(program,
+                          result.finish_reason == FinishReason::StopToken && cold &&
+                              program.saw_force_cold && program.invalidate_disk_count == 1 &&
+                              program.consume_disk_count == 0 && program.restore_disk_count == 1 &&
+                              in_order(program.trace, {"claim_disk", "restore_disk", "release_disk",
+                                                       "invalidate_disk", "start_prefill"}),
+                          "a refused invalidation failed the cold fallback");
+            break;
         case CacheCase::RecoveryRamRestoreFails:
         case CacheCase::RecoveryResidentHit:
         case CacheCase::RecoveryRamHit:
         case CacheCase::RecoveryDiskHit:
         case CacheCase::RecoveryDiskClaimMiss:
         case CacheCase::RecoveryDiskRestoreFails:
+        case CacheCase::RecoveryPlanFails:
             failures += fail_case(program, false, "a retry script was submitted as a new request");
             break;
         }
@@ -1109,7 +1376,7 @@ int run_admission(Frontend& frontend, CacheCase script) {
 int run_idle_poll_does_not_block_submit(Frontend& frontend) {
     ProbeProgram program;
     program.script = CacheCase::AdmitRamHit;
-    program.copies_ready_stall_ms.store(500);
+    program.copies_ready_held.store(true);
     ProbeLoaded loaded{frontend};
     RecoveryProbe instance;
     instance.program = &program;
@@ -1121,7 +1388,7 @@ int run_idle_poll_does_not_block_submit(Frontend& frontend) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (!program.copies_ready_entered.load()) {
-        program.copies_ready_stall_ms.store(0);
+        program.copies_ready_held.store(false);
         return check(false, "idle worker never polled the cache tiers");
     }
     auto prepared      = frontend.prepare(thinking_input());
@@ -1130,23 +1397,31 @@ int run_idle_poll_does_not_block_submit(Frontend& frontend) {
     options.execution.sampling.p_less    = true;
     options.execution.allow_prefix_reuse = true;
     options.stop.token_ids               = {kCallerStop};
-    const auto t0                        = std::chrono::steady_clock::now();
-    auto submission    = executor.submit(std::move(prepared), summary, 0.0, std::move(options),
-                                         ninfer::OutputDelivery::TerminalOnly);
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    program.copies_ready_stall_ms.store(0);
+    // A submit that waits on the held poll is released by the watchdog and fails.
+    std::atomic<bool> submitted{false};
+    std::atomic<bool> fired{false};
+    std::jthread watchdog([&] {
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!submitted.load() && std::chrono::steady_clock::now() < limit) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!submitted.load()) {
+            fired.store(true);
+            program.copies_ready_held.store(false);
+        }
+    });
+    auto submission = executor.submit(std::move(prepared), summary, 0.0, std::move(options),
+                                      ninfer::OutputDelivery::TerminalOnly);
+    submitted.store(true);
+    watchdog.join();
+    const bool prompt = !fired.load();
+    program.copies_ready_held.store(false);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     ninfer::CancellationView cancel(
         [deadline] { return std::chrono::steady_clock::now() >= deadline; });
     const auto result = submission.wait(nullptr, cancel);
     int failures      = 0;
-    if (elapsed > std::chrono::milliseconds(200)) {
-        std::cerr << "submit waited "
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
-                  << " ms\n";
-    }
-    failures += check(elapsed <= std::chrono::milliseconds(200),
-                      "submit waited on an idle-worker cache-tier poll");
+    failures += check(prompt, "submit waited on an idle-worker cache-tier poll");
     failures += check(result.finish_reason == FinishReason::StopToken,
                       "request submitted during an idle cache poll did not finish");
     return failures;
@@ -1509,13 +1784,34 @@ int main() {
             CacheCase::AdmitRamHit,
             CacheCase::AdmitDiskLongerThanRam,
             CacheCase::AdmitRamRestoreThenCold,
+            CacheCase::AdmitDiskRestoreThenCold,
         };
         int failures = 0;
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }
-        failures += run_recovery(frontend, CacheCase::RecoveryRamHit, true);
-        failures += run_recovery(frontend, CacheCase::RecoveryDiskHit, true);
+        failures += run_recovery(frontend, CacheCase::RecoveryRamHit, {.cancel_on_restore = true});
+        failures += run_recovery(frontend, CacheCase::RecoveryDiskHit, {.cancel_on_restore = true});
+        failures += run_recovery(frontend, CacheCase::RecoveryRamHit, {.peer_decoding = true});
+        failures += run_recovery(frontend, CacheCase::RecoveryDiskHit, {.peer_decoding = true});
+        failures +=
+            run_recovery(frontend, CacheCase::RecoveryRamHit,
+                         {.peer_decoding = true, .cancel_held = true, .peer_round_limit = 2});
+        failures +=
+            run_recovery(frontend, CacheCase::RecoveryRamRestoreFails, {.peer_decoding = true});
+        failures += run_recovery(frontend, CacheCase::RecoveryRamRestoreFails,
+                                 {.peer_decoding = true, .cold_plan_fails = true});
+        failures += run_recovery(frontend, CacheCase::RecoveryPlanFails, {.peer_decoding = true});
+        failures += run_recovery(frontend, CacheCase::RecoveryRamRestoreFails,
+                                 {.peer_decoding        = true,
+                                  .cancel_failed_hold   = true,
+                                  .peer_round_limit     = 4,
+                                  .settle_after_decodes = 2});
+        failures += run_recovery(frontend, CacheCase::AdmitRamRestoreThenCold,
+                                 {.peer_decoding        = true,
+                                  .admit_beside_peer    = true,
+                                  .peer_round_limit     = 6,
+                                  .settle_after_decodes = 2});
         for (const CacheCase script : admission_cases) {
             failures += run_admission(frontend, script);
         }

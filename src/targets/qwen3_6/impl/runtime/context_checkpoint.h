@@ -4,6 +4,7 @@
 
 #include <ninfer/types.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -32,29 +33,34 @@ struct PrefillReuseHead {
     ContextCheckpointKind kind = ContextCheckpointKind::Ladder;
 };
 
-// A pooled host image is reusable only for an exact state layout.  MTP has no DFlash cyclic
-// image; DFlash does.  Keeping this decision independent of CUDA storage makes the pool's
-// ownership contract directly testable.
-struct ContextCheckpointImageLayout {
-    std::size_t conv_bytes      = 0;
-    std::size_t recurrent_bytes = 0;
-    std::size_t hidden_bytes    = 0;
-    std::size_t dflash_bytes    = 0;
-};
-
-[[nodiscard]] constexpr bool
-context_checkpoint_image_layout_matches(ContextCheckpointImageLayout lhs,
-                                        ContextCheckpointImageLayout rhs) noexcept {
-    return lhs.conv_bytes == rhs.conv_bytes && lhs.recurrent_bytes == rhs.recurrent_bytes &&
-           lhs.hidden_bytes == rhs.hidden_bytes && lhs.dflash_bytes == rhs.dflash_bytes;
-}
-
-// Each lane owns at most one image for each ladder mark and one rollback image. Retired images
-// are only retained within this exact live high-water bound.
-[[nodiscard]] constexpr std::size_t
+// Upper bound on the checkpoint images all lanes own at once; it sizes the Program's startup
+// pool. A lane owns at most one turn-rollback image plus one ladder image per mark it has
+// crossed: its k-th ladder image lies at or past marks[k-1], marks above the sequence capacity
+// are unreachable, and every image lies inside the lane's resident Main Text KV, which all
+// lanes share within kv_capacity tokens. The bound maximizes the lanes' ladder images under
+// that shared budget (lanes are interchangeable, so nonincreasing per-lane counts suffice) and
+// adds one rollback image per lane. An entry restored from a cache written with other marks can
+// exceed it; acquisition then skips the optional image instead of allocating.
+[[nodiscard]] inline std::size_t
 context_checkpoint_image_pool_capacity(std::uint32_t max_concurrency,
-                                       std::size_t mark_count) noexcept {
-    return static_cast<std::size_t>(max_concurrency) * (mark_count + 1U);
+                                       std::span<const std::uint32_t> marks,
+                                       std::uint32_t sequence_capacity, std::uint64_t kv_capacity) {
+    std::size_t reachable = 0;
+    while (reachable < marks.size() && marks[reachable] <= sequence_capacity) { ++reachable; }
+    const auto best = [&](const auto& self, std::uint32_t lanes, std::size_t max_k,
+                          std::uint64_t budget) -> std::size_t {
+        std::size_t result = 0;
+        if (lanes == 0) { return result; }
+        for (std::size_t k = max_k + 1; k-- > 0;) {
+            if (result >= k * lanes) { break; }
+            const std::uint64_t cost = k == 0 ? 0 : marks[k - 1];
+            if (cost > budget) { continue; }
+            result = std::max(result, k + self(self, lanes - 1, k, budget - cost));
+        }
+        return result;
+    };
+    return static_cast<std::size_t>(max_concurrency) +
+           best(best, max_concurrency, reachable, kv_capacity);
 }
 
 // Prefill chunk-end thresholds. Advertised restore frontier is the committed chunk end
@@ -348,11 +354,17 @@ struct ReuseBackendPolicy {
 // the checkpoint branch runs: DFlash needs its context at the frontier, MTP needs tail
 // hidden + MTP KV there. An unready append falls through to a usable rewrite or staged
 // checkpoint instead of forcing a FullReset later. Among the non-append candidates the
-// longest matching head that the backend can legally continue wins.
+// longest matching head that the backend can legally continue wins. `prompt_hashes` is
+// prefix_hash_chain(prompt), computed once per prompt by its owner; only checkpoint heads
+// consult it, so it may be empty when the state has none.
 [[nodiscard]] inline PrefillReuseSelection
 decide_resident_reuse(const ResidentReuseState& state, const PreparedPromptData& prompt,
+                      std::span<const PrefixHash128> prompt_hashes,
                       ninfer::SpeculativeBackend backend, bool mtp_cache_present,
                       bool dflash_present, bool dflash_full_layers) {
+    if (!state.context_checkpoints.empty() && prompt_hashes.size() != prompt.token_ids.size() + 1) {
+        throw std::invalid_argument("prompt prefix hash chain does not cover the prompt");
+    }
     const ReuseBackendPolicy policy{backend, mtp_cache_present, dflash_present, dflash_full_layers};
     const auto ready = [&](ninfer::PrefixReusePath path, std::uint32_t frontier) {
         return reuse_candidate_ready(state, path, frontier, prompt.token_ids.size(), policy);
@@ -366,36 +378,27 @@ decide_resident_reuse(const ResidentReuseState& state, const PreparedPromptData&
     std::uint32_t rewrite_frontier       = 0;
     std::vector<PrefillReuseHead> matching_heads;
     if (!current_matches) {
-        const auto chain   = prefix_hash_chain(prompt);
-        const auto hash_ok = [&](std::uint32_t frontier, PrefixHash128 hash) {
-            return frontier != 0 && frontier <= prompt.token_ids.size() &&
-                   frontier < chain.size() && chain[frontier] == hash &&
-                   prefix_matches(prompt, *state.ledger, *state.identity, frontier);
-        };
+        // The rewrite checkpoint is the resident prefix itself: an identical represented
+        // prefix has the identical hash, so the prefix comparison alone decides it.
         if (state.rewrite_valid && state.rewrite_frontier != 0 &&
-            state.rewrite_frontier <= state.ledger->size() &&
-            state.rewrite_frontier <= state.identity->size()) {
-            const PrefixHash128 hash =
-                prefix_hash_at(*state.ledger, *state.identity, state.rewrite_frontier);
-            if (hash_ok(state.rewrite_frontier, hash) &&
-                ready(rewrite_restore_path(state.rewrite_kind), state.rewrite_frontier)) {
-                rewrite_matches  = true;
-                rewrite_frontier = state.rewrite_frontier;
-                rewrite_path     = rewrite_restore_path(state.rewrite_kind);
-            }
+            prefix_matches(prompt, *state.ledger, *state.identity, state.rewrite_frontier) &&
+            ready(rewrite_restore_path(state.rewrite_kind), state.rewrite_frontier)) {
+            rewrite_matches  = true;
+            rewrite_frontier = state.rewrite_frontier;
+            rewrite_path     = rewrite_restore_path(state.rewrite_kind);
         }
         matching_heads.reserve(state.context_checkpoints.size());
         for (const ContextCheckpointRef& head : state.context_checkpoints) {
-            if (hash_ok(head.frontier, head.hash) &&
+            if (head.frontier != 0 && head.frontier <= prompt.token_ids.size() &&
+                prompt_hashes[head.frontier] == head.hash &&
+                prefix_matches(prompt, *state.ledger, *state.identity, head.frontier) &&
                 ready(reuse_path_for_context_checkpoint_kind(head.kind), head.frontier)) {
                 matching_heads.push_back(PrefillReuseHead{head.frontier, head.kind});
             }
         }
     }
-    PrefillReuseSelection selected =
-        select_resident_prefill_reuse(current_matches, state.execution_frontier, rewrite_matches,
-                                      rewrite_frontier, rewrite_path, matching_heads);
-    return selected;
+    return select_resident_prefill_reuse(current_matches, state.execution_frontier, rewrite_matches,
+                                         rewrite_frontier, rewrite_path, matching_heads);
 }
 
 [[nodiscard]] constexpr bool

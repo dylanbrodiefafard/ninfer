@@ -277,15 +277,18 @@ and retire normally before a successful spill retry.
 Two branch-spill schedules fail the actual next C++ allocation on the preparing thread,
 preserve the parent's shared-object reference count,
 retry successfully, and require all references to retire when both owning entries are evicted.
-A two-gate RAM eviction schedule lets a disk-worker-style snapshot borrow the victim's CUDA
-event during eviction's unlocked wait. Completing the victim's DMA must not release its entry
-until the snapshot's second DMA finishes; the surviving image then restores exact KV.
+RAM retirement schedules gate the copy stream: consume (with a spill's I/O pin held), discard
+(while a disk-worker-style snapshot borrows the entry's fence) and eviction must return while
+the restore H2D or capture D2H is still gated, drop the entry from the index, and keep its
+block until the fence completes and the last I/O pin drops; the freed block then serves an
+exact recapture and restore. Restored ladder-head copies out of an entry, held behind a gated
+head fence, must leave the entry's copy readiness set, and a consumed or evicted entry must
+keep its block until they land and deliver its bytes.
 Two RAM teardown schedules deny C++ allocations on the destroying executor while D2H or H2D
 is incomplete, requiring DMA retirement and exact restored bytes. Three RAM event-exhaustion
 cases cover capture timing before DMA, capture completion after gated D2H, and restore timing
 before H2D; they require clean ownership and exact retry. A synthetic CUDA launch failure must
-retain its execution-error classification. The checkpoint pool retirement test also fails initial
-head-fence allocation, then retries before gated D2H and checks completed bytes at release. Six spill-batch schedules fail
+retain its execution-error classification. Six spill-batch schedules fail
 page-record allocation after acquiring two, four, or eight jobs, for idle and emergency spills;
 all payload claims must retire and a later eight-page spill must restore exactly. Idle-to-emergency
 promotion also runs with caller allocation denied. Eight publication schedules fail metadata
@@ -302,8 +305,14 @@ healthy sibling reuse, FIFO eviction, and later reopening of an entry skipped by
 allocation pressure.
 Backend-readiness regressions exercise seven RAM cases, nine disk ranking/reopen cases, and
 four resident-planner cases: invalid current tails or unsupported longer frontiers must not hide
-a usable alternative. Two same-prefix disk refresh schedules replace the selected generation before claim or while
-claim waits for idle publication; both reject the stale plan and permit a fresh claim.
+a usable alternative. Two same-prefix disk refresh schedules replace the selected generation before a
+claim, which rejects the stale plan, or after a claim that lands while the refresh commit is
+held after its meta rename; that claim returns without waiting, the failed meta rollback
+publishes the new generation, the stale claim's host load and restore setup must each be a
+`CacheRestoreFailure`, and a fresh plan claims the new generation. A disk-hit claim of an entry
+whose idle Extend has its page write, commit object sync, or post-rename commit held must
+likewise return at once; the abandoned Extend (before its rename, or by rollback) leaves the
+claimed generation in memory and, after reopening, on disk.
 These bounds do not exhaust arbitrary OS/CUDA instruction schedules, unbounded request histories,
 all prompt geometries, or every speculative backend combination. Passing them is evidence for
 the stated transitions, not a proof that all possible interleavings are correct.
@@ -330,13 +339,16 @@ and requires transparent cold continuation with the same next token as fresh com
 C=1–4, with C−1 healthy peers each decoding 128 tokens. The DFlash artifact environment runs
 the same four cases with DFlash and checkpoint capture enabled. The failed entry is invalidated;
 a later request must also succeed.
-Its `--case metadata` selection checks 32 allocation-failure recoveries: C=1–4 at host
-descriptor creation, partially published restore setup, post-copy checkpoint installation,
-and lazy CUDA completion-event creation after restore DMA. The eight event cases also run via
-`--case event`.
-Descriptor/setup/event cases use ordinary and DFlash execution; checkpoint cases use MTP and DFlash
-and require an actual captured checkpoint. Peers must finish and cold output must match fresh
-computation after the injected failure.
+Its `--case metadata` selection checks 24 allocation-failure recoveries: C=1–4 at host
+descriptor creation, partially published restore setup, and lazy CUDA completion-event creation
+after restore DMA, each with ordinary and DFlash execution. The eight event cases also run via
+`--case event`. Peers must finish and cold output must match fresh computation after the
+injected failure.
+Its `--case checkpoint-heads` selection seeds a 64-token ladder head (MTP, and DFlash when its
+artifact is set), saves it through RAM to disk at shutdown, and requires a new Engine's HostDisk
+restore to install the decoded head on the lane; a later prompt diverging after the mark must
+reuse that head as a VRAM-resident context-checkpoint restore whose next token matches a cold
+prefill.
 The RAM Engine suite's `--case fallback` selection injects a one-shot restore metadata
 allocation failure after H2D submission for a 128-token NVFP4 KV image. Sixteen cases combine
 C=1–4, RAM-only or RAM+disk, and ordinary or DFlash execution. Each requires consumption of the
@@ -360,22 +372,18 @@ overlapped restore, fragmented vs contiguous PageMajor runs, and GDN/hidden RAM 
 `ninfer_kv_ram_cache_test` includes `test_copy_compute_stream_overlap`: callback-gated D2H/H2D
 on `copy_stream` remain incomplete while a compute-only event on `device.stream` completes.
 The same gates verify that eviction/consume fence unfinished copies before retiring and reusing
-their pinned storage. It also checks that `unpack_device` without an intervening harvest still reports
-both save and load elapsed, and that `consume` without harvest clears pending copy ids and folds
-D2H elapsed into save. Post-DMA capture and restore metadata allocation faults use the same
+their pinned storage. It also checks that `unpack_device` without an intervening harvest still
+bills its load and keeps the unharvested capture D2H in the lifetime save total, and that
+`consume` without harvest clears pending copy ids and counts the D2H only in that total. Post-DMA capture and restore metadata allocation faults use the same
 gates to verify incomplete-copy ownership, safe cleanup, exact subsequent restores, and reclaimed
 capacity. The arena suite checks fragmented retirement and full coalescing while preserving live
 bytes. `ninfer_device_test` checks `order_copy_after_compute`.
-The real checkpoint suite's `--case event-allocation` checks MTP or DFlash Program capture with
-head-event allocation failure at a prefill checkpoint. The request must complete without a
-capture and consume the injected failure; later capture and actual checkpoint restore must
-succeed, with next-token output matching fresh computation. The default real checkpoint run
-also includes this case.
-The runtime-mechanism suite fills the checkpoint recycling pool, then verifies that dropping
-an excess image waits for its gated D2H and releases the completed bytes without growing the pool.
-Twelve copy-snapshot allocation schedules cover both snapshot buffers, D2H/H2D, and CPU wait,
-compute-stream wait, or timing harvest. They require safe completion without leaked I/O pins,
-exact destination bytes, and successful consumption and capacity reclamation.
+The runtime-mechanism suite checks the startup checkpoint-image pool bound: one rollback image
+per lane plus the reachable marks all lanes can hold at once within the shared KV capacity.
+`ninfer_kv_ram_cache_test` runs eight copy-snapshot allocation schedules covering both
+snapshot buffers, D2H/H2D, and the CPU or compute-stream wait (harvest never waits and takes no
+snapshot). They require safe completion without leaked I/O pins, exact destination bytes, and
+successful consumption and capacity reclamation.
 `ninfer_kv_ram_cache_large_test` moves a 27B-shaped GDN slot (~147 MiB) and a
 64-plane ~100 MiB INT8 KV image both ways, including a two-slot GDN plus KV restore, and repeats
 that copy/compute overlap proof:

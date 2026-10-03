@@ -875,7 +875,10 @@ the host budget increments `drops` once and the incoming request still proceeds.
 `Captured`, `NeedsEviction`, or `Dropped`; only `NeedsEviction` permits the caller to spill/evict
 residents and retry. An image larger than the entire arena is `Dropped` without evicting any
 resident. D2H/H2D run on
-`DeviceContext::copy_stream`. Source GPU pages stay mapped until that entry's `copies_done` is
+`DeviceContext::copy_stream`. Rewrite-image and ladder-head copies between pinned host buffers
+run as host callbacks (4 MiB chunks) on the tier's own startup host-copy stream, ordered only
+after each image's fence, so they overlap the entry's KV/GDN D2H or H2D; that stream then joins
+`copy_stream` before the entry's `copies_done`, which still covers every copy. Source GPU pages stay mapped until that entry's `copies_done` is
 ready; unpack is not ordered behind block-table publish on the compute stream. Restore writes the
 host image onto a new page mapping of the chosen free lane (an empty lane
 first; a dirty lane only when none is empty, and among equal-reuse dirty lanes the
@@ -883,16 +886,20 @@ least-recently-admitted retained bundle), records H2D completion on the same eve
 `device.stream` waits on that event only immediately before this lane's `start_prefill_lane`.
 Capture and restore both require a selected
 free lane; a queued request that cannot admit does not dump in-flight or other retained GPU
-state. Consume erases the host entry wherever it sits
-in the FIFO and retires the block; capacity eviction destroys the oldest unpinned resident and
-waits for its copy event and all host-side event borrowers before freeing. A disk worker waiting
-on another pending image can borrow this event while the eviction's CUDA wait releases the RAM
-mutex; transfer completion alone does not retire that borrow. Both then follow the same checkpoint decision as VRAM
-prefix reuse.
+state. Consume, a rollback discard, and capacity eviction
+(of the oldest unpinned resident) erase the host entry wherever it sits in the FIFO without
+waiting and retire its block. A retired block is freed once its copy and block events have completed and its
+last I/O pin has dropped: a disk spill still reading the image, or a disk worker's pending-copy
+snapshot borrowing its event. A RAM restore claim therefore neither cancels nor waits for a spill
+of the same entry; the spill commits from the pinned bytes. Harvest bills only completed copies;
+a retired entry's never-harvested copies count only toward the lifetime totals.
+Both then follow the same checkpoint decision as VRAM prefix reuse.
 Before requesting capacity eviction, capture checks whether the image can fit a contiguous
 arena interval after removing unclaimed residents. A claimed restore source divides the arena
 into fixed gaps; if none can fit the image, capture drops once and preserves the other residents.
-Retired copies drain before this decision; temporary idle-spill I/O pins can drain before eviction.
+Retired blocks and idle-spill I/O pins are temporary and do not count against this decision. A
+blocking reclaim waits for a victim's copies or a retired block's fence; a non-blocking reclaim
+selects only victims whose copies have landed and otherwise defers the admission.
 Logged `used`/`entries` (human `kv-ram=` / `n=`) are live host residents only. Serve and CLI also
 print CUDA D2H `save=` and H2D `load=` elapsed harvested after the first non-throwing
 `start_prefill_lane`. The host image packs logical page `i`
@@ -905,7 +912,13 @@ One long MTP or DFlash bundle with six ladder heads is about 6 GiB (Main+backend
 moved live heads, including DFlash cyclic). `--kv-ram-capacity off` still keeps the live-lane pinned GDN log for same-lane
 rollback; other-lane restore after eviction remains a miss without the FIFO. Eviction of a retained
 bundle is the existing KV dump plus those ladder heads **moved** (not aliased) into the same FIFO
-entry. A middle-head hit unpacks that head's GDN+hidden (and DFlash cyclic) into current/`tail_hidden` and KV
+entry. A middle-head hit unpacks that head's GDN+hidden (and DFlash cyclic) into current/`tail_hidden`, so
+occupy does not unpack it again, and installs only the entry's heads at or before the restored
+base (occupy drops later ones) into the Program's checkpoint pool. Those head copies run on the
+RAM tier's host-copy stream behind only each head's fence; the entry's copy fence, which gates the
+lane's first prefill chunk, does not include them, and a separate block fence keeps the retired
+block allocated until they land. A RAM restore starts only once the entry's own capture copies
+are ready; while other lanes decode, the copy-hold polls that instead of blocking. KV
 `dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
 working set.
 
@@ -957,7 +970,21 @@ ownership without allocating; failed preparation drops the optional spill while 
 previous generation and releasing its pins. Spill page batches have a fixed maximum of eight
 jobs, and idle-to-emergency promotion transfers its queue without allocation.
 Spill preparation transfers the caller's RAM pin only after all jobs are queued, so a failed
-queue allocation leaves exactly one caller-owned pin to release. Branch sharing reserves all
+queue allocation leaves exactly one caller-owned pin to release. The state-blob encode runs
+with the index mutex released for both codecs, after the refusals it cannot change (pending
+compaction for an idle spill, a physical-room floor): it compresses (zstd) and seals each
+record's codec header and record CRC32C, so the commit only reserves an object ID and extent
+under the mutex; a cancelled worker prepare stops between 8 MiB compression chunks. A page
+batch likewise builds its record headers and CRCs unlocked from the I/O-pinned RAM image, then
+relocks to reserve IDs and the contiguous append range. An object-ID reservation that must
+extend `PACKSET` writes it unlocked; only the installed spill session allocates IDs, and it
+blocks compaction publication. Retired generations reaped during preparation are removed
+unlocked as well. After relocking, preparation re-validates cancellation, a claim of the
+entry an Extend or Refresh would rewrite, and quarantine or eviction of its source, and abandons
+without marking the RAM entry failed so a retry re-plans. A commit's unlocked object sync and map append
+use object records copied under the mutex. MANIFEST images are sequenced under the index mutex
+and published by one writer at a time (tmp write, fsync, rename, directory fsync); an image older
+than the last published one is dropped. Branch sharing reserves all
 rollback bookkeeping before acquiring references; allocation failure cannot leave an untracked
 shared reference.
 
@@ -1002,13 +1029,33 @@ durable and all reader leases have drained. Spill admission only requests compac
 worker runs it between its queued jobs, copying a snapshot of live extents in 64 MiB slices with
 the cache mutex released, then copying objects committed to the source generation meanwhile.
 Lookups, claims, and statistics therefore never wait for the copy. Publication switches object
-locations to the new generation and waits only for no spill session or payload I/O; restores and
-reader claims continue across it on their generation leases. While compaction is pending an idle spill defers without marking its entry failed,
+locations to the new generation and waits only for no spill session, payload I/O, or scheduler
+emergency preparation; restores and reader claims continue across it on their generation
+leases. The new `PACKSET` is written, synced and renamed with the mutex released, the
+in-memory generation switch follows under the mutex, and the root fsync again runs unlocked.
+A publishing flag keeps object writers out from the `PACKSET` write until that root fsync: the
+worker's own prepares run on the publishing thread, and an emergency prepare waits for the
+flag. A retired generation no reader leases is marked reaping under the mutex and stays listed
+as retired, while its descriptors are closed, its pack root and maps removed, and the `packs`
+and `maps` directories fsynced with the mutex released; a failed reap is retried later. Pack
+space accounting skips a generation being reaped, and explicit maintenance
+(`wait_idle_and_fsync`) returns only after every in-flight reap finishes. While compaction is pending an idle spill defers without marking its entry failed,
 and an emergency spill appends past the garbage threshold inside the copy-on-write reserve. A
 spill's room check counts the pending compaction copy but not later appends, so a compaction that
 no longer fits falls back to low-space eviction; a failed compaction is not retried until the
 durable generation changes. Eviction uses durable tombstones so an uncertain
-metadata publication cannot make a referenced object reusable. Before capacity eviction, admission
+metadata publication cannot make a referenced object reusable. Capacity and quarantine
+eviction are two-phase: victims are selected under the mutex (capacity eviction projects the
+unique bytes released by FIFO victims so one round covers the shortfall) and made unavailable
+to planning, claims, spill tickets, and RAM durability; their tombstones are written, synced
+and renamed, and the tombstone directory fsynced once per round, with the mutex released.
+Only a durably tombstoned victim then drops its object references and index position under
+the mutex; a victim whose tombstone did not become durable keeps its references, has any
+tombstone its attempt renamed removed, and returns to service unless it is quarantined. Capacity
+eviction then moves on to the next FIFO candidate, and it waits for another thread's in-flight
+round instead of evicting around victims whose bytes are about to be released. A tombstone is released only after a store fsync that
+follows the unlocked scan finding its entry directory gone, and only when no entry, skipped
+tree, or object reference still needs it. Before capacity eviction, admission
 checks that the incoming incremental bytes plus unique extents protected by claims or I/O pins
 (including a spill's parent) fit the budget. Known capacity shortfalls are rejected without
 evicting unrelated residents. Shared protected extents are counted once, and refresh/extend
@@ -1017,7 +1064,9 @@ replacement credit remains included in the incremental-byte calculation.
 Restore owns `2 * restore_io_threads` pinned page slots and equally sized device staging slots.
 Readers issue aligned direct reads into the pinned slots, validate each packed record, enqueue one
 dense H2D per logical page, and scatter it into the target's physical planes. Raw state objects
-read directly into their final pinned owners using 4 MiB read/CRC chunks; each object uses at most
+read directly into their final pinned owners using 4 MiB read/CRC chunks; saved checkpoint heads
+decode straight into Program pool heads handed in with the restore target, only for the heads at
+or before the restored base, after each head's previous DMA or host-copy owner has finished; each object uses at most
 four readers and independent objects share the startup-fixed reader budget. Compressed state uses
 bounded decoded owners. Contiguous CRC32C checks use the serial SSE4.2 dependency chain below
 512 KiB and three interleaved hardware chains for larger payloads; incremental checks remain
@@ -1037,7 +1086,15 @@ retirement, including the interval before a transfer slot is assigned and except
 Prefix matching filters append and checkpoint candidates using the same backend-readiness
 rules as resident reuse before ranking them. An unusable canceled tail cannot shadow a usable
 checkpoint or another cache entry. Disk plans carry the selected committed generation; claim
-checks it before and after waiting for an idle rewrite, so a same-prefix refresh requires replanning.
+checks it, so a same-prefix refresh requires replanning. A claim never waits for an idle Extend or
+Refresh of its entry, not even for the commit's fsyncs: it cancels the spill, and the commit
+abandons at its next check: before its `meta.bin` rename when the claim lands during the object
+sync, otherwise by rolling the renamed `meta.bin` back, so the claimed generation stays published
+and its objects untouched. Only if that rollback cannot be written, or the post-rename syncs fail,
+is the newer generation published, with the replaced objects held until the entry is next
+replaced or evicted; the claimed restore then fails its committed-generation check (at setup in
+`load_host`/`restore_device`, or while running) as a `CacheRestoreFailure` cache miss, and the
+request falls back to cold prefill.
 MTP disk validation requires pages for the declared valid backend extent; readiness checks exclude
 frontiers beyond that extent while preserving eligible earlier checkpoints.
 Cache-owned CUDA event creation treats only `cudaErrorMemoryAllocation` as recoverable
@@ -1053,8 +1110,13 @@ without reuse. Re-admission preserves request identity and FIFO ordering, rechec
 reservation, and does not apply the initial queue deadline to an already-admitted recovery.
 The fallback is bounded to one cold-prefill retry, preserving the request's checkpoint-capture
 settings. Invariant and execution failures are not
-cache-miss signals. Quarantine uses normal tombstone/refcount eviction; if tombstone persistence
-fails, the entry stays unavailable in memory without dropping shared-object references.
+cache-miss signals. Quarantine marks the entry unavailable and invalidates RAM tickets naming it at once,
+without waiting for claims, restores, or spills that pin it; a spill that extends, refreshes, or
+branches from it abandons its commit. The disk worker then evicts it with normal
+tombstone/refcount eviction once its pins drop; if tombstone persistence fails, the entry stays
+unavailable in memory without dropping shared-object references. Disk-worker allocation and I/O
+failures (an unopenable pack, a failed read) surface as the cache-miss signal; invariant
+violations keep their type.
 
 ---
 

@@ -230,11 +230,6 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
-void Program<Variant>::retain_lane(std::uint32_t lane) {
-    impl_->retain_lane(lane);
-}
-
-template <>
 bool Program<Variant>::retain_reusable_lane(std::uint32_t lane) {
     return impl_->retain_reusable_lane(lane);
 }
@@ -288,6 +283,11 @@ template <>
 void Program<Variant>::restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id,
                                           const RequestPlan<Variant>& plan) {
     impl_->restore_disk_entry(lane, entry_id, plan);
+}
+
+template <>
+bool Program<Variant>::ram_restore_ready(std::uint64_t entry_id) const {
+    return impl_->ram_restore_ready(entry_id);
 }
 
 template <>
@@ -361,6 +361,16 @@ void Program<Variant>::pump_disk_restore() {
 template <>
 void Program<Variant>::cancel_disk_restore() {
     impl_->cancel_disk_restore();
+}
+
+template <>
+void Program<Variant>::begin_copy_hold_cancel() {
+    impl_->begin_copy_hold_cancel();
+}
+
+template <>
+bool Program<Variant>::copy_hold_cancel_settled() const {
+    return impl_->copy_hold_cancel_settled();
 }
 
 template <>

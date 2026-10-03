@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -14,8 +15,12 @@
 
 namespace {
 
-constexpr int kWarmup                       = 2;
-constexpr int kIters                        = 8;
+constexpr int kWarmup = 2;
+constexpr int kIters  = 8;
+constexpr int kRounds = 3;
+// Pack/unpack is compared with a same-run pinned memcpy baseline; each side takes its best of
+// interleaved rounds, so GPU time-slicing with another process during one round does not fail
+// the comparison while a structurally slower pack path still does.
 constexpr double kMinFractionOfPinnedMemcpy = 0.50;
 
 int fail(const char* message) {
@@ -183,27 +188,33 @@ int main() {
             cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice, ctx.stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-    CUDA_CHECK(cudaEventRecord(start, ctx.stream));
-    for (int i = 0; i < kIters; ++i) {
-        ninfer::pack_paged_kv_allocation_to_host(source, pool, pinned_block, ctx.stream);
-        ninfer::unpack_paged_kv_allocation_from_host(source, pool, pinned_block, kPages, kPages,
-                                                     ctx.stream);
-    }
-    CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    const double pack_ms  = elapsed_ms(start, stop) / kIters;
-    const double pack_gbs = (2.0 * static_cast<double>(image_bytes) / 1.0e9) / (pack_ms / 1000.0);
+    double pack_ms   = 0.0;
+    double memcpy_ms = 0.0;
+    for (int round = 0; round < kRounds; ++round) {
+        CUDA_CHECK(cudaEventRecord(start, ctx.stream));
+        for (int i = 0; i < kIters; ++i) {
+            ninfer::pack_paged_kv_allocation_to_host(source, pool, pinned_block, ctx.stream);
+            ninfer::unpack_paged_kv_allocation_from_host(source, pool, pinned_block, kPages, kPages,
+                                                         ctx.stream);
+        }
+        CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        const double round_pack_ms = elapsed_ms(start, stop) / kIters;
+        pack_ms                    = round == 0 ? round_pack_ms : std::min(pack_ms, round_pack_ms);
 
-    CUDA_CHECK(cudaEventRecord(start, ctx.stream));
-    for (int i = 0; i < kIters; ++i) {
-        CUDA_CHECK(
-            cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost, ctx.stream));
-        CUDA_CHECK(
-            cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice, ctx.stream));
+        CUDA_CHECK(cudaEventRecord(start, ctx.stream));
+        for (int i = 0; i < kIters; ++i) {
+            CUDA_CHECK(cudaMemcpyAsync(pinned_block, bulk.p, image_bytes, cudaMemcpyDeviceToHost,
+                                       ctx.stream));
+            CUDA_CHECK(cudaMemcpyAsync(bulk.p, pinned_block, image_bytes, cudaMemcpyHostToDevice,
+                                       ctx.stream));
+        }
+        CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        const double round_memcpy_ms = elapsed_ms(start, stop) / kIters;
+        memcpy_ms = round == 0 ? round_memcpy_ms : std::min(memcpy_ms, round_memcpy_ms);
     }
-    CUDA_CHECK(cudaEventRecord(stop, ctx.stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    const double memcpy_ms = elapsed_ms(start, stop) / kIters;
+    const double pack_gbs = (2.0 * static_cast<double>(image_bytes) / 1.0e9) / (pack_ms / 1000.0);
     const double memcpy_gbs =
         (2.0 * static_cast<double>(image_bytes) / 1.0e9) / (memcpy_ms / 1000.0);
 
@@ -293,6 +304,8 @@ int main() {
     gdn_cache.claim(gdn_match->entry_id);
     (void)gdn_cache.unpack_device(gdn_match->entry_id, gdn_target);
     gdn_cache.consume(gdn_match->entry_id);
+    // consume() does not fence the restore; the reader waits for its H2D.
+    ctx.synchronize_all();
     if (expect_logical_pages(pool, gdn_dest, 22) != 0) { return fail("GDN restore KV mismatch"); }
     std::vector<unsigned char> conv_out(conv_pattern.size());
     CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 1).data, conv_out.size(),

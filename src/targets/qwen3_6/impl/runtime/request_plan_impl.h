@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -58,6 +60,14 @@ void install_suppressed_tokens(ops::SamplingConfig& destination,
 
 std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
     return 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+std::span<const qwen3_6::detail::PrefixHash128>
+planned_prompt_hashes(const RequestBasePlanImpl& base) {
+    if (base.prompt_hashes == nullptr) {
+        throw std::logic_error("prefix reuse planning requires the prompt hash chain");
+    }
+    return *base.prompt_hashes;
 }
 
 std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
@@ -118,7 +128,13 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->sampling.draft_temperature = p_less_draft_temperature;
     }
     install_suppressed_tokens(base->sampling, options);
-    base->allow_prefix_reuse         = options.allow_prefix_reuse;
+    base->allow_prefix_reuse = options.allow_prefix_reuse;
+    // Only checkpoint heads and the RAM/disk tiers key on prefix hashes.
+    if (options.allow_prefix_reuse && prompt.identity.reusable &&
+        (captures_context_checkpoints() || kv_ram_cache_ || kv_disk_cache_)) {
+        base->prompt_hashes = std::make_shared<const std::vector<qwen3_6::detail::PrefixHash128>>(
+            qwen3_6::detail::prefix_hash_chain(prompt));
+    }
     base->force_cold_prefill         = options.force_cold_prefill;
     base->capture_context_checkpoint = options.capture_context_checkpoint;
     if (options.capture_context_checkpoint &&
@@ -235,8 +251,10 @@ void ProgramImplCore::apply_reuse_decision(RequestPlanImpl& plan, const Resident
     };
     const bool mtp_cache_present = decoder->mtp_cache() != nullptr;
     const auto selected          = qwen3_6::detail::decide_resident_reuse(
-        state, prompt, speculative_backend, mtp_cache_present, dflash.has_value(),
-        DFlashConfig::full_layers > 0);
+        state, prompt,
+        base.prompt_hashes ? std::span<const qwen3_6::detail::PrefixHash128>(*base.prompt_hashes)
+                           : std::span<const qwen3_6::detail::PrefixHash128>{},
+        speculative_backend, mtp_cache_present, dflash.has_value(), DFlashConfig::full_layers > 0);
     plan.reuse      = selected.path;
     plan.reuse_base = selected.frontier;
 
@@ -370,6 +388,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->prompt_hashes               = base.prompt_hashes;
 
     ResidentStateView view;
     if (sequence.retained) {
@@ -403,6 +422,7 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->prompt_hashes               = base.prompt_hashes;
 
     if (!kv_ram_cache_ || !base.allow_prefix_reuse || base.force_cold_prefill ||
         !prompt.identity.reusable) {
@@ -410,10 +430,8 @@ RequestPlan ProgramImplCore::plan_ram_reuse(const PreparedPromptData& prompt,
         return RequestPlan(std::move(plan));
     }
 
-    const std::vector<qwen3_6::detail::PrefixHash128> chain =
-        qwen3_6::detail::prefix_hash_chain(prompt);
     const std::optional<qwen3_6::detail::RamMatch> match = kv_ram_cache_->plan_match(
-        prompt, chain,
+        prompt, planned_prompt_hashes(base),
         qwen3_6::detail::ReuseBackendPolicy{speculative_backend, decoder->mtp_cache() != nullptr,
                                             dflash.has_value(), DFlashConfig::full_layers > 0});
     if (!match || match->reuse_base == 0) {
@@ -462,6 +480,7 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->prompt_hashes               = base.prompt_hashes;
 
     if (!kv_disk_cache_ || !base.allow_prefix_reuse || base.force_cold_prefill ||
         !prompt.identity.reusable) {
@@ -469,10 +488,8 @@ RequestPlan ProgramImplCore::plan_disk_reuse(const PreparedPromptData& prompt,
         return RequestPlan(std::move(plan));
     }
 
-    const std::vector<qwen3_6::detail::PrefixHash128> chain =
-        qwen3_6::detail::prefix_hash_chain(prompt);
     const std::optional<qwen3_6::detail::DiskMatch> match = kv_disk_cache_->plan_match(
-        prompt, chain,
+        prompt, planned_prompt_hashes(base),
         qwen3_6::detail::ReuseBackendPolicy{speculative_backend, decoder->mtp_cache() != nullptr,
                                             dflash.has_value(), DFlashConfig::full_layers > 0});
     if (!match || match->reuse_base == 0) {

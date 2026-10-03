@@ -18,6 +18,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/dtype.h"
+#include "core/host_copy.h"
 
 #include <cuda_runtime.h>
 
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <span>
@@ -35,6 +37,22 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+
+// MemAvailable from /proc/meminfo, or nullopt when the kernel does not report it.
+std::optional<std::size_t> available_host_memory_bytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    std::size_t kib = 0;
+    std::string unit;
+    while (meminfo >> key >> kib >> unit) {
+        if (key == "MemAvailable:") { return kib * 1024U; }
+    }
+    return std::nullopt;
+}
+
+// Pinned, prefaulted checkpoint images cannot be reclaimed or swapped, so startup leaves this
+// much host memory available after carving them instead of courting the OOM killer.
+inline constexpr std::size_t kCheckpointSlabHostHeadroomBytes = std::size_t{4} << 30;
 
 using Clock = std::chrono::steady_clock;
 
@@ -357,8 +375,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
                                                              sizeof(qwen3_6::DFlashDecodeEgress))
                       : std::nullopt) {
-    context_checkpoint_pool_.reserve(qwen3_6::detail::context_checkpoint_image_pool_capacity(
-        max_concurrency, context_marks.size()));
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -413,6 +429,47 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (plan.persistent.staging_hidden) {
         staging_hidden = plan.persistent.staging_hidden->bind(backing);
     }
+    {
+        // Every pinned checkpoint image is carved here from one prefaulted, registered slab, so
+        // no serving path allocates or frees pinned memory for checkpoints.
+        const std::size_t conv_bytes      = decoder->linear_attention.conv_host_image_bytes();
+        const std::size_t recurrent_bytes = decoder->linear_attention.recurrent_host_image_bytes();
+        const std::size_t dflash_bytes    = dflash ? dflash->local.lane_host_bytes() : 0;
+        const std::size_t pool_heads =
+            captures_context_checkpoints() && staging_hidden.data != nullptr
+                ? qwen3_6::detail::context_checkpoint_image_pool_capacity(
+                      max_concurrency, context_marks, capacity, kv_capacity)
+                : 0;
+        const auto region = [](std::size_t bytes) {
+            constexpr std::size_t alignment = qwen3_6::detail::kCheckpointImageAlignment;
+            return (bytes + alignment - 1) / alignment * alignment;
+        };
+        const std::size_t rewrite_image_bytes =
+            region(conv_bytes) + region(recurrent_bytes) + region(dflash_bytes);
+        const std::size_t head_bytes = rewrite_image_bytes + region(staging_hidden.bytes());
+        const std::size_t slab_bytes =
+            max_concurrency * rewrite_image_bytes + pool_heads * head_bytes;
+        if (const std::optional<std::size_t> available = available_host_memory_bytes();
+            available && slab_bytes + kCheckpointSlabHostHeadroomBytes > *available) {
+            throw std::runtime_error(
+                "checkpoint images need " + std::to_string(slab_bytes >> 20) +
+                " MiB of pinned host memory (" + std::to_string(pool_heads) +
+                " context-checkpoint heads), but only " + std::to_string(*available >> 20) +
+                " MiB is available and 4096 MiB must stay free; lower --max-concurrency or "
+                "--max-context, or use fewer --context-checkpoints marks");
+        }
+        checkpoint_image_slab_.emplace(slab_bytes);
+        context_checkpoint_pool_.reserve(pool_heads);
+        for (std::size_t i = 0; i < pool_heads; ++i) {
+            ContextCheckpointHead head;
+            head.prepare_copy_event();
+            head.conv      = carve_checkpoint_image(conv_bytes);
+            head.recurrent = carve_checkpoint_image(recurrent_bytes);
+            head.hidden    = carve_checkpoint_image(staging_hidden.bytes());
+            head.dflash    = carve_checkpoint_image(dflash_bytes);
+            context_checkpoint_pool_.push_back(std::move(head));
+        }
+    }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         SequenceState& sequence = sequences[lane];
         sequence.lane           = lane;
@@ -421,6 +478,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             rewrite_checkpoint_hidden_store.slice(1, static_cast<std::int32_t>(lane), 1);
         sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
+        sequence.prefix_hashes.reserve(static_cast<std::size_t>(capacity) + 1ULL);
         sequence.next_context_mark = qwen3_6::detail::first_prefill_context_mark(context_marks);
         allocate_rewrite_image(sequence);
     }
@@ -517,6 +575,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             throw;
         }
     }
+    try {
+        qwen3_6::detail::create_cache_cuda_event(&copy_hold_cancel_fence_, cudaEventDisableTiming);
+    } catch (...) {
+        if (staging_.copies_done != nullptr) {
+            (void)cudaEventDestroy(staging_.copies_done);
+            staging_.copies_done = nullptr;
+        }
+        if (staging_.d2d_done != nullptr) {
+            (void)cudaEventDestroy(staging_.d2d_done);
+            staging_.d2d_done = nullptr;
+        }
+        throw;
+    }
 }
 
 ProgramImplCore::~ProgramImplCore() noexcept {
@@ -536,6 +607,11 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (staging_.copies_done != nullptr) {
         (void)cudaEventDestroy(staging_.copies_done);
         staging_.copies_done = nullptr;
+    }
+    if (copy_hold_cancel_fence_ != nullptr) {
+        (void)cudaEventSynchronize(copy_hold_cancel_fence_);
+        (void)cudaEventDestroy(copy_hold_cancel_fence_);
+        copy_hold_cancel_fence_ = nullptr;
     }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         clear_context_checkpoints(sequences[lane]);
@@ -800,6 +876,7 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
             clear_context_checkpoints(sequence);
             ordered_reset(sequence);
             sequence.ledger.clear();
+            sequence.prefix_hashes.clear();
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
@@ -826,6 +903,7 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
+            sequence.prefix_hashes.truncate(base);
             drop_context_checkpoints_after(sequence, base);
             // A tier entry cut at its turn checkpoint is the only one restored without a rewrite
             // checkpoint at its frontier.
@@ -864,6 +942,7 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
             restore_rewrite_checkpoint_state(sequence);
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+            sequence.prefix_hashes.truncate(base);
             drop_context_checkpoints_after(sequence, base);
             maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
                                         prompt_tokens, request_plan.capture_context_checkpoints,
@@ -901,6 +980,7 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
                 sequence.rewrite_checkpoint = {};
             }
             sequence.ledger.resize(base);
+            sequence.prefix_hashes.truncate(base);
             drop_context_checkpoints_after(sequence, base);
             maybe_capture_turn_rollback(sequence, request, prompt, request_plan.reuse, base,
                                         prompt_tokens, request_plan.capture_context_checkpoints,
@@ -934,12 +1014,19 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
         request.pending = {};
         request.restored_context_checkpoint_tokens =
             qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse) ? base : 0;
-        sequence.disk_unpacked_context_base = 0;
-        sequence.disk_unpacked_context_hash = {};
+        sequence.tier_unpacked_context_base = 0;
+        sequence.tier_unpacked_context_hash = {};
         sequence.mtp_draft_count            = 0;
         sequence.tail_hidden_valid          = base == prompt_tokens && sequence.tail_hidden_valid;
+        sequence.prefix_hashes.clear();
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt);
+        if (request_plan.prompt_hashes) {
+            if (request_plan.prompt_hashes->size() != prompt.token_ids.size() + 1) {
+                throw std::logic_error("planned prompt hash chain does not describe the prompt");
+            }
+            sequence.prefix_hashes.assign(*request_plan.prompt_hashes);
+        }
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
             if (!dflash || !io.dflash_decode || !sequence.kv) {
@@ -1348,16 +1435,6 @@ void ProgramImplCore::retain_committed_sequence(SequenceState& sequence, Request
     request.lifecycle = Lifecycle::Complete;
 }
 
-void ProgramImplCore::retain_lane(std::uint32_t lane) {
-    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    SequenceState& sequence = sequences[lane];
-    RequestControl& request = requests[lane];
-    if (request.lifecycle != Lifecycle::Active) {
-        throw std::logic_error("retain_lane requires a committed Active sequence");
-    }
-    retain_committed_sequence(sequence, request);
-}
-
 bool ProgramImplCore::retain_reusable_lane(std::uint32_t lane) {
     if (lane >= max_concurrency) { return false; }
     SequenceState& sequence = sequences[lane];
@@ -1453,7 +1530,9 @@ bool ProgramImplCore::revert_cancelled_prefill_lane(std::uint32_t lane) {
         if (sequence.ledger.size() > frontier) {
             sequence.ledger.resize(frontier + 1);
             sequence.prefix_identity.truncate(frontier + 1);
+            sequence.prefix_hashes.truncate(frontier + 1);
         } else {
+            sequence.prefix_hashes.truncate(frontier);
             const TokenId pad = frontier == 0 ? TokenId{0} : sequence.ledger[frontier - 1];
             sequence.ledger.push_back(pad);
             sequence.prefix_identity.truncate(frontier);
@@ -1502,7 +1581,7 @@ bool ProgramImplCore::capture_cuts_at_rewrite(const SequenceState& sequence) con
 }
 
 qwen3_6::detail::RamCaptureSource
-ProgramImplCore::ram_capture_source(const SequenceState& sequence,
+ProgramImplCore::ram_capture_source(SequenceState& sequence,
                                     qwen3_6::detail::ResidentPrefixIdentity& cut_identity) {
     if (!sequence.kv || !sequence.retained) {
         throw std::logic_error("RAM capture requires a retained sequence bundle");
@@ -1523,10 +1602,10 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence,
     source.rewrite_frontier        = sequence.rewrite_checkpoint.frontier;
     source.ledger                  = sequence.ledger;
     source.identity                = &sequence.prefix_identity;
-    source.hash_f = qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity,
-                                                    sequence.execution_frontier);
+    source.hash_f = sequence.prefix_hashes.at(sequence.ledger, sequence.prefix_identity,
+                                              sequence.execution_frontier);
     if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0) {
-        source.hash_c = qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity,
+        source.hash_c       = sequence.prefix_hashes.at(sequence.ledger, sequence.prefix_identity,
                                                         sequence.rewrite_checkpoint.frontier);
         source.hash_c_valid = true;
     }
@@ -1540,37 +1619,38 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence,
     source.gdn_current_slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
     source.tail_hidden      = &sequence.tail_hidden;
     if (sequence.rewrite_checkpoint.valid) {
+        // The host tier reads the image on the copy stream after its fence.
         const ContextCheckpointHead& image = sequence.rewrite_image;
-        image.wait_copies();
-        source.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
-        source.rewrite_state             = qwen3_6::detail::RewriteStateHostSource{
-            .conv      = image.conv->data(),
-            .recurrent = image.recurrent->data(),
-            .dflash    = image.dflash ? image.dflash->data() : nullptr,
+        source.rewrite_checkpoint_hidden   = &sequence.rewrite_checkpoint_hidden;
+        source.rewrite_state               = qwen3_6::detail::RewriteStateHostSource{
+            .conv        = image.conv.data(),
+            .recurrent   = image.recurrent.data(),
+            .dflash      = image.dflash ? image.dflash.data() : nullptr,
+            .copies_done = image.copies_done,
         };
     }
     source.ladder_heads.reserve(sequence.context_checkpoints.size());
     for (const ContextCheckpointHead& head : sequence.context_checkpoints) {
-        head.wait_copies();
         RamLadderHead view;
-        view.frontier = head.frontier;
-        view.hash     = head.hash;
-        view.kind     = head.kind;
+        view.frontier    = head.frontier;
+        view.hash        = head.hash;
+        view.kind        = head.kind;
+        view.copies_done = head.copies_done;
         if (head.conv) {
-            view.conv       = head.conv->data();
-            view.conv_bytes = head.conv->size();
+            view.conv       = head.conv.data();
+            view.conv_bytes = head.conv.size();
         }
         if (head.recurrent) {
-            view.recurrent       = head.recurrent->data();
-            view.recurrent_bytes = head.recurrent->size();
+            view.recurrent       = head.recurrent.data();
+            view.recurrent_bytes = head.recurrent.size();
         }
         if (head.hidden) {
-            view.hidden       = head.hidden->data();
-            view.hidden_bytes = head.hidden->size();
+            view.hidden       = head.hidden.data();
+            view.hidden_bytes = head.hidden.size();
         }
         if (head.dflash) {
-            view.dflash       = head.dflash->data();
-            view.dflash_bytes = head.dflash->size();
+            view.dflash       = head.dflash.data();
+            view.dflash_bytes = head.dflash.size();
         }
         source.ladder_heads.push_back(view);
     }
@@ -1587,7 +1667,7 @@ ProgramImplCore::ram_capture_source(const SequenceState& sequence,
 // slot a committed lane keeps past its execution frontier), the checkpoint state and hidden are
 // the current set, and no rewrite set or later head is stored.
 qwen3_6::detail::RamCaptureSource
-ProgramImplCore::cut_ram_capture_source(const SequenceState& sequence,
+ProgramImplCore::cut_ram_capture_source(SequenceState& sequence,
                                         qwen3_6::detail::ResidentPrefixIdentity& cut_identity) {
     // The caller has established the retained bundle; value() throws if that contract is broken.
     const auto& kv               = sequence.kv.value();
@@ -1606,9 +1686,8 @@ ProgramImplCore::cut_ram_capture_source(const SequenceState& sequence,
     source.tail_hidden_valid = true;
     source.ledger            = std::span<const TokenId>(sequence.ledger).first(frontier + 1);
     source.identity          = &cut_identity;
-    source.hash_f =
-        qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity, frontier);
-    source.text       = &kv.text;
+    source.hash_f = sequence.prefix_hashes.at(sequence.ledger, sequence.prefix_identity, frontier);
+    source.text   = &kv.text;
     source.text_pool  = &decoder->text_kv.pool();
     source.text_pages = std::min(ninfer::pages_for_tokens(frontier), kv.text.mapped_page_count());
     if (kv.backend) {
@@ -1620,38 +1699,40 @@ ProgramImplCore::cut_ram_capture_source(const SequenceState& sequence,
         source.backend_pages =
             std::min(ninfer::pages_for_tokens(backend_tokens), kv.backend->mapped_page_count());
     }
+    // The checkpoint image is the current state; the host tier reads it, like every head below,
+    // on its host-copy stream after the image's own fence.
     const ContextCheckpointHead& image = sequence.rewrite_image;
-    image.wait_copies();
-    source.gdn              = &decoder->linear_attention;
+    source.gdn                         = &decoder->linear_attention;
     source.gdn_current_slot = LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
     source.current_state    = qwen3_6::detail::RewriteStateHostSource{
-        .conv      = image.conv->data(),
-        .recurrent = image.recurrent->data(),
-        .dflash    = image.dflash ? image.dflash->data() : nullptr,
+        .conv        = image.conv.data(),
+        .recurrent   = image.recurrent.data(),
+        .dflash      = image.dflash ? image.dflash.data() : nullptr,
+        .copies_done = image.copies_done,
     };
     source.tail_hidden = &sequence.rewrite_checkpoint_hidden;
     for (const ContextCheckpointHead& head : sequence.context_checkpoints) {
         if (head.frontier > frontier) { continue; }
-        head.wait_copies();
         RamLadderHead view;
-        view.frontier = head.frontier;
-        view.hash     = head.hash;
-        view.kind     = head.kind;
+        view.frontier    = head.frontier;
+        view.hash        = head.hash;
+        view.kind        = head.kind;
+        view.copies_done = head.copies_done;
         if (head.conv) {
-            view.conv       = head.conv->data();
-            view.conv_bytes = head.conv->size();
+            view.conv       = head.conv.data();
+            view.conv_bytes = head.conv.size();
         }
         if (head.recurrent) {
-            view.recurrent       = head.recurrent->data();
-            view.recurrent_bytes = head.recurrent->size();
+            view.recurrent       = head.recurrent.data();
+            view.recurrent_bytes = head.recurrent.size();
         }
         if (head.hidden) {
-            view.hidden       = head.hidden->data();
-            view.hidden_bytes = head.hidden->size();
+            view.hidden       = head.hidden.data();
+            view.hidden_bytes = head.hidden.size();
         }
         if (head.dflash) {
-            view.dflash       = head.dflash->data();
-            view.dflash_bytes = head.dflash->size();
+            view.dflash       = head.dflash.data();
+            view.dflash_bytes = head.dflash.size();
         }
         source.ladder_heads.push_back(view);
     }
@@ -1709,19 +1790,35 @@ bool ProgramImplCore::capture_retained_lane(std::uint32_t lane, std::uint64_t* r
             ram.record_drop();
             return false;
         }
-        std::optional<std::uint64_t> victim = ram.peek_oldest_unpinned();
-        if (!victim) {
-            try {
-                ram.wait_pending_copies();
-            } catch (...) { // NOLINT(bugprone-empty-catch): capture is optional; see below.
-                // A failed wait leaves the re-peek below to find a victim or record a drop.
+        // Without a disk tier the oldest unclaimed entry is dropped. Retired blocks waiting
+        // only for their copy fence free before any live entry is dropped: a non-blocking
+        // caller defers, a blocking one waits for them.
+        if (ram.retired_fence_pending()) {
+            if (!may_block && deferred != nullptr) {
+                *deferred = true;
+                return false;
             }
-            victim = ram.peek_oldest_unpinned();
+            if (may_block && ram.wait_retired_copies()) { continue; }
+        }
+        // This admission's own earlier captures are never victims: a deferral rolls them back,
+        // so the retry would recapture and target them again.
+        std::optional<std::uint64_t> victim;
+        for (const std::uint64_t id : ram.unpinned_ids()) {
+            if (std::find(attempt_ram_ids.begin(), attempt_ram_ids.end(), id) ==
+                attempt_ram_ids.end()) {
+                victim = id;
+                break;
+            }
         }
         if (!victim) {
             ram.record_drop();
             return false;
         }
+        if (!may_block && !ram.copies_ready(*victim)) {
+            if (deferred != nullptr) { *deferred = true; }
+            return false;
+        }
+        if (may_block) { ram.wait_entry_copies(*victim); }
         (void)ram.evict_one_unpinned(*victim);
     }
 }
@@ -1760,14 +1857,14 @@ void ProgramImplCore::reload_turn_rollback_into_staging(std::uint32_t lane,
         unoccupy_staging();
         return;
     }
-    head->wait_copies();
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, head->copies_done, 0));
     if (staging_.d2d_done != nullptr) {
         CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
     }
     const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
-    decoder->linear_attention.unpack_slot_from_host(staging, head->conv->data(),
-                                                    head->recurrent->data(), device.copy_stream);
-    CUDA_CHECK(cudaMemcpyAsync(staging_hidden.data, head->hidden->data(), staging_hidden.bytes(),
+    decoder->linear_attention.unpack_slot_from_host(staging, head->conv.data(),
+                                                    head->recurrent.data(), device.copy_stream);
+    CUDA_CHECK(cudaMemcpyAsync(staging_hidden.data, head->hidden.data(), staging_hidden.bytes(),
                                cudaMemcpyHostToDevice, device.copy_stream));
     CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
     record_context_checkpoint_head_use(*head, device.copy_stream);
@@ -1785,39 +1882,19 @@ bool ProgramImplCore::staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixH
         staging_.occupied, staging_.lane, staging_.hash, staging_.frontier, lane, hash, frontier);
 }
 
-ContextCheckpointHead ProgramImplCore::acquire_context_checkpoint_head(std::size_t conv_bytes,
-                                                                       std::size_t recurrent_bytes,
-                                                                       std::size_t hidden_bytes,
-                                                                       std::size_t dflash_bytes) {
-    const qwen3_6::detail::ContextCheckpointImageLayout wanted{conv_bytes, recurrent_bytes,
-                                                               hidden_bytes, dflash_bytes};
-    const auto layout_of = [](const ContextCheckpointHead& head) {
-        return qwen3_6::detail::ContextCheckpointImageLayout{
-            head.conv ? head.conv->size() : 0, head.recurrent ? head.recurrent->size() : 0,
-            head.hidden ? head.hidden->size() : 0, head.dflash ? head.dflash->size() : 0};
-    };
-    for (std::size_t i = 0; i < context_checkpoint_pool_.size(); ++i) {
-        ContextCheckpointHead& candidate = context_checkpoint_pool_[i];
-        if (!qwen3_6::detail::context_checkpoint_image_layout_matches(layout_of(candidate),
-                                                                      wanted)) {
-            continue;
-        }
-        ContextCheckpointHead head = std::move(candidate);
-        if (i + 1 != context_checkpoint_pool_.size()) {
-            candidate = std::move(context_checkpoint_pool_.back());
-        }
-        context_checkpoint_pool_.pop_back();
-        return head;
-    }
+PinnedImage ProgramImplCore::carve_checkpoint_image(std::size_t bytes) {
+    if (bytes == 0) { return {}; }
+    if (!checkpoint_image_slab_) { throw std::logic_error("checkpoint image slab is missing"); }
+    void* data =
+        checkpoint_image_slab_->try_alloc(bytes, qwen3_6::detail::kCheckpointImageAlignment);
+    if (data == nullptr) { throw std::logic_error("checkpoint image slab is undersized"); }
+    return {data, bytes};
+}
 
-    ContextCheckpointHead head;
-    head.prepare_copy_event();
-    if (conv_bytes != 0) { head.conv = std::make_shared<PinnedHostBuffer>(conv_bytes); }
-    if (recurrent_bytes != 0) {
-        head.recurrent = std::make_shared<PinnedHostBuffer>(recurrent_bytes);
-    }
-    if (hidden_bytes != 0) { head.hidden = std::make_shared<PinnedHostBuffer>(hidden_bytes); }
-    if (dflash_bytes != 0) { head.dflash = std::make_shared<PinnedHostBuffer>(dflash_bytes); }
+std::optional<ContextCheckpointHead> ProgramImplCore::acquire_context_checkpoint_head() noexcept {
+    if (context_checkpoint_pool_.empty()) { return std::nullopt; }
+    std::optional<ContextCheckpointHead> head(std::move(context_checkpoint_pool_.back()));
+    context_checkpoint_pool_.pop_back();
     return head;
 }
 
@@ -1854,68 +1931,71 @@ void ProgramImplCore::drop_context_checkpoints_after(SequenceState& sequence,
     sequence.next_context_mark = next.value_or(0);
 }
 
-void ProgramImplCore::install_ram_context_checkpoints(
-    SequenceState& sequence, const qwen3_6::detail::RamRestoredHost& host) {
+void ProgramImplCore::install_ram_context_checkpoints(SequenceState& sequence,
+                                                      const qwen3_6::detail::RamRestoredHost& host,
+                                                      std::uint64_t entry_id,
+                                                      std::uint32_t reuse_base) {
+    if (!kv_ram_cache_) { throw std::logic_error("RAM checkpoint install requires a RAM tier"); }
+    qwen3_6::detail::KVRamCache& ram = *kv_ram_cache_;
     std::vector<ContextCheckpointHead> heads;
     heads.reserve(host.ladder_images.size());
-    for (const qwen3_6::detail::RamLadderImage& image : host.ladder_images) {
-        if (image.hidden_bytes != 0 && sequence.tail_hidden.bytes() != 0 &&
-            image.hidden_bytes != sequence.tail_hidden.bytes()) {
-            continue;
+    std::vector<HostCopy> copies;
+    copies.reserve(4 * host.ladder_images.size());
+    std::vector<cudaEvent_t> fences;
+    fences.reserve(host.ladder_images.size());
+    try {
+        for (const qwen3_6::detail::RamLadderImage& image : host.ladder_images) {
+            // Occupy keeps only heads at or before the restored base.
+            if (image.frontier > reuse_base) { continue; }
+            const auto matches = [](const void* data, std::size_t bytes, const PinnedImage& slot) {
+                return (data != nullptr ? bytes : 0) == slot.size();
+            };
+            if (context_checkpoint_pool_.empty()) { break; }
+            const ContextCheckpointHead& layout = context_checkpoint_pool_.back();
+            if (!matches(image.conv, image.conv_bytes, layout.conv) ||
+                !matches(image.recurrent, image.recurrent_bytes, layout.recurrent) ||
+                !matches(image.hidden, image.hidden_bytes, layout.hidden) ||
+                !matches(image.dflash, image.dflash_bytes, layout.dflash)) {
+                continue;
+            }
+            std::optional<ContextCheckpointHead> head = acquire_context_checkpoint_head();
+            if (!head) { break; }
+            head->frontier = image.frontier;
+            head->hash     = image.hash;
+            head->kind     = image.kind;
+            if (head->conv) { copies.push_back({head->conv.data(), image.conv, image.conv_bytes}); }
+            if (head->recurrent) {
+                copies.push_back({head->recurrent.data(), image.recurrent, image.recurrent_bytes});
+            }
+            if (head->hidden) {
+                copies.push_back({head->hidden.data(), image.hidden, image.hidden_bytes});
+            }
+            if (head->dflash) {
+                copies.push_back({head->dflash.data(), image.dflash, image.dflash_bytes});
+            }
+            // A recycled head's last reader or writer finishes before the copies refill it.
+            fences.push_back(head->copies_done);
+            heads.push_back(std::move(*head));
         }
-        if (image.conv != nullptr && sequence.tail_hidden.bytes() != 0 && image.hidden == nullptr) {
-            continue;
+        // The copies run on the RAM tier's host-copy stream beside the entry's H2D, and only
+        // each head's fence follows them: the restored lane's prefill does not wait for heads
+        // it does not read. The entry's block stays alive until they land.
+        ram.copy_from_entry(entry_id, copies, fences);
+    } catch (...) {
+        for (ContextCheckpointHead& head : heads) {
+            recycle_context_checkpoint_head(std::move(head));
         }
-        ContextCheckpointHead head =
-            acquire_context_checkpoint_head(image.conv != nullptr ? image.conv_bytes : 0,
-                                            image.recurrent != nullptr ? image.recurrent_bytes : 0,
-                                            image.hidden != nullptr ? image.hidden_bytes : 0,
-                                            image.dflash != nullptr ? image.dflash_bytes : 0);
-        head.wait_copies();
-        head.frontier = image.frontier;
-        head.hash     = image.hash;
-        head.kind     = image.kind;
-        if (image.conv_bytes != 0 && image.conv != nullptr) {
-            std::memcpy(head.conv->data(), image.conv, image.conv_bytes);
-        }
-        if (image.recurrent_bytes != 0 && image.recurrent != nullptr) {
-            std::memcpy(head.recurrent->data(), image.recurrent, image.recurrent_bytes);
-        }
-        if (image.hidden_bytes != 0 && image.hidden != nullptr) {
-            std::memcpy(head.hidden->data(), image.hidden, image.hidden_bytes);
-        }
-        if (image.dflash_bytes != 0 && image.dflash != nullptr) {
-            std::memcpy(head.dflash->data(), image.dflash, image.dflash_bytes);
-        }
-        heads.push_back(std::move(head));
+        throw;
     }
     clear_context_checkpoints(sequence);
     sequence.context_checkpoints = std::move(heads);
 }
 
-void ProgramImplCore::install_disk_context_checkpoints(SequenceState& sequence,
-                                                       qwen3_6::detail::DiskRestoredHost host) {
-    std::vector<ContextCheckpointHead> heads;
-    heads.reserve(host.ladder_images.size());
-    for (qwen3_6::detail::DiskLadderImage& image : host.ladder_images) {
-        if (image.hidden && sequence.tail_hidden.bytes() != 0 &&
-            image.hidden->size() != sequence.tail_hidden.bytes()) {
-            continue;
-        }
-        if (image.conv && sequence.tail_hidden.bytes() != 0 && !image.hidden) { continue; }
-        ContextCheckpointHead head;
-        head.prepare_copy_event();
-        head.frontier  = image.frontier;
-        head.hash      = image.hash;
-        head.kind      = image.kind;
-        head.conv      = std::move(image.conv);
-        head.recurrent = std::move(image.recurrent);
-        head.hidden    = std::move(image.hidden);
-        head.dflash    = std::move(image.dflash);
-        heads.push_back(std::move(head));
+void ProgramImplCore::recycle_pending_disk_checkpoint_heads() noexcept {
+    for (ContextCheckpointHead& head : pending_disk_checkpoint_heads_) {
+        recycle_context_checkpoint_head(std::move(head));
     }
-    clear_context_checkpoints(sequence);
-    sequence.context_checkpoints = std::move(heads);
+    pending_disk_checkpoint_heads_.clear();
 }
 
 bool ProgramImplCore::captures_context_checkpoints() const noexcept {
@@ -1934,18 +2014,18 @@ void ProgramImplCore::pack_dflash_cyclic_to_head(ContextCheckpointHead& head) {
     if (!dflash || !head.dflash) {
         throw std::logic_error("context checkpoint DFlash cyclic image is incomplete");
     }
-    dflash->staging_local.copy_lane_to_host(0, head.dflash->data(), device.copy_stream);
+    dflash->staging_local.copy_lane_to_host(0, head.dflash.data(), device.copy_stream);
 }
 
 void ProgramImplCore::restore_dflash_cyclic_from_head(SequenceState& sequence,
                                                       const ContextCheckpointHead& head) {
     if (speculative_backend != SpeculativeBackend::DFlash) { return; }
     if (!dflash) { throw std::logic_error("context checkpoint restore requires DFlash state"); }
-    head.wait_copies();
-    if (!head.dflash || head.dflash->size() != dflash->local.lane_host_bytes()) {
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, head.copies_done, 0));
+    if (!head.dflash || head.dflash.size() != dflash->local.lane_host_bytes()) {
         throw std::logic_error("context checkpoint DFlash cyclic image is incomplete");
     }
-    dflash->local.copy_lane_from_host(head.dflash->data(), static_cast<std::int32_t>(sequence.lane),
+    dflash->local.copy_lane_from_host(head.dflash.data(), static_cast<std::int32_t>(sequence.lane),
                                       device.stream);
     sequence.dflash_context_frontier = head.frontier;
 }
@@ -1955,12 +2035,15 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
     const auto head = std::find_if(
         sequence.context_checkpoints.begin(), sequence.context_checkpoints.end(),
         [base](const ContextCheckpointHead& candidate) { return candidate.frontier == base; });
+    // A host-tier restore already unpacked the planned head into current; the installed head,
+    // when the pool had one for it, only remains a later reuse candidate.
+    if (sequence.tier_unpacked_context_base == base &&
+        (head == sequence.context_checkpoints.end() ||
+         sequence.tier_unpacked_context_hash == head->hash)) {
+        return;
+    }
     if (head == sequence.context_checkpoints.end()) {
         throw std::logic_error("context checkpoint head is missing at restore");
-    }
-    if (sequence.disk_unpacked_context_base == base &&
-        sequence.disk_unpacked_context_hash == head->hash) {
-        return;
     }
     const std::int32_t current =
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
@@ -1978,20 +2061,20 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
         record_context_checkpoint_head_use(*head, device.stream);
         return;
     }
-    head->wait_copies();
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, head->copies_done, 0));
     if (!head->conv || !head->recurrent) {
         throw std::logic_error("context checkpoint GDN image is incomplete");
     }
-    decoder->linear_attention.unpack_slot_from_host(current, head->conv->data(),
-                                                    head->recurrent->data(), device.stream);
+    decoder->linear_attention.unpack_slot_from_host(current, head->conv.data(),
+                                                    head->recurrent.data(), device.stream);
     if (sequence.tail_hidden.bytes() != 0 && !head->hidden) {
         throw std::logic_error("context checkpoint hidden image is incomplete");
     }
     if (head->hidden) {
-        if (head->hidden->size() != sequence.tail_hidden.bytes()) {
+        if (head->hidden.size() != sequence.tail_hidden.bytes()) {
             throw std::logic_error("context checkpoint hidden geometry mismatch");
         }
-        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, head->hidden->data(),
+        CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, head->hidden.data(),
                                    sequence.tail_hidden.bytes(), cudaMemcpyHostToDevice,
                                    device.stream));
         sequence.tail_hidden_valid = true;
@@ -2000,17 +2083,14 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
     record_context_checkpoint_head_use(*head, device.stream);
 }
 
-// Startup-owned like the device slots it replaces: no prefill or restore path allocates it.
+// Startup-carved like the device slots it replaces: no prefill or restore path allocates it.
 void ProgramImplCore::allocate_rewrite_image(SequenceState& sequence) {
     ContextCheckpointHead& image = sequence.rewrite_image;
     image.prepare_copy_event();
-    image.conv =
-        std::make_shared<PinnedHostBuffer>(decoder->linear_attention.conv_host_image_bytes());
+    image.conv = carve_checkpoint_image(decoder->linear_attention.conv_host_image_bytes());
     image.recurrent =
-        std::make_shared<PinnedHostBuffer>(decoder->linear_attention.recurrent_host_image_bytes());
-    if (dflash) {
-        image.dflash = std::make_shared<PinnedHostBuffer>(dflash->local.lane_host_bytes());
-    }
+        carve_checkpoint_image(decoder->linear_attention.recurrent_host_image_bytes());
+    image.dflash = carve_checkpoint_image(dflash ? dflash->local.lane_host_bytes() : 0);
 }
 
 // Snapshots the current GDN slot (and DFlash local lane) into the staging slot on the compute
@@ -2027,8 +2107,8 @@ void ProgramImplCore::capture_rewrite_image(SequenceState& sequence) {
         // No staging slot without MTP/DFlash: copy to the image on the compute stream.
         if (dflash) { throw std::logic_error("DFlash rewrite capture requires the staging lane"); }
         CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
-        decoder->linear_attention.pack_slot_to_host(current, image.conv->data(),
-                                                    image.recurrent->data(), device.stream);
+        decoder->linear_attention.pack_slot_to_host(current, image.conv.data(),
+                                                    image.recurrent.data(), device.stream);
         record_context_checkpoint_head_use(image, device.stream);
         return;
     }
@@ -2042,10 +2122,10 @@ void ProgramImplCore::capture_rewrite_image(SequenceState& sequence) {
     CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
     // A staging-miss restore may still be reading the previous image.
     CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, image.copies_done, 0));
-    decoder->linear_attention.pack_slot_to_host(staging, image.conv->data(),
-                                                image.recurrent->data(), device.copy_stream);
+    decoder->linear_attention.pack_slot_to_host(staging, image.conv.data(), image.recurrent.data(),
+                                                device.copy_stream);
     if (dflash) {
-        dflash->staging_local.copy_lane_to_host(0, image.dflash->data(), device.copy_stream);
+        dflash->staging_local.copy_lane_to_host(0, image.dflash.data(), device.copy_stream);
     }
     CUDA_CHECK(cudaEventRecord(image.copies_done, device.copy_stream));
     CUDA_CHECK(cudaEventRecord(staging_.copies_done, device.copy_stream));
@@ -2068,21 +2148,23 @@ void ProgramImplCore::restore_rewrite_checkpoint_state(SequenceState& sequence) 
         return;
     }
     CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
-    decoder->linear_attention.unpack_slot_from_host(current, image.conv->data(),
-                                                    image.recurrent->data(), device.stream);
-    if (dflash) { dflash->local.copy_lane_from_host(image.dflash->data(), lane, device.stream); }
+    decoder->linear_attention.unpack_slot_from_host(current, image.conv.data(),
+                                                    image.recurrent.data(), device.stream);
+    if (dflash) { dflash->local.copy_lane_from_host(image.dflash.data(), lane, device.stream); }
     record_context_checkpoint_head_use(image, device.stream);
 }
 
 qwen3_6::detail::RewriteStateHostTarget
 ProgramImplCore::rewrite_state_host_target(SequenceState& sequence) {
-    // Tier restores overwrite the image with host copies, so staging no longer matches it.
-    sequence.rewrite_image.wait_copies();
+    // Tier restores overwrite the image by stream-ordered host copies after its fence and
+    // re-record the fence after them, so staging no longer matches it.
+    ContextCheckpointHead& image = sequence.rewrite_image;
     ++sequence.rewrite_image_generation;
     return qwen3_6::detail::RewriteStateHostTarget{
-        .conv      = sequence.rewrite_image.conv->data(),
-        .recurrent = sequence.rewrite_image.recurrent->data(),
-        .dflash = sequence.rewrite_image.dflash ? sequence.rewrite_image.dflash->data() : nullptr,
+        .conv        = image.conv.data(),
+        .recurrent   = image.recurrent.data(),
+        .dflash      = image.dflash ? image.dflash.data() : nullptr,
+        .copies_done = image.copies_done,
     };
 }
 
@@ -2113,7 +2195,7 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
     if (sequence.ledger.size() < base || sequence.tail_hidden.data == nullptr) { return; }
 
     const qwen3_6::detail::PrefixHash128 hash =
-        qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity, base);
+        sequence.prefix_hashes.at(sequence.ledger, sequence.prefix_identity, base);
     auto& heads = sequence.context_checkpoints;
     ContextCheckpointHead head;
     const auto existing_rollback =
@@ -2121,23 +2203,22 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
             return existing.kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback;
         });
     if (existing_rollback != heads.end()) {
-        existing_rollback->wait_copies();
         head = std::move(*existing_rollback);
         heads.erase(existing_rollback);
     } else {
         try {
             heads.reserve(heads.size() + 1);
-            head = acquire_context_checkpoint_head(
-                decoder->linear_attention.conv_host_image_bytes(),
-                decoder->linear_attention.recurrent_host_image_bytes(), staging_hidden.bytes(),
-                dflash ? dflash->local.lane_host_bytes() : 0);
         } catch (const std::bad_alloc&) { return; }
-        head.wait_copies();
+        std::optional<ContextCheckpointHead> acquired = acquire_context_checkpoint_head();
+        if (!acquired) { return; }
+        head = std::move(*acquired);
     }
     head.frontier = base;
     head.hash     = hash;
     head.kind     = qwen3_6::detail::ContextCheckpointKind::TurnRollback;
-    fence_staging_copies();
+    // Earlier copy-stream reads of staging (a drain or rollback reload) finish before it is
+    // overwritten; the compute stream itself wrote d2d_done.
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, staging_.copies_done, 0));
     unoccupy_staging();
     const std::int32_t current =
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
@@ -2153,9 +2234,11 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
     staging_.hash     = hash;
     staging_.kind     = qwen3_6::detail::ContextCheckpointKind::TurnRollback;
     CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
-    decoder->linear_attention.pack_slot_to_host(staging, head.conv->data(), head.recurrent->data(),
+    // The head's previous reader or writer (a tier copy or restore) finishes before the refill.
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, head.copies_done, 0));
+    decoder->linear_attention.pack_slot_to_host(staging, head.conv.data(), head.recurrent.data(),
                                                 device.copy_stream);
-    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), staging_hidden.data, staging_hidden.bytes(),
+    CUDA_CHECK(cudaMemcpyAsync(head.hidden.data(), staging_hidden.data, staging_hidden.bytes(),
                                cudaMemcpyDeviceToHost, device.copy_stream));
     pack_dflash_cyclic_to_head(head);
     CUDA_CHECK(cudaEventRecord(head.copies_done, device.copy_stream));
@@ -2185,21 +2268,19 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
     if (sequence.ledger.size() < frontier) { return; }
 
     const qwen3_6::detail::PrefixHash128 hash =
-        qwen3_6::detail::prefix_hash_at(sequence.ledger, sequence.prefix_identity, frontier);
-    ContextCheckpointHead head;
+        sequence.prefix_hashes.at(sequence.ledger, sequence.prefix_identity, frontier);
     try {
         sequence.context_checkpoints.reserve(sequence.context_checkpoints.size() + 1);
-        head = acquire_context_checkpoint_head(
-            decoder->linear_attention.conv_host_image_bytes(),
-            decoder->linear_attention.recurrent_host_image_bytes(), staging_hidden.bytes(),
-            dflash ? dflash->local.lane_host_bytes() : 0);
     } catch (const std::bad_alloc&) { return; }
-    head.wait_copies();
-    head.frontier = qwen3_6::detail::advertised_context_checkpoint_frontier(frontier);
-    head.hash     = hash;
-    head.kind     = qwen3_6::detail::ContextCheckpointKind::Ladder;
+    std::optional<ContextCheckpointHead> acquired = acquire_context_checkpoint_head();
+    if (!acquired) { return; }
+    ContextCheckpointHead head = std::move(*acquired);
+    head.frontier              = qwen3_6::detail::advertised_context_checkpoint_frontier(frontier);
+    head.hash                  = hash;
+    head.kind                  = qwen3_6::detail::ContextCheckpointKind::Ladder;
 
-    fence_staging_copies();
+    // Earlier copy-stream reads of staging finish before the compute stream overwrites it.
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, staging_.copies_done, 0));
     // A rewrite capture in the same step overwrites staging next; reloading the rollback
     // would only make the compute stream wait for a copy that is discarded.
     const bool reload_rollback =
@@ -2208,15 +2289,6 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
     const std::uint32_t saved_lane                  = staging_.lane;
     const std::uint32_t saved_frontier              = staging_.frontier;
     const qwen3_6::detail::PrefixHash128 saved_hash = staging_.hash;
-    if (reload_rollback && saved_lane < max_concurrency) {
-        for (const ContextCheckpointHead& existing : sequences[saved_lane].context_checkpoints) {
-            if (existing.kind == qwen3_6::detail::ContextCheckpointKind::TurnRollback &&
-                existing.frontier == saved_frontier && existing.hash == saved_hash) {
-                existing.wait_copies();
-                break;
-            }
-        }
-    }
     unoccupy_staging();
 
     const std::int32_t current =
@@ -2237,9 +2309,11 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
         staging_.kind     = qwen3_6::detail::ContextCheckpointKind::Ladder;
     }
     CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, staging_.d2d_done, 0));
-    decoder->linear_attention.pack_slot_to_host(staging, head.conv->data(), head.recurrent->data(),
+    // The recycled head's previous reader or writer finishes before the refill.
+    CUDA_CHECK(cudaStreamWaitEvent(device.copy_stream, head.copies_done, 0));
+    decoder->linear_attention.pack_slot_to_host(staging, head.conv.data(), head.recurrent.data(),
                                                 device.copy_stream);
-    CUDA_CHECK(cudaMemcpyAsync(head.hidden->data(), staging_hidden.data, staging_hidden.bytes(),
+    CUDA_CHECK(cudaMemcpyAsync(head.hidden.data(), staging_hidden.data, staging_hidden.bytes(),
                                cudaMemcpyDeviceToHost, device.copy_stream));
     pack_dflash_cyclic_to_head(head);
     CUDA_CHECK(cudaEventRecord(head.copies_done, device.copy_stream));
@@ -2332,13 +2406,22 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
             .kind     = host.rewrite_kind,
             .frontier = host.rewrite_frontier,
         };
+        sequence.prefix_hashes.clear();
         sequence.ledger          = std::move(host.ledger);
         sequence.prefix_identity = std::move(host.identity);
         sequence.disk_entry_id   = host.disk_entry_id;
         sequence.mtp_draft_count = 0;
         sequence.retained        = true;
-        install_ram_context_checkpoints(sequence, host);
+        install_ram_context_checkpoints(sequence, host, entry_id, request_plan.reuse_base);
         if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
+            // unpack_device restored the matched head into current with the entry's KV.
+            if (!request_plan.prompt_hashes ||
+                request_plan.reuse_base >= request_plan.prompt_hashes->size()) {
+                throw std::logic_error("RAM staged restore plan has no prompt hash chain");
+            }
+            sequence.tier_unpacked_context_base = request_plan.reuse_base;
+            sequence.tier_unpacked_context_hash =
+                (*request_plan.prompt_hashes)[request_plan.reuse_base];
             sequence.tail_hidden_valid = true;
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = request_plan.reuse_base;
@@ -2364,14 +2447,12 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
 
 void ProgramImplCore::claim_ram_entry(std::uint64_t entry_id) {
     if (!kv_ram_cache_) { throw std::logic_error("RAM claim requires an enabled RAM tier"); }
-    if (kv_disk_cache_) { kv_disk_cache_->begin_ram_idle_exclusion(entry_id); }
-    try {
-        kv_ram_cache_->claim(entry_id);
-    } catch (...) {
-        if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(entry_id); }
-        throw;
-    }
-    if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(entry_id); }
+    // A restore only reads the entry, like a disk spill of it: neither waits for the other,
+    // and the spill's I/O pin keeps the block alive past consume. A spill that commits after
+    // the restore read the image's disk ticket leaves the lane with the older ticket: an
+    // Extend/Refresh keeps that id, and after a Create/Branch the lane's next spill re-plans
+    // from the older ticket (extra disk copies until FIFO eviction, never wrong data).
+    kv_ram_cache_->claim(entry_id);
 }
 
 void ProgramImplCore::release_ram_entry(std::uint64_t entry_id) {
@@ -2404,6 +2485,10 @@ void disk_reuse_pages(SpeculativeBackend backend, bool growing_backend, std::uin
     } else if (backend == SpeculativeBackend::DFlash) {
         backend_pages = ninfer::pages_for_tokens(reuse_base);
     }
+}
+
+bool ProgramImplCore::ram_restore_ready(std::uint64_t entry_id) const {
+    return !kv_ram_cache_ || kv_ram_cache_->copies_ready(entry_id);
 }
 
 bool ProgramImplCore::disk_restore_ready(std::uint64_t entry_id) const {
@@ -2474,34 +2559,84 @@ void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry
             target.dflash_local = &dflash->local;
             target.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
         }
-        target.stream = device.copy_stream;
+        target.stream               = device.copy_stream;
+        target.committed_generation = request_plan.disk_committed_generation;
 
-        std::optional<qwen3_6::detail::DiskRestoredHost> loaded = disk.load_host(entry_id);
+        std::optional<qwen3_6::detail::DiskRestoredHost> loaded =
+            disk.load_host(entry_id, request_plan.disk_committed_generation);
         if (!loaded) { throw std::runtime_error("KV disk restore lost its claimed entry"); }
         qwen3_6::detail::DiskRestoredHost host = std::move(*loaded);
-        pending_disk_restore_ticket_           = disk.restore_device(entry_id, target);
-        pending_disk_checkpoint_lane_          = lane;
-        sequence.execution_frontier            = host.execution_frontier;
-        sequence.ledger_frontier               = host.ledger_frontier;
-        sequence.rope_delta                    = host.rope_delta;
-        sequence.text_kv_valid                 = host.text_kv_valid;
-        sequence.mtp_kv_valid                  = host.mtp_kv_valid;
-        sequence.dflash_context_frontier       = host.dflash_context_frontier;
-        sequence.tail_hidden_valid             = host.tail_hidden_valid;
-        sequence.rewrite_checkpoint            = RewriteCheckpoint{
+        // The restore workers decode the entry's checkpoint heads straight into pool heads.
+        // Occupy keeps only heads at or before the base, so later ones are never decoded; the
+        // planned head goes first so pool exhaustion cannot drop it.
+        // Heads stay pending when an earlier cancellation failed before it could prove its
+        // workers drained; drain again before they return to the pool.
+        if (!pending_disk_checkpoint_heads_.empty()) {
+            disk.cancel_restore();
+            recycle_pending_disk_checkpoint_heads();
+        }
+        pending_disk_checkpoint_heads_.reserve(host.ladders.size());
+        target.checkpoint_images.reserve(host.ladders.size());
+        std::vector<qwen3_6::detail::RamLadderIndex> wanted;
+        wanted.reserve(host.ladders.size());
+        for (const qwen3_6::detail::RamLadderIndex& ladder : host.ladders) {
+            if (ladder.frontier == request_plan.reuse_base) { wanted.push_back(ladder); }
+        }
+        for (const qwen3_6::detail::RamLadderIndex& ladder : host.ladders) {
+            if (ladder.frontier < request_plan.reuse_base) { wanted.push_back(ladder); }
+        }
+        for (const qwen3_6::detail::RamLadderIndex& ladder : wanted) {
+            std::optional<ContextCheckpointHead> head = acquire_context_checkpoint_head();
+            if (!head) { break; }
+            head->frontier = ladder.frontier;
+            head->hash     = ladder.hash;
+            head->kind     = ladder.kind;
+            target.checkpoint_images.push_back(qwen3_6::detail::DiskCheckpointImageTarget{
+                .frontier        = head->frontier,
+                .hash            = head->hash,
+                .kind            = head->kind,
+                .conv            = head->conv.data(),
+                .conv_bytes      = head->conv.size(),
+                .recurrent       = head->recurrent.data(),
+                .recurrent_bytes = head->recurrent.size(),
+                .hidden          = head->hidden.data(),
+                .hidden_bytes    = head->hidden.size(),
+                .dflash          = head->dflash.data(),
+                .dflash_bytes    = head->dflash.size(),
+                .writable        = head->copies_done,
+            });
+            pending_disk_checkpoint_heads_.push_back(std::move(*head));
+        }
+        pending_disk_restore_ticket_     = disk.restore_device(entry_id, target);
+        pending_disk_checkpoint_lane_    = lane;
+        sequence.execution_frontier      = host.execution_frontier;
+        sequence.ledger_frontier         = host.ledger_frontier;
+        sequence.rope_delta              = host.rope_delta;
+        sequence.text_kv_valid           = host.text_kv_valid;
+        sequence.mtp_kv_valid            = host.mtp_kv_valid;
+        sequence.dflash_context_frontier = host.dflash_context_frontier;
+        sequence.tail_hidden_valid       = host.tail_hidden_valid;
+        sequence.rewrite_checkpoint      = RewriteCheckpoint{
             .valid    = host.rewrite_valid,
             .kind     = host.rewrite_kind,
             .frontier = host.rewrite_frontier,
         };
+        sequence.prefix_hashes.clear();
         sequence.ledger          = std::move(host.ledger);
         sequence.prefix_identity = std::move(host.identity);
         sequence.disk_entry_id   = entry_id;
         sequence.mtp_draft_count = 0;
         sequence.retained        = true;
         if (qwen3_6::detail::is_staged_checkpoint_restore(request_plan.reuse)) {
-            sequence.disk_unpacked_context_base = request_plan.reuse_base;
-            sequence.disk_unpacked_context_hash = qwen3_6::detail::prefix_hash_at(
-                sequence.ledger, sequence.prefix_identity, request_plan.reuse_base);
+            // The restore unpacks the planned head into current with the entry's KV.
+            sequence.tier_unpacked_context_base = request_plan.reuse_base;
+            // The plan selected this head by its hash in the prompt's chain.
+            if (!request_plan.prompt_hashes ||
+                request_plan.reuse_base >= request_plan.prompt_hashes->size()) {
+                throw std::logic_error("disk staged restore plan has no prompt hash chain");
+            }
+            sequence.tier_unpacked_context_hash =
+                (*request_plan.prompt_hashes)[request_plan.reuse_base];
             sequence.tail_hidden_valid = true;
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = request_plan.reuse_base;
@@ -2523,7 +2658,15 @@ void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry
     } catch (...) {
         pending_disk_checkpoint_lane_.reset();
         synchronize_for_failure_cleanup(device);
-        if (kv_disk_cache_) { kv_disk_cache_->cancel_restore(); }
+        if (kv_disk_cache_) {
+            try {
+                kv_disk_cache_->cancel_restore();
+                // No restore worker writes the heads once cancellation has drained them. A
+                // failed cancellation leaves them pending for the next restore to drain.
+                recycle_pending_disk_checkpoint_heads();
+            } catch (...) { // NOLINT(bugprone-empty-catch): the restore's own failure is rethrown.
+            }
+        }
         clear_lane(sequence, request);
         throw;
     }
@@ -2548,10 +2691,8 @@ void ProgramImplCore::release_disk_entry(std::uint64_t entry_id) {
 }
 
 void ProgramImplCore::invalidate_disk_entry(std::uint64_t entry_id) {
-    if (kv_disk_cache_) {
-        kv_disk_cache_->cancel_idle_spill();
-        kv_disk_cache_->invalidate_entry(entry_id);
-    }
+    // A spill built on the entry sees the quarantine and abandons its own commit.
+    if (kv_disk_cache_) { kv_disk_cache_->invalidate_entry(entry_id); }
 }
 
 void ProgramImplCore::consume_disk_entry(std::uint64_t entry_id) {
@@ -2590,27 +2731,36 @@ void ProgramImplCore::pump_disk_restore() {
     }
 }
 
+void ProgramImplCore::begin_copy_hold_cancel() {
+    if (kv_disk_cache_) { kv_disk_cache_->begin_cancel_restore(); }
+    CUDA_CHECK(cudaEventRecord(copy_hold_cancel_fence_, device.copy_stream));
+}
+
+bool ProgramImplCore::copy_hold_cancel_settled() const {
+    const cudaError_t ready = cudaEventQuery(copy_hold_cancel_fence_);
+    if (ready == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(ready);
+    return !kv_disk_cache_ || kv_disk_cache_->restore_cancel_settled();
+}
+
 void ProgramImplCore::cancel_disk_restore() {
     if (!kv_disk_cache_) { return; }
-    const std::uint64_t ticket = pending_disk_restore_ticket_;
-    kv_disk_cache_->cancel_restore();
-    if (ticket != 0) { kv_disk_cache_->release_restore_ticket(ticket); }
+    qwen3_6::detail::KVDiskCache& disk = *kv_disk_cache_;
+    const std::uint64_t ticket         = pending_disk_restore_ticket_;
+    disk.cancel_restore();
+    // No restore worker writes the heads once cancellation has drained them.
+    recycle_pending_disk_checkpoint_heads();
+    if (ticket != 0) { disk.release_restore_ticket(ticket); }
     pending_disk_restore_ticket_ = 0;
     pending_disk_checkpoint_lane_.reset();
 }
 
 void ProgramImplCore::discard_ram_capture(std::uint64_t ram_id) {
     if (ram_id == 0 || !kv_ram_cache_) { return; }
-    if (kv_disk_cache_) { kv_disk_cache_->begin_ram_idle_exclusion(ram_id); }
-    bool evicted = false;
-    try {
-        evicted = kv_ram_cache_->evict_one_unpinned(ram_id);
-    } catch (...) {
-        if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(ram_id); }
-        throw;
-    }
-    if (evicted && kv_disk_cache_) { kv_disk_cache_->forget_ram_resident(ram_id); }
-    if (kv_disk_cache_) { kv_disk_cache_->end_ram_idle_exclusion(ram_id); }
+    // Neither call waits: a spill of the capture is cancelled at its next cancellation point,
+    // and the block is freed once its D2H fence and the spill's I/O pin are gone.
+    if (kv_disk_cache_) { kv_disk_cache_->abandon_ram_spill(ram_id); }
+    kv_ram_cache_->discard(ram_id);
 }
 
 void ProgramImplCore::shutdown_kv_tiers(LoadProgress progress) {
@@ -2624,7 +2774,10 @@ void ProgramImplCore::shutdown_kv_tiers(LoadProgress progress) {
         } catch (...) {}
     };
     const bool report_disk = kv_disk_cache_.has_value() && static_cast<bool>(progress.callback);
-    if (kv_disk_cache_) { kv_disk_cache_->cancel_restore(); }
+    if (kv_disk_cache_) {
+        kv_disk_cache_->cancel_restore();
+        recycle_pending_disk_checkpoint_heads();
+    }
     if (kv_disk_cache_) { kv_disk_cache_->cancel_idle_spill(); }
     std::array<std::uint32_t, kMaximumConcurrency> failed_lanes{};
     std::size_t failed_lane_count = 0;
@@ -2746,14 +2899,17 @@ void ProgramImplCore::install_pending_disk_restore_checkpoints() {
     if (!pending_disk_checkpoint_lane_ || !kv_disk_cache_) { return; }
     const std::uint32_t lane = *pending_disk_checkpoint_lane_;
     pending_disk_checkpoint_lane_.reset();
-    try {
-        qwen3_6::detail::DiskRestoredHost host = kv_disk_cache_->take_restore_checkpoints();
-        install_disk_context_checkpoints(sequences[lane], std::move(host));
-    } catch (const std::bad_alloc&) {
-        // Copies have completed, but the optional restored checkpoint index
-        // could not be materialized. CopyHold still owns the unstarted request.
-        throw runtime::CacheRestoreFailure("disk cache checkpoint metadata allocation failed");
+    // A loaded restore decoded every requested head and its workers no longer write them.
+    // Otherwise the restore never loaded (stopping or cancelled): drain any worker first.
+    if (!kv_disk_cache_->take_restore_checkpoints()) {
+        kv_disk_cache_->cancel_restore();
+        recycle_pending_disk_checkpoint_heads();
+        return;
     }
+    SequenceState& sequence = sequences[lane];
+    clear_context_checkpoints(sequence);
+    sequence.context_checkpoints = std::move(pending_disk_checkpoint_heads_);
+    pending_disk_checkpoint_heads_.clear();
 }
 
 std::uint64_t ProgramImplCore::pending_disk_restore_ticket() const noexcept {
@@ -2798,6 +2954,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
     sequence.prefix_identity.clear();
+    sequence.prefix_hashes.clear();
     sequence.text_kv_valid              = 0;
     sequence.mtp_kv_valid               = 0;
     sequence.dflash_context_frontier    = 0;
@@ -2809,8 +2966,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.use_tick                   = 0;
     sequence.disk_entry_id              = 0;
     sequence.rewrite_checkpoint         = {};
-    sequence.disk_unpacked_context_base = 0;
-    sequence.disk_unpacked_context_hash = {};
+    sequence.tier_unpacked_context_base = 0;
+    sequence.tier_unpacked_context_hash = {};
     clear_context_checkpoints(sequence);
     request.pending                 = {};
     request.adaptive                = {};
@@ -4694,6 +4851,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.checkpoint_image_host_bytes =
+        checkpoint_image_slab_ ? checkpoint_image_slab_->capacity() : 0;
+    out.checkpoint_image_pool_heads = context_checkpoint_pool_.capacity();
     const qwen3_6::detail::KvRamSnapshot ram =
         kv_ram_cache_ ? kv_ram_cache_->snapshot() : qwen3_6::detail::KvRamSnapshot{};
     out.kv_ram_capacity_bytes = ram.capacity_bytes;
@@ -4861,6 +5021,7 @@ void ProgramImplCore::run_decode_score(PreparedPromptData&& prompt,
             throw std::logic_error("decode score prefix ledger is not prompt plus sampled token");
         }
         sequence.ledger.back() = ids[prefix];
+        sequence.prefix_hashes.truncate(sequence.ledger.size() - 1);
         if (speculative_backend == SpeculativeBackend::Mtp) { sequence.mtp_draft_count = 0; }
         resolve_prefill_lane(0, false);
 
@@ -4892,10 +5053,12 @@ void ProgramImplCore::run_decode_score(PreparedPromptData&& prompt,
                 // MTP resolve inserts licensed tokens; replace the committed token with gold
                 // and drop the model's next drafts so the following step stays T=1 verify.
                 resolve_pending_batch(lanes, accepted, terminal, cancelled);
-                sequence.ledger.back()   = ids[position + 1];
+                sequence.ledger.back() = ids[position + 1];
+                sequence.prefix_hashes.truncate(sequence.ledger.size() - 1);
                 sequence.mtp_draft_count = 0;
             } else {
                 sequence.ledger.back() = ids[position + 1];
+                sequence.prefix_hashes.truncate(sequence.ledger.size() - 1);
                 resolve_pending_batch(lanes, accepted, terminal, cancelled);
             }
         }

@@ -289,10 +289,6 @@ int main() {
     stale.disk_reusable_tokens     = 50;
     check(route(stale).route == RecoveryPrefillRoute::HostDisk,
           "a stale resident count on an unretained lane hid the host checkpoint");
-    auto restored                = host_disk;
-    restored.host_restore_failed = true;
-    check(route(restored).route == RecoveryPrefillRoute::Cold && route(restored).detail.empty(),
-          "a failed host restore did not cold-prefill");
 
     check(recovery_output_budget_preserved(8, 8, 1) && !recovery_output_budget_preserved(8, 8, 2) &&
               !recovery_output_budget_preserved(9, 8, 1),

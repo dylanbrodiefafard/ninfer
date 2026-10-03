@@ -79,6 +79,10 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    // prefix_hash_chain(prompt), computed once at submission for a reusable prompt when a
+    // checkpoint or host tier can key on it, and shared by every lane, RAM, and disk plan of
+    // the request and by the occupied sequence.
+    std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
     bool allow_prefix_reuse         = false;
     bool force_cold_prefill         = false;
     bool capture_context_checkpoint = false;
@@ -107,6 +111,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint64_t disk_committed_generation = 0;
     bool capture_context_checkpoints        = false;
     bool capture_context_checkpoint         = false;
+    std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -151,6 +156,7 @@ struct RewriteCheckpoint {
 };
 
 using ContextCheckpointHead = qwen3_6::detail::ContextCheckpointHead;
+using PinnedImage           = qwen3_6::detail::PinnedImage;
 
 struct ContextCheckpointIndex {
     std::uint32_t frontier = 0;
@@ -198,6 +204,8 @@ struct SequenceState {
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    // Hashes of (ledger, prefix_identity) prefixes; truncated wherever either is rewritten.
+    qwen3_6::detail::ResidentPrefixHashes prefix_hashes;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
@@ -218,19 +226,19 @@ struct SequenceState {
     std::uint64_t disk_entry_id    = 0;
     RewriteCheckpoint rewrite_checkpoint;
     // Lane-owned pinned image of the rewrite checkpoint's GDN slot and DFlash cyclic lane,
-    // allocated with the Program; rewrite_checkpoint says whether its contents are valid. Its
-    // fence covers every asynchronous copy that reads or writes it.
+    // carved from the Program's checkpoint-image slab; rewrite_checkpoint says whether its
+    // contents are valid. Its fence covers every asynchronous copy that reads or writes it.
     ContextCheckpointHead rewrite_image;
     // Advances whenever the image contents are replaced (capture or tier restore), so a
     // staging slot still holding an older capture is never mistaken for it.
     std::uint64_t rewrite_image_generation = 0;
     std::vector<ContextCheckpointHead> context_checkpoints;
     std::uint32_t next_context_mark = 0;
-    // Set by HostDisk staged restore after the matching head is unpacked into current.
-    // start_prefill skips a second unpack when occupy matches this (base, hash). Cleared
-    // at end of occupy and in clear_lane so a later VRAM/RAM staged restore still unpacks.
-    std::uint32_t disk_unpacked_context_base = 0;
-    qwen3_6::detail::PrefixHash128 disk_unpacked_context_hash{};
+    // Set by a HostRam or HostDisk staged restore, which unpacks the matching head into current
+    // with the entry's KV. Occupy skips a second unpack when it matches this (base, hash).
+    // Cleared at end of occupy and in clear_lane so a later VRAM staged restore still unpacks.
+    std::uint32_t tier_unpacked_context_base = 0;
+    qwen3_6::detail::PrefixHash128 tier_unpacked_context_hash{};
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -326,7 +334,6 @@ public:
                                std::span<const std::uint8_t> cancelled,
                                std::span<const std::uint8_t> rejected = {});
     void abort_lane(std::uint32_t lane) noexcept;
-    void retain_lane(std::uint32_t lane);
     // Active sequences are retained in place. An already retained lane stays.
     // False leaves the caller to drop the lane; this does not clear it.
     [[nodiscard]] bool retain_reusable_lane(std::uint32_t lane);
@@ -353,6 +360,7 @@ public:
                                              std::span<const std::uint64_t> attempt_ram_ids = {});
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
+    [[nodiscard]] bool ram_restore_ready(std::uint64_t entry_id) const;
     [[nodiscard]] bool disk_restore_ready(std::uint64_t entry_id) const;
     [[nodiscard]] bool kv_ram_reclaim_pending() const;
     void claim_ram_entry(std::uint64_t entry_id);
@@ -371,6 +379,10 @@ public:
     void prefetch_disk_plan(std::uint64_t entry_id, const RequestPlan& plan);
     void pump_disk_restore();
     void cancel_disk_restore();
+    // A cancelled or failed copy-hold admission stops further restore work and fences the copies
+    // already queued, so the executor can keep decoding until they settle instead of draining them.
+    void begin_copy_hold_cancel();
+    [[nodiscard]] bool copy_hold_cancel_settled() const;
     void discard_ram_capture(std::uint64_t ram_id);
     void shutdown_kv_tiers(LoadProgress progress = {});
     void request_idle_spill();
@@ -460,6 +472,9 @@ public:
     Tensor rewrite_checkpoint_hidden_store;
     Tensor staging_hidden;
 
+    // Every pinned checkpoint image (per-lane rewrite images and the context-checkpoint pool),
+    // prefaulted and registered at startup. Declared before every head that views it.
+    std::optional<HostPinnedArena> checkpoint_image_slab_;
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
 
@@ -485,6 +500,9 @@ public:
     std::uint64_t next_use_tick_ = 1;
     bool kv_tiers_shutdown_      = false;
     std::optional<std::uint32_t> pending_disk_checkpoint_lane_;
+    // Pool heads the disk restore workers decode into; the Program keeps them until the restore
+    // installs them or cancel_restore() has quiesced every writer.
+    std::vector<ContextCheckpointHead> pending_disk_checkpoint_heads_;
     std::uint64_t pending_disk_restore_ticket_ = 0;
 
 private:
@@ -553,10 +571,10 @@ private:
                              const PreparedPromptData& prompt, const RequestBasePlanImpl& base);
     [[nodiscard]] bool capture_cuts_at_rewrite(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::detail::RamCaptureSource
-    ram_capture_source(const SequenceState& sequence,
+    ram_capture_source(SequenceState& sequence,
                        qwen3_6::detail::ResidentPrefixIdentity& cut_identity);
     [[nodiscard]] qwen3_6::detail::RamCaptureSource
-    cut_ram_capture_source(const SequenceState& sequence,
+    cut_ram_capture_source(SequenceState& sequence,
                            qwen3_6::detail::ResidentPrefixIdentity& cut_identity);
     void accumulate_prefill_nll(std::span<const TokenId> ids, std::uint32_t chunk_begin,
                                 std::uint32_t chunk_tokens, std::uint32_t skip,
@@ -584,18 +602,17 @@ private:
                                          const ContextCheckpointHead& head);
     void snapshot_dflash_cyclic_to_staging(std::int32_t lane);
     void pack_dflash_cyclic_to_head(ContextCheckpointHead& head);
-    [[nodiscard]] ContextCheckpointHead acquire_context_checkpoint_head(std::size_t conv_bytes,
-                                                                        std::size_t recurrent_bytes,
-                                                                        std::size_t hidden_bytes,
-                                                                        std::size_t dflash_bytes);
+    [[nodiscard]] PinnedImage carve_checkpoint_image(std::size_t bytes);
+    // An unowned pool head, or none once every head is owned (the image is optional).
+    [[nodiscard]] std::optional<ContextCheckpointHead> acquire_context_checkpoint_head() noexcept;
     void record_context_checkpoint_head_use(ContextCheckpointHead& head, cudaStream_t stream);
     void recycle_context_checkpoint_head(ContextCheckpointHead&& head) noexcept;
     void drop_context_checkpoints_after(SequenceState& sequence, std::uint32_t frontier) noexcept;
     void clear_context_checkpoints(SequenceState& sequence) noexcept;
     void install_ram_context_checkpoints(SequenceState& sequence,
-                                         const qwen3_6::detail::RamRestoredHost& host);
-    void install_disk_context_checkpoints(SequenceState& sequence,
-                                          qwen3_6::detail::DiskRestoredHost host);
+                                         const qwen3_6::detail::RamRestoredHost& host,
+                                         std::uint64_t entry_id, std::uint32_t reuse_base);
+    void recycle_pending_disk_checkpoint_heads() noexcept;
     [[nodiscard]] bool staging_holds(std::uint32_t lane, qwen3_6::detail::PrefixHash128 hash,
                                      std::uint32_t frontier) const noexcept;
     [[nodiscard]] bool captures_context_checkpoints() const noexcept;
@@ -620,6 +637,9 @@ private:
     };
 
     ContextCheckpointStaging staging_;
+    cudaEvent_t copy_hold_cancel_fence_ = nullptr;
+    // Startup-carved heads of one layout (GDN, staging hidden, DFlash cyclic); capacity is
+    // context_checkpoint_image_pool_capacity and never grows.
     std::vector<ContextCheckpointHead> context_checkpoint_pool_;
 };
 

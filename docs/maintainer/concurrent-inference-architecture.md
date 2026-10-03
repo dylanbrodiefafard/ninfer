@@ -102,10 +102,13 @@ PrefillChunk / DecodeRound 正在读写的 pages 不得作为 copy source 或 de
 context-checkpoint 冻结是例外：staging GDN（slot `C`，与 lane current 不相交）、staging hidden，
 以及 DFlash staging cyclic state 的 D2H 可以与**同一条** lane 的下一 prefill chunk 重叠。冻结期间 `C` 从 turn-rollback occupant
 借出，pack 后 H2D 把 rollback 装回；`occupied=false` 必须发生在 clobber D2D 之前。`device.stream`
-上的 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images 使用 Program-owned
-high-water pinned pool；head 离队后回池，后续相同 layout 的 freeze 复用 allocation 与 completion event，
-不在 prefill boundary 重复 `cudaMallocHost`/`cudaFreeHost`。Pool 只保留实际到达过的 high-water image，
-不按 `C * mark-count` 预分配。
+上的 `synchronize()` 只排空 compute，不排空 copy_stream。Checkpoint host images（每条 lane 的 rewrite
+image 与 MTP/DFlash context-checkpoint head pool）在启动时从一块 prefault 并注册的 pinned slab 切出，
+由 Program 拥有；head 离队后回池，后续 freeze、turn-rollback 与 RAM/disk restore 复用同一 image 与
+completion event，serving 期间不调用 `cudaMallocHost`/`cudaFreeHost`。Pool 容量是每 lane 一个 rollback
+head，加上所有 lane 在共享 KV capacity 内能同时持有的 ladder head 数（`--max-context` 之上的 mark
+不可达）；pool 用尽时跳过可选的 capture 或 restored head。复用 head 前等待其上一个 DMA/host-copy
+owner 一律是 stream wait（copy_stream 或 compute stream 等 head fence），scheduler 线程不 host wait。
 
 ### 2.7 Bounded ingress and output
 
@@ -184,7 +187,8 @@ generation is omitted. A ready checkpoint that is a prefix is restored and the s
 prefilled. The retry does not take a new admission and does not trim at an arbitrary
 token. Retry queue entries are bounded by admitted slots and checked against current lane
 ownership. Other lanes still decode outside the exclusive retry prefill; a resident-miss
-host restore blocks them for the copy.
+host restore holds its lane in copy-hold like an admission, so they keep decoding while the
+RAM or disk image copies, and a failed host restore cold-prefills the same lane.
 
 Calls remain unpublished until recovery accepts the terminal result. Already streamed prose
 and reasoning cannot be retracted. All generated attempts consume the original token budget;
@@ -904,14 +908,38 @@ Capture queues D2H on `copy_stream` and **holds the source pages mapped** until 
 Admit is two-phase: bind records the request in its lane and the retained victims awaiting release
 as copy-hold (including victims whose optional capture was dropped); other decode-ready lanes may
 run a DecodeRound while that D2H (and later restore H2D) is in flight. Admit-complete waits with `cudaEventQuery` (and `EventSynchronize` on copy
-only when membership is empty), then `evict_retained_lane` / `kv.reset()`, optional restore H2D,
+only when membership is empty), then `evict_retained_lane` / `kv.reset()`, optional restore H2D
+(a RAM restore starts only once its entry's own capture copies are ready, polled while others
+decode),
 `wait_kv_ram_copies_on_compute` immediately before this lane's `start_prefill_lane`, and harvest.
 Harvest of D2H/H2D elapsed happens after that wait, not on an overlapping DecodeRound launch.
+A cancellation while other lanes decode does not drain at once: `begin_copy_hold_cancel` stops
+further disk restore work and records a fence on the copy stream behind the copies already queued,
+the hold stays parked while DecodeRounds continue, and the drain below runs once
+`copy_hold_cancel_settled` (or membership is empty), so it no longer waits on in-flight SSD reads.
+A shutdown with such a hold parked finishes it as cancelled.
+A `CacheRestoreFailure` before prefill consumes the prompt parks the hold the same way; once it
+settles, best-effort cleanup releases the claims and drops the failed RAM/disk entry, then a retry
+cold-prefills its lane and a new request re-enters FIFO admission as a cold fallback. Any other
+request-local failure (`RequestError`, or a `CacheRestoreFailure` after prefill starts) of an
+admission, copy-hold, or generation-recovery retry drains and fails only that request (a drain
+after any `CacheRestoreFailure`, or of a cancelled failed hold, also drops the failed entry);
+other exceptions remain Engine-fatal.
 If the held request is cancelled or fails before admit-complete, drain waits for those copies,
-harvests, releases an unused RAM claim, and calls `evict_retained_lane` on every selected victim.
+harvests, releases unused RAM/disk claims (after a `CacheRestoreFailure` it also drops the failed
+entry, as above), and calls `evict_retained_lane` on every selected victim not yet evicted; a
+failed restore's fallback evicts them the same way.
 If capture succeeded, the completed D2H image is the only remaining copy. A later RAM hit
 exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
-after them so other-lane decode can overlap the DMA. Consume then erases that entry wherever it
+after them so other-lane decode can overlap the DMA. The pinned rewrite-checkpoint and ladder
+images (GDN conv/recurrent, about 150 MB per image, plus DFlash cyclic) copy host-to-host through
+`enqueue_host_copies`, a stream-ordered `cudaLaunchHostFunc` callback, because a host-to-host
+`cudaMemcpyAsync` is synchronous with respect to the calling thread. Each image's `copies_done`
+fence is stream-waited before and re-recorded after those copies; disk restore does the same on
+its state stream. A RAM restore's installed ladder heads copy out of the entry on that host-copy
+stream behind only their own fences: no stream joins them and the entry's copy fence, which gates
+the lane's first prefill chunk, excludes them; a separate block fence keeps the entry's block
+allocated until they land. Consume then erases that entry wherever it
 sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
 before consume releases the claim and leaves the host row in place. After consume the bundle lives
 only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` (human `kv-ram=` / `n=`)
@@ -988,7 +1016,10 @@ opportunity，直到该 lane 的 copies 允许 `start_prefill_lane`。
 6. choose, prepare and launch one next GPU unit
 ```
 
-copy-hold 在 admission gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
+已取消或 restore 失败而 parked 的 copy-hold 最先检查：其 fenced copies settle 之前，只要 membership
+非空就只跑该 membership 的 DecodeRound，generation recovery、admission 和 prefill 都不推进；settle 后
+（或 membership 为空）才 cancel 该 lane，或丢弃失败 entry 并走 cold fallback。其余 copy-hold 在
+admission gate 之前检查：membership 非空且 copies 未就绪时先跑其他 lane 的
 DecodeRound（不 harvest、不 `EventSynchronize` copy）；membership 空则 `EventSynchronize` copy
 并 complete。Capture D2H ready 后 `admit_complete` 可能排入 restore H2D；若 frozen membership 非空，
 同一 boundary transaction 立即运行该 membership 的 DecodeRound，不重新处理 control events。Harvest
@@ -1004,10 +1035,20 @@ boundary 最多发布一个新 admitted request。
 调度策略为：
 
 ```text
-if a prefill owner exists:
+if a parked copy-hold was cancelled or its restore failed:
+    if its fenced copies have not settled and requests are DECODE_READY:
+        run one DecodeRound containing them (nothing else advances)
+    else:
+        cancel it, or drop the failed entry and fall back to cold prefill
+else if an admitted copy-hold exists:
+    if its copies are not ready and requests are DECODE_READY:
+        run one DecodeRound containing them
+    else:
+        complete it and start its prefill
+else if a prefill owner exists:
     run the next PrefillChunk
-else if an admitted copy-hold is ready:
-    complete it and start its prefill
+else if a generation-recovery retry is queued:
+    start it (a host restore parks it as a copy-hold)
 else if a pending request is admissible and decode-admission budget permits:
     admit it and start its prefill
 else if one or more requests are DECODE_READY:
