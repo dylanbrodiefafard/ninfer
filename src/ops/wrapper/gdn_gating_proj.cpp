@@ -1,6 +1,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include "ops/common/a8_activation_check.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cmath>
@@ -134,23 +135,33 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
     detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 
-void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
-                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
-                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
-                          Tensor& beta, cudaStream_t stream) {
+namespace {
+
+void require_h_activation(const A8Activation* h_activation, const Tensor& h, const char* op) {
+    if (h_activation == nullptr) { return; }
+    if (detail::validate_a8_activation(*h_activation, 5120, op) != h.ne[1] ||
+        h_activation->codes.ne[1] != h.ne[1]) {
+        throw std::invalid_argument(std::string(op) + ": h activation must be [5120,T]");
+    }
+}
+
+void norm_gating_27(const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
+                    const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias,
+                    WorkspaceArena& ws, Tensor& h, A8Activation* h_activation, Tensor& g,
+                    Tensor& beta, cudaStream_t stream) {
     constexpr const char* op = "gdn_norm_gating_proj";
     validate_norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g, beta,
                             op);
-
-    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
+    require_h_activation(h_activation, h, op);
+    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, h_activation, a_weight, b_weight,
+                                          A_log, dt_bias, ws, g, beta, stream);
 }
 
-void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
-                                           const Weight& a_weight, const Weight& b_weight,
-                                           const Tensor& A_log, const Tensor& dt_bias,
-                                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
-                                           cudaStream_t stream, std::int32_t sequence_width) {
+void norm_gating_27_packed(const Tensor& x, const Tensor& norm_weight, float eps,
+                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
+                           A8Activation* h_activation, Tensor& g, Tensor& beta, cudaStream_t stream,
+                           std::int32_t sequence_width) {
     constexpr const char* op = "gdn_norm_gating_proj_packed_sequences";
     if (x.ne[1] <= 0 || sequence_width <= 0 || x.ne[1] % sequence_width != 0) {
         throw std::invalid_argument(
@@ -158,6 +169,7 @@ void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_w
     }
     validate_norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g, beta,
                             op);
+    require_h_activation(h_activation, h, op);
 
     const std::int32_t tokens = x.ne[1];
     const std::int32_t batch  = tokens / sequence_width;
@@ -165,8 +177,8 @@ void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_w
         throw std::invalid_argument("gdn_norm_gating_proj_packed_sequences: batch must be in 1..6");
     }
     if (detail::bf16_gdn_gating_packed_aggregates(sequence_width, batch)) {
-        detail::bf16_gdn_norm_gating_packed_dispatch(x, norm_weight, eps, h, a_weight, b_weight,
-                                                     A_log, dt_bias, ws, g, beta, stream);
+        detail::bf16_gdn_norm_gating_packed_dispatch(x, norm_weight, eps, h, h_activation, a_weight,
+                                                     b_weight, A_log, dt_bias, ws, g, beta, stream);
         return;
     }
 
@@ -174,9 +186,53 @@ void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_w
         Tensor h_panel    = h.slice(1, offset, sequence_width);
         Tensor g_panel    = g.slice(1, offset, sequence_width);
         Tensor beta_panel = beta.slice(1, offset, sequence_width);
-        gdn_norm_gating_proj(x.slice(1, offset, sequence_width), norm_weight, eps, a_weight,
-                             b_weight, A_log, dt_bias, ws, h_panel, g_panel, beta_panel, stream);
+        A8Activation activation_panel;
+        if (h_activation != nullptr) {
+            activation_panel = a8_activation_columns(*h_activation, offset, sequence_width);
+        }
+        norm_gating_27(x.slice(1, offset, sequence_width), norm_weight, eps, a_weight, b_weight,
+                       A_log, dt_bias, ws, h_panel,
+                       h_activation != nullptr ? &activation_panel : nullptr, g_panel, beta_panel,
+                       stream);
     }
+}
+
+} // namespace
+
+void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
+                          Tensor& beta, cudaStream_t stream) {
+    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h, nullptr, g, beta,
+                   stream);
+}
+
+void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
+                          A8Activation& h_activation, Tensor& g, Tensor& beta,
+                          cudaStream_t stream) {
+    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h, &h_activation, g,
+                   beta, stream);
+}
+
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width) {
+    norm_gating_27_packed(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h, nullptr,
+                          g, beta, stream, sequence_width);
+}
+
+void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
+                                           const Weight& a_weight, const Weight& b_weight,
+                                           const Tensor& A_log, const Tensor& dt_bias,
+                                           WorkspaceArena& ws, Tensor& h,
+                                           A8Activation& h_activation, Tensor& g, Tensor& beta,
+                                           cudaStream_t stream, std::int32_t sequence_width) {
+    norm_gating_27_packed(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h,
+                          &h_activation, g, beta, stream, sequence_width);
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -199,8 +255,8 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, 32);
     const Weight b_weight = bf16_row_view(ab_weight, 32, 32);
-    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
+    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, nullptr, a_weight, b_weight,
+                                          A_log, dt_bias, ws, g, beta, stream);
 }
 
 } // namespace ninfer::ops

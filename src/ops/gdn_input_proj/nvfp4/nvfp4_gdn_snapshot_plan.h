@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -41,6 +42,16 @@ void nvfp4_gdn_record_quantized_launch(const Tensor& x, const Weight& weight,
                                        Tensor& value, Tensor& z, LinearPolicy policy,
                                        WorkspaceArena& workspace, cudaStream_t stream,
                                        const std::int32_t* parent_index);
+
+// The AllowA8 quantized record (width in [kNvfp4FirstA8, 16]) of an already quantized
+// [5120, width*batch] activation; otherwise identical to nvfp4_gdn_record_quantized_launch.
+void nvfp4_gdn_record_a8_input_launch(Fp8A8Workspace activation, std::int32_t width,
+                                      std::int32_t batch, const Weight& weight,
+                                      const Tensor& conv_weight, const Tensor& conv_states,
+                                      const Tensor& valid_columns, const Tensor& initial_slot,
+                                      Tensor& conv_record, Tensor& query, Tensor& key,
+                                      Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                                      cudaStream_t stream, const std::int32_t* parent_index);
 
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size);

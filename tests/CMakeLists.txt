@@ -363,6 +363,7 @@ target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DI
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
+  a8_activation
   add_bias
   gelu
   silu_mul
@@ -528,6 +529,7 @@ ninfer_add_sanitizer_cases(ninfer_sampling_test)
 ninfer_add_sanitizer_cases(ninfer_speculative_round_test)
 ninfer_add_sanitizer_cases(ninfer_gqa_attention_test)
 ninfer_add_sanitizer_cases(ninfer_attn_input_proj_test)
+ninfer_add_sanitizer_cases(ninfer_a8_activation_test)
 set(ninfer_sanitizer_racecheck_tests
   ninfer_kv_cache_test
   ninfer_embedding_test

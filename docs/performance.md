@@ -18,6 +18,41 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Producer-side A8 activations (2026-10-03)
+
+In DFlash verification every NVFP4 A8 projection quantized its BF16 input in a standalone
+`fp8_a8_quantize_kernel` (T CTAs, 1.3-2.2 us each, 184 launches per C=1 round). The producers of
+the 5120- and 6144-wide inputs now publish the row-scaled E4M3 activation
+(`include/ninfer/ops/a8_activation.h`) themselves, and the attention-input, GDN-record and
+`linear_add` projections consume it through A8-input overloads:
+
+- attention input: `rmsnorm_a8` (codes only) feeds `attn_input_proj`;
+- GDN input: the 27B `gdn_norm_gating_proj` writes BF16 `h` for the control projection and its
+  A8 activation for the record projection in one RMSNorm launch;
+- GDN output: `gated_rmsnorm_a8` normalizes all 48 heads of a token in one CTA, with each head's
+  arithmetic identical to `gated_rmsnorm`, and encodes the 6144-wide column;
+- attention output: `sigmoid_mul_a8` applies the gate and encodes in one launch.
+
+Codes, scales, and every projection output are bit-identical to the previous two-kernel path
+(public-Op exact checks in `ninfer_a8_activation_test` and the GDN record qualification; greedy
+Engine trajectories identical at C=1/4/6). The MLP-down input (17408, produced by the gate/up
+GEMM) keeps its standalone quantizer. Kernels per C=1 round fell from 963 to 844 and GPU kernel
+time from 13.50 to 13.35 ms.
+
+RTX 5090, `ninfer_bench -pg 512,256 --spec dflash --draft-tokens 4 --lm-head-draft`, greedy,
+NVFP4 KV, CUDA Graphs, one warmup and three repetitions; C=6 is two alternating base/candidate
+pairs because a single run was disturbed by another GPU job:
+
+| decode tok/s | C=1 | C=4 | C=6 |
+|---|---:|---:|---:|
+| before (`593c2d0c`) | 222.11 | 515.65 | 696.24 / 693.06 |
+| producer-side A8 | 224.63 | 519.71 | 700.60 / 697.19 |
+| change | +1.13% | +0.79% | +0.63% / +0.60% |
+
+The megakernel assessment behind this change, including the measured L2-prefetch non-win, is in
+[performance_enhancements.md](maintainer/performance_enhancements.md). Evidence:
+`profiles/bench/mk-glue/`, traces `profiles/nsys/mk-{base,a8b}-c{1,4,6}`.
+
 ## Parallel p-less tile choice and BF16/conv verify aggregation at every width (2026-10-02)
 
 nsys at C=1..6 (k=3..5) put `speculative_sampling_p_less_mass_finalize_kernel` at 1.5–1.95 ms

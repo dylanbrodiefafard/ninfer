@@ -88,7 +88,13 @@ void nvfp4_attn_input_w4a8_launch(const Tensor& x, const Weight& weight, Tensor&
                                   Tensor& k, Tensor& v, Fp8A8Workspace workspace,
                                   cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    launch_nvfp4_w4a8_mma<Geometry>(weight, x.ne[1], workspace, Nvfp4IdentityEpilogue{},
+    nvfp4_attn_input_w4a8_project(weight, x.ne[1], workspace, q, gate, k, v, stream);
+}
+
+void nvfp4_attn_input_w4a8_project(const Weight& weight, std::int32_t tokens,
+                                   Fp8A8Workspace activation, Tensor& q, Tensor& gate, Tensor& k,
+                                   Tensor& v, cudaStream_t stream) {
+    launch_nvfp4_w4a8_mma<Geometry>(weight, tokens, activation, Nvfp4IdentityEpilogue{},
                                     Nvfp4W4a4AttentionOutput{static_cast<__nv_bfloat16*>(q.data),
                                                              static_cast<__nv_bfloat16*>(k.data),
                                                              static_cast<__nv_bfloat16*>(gate.data),

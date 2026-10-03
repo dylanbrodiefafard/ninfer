@@ -205,7 +205,8 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
                 const auto& first = p.model.gdn_layers[0];
                 target::Variant::gdn_norm_control_projection(
                     embedding, first.input_norm, target::TextConfig::rms_epsilon, first.projection,
-                    normalized, g, beta, p.work, p.device.stream, w);
+                    normalized, nullptr, g, beta, ninfer::targets::qwen3_6::TextPhase::Verify,
+                    p.work, p.device.stream, w);
                 std::vector<std::uint16_t> bits(
                     static_cast<std::size_t>(target::TextConfig::hidden) * columns);
                 CUDA_CHECK(cudaMemcpyAsync(bits.data(), normalized.data,

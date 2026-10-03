@@ -125,7 +125,7 @@ void nvfp4_rmsnorm_linear_swiglu_launch(const Tensor& x, const Tensor& norm_weig
                                         WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope         = workspace.scope();
     const auto scratch = detail::allocate_fp8_a8_workspace(workspace, x.ne[1], 5120);
-    rmsnorm_cta_bf16x2_kernel<RmsEpilogue::Offset, 512, 8, true>
+    rmsnorm_cta_bf16x2_kernel<RmsEpilogue::Offset, 512, 8, RmsOutput::A8>
         <<<x.ne[1], 512, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.data),
                                       static_cast<const __nv_bfloat162*>(norm_weight.data), nullptr,
                                       nullptr, 5120, x.ne[1], eps, scratch.codes, scratch.scales);

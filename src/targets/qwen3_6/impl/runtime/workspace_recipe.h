@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/layout.h"
 
+#include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/grouped_dynamic_conv.h"
 #include <ninfer/targets/qwen3_6/dflash_kind.h>
 
@@ -97,6 +98,12 @@ GdnControlRoots gdn_control(Allocator& allocator, std::int32_t tokens) {
         matrix(allocator, DType::FP32, Config::gdn_value_heads, tokens),
         matrix(allocator, DType::FP32, Config::gdn_value_heads, tokens),
     };
+}
+
+// Replay-record verify: the normalized GDN input as the record projection's A8 activation.
+template <class Config, class Allocator>
+ops::A8Activation gdn_input_activation(Allocator& allocator, std::int32_t tokens) {
+    return ops::allocate_a8_activation(allocator, Config::hidden, tokens);
 }
 
 struct GdnProjectionRoots {

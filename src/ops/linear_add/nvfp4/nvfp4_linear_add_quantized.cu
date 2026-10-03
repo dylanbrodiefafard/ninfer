@@ -57,19 +57,25 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
 
 } // namespace
 
-void nvfp4_linear_add_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                  Fp8A8Workspace workspace, cudaStream_t stream) {
-    launch_fp8_a8_quantize(x, weight, workspace, stream);
+void nvfp4_linear_add_w4a8_project(const Weight& weight, std::int32_t tokens,
+                                   Fp8A8Workspace activation, Tensor& residual,
+                                   cudaStream_t stream) {
     auto* data = static_cast<__nv_bfloat16*>(residual.data);
     const Nvfp4AddResidualEpilogue epilogue{data, weight.n};
     const Nvfp4ContiguousOutput out{data, weight.n};
     if (weight.k == 6144) {
-        launch_nvfp4_w4a8_mma<Nvfp4Residual6144Geometry>(weight, x.ne[1], workspace, epilogue, out,
+        launch_nvfp4_w4a8_mma<Nvfp4Residual6144Geometry>(weight, tokens, activation, epilogue, out,
                                                          stream);
     } else {
-        launch_nvfp4_w4a8_mma<Nvfp4Residual17408Geometry>(weight, x.ne[1], workspace, epilogue, out,
+        launch_nvfp4_w4a8_mma<Nvfp4Residual17408Geometry>(weight, tokens, activation, epilogue, out,
                                                           stream);
     }
+}
+
+void nvfp4_linear_add_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                  Fp8A8Workspace workspace, cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    nvfp4_linear_add_w4a8_project(weight, x.ne[1], workspace, residual, stream);
 }
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,

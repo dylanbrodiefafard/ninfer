@@ -1206,6 +1206,38 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                     std::cerr << label << ": FP8 activation codec mismatch\n";
                     ++failures;
                 }
+                if (qtype == QType::NVFP4) {
+                    // A producer-published activation must reproduce the policy route exactly.
+                    GuardedBf16Tensor a8_q(kQueryRows, aggregate);
+                    GuardedBf16Tensor a8_k(kKeyRows, aggregate);
+                    GuardedBf16Tensor a8_v(kValueRows, aggregate);
+                    GuardedBf16Tensor a8_z(kZRows, aggregate);
+                    GuardedBf16Tensor a8_record(kChannels, aggregate);
+                    Tensor aq(a8_q.data(), DType::BF16, {kQueryRows, width, batch});
+                    Tensor ak(a8_k.data(), DType::BF16, {kKeyRows, width, batch});
+                    Tensor av(a8_v.data(), DType::BF16, {kValueRows, width, batch});
+                    Tensor az(a8_z.data(), DType::BF16, {kZRows, width, batch});
+                    Tensor ar(a8_record.data(), DType::BF16, {kChannels, width, batch});
+                    const ops::A8Activation a8_input{
+                        Tensor(scratch.codes, DType::FP8_E4M3FN, {kHidden, width, batch}),
+                        Tensor(scratch.scales, DType::FP32, {width, batch})};
+                    WorkspaceArena a8_ws(std::max<std::size_t>(256, rec_bytes));
+                    ops::gdn_input_proj_conv_record(
+                        a8_input, parent.view(), conv, batched_state_view, valid, initial, ar, aq,
+                        ak, av, az, a8_ws, nullptr,
+                        parent_indices.empty() ? nullptr : &parent_index);
+                    cuda_synchronize();
+                    failures +=
+                        verify_equal(label + " A8 input query", a8_q.bits(), batched_q.bits());
+                    failures +=
+                        verify_equal(label + " A8 input key", a8_k.bits(), batched_k.bits());
+                    failures +=
+                        verify_equal(label + " A8 input value", a8_v.bits(), batched_v.bits());
+                    failures += verify_equal(label + " A8 input z", a8_z.bits(), batched_z.bits());
+                    failures += verify_valid_record_equal(label + " A8 input conv_record",
+                                                          a8_record.bits(), batched_record.bits(),
+                                                          kChannels, width, batch, valid_columns);
+                }
             } else {
                 const auto encoded =
                     nvfp4_activation_reference(activation, parent.view().input_scale_divisor);
