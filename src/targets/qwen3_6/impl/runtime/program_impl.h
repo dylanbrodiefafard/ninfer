@@ -913,8 +913,9 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
             sequence.ledger.resize(base);
             sequence.prefix_hashes.truncate(base);
             drop_context_checkpoints_after(sequence, base);
-            // A tier entry cut at its turn checkpoint is the only one restored without a rewrite
-            // checkpoint at its frontier.
+            // A tier entry cut at its turn checkpoint is restored without a rewrite checkpoint at
+            // its frontier. So is one whose request drops the checkpoint, but such a request has
+            // no closure frontier, so the cut-restore pin skip never applies to it.
             const bool cut_restore = (request_plan.reuse_source == PrefixReuseSource::HostRam ||
                                       request_plan.reuse_source == PrefixReuseSource::HostDisk) &&
                                      !sequence.rewrite_checkpoint.valid;
@@ -2335,6 +2336,14 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
     }
 }
 
+// The entry's rewrite checkpoint is read only when the request keeps it or restores from it.
+// Otherwise start_prefill_lane drops it, so a tier restore neither reads its image nor installs
+// metadata that would let a cancelled prefill revert to an image it never loaded.
+[[nodiscard]] bool tier_restore_keeps_rewrite(const RequestPlanImpl& plan) noexcept {
+    return plan.rewrite_checkpoint_action != RewriteCheckpointAction::Drop ||
+           is_rewrite_checkpoint_restore(plan.reuse);
+}
+
 void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id,
                                         const RequestPlan& plan) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
@@ -2395,6 +2404,7 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         target.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
         target.reuse                     = request_plan.reuse;
         target.reuse_base                = request_plan.reuse_base;
+        target.keep_rewrite_checkpoint   = tier_restore_keeps_rewrite(request_plan);
         if (dflash) {
             target.dflash_local = &dflash->local;
             target.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
@@ -2414,6 +2424,11 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
             .kind     = host.rewrite_kind,
             .frontier = host.rewrite_frontier,
         };
+        if (!target.keep_rewrite_checkpoint) { sequence.rewrite_checkpoint = {}; }
+        // The frontier tail hidden is not restored; start_prefill_lane copies the checkpoint's.
+        if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
+            sequence.tail_hidden_valid = false;
+        }
         sequence.prefix_hashes.clear();
         sequence.ledger          = std::move(host.ledger);
         sequence.prefix_identity = std::move(host.identity);
@@ -2563,6 +2578,7 @@ void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry
         target.rewrite_checkpoint_hidden = &sequence.rewrite_checkpoint_hidden;
         target.reuse                     = request_plan.reuse;
         target.reuse_base                = request_plan.reuse_base;
+        target.keep_rewrite_checkpoint   = tier_restore_keeps_rewrite(request_plan);
         if (dflash) {
             target.dflash_local = &dflash->local;
             target.dflash_lane  = static_cast<std::int32_t>(sequence.lane);
@@ -2629,6 +2645,11 @@ void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry
             .kind     = host.rewrite_kind,
             .frontier = host.rewrite_frontier,
         };
+        if (!target.keep_rewrite_checkpoint) { sequence.rewrite_checkpoint = {}; }
+        // The frontier tail hidden is not restored; start_prefill_lane copies the checkpoint's.
+        if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
+            sequence.tail_hidden_valid = false;
+        }
         sequence.prefix_hashes.clear();
         sequence.ledger          = std::move(host.ledger);
         sequence.prefix_identity = std::move(host.identity);

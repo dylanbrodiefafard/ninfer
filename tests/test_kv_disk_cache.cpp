@@ -8598,7 +8598,7 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     auto restore_one = [&](const q36::detail::DiskMatch& restore_match,
                            ninfer::PrefixReusePath reuse, std::uint32_t reuse_base,
                            std::int32_t current_slot, std::int32_t checkpoint_slot,
-                           const char* hung) -> int {
+                           const char* hung, bool keep_rewrite = true) -> int {
         if (!disk.claim(restore_match.entry_id, restore_match.hash_f,
                         restore_match.execution_frontier, reuse_base, reuse)) {
             return fail("skip-current claim failed");
@@ -8618,7 +8618,8 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
         target.rewrite_state = target_rewrite.target();
         target.reuse         = reuse;
         target.reuse_base    = reuse_base;
-        target.stream        = ctx.copy_stream;
+        target.keep_rewrite_checkpoint = keep_rewrite;
+        target.stream                  = ctx.copy_stream;
         disk.restore_device(restore_match.entry_id, target);
         try {
             if (const int rc = wait_restore_bounded(disk, ctx, hung); rc != 0) {
@@ -8662,6 +8663,32 @@ int test_rewrite_restore_skips_frontier_gdn(ninfer::DeviceContext& ctx, ninfer::
     if (conv_got != rewrite_conv || rec_got != rewrite_rec) {
         alloc.release();
         return fail("append restore did not unpack rewrite GDN");
+    }
+
+    // A request that drops the rewrite checkpoint never reads the entry's rewrite set.
+    std::vector<unsigned char> unread_conv(frontier_conv.size(), 0xce);
+    std::vector<unsigned char> unread_rec(frontier_rec.size(), 0xcf);
+    gdn.zero_slot(2, ctx.stream);
+    gdn.unpack_slot_from_host(3, unread_conv.data(), unread_rec.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (const int rc = restore_one(*match, ninfer::PrefixReusePath::AppendAtFrontier, 4, 2, 3,
+                                   "drop restore hung", false);
+        rc != 0) {
+        alloc.release();
+        return rc;
+    }
+    ctx.synchronize_all();
+    gdn.pack_slot_to_host(2, conv_got.data(), rec_got.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (conv_got != frontier_conv || rec_got != frontier_rec) {
+        alloc.release();
+        return fail("drop restore skipped required frontier GDN");
+    }
+    gdn.pack_slot_to_host(3, conv_got.data(), rec_got.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (conv_got != unread_conv || rec_got != unread_rec) {
+        alloc.release();
+        return fail("drop restore unpacked the dropped rewrite GDN");
     }
 
     std::vector<unsigned char> poison_conv(frontier_conv.size(), 0xcc);

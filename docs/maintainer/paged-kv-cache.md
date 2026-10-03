@@ -917,7 +917,10 @@ occupy does not unpack it again, and installs only the entry's heads at or befor
 base (occupy drops later ones) into the Program's checkpoint pool. Those head copies run on the
 RAM tier's host-copy stream behind only each head's fence; the entry's copy fence, which gates the
 lane's first prefill chunk, does not include them, and a separate block fence keeps the retired
-block allocated until they land. A RAM restore starts only once the entry's own capture copies
+block allocated until they land. A RAM or disk restore reads only the state its planned path keeps: a turn- or response-checkpoint restore skips the entry's
+frontier GDN, tail hidden and DFlash lane, which `start_prefill_lane` overwrites with the checkpoint
+set (the disk tier neither reads nor decodes them), and a request that drops its rewrite checkpoint
+skips the entry's rewrite set and installs no rewrite checkpoint. A RAM restore starts only once the entry's own capture copies
 are ready; while other lanes decode, the copy-hold polls that instead of blocking. KV
 `dst_extent` Main `pages_for_tokens(F)` / MTP `pages_for_tokens(F-1)` / DFlash Full `pages_for_tokens(F)`. Host RAM is not a second GPU
 working set.

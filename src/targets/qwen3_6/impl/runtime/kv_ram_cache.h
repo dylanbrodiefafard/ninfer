@@ -144,6 +144,10 @@ struct RamRestoreTarget {
 
     PrefixReusePath reuse    = PrefixReusePath::FullReset;
     std::uint32_t reuse_base = 0;
+    // False when the request drops the entry's rewrite checkpoint on an append or staged
+    // restore: nothing reads that set, so it is not restored. A rewrite-checkpoint restore
+    // likewise skips the frontier set it overwrites.
+    bool keep_rewrite_checkpoint = true;
 
     CyclicKVCache* dflash_local = nullptr;
     std::int32_t dflash_lane    = 0;
