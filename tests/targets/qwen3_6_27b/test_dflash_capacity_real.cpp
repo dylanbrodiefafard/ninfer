@@ -147,6 +147,12 @@ void exercise(const char* artifact) {
                 program.requests[lanes[row]].adaptive.live_k = k;
             }
             program.adaptive_batch_k_by_c[batch - 1].live_k = k;
+            // One decision in kAdaptiveExploreEvery overrides the live K for exploration; keep
+            // this forced-K walk on ordinary decisions.
+            auto& decisions = program.adaptive_hop_rates.decisions;
+            while (family::adaptive_explore_hash(decisions) % family::kAdaptiveExploreEvery == 0) {
+                ++decisions;
+            }
             const auto round = program.decode_batch(std::span(lanes).first(batch),
                                                     std::span(budgets).first(batch));
             for (std::size_t row = 0; row < batch; ++row) {
