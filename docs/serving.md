@@ -699,7 +699,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
 | `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four. MTP captures `{3,4,5}` up to its configured limit | off |
 | `--dflash-verify-width N` | pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
-| `--dflash-p-less-draft-temperature T` | DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` (scaled by the target's block-length factor) and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Tuned for the default p-less `--temperature 2`: on the 40-prompt corpus `0.8` beat `0.4` by +3.8% (k=7) and +4.8% (k=5) C=1 decode; at `--temperature 1.5` about `0.45` is best ([q-lab measurements](performance.md#dflash2-p-less-proposal-temperature-2026-10-03)) | 0.8 |
+| `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([calibration](performance.md#dflash2-p-less-proposal-calibration-2026-10-03)) | calibrated |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
@@ -736,7 +736,7 @@ p-less remains exact argmax. P-less membership is `p_v ≥ max(L·exp(-2ε/T), 1
 `ε = 1/16` and `M = 1024`; L is the unperturbed collision probability, and an empty set
 falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (block verification
 over the chain with the recorded draft `q`; DFlash2 drafts are sampled at
-`--dflash-p-less-draft-temperature`, scaled down for k=6/7 blocks) and to the bonus. A thinking-cycle exclusion affects only the next token,
+the calibrated or pinned `--dflash-p-less-draft-temperature`) and to the bonus. A thinking-cycle exclusion affects only the next token,
 not later hops in the same speculative round. There is
 no OpenAI or Anthropic schema field for this mode.
 

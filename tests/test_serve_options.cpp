@@ -118,9 +118,9 @@ int main() {
     failures +=
         check(adaptive_without_spec_rejected, "--adaptive-draft was accepted without --spec");
 
-    failures += check(
-        parse({"ninfer-serve", "model.ninfer"}).speculative.dflash_p_less_draft_temperature == 0.8f,
-        "p-less draft temperature default is not 0.8");
+    failures += check(!parse({"ninfer-serve", "model.ninfer"})
+                           .speculative.dflash_p_less_draft_temperature.has_value(),
+                      "p-less draft temperature is pinned by default");
     const ServeOptions draft_temperature =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "5",
                "--dflash-p-less-draft-temperature", "0.6"});

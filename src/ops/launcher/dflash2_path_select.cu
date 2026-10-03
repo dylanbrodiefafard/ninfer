@@ -61,7 +61,7 @@ void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
                                 std::int32_t batch, const SamplingConfig* configs,
                                 cudaStream_t stream, Tensor* selector_ids, Tensor* selector_q,
                                 unsigned long long seed_xor, std::int32_t position_offset,
-                                bool force_greedy, float p_less_draft_temperature_scale) {
+                                bool force_greedy) {
     dflash2_path_select_kernel<<<static_cast<unsigned int>(batch), kDflash2PathSelectBlock, 0,
                                  stream>>>(
         cand_val, cand_idx, static_cast<const __nv_bfloat16*>(hidden_proj.data),
@@ -71,7 +71,7 @@ void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
         static_cast<std::int32_t*>(path.data),
         selector_ids != nullptr ? static_cast<std::int32_t*>(selector_ids->data) : nullptr,
         selector_q != nullptr ? static_cast<float*>(selector_q->data) : nullptr, tokens, batch,
-        configs, seed_xor, position_offset, force_greedy, p_less_draft_temperature_scale);
+        configs, seed_xor, position_offset, force_greedy);
     CUDA_CHECK(cudaGetLastError());
 }
 

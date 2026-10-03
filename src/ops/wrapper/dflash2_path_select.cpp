@@ -243,7 +243,7 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
                          const Tensor* logit_token_ids, const Weight* pred_nvfp4,
                          const Weight* succ_nvfp4, Tensor* selector_ids, Tensor* selector_q,
                          unsigned long long seed_xor, std::int32_t position_offset,
-                         bool force_greedy, float p_less_draft_temperature_scale) {
+                         bool force_greedy) {
     require_logits(logits);
     const std::int32_t vocab  = logits.ne[0];
     const std::int32_t tokens = logits.ne[1];
@@ -297,7 +297,7 @@ void dflash2_path_select(const Tensor& logits, const Tensor& hidden,
         topk.cand_val, topk.cand_idx, hidden_proj, pred_q == nullptr ? &pred_code : nullptr,
         succ_q == nullptr ? &succ_code : nullptr, pred_q, succ_q, anchors, logical_positions, path,
         tokens, batch, configs, stream, selector_ids, selector_q, seed_xor, position_offset,
-        force_greedy, p_less_draft_temperature_scale);
+        force_greedy);
 }
 
 void dflash2_tree_select(const Tensor& logits, const Tensor& hidden,

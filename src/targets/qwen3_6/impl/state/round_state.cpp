@@ -371,6 +371,10 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     accepted_column =
         egress_tensor(offsetof(DFlashDecodeEgress, accepted_column), DType::I32, {batch});
     fold_path = egress_tensor(offsetof(DFlashDecodeEgress, fold_path), DType::I32, {width, batch});
+    proposal_calibration =
+        egress_tensor(offsetof(DFlashDecodeEgress, proposal_calibration), DType::FP32,
+                      {ops::kPLessProposalCalibrationTemperatureCount *
+                       static_cast<std::int32_t>(kDFlashDecodeMaximumDrafts) * batch});
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     target_rope_positions      = layout.target_rope_positions.bind(backing);

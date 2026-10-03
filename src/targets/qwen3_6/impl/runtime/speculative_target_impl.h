@@ -67,7 +67,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
             frame.accepted_drafts, TextConfig::token_domain, frame.sampling, execution.work,
             execution.device.stream,
             frame.draft_selector_ids.data != nullptr ? &frame.draft_selector_ids : nullptr,
-            frame.draft_selector_q.data != nullptr ? &frame.draft_selector_q : nullptr);
+            frame.draft_selector_q.data != nullptr ? &frame.draft_selector_q : nullptr,
+            frame.proposal_calibration.data != nullptr ? &frame.proposal_calibration : nullptr);
         ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
                                                 frame.selected_hidden, execution.device.stream);
     }

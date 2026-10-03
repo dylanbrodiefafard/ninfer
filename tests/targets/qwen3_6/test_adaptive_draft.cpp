@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
+#include "targets/qwen3_6/impl/runtime/p_less_draft_calibration.h"
 
 #include "ninfer/types.h"
 
@@ -9,6 +10,7 @@
 #include <utility>
 #include <iostream>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -715,7 +717,51 @@ void test_round_time_forgets_old_level() {
 
 } // namespace
 
+// The p-less proposal calibration keeps the prior until warm, then picks the grid temperature with
+// the greatest predicted chain length for the round's k: hop 0 alone favors 0.4, the deeper hops
+// favor 0.8 enough to win a 7-draft chain. Entries past a row's extent (-1) are never read, and
+// each target temperature learns separately.
+void test_p_less_calibration_picks_by_block_length() {
+    constexpr std::size_t grid = q36::kPLessCalibrationGrid;
+    constexpr std::uint32_t k  = 7;
+    static_assert(ninfer::ops::kPLessProposalCalibrationTemperatures[2] == 0.4f &&
+                  ninfer::ops::kPLessProposalCalibrationTemperatures[5] == 0.8f);
+    std::vector<float> alphas(grid * k, -1.0f);
+    for (std::size_t j = 0; j < k; ++j) {
+        for (std::size_t g = 0; g < grid; ++g) {
+            float alpha = j == 0 ? 0.5f : 0.4f;
+            if (g == 2) { alpha = j == 0 ? 0.80f : 0.5f; }
+            if (g == 5) { alpha = j == 0 ? 0.78f : 0.9f; }
+            alphas[j * grid + g] = alpha;
+        }
+    }
+    q36::PLessDraftCalibration calibration;
+    expect(q36::p_less_calibrated_draft_temperature(calibration, 1.5f, k, 0.45f) == 0.45f,
+           "p-less calibration: cold start returns the prior");
+    for (int round = 0; round < 12; ++round) {
+        q36::p_less_calibration_observe(calibration, 1.5f, alphas, k);
+    }
+    // A 2-draft row leaves hops 2..6 at -1; they must not be read.
+    std::vector<float> short_row(alphas.begin(), alphas.begin() + 2 * grid);
+    short_row.resize(grid * k, -1.0f);
+    q36::p_less_calibration_observe(calibration, 1.5f, short_row, 2);
+    expect(q36::p_less_calibrated_draft_temperature(calibration, 1.5f, 1, 0.45f) == 0.4f,
+           "p-less calibration: one-draft chains follow hop 0");
+    expect(q36::p_less_calibrated_draft_temperature(calibration, 1.5f, k, 0.45f) == 0.8f,
+           "p-less calibration: seven-draft chains follow the deep hops");
+    expect(q36::p_less_calibrated_draft_temperature(calibration, 2.0f, k, 0.8f) == 0.8f &&
+               q36::p_less_calibrated_draft_temperature(calibration, 2.0f, 1, 0.65f) == 0.65f,
+           "p-less calibration: an unseen target temperature keeps its prior");
+    bool rejected = false;
+    alphas[3]     = 1.5f;
+    try {
+        q36::p_less_calibration_observe(calibration, 1.5f, alphas, k);
+    } catch (const std::runtime_error&) { rejected = true; }
+    expect(rejected, "p-less calibration: an overlap above one is rejected");
+}
+
 int main() {
+    test_p_less_calibration_picks_by_block_length();
     test_capture_set();
     test_seed_is_captured_min();
     test_topology_class();

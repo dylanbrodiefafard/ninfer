@@ -86,13 +86,39 @@ temperatures add 0.2%. Engine confirmation, same corpus, C=1, fixed chain, p-les
 | 7 (effective 0.3 / 0.6) | 255.7 tok/s, tau 3.76 | 265.3 tok/s, tau 3.90 (+3.8%) |
 | 5 | 241.5 tok/s, tau 3.47 | 253.0 tok/s, tau 3.64 (+4.8%) |
 
-The default is now 0.8. The earlier 0.4 optimum was measured at p-less T=1.5; a flatter target
-favours a flatter proposal. Re-scoring the same rounds against the p-less law at T=1.5 puts the
-optimum at an effective 0.30-0.45 (tau_est 4.07, against 3.96 at 0.8), so deployments that
-override the p-less temperature to 1.5 should pass `--dflash-p-less-draft-temperature 0.45`. Building the packed tree from a p-less-transformed drafter law
+The earlier 0.4 optimum was measured at p-less T=1.5; a flatter target favours a flatter proposal.
+Re-scoring the same rounds against the p-less law at T=1.5 puts the optimum at an effective
+0.30-0.45 (tau_est 4.07, against 3.96 at 0.8). Because the optimum moves with the target
+temperature and the block length, the draft temperature is now
+[calibrated online](#dflash2-p-less-proposal-calibration-2026-10-03). Building the packed tree from a p-less-transformed drafter law
 (collision cut on the selector softmax) lowered tree acceptance (3.80 against 3.88 at 11 nodes);
 a plain per-parent temperature of 1.5 raised it to 3.95 and is the tree arm's p-less setting.
 The large gap to the coverage ceiling is drafter calibration, not candidate coverage.
+
+## DFlash2 p-less proposal calibration (2026-10-03)
+
+The chain accept op scores eight candidate draft temperatures on every p-less round from the
+verified target law and the recorded proposal (re-tempered, no drafter work), and the Program drafts
+each round at the temperature with the best predicted chain length for its k
+([model §8.2](maintainer/qwen3.6-27b-model.md#82-p-less-proposal-calibration)). It replaces the
+fixed 0.8 default and the per-k 1/0.875/0.75 scale. The scoring kernel is one warp per drafted hop
+and row.
+
+RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, NVFP4 KV, CUDA Graphs, optimized
+proposal head, `--draft-tokens 7 --adaptive-draft`, thinking on, C=1, 512 new tokens on each of the
+40 corpus prompts in one Engine (`profiles/dflash_tau/dflash_lab.cpp`):
+
+| p-less T | draft temperature | tau | decode tok/s |
+|---:|---|---:|---:|
+| 1.5 | calibrated | 4.79 | 294.2 (+3.8%) |
+| 1.5 | pinned 0.45 (previous recommendation) | 4.58 | 283.3 |
+| 2 | calibrated | 4.12 | 251.9 |
+| 2 | pinned 0.6 | 4.13 | 252.3 |
+| 2 | pinned 0.8 | 4.14 | 253.3 |
+
+At T=2 the calibration matches the best pinned values within run-to-run noise; at T=1.5 it beats
+the hand-tuned value, since per-k calibration also covers the block-length effect the old scale
+approximated.
 
 ## DFlash2 best-first tree arm (2026-10-03)
 
@@ -375,7 +401,8 @@ p-less draft temperature 0.4 was tuned at k=5. At k=7, C=1, one seed each:
 
 At k=5, 0.3/0.2 are slower than 0.4 (139.9/138.1). The 27B variant therefore scales the draft
 temperature by block length: x1 for k<=5, x0.875 at k=6, x0.75 at k=7 (k=6 is interpolated, not
-measured).
+measured). The [online calibration](#dflash2-p-less-proposal-calibration-2026-10-03) later
+replaced this scale.
 
 Final comparison with [block verification](#p-less-block-verification-2026-09-30) and the per-k
 draft temperature, C=1 `c1long`, p-less, seed

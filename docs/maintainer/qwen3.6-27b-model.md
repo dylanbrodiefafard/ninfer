@@ -390,10 +390,11 @@ One propose block:
 4. Path selector (`dflash2_path_select`): unsorted top-16 of those logits, then the Markov score
    `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum.
    Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`.
-   Under p-less the target temperature is not reused for drafting: the selector draws at
-   `--dflash-p-less-draft-temperature` (default 0.8; 0 is greedy, one-hot `q`), and chain accept
-   uses the recorded `q`, which is exact for any proposal law. Drafting at the p-less target
-   temperature itself accepts less than greedy; 0.4 accepts more (docs/performance.md).
+   Under p-less the target temperature is not reused for drafting: drafting at the p-less target
+   temperature itself accepts less than greedy. The selector draws at the row's
+   `draft_temperature` (0 is greedy, one-hot `q`), and chain accept uses the recorded `q`, which
+   is exact for any proposal law. `--dflash-p-less-draft-temperature` pins it; unset, the
+   Program calibrates it online (§8.2).
    Selector RNG is keyed by request seed and absolute token position, independent of compact batch
    row. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
    A tree round (the adaptive tree arm, §8.1) instead runs `dflash2_tree_select`: each parent's
@@ -447,8 +448,8 @@ One propose block:
    (Sun et al. 2024) over the chain with the recorded selector `q`: it accepts the longest prefix
    the block test admits, which is exact and never shorter in expectation than per-hop Leviathan,
    and samples the correction from `max(p_τ p' − q, 0)` or the bonus from its column's p-less
-   distribution. DFlash2 p-less drafts are sampled at the draft temperature scaled by the
-   target's block-length calibration (27B: ×1 for k≤5, ×0.875 at k=6, ×0.75 at k=7). Draft and
+   distribution. DFlash2 p-less drafts are sampled at the row's calibrated or pinned draft
+   temperature (§8.2). Draft and
    block-accept uniforms are keyed by the round's first position and the hop, so a round never
    reuses a uniform the previous round's acceptance conditioned on.
    A cycle exclusion affects hop 0 only. ReplaySSM Fold commits the corresponding sequential prefix. The RTX 5090
@@ -561,10 +562,34 @@ measurement per arm, the warm-server start, and shared batch k. DFlash captures
 never beat k=3 at any C=1..6 (C=1 round time
 is nearly flat in k, 14.6 ms at k=1 to 15.3–15.8 ms at k=3–5; at C≥4 a k=4 round is cheaper than a
 k=1 round), see [performance.md](../performance.md#adaptive-draft-start-and-k-set-2026-09-27).
-The 27B variant's per-k p-less draft temperature scale (x1 for k<=5, x0.875 at k=6, x0.75
-at k=7) restores hop-0 acceptance at k=7 to k=5's (0.51 against 0.49 unscaled); `ρ_k` absorbs
-the remaining differences. See
-[performance.md](../performance.md#dflash2-k6k7-verify-2026-09-29).
+Under p-less the block length also moves the best proposal temperature (the drafter's
+bidirectional block attention flattens per-position selector laws at k=6/7); §8.2 calibrates it per
+draft length, and `ρ_k` absorbs the remaining differences.
+
+### 8.2 P-less proposal calibration
+
+Unless `--dflash-p-less-draft-temperature` pins it, the Program chooses each p-less chain round's
+draft temperature `T_d` online (`p_less_draft_calibration.h`). A p-less row draws hop j from
+`q_j = softmax(score_j / T_d)` over its 16 selector candidates, so re-tempering the recorded `q_j`
+gives any other temperature's proposal without drafter work: `q'_j ∝ q_j^(T_d/T')`. The chain
+accept op scores the grid `T' ∈ {0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.25}` on every round:
+`α_j(T') = Σ_c min(p'_j(c), q'_j(c))`, with `p'_j` the represented p-less target law of verify
+column j (typical exclusion at hop 0 only). The values reach the host in the round's egress.
+
+Per p-less target temperature (eight tracked, least recently observed replaced), the Program keeps
+discounted sums (memory 256 rounds) of the prefix acceptance `S_j(T') = Π_{i≤j} α_i(T')` over rounds
+that drafted hop j, predicts a k-draft chain's committed length `1 + Σ_{j<k} mean S_j(T')`, and
+drafts the next round at the grid temperature with the greatest prediction for that round's k.
+Every candidate is scored on the same verified content, so the choice needs no exploration and
+carries no selection bias. The prediction scores token verification of the drafted prefix; block
+verification accepts at least as much, and offline replay ranked proposal laws identically under
+both. Until a temperature has eight discounted rounds, the Variant prior applies:
+`clamp(0.8·(T−1), 0.2, 1.25)` for 27B, which passes through the measured optima at T=1.5 and T=2.
+Packed-tree rounds draw at the Variant tree temperature and contribute no calibration. The
+calibration changes only which valid proposal is drawn; output remains the p-less target
+distribution. Like adaptive k, it makes a request's realized sample (for a fixed seed) depend on
+what the Engine verified before, including co-scheduled requests; pin the temperature where
+seed-level reproducibility across batch compositions matters.
 
 ## 9. Speculative round semantics
 
@@ -574,8 +599,8 @@ and accepts only the prefix licensed by the target distribution.
 In greedy mode, MTP and DFlash2 accept the longest draft prefix matching the target argmax. In
 sampling mode both use chain rejection sampling against the represented target distribution. A bad
 draft therefore reduces acceptance and throughput; it must not change the distribution of emitted
-target tokens. Under p-less, DFlash2 drafts are drawn at `--dflash-p-less-draft-temperature` and
-chain accept uses their recorded proposal `q` at every hop (one-hot for greedy drafts, as for MTP);
+target tokens. Under p-less, DFlash2 drafts are drawn at the calibrated or pinned draft temperature
+(§8.2) and chain accept uses their recorded proposal `q` at every hop (one-hot for greedy drafts, as for MTP);
 speculative rejection sampling is exact for any proposal law, so the draft temperature changes
 only acceptance. Each hop uses its own represented
 p-less distribution, and the bonus samples its own column's distribution. Cycle-exit exclusion

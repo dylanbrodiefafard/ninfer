@@ -139,7 +139,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--p-less-draft-temperature",
         type=float,
         default=None,
-        help="DFlash2 p-less draft temperature passed to ninfer-serve (default: the server's own)",
+        help="pinned DFlash2 p-less draft temperature passed to ninfer-serve "
+        "(default: the server's online calibration)",
     )
     parser.add_argument(
         "--p-less-temperature",

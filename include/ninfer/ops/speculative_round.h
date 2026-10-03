@@ -5,9 +5,20 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 
 namespace ninfer::ops {
+
+// Candidate DFlash p-less draft temperatures scored by the accept op's proposal calibration.
+inline constexpr std::int32_t kPLessProposalCalibrationTemperatureCount = 8;
+inline constexpr std::array<float, kPLessProposalCalibrationTemperatureCount>
+    kPLessProposalCalibrationTemperatures = {0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.8f, 1.0f, 1.25f};
+
+// The grid passed by value to the calibration kernel.
+struct PLessProposalCalibrationGrid {
+    float temperature[kPLessProposalCalibrationTemperatureCount];
+};
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
 // domains. token_domain is the fixed sampling profile; invalid domains throw.
@@ -113,6 +124,19 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   token_counts. current_extents and all other inputs remain unchanged. Request statistics are
  *   deliberately outside this Op.
  *
+ * Proposal calibration (optional): proposal_calibration is FP32 [G,K,B] with
+ *   G = kPLessProposalCalibrationTemperatureCount and requires contiguous selector_ids/selector_q
+ *   with C<=32 and a token_domain large enough for the multi-block sampler (the product
+ *   vocabulary); otherwise std::invalid_argument. For each row b
+ *   that is p-less with draft_temperature T_d > 0 and each drafted hop j < current_extents[b],
+ *   proposal_calibration[g,j,b] = sum_c min(p'_j(c), q'_g(c)) over the C selector candidates of hop
+ *   j, where p'_j is the p-less target law of column j (typical exclusion at hop 0 only; a Dirac on
+ *   the correction fallback when the column has no admitted mass) and q'_g
+ *   is the recorded q_j raised to T_d / kPLessProposalCalibrationTemperatures[g] and renormalized
+ *   over the candidates: the per-hop acceptance probability the proposal would have had at that
+ *   temperature (token verification of the same prefix). Other (g,j,b) entries are -1. It reads
+ *   only accept-time statistics and does not change any accept output.
+ *
  * Workspace:
  *   Caller-owned transient storage reported by
  *   speculative_accept_greedy_drafts_workspace_capacity_bytes().
@@ -123,8 +147,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                      const Tensor* selector_ids = nullptr,
-                                      const Tensor* selector_q   = nullptr);
+                                      const Tensor* selector_ids   = nullptr,
+                                      const Tensor* selector_q     = nullptr,
+                                      Tensor* proposal_calibration = nullptr);
 
 /**
  * Op: speculative_accept_tree_drafts

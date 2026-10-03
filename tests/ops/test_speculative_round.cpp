@@ -3335,10 +3335,183 @@ int column_eligibility_cases(int domain, int physical) {
     return failures;
 }
 
+// Proposal calibration against an FP64 oracle: per (temperature g, hop j, row b), the overlap
+// sum_c min(p'_j(c), q_j(c)^(T_d/T_g) / Z) between the independent p-less target law of verify
+// column j and the recorded proposal re-tempered to T_g. Row 0 is p-less with T_d = 0.6, a typical
+// exclusion on a supported candidate (hop 0 only), and extent 2 < K so hop 2 is undrafted; row 1
+// draws greedy drafts (draft_temperature 0), so every row-1 entry is -1.
+int p_less_proposal_calibration_case() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    constexpr int k             = 3;
+    constexpr int cols          = k + 1;
+    constexpr int batch         = 2;
+    constexpr int cap           = 16;
+    constexpr int active        = 48;
+    constexpr int grid          = ops::kPLessProposalCalibrationTemperatureCount;
+    constexpr float draft_temp  = 0.6f;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * cols * batch, -20.0f);
+    for (int b = 0; b < batch; ++b) {
+        for (int col = 0; col < cols; ++col) {
+            const std::size_t base = static_cast<std::size_t>(b * cols + col) * physical_rows;
+            for (int t = 0; t < active; ++t) {
+                logits[base + static_cast<std::size_t>(t)] =
+                    2.0f * std::sin((0.6f + 0.11f * static_cast<float>(col + b)) *
+                                    static_cast<float>(t)) +
+                    0.05f * static_cast<float>(t);
+            }
+            for (int t = token_domain; t < physical_rows; ++t) {
+                logits[base + static_cast<std::size_t>(t)] = 100.0f;
+            }
+        }
+    }
+    round_to_bf16(logits);
+    std::vector<std::uint16_t> logits_bits(logits.size());
+    for (std::size_t i = 0; i < logits.size(); ++i) { logits_bits[i] = f32_to_bf16(logits[i]); }
+
+    // Selector layout [C,K,B]: (b, h) owns entries [(b*K + h)*C, +C). Distinct ids per hop.
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(cap) * k * batch);
+    std::vector<float> q(ids.size());
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < k; ++h) {
+            const std::size_t base = static_cast<std::size_t>(b * k + h) * cap;
+            double qsum            = 0.0;
+            for (int c = 0; c < cap; ++c) {
+                ids[base + c]  = (c * (5 + 2 * h) + 1 + h + b) % active;
+                const double w = std::exp(0.9 * std::cos(0.7 * static_cast<double>(c + h + b)));
+                q[base + c]    = static_cast<float>(w);
+                qsum += w;
+            }
+            for (int c = 0; c < cap; ++c) {
+                q[base + c] = static_cast<float>(static_cast<double>(q[base + c]) / qsum);
+            }
+        }
+    }
+
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (auto& config : configs) {
+        config.temperature = 1.5f;
+        config.p_less      = 1;
+    }
+    configs[0].draft_temperature = draft_temp;
+    {
+        const std::vector<int> support =
+            p_less_support_oracle(logits, physical_rows, 0, token_domain, configs[0]);
+        for (int c = 0; c < cap && configs[0].typical_exclude < 0; ++c) {
+            if (std::find(support.begin(), support.end(), ids[static_cast<std::size_t>(c)]) !=
+                support.end()) {
+                configs[0].typical_exclude = ids[static_cast<std::size_t>(c)];
+            }
+        }
+        if (support.size() < 2 || configs[0].typical_exclude < 0) {
+            std::fprintf(stderr, "p_less_proposal_calibration: fixture lacks an excludable "
+                                 "supported candidate\n");
+            return 1;
+        }
+    }
+    const std::vector<std::int32_t> extents{2, k};
+
+    DeviceBuffer d_targets = to_device(std::vector<std::int32_t>(cols * batch, 0));
+    DeviceBuffer d_logits  = to_device(logits_bits);
+    DeviceBuffer d_drafts  = to_device(std::vector<std::int32_t>(k * batch, 0));
+    DeviceBuffer d_extent  = to_device(extents);
+    DeviceBuffer d_sel_ids = to_device(ids);
+    DeviceBuffer d_sel_q   = to_device(q);
+    DeviceBuffer d_config  = to_device(configs);
+    GuardedDeviceBuffer d_length(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_token(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_licensed(static_cast<std::size_t>(cols) * batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_num(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_accepted(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_calibration(static_cast<std::size_t>(grid) * k * batch * sizeof(float));
+    initialize(d_length, std::vector<std::int32_t>(batch, 10));
+    Tensor targets(d_targets.p, DType::I32, {cols, batch});
+    Tensor logits_t(d_logits.p, DType::BF16, {physical_rows, cols, batch});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
+    Tensor extent(d_extent.p, DType::I32, {batch});
+    Tensor length(d_length.data(), DType::I32, {batch});
+    Tensor token(d_token.data(), DType::I32, {batch});
+    Tensor licensed(d_licensed.data(), DType::I32, {cols, batch});
+    Tensor num(d_num.data(), DType::I32, {batch});
+    Tensor accepted(d_accepted.data(), DType::I32, {batch});
+    Tensor sel_ids_t(d_sel_ids.p, DType::I32, {cap, k, batch});
+    Tensor sel_q_t(d_sel_q.p, DType::FP32, {cap, k, batch});
+    Tensor calibration(d_calibration.data(), DType::FP32, {grid, k, batch});
+    WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                       token_domain, k, k, batch, batch)));
+    ops::speculative_accept_greedy_drafts(targets, logits_t, draft_tensor, extent, length, token,
+                                          licensed, num, accepted, token_domain,
+                                          static_cast<const ops::SamplingConfig*>(d_config.p),
+                                          workspace, nullptr, &sel_ids_t, &sel_q_t, &calibration);
+    const std::vector<float> got =
+        read<float>(d_calibration, static_cast<std::size_t>(grid) * k * batch);
+
+    int failures = 0;
+    for (int b = 0; b < batch; ++b) {
+        for (int h = 0; h < k; ++h) {
+            const bool scored = b == 0 && h < extents[static_cast<std::size_t>(b)];
+            std::vector<double> target(cap, 0.0);
+            if (scored) {
+                ops::SamplingConfig config = configs[static_cast<std::size_t>(b)];
+                if (h > 0) { config.typical_exclude = -1; }
+                const int flat_col = b * cols + h;
+                const std::vector<int> supp =
+                    p_less_support_oracle(logits, physical_rows, flat_col, token_domain, config);
+                const std::size_t base = static_cast<std::size_t>(flat_col) * physical_rows;
+                double max_scaled      = -1e30;
+                for (const int t : supp) {
+                    max_scaled = std::max(max_scaled, logits[base + t] / 1.5);
+                }
+                double z = 0.0;
+                for (const int t : supp) { z += std::exp(logits[base + t] / 1.5 - max_scaled); }
+                for (int c = 0; c < cap; ++c) {
+                    const int id = ids[static_cast<std::size_t>(b * k + h) * cap + c];
+                    if (std::find(supp.begin(), supp.end(), id) != supp.end()) {
+                        target[static_cast<std::size_t>(c)] =
+                            std::exp(logits[base + id] / 1.5 - max_scaled) / z;
+                    }
+                }
+            }
+            for (int g = 0; g < grid; ++g) {
+                const float value =
+                    got[(static_cast<std::size_t>(b) * k + static_cast<std::size_t>(h)) * grid +
+                        static_cast<std::size_t>(g)];
+                double expected = -1.0;
+                if (scored) {
+                    const double ratio = draft_temp / ops::kPLessProposalCalibrationTemperatures[g];
+                    std::vector<double> retempered(cap);
+                    double z = 0.0;
+                    for (int c = 0; c < cap; ++c) {
+                        retempered[static_cast<std::size_t>(c)] = std::pow(
+                            static_cast<double>(q[static_cast<std::size_t>(b * k + h) * cap + c]),
+                            ratio);
+                        z += retempered[static_cast<std::size_t>(c)];
+                    }
+                    expected = 0.0;
+                    for (int c = 0; c < cap; ++c) {
+                        expected += std::min(target[static_cast<std::size_t>(c)],
+                                             retempered[static_cast<std::size_t>(c)] / z);
+                    }
+                }
+                if (!(std::abs(static_cast<double>(value) - expected) <= 2e-4)) {
+                    std::fprintf(stderr,
+                                 "p_less_proposal_calibration b=%d hop=%d g=%d got %.6f "
+                                 "expected %.6f\n",
+                                 b, h, g, static_cast<double>(value), expected);
+                    ++failures;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 // Every chain-verify route once at its boundary shapes: deterministic and small-sample cases that
 // each issue a handful of launches. This list is the test's `--sanitizer` scope.
 int run_route_cases() {
     int failures = 0;
+    failures += p_less_proposal_calibration_case();
     failures += column_eligibility_cases(64, 64);
     failures += column_eligibility_cases(4096, 4096);
     failures += column_eligibility_cases(248077, 248320);

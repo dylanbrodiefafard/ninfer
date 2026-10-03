@@ -36,11 +36,13 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash_draft_tokens          = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_adaptive_dflash_draft_tokens = kMaximumDFlashDraftTokens;
 
-    // The DFlash2 drafter is trained at block eight (k=7). Its block attention is bidirectional,
-    // so the untruncated block gives flatter per-position selector laws; the p-less draft
-    // temperature (set for k<=5) is scaled down for longer blocks: 0.4 -> 0.35 (k=6), 0.3 (k=7).
-    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_scale(std::uint32_t k) {
-        return k <= 5 ? 1.0f : (k == 6 ? 0.875f : 0.75f);
+    // Cold-start DFlash2 p-less proposal temperature for a p-less target temperature T, used
+    // until the online proposal calibration has observed rounds at T. Offline replay of p-less
+    // selector dumps put the effective optimum near 0.3-0.45 at T=1.5 and 0.6-0.8 at T=2;
+    // 0.8*(T-1) passes through both, clamped to the calibration grid.
+    [[nodiscard]] static constexpr float dflash_p_less_draft_temperature_prior(float temperature) {
+        const float prior = 0.8f * (temperature - 1.0f);
+        return prior < 0.2f ? 0.2f : (prior > 1.25f ? 1.25f : prior);
     }
 
     // Per-parent softmax temperature for p-less tree drafting: p-less samples the target at T=2,

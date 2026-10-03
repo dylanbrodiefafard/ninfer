@@ -22,8 +22,7 @@ void dflash2_path_select_launch(const float* cand_val, const int* cand_idx,
                                 std::int32_t batch, const SamplingConfig* configs,
                                 cudaStream_t stream, Tensor* selector_ids = nullptr,
                                 Tensor* selector_q = nullptr, unsigned long long seed_xor = 0,
-                                std::int32_t position_offset = 0, bool force_greedy = false,
-                                float p_less_draft_temperature_scale = 1.0f);
+                                std::int32_t position_offset = 0, bool force_greedy = false);
 void dflash2_tree_select_launch(
     const float* cand_val, const int* cand_idx, const Tensor& hidden_proj, const Tensor* pred_bf16,
     const Tensor* succ_bf16, const Weight* pred_nvfp4, const Weight* succ_nvfp4,
