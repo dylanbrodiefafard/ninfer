@@ -10,6 +10,11 @@
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
+// Packed verify extent (W*B tokens) whose projections keep each request's panel arithmetic in
+// one aggregated launch: the NVFP4 A8 MMA's single M48 tile. Verify aggregation and the adaptive
+// tree arm both derive from it, so they stay consistent with that kernel limit.
+inline constexpr std::int32_t kVerifyAggregateMaxTokens = 48;
+
 struct TextConfig {
     static constexpr int hidden       = 5120;
     static constexpr int layers       = 64;
@@ -93,9 +98,12 @@ struct DFlashConfig {
     static constexpr float rope_theta         = 1.0e7F;
     static constexpr float attention_scale    = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
-    // Chain verify only: W=k+1. Packed-tree and Spark two-block are off; adaptive k is {3..N}.
-    static constexpr bool tree_verify = false;
-    static constexpr int verify_width = 0;
+    // Adaptive draft also captures a packed best-first draft tree of this many columns (anchor
+    // included) as an arm; the picker learns per batch size when it beats the chain (W=k+1).
+    // The tree arm is captured for batches whose packed verify extent W*B stays within the
+    // aggregated verify limit; beyond it every projection splits into per-request weight passes.
+    static constexpr int tree_verify_width      = 12;
+    static constexpr int tree_verify_max_tokens = kVerifyAggregateMaxTokens;
     // 1 was A/B'd: greedy 128-tok 4.10 tok/round / 211 tok/s vs keep 4.23 / 239. Leave off.
     static constexpr int unmask_refine   = 0;
     static constexpr int two_block_first = 0;

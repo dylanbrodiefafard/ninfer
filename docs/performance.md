@@ -60,6 +60,89 @@ drew about 4% higher, so the round-rate gain is about 9.5%. Evidence:
 `profiles/nsys/{c6-k45-20260930,c6-after-20261001,cx-after-20261001}`,
 `profiles/bench/pless-tile-choice-20261002`.
 
+## DFlash2 p-less proposal temperature (2026-10-03)
+
+The selector dump probe (`NINFER_DFLASH_CANDIDATE_STATS=1` with `NINFER_DFLASH_SELECTOR_DUMP`,
+eager rounds) also records each verify column's target top-256 logits with the full-vocabulary
+log-sum-exp at T=1 and T=2, so the exact p-less target law p' of every hop is known offline. Any
+proposal law q over the 16 selector candidates then has hop acceptance
+`alpha = sum min(p', q)` given the realized prefix, and `tau_est = 1 + sum_j prod_{i<=j} alpha_i`.
+On 3,557 p-less rounds of the 40-prompt corpus (k=7 chain, default p-less T=2), trained on even
+and scored on odd prompts:
+
+| Proposal law | Held-out tau_est |
+|---|---:|
+| path-select softmax at T_d=0.3 (the k=7 default before) | 4.061 |
+| T_d=0.6 / 0.8 / 1.0 | 4.185 / 4.218 / 4.204 |
+| fitted `softmax(1.25 unary + 0.75 Markov)` | 4.228 |
+| per-hop fitted | 4.233 |
+| q = p' restricted to the 16 candidates (coverage ceiling) | 7.2 |
+
+A hotter proposal carries nearly all of the gain; separate unary/Markov scales and per-hop
+temperatures add 0.2%. Engine confirmation, same corpus, C=1, fixed chain, p-less T=2:
+
+| k | draft temperature 0.4 | 0.8 |
+|---:|---:|---:|
+| 7 (effective 0.3 / 0.6) | 255.7 tok/s, tau 3.76 | 265.3 tok/s, tau 3.90 (+3.8%) |
+| 5 | 241.5 tok/s, tau 3.47 | 253.0 tok/s, tau 3.64 (+4.8%) |
+
+The default is now 0.8. The earlier 0.4 optimum was measured at p-less T=1.5; a flatter target
+favours a flatter proposal. Re-scoring the same rounds against the p-less law at T=1.5 puts the
+optimum at an effective 0.30-0.45 (tau_est 4.07, against 3.96 at 0.8), so deployments that
+override the p-less temperature to 1.5 should pass `--dflash-p-less-draft-temperature 0.45`. Building the packed tree from a p-less-transformed drafter law
+(collision cut on the selector softmax) lowered tree acceptance (3.80 against 3.88 at 11 nodes);
+a plain per-parent temperature of 1.5 raised it to 3.95 and is the tree arm's p-less setting.
+The large gap to the coverage ceiling is drafter calibration, not candidate coverage.
+
+## DFlash2 best-first tree arm (2026-10-03)
+
+RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, NVFP4 KV, CUDA Graphs, optimized
+proposal head. Corpus: the first eight prompts of GSM8K, MATH-500, HumanEval, MBPP and MT-Bench
+(40 prompts), chat template with thinking unless stated, 512 output tokens each, one Engine per
+configuration.
+
+**Acceptance is at the published reference.** Greedy, thinking off, fixed chain k=7: tau
+(tokens per round) GSM8K 6.04, MATH-500 6.26, HumanEval 7.58, MBPP 5.61, MT-Bench 2.62, against
+5.46/5.28/4.39/4.79/4.10 on the z-lab model card (H200, BF16). Thinking (greedy 4.40) and the
+p-less sampler (3.76) explain the lower production tau, not the implementation.
+
+**Tree construction.** Offline replay of logged selector lattices (3.4k greedy-thinking rounds)
+showed that a best-first tree over the selector's per-parent Markov probabilities beats both the
+chain and a factorized (per-column marginal) tree at every node budget; at 11 nodes it reaches tau
+5.05 against the k=7 chain's 4.38. The previous beam-2 BFS tree reached 5.49 against the chain's
+5.08 on one MATH prompt where the best-first tree reaches 6.37.
+
+**Tree verify cost.** At C=1 the W=12 tree round first cost 1.36 ms more than the W=8 chain
+round. Retained changes:
+
+| Change | Effect |
+|---|---|
+| GDN tree record from a per-round step list (register spine, three shared-memory branch slots, root replay when exhausted) instead of HBM per-column state | public Op W=12: 18.7 to 13.0 us/layer (chain W=12: 11.4); bit-identical per root path |
+| Fused A8 GDN conv-record epilogue for W<=16 while W*B<=48 | removes the separate parent-indexed conv (about 0.2 ms/round) |
+| Verify aggregation for W<=16 while W*B<=48 | C=4 W=12 verify reads each weight once instead of per request |
+| Batched tree proposals (and RoPE positions no longer overwritten) | one drafter pass per round at C>1 |
+
+**Adaptive tree arm.** `--draft-tokens 7 --adaptive-draft`, warm Engine (40 prompts per
+configuration), against the same picker with the chain arms only (`--dflash-verify-width 8`).
+C=1 is decode tok/s; C=2/4 is total tokens over summed per-request decode time times C (wave
+aggregates are confounded by differing output lengths):
+
+| C | greedy, chain arms | greedy, + tree arm | p-less, chain arms | p-less, + tree arm |
+|---|---:|---:|---:|---:|
+| 1 | 294.0 | **324.2** (+10.3%) | 249.7 | **260.4** (+4.3%) |
+| 2 | 512.2 (wave) | 507.8 (wave) | 419.3 (wave) | 420.1 (wave) |
+| 4 | 896.1 | 898.6 | — | — |
+
+Fixed W=12 trees lose at C>=2 (-3% to -16%) because the extra verify tokens reach the A8 compute
+knee; the learned picker keeps chains there.
+
+The p-less columns above use the earlier draft temperature 0.4. With the
+[retuned proposal temperature](#dflash2-p-less-proposal-temperature-2026-10-03) the sampled chain
+gains and the deterministic tree does not: warm C=1 p-less, chain arms 263.9 tok/s (tau 3.90)
+against 258.8 (tau 3.94) with the tree arm, a single-run difference within p-less noise. The tree
+arm's advantage is now in greedy decoding; under p-less it needs sampled sibling drafts (offline
+estimate +4-5% tree acceptance over deterministic siblings) or a smaller verify tax to pay.
+
 ## Short appends to long contexts: chunked and context-split prompt attention (2026-09-30)
 
 A 7..1024-row `gqa_attention` call with no batch took the dense NVFP4 Prompt tile, one 512-thread
@@ -662,7 +745,8 @@ P-less requests used greedy DFlash2 drafts and verified them as point masses. Ve
 the recorded proposal q (accept `min(1,p'/q)`, correct from `max(0,p'-q)`), which is exact for any
 proposal law (Monte Carlo op test at V=64 and V=248077: chi-square within bound, acceptance equal to
 `sum min(p',q)`), and p-less drafts are drawn from the path-select softmax at
-`--dflash-p-less-draft-temperature` (default 0.4). Drafting at the p-less target temperature itself
+`--dflash-p-less-draft-temperature` (0.4 at the time; see the
+[2026-10-03 retune](#dflash2-p-less-proposal-temperature-2026-10-03)). Drafting at the p-less target temperature itself
 (1.5) accepts less than greedy; a low draft temperature accepts more.
 
 RTX 5090, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, p-less T=1.5, fixed k=5, optimized head, NVFP4

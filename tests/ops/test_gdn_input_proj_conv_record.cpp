@@ -1414,6 +1414,21 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                 failures += run_shape(width, batch, valid, {}, 2300U + width * 4 + batch);
             }
         }
+        // Depth-first draft trees at the product tree widths; W*B<=48 runs the fused epilogue.
+        for (int width : {12, 16}) {
+            for (int batch : {1, 2, 3}) {
+                std::vector<int> valid(batch);
+                std::vector<int> tree(static_cast<std::size_t>(width) * batch);
+                for (int b = 0; b < batch; ++b) {
+                    valid[b] = width - 2 * b;
+                    for (int t = 0; t < width; ++t) {
+                        // Spine 0..7, then siblings hanging off spine columns b, b+1, ...
+                        tree[b * width + t] = t == 0 ? -1 : (t < 8 ? t - 1 : (t - 8 + b) % 7);
+                    }
+                }
+                failures += run_shape(width, batch, valid, tree, 2500U + width * 4 + batch);
+            }
+        }
         for (int width : {4, 5, 6, 8, 16}) {
             std::vector<std::uint16_t> carried, independent;
             for (int prefix = 1; prefix <= width; ++prefix) {

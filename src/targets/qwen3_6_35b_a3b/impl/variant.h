@@ -39,6 +39,9 @@ struct Variant {
         return 1.0f;
     }
 
+    // DFlash v1 has no tree route; the selector temperature is unused.
+    static constexpr float dflash_p_less_tree_temperature = 1.0f;
+
     static constexpr std::uint32_t maximum_context = kNativeContext;
     static constexpr bool supports_dflash          = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows  = 131072;

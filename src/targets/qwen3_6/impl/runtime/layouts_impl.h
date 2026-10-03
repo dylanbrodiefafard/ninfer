@@ -254,21 +254,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         plan.draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("sequence workspace dimensions are invalid");
     }
-    const auto chunk         = static_cast<std::int32_t>(chunk_u32);
-    const auto drafts        = static_cast<std::int32_t>(plan.draft_window);
-    const auto verify        = drafts + 1;
-    const auto dflash_verify = static_cast<std::int32_t>(
-        plan.features.dflash() ? plan.dflash_verify_width : plan.draft_window + 1U);
-    bool dflash_tree = false;
-    if (plan.features.dflash()) {
-        for (const std::uint32_t k : plan.captured_ks) {
-            const std::uint32_t wk = dflash_captured_verify_width(k, plan.dflash_verify_width);
-            dflash_tree            = dflash_tree || dflash_uses_tree_verify(k, wk);
+    const auto chunk  = static_cast<std::int32_t>(chunk_u32);
+    const auto drafts = static_cast<std::int32_t>(plan.draft_window);
+    const auto verify = drafts + 1;
+    // Widest captured shape a batch of this size runs, and whether any such shape is a tree.
+    const auto dflash_batch_width = [&](std::int32_t batch) {
+        std::uint32_t width = 0;
+        for (const DFlashRoundShape& shape : plan.dflash_shapes) {
+            if (shape.max_batch >= static_cast<std::uint32_t>(batch)) {
+                width = std::max(width, shape.verify_width);
+            }
         }
-        if (plan.captured_ks.empty()) {
-            dflash_tree = dflash_uses_tree_verify(plan.draft_window, plan.dflash_verify_width);
+        return static_cast<std::int32_t>(width);
+    };
+    const auto dflash_batch_tree = [&](std::int32_t batch) {
+        bool tree = false;
+        for (const DFlashRoundShape& shape : plan.dflash_shapes) {
+            tree = tree || (shape.max_batch >= static_cast<std::uint32_t>(batch) &&
+                            dflash_uses_tree_verify(shape.k, shape.verify_width));
         }
-    }
+        return tree;
+    };
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -304,7 +310,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                std::int32_t batch_size, std::int32_t min_width,
-                               std::int32_t max_width, bool tree_verify) {
+                               std::int32_t max_width) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
@@ -322,13 +328,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::ReplayRecord) {
-            // Nested: gdn_mix scopes the fold alloc before gdn_normalized_output.
-            // Tree verify reserves the T=1 overlay scratch pool that holds every column state;
-            // chain verify carries the state in registers and needs no scratch.
-            if (tree_verify) {
-                scratch(layout, ops::gated_delta_net_replay_record_workspace_capacity_bytes(
-                                    TextConfig::gdn_value_heads, batch_size, max_width));
-            }
             if (plan.adaptive_draft) {
                 (void)layout.alloc(DType::BF16,
                                    {TextConfig::convolution_dim, max_width, batch_size});
@@ -364,7 +363,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  bool tree_verify = false) {
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope,
                         tree_verify);
-        gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width, tree_verify);
+        gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
@@ -775,18 +774,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             out.dflash_context = dflash_context_capacity(chunk, false);
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
-                const std::int32_t aggregate = dflash_verify * batch;
+                const std::int32_t batch_verify = dflash_batch_width(batch);
+                const bool batch_tree           = dflash_batch_tree(batch);
+                const std::int32_t aggregate    = batch_verify * batch;
                 WorkspaceLayoutBuilder target;
                 matrix(target, DType::BF16, TextConfig::hidden, aggregate);
                 target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
-                            GdnWorkspacePath::ReplayRecord, batch, dflash_verify, dflash_verify,
-                            text_envelope, dflash_tree);
+                            GdnWorkspacePath::ReplayRecord, batch, batch_verify, batch_verify,
+                            text_envelope, batch_tree);
                 const std::size_t chain_accept =
                     ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                         TextConfig::token_domain, drafts, drafts, batch, batch);
                 const std::size_t tree_accept =
-                    ops::speculative_accept_tree_drafts_workspace_capacity_bytes(
-                        TextConfig::token_domain, dflash_verify, dflash_verify, batch, batch);
+                    batch_tree
+                        ? ops::speculative_accept_tree_drafts_workspace_capacity_bytes(
+                              TextConfig::token_domain, batch_verify, batch_verify, batch, batch)
+                        : 0;
                 const std::size_t accept   = std::max(chain_accept, tree_accept);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
                 const std::size_t dflash_peak =
@@ -795,10 +798,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 out.dflash_round = dflash_peak;
                 if (plan.adaptive_draft) {
                     std::size_t panel_bytes = 0;
-                    for (const std::uint32_t k : plan.captured_ks) {
-                        const auto wk = static_cast<std::int32_t>(
-                            dflash_captured_verify_width(k, plan.dflash_verify_width));
-                        if (wk >= dflash_verify) { continue; }
+                    for (const DFlashRoundShape& shape : plan.dflash_shapes) {
+                        if (shape.max_batch < static_cast<std::uint32_t>(batch)) { continue; }
+                        const std::uint32_t k = shape.k;
+                        const auto wk         = static_cast<std::int32_t>(shape.verify_width);
+                        if (wk >= batch_verify) { continue; }
                         const std::int32_t compact_t = wk * batch;
                         WorkspaceLayoutBuilder panels;
                         matrix(panels, DType::I32, static_cast<std::int32_t>(k), batch);
@@ -919,11 +923,17 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument(
                 "DFlash and Vision are not supported together by this target");
         }
-        if constexpr (!DFlashConfig::tree_verify) {
-            if (options.speculative.dflash_verify_width != 0 &&
-                options.speculative.dflash_verify_width != options.speculative.draft_tokens + 1U) {
+        if (options.speculative.dflash_verify_width != 0) {
+            const std::uint32_t chain = options.speculative.draft_tokens + 1U;
+            if constexpr (kDFlashTreeVerifyWidth == 0) {
+                if (options.speculative.dflash_verify_width != chain) {
+                    throw std::invalid_argument(
+                        "this DFlash target requires verify width equal to draft_tokens + 1");
+                }
+            } else if (options.speculative.dflash_verify_width < chain ||
+                       options.speculative.dflash_verify_width > 16U) {
                 throw std::invalid_argument(
-                    "this DFlash target requires verify width equal to draft_tokens + 1");
+                    "DFlash verify width must be in [draft_tokens + 1, 16]");
             }
         }
         break;
@@ -966,11 +976,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->captured_ks = qwen3_6::adaptive_draft_ks(inputs.speculative_backend, inputs.draft_window,
                                                    inputs.adaptive_draft,
                                                    Variant::maximum_adaptive_dflash_draft_tokens);
-    impl->dflash_verify_width =
-        inputs.speculative_backend == SpeculativeBackend::DFlash
-            ? dflash_storage_verify_width(impl->captured_ks, inputs.draft_window,
-                                          inputs.dflash_verify_width)
-            : 0U;
+    if (inputs.speculative_backend == SpeculativeBackend::DFlash) {
+        impl->dflash_shapes =
+            dflash_round_shapes(impl->captured_ks, inputs.draft_window, inputs.dflash_verify_width,
+                                inputs.max_concurrency, inputs.adaptive_draft);
+        impl->dflash_verify_width = dflash_storage_verify_width(impl->dflash_shapes);
+    }
     impl->speculative_backend      = inputs.speculative_backend;
     impl->proposal_head            = inputs.proposal_head;
     impl->features                 = inputs.features;
@@ -1036,12 +1047,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 graph_executables_allowance(graph_topology_count(expanded), "MTP graph allowance");
         } else {
             std::uint32_t max_planned = 0;
-            for (const std::uint32_t k : impl->captured_ks) {
-                const std::uint32_t wk = dflash_captured_verify_width(k, impl->dflash_verify_width);
-                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
-                     ++batch_size) {
-                    for (const GraphExecutionProfile profile :
-                         dflash_graph_profiles(impl->capacity, k, batch_size, wk)) {
+            for (const DFlashRoundShape& shape : impl->dflash_shapes) {
+                for (std::uint32_t batch_size = 1; batch_size <= shape.max_batch; ++batch_size) {
+                    for (const GraphExecutionProfile profile : dflash_graph_profiles(
+                             impl->capacity, shape.k, batch_size, shape.verify_width)) {
                         max_planned = std::max(max_planned, profile.topology_class);
                     }
                 }
@@ -1050,15 +1059,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 qwen3_6::adaptive_k_stride(impl->max_concurrency, max_planned);
             std::vector<GraphExecutionProfile> expanded;
             std::vector<std::uint32_t> expanded_w;
-            for (std::uint32_t k_index = 0; k_index < impl->captured_ks.size(); ++k_index) {
-                const std::uint32_t k  = impl->captured_ks[k_index];
-                const std::uint32_t wk = dflash_captured_verify_width(k, impl->dflash_verify_width);
-                for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency;
-                     ++batch_size) {
-                    const auto profiles = dflash_graph_profiles(impl->capacity, k, batch_size, wk);
+            for (std::uint32_t shape_index = 0; shape_index < impl->dflash_shapes.size();
+                 ++shape_index) {
+                const DFlashRoundShape& shape = impl->dflash_shapes[shape_index];
+                for (std::uint32_t batch_size = 1; batch_size <= shape.max_batch; ++batch_size) {
+                    const auto profiles = dflash_graph_profiles(impl->capacity, shape.k, batch_size,
+                                                                shape.verify_width);
                     for (const GraphExecutionProfile planned : profiles) {
                         const std::uint32_t topology = qwen3_6::adaptive_topology_class(
-                            k_index, k_stride, planned.topology_class, impl->max_concurrency,
+                            shape_index, k_stride, planned.topology_class, impl->max_concurrency,
                             batch_size);
                         for (std::uint32_t variant = 0; variant < kDFlashExchangeVariants;
                              ++variant) {
@@ -1068,7 +1077,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                     ? topology
                                     : qwen3_6::grammar_exchange_topology(topology, variant == 1);
                             expanded.push_back(folded);
-                            expanded_w.push_back(wk);
+                            expanded_w.push_back(shape.verify_width);
                         }
                     }
                 }

@@ -22,9 +22,10 @@ struct Nvfp4GdnConvPlan {
     Nvfp4GdnConvScheduleId schedule;
 };
 
-// A8 record widths whose C<=6 batch fits one M48 W4A8 tile write the conv record from the MMA
-// epilogue; wider widths stage the FP32 projection and run the grouped conv separately.
-inline constexpr std::int32_t kNvfp4GdnA8FusedRecordMaxWidth = 8;
+// A8 record launches whose W*B fits one M48 W4A8 tile write the conv record from the MMA
+// epilogue; larger launches stage the FP32 projection and run the grouped conv separately.
+inline constexpr std::int32_t kNvfp4GdnA8FusedRecordMaxWidth  = 16;
+inline constexpr std::int32_t kNvfp4GdnA8FusedRecordMaxTokens = 48;
 
 inline constexpr bool nvfp4_gdn_record_uses_quantized(LinearPolicy policy,
                                                       std::int32_t width) noexcept {

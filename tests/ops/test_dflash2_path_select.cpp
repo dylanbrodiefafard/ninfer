@@ -653,16 +653,17 @@ int run_tree_layout_case(std::int32_t width) {
                              workspace, nullptr);
     cuda_synchronize();
 
-    const auto ids    = from_device<std::int32_t>(device_ids.data(), width);
-    const auto parent = from_device<std::int32_t>(device_parent.data(), width);
-    const auto cache  = from_device<std::int32_t>(device_cache.data(), width);
-    const auto rope   = from_device<std::int32_t>(device_rope.data(), width);
-    const auto mask   = from_device<std::int32_t>(device_mask.data(), width);
-    const auto valid  = from_device<std::int32_t>(device_valid.data(), 1);
-    int failures      = 0;
-    const int live    = valid[0];
-    if (live != 1 + ops::kDflash2TreeFrontier * tokens) {
-        std::cerr << "dflash2_tree_select: expected live " << (1 + 2 * tokens) << " got " << live
+    const auto ids          = from_device<std::int32_t>(device_ids.data(), width);
+    const auto parent       = from_device<std::int32_t>(device_parent.data(), width);
+    const auto cache        = from_device<std::int32_t>(device_cache.data(), width);
+    const auto rope         = from_device<std::int32_t>(device_rope.data(), width);
+    const auto mask         = from_device<std::int32_t>(device_mask.data(), width);
+    const auto valid        = from_device<std::int32_t>(device_valid.data(), 1);
+    int failures            = 0;
+    const int live          = valid[0];
+    const int expected_live = std::min(width, 1 + ops::kDflash2PathSelectTopK * tokens);
+    if (live != expected_live) {
+        std::cerr << "dflash2_tree_select: expected live " << expected_live << " got " << live
                   << "\n";
         ++failures;
     }
@@ -774,9 +775,16 @@ int run_tree_compact_case() {
                   << "\n";
         ++failures;
     }
-    if (live >= 3 && (parent[1] != 0 || parent[2] != 0)) {
-        std::cerr << "dflash2_tree_select compact: BFS prefix dropped a depth-1 sibling\n";
-        ++failures;
+    // Depth-first preorder: every column's parent lies on the root path of the previous column.
+    for (int j = 2; j < live; ++j) {
+        bool on_path = false;
+        for (int cur = j - 1; cur >= 0; cur = parent[static_cast<std::size_t>(cur)]) {
+            if (cur == parent[static_cast<std::size_t>(j)]) { on_path = true; }
+        }
+        if (!on_path) {
+            std::cerr << "dflash2_tree_select compact: column " << j << " breaks preorder\n";
+            ++failures;
+        }
     }
     for (int j = 1; j < live; ++j) {
         if (parent[static_cast<std::size_t>(j)] < 0 || parent[static_cast<std::size_t>(j)] >= j ||
@@ -1328,8 +1336,11 @@ int run_nvfp4_codebook_matches_bf16_accept(const char* label, std::int32_t token
 // identically and only the *structural* invariants (prefix-closed parent, mask
 // closure, cache/rope slots, live count) are exercised. The content of the
 // node selection -- which token actually lands in which tree node, via the real
-// Markov score -- was never checked. This oracle rebuilds the same beam-2 BFS
-// in FP64 on the host and compares the full packed tree.
+// Markov score -- is checked here. This oracle rebuilds the best-first tree in FP64
+// on the host (each parent's 16 children scored by unary + Markov, log-softmax
+// normalized per parent; repeatedly pop the frontier node of greatest path
+// log-probability) and emits it in depth-first preorder with children in
+// descending path log-probability, then compares the full packed tree.
 //
 // The inputs are deliberately well-separated so the top-2 frontier choice is
 // unambiguous regardless of the kernel's FP32/BF16 accumulation order:
@@ -1354,18 +1365,13 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
                                       const std::vector<float>& pred,
                                       const std::vector<float>& succ, std::int32_t anchor,
                                       std::int32_t frontier, std::int32_t vocab,
-                                      std::int32_t tokens, std::int32_t width) {
-    const std::int32_t kExpand = ops::kDflash2TreeExpandWidth;
-    // node_id[i] = packed column i's token id; node_parent[i] = parent packed column
-    // (-1 for the root); node_score[i] = cumulative Markov score of the path.
-    std::vector<std::int32_t> node_id; // token id per packed column
-    std::vector<std::int32_t> node_parent;
-    std::vector<std::int32_t> node_depth;
-    std::vector<double> node_score;
-    node_id.push_back(anchor);
-    node_parent.push_back(-1);
-    node_depth.push_back(0);
-    node_score.push_back(0.0);
+                                      std::int32_t tokens, std::int32_t width,
+                                      double hidden_scale = 1.0, double temperature = 1.0) {
+    // Nodes in pop order: token id, parent node, depth, path log-probability.
+    std::vector<std::int32_t> node_id{anchor};
+    std::vector<std::int32_t> node_parent{-1};
+    std::vector<std::int32_t> node_depth{0};
+    std::vector<double> node_logp{0.0};
 
     auto top16 = [&](std::int32_t t) {
         std::vector<float> tv(kTopK, -std::numeric_limits<float>::infinity());
@@ -1376,66 +1382,82 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
         }
         return std::pair<std::vector<float>, std::vector<int>>(std::move(tv), std::move(ti));
     };
+    // The fixtures force the hidden projection h = 1 exactly; the Markov sum is evaluated
+    // generically over the kRank ranks.
+    std::vector<double> hidden_proj(kRank, hidden_scale);
 
-    // h[r] for each draft column: here the test fixtures force h = 1 exactly, but the
-    // oracle computes the Markov sum generically over the kRank ranks so it stays valid
-    // if the fixture is relaxed.
-    std::vector<std::vector<double>> hidden_proj(tokens, std::vector<double>(kRank, 1.0));
+    struct Entry {
+        double logp;
+        std::int32_t cand;
+        std::int32_t parent;
+        std::int32_t depth;
+    };
 
-    std::vector<std::int32_t> frontier_nodes{0};
-    for (std::int32_t t = 0; t < tokens; ++t) {
-        const auto tv_ti    = top16(t);
-        const auto& top_val = tv_ti.first;
-        const auto& top_idx = tv_ti.second;
-
-        struct Pair {
-            double joint;
-            int cand;
-            int pcol;
-        };
-
-        std::vector<Pair> pairs;
-        pairs.reserve(frontier_nodes.size() * static_cast<std::size_t>(kTopK));
-        for (int f : frontier_nodes) {
-            const int pcol         = f;
-            const double base      = node_score[pcol];
-            const int parent_token = node_id[pcol];
-            for (int c = 0; c < kTopK; ++c) {
-                const int cand     = top_idx[static_cast<std::size_t>(c)];
-                const double unary = static_cast<double>(top_val[static_cast<std::size_t>(c)]);
-                double markov      = 0.0;
-                for (std::int32_t r = 0; r < kRank; ++r) {
-                    markov +=
-                        (static_cast<double>(
-                             pred[static_cast<std::size_t>(parent_token) * kRank + r]) *
-                         hidden_proj[static_cast<std::size_t>(t)][static_cast<std::size_t>(r)]) *
-                        static_cast<double>(succ[static_cast<std::size_t>(cand) * kRank + r]);
-                }
-                pairs.push_back({base + unary + markov, cand, pcol});
+    std::vector<Entry> pool;
+    const auto expand = [&](std::int32_t node) {
+        const std::int32_t t = node_depth[static_cast<std::size_t>(node)];
+        if (t >= tokens) { return; }
+        const auto [top_val, top_idx] = top16(t);
+        std::vector<double> score(kTopK);
+        const int parent_token = node_id[static_cast<std::size_t>(node)];
+        for (int c = 0; c < kTopK; ++c) {
+            const int cand = top_idx[static_cast<std::size_t>(c)];
+            double markov  = 0.0;
+            for (std::int32_t r = 0; r < kRank; ++r) {
+                markov +=
+                    (static_cast<double>(pred[static_cast<std::size_t>(parent_token) * kRank + r]) *
+                     hidden_proj[static_cast<std::size_t>(r)]) *
+                    static_cast<double>(succ[static_cast<std::size_t>(cand) * kRank + r]);
+            }
+            score[static_cast<std::size_t>(c)] =
+                (static_cast<double>(top_val[static_cast<std::size_t>(c)]) + markov) / temperature;
+        }
+        const double mx = *std::max_element(score.begin(), score.end());
+        double sum      = 0.0;
+        for (double v : score) { sum += std::exp(v - mx); }
+        const double lse = mx + std::log(sum);
+        for (int c = 0; c < kTopK; ++c) {
+            pool.push_back({node_logp[static_cast<std::size_t>(node)] +
+                                score[static_cast<std::size_t>(c)] - lse,
+                            top_idx[static_cast<std::size_t>(c)], node, t + 1});
+        }
+    };
+    expand(0);
+    while (static_cast<std::int32_t>(node_id.size()) < width && !pool.empty()) {
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < pool.size(); ++i) {
+            if (pool[i].logp > pool[best].logp ||
+                (pool[i].logp == pool[best].logp && pool[i].cand < pool[best].cand)) {
+                best = i;
             }
         }
-        // Top-2 by (joint desc, cand asc, pcol asc) -- matches the kernel tiebreak.
-        std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
-            if (a.joint != b.joint) { return a.joint > b.joint; }
-            if (a.cand != b.cand) { return a.cand < b.cand; }
-            return a.pcol < b.pcol;
-        });
-        const int take = std::min<std::size_t>(2, pairs.size());
-        std::vector<std::int32_t> next_frontier;
-        for (int s = 0; s < take; ++s) {
-            const auto& p = pairs[static_cast<std::size_t>(s)];
-            if (static_cast<std::int32_t>(node_id.size()) >= kExpand) { break; }
-            node_id.push_back(p.cand);
-            node_parent.push_back(p.pcol);
-            node_depth.push_back(t + 1);
-            node_score.push_back(p.joint);
-            next_frontier.push_back(static_cast<std::int32_t>(node_id.size() - 1));
-        }
-        if (!next_frontier.empty()) { frontier_nodes = std::move(next_frontier); }
+        const Entry e = pool[best];
+        pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(best));
+        node_id.push_back(e.cand);
+        node_parent.push_back(e.parent);
+        node_depth.push_back(e.depth);
+        node_logp.push_back(e.logp);
+        expand(static_cast<std::int32_t>(node_id.size()) - 1);
     }
+    const auto out_n = static_cast<std::int32_t>(node_id.size());
 
-    const std::int32_t out_n =
-        static_cast<std::int32_t>(std::min(node_id.size(), static_cast<std::size_t>(width)));
+    // Depth-first preorder, children in descending path log-probability.
+    std::vector<std::int32_t> order;
+    std::vector<std::int32_t> column_of(node_id.size(), -1);
+    const auto visit = [&](auto&& self, std::int32_t node) -> void {
+        column_of[static_cast<std::size_t>(node)] = static_cast<std::int32_t>(order.size());
+        order.push_back(node);
+        std::vector<std::int32_t> kids;
+        for (std::int32_t c = 1; c < out_n; ++c) {
+            if (node_parent[static_cast<std::size_t>(c)] == node) { kids.push_back(c); }
+        }
+        std::stable_sort(kids.begin(), kids.end(), [&](std::int32_t x, std::int32_t y) {
+            return node_logp[static_cast<std::size_t>(x)] > node_logp[static_cast<std::size_t>(y)];
+        });
+        for (std::int32_t kid : kids) { self(self, kid); }
+    };
+    visit(visit, 0);
+
     TreeContentOracle out;
     out.ids.resize(width);
     out.parent.resize(width);
@@ -1445,21 +1467,22 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
     const std::int32_t last = out_n > 0 ? out_n - 1 : 0;
     for (std::int32_t i = 0; i < width; ++i) {
         if (i < out_n) {
-            out.ids[static_cast<std::size_t>(i)] = node_id[static_cast<std::size_t>(i)];
+            const std::int32_t n                 = order[static_cast<std::size_t>(i)];
+            out.ids[static_cast<std::size_t>(i)] = node_id[static_cast<std::size_t>(n)];
             out.parent[static_cast<std::size_t>(i)] =
-                i == 0 ? -1 : node_parent[static_cast<std::size_t>(i)];
+                i == 0
+                    ? -1
+                    : column_of[static_cast<std::size_t>(node_parent[static_cast<std::size_t>(n)])];
             out.cache[static_cast<std::size_t>(i)] = frontier + i;
             out.rope[static_cast<std::size_t>(i)] =
-                frontier + node_depth[static_cast<std::size_t>(i)];
-            int m   = 0;
-            int cur = i;
-            while (cur >= 0) {
-                m |= 1 << cur;
-                cur = node_parent[static_cast<std::size_t>(cur)];
+                frontier + node_depth[static_cast<std::size_t>(n)];
+            int m = 0;
+            for (std::int32_t cur = n; cur >= 0; cur = node_parent[static_cast<std::size_t>(cur)]) {
+                m |= 1 << column_of[static_cast<std::size_t>(cur)];
             }
             out.mask[static_cast<std::size_t>(i)] = m;
         } else {
-            // Padding columns duplicate the last live node's id/parent/rope/mask, but keep
+            // Padding columns duplicate the last live column's id/parent/rope/mask, but keep
             // their own cache slot (e + col) -- matches the kernel's output convention.
             out.ids[static_cast<std::size_t>(i)]    = out.ids[static_cast<std::size_t>(last)];
             out.parent[static_cast<std::size_t>(i)] = out.parent[static_cast<std::size_t>(last)];
@@ -1472,8 +1495,13 @@ TreeContentOracle tree_content_oracle(const std::vector<float>& logits,
     return out;
 }
 
+// hidden_scale (a power of two) scales the projected hidden state so Markov terms are moderate
+// and the per-parent softmax temperature changes cross-parent choices. p_less_temperature > 0
+// runs the row as p-less with that tree temperature. expected_out receives the packed ids.
 int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t width,
-                          std::int32_t anchor, std::int32_t frontier) {
+                          std::int32_t anchor, std::int32_t frontier, float hidden_scale = 1.0f,
+                          float p_less_temperature           = 0.0f,
+                          std::vector<std::int32_t>* ids_out = nullptr) {
     constexpr std::int32_t vocab = 32;
     // The first 32 primes, so prime[token] is unique per token.
     const std::int32_t prime[vocab] = {
@@ -1489,8 +1517,8 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
         for (std::int32_t v = 0; v < vocab; ++v) {
             logits[col + static_cast<std::size_t>(v)] = static_cast<float>(v);
         }
-        // hidden[0] = 1 for every draft column, rest zero -> h = 1 exactly.
-        hidden[static_cast<std::size_t>(t) * kHidden + 0] = 1.0f;
+        // hidden[0] = hidden_scale for every draft column, rest zero -> h = hidden_scale exactly.
+        hidden[static_cast<std::size_t>(t) * kHidden + 0] = hidden_scale;
     }
     for (std::int32_t token = 0; token < vocab; ++token) {
         for (std::int32_t r = 0; r < kRank; ++r) {
@@ -1516,7 +1544,14 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
     DeviceWeight device_weight(std::move(host_weight));
 
     const TreeContentOracle expected =
-        tree_content_oracle(logits, pred, succ, anchor, frontier, vocab, tokens, width);
+        tree_content_oracle(logits, pred, succ, anchor, frontier, vocab, tokens, width,
+                            hidden_scale, p_less_temperature > 0.0f ? p_less_temperature : 1.0);
+
+    ops::SamplingConfig config;
+    config.temperature = 2.0f;
+    config.p_less      = p_less_temperature > 0.0f ? 1 : 0;
+    GuardedDeviceBuffer device_config(sizeof(ops::SamplingConfig));
+    device_config.copy_from_host(&config, sizeof(config));
 
     const auto logit_bits  = encode_bf16(logits);
     const auto hidden_bits = encode_bf16(hidden);
@@ -1558,10 +1593,13 @@ int run_tree_content_case(const char* label, std::int32_t tokens, std::int32_t w
         ops::dflash2_path_select_workspace_capacity_bytes(QType::BF16_CTRL, tokens, tokens, 1)));
     ops::dflash2_tree_select(logits_t, hidden_t, device_weight.view(), pred_t, succ_t, anchors_t,
                              frontiers_t, ids_t, parent_t, cache_t, rope_t, mask_t, valid_t,
-                             workspace, nullptr);
+                             workspace, nullptr, nullptr, nullptr, nullptr,
+                             reinterpret_cast<const ops::SamplingConfig*>(device_config.data()),
+                             p_less_temperature > 0.0f ? p_less_temperature : 1.0f);
     cuda_synchronize();
 
-    const auto ids    = from_device<std::int32_t>(device_ids.data(), width);
+    const auto ids = from_device<std::int32_t>(device_ids.data(), width);
+    if (ids_out != nullptr) { *ids_out = ids; }
     const auto parent = from_device<std::int32_t>(device_parent.data(), width);
     const auto cache  = from_device<std::int32_t>(device_cache.data(), width);
     const auto rope   = from_device<std::int32_t>(device_rope.data(), width);
@@ -1780,6 +1818,22 @@ int main() {
                                       ops::kDflash2VerifyWidth, 5, 16);
     failures += run_tree_content_case("dflash2_tree_select content T=7 W=12 anchor=9 e=24", 7,
                                       ops::kDflash2VerifyWidth, 9, 24);
+    {
+        // h = 2^-26 leaves the Markov term a sub-0.02 tie-breaker, so each parent's children
+        // follow softmax(unary / T) with unit unary spacing: T=1.5 admits a third root child
+        // that T=1 does not.
+        constexpr float kScale = 1.0f / 67108864.0f;
+        std::vector<std::int32_t> greedy_tree;
+        std::vector<std::int32_t> p_less_tree;
+        failures += run_tree_content_case("dflash2_tree_select content T=7 W=8 moderate", 7, 8, 7,
+                                          32, kScale, 0.0f, &greedy_tree);
+        failures += run_tree_content_case("dflash2_tree_select content T=7 W=8 p-less T=1.5", 7, 8,
+                                          7, 32, kScale, 1.5f, &p_less_tree);
+        if (greedy_tree == p_less_tree) {
+            std::cerr << "dflash2_tree_select: p-less tree temperature left the tree unchanged\n";
+            ++failures;
+        }
+    }
     failures += run_tree_batch_row_isolation_case();
     failures += run_nvfp4_codebook_greedy_case(
         "dflash2_path_select NVFP4 codebook greedy T=2 V=128", 2, 1, 23u);

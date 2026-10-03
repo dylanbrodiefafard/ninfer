@@ -214,12 +214,14 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label,
-                                         std::uint32_t draft_k = 0, bool grammar_exchange = false) {
+                                         std::uint32_t draft_k = 0, bool grammar_exchange = false,
+                                         std::uint32_t verify_width = 0) {
     const auto it = std::find_if(
         family.profiles.begin(), family.profiles.end(), [&](const DecodeGraphProfile& profile) {
             return profile.batch_size == batch_size && profile.min_execution_frontier <= frontier &&
                    frontier <= profile.max_execution_frontier && profile.draft_k == draft_k &&
-                   profile.grammar_exchange == grammar_exchange;
+                   profile.grammar_exchange == grammar_exchange &&
+                   (verify_width == 0 || profile.verify_width == verify_width);
         });
     if (it == family.profiles.end()) {
         throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
@@ -350,12 +352,18 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
       adaptive_draft(plan.adaptive_draft), p_less_draft_temperature(plan.p_less_draft_temperature),
-      captured_ks(plan.captured_ks), speculative_backend(plan.speculative_backend),
-      context_marks(plan.context_checkpoint_marks), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
-      keep_frac(plan.keep_frac), xattn_tau(plan.xattn_tau), xattn_min_len(plan.xattn_min_len),
-      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      captured_ks(plan.captured_ks), dflash_shapes(plan.dflash_shapes), dflash_arms_by_batch([&] {
+          std::array<std::vector<std::uint32_t>, kMaximumConcurrency> arms;
+          for (std::uint32_t b = 1; b <= kMaximumConcurrency; ++b) {
+              arms[b - 1] = dflash_batch_arms(plan.dflash_shapes, b);
+          }
+          return arms;
+      }()),
+      speculative_backend(plan.speculative_backend), context_marks(plan.context_checkpoint_marks),
+      kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      proposal_head(plan.proposal_head), keep_frac(plan.keep_frac), xattn_tau(plan.xattn_tau),
+      xattn_min_len(plan.xattn_min_len), vision_enabled(plan.features.vision),
+      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       kv_ram_capacity_bytes(plan.kv_ram_capacity_bytes),
       kv_disk_capacity_bytes(plan.kv_disk_capacity_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -3439,10 +3447,10 @@ void ProgramImplCore::prepare_graphs() {
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         std::uint32_t max_planned = 0;
-        for (const std::uint32_t k : captured_ks) {
-            const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                const auto planned_profiles = dflash_graph_profiles(capacity, k, batch_size, wk);
+        for (const DFlashRoundShape& shape : dflash_shapes) {
+            for (std::uint32_t batch_size = 1; batch_size <= shape.max_batch; ++batch_size) {
+                const auto planned_profiles =
+                    dflash_graph_profiles(capacity, shape.k, batch_size, shape.verify_width);
                 if (batch_size == 1) {
                     validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 }
@@ -3452,8 +3460,8 @@ void ProgramImplCore::prepare_graphs() {
             }
         }
         const std::uint32_t k_stride = qwen3_6::adaptive_k_stride(max_concurrency, max_planned);
-        const std::uint32_t warm_k   = captured_ks.empty() ? draft_window : captured_ks.back();
-        const std::uint32_t warm_w   = dflash_captured_verify_width(warm_k, dflash_verify_width);
+        const std::uint32_t warm_k   = dflash_shapes.back().k;
+        const std::uint32_t warm_w   = dflash_shapes.back().verify_width;
         schedule::DFlashBatchContext dflash_state{
             execution_core(),     decoder->text_kv,    dflash.value(),    io.dflash_decode.value(),
             *dflash_host_ingress, *dflash_host_egress, tail_hidden_store, tool_masks.get()};
@@ -3471,16 +3479,17 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
 
         std::size_t dflash_profile_count = 0;
-        for (const std::uint32_t k : captured_ks) {
-            const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
-            dflash_profile_count += dflash_graph_profiles(capacity, k, 1, wk).size() *
-                                    max_concurrency * kDFlashExchangeVariants;
+        for (const DFlashRoundShape& shape : dflash_shapes) {
+            dflash_profile_count +=
+                dflash_graph_profiles(capacity, shape.k, 1, shape.verify_width).size() *
+                shape.max_batch * kDFlashExchangeVariants;
         }
         dflash_graphs.profiles.reserve(dflash_profile_count);
-        for (std::uint32_t k_index = 0; k_index < captured_ks.size(); ++k_index) {
-            const std::uint32_t k  = captured_ks[k_index];
-            const std::uint32_t wk = dflash_captured_verify_width(k, dflash_verify_width);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+        for (std::uint32_t shape_index = 0; shape_index < dflash_shapes.size(); ++shape_index) {
+            const std::uint32_t k  = dflash_shapes[shape_index].k;
+            const std::uint32_t wk = dflash_shapes[shape_index].verify_width;
+            for (std::uint32_t batch_size = 1; batch_size <= dflash_shapes[shape_index].max_batch;
+                 ++batch_size) {
                 const auto planned_profiles = dflash_graph_profiles(capacity, k, batch_size, wk);
                 validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 for (std::uint32_t variant = 0; variant < kDFlashExchangeVariants; ++variant) {
@@ -3496,7 +3505,8 @@ void ProgramImplCore::prepare_graphs() {
                         profile.verify_width           = wk;
                         profile.grammar_exchange       = exchange;
                         const std::uint32_t topology   = qwen3_6::adaptive_topology_class(
-                            k_index, k_stride, planned.topology_class, max_concurrency, batch_size);
+                            shape_index, k_stride, planned.topology_class, max_concurrency,
+                            batch_size);
                         profile.topology_class =
                             kDFlashExchangeVariants == 1
                                 ? topology
@@ -4474,17 +4484,19 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const std::uint32_t afford        = std::min(budget_extent, cap_extent);
         row_affords[row]                  = afford;
         row_ks[row] = adaptive_draft ? afford : std::min({draft_window, budget_extent, cap_extent});
-        if (adaptive_draft && lanes.size() == 1 && request.adaptive.live_k != 0) {
-            row_ks[row] = std::min(request.adaptive.live_k, afford);
-        }
     }
     std::array<const qwen3_6::AdaptiveDraftState*, kMaximumConcurrency> dflash_row_states{};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         dflash_row_states[row] = &requests[lanes[row]].adaptive;
     }
     const std::uint32_t batch_idx = static_cast<std::uint32_t>(lanes.size()) - 1U;
-    std::uint32_t batch_k         = qwen3_6::adaptive_batch_k(
-        std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks);
+    // Arms this batch size can run: chain (or pinned) shapes, plus the packed-tree arm in adaptive
+    // mode while the packed verify fits one A8 tile. The picker learns which wins per batch size.
+    const std::span<const std::uint32_t> arms = dflash_arms_by_batch[batch_idx];
+    const std::uint32_t cap_k                 = *std::max_element(
+        row_ks.begin(), row_ks.begin() + static_cast<std::ptrdiff_t>(lanes.size()));
+    std::uint32_t batch_arm = qwen3_6::adaptive_batch_k(
+        std::span<const std::uint32_t>(row_ks.data(), lanes.size()), arms);
     if (adaptive_draft) {
         qwen3_6::AdaptiveRoundTimeState& t_state = adaptive_t_by_batch[batch_idx];
         qwen3_6::AdaptiveBatchKState& batch_st   = adaptive_batch_k_by_c[batch_idx];
@@ -4496,7 +4508,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             if (ad.live_k == 0) {
                 qwen3_6::AdaptiveDraftConfig cfg;
                 cfg.hop_rates                          = hop_rates();
-                cfg.captured_ks                        = captured_ks;
+                cfg.captured_ks                        = arms;
                 cfg.round_time                         = &t_state;
                 cfg.length_tokens                      = maximum_frontier;
                 const qwen3_6::AdaptiveDraftState* ptr = &ad;
@@ -4505,23 +4517,20 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     cfg, std::span<const qwen3_6::AdaptiveDraftState* const>(&ptr, 1),
                     std::span<const std::uint32_t>(row_cap, 1), row_ks[0], 0);
             }
-            row_ks[0] = std::min(ad.live_k, row_ks[0]);
-            batch_k   = qwen3_6::adaptive_batch_k(
-                std::span<const std::uint32_t>(row_ks.data(), lanes.size()), captured_ks);
+            batch_arm = qwen3_6::adaptive_clamp_arm(arms, ad.live_k, row_ks[0]);
         } else if (batch_st.live_k == 0) {
-            batch_k = qwen3_6::adaptive_batch_next(batch_st, states, caps, captured_ks, &t_state,
-                                                   maximum_frontier, hop_rates());
+            batch_arm = qwen3_6::adaptive_batch_next(batch_st, states, caps, arms, &t_state,
+                                                     maximum_frontier, hop_rates());
         } else {
-            batch_k = std::min(batch_st.live_k, batch_k);
+            batch_arm = qwen3_6::adaptive_clamp_arm(arms, batch_st.live_k, cap_k);
         }
-        // Exploration: a content-independent one-round override that leaves the incumbent k.
-        explore_k = qwen3_6::adaptive_explore_k(
-            adaptive_hop_rates, captured_ks, t_state,
-            qwen3_6::adaptive_batch_k(
-                std::span<const std::uint32_t>(row_affords.data(), lanes.size()), captured_ks));
-        if (explore_k != 0) { batch_k = explore_k; }
+        // Exploration: a content-independent one-round override that leaves the incumbent arm.
+        explore_k = qwen3_6::adaptive_explore_k(adaptive_hop_rates, arms, t_state, cap_k);
+        if (explore_k != 0) { batch_arm = explore_k; }
     }
-    const std::uint32_t live_w = dflash_captured_verify_width(batch_k, dflash_verify_width);
+    const DFlashRoundShape& round_shape = dflash_arm_shape(dflash_shapes, batch_arm);
+    const std::uint32_t batch_k         = round_shape.k;
+    const std::uint32_t live_w          = round_shape.verify_width;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         maximum_target_tokens =
@@ -4535,9 +4544,9 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, width);
         ops::GqaExecutionEnvelope target_envelope{maximum_frontier + 1, maximum_target_tokens};
         if (use_cuda_graph) {
-            DecodeGraphProfile& profile =
-                select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch", batch_k, dflash_exchange);
+            DecodeGraphProfile& profile = select_graph_profile(
+                dflash_graphs, static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
+                "DFlash batch", batch_k, dflash_exchange, live_w);
             executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
                                                profile.max_execution_frontier, width);
@@ -4600,7 +4609,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         tool_masks->rethrow_error();
         // Fallback (extent 0) is not a k-draft round; do not fit T(batch_k) from it.
         if (adaptive_draft && realized_extent > 0) {
-            qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_k,
+            qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_arm,
                                                  static_cast<float>(seconds), maximum_frontier);
         }
         if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats_enabled() &&
@@ -4616,6 +4625,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                   ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(pars.data(), frame.parent_index.data,
                                   pars.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+            if (b == 1) {
+                ninfer::targets::qwen3_6::detail::dflash_candidate_stats::capture_target_logits(
+                    frame.target_logits, w);
+            }
             for (int row = 0; row < b; ++row) {
                 const int count =
                     dflash_host_egress->licensed_counts[static_cast<std::size_t>(row)];
@@ -4683,17 +4696,17 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         if (budget_extent > 0) {
                             qwen3_6::AdaptiveDraftConfig cfg;
                             cfg.hop_rates     = hop_rates();
-                            cfg.captured_ks   = captured_ks;
+                            cfg.captured_ks   = arms;
                             cfg.round_time    = &adaptive_t_by_batch[batch_idx];
                             cfg.length_tokens = base_E + static_cast<std::uint32_t>(count_i);
                             (void)qwen3_6::adaptive_draft_next(
                                 cfg, request.adaptive, static_cast<std::uint32_t>(accepted_i),
-                                extent, budget_extent, batch_k, explore_k != 0);
+                                extent, budget_extent, batch_arm, explore_k != 0);
                         }
                     } else {
                         qwen3_6::adaptive_record_round(
                             request.adaptive, static_cast<std::uint32_t>(accepted_i), extent,
-                            batch_k, hop_rates(), explore_k != 0);
+                            batch_arm, hop_rates(), explore_k != 0);
                     }
                 }
             }
@@ -4724,7 +4737,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 adaptive_batch_k_by_c[batch_idx],
                 std::span<const qwen3_6::AdaptiveDraftState* const>(dflash_row_states.data(),
                                                                     lanes.size()),
-                std::span<const std::uint32_t>(next_caps.data(), lanes.size()), captured_ks,
+                std::span<const std::uint32_t>(next_caps.data(), lanes.size()), arms,
                 &adaptive_t_by_batch[batch_idx], next_length, hop_rates());
             qwen3_6::adaptive_assign_live_k(
                 std::span<qwen3_6::AdaptiveDraftState*>(mut_states.data(), lanes.size()), next);

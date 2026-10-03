@@ -1,5 +1,6 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include "ninfer/ops/dflash2_path_select.h"
+#include "ninfer/ops/gated_delta_net.h"
 
 #include <algorithm>
 #include <limits>
@@ -214,6 +215,9 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash target verify ids");
         decode.parent_index =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree parent index");
+        decode.gdn_tree_schedule =
+            add_tensor(builder, DType::I32, {ops::kGdnTreeScheduleWords, batch},
+                       "DFlash tree GDN record schedule");
         decode.ancestor_mask =
             add_tensor(builder, DType::I32, {dflash_width, batch}, "DFlash tree ancestor mask");
         decode.cache_positions =
@@ -377,6 +381,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     selector_q                 = layout.selector_q.bind(backing);
     verify_ids                 = layout.verify_ids.bind(backing);
     parent_index               = layout.parent_index.bind(backing);
+    gdn_tree_schedule          = layout.gdn_tree_schedule.bind(backing);
     ancestor_mask              = layout.ancestor_mask.bind(backing);
     cache_positions            = layout.cache_positions.bind(backing);
     target_argmax              = layout.target_argmax.bind(backing);

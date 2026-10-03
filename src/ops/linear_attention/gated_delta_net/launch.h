@@ -46,18 +46,11 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream,
-                             const std::int32_t* parent_index = nullptr);
+                             const std::int32_t* tree_schedule = nullptr);
 
-// Tree replay record: publish replay inputs and produce packed GDN out with T=1 snapshot
-// arithmetic, loading each column's parent state from scratch. parent_index is non-null.
-// overlay_states is FP32 [128,128,Hv,B*W]; column t of row b is slot t*B+b.
-// Does not write live ssm_states.
-void launch_recurrent_overlay(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                              const Tensor& beta, float scale, const Tensor& ssm_states,
-                              const Tensor& valid_columns, const Tensor& initial_state_slots,
-                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                              Tensor& out, float* overlay_states, const std::int32_t* parent_index,
-                              cudaStream_t stream);
+void launch_tree_schedule(const std::int32_t* parent_index, const std::int32_t* valid_columns,
+                          std::int32_t width, std::int32_t batch, std::int32_t* schedule,
+                          cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

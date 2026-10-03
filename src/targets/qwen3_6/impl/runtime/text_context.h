@@ -192,8 +192,8 @@ public:
 
     void set_linear_state_slot(std::int32_t current_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
-    void set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
-                         const Tensor* prefix_lengths);
+    void set_tree_verify(const Tensor* parent_index, const Tensor* gdn_tree_schedule,
+                         const Tensor* ancestor_mask, const Tensor* prefix_lengths);
 
     void set_sequence_row(std::int32_t row) noexcept { active_sequence_row_ = row; }
 
@@ -332,6 +332,7 @@ private:
     const Tensor* active_linear_state_slots_              = nullptr;
     const Tensor* active_valid_columns_                   = nullptr;
     const Tensor* active_parent_index_                    = nullptr;
+    const Tensor* active_gdn_tree_schedule_               = nullptr;
     const Tensor* active_ancestor_mask_                   = nullptr;
     const Tensor* active_prefix_lengths_                  = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;

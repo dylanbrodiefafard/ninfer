@@ -282,11 +282,10 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         throw std::logic_error("DFlash proposal is unavailable for this target");
     } else {
         using Config = typename V::DFlashConfig;
-        // DFlash2 chain rounds draft every row in one batched pass; tree verify keeps per-row
-        // proposals.
-        const bool batched_chain =
-            Config::kind == qwen3_6::DFlashKind::DFlash2 && verify_width == k + 1;
-        if (batch_size > 1 && !batched_chain) {
+        // DFlash2 rounds draft every row in one batched pass; the drafter forward is identical
+        // for chain and tree rounds, and both selectors take every row in one launch.
+        const bool batched = Config::kind == qwen3_6::DFlashKind::DFlash2;
+        if (batch_size > 1 && !batched) {
             for (std::int32_t row = 0; row < batch_size; ++row) {
                 propose_batch_impl<V>(state, frame, 1, k, envelopes, verify_width,
                                       exact_sequence_envelope, row_begin + row);
@@ -836,7 +835,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 rope_positions, ancestor_mask, live_columns, state.execution.work,
                                 state.execution.device.stream, logit_token_ids,
                                 dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
-                                dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4));
+                                dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4),
+                                frame.sampling + row_begin, V::dflash_p_less_tree_temperature);
                         } else if (batch_size == 1) {
                             ops::dflash2_path_select(
                                 logits_batch, hidden_batch, dflash.hidden_projection,
@@ -846,6 +846,23 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 dflash2_nvfp4_codebook(dflash.predecessor_codebook_nvfp4),
                                 dflash2_nvfp4_codebook(dflash.successor_codebook_nvfp4), &sel_ids,
                                 &sel_q, 0, 0, false, V::dflash_p_less_draft_temperature_scale(k));
+                            if (ninfer::targets::qwen3_6::detail::dflash_candidate_stats::
+                                        selector_dump_path() != nullptr &&
+                                ninfer::targets::qwen3_6::detail::
+                                    dflash_candidate_stats_enabled()) {
+                                Tensor hidden_flat = hidden_batch.view(
+                                    {Config::hidden, static_cast<std::int32_t>(k)});
+                                Tensor hidden_proj = state.execution.work.alloc(
+                                    DType::BF16, {256, static_cast<std::int32_t>(k)});
+                                ops::linear_packed_sequences(
+                                    hidden_flat, dflash.hidden_projection, hidden_proj,
+                                    state.execution.device.stream, static_cast<std::int32_t>(k));
+                                ninfer::targets::qwen3_6::detail::dflash_candidate_stats::
+                                    capture_selector(
+                                        hidden_proj, sel_ids, dflash.predecessor_codebook,
+                                        dflash.successor_codebook, anchors, static_cast<int>(k),
+                                        state.execution.device.stream);
+                            }
                         } else {
                             for (std::int32_t row = 0; row < batch_size; ++row) {
                                 Tensor logits_row   = logits_batch.slice(2, row, 1);
@@ -1003,7 +1020,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             }
         }
         qwen3_6::copy_i32_panel(ids_view, ids_full, state.execution.device.stream);
-        qwen3_6::copy_i32_panel(pos_view, pos_full, state.execution.device.stream);
+        // A tree round's selector already wrote its RoPE positions into proposal_positions; the
+        // drafter's block positions must not overwrite them.
+        if (!dflash_uses_tree_verify(k, verify_width)) {
+            qwen3_6::copy_i32_panel(pos_view, pos_full, state.execution.device.stream);
+        }
         qwen3_6::copy_i32_panel(drafts_view, drafts, state.execution.device.stream);
         state.execution.work.reset();
     }
@@ -1169,12 +1190,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             .tool_masks      = state.tool_masks,
         };
         if (use_tree) {
-            verify_frame.parent_index    = parent_index;
-            verify_frame.ancestor_mask   = ancestor_mask;
-            verify_frame.prefix_lengths  = frontiers;
-            verify_frame.accepted_column = accepted_column;
-            verify_frame.fold_path       = fold_path;
-            verify_frame.tree_verify     = true;
+            verify_frame.parent_index      = parent_index;
+            verify_frame.gdn_tree_schedule = frame.gdn_tree_schedule.slice(1, 0, batch_size);
+            verify_frame.ancestor_mask     = ancestor_mask;
+            verify_frame.prefix_lengths    = frontiers;
+            verify_frame.accepted_column   = accepted_column;
+            verify_frame.fold_path         = fold_path;
+            verify_frame.tree_verify       = true;
         } else if constexpr (Variant::DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
             if (!selector_ids.is_contiguous() || !selector_q.is_contiguous()) {
                 Tensor compact_ids = state.execution.work.alloc(

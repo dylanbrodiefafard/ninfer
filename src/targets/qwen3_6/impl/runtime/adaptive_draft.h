@@ -32,10 +32,20 @@
 // unseen hop (the truncation lands on MTP's cheapest arm k=3; counting unseen hops as accepted
 // measured 5% slower there at C=1).
 //
-// T(k,C,L) = a_{C,k} + c_C L from online least squares (shared slope, per-k
-// intercept), one table per batch size. Each captured k within the cap is
-// measured once per batch size before exploitation; then argmax E[Y]/T.
-// Switching k adds 1 ms to that arm's T. Ties keep the smaller k.
+// Arms. A DFlash arm is a draft window k verified as a chain (arm id k) or, for the packed
+// best-first draft tree, arm id kAdaptiveTreeArmBase + k. A tree round accepts the deepest
+// target-licensed root path, so its depth hazard H_tree[law][i] is learned from exploration rounds
+// like the chain cells and shrinks toward the chain hazard of the same block length. Chain and
+// tree arms share the request's content factor c. Which arm wins at a batch size is learned:
+// round time differs by batch size and the tree's extra verify tokens are cheap only while the
+// packed verify stays memory-bound.
+//
+// T(arm,C,L) = a_{C,arm} + c_C L from exponentially forgetting least squares (shared slope,
+// per-arm intercept; every observation of an arm discounts that arm's statistics by
+// kAdaptiveTimeDiscount), one table per batch size, so round time tracks drift in load and
+// context. Each captured arm within the cap is measured once per batch size before
+// exploitation; then argmax E[Y]/T. Switching arms adds 1 ms to that arm's T. Ties keep the
+// smaller arm id.
 
 #include "ninfer/types.h"
 
@@ -47,11 +57,13 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-inline constexpr float kAdaptiveEwma                 = 32.0f;
-inline constexpr float kAdaptiveEwmaAlpha            = 2.0f / (kAdaptiveEwma + 1.0f);
-inline constexpr float kAdaptiveDiscount             = 1.0f - kAdaptiveEwmaAlpha;
-inline constexpr float kAdaptiveBetaPrior            = 1.0f;
-inline constexpr std::uint32_t kAdaptiveTBins        = 16;
+inline constexpr float kAdaptiveEwma      = 32.0f;
+inline constexpr float kAdaptiveEwmaAlpha = 2.0f / (kAdaptiveEwma + 1.0f);
+inline constexpr float kAdaptiveDiscount  = 1.0f - kAdaptiveEwmaAlpha;
+inline constexpr float kAdaptiveBetaPrior = 1.0f;
+// Arm ids: chain k in [1,16), tree k at kAdaptiveTreeArmBase + k.
+inline constexpr std::uint32_t kAdaptiveTreeArmBase  = 16;
+inline constexpr std::uint32_t kAdaptiveTBins        = 2 * kAdaptiveTreeArmBase;
 inline constexpr std::uint32_t kAdaptiveMaxHops      = 16;
 inline constexpr float kAdaptiveSwitchSeconds        = 0.001f;
 inline constexpr std::uint32_t kAdaptiveHopTableMaxK = 8;
@@ -65,6 +77,22 @@ inline constexpr float kAdaptiveBlockRatioPrior      = 64.0f; // expected failur
 inline constexpr float kAdaptiveCellPriorTrials      = 256.0f;
 inline constexpr float kAdaptiveCellDiscount         = 1.0f - 1.0f / 8192.0f;
 inline constexpr float kAdaptivePooledDiscount       = 1.0f - 1.0f / 1024.0f;
+// The tree arm has one depth cell per hop and no cross-k pooling, so it leaves the chain prior
+// on less evidence than a chain cell.
+inline constexpr float kAdaptiveTreePriorTrials = 16.0f;
+inline constexpr double kAdaptiveTimeDiscount   = 1.0 - 1.0 / 512.0;
+
+[[nodiscard]] constexpr std::uint32_t adaptive_tree_arm(std::uint32_t k) noexcept {
+    return kAdaptiveTreeArmBase + k;
+}
+
+[[nodiscard]] constexpr bool adaptive_arm_is_tree(std::uint32_t arm) noexcept {
+    return arm >= kAdaptiveTreeArmBase;
+}
+
+[[nodiscard]] constexpr std::uint32_t adaptive_arm_k(std::uint32_t arm) noexcept {
+    return adaptive_arm_is_tree(arm) ? arm - kAdaptiveTreeArmBase : arm;
+}
 
 // The drafter draws argmax for a greedy target, at the scaled draft temperature for a p-less
 // target, and at the target temperature otherwise; each law has its own hop table.
@@ -78,6 +106,8 @@ struct AdaptiveHopRates {
     float trials[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK + 1][kAdaptiveHopTableMaxK]   = {};
     float pooled_failures[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]                     = {};
     float pooled_trials[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]                       = {};
+    float tree_failures[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]                       = {};
+    float tree_trials[kAdaptiveDraftLaws][kAdaptiveHopTableMaxK]                         = {};
     std::uint64_t decisions                                                              = 0;
 };
 
@@ -94,12 +124,14 @@ struct AdaptiveDraftState {
     float hazard_expected[kAdaptiveMaxHops] = {};
 };
 
+// Exponentially forgetting least-squares statistics per arm: n is the discounted observation
+// weight, Sxx/Sxy the discounted centred sums. Double keeps L^2 at long contexts exact enough.
 struct AdaptiveRoundTimeState {
-    float n[kAdaptiveTBins]      = {};
-    float mean_L[kAdaptiveTBins] = {};
-    float mean_T[kAdaptiveTBins] = {};
-    float Sxx[kAdaptiveTBins]    = {};
-    float Sxy[kAdaptiveTBins]    = {};
+    double n[kAdaptiveTBins]      = {};
+    double mean_L[kAdaptiveTBins] = {};
+    double mean_T[kAdaptiveTBins] = {};
+    double Sxx[kAdaptiveTBins]    = {};
+    double Sxy[kAdaptiveTBins]    = {};
 };
 
 struct AdaptiveBatchKState {
@@ -164,13 +196,17 @@ inline constexpr std::uint32_t kGrammarExchangeVariants = 2;
     return topology * kGrammarExchangeVariants + (exchange ? 1U : 0U);
 }
 
+// Smallest captured chain arm of at least k drafts (else the largest chain arm). Tree arms are
+// chosen only by the picker.
 [[nodiscard]] inline std::uint32_t
 adaptive_snap_captured_k(std::span<const std::uint32_t> captured_ks, std::uint32_t k) {
-    if (captured_ks.empty()) { return k; }
+    std::uint32_t largest = 0;
     for (std::uint32_t c : captured_ks) {
+        if (adaptive_arm_is_tree(c)) { continue; }
         if (c >= k) { return c; }
+        largest = c;
     }
-    return captured_ks.back();
+    return largest != 0 ? largest : k;
 }
 
 [[nodiscard]] inline std::uint32_t adaptive_batch_k(std::span<const std::uint32_t> row_k,
@@ -218,9 +254,10 @@ inline void seed_adaptive_draft_state(AdaptiveDraftState& state, std::uint32_t l
     return (failures + kAdaptiveBlockRatioPrior) / (expected + kAdaptiveBlockRatioPrior);
 }
 
-// Rejection hazard of hop i in a block of length k.
-[[nodiscard]] inline float adaptive_hop_hazard(const AdaptiveHopRates& rates, AdaptiveDraftLaw law,
-                                               std::uint32_t k, std::uint32_t hop) {
+// Rejection hazard of hop i in a chain block of length k.
+[[nodiscard]] inline float adaptive_chain_hop_hazard(const AdaptiveHopRates& rates,
+                                                     AdaptiveDraftLaw law, std::uint32_t k,
+                                                     std::uint32_t hop) {
     const auto l           = static_cast<std::uint32_t>(law);
     const std::uint32_t kk = std::clamp(k, 1U, kAdaptiveHopTableMaxK);
     const std::uint32_t i  = std::min(hop, kk - 1U);
@@ -231,6 +268,20 @@ inline void seed_adaptive_draft_state(AdaptiveDraftState& state, std::uint32_t l
     return std::min(h, 1.0f);
 }
 
+// Rejection hazard of hop i (depth i+1) for an arm: a chain cell, or the tree depth cell shrunk
+// toward the chain hazard of the same block length.
+[[nodiscard]] inline float adaptive_hop_hazard(const AdaptiveHopRates& rates, AdaptiveDraftLaw law,
+                                               std::uint32_t arm, std::uint32_t hop) {
+    const std::uint32_t k = adaptive_arm_k(arm);
+    if (!adaptive_arm_is_tree(arm)) { return adaptive_chain_hop_hazard(rates, law, k, hop); }
+    const auto l          = static_cast<std::uint32_t>(law);
+    const std::uint32_t i = std::min(hop, kAdaptiveHopTableMaxK - 1U);
+    const float prior     = adaptive_chain_hop_hazard(rates, law, k, hop);
+    const float h         = (rates.tree_failures[l][i] + kAdaptiveTreePriorTrials * prior) /
+                            (rates.tree_trials[l][i] + kAdaptiveTreePriorTrials);
+    return std::min(h, 1.0f);
+}
+
 [[nodiscard]] inline std::uint64_t adaptive_explore_hash(std::uint64_t x) {
     x += 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -238,25 +289,29 @@ inline void seed_adaptive_draft_state(AdaptiveDraftState& state, std::uint32_t l
     return x ^ (x >> 31);
 }
 
-inline void adaptive_observe_round_time(AdaptiveRoundTimeState& st, std::uint32_t k, float seconds,
-                                        std::uint32_t length_tokens) {
-    if (k >= kAdaptiveTBins || !(seconds > 0.0f)) { return; }
-    const float L = static_cast<float>(length_tokens);
-    if (!(st.n[k] > 0.0f)) {
-        st.n[k]      = 1.0f;
-        st.mean_L[k] = L;
-        st.mean_T[k] = seconds;
-        st.Sxx[k]    = 0.0f;
-        st.Sxy[k]    = 0.0f;
+inline void adaptive_observe_round_time(AdaptiveRoundTimeState& st, std::uint32_t arm,
+                                        float seconds, std::uint32_t length_tokens) {
+    if (arm >= kAdaptiveTBins || !(seconds > 0.0f)) { return; }
+    const double L = static_cast<double>(length_tokens);
+    const double T = static_cast<double>(seconds);
+    if (!(st.n[arm] > 0.0)) {
+        st.n[arm]      = 1.0;
+        st.mean_L[arm] = L;
+        st.mean_T[arm] = T;
+        st.Sxx[arm]    = 0.0;
+        st.Sxy[arm]    = 0.0;
         return;
     }
-    st.n[k] += 1.0f;
-    const float dL = L - st.mean_L[k];
-    const float dT = seconds - st.mean_T[k];
-    st.mean_L[k] += dL / st.n[k];
-    st.mean_T[k] += dT / st.n[k];
-    st.Sxx[k] += dL * (L - st.mean_L[k]);
-    st.Sxy[k] += dL * (seconds - st.mean_T[k]);
+    // Exponentially weighted Welford update: older rounds of this arm decay before the new one.
+    st.n[arm] = kAdaptiveTimeDiscount * st.n[arm] + 1.0;
+    st.Sxx[arm] *= kAdaptiveTimeDiscount;
+    st.Sxy[arm] *= kAdaptiveTimeDiscount;
+    const double dL = L - st.mean_L[arm];
+    const double dT = T - st.mean_T[arm];
+    st.mean_L[arm] += dL / st.n[arm];
+    st.mean_T[arm] += dT / st.n[arm];
+    st.Sxx[arm] += dL * (L - st.mean_L[arm]);
+    st.Sxy[arm] += dL * (T - st.mean_T[arm]);
 }
 
 namespace detail {
@@ -283,9 +338,9 @@ namespace detail {
            (state.hazard_expected[i] + kAdaptiveHazardPrior);
 }
 
-// Block length k, of which the row uses the first `extent` hops.
+// Arm of block length k, of which the row uses the first `extent` hops (tree depths).
 [[nodiscard]] inline float hop_expected_tokens(const AdaptiveDraftState& state,
-                                               const AdaptiveHopRates& rates, std::uint32_t k,
+                                               const AdaptiveHopRates& rates, std::uint32_t arm,
                                                std::uint32_t extent) {
     float e               = 1.0f;
     float run             = 1.0f;
@@ -293,7 +348,7 @@ namespace detail {
     const std::uint32_t n = std::min(extent, kAdaptiveMaxHops);
     for (std::uint32_t i = 0; i < n; ++i) {
         const float c = hazard_factor(state, i, prior);
-        const float h = adaptive_hop_hazard(rates, state.law, k, i);
+        const float h = adaptive_hop_hazard(rates, state.law, arm, i);
         run *= std::clamp(1.0f - c * h, 0.0f, kAdaptiveMaxHopRate);
         e += run;
         prior = 1.0f + kAdaptiveHazardInherit * (c - 1.0f);
@@ -314,47 +369,53 @@ namespace detail {
     return e;
 }
 
-[[nodiscard]] inline float pooled_slope(const AdaptiveRoundTimeState& st) {
-    float sxx = 0.0f;
-    float sxy = 0.0f;
-    for (std::uint32_t k = 0; k < kAdaptiveTBins; ++k) {
-        if (st.n[k] >= 2.0f) {
-            sxx += st.Sxx[k];
-            sxy += st.Sxy[k];
+[[nodiscard]] inline double pooled_slope(const AdaptiveRoundTimeState& st) {
+    double sxx = 0.0;
+    double sxy = 0.0;
+    // An arm contributes once it has two observations; forgetting keeps n just below 2 there.
+    for (std::uint32_t arm = 0; arm < kAdaptiveTBins; ++arm) {
+        if (st.n[arm] > 1.5) {
+            sxx += st.Sxx[arm];
+            sxy += st.Sxy[arm];
         }
     }
-    if (!(sxx > 1.0f)) { return 0.0f; }
+    if (!(sxx > 1.0)) { return 0.0; }
     return sxy / sxx;
 }
 
-inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uint32_t L, float& t,
+inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t arm, std::uint32_t L, float& t,
                      bool& measured) {
     t        = 0.0f;
     measured = false;
-    if (st == nullptr || k >= kAdaptiveTBins || !(st->n[k] > 0.0f)) { return; }
-    const float c = pooled_slope(*st);
-    t             = st->mean_T[k] + c * (static_cast<float>(L) - st->mean_L[k]);
-    if (!(t > 0.0f)) { t = st->mean_T[k]; }
+    if (st == nullptr || arm >= kAdaptiveTBins || !(st->n[arm] > 0.0)) { return; }
+    const double c = pooled_slope(*st);
+    double tt      = st->mean_T[arm] + c * (static_cast<double>(L) - st->mean_L[arm]);
+    if (!(tt > 0.0)) { tt = st->mean_T[arm]; }
+    t        = static_cast<float>(tt);
     measured = t > 0.0f;
 }
 
+// The arm itself when its draft window fits the budget, else the largest captured chain arm that
+// fits (the smallest chain arm when none does).
 [[nodiscard]] inline std::uint32_t clamp_to_budget(std::span<const std::uint32_t> captured,
-                                                   std::uint32_t k, std::uint32_t budget) {
-    k = std::min(k, budget);
-    if (captured.empty()) { return k; }
-    if (captured_contains(captured, k) && k <= budget) { return k; }
-    std::uint32_t down = captured.front();
+                                                   std::uint32_t arm, std::uint32_t budget) {
+    if (captured.empty()) { return std::min(arm, budget); }
+    if (captured_contains(captured, arm) && adaptive_arm_k(arm) <= budget) { return arm; }
+    std::uint32_t down     = 0;
+    std::uint32_t smallest = 0;
     for (std::uint32_t c : captured) {
-        if (c <= budget) { down = c; }
+        if (adaptive_arm_is_tree(c)) { continue; }
+        if (smallest == 0 || c < smallest) { smallest = c; }
+        if (c <= budget && c > down) { down = c; }
     }
-    if (down > budget) { return captured.front(); }
-    return down;
+    return down != 0 ? down : (smallest != 0 ? smallest : captured.front());
 }
 
 [[nodiscard]] inline float row_sum_e(std::span<const AdaptiveDraftState* const> states,
-                                     std::span<const std::uint32_t> row_cap, std::uint32_t k,
+                                     std::span<const std::uint32_t> row_cap, std::uint32_t arm,
                                      const AdaptiveHopRates* rates) {
-    float sum_e = 0.0f;
+    const std::uint32_t k = adaptive_arm_k(arm);
+    float sum_e           = 0.0f;
     for (std::size_t r = 0; r < states.size(); ++r) {
         const AdaptiveDraftState* st = states[r];
         if (st == nullptr) { continue; }
@@ -362,7 +423,7 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
         if (kr == 0) { continue; }
         // The batch drafts a block of length k; a capped row uses its first kr hops.
         sum_e +=
-            rates != nullptr ? hop_expected_tokens(*st, *rates, k, kr) : expected_tokens(*st, kr);
+            rates != nullptr ? hop_expected_tokens(*st, *rates, arm, kr) : expected_tokens(*st, kr);
     }
     return sum_e;
 }
@@ -378,8 +439,8 @@ inline void t_lookup(const AdaptiveRoundTimeState* st, std::uint32_t k, std::uin
     return t;
 }
 
-[[nodiscard]] inline bool adaptive_t_measured(const AdaptiveRoundTimeState& st, std::uint32_t k) {
-    return k < kAdaptiveTBins && st.n[k] > 0.0f;
+[[nodiscard]] inline bool adaptive_t_measured(const AdaptiveRoundTimeState& st, std::uint32_t arm) {
+    return arm < kAdaptiveTBins && st.n[arm] > 0.0;
 }
 
 inline void adaptive_observe_hops(AdaptiveDraftState& state, std::uint32_t accepted,
@@ -403,15 +464,30 @@ inline void adaptive_observe_hops(AdaptiveDraftState& state, std::uint32_t accep
 // drafted the full block also counts its trials in the global table.
 inline void adaptive_observe_hazards(AdaptiveDraftState& state, AdaptiveHopRates& rates,
                                      std::uint32_t accepted, std::uint32_t drafted,
-                                     std::uint32_t round_k, bool explored,
+                                     std::uint32_t round_arm, bool explored,
                                      float discount = kAdaptiveDiscount) {
+    const std::uint32_t round_k    = adaptive_arm_k(round_arm);
     const std::uint32_t n          = std::min({drafted, accepted + 1U, kAdaptiveMaxHops});
     float hazard[kAdaptiveMaxHops] = {};
     for (std::uint32_t i = 0; i < n; ++i) {
-        hazard[i] = adaptive_hop_hazard(rates, state.law, round_k, i);
+        hazard[i] = adaptive_hop_hazard(rates, state.law, round_arm, i);
     }
-    if (explored && drafted == round_k && round_k <= kAdaptiveHopTableMaxK) {
-        const auto l = static_cast<std::uint32_t>(state.law);
+    const auto l = static_cast<std::uint32_t>(state.law);
+    if (adaptive_arm_is_tree(round_arm) && drafted == round_k && round_k <= kAdaptiveHopTableMaxK) {
+        // Tree depth cells learn from every full-depth tree round, not only exploration rounds:
+        // a single arm has no cross-k selection effect to remove, and once the tree wins at a
+        // batch size it runs on nearly all content there. They decay like the chain cells.
+        for (std::uint32_t i = 0; i < kAdaptiveHopTableMaxK; ++i) {
+            rates.tree_failures[l][i] *= kAdaptiveCellDiscount;
+            rates.tree_trials[l][i] *= kAdaptiveCellDiscount;
+        }
+        for (std::uint32_t i = 0; i < n; ++i) {
+            rates.tree_failures[l][i] += accepted > i ? 0.0f : 1.0f;
+            rates.tree_trials[l][i] += 1.0f;
+        }
+    }
+    if (explored && !adaptive_arm_is_tree(round_arm) && drafted == round_k &&
+        round_k <= kAdaptiveHopTableMaxK) {
         for (std::uint32_t k = 0; k <= kAdaptiveHopTableMaxK; ++k) {
             for (std::uint32_t i = 0; i < kAdaptiveHopTableMaxK; ++i) {
                 rates.failures[l][k][i] *= kAdaptiveCellDiscount;
@@ -461,15 +537,21 @@ inline void adaptive_record_round(AdaptiveDraftState& state, std::uint32_t accep
                                                       std::uint32_t cap_k) {
     std::uint32_t candidates[kAdaptiveTBins] = {};
     std::uint32_t count                      = 0;
-    for (std::uint32_t k : captured_ks) {
-        if (k > cap_k || k >= kAdaptiveTBins) { continue; }
-        if (!adaptive_t_measured(round_time, k)) { return 0; }
-        candidates[count++] = k;
+    for (std::uint32_t arm : captured_ks) {
+        if (adaptive_arm_k(arm) > cap_k || arm >= kAdaptiveTBins) { continue; }
+        if (!adaptive_t_measured(round_time, arm)) { return 0; }
+        candidates[count++] = arm;
     }
     if (count < 2) { return 0; }
     const std::uint64_t h = adaptive_explore_hash(rates.decisions++);
     if ((h % kAdaptiveExploreEvery) != 0) { return 0; }
     return candidates[(h >> 32) % count];
+}
+
+// The arm when its draft window fits cap_k, else the largest captured chain arm that does.
+[[nodiscard]] inline std::uint32_t adaptive_clamp_arm(std::span<const std::uint32_t> captured,
+                                                      std::uint32_t arm, std::uint32_t cap_k) {
+    return detail::clamp_to_budget(captured, arm, cap_k);
 }
 
 inline void adaptive_assign_live_k(std::span<AdaptiveDraftState*> states, std::uint32_t k) {
@@ -491,7 +573,8 @@ adaptive_select_k(const AdaptiveDraftConfig& cfg, std::span<const AdaptiveDraftS
     if (cfg.captured_ks.empty() || states.empty()) { return cap_k; }
 
     for (std::uint32_t k : cfg.captured_ks) {
-        if (k <= cap_k && (cfg.round_time == nullptr || !adaptive_t_measured(*cfg.round_time, k))) {
+        if (adaptive_arm_k(k) <= cap_k &&
+            (cfg.round_time == nullptr || !adaptive_t_measured(*cfg.round_time, k))) {
             return k;
         }
     }
@@ -499,7 +582,7 @@ adaptive_select_k(const AdaptiveDraftConfig& cfg, std::span<const AdaptiveDraftS
     std::uint32_t best = 0;
     float best_s       = -1.0f;
     for (std::uint32_t k : cfg.captured_ks) {
-        if (k > cap_k) { continue; }
+        if (adaptive_arm_k(k) > cap_k) { continue; }
         float t       = 0.0f;
         bool measured = false;
         detail::t_lookup(cfg.round_time, k, cfg.length_tokens, t, measured);

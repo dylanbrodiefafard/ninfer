@@ -391,18 +391,27 @@ One propose block:
    `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum.
    Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`.
    Under p-less the target temperature is not reused for drafting: the selector draws at
-   `--dflash-p-less-draft-temperature` (default 0.4; 0 is greedy, one-hot `q`), and chain accept
+   `--dflash-p-less-draft-temperature` (default 0.8; 0 is greedy, one-hot `q`), and chain accept
    uses the recorded `q`, which is exact for any proposal law. Drafting at the p-less target
    temperature itself accepts less than greedy; 0.4 accepts more (docs/performance.md).
    Selector RNG is keyed by request seed and absolute token position, independent of compact batch
    row. `--lm-head-draft` runs top-16 on the shortlist and gathers codebooks by token id.
+   A tree round (the adaptive tree arm, §8.1) instead runs `dflash2_tree_select`: each parent's
+   16 children are scored with the same Markov score and log-softmax normalized per parent; the
+   selector repeatedly adds the frontier node of greatest path log-probability until the tree
+   has `tree_verify_width` (12) columns, which is the prefix-closed tree of greatest summed path
+   probability under the Markov model. Columns are emitted in depth-first preorder with children
+   in descending path probability, so the greedy Markov chain is the contiguous spine. Tree drafts
+   are deterministic and verified by sample-then-descend, which is exact for every sampler.
 5. The 27B target verifies the chain (`W=k+1`) in one
    causal forward for the compact batch. Concurrent C>1 keeps that forward packed (`B=batch`)
    so CUDA graphs capture one 27B verify rather than a serial host loop. The leaf selects
    precision from the request-local width through `packed_route_tokens`: W=2..3 retains A16,
    while the selected policy permits A8 for ordinary and GDN verification projections at
    W=4/5/6, independently of concurrency. Prefill and ordinary decode retain their text policy.
-   Qualified NVFP4 MLP, attention-input and residual projections aggregate through W=8.
+   Qualified NVFP4 MLP, attention-input and residual projections aggregate for every chain or
+   tree width while the packed extent `W*B` stays within one M48 A8 tile
+   (`kVerifyAggregateMaxTokens`); larger extents run per-request panels.
    BF16 MMA keeps one K-ordered accumulator per output under every tile, and every BF16 verify
    width runs MMA, so BF16 attention input and residuals aggregate for every W; each request keeps
    its panel's exact output. The W8 vocabulary and Q4 draft heads share one
@@ -428,7 +437,12 @@ One propose block:
    The down projection remains separate. Other profiles materialize the ordinary RMSNorm result.
    Packed GDN recurrence uses one
    fused scratch-SSM pass to publish raw replay records and produce T=1 snapshot `out`. Greedy
-   accepts the matching prefix.
+   accepts the matching prefix. A tree round first compiles each row's parent indices into a step
+   list (`gated_delta_net_tree_schedule`, once per round); every GDN layer's record kernel then
+   keeps the checkpoint state in registers, continues along the spine in place, saves branch
+   states in three shared-memory slots, and replays a root path when the slots are exhausted, so
+   every column is bit-identical to sequential record over its root path and no column state is
+   materialized. Attention masks by ancestor; commit folds the accepted root path.
    Truncated sampling uses Leviathan `min(1,p/q)` on every hop. P-less uses block verification
    (Sun et al. 2024) over the chain with the recorded selector `q`: it accepts the longest prefix
    the block test admits, which is exact and never shorter in expectation than per-hop Leviathan,
@@ -457,7 +471,7 @@ the **next** round. “Lock” means: do not mix k as a bandit; take the current
 
 | State | Lifetime | Role |
 |---|---|---|
-| CUDA graphs for DFlash `{3..N}` or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed |
+| CUDA graphs for DFlash arms (chains `{3..N}` plus the tree arm) or MTP `{3,4,5}` | once per Engine launch | the captured round shapes; DFlash below a configured maximum of 5 stays fixed (chain `N` plus the tree arm) |
 | `T(k,C,L)` | Engine lifetime, one table per concurrency C | seconds for a k-round at this batch size and length |
 | DFlash hop hazards `H[law][k][i]` | Engine lifetime | block-length acceptance, learned from exploration rounds |
 | content factors `c_i` (DFlash) / hop chances `r_i` (MTP) | one request | how far down the draft this prompt still matches |
@@ -471,10 +485,19 @@ Throughput of a round is expected tokens kept divided by expected seconds. The d
 hardware. Drafting 5 tokens is a bigger kernel than drafting 3, and attention grows with
 sequence length L, so
 
-`T(k,C,L) = a_{C,k} + c_C L`
+`T(arm,C,L) = a_{C,arm} + c_C L`
 
-by online least squares: shared slope in L, per-k intercept, one table per C. That table is
-**shared across requests** on this server. After a few rounds, competitive captured widths have
+by exponentially forgetting least squares (each observation of an arm discounts that arm's
+statistics by `1 - 1/512`): shared slope in L, per-arm intercept, one table per C, so round time
+tracks drift in load and context. That table is **shared across requests** on this server.
+
+**Arms.** A DFlash arm is a round shape: draft window k verified as a chain (`W=k+1`), or the
+packed best-first draft tree of the full window (`W=tree_verify_width`). The tree arm is captured
+for every batch size whose packed verify extent fits the aggregated-verify limit
+(`kVerifyAggregateMaxTokens`, the single M48 A8 tile: B<=4 at W=12); beyond it every projection
+would split into per-request weight passes. Which arm wins at a batch size is learned from
+measured round time and acceptance; on the RTX 5090 the tree wins in one-request rounds and is a
+wash in larger batches. After a few rounds, competitive captured widths have
 measured times. Each captured k within the cap is measured once per batch size, smallest first,
 before the argmax applies; an unmeasured `T(k)` is never extrapolated from other arms. Fallback
 rounds with draft extent 0 do not update T.
@@ -493,7 +516,10 @@ block length k as well as on the prompt. The picker factors the two:
 `r_{k,i} = clamp(1 − c_i · H[law][k][i], 0, 0.995)`
 
 `H` is an engine-global rejection hazard per draft law (greedy, p-less, or temperature-sampled
-drafts), block length, and hop. `c_i` is the request's content factor. `H` is learned only from
+drafts), block length, and hop. The tree arm has one depth cell per law and hop; it starts at the
+chain hazard of the same block length and learns from every full-depth tree round (16 prior
+trials), not only exploration rounds, because one arm has no cross-k selection effect to remove;
+it decays like the chain cells. `c_i` is the request's content factor. `H` is learned only from
 exploration rounds: one decode round in 32, chosen by a hash of a Program-wide counter (so
 independent of content), runs a uniformly drawn captured k within the round's cap as a one-round
 override that leaves the incumbent k and its switch cost untouched. Only

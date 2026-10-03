@@ -10,7 +10,10 @@
 #include <ninfer/targets/qwen3_6/runtime.h>
 #include "targets/qwen3_6/impl/runtime/adaptive_draft.h"
 
+#include <algorithm>
 #include <span>
+#include <stdexcept>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
@@ -45,59 +48,82 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dfla
 inline constexpr std::uint32_t kDFlashExchangeVariants =
     DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2 ? qwen3_6::kGrammarExchangeVariants : 1U;
 
-// Auto verify width from k when --dflash-verify-width is omitted. Product DFlash is chain W=k+1.
-// A tree-capable package may still select a wider default for a native draft window.
-[[nodiscard]] inline constexpr std::uint32_t
-dflash_default_verify_width(std::uint32_t draft_window) {
-    if constexpr (!DFlashConfig::tree_verify) {
-        return draft_window + 1U;
+// Packed-tree verify width of the adaptive tree arm; 0 when the target has no tree route.
+inline constexpr std::uint32_t kDFlashTreeVerifyWidth =
+    static_cast<std::uint32_t>(DFlashConfig::tree_verify_width);
+inline constexpr std::uint32_t kDFlashTreeVerifyMaxTokens =
+    static_cast<std::uint32_t>(DFlashConfig::tree_verify_max_tokens);
+
+// One captured DFlash round shape: draft window k, packed verify width, and the largest batch
+// that runs it. W == k+1 is the chain; a wider W verifies a packed best-first tree. arm is the
+// adaptive arm id (adaptive_tree_arm(k) for the adaptive tree arm, k otherwise).
+struct DFlashRoundShape {
+    std::uint32_t k            = 0;
+    std::uint32_t verify_width = 0;
+    std::uint32_t max_batch    = 0;
+    std::uint32_t arm          = 0;
+};
+
+[[nodiscard]] inline constexpr bool dflash_uses_tree_verify(std::uint32_t k,
+                                                            std::uint32_t verify_width) {
+    return verify_width != k + 1U;
+}
+
+// Captured round shapes. Every captured k verifies its chain at every batch size, except that an
+// explicit width pins the draft window's shape (W=k+1 is chain-only). Adaptive draft without an
+// explicit width also captures the packed-tree arm of the full draft window for every batch whose
+// packed extent fits kDFlashTreeVerifyMaxTokens.
+[[nodiscard]] inline std::vector<DFlashRoundShape>
+dflash_round_shapes(std::span<const std::uint32_t> captured_ks, std::uint32_t draft_window,
+                    std::uint32_t override_width, std::uint32_t max_concurrency, bool adaptive) {
+    std::vector<DFlashRoundShape> shapes;
+    if (captured_ks.empty()) {
+        shapes.push_back({draft_window, override_width != 0 ? override_width : draft_window + 1U,
+                          max_concurrency, draft_window});
     } else {
-        if constexpr (DFlashConfig::two_block_first > 0) {
-            if (draft_window > static_cast<std::uint32_t>(DFlashConfig::two_block_first)) {
-                return draft_window + 1U;
+        for (const std::uint32_t k : captured_ks) {
+            shapes.push_back({k, override_width != 0 && k == draft_window ? override_width : k + 1U,
+                              max_concurrency, k});
+        }
+    }
+    if constexpr (kDFlashTreeVerifyWidth > 0) {
+        if (adaptive && override_width == 0 && kDFlashTreeVerifyWidth > draft_window + 1U) {
+            const std::uint32_t max_batch =
+                std::min(max_concurrency, kDFlashTreeVerifyMaxTokens / kDFlashTreeVerifyWidth);
+            if (max_batch > 0) {
+                shapes.push_back({draft_window, kDFlashTreeVerifyWidth, max_batch,
+                                  qwen3_6::adaptive_tree_arm(draft_window)});
             }
         }
-        if (draft_window <= 5U) { return draft_window + 1U; }
-        return static_cast<std::uint32_t>(DFlashConfig::verify_width);
     }
+    return shapes;
 }
 
-[[nodiscard]] inline constexpr std::uint32_t dflash_verify_width(std::uint32_t draft_window,
-                                                                 std::uint32_t override_width = 0) {
-    return override_width != 0 ? override_width : dflash_default_verify_width(draft_window);
-}
-
-// Packed-tree verify and GDN/KV path fold for a tree-capable package. W == k+1 is chain.
-[[nodiscard]] inline constexpr bool dflash_uses_tree_verify(std::uint32_t draft_window,
-                                                            std::uint32_t verify_width) {
-    if constexpr (!DFlashConfig::tree_verify) { return false; }
-    if constexpr (DFlashConfig::two_block_first > 0) {
-        if (draft_window > static_cast<std::uint32_t>(DFlashConfig::two_block_first)) {
-            return false;
-        }
+// Adaptive arm ids a batch of this size can run, in captured order (chains, then the tree).
+[[nodiscard]] inline std::vector<std::uint32_t>
+dflash_batch_arms(std::span<const DFlashRoundShape> shapes, std::uint32_t batch_size) {
+    std::vector<std::uint32_t> arms;
+    for (const DFlashRoundShape& shape : shapes) {
+        if (shape.max_batch >= batch_size) { arms.push_back(shape.arm); }
     }
-    if (verify_width == draft_window + 1U) { return false; }
-    return true;
+    return arms;
 }
 
-[[nodiscard]] inline constexpr std::uint32_t
-dflash_captured_verify_width(std::uint32_t k, std::uint32_t storage_ceil) {
-    const std::uint32_t live = dflash_verify_width(k, 0);
-    return live <= storage_ceil ? live : storage_ceil;
+// The captured shape of an arm.
+[[nodiscard]] inline const DFlashRoundShape&
+dflash_arm_shape(std::span<const DFlashRoundShape> shapes, std::uint32_t arm) {
+    for (const DFlashRoundShape& shape : shapes) {
+        if (shape.arm == arm) { return shape; }
+    }
+    throw std::logic_error("DFlash round shape for the selected arm was not captured");
 }
 
-// Storage / ReplaySSM / pending-features width. Adaptive DFlash `{3..N}` is chain W<=N+1.
-// An explicit --dflash-verify-width still wins; chain-only packages require W=k+1.
+// Storage / ReplaySSM / pending-features width: the widest captured shape.
 [[nodiscard]] inline std::uint32_t
-dflash_storage_verify_width(std::span<const std::uint32_t> captured_ks, std::uint32_t draft_window,
-                            std::uint32_t override_width) {
-    if (override_width != 0) { return dflash_verify_width(draft_window, override_width); }
-    std::uint32_t ceil = 0;
-    for (const std::uint32_t k : captured_ks) {
-        const std::uint32_t w = dflash_default_verify_width(k);
-        if (w > ceil) { ceil = w; }
-    }
-    return ceil != 0 ? ceil : dflash_default_verify_width(draft_window);
+dflash_storage_verify_width(std::span<const DFlashRoundShape> shapes) {
+    std::uint32_t width = 0;
+    for (const DFlashRoundShape& shape : shapes) { width = std::max(width, shape.verify_width); }
+    return width;
 }
 
 inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {

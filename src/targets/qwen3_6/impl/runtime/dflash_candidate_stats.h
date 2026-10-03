@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -244,12 +245,228 @@ inline void capture_activation(const char* name, const Tensor& tensor, cudaStrea
                  static_cast<unsigned long long>(zeros), abs_sum / static_cast<float>(n), mn, mx);
 }
 
+// Selector lattice dump for offline tree replay. NINFER_DFLASH_SELECTOR_DUMP=<path> (with the
+// candidate-stats probe enabled, eager C=1 rounds) appends one record per round:
+//   i32 magic 0x44465332, i32 k, i32 anchor, i32 licensed_count, i32 licensed[licensed_count],
+//   i32 chain_path[k], then per draft column t: i32 ids[16], f32 unary[16], f32 column
+//   log-sum-exp over the represented draft head, f32 pair scores: [16] from the anchor at t=0,
+//   [16 parents of column t-1][16 candidates] at t>0.
+// pair = sum_r pred[r,parent] * h[r,t] * succ[r,cand] (FP64 host evaluation of the selector's
+// bilinear term); the selector's Markov score is unary + pair.
+// Then the target verify columns of the same round (row 0): i32 width, and per column j
+// (target distribution after the anchor and drafts 1..j): f32 log-sum-exp of the full logits at
+// T=1, f32 log-sum-exp at T=2, i32 ids[kTargetTop], f32 logits[kTargetTop] (top logits, any
+// order). The p-less cut lies far inside the top kTargetTop at T=2.
+inline const char* selector_dump_path() {
+    static const char* path = std::getenv("NINFER_DFLASH_SELECTOR_DUMP");
+    return path;
+}
+
+struct SelectorPending {
+    bool valid = false;
+    int k      = 0;
+    int anchor = 0;
+    std::vector<std::int32_t> ids; // [k][16]
+    std::vector<float> unary;      // [k][16]
+    std::vector<float> lse;        // [k]
+    std::vector<float> pair;       // anchor row [16], then [k-1][16][16]
+    int target_width = 0;
+    std::vector<float> target_lse;        // [width][2]: T=1, T=2
+    std::vector<std::int32_t> target_ids; // [width][kTargetTop]
+    std::vector<float> target_logits;     // [width][kTargetTop]
+};
+
+inline constexpr int kTargetTop = 256;
+
+inline SelectorPending& selector_pending() {
+    static SelectorPending s;
+    return s;
+}
+
+// hidden_proj: BF16 [256,k] device (the selector's h). sel_ids: I32 [16,k] device. pred/succ:
+// BF16 [256,248320] device codebooks (rank fastest). anchor: I32 [1] device.
+inline void capture_selector(const Tensor& hidden_proj, const Tensor& sel_ids,
+                             const Tensor& pred_code, const Tensor& succ_code, const Tensor& anchor,
+                             int k, cudaStream_t stream) {
+    if (!dflash_candidate_stats_enabled() || selector_dump_path() == nullptr) { return; }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) { return; }
+    if (pred_code.data == nullptr || pred_code.dtype != DType::BF16) {
+        throw std::logic_error("selector dump requires BF16 selector codebooks");
+    }
+    constexpr int kRank = 256;
+    constexpr int kTop  = 16;
+    // The first captured round copies both BF16 selector codebooks ([256, 248320] each, about
+    // 254 MB together) to host once, so later rounds score candidate pairs without device reads.
+    static std::vector<std::uint16_t> pred_host;
+    static std::vector<std::uint16_t> succ_host;
+    if (pred_host.empty()) {
+        pred_host.resize(static_cast<std::size_t>(pred_code.numel()));
+        succ_host.resize(static_cast<std::size_t>(succ_code.numel()));
+        CUDA_CHECK(cudaMemcpy(pred_host.data(), pred_code.data, pred_host.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(succ_host.data(), succ_code.data, succ_host.size() * 2,
+                              cudaMemcpyDeviceToHost));
+    }
+    std::vector<std::uint16_t> h(static_cast<std::size_t>(kRank) * static_cast<std::size_t>(k));
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kTop) * static_cast<std::size_t>(k));
+    std::int32_t anchor_id = 0;
+    CUDA_CHECK(
+        cudaMemcpyAsync(h.data(), hidden_proj.data, h.size() * 2, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(ids.data(), sel_ids.data, ids.size() * 4, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(&anchor_id, anchor.data, 4, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    Probe& p = probe();
+    std::lock_guard<std::mutex> lock(p.mu);
+    SelectorPending& s = selector_pending();
+    s.valid            = true;
+    s.k                = k;
+    s.anchor           = anchor_id;
+    s.ids              = ids;
+    s.unary.assign(ids.size(), 0.0f);
+    s.lse.assign(static_cast<std::size_t>(k), 0.0f);
+    s.pair.clear();
+    const std::size_t rows = static_cast<std::size_t>(p.rows);
+    for (int t = 0; t < k; ++t) {
+        const std::uint16_t* col = p.logits.data() + static_cast<std::size_t>(t) * rows;
+        float mx                 = -std::numeric_limits<float>::infinity();
+        for (std::size_t r = 0; r < rows; ++r) { mx = std::max(mx, bf16_f32(col[r])); }
+        double sum = 0.0;
+        for (std::size_t r = 0; r < rows; ++r) {
+            const float v = bf16_f32(col[r]);
+            if (std::isfinite(v)) { sum += std::exp(static_cast<double>(v - mx)); }
+        }
+        s.lse[static_cast<std::size_t>(t)] = mx + static_cast<float>(std::log(sum));
+        for (int c = 0; c < kTop; ++c) {
+            const int tok = ids[(static_cast<std::size_t>(t) * kTop + static_cast<std::size_t>(c))];
+            const int row =
+                tok >= 0 && tok < kVocabCap ? p.token_row[static_cast<std::size_t>(tok)] : -1;
+            s.unary[(static_cast<std::size_t>(t) * kTop + static_cast<std::size_t>(c))] =
+                row >= 0 ? bf16_f32(col[static_cast<std::size_t>(row)])
+                         : -std::numeric_limits<float>::infinity();
+        }
+    }
+    const auto score = [&](int parent, int cand, int t) {
+        const std::uint16_t* pr = pred_host.data() + static_cast<std::size_t>(parent) * kRank;
+        const std::uint16_t* sr = succ_host.data() + static_cast<std::size_t>(cand) * kRank;
+        const std::uint16_t* hr = h.data() + static_cast<std::size_t>(t) * kRank;
+        double acc              = 0.0;
+        for (int r = 0; r < kRank; ++r) {
+            acc += static_cast<double>(bf16_f32(pr[r])) * static_cast<double>(bf16_f32(hr[r])) *
+                   static_cast<double>(bf16_f32(sr[r]));
+        }
+        return static_cast<float>(acc);
+    };
+    for (int c = 0; c < kTop; ++c) {
+        s.pair.push_back(score(anchor_id, ids[static_cast<std::size_t>(c)], 0));
+    }
+    for (int t = 1; t < k; ++t) {
+        for (int a = 0; a < kTop; ++a) {
+            const int parent =
+                ids[(static_cast<std::size_t>(t - 1) * kTop + static_cast<std::size_t>(a))];
+            for (int c = 0; c < kTop; ++c) {
+                s.pair.push_back(score(
+                    parent, ids[(static_cast<std::size_t>(t) * kTop + static_cast<std::size_t>(c))],
+                    t));
+            }
+        }
+    }
+}
+
+// target_logits: BF16 [V, width_capacity, B] device; captures row 0's first `width` columns.
+inline void capture_target_logits(const Tensor& target_logits, int width) {
+    if (!dflash_candidate_stats_enabled() || selector_dump_path() == nullptr) { return; }
+    SelectorPending& s = selector_pending();
+    if (!s.valid) { return; }
+    const std::size_t vocab = static_cast<std::size_t>(target_logits.ne[0]);
+    std::vector<std::uint16_t> bits(vocab * static_cast<std::size_t>(width));
+    CUDA_CHECK(
+        cudaMemcpy(bits.data(), target_logits.data, bits.size() * 2, cudaMemcpyDeviceToHost));
+    s.target_width = width;
+    s.target_lse.assign(static_cast<std::size_t>(width) * 2, 0.0f);
+    s.target_ids.assign(static_cast<std::size_t>(width) * kTargetTop, 0);
+    s.target_logits.assign(static_cast<std::size_t>(width) * kTargetTop, 0.0f);
+    std::vector<float> col(vocab);
+    std::vector<std::int32_t> order(vocab);
+    for (int j = 0; j < width; ++j) {
+        float mx = -std::numeric_limits<float>::infinity();
+        for (std::size_t v = 0; v < vocab; ++v) {
+            col[v] = bf16_f32(bits[static_cast<std::size_t>(j) * vocab + v]);
+            if (std::isfinite(col[v])) { mx = std::max(mx, col[v]); }
+        }
+        double s1 = 0.0;
+        double s2 = 0.0;
+        for (std::size_t v = 0; v < vocab; ++v) {
+            if (!std::isfinite(col[v])) { continue; }
+            s1 += std::exp(static_cast<double>(col[v] - mx));
+            s2 += std::exp(static_cast<double>(col[v] - mx) / 2.0);
+        }
+        s.target_lse[static_cast<std::size_t>(j) * 2] = mx + static_cast<float>(std::log(s1));
+        s.target_lse[static_cast<std::size_t>(j) * 2 + 1] =
+            mx / 2.0f + static_cast<float>(std::log(s2));
+        for (std::size_t v = 0; v < vocab; ++v) { order[v] = static_cast<std::int32_t>(v); }
+        std::nth_element(order.begin(), order.begin() + kTargetTop, order.end(),
+                         [&](std::int32_t a, std::int32_t b) {
+                             const float x = std::isfinite(col[static_cast<std::size_t>(a)])
+                                                 ? col[static_cast<std::size_t>(a)]
+                                                 : -1e30f;
+                             const float y = std::isfinite(col[static_cast<std::size_t>(b)])
+                                                 ? col[static_cast<std::size_t>(b)]
+                                                 : -1e30f;
+                             return x > y;
+                         });
+        for (int i = 0; i < kTargetTop; ++i) {
+            const std::int32_t v = order[static_cast<std::size_t>(i)];
+            s.target_ids[static_cast<std::size_t>(j) * kTargetTop + static_cast<std::size_t>(i)] =
+                v;
+            s.target_logits[static_cast<std::size_t>(j) * kTargetTop +
+                            static_cast<std::size_t>(i)] = col[static_cast<std::size_t>(v)];
+        }
+    }
+}
+
+inline void write_selector_record(const std::int32_t* verify_ids, const std::int32_t* licensed,
+                                  int licensed_count) {
+    SelectorPending& s = selector_pending();
+    if (!s.valid || selector_dump_path() == nullptr) { return; }
+    s.valid             = false;
+    static std::FILE* f = [] {
+        std::FILE* file = std::fopen(selector_dump_path(), "ab");
+        if (file == nullptr) { throw std::runtime_error("cannot open selector dump"); }
+        return file;
+    }();
+    const std::int32_t header[4] = {0x44465332, s.k, s.anchor, licensed_count};
+    std::fwrite(header, 4, 4, f);
+    std::fwrite(licensed, 4, static_cast<std::size_t>(licensed_count), f);
+    std::fwrite(verify_ids + 1, 4, static_cast<std::size_t>(s.k), f);
+    for (int t = 0; t < s.k; ++t) {
+        std::fwrite(s.ids.data() + static_cast<std::size_t>(t) * 16, 4, 16, f);
+        std::fwrite(s.unary.data() + static_cast<std::size_t>(t) * 16, 4, 16, f);
+        std::fwrite(s.lse.data() + t, 4, 1, f);
+        const std::size_t off = t == 0 ? 0 : 16 + static_cast<std::size_t>(t - 1) * 256;
+        std::fwrite(s.pair.data() + off, 4, t == 0 ? 16 : 256, f);
+    }
+    std::fwrite(&s.target_width, 4, 1, f);
+    for (int j = 0; j < s.target_width; ++j) {
+        std::fwrite(s.target_lse.data() + static_cast<std::size_t>(j) * 2, 4, 2, f);
+        std::fwrite(s.target_ids.data() + static_cast<std::size_t>(j) * kTargetTop, 4, kTargetTop,
+                    f);
+        std::fwrite(s.target_logits.data() + static_cast<std::size_t>(j) * kTargetTop, 4,
+                    kTargetTop, f);
+    }
+    s.target_width = 0;
+    std::fflush(f);
+}
+
 inline void record_round(const std::int32_t* verify_ids, const std::int32_t* parents,
                          const std::int32_t* licensed, int licensed_count, int width, int drafts) {
     if (!dflash_candidate_stats_enabled() || licensed_count <= 0) { return; }
     Probe& p = probe();
     std::lock_guard<std::mutex> lock(p.mu);
     if (p.logits.empty() || p.rows <= 0) { return; }
+    write_selector_record(verify_ids, licensed, licensed_count);
     const int live_w = width < kMaxWidth ? width : kMaxWidth;
     int node         = 0;
     for (int hop = 0; hop < licensed_count; ++hop) {

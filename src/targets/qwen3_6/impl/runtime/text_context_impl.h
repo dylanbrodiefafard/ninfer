@@ -270,11 +270,12 @@ void TextContext::set_gdn_state_action(GdnStateAction action,
     replay_records_   = replay_records;
 }
 
-void TextContext::set_tree_verify(const Tensor* parent_index, const Tensor* ancestor_mask,
-                                  const Tensor* prefix_lengths) {
-    active_parent_index_   = parent_index;
-    active_ancestor_mask_  = ancestor_mask;
-    active_prefix_lengths_ = prefix_lengths;
+void TextContext::set_tree_verify(const Tensor* parent_index, const Tensor* gdn_tree_schedule,
+                                  const Tensor* ancestor_mask, const Tensor* prefix_lengths) {
+    active_parent_index_      = parent_index;
+    active_gdn_tree_schedule_ = gdn_tree_schedule;
+    active_ancestor_mask_     = ancestor_mask;
+    active_prefix_lengths_    = prefix_lengths;
 }
 
 void TextContext::bind() {
@@ -978,14 +979,12 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
         Tensor out_batch =
             o.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, width, active_sequence_batch_});
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            // Nested like the workspace plan: fold scratch pops before
-            // gdn_normalized_output. Same-stream launch keeps the pointer live
-            // until this kernel completes.
-            auto fold_scope = work_.scope();
+            const bool tree =
+                active_parent_index_ != nullptr && active_parent_index_->data != nullptr;
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
                 *active_linear_state_slots_, live_records.key, live_records.value,
-                live_records.gate, out_batch, s, active_parent_index_, &work_);
+                live_records.gate, out_batch, s, tree ? active_gdn_tree_schedule_ : nullptr);
             if (pack_replay) {
                 qwen3_6::pack_replay_record_layer(persistent_records, live_records, s);
             }

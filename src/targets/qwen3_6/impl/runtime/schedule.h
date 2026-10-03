@@ -134,6 +134,8 @@ struct TargetVerifyFrameView {
     Tensor accepted_drafts;
     Tensor selected_hidden;
     Tensor parent_index;
+    // I32 [kGdnTreeScheduleWords,B], written by target_verify_accept from parent_index.
+    Tensor gdn_tree_schedule;
     Tensor ancestor_mask;
     Tensor prefix_lengths;
     Tensor accepted_column;

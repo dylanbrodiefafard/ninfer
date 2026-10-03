@@ -43,6 +43,11 @@ struct Variant {
         return k <= 5 ? 1.0f : (k == 6 ? 0.875f : 0.75f);
     }
 
+    // Per-parent softmax temperature for p-less tree drafting: p-less samples the target at T=2,
+    // so the tree's child probabilities track that flatter law (offline replay over p-less
+    // streams: +1.9% tree acceptance at 11 nodes against T=1; greedy is best at 1).
+    static constexpr float dflash_p_less_tree_temperature = 1.5f;
+
     static constexpr std::uint32_t maximum_context = kNativeContext;
     static constexpr bool supports_dflash          = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows  = 131072;
