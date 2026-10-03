@@ -2025,8 +2025,14 @@ int test_spill_drop_keeps_indexed_source(ninfer::DeviceContext& ctx, ninfer::Pag
 
 // `cut` captures the lane as of its rewrite checkpoint (frontier 2): one leading KV page, the
 // checkpoint host image and hidden as the current set, and no rewrite set.
-int test_full_state_image(ninfer::DeviceContext& ctx, bool cut) {
+// Frontier: an append restores both state sets. Cut: a closed-turn entry holds one. Rewrite: a
+// rewrite-checkpoint restore leaves the frontier set it would overwrite unread. Drop: a request
+// that drops the checkpoint leaves the rewrite set unread.
+enum class FullStateRestore : std::uint8_t { Frontier, Cut, Rewrite, Drop };
+
+int test_full_state_image(ninfer::DeviceContext& ctx, FullStateRestore mode) {
     namespace q36  = ninfer::targets::qwen3_6;
+    const bool cut = mode == FullStateRestore::Cut;
     auto text_plan = plan_paged_cache(4, 4, 2,
                                       {{ninfer::DType::I8, 16, 2},
                                        {ninfer::DType::I8, 16, 2},
@@ -2213,6 +2219,23 @@ int test_full_state_image(ninfer::DeviceContext& ctx, bool cut) {
     target.dflash_local              = &dflash_local;
     target.dflash_lane               = 1;
     target.stream                    = ctx.copy_stream;
+    // Poison each set the restore must not read; it must still hold the poison afterwards.
+    constexpr unsigned char kUnread = 0xcc;
+    if (mode == FullStateRestore::Rewrite) {
+        target.reuse      = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
+        target.reuse_base = 2;
+        const std::vector<unsigned char> conv_poison(gdn.conv_host_image_bytes(), kUnread);
+        const std::vector<unsigned char> rec_poison(gdn.recurrent_host_image_bytes(), kUnread);
+        gdn.unpack_slot_from_host(2, conv_poison.data(), rec_poison.data(), ctx.stream);
+        const std::vector<unsigned char> lane_poison(dflash_local.lane_host_bytes(), kUnread);
+        dflash_local.copy_lane_from_host(lane_poison.data(), 1, ctx.stream);
+        hidden_out_buf.fill(kUnread);
+        ctx.synchronize_all();
+    } else if (mode == FullStateRestore::Drop) {
+        target.keep_rewrite_checkpoint = false;
+        target_rewrite.fill(kUnread);
+        rewrite_out_buf.fill(kUnread);
+    }
     cache.claim(match->entry_id);
     const q36::detail::RamRestoredHost host = cache.unpack_device(match->entry_id, target);
     cache.consume(match->entry_id);
@@ -2268,41 +2291,46 @@ int test_full_state_image(ninfer::DeviceContext& ctx, bool cut) {
         backend_dest.release();
         return failures;
     }
+    const bool frontier_read = mode != FullStateRestore::Rewrite;
+    const bool rewrite_read  = mode != FullStateRestore::Drop;
+    const auto expect        = [&](const std::vector<unsigned char>& restored, bool read) {
+        return read ? restored : std::vector<unsigned char>(restored.size(), kUnread);
+    };
     CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 2).data, conv_out.size(),
                           cudaMemcpyDeviceToHost));
-    if (conv_out != conv_cur) {
+    if (conv_out != expect(conv_cur, frontier_read)) {
         std::cerr << "full-state GDN conv current did not round-trip\n";
         ++failures;
     }
     CUDA_CHECK(cudaMemcpy(conv_out.data(), gdn.conv_slot(0, 3).data, conv_out.size(),
                           cudaMemcpyDeviceToHost));
-    if (conv_out != conv_ckpt) {
+    if (conv_out != expect(conv_ckpt, rewrite_read)) {
         std::cerr << "full-state GDN conv checkpoint did not round-trip\n";
         ++failures;
     }
     std::vector<unsigned char> rec_out(rec_cur.size());
     CUDA_CHECK(cudaMemcpy(rec_out.data(), gdn.recurrent_slot(1, 2).data, rec_out.size(),
                           cudaMemcpyDeviceToHost));
-    if (rec_out != rec_cur) {
+    if (rec_out != expect(rec_cur, frontier_read)) {
         std::cerr << "full-state GDN recurrent current did not round-trip\n";
         ++failures;
     }
     CUDA_CHECK(cudaMemcpy(rec_out.data(), gdn.recurrent_slot(1, 3).data, rec_out.size(),
                           cudaMemcpyDeviceToHost));
-    if (rec_out != rec_ckpt) {
+    if (rec_out != expect(rec_ckpt, rewrite_read)) {
         std::cerr << "full-state GDN recurrent checkpoint did not round-trip\n";
         ++failures;
     }
     std::vector<unsigned char> hidden_host(128);
     CUDA_CHECK(cudaMemcpy(hidden_host.data(), hidden_out.data, hidden_host.size(),
                           cudaMemcpyDeviceToHost));
-    if (hidden_host != std::vector<unsigned char>(128, 0xa1)) {
+    if (hidden_host != expect(std::vector<unsigned char>(128, 0xa1), frontier_read)) {
         std::cerr << "full-state tail hidden did not round-trip\n";
         ++failures;
     }
     CUDA_CHECK(cudaMemcpy(hidden_host.data(), rewrite_out.data, hidden_host.size(),
                           cudaMemcpyDeviceToHost));
-    if (hidden_host != std::vector<unsigned char>(128, 0xa2)) {
+    if (hidden_host != expect(std::vector<unsigned char>(128, 0xa2), rewrite_read)) {
         std::cerr << "full-state rewrite hidden did not round-trip\n";
         ++failures;
     }
@@ -2312,7 +2340,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx, bool cut) {
     std::vector<unsigned char> v_out(v_local.size());
     CUDA_CHECK(cudaMemcpy(v_out.data(), dflash_local.layer_view(0).v.slice(3, 1, 1).data,
                           v_out.size(), cudaMemcpyDeviceToHost));
-    if (k_out != k_local || v_out != v_local) {
+    if (k_out != expect(k_local, frontier_read) || v_out != expect(v_local, frontier_read)) {
         std::cerr << "full-state DFlash local lane did not round-trip\n";
         ++failures;
     }
@@ -2320,7 +2348,7 @@ int test_full_state_image(ninfer::DeviceContext& ctx, bool cut) {
                           k_out.size(), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(v_out.data(), dflash_ckpt.layer_view(0).v.slice(3, 1, 1).data,
                           v_out.size(), cudaMemcpyDeviceToHost));
-    if (k_out != k_ckpt || v_out != v_ckpt) {
+    if (k_out != expect(k_ckpt, rewrite_read) || v_out != expect(v_ckpt, rewrite_read)) {
         std::cerr << "full-state DFlash checkpoint lane did not round-trip\n";
         ++failures;
     }
@@ -6086,8 +6114,10 @@ int main(int argc, char** argv) {
     failures += test_copy_event_allocation_recovery(ctx, paged_pool);
     failures += test_unready_ram_image_does_not_shadow_usable_image(ctx, paged_pool);
     failures += test_spill_drop_keeps_indexed_source(ctx, paged_pool);
-    failures += test_full_state_image(ctx, false);
-    failures += test_full_state_image(ctx, true);
+    for (const auto mode : {FullStateRestore::Frontier, FullStateRestore::Cut,
+                            FullStateRestore::Rewrite, FullStateRestore::Drop}) {
+        failures += test_full_state_image(ctx, mode);
+    }
     failures += test_context_checkpoint_middle_head(ctx);
     failures += test_context_checkpoint_two_ram_entries(ctx);
     failures += test_context_checkpoint_ladder_beats_rewrite(ctx);

@@ -1583,11 +1583,16 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
                 target.dflash_local->copy_lane_from_host(matched_head->dflash, target.dflash_lane,
                                                          target.stream);
             }
-        } else if (target.gdn != nullptr && (header.length[4] != 0 || header.length[6] != 0)) {
+        }
+        // A rewrite-checkpoint restore overwrites the frontier set with the checkpoint set.
+        const bool frontier_current = !context_head && !is_rewrite_checkpoint_restore(target.reuse);
+        if (frontier_current && target.gdn != nullptr &&
+            (header.length[4] != 0 || header.length[6] != 0)) {
             target.gdn->unpack_slot_from_host(target.gdn_current_slot, raw + header.offset[4],
                                               raw + header.offset[6], target.stream);
         }
-        const bool unpack_rewrite = !context_head || header.rewrite_frontier <= target.reuse_base;
+        const bool unpack_rewrite = target.keep_rewrite_checkpoint &&
+                                    (!context_head || header.rewrite_frontier <= target.reuse_base);
         std::vector<HostCopy> rewrite_copies;
         rewrite_copies.reserve(3);
         if (unpack_rewrite && target.gdn != nullptr &&
@@ -1600,7 +1605,7 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
             rewrite_copies.push_back({target.rewrite_state.recurrent, raw + header.offset[7],
                                       static_cast<std::size_t>(header.length[7])});
         }
-        if (!context_head && target.tail_hidden != nullptr && header.length[8] != 0) {
+        if (frontier_current && target.tail_hidden != nullptr && header.length[8] != 0) {
             CUDA_CHECK(cudaMemcpyAsync(target.tail_hidden->data, raw + header.offset[8],
                                        static_cast<std::size_t>(header.length[8]),
                                        cudaMemcpyHostToDevice, target.stream));
@@ -1611,7 +1616,7 @@ RamRestoredHost KVRamCache::unpack_device(std::uint64_t entry_id, const RamResto
                 target.rewrite_checkpoint_hidden->data, raw + header.offset[9],
                 static_cast<std::size_t>(header.length[9]), cudaMemcpyHostToDevice, target.stream));
         }
-        if (!context_head && target.dflash_local != nullptr && header.length[10] != 0) {
+        if (frontier_current && target.dflash_local != nullptr && header.length[10] != 0) {
             target.dflash_local->copy_lane_from_host(raw + header.offset[10], target.dflash_lane,
                                                      target.stream);
         }

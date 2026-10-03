@@ -7699,7 +7699,8 @@ std::uint64_t KVDiskCache::restore_device(std::uint64_t entry_id, const DiskRest
         restore_use_context_head_ =
             is_staged_checkpoint_restore(target.reuse) && target.reuse_base != 0;
         restore_unpack_rewrite_ =
-            !restore_use_context_head_ || record.meta.rewrite_frontier <= target.reuse_base;
+            target.keep_rewrite_checkpoint &&
+            (!restore_use_context_head_ || record.meta.rewrite_frontier <= target.reuse_base);
         restore_checkpoints_loaded_ = false;
         if (text_n == 0 && backend_n == 0) { restore_kv_done_ = true; }
         if (restore_q_.empty()) { cv_.notify_all(); }
@@ -8562,8 +8563,9 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
                 release_owner();
                 return;
             }
-        } else if (checkpoint_missing_hidden(meta.current_hidden_id, config_.hidden_bytes) ||
-                   (hidden_n != 0 && meta.current_hidden_id == 0)) {
+        } else if (!is_rewrite_checkpoint_restore(reuse) &&
+                   (checkpoint_missing_hidden(meta.current_hidden_id, config_.hidden_bytes) ||
+                    (hidden_n != 0 && meta.current_hidden_id == 0))) {
             restore_failed_ = true;
             note_drop(KvDiskDropReason::RestoreFailed);
             release_owner();
@@ -8650,7 +8652,8 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
                         state_slices.hidden, hidden_n);
                 enqueue(slot.dflash_id, cyc_kind, restore_state_capacity_.cyclic,
                         state_slices.cyclic, cyclic_n);
-            } else {
+            } else if (!is_rewrite_checkpoint_restore(reuse)) {
+                // A rewrite-checkpoint restore overwrites the frontier set; do not read it.
                 enqueue_gdn(meta.current_gdn_id, DiskStateKind::CurrentGdn,
                             restore_state_capacity_.gdn_conv, restore_state_capacity_.gdn_rec,
                             state_slices.gdn_conv, state_slices.gdn_rec);
