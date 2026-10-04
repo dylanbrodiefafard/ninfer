@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 
@@ -21,6 +22,17 @@ struct alignas(8) GdnReplayFoldKernelRow {
 struct alignas(16) GdnReplayFoldKernelRows {
     GdnReplayFoldKernelRow row[6];
 };
+
+void launch_history_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                           const Tensor& beta, float scale, const Tensor& states,
+                           const Tensor& valid, const Tensor& slots, Tensor& key_record,
+                           Tensor& value_record, Tensor& gate_record, Tensor& out,
+                           const GdnHistoryLayer& history, cudaStream_t stream,
+                           const std::int32_t* schedule);
+void launch_history_commit(const GdnReplayRecords& records, const GdnHistory& history,
+                           LinearAttentionStateAllLayersView states,
+                           const GdnReplayFoldKernelRows& rows, std::int32_t batch,
+                           bool force_flush, cudaStream_t stream);
 
 void launch_recurrent_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                            const Tensor& beta, float scale, Tensor& ssm_state, Tensor& out,

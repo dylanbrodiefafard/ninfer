@@ -44,6 +44,28 @@ static_assert(kGqaPrefillNvfp4Groups == 16);
 static_assert(kGqaPrefillNvfp4DConsumers == 2);
 static_assert(kGqaPrefillNvfp4SmemBytes == 87040);
 
+// Query rows select 8 or 16 warps with two D consumers per 16-row tile.
+// Both profiles require one CTA per SM because their dynamic shared memory exceeds 64 KiB.
+template <int QueryRows>
+struct GqaPrefillNvfp4Tile {
+    static_assert(QueryRows == 64 || QueryRows == 128);
+    static constexpr int Br          = QueryRows;
+    static constexpr int RowTiles    = Br / 16;
+    static constexpr int Warps       = 2 * RowTiles;
+    static constexpr int Threads     = Warps * 32;
+    static constexpr int DConsumers  = 2;
+    static constexpr int QBytes      = Br * kGqaPrefillNvfp4CodeW;
+    static constexpr int QScaleBytes = Br * kGqaPrefillNvfp4Groups;
+    static constexpr int PBytes = Br * kGqaPrefillNvfp4Bc * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int StatsBytes = 2 * Br * static_cast<int>(sizeof(float));
+    static constexpr int SmemBytes = QBytes + QScaleBytes + kGqaPrefillNvfp4KBytes +
+                                     kGqaPrefillNvfp4VBytes + kGqaPrefillNvfp4VStageBytes + PBytes +
+                                     kGqaPrefillNvfp4ScaleBytes + StatsBytes;
+};
+
+static_assert(GqaPrefillNvfp4Tile<128>::SmemBytes == kGqaPrefillNvfp4SmemBytes);
+static_assert(GqaPrefillNvfp4Tile<64>::SmemBytes == 69120);
+
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
@@ -179,29 +201,30 @@ struct GqaPrefillNvfp4SplitPartials {
     float* l   = nullptr;
 };
 
-// Split=false: one CTA per (128-row block, q head) streams the whole causal key history and
+// Split=false: one CTA per (query-row block, q head) streams the whole causal key history and
 // writes normalized BF16. Split=true: grid.z partitions each CTA's key tiles into contiguous
 // ranges and publishes FP32 partials for gqa_attention_prefill_nvfp4_merge_kernel, so short
 // appends to long histories fill the GPU instead of running 24 serial CTAs.
-template <typename Geometry, typename Metadata, bool Split>
-// Occupancy-1: 16 warps × 128 regs = 65536. 512-thread CTA cannot exceed 128.
+template <typename Geometry, typename Metadata, bool Split, int QueryRows = 128>
+// The 128-register cap fits the 16-warp profile in one SM register file.
 __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const std::uint8_t* __restrict__ cache_k_scale,
     const std::uint8_t* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width, GqaPrefillNvfp4SplitPartials partials) {
+    using Tile                  = GqaPrefillNvfp4Tile<QueryRows>;
     constexpr int D             = kGqaPrefillHeadDim;
-    constexpr int Br            = kGqaPrefillNvfp4Br;
+    constexpr int Br            = Tile::Br;
     constexpr int Bc            = kGqaPrefillNvfp4Bc;
     constexpr int Groups        = kGqaPrefillNvfp4Groups;
     constexpr int CodeW         = kGqaPrefillNvfp4CodeW;
     constexpr int QKNt          = Bc / 8;
     constexpr int K64s          = kGqaNvfp4K64;
-    constexpr int PVNtPerWarp   = D / (kGqaPrefillNvfp4DConsumers * 8);
+    constexpr int PVNtPerWarp   = D / (Tile::DConsumers * 8);
     constexpr int PVKs          = Bc / 16;
-    constexpr int ProducerWarps = kGqaPrefillNvfp4RowTiles;
-    constexpr int VWorkerWarps  = kGqaPrefillNvfp4Warps - ProducerWarps;
+    constexpr int ProducerWarps = Tile::RowTiles;
+    constexpr int VWorkerWarps  = Tile::Warps - ProducerWarps;
     constexpr int WorkerThreads = VWorkerWarps * 32;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -210,14 +233,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::uint8_t* q_codes = smem_raw;
-    std::uint8_t* q_scale = q_codes + kGqaPrefillNvfp4QBytes;
-    std::uint8_t* k_codes = q_scale + kGqaPrefillNvfp4QScaleBytes;
+    std::uint8_t* q_scale = q_codes + Tile::QBytes;
+    std::uint8_t* k_codes = q_scale + Tile::QScaleBytes;
     std::uint8_t* v_codes = k_codes + kGqaPrefillNvfp4KBytes;
     __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(v_codes + kGqaPrefillNvfp4VBytes);
     __nv_bfloat16* p_s = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<unsigned char*>(v_bf16) +
                                                           kGqaPrefillNvfp4VStageBytes);
-    std::uint8_t* k_scale_s = reinterpret_cast<std::uint8_t*>(
-        reinterpret_cast<unsigned char*>(p_s) + kGqaPrefillNvfp4PBytes);
+    std::uint8_t* k_scale_s =
+        reinterpret_cast<std::uint8_t*>(reinterpret_cast<unsigned char*>(p_s) + Tile::PBytes);
     std::uint8_t* v_scale_s = k_scale_s + Bc * Groups;
     float* alpha_s          = reinterpret_cast<float*>(v_scale_s + Bc * Groups);
     float* final_l_s        = alpha_s + Br;
@@ -235,7 +258,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         // The split merge owns the invalid-tail zeros.
         if constexpr (!Split) {
             gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                   kGqaPrefillNvfp4Threads);
+                                                   Tile::Threads);
         }
         return;
     }
@@ -253,7 +276,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         kb_begin = min(kb_end, split * per_split);
         kb_end   = min(kb_end, kb_begin + per_split);
         if (kb_begin >= kb_end) {
-            for (int row = tid; row < tile_rows; row += kGqaPrefillNvfp4Threads) {
+            for (int row = tid; row < tile_rows; row += Tile::Threads) {
                 const std::int64_t stat =
                     (static_cast<std::int64_t>(split) * width + q0 + row) * Geometry::QHeads +
                     q_head;
@@ -264,11 +287,11 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         }
     }
 
-    for (int i = tid; i < Br * CodeW; i += kGqaPrefillNvfp4Threads) { q_codes[i] = 0; }
-    for (int i = tid; i < Br * Groups; i += kGqaPrefillNvfp4Threads) { q_scale[i] = 0; }
+    for (int i = tid; i < Br * CodeW; i += Tile::Threads) { q_codes[i] = 0; }
+    for (int i = tid; i < Br * Groups; i += Tile::Threads) { q_scale[i] = 0; }
     __syncthreads();
 
-    for (int unit = tid; unit < Br * Groups; unit += kGqaPrefillNvfp4Threads) {
+    for (int unit = tid; unit < Br * Groups; unit += Tile::Threads) {
         const int row    = unit / Groups;
         const int grp    = unit - row * Groups;
         std::uint32_t lo = 0, hi = 0;
@@ -287,7 +310,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
 
     auto issue_kv_tile = [&](int tile_k0) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
-        for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillNvfp4Threads) {
+        for (int key_l = tid; key_l < Bc; key_l += Tile::Threads) {
             const int key = tile_k0 + key_l;
             if (key <= max_query_abs) {
                 const std::int64_t off =
@@ -299,7 +322,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
                 store_vec(&v_scale_s[key_l * Groups], make_int4(0, 0, 0, 0));
             }
         }
-        for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += kGqaPrefillNvfp4Threads) {
+        for (int chunk = tid; chunk < Bc * (CodeW / 16); chunk += Tile::Threads) {
             const int key_l   = chunk / (CodeW / 16);
             const int seg     = chunk - key_l * (CodeW / 16);
             const int logical = seg * 16;
@@ -484,8 +507,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         const bool has_next = kb + 1 < kb_end;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
-        const int row_tile = warp % kGqaPrefillNvfp4RowTiles;
-        const int d_slice  = warp / kGqaPrefillNvfp4RowTiles;
+        const int row_tile = warp % Tile::RowTiles;
+        const int d_slice  = warp / Tile::RowTiles;
         const int row_base = row_tile * 16;
         const float alpha0 = alpha_s[row_base + gid];
         const float alpha1 = alpha_s[row_base + gid + 8];
@@ -520,8 +543,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
         __syncthreads();
     }
 
-    const int row_tile = warp % kGqaPrefillNvfp4RowTiles;
-    const int d_slice  = warp / kGqaPrefillNvfp4RowTiles;
+    const int row_tile = warp % Tile::RowTiles;
+    const int d_slice  = warp / Tile::RowTiles;
     const int row_base = row_tile * 16;
     const int row0     = row_base + gid;
     const int row1     = row0 + 8;

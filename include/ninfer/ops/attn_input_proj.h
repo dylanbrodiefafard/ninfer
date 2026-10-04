@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
@@ -107,5 +108,15 @@ void attn_input_proj(const A8Activation& x, const Weight& query_key_gate_value_w
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
+
+/**
+ * Single-parent NVFP4 [14336,5120] projection of caller-owned tiled A4[5120,T].
+ * T must be 256 or greater than 384, matching the native tiled consumer.
+ * Output shapes and row ordering match the BF16 overload. The oracle independently decodes
+ * signed activation/weight codes with their exact stored scales and divisors, accumulating
+ * each projection in FP64. No quantization, repacking, allocation or workspace occurs here.
+ */
+void attn_input_proj(const A4Activation& x, const Weight& weight, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, cudaStream_t stream);
 
 } // namespace ninfer::ops

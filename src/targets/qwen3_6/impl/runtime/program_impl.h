@@ -7,6 +7,7 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/gdn_history.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/nll_from_logits.h"
@@ -400,6 +401,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
+    }
+    if (plan.persistent.gdn_history) {
+        gdn_history.emplace(backing, *plan.persistent.gdn_history);
+        ops::gdn_history_reset_all(*gdn_history, device.stream);
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
@@ -1222,9 +1227,23 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     // copy still reads the pinned staging the next round rewrites.
     bool ingress_copy_pending = false;
     try {
-        ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
-                             std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        const auto committed_rows =
+            std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size());
+        if (gdn_history) {
+            ops::gdn_history_commit(*replay_records, *gdn_history,
+                                    decoder->linear_attention.all_layers_view(), committed_rows,
+                                    device.stream);
+            for (const auto& row : committed_rows) {
+                const auto lane     = static_cast<std::uint32_t>(row.linear_state_slot);
+                const auto accepted = static_cast<std::uint32_t>(
+                    row.path_length < 0 ? row.commit_columns : row.path_length);
+                const auto length         = gdn_history_lengths[lane] + accepted;
+                gdn_history_lengths[lane] = length >= 4U ? 0U : length;
+            }
+        } else {
+            ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
+                                 committed_rows, device.stream);
+        }
 
         if (needs_hidden_correction) {
             const auto batch = static_cast<std::int32_t>(lanes.size());
@@ -1327,6 +1346,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                     std::span<const std::uint32_t>(append_lanes.data(), append_size),
                     std::span<const std::uint32_t>(append_starts.data(), append_size),
                     std::span<const std::uint32_t>(append_counts.data(), append_size));
+                // Terminal retention exposes a dense checkpoint after the append tail's fence.
+                for (std::size_t index = 0; index < append_size; ++index) {
+                    materialize_gdn_history(append_lanes[index]);
+                }
             }
         }
 
@@ -1434,6 +1457,7 @@ void ProgramImplCore::retain_committed_sequence(SequenceState& sequence, Request
     if (!sequence.kv) {
         throw std::logic_error("cannot retain a lane with no KV allocation bundle");
     }
+    materialize_gdn_history(sequence.lane);
     request.prefill.reset();
     request.pending          = {};
     sequence.mtp_draft_count = 0;
@@ -2049,6 +2073,7 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
     if (sequence.tier_unpacked_context_base == base &&
         (head == sequence.context_checkpoints.end() ||
          sequence.tier_unpacked_context_hash == head->hash)) {
+        reset_gdn_history(sequence.lane);
         return;
     }
     if (head == sequence.context_checkpoints.end()) {
@@ -2065,6 +2090,7 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
         }
         decoder->linear_attention.copy_slot_2d(
             LinearStateSlots::staging_state_slot(max_concurrency), current, device.stream);
+        reset_gdn_history(sequence.lane);
         copy_tail(sequence, staging_hidden);
         restore_dflash_cyclic_from_head(sequence, *head);
         record_context_checkpoint_head_use(*head, device.stream);
@@ -2076,6 +2102,7 @@ void ProgramImplCore::restore_context_checkpoint_state(SequenceState& sequence,
     }
     decoder->linear_attention.unpack_slot_from_host(current, head->conv.data(),
                                                     head->recurrent.data(), device.stream);
+    reset_gdn_history(sequence.lane);
     if (sequence.tail_hidden.bytes() != 0 && !head->hidden) {
         throw std::logic_error("context checkpoint hidden image is incomplete");
     }
@@ -2116,6 +2143,7 @@ void ProgramImplCore::capture_rewrite_image(SequenceState& sequence) {
         // No staging slot without MTP/DFlash: copy to the image on the compute stream.
         if (dflash) { throw std::logic_error("DFlash rewrite capture requires the staging lane"); }
         CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
+        materialize_gdn_history(sequence.lane);
         decoder->linear_attention.pack_slot_to_host(current, image.conv.data(),
                                                     image.recurrent.data(), device.stream);
         record_context_checkpoint_head_use(image, device.stream);
@@ -2125,6 +2153,7 @@ void ProgramImplCore::capture_rewrite_image(SequenceState& sequence) {
     // Earlier copy_stream reads of staging (a previous drain or checkpoint pack) finish first.
     CUDA_CHECK(cudaStreamWaitEvent(device.stream, staging_.copies_done, 0));
     const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    materialize_gdn_history(sequence.lane);
     decoder->linear_attention.copy_slot_2d(current, staging, device.stream);
     if (dflash) { dflash->staging_local.copy_lane_from(dflash->local, lane, 0, device.stream); }
     CUDA_CHECK(cudaEventRecord(staging_.d2d_done, device.stream));
@@ -2153,12 +2182,14 @@ void ProgramImplCore::restore_rewrite_checkpoint_state(SequenceState& sequence) 
         // Staging was written on this stream; the drain only reads it.
         decoder->linear_attention.copy_slot_2d(
             LinearStateSlots::staging_state_slot(max_concurrency), current, device.stream);
+        reset_gdn_history(sequence.lane);
         if (dflash) { dflash->local.copy_lane_from(dflash->staging_local, 0, lane, device.stream); }
         return;
     }
     CUDA_CHECK(cudaStreamWaitEvent(device.stream, image.copies_done, 0));
     decoder->linear_attention.unpack_slot_from_host(current, image.conv.data(),
                                                     image.recurrent.data(), device.stream);
+    reset_gdn_history(sequence.lane);
     if (dflash) { dflash->local.copy_lane_from_host(image.dflash.data(), lane, device.stream); }
     record_context_checkpoint_head_use(image, device.stream);
 }
@@ -2232,6 +2263,7 @@ void ProgramImplCore::maybe_capture_turn_rollback(SequenceState& sequence, Reque
     const std::int32_t current =
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
     const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    materialize_gdn_history(sequence.lane);
     decoder->linear_attention.copy_slot_2d(current, staging, device.stream);
     CUDA_CHECK(cudaMemcpyAsync(staging_hidden.data, sequence.tail_hidden.data,
                                staging_hidden.bytes(), cudaMemcpyDeviceToDevice, device.stream));
@@ -2303,6 +2335,7 @@ void ProgramImplCore::maybe_freeze_context_checkpoint(SequenceState& sequence,
     const std::int32_t current =
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
     const std::int32_t staging = LinearStateSlots::staging_state_slot(max_concurrency);
+    materialize_gdn_history(sequence.lane);
     decoder->linear_attention.copy_slot_2d(current, staging, device.stream);
     const Tensor last_hidden =
         prefill_hidden.slice(1, static_cast<std::int32_t>(chunk_tokens) - 1, 1);
@@ -2412,14 +2445,15 @@ void ProgramImplCore::restore_ram_entry(std::uint32_t lane, std::uint64_t entry_
         target.stream = device.copy_stream;
 
         qwen3_6::detail::RamRestoredHost host = ram.unpack_device(entry_id, target);
-        sequence.execution_frontier           = host.execution_frontier;
-        sequence.ledger_frontier              = host.ledger_frontier;
-        sequence.rope_delta                   = host.rope_delta;
-        sequence.text_kv_valid                = host.text_kv_valid;
-        sequence.mtp_kv_valid                 = host.mtp_kv_valid;
-        sequence.dflash_context_frontier      = host.dflash_context_frontier;
-        sequence.tail_hidden_valid            = host.tail_hidden_valid;
-        sequence.rewrite_checkpoint           = RewriteCheckpoint{
+        reset_gdn_history(sequence.lane);
+        sequence.execution_frontier      = host.execution_frontier;
+        sequence.ledger_frontier         = host.ledger_frontier;
+        sequence.rope_delta              = host.rope_delta;
+        sequence.text_kv_valid           = host.text_kv_valid;
+        sequence.mtp_kv_valid            = host.mtp_kv_valid;
+        sequence.dflash_context_frontier = host.dflash_context_frontier;
+        sequence.tail_hidden_valid       = host.tail_hidden_valid;
+        sequence.rewrite_checkpoint      = RewriteCheckpoint{
             .valid    = host.rewrite_valid,
             .kind     = host.rewrite_kind,
             .frontier = host.rewrite_frontier,
@@ -2631,7 +2665,8 @@ void ProgramImplCore::restore_disk_entry(std::uint32_t lane, std::uint64_t entry
             });
             pending_disk_checkpoint_heads_.push_back(std::move(*head));
         }
-        pending_disk_restore_ticket_     = disk.restore_device(entry_id, target);
+        pending_disk_restore_ticket_ = disk.restore_device(entry_id, target);
+        reset_gdn_history(sequence.lane);
         pending_disk_checkpoint_lane_    = lane;
         sequence.execution_frontier      = host.execution_frontier;
         sequence.ledger_frontier         = host.ledger_frontier;
@@ -2974,7 +3009,8 @@ ProgramImplCore::restored_context_checkpoint_tokens_lane(std::uint32_t lane) con
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
-    request.output = nullptr;
+    gdn_history_lengths[sequence.lane] = 0;
+    request.output                     = nullptr;
     if (staging_.occupied && staging_.lane == sequence.lane) { unoccupy_staging(); }
     request.prefill.reset();
     sequence.kv.reset();
@@ -3169,9 +3205,29 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
         cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
 }
 
+void ProgramImplCore::materialize_gdn_history(std::uint32_t lane) {
+    if (!gdn_history || gdn_history_lengths[lane] == 0) { return; }
+    if (!replay_records) {
+        throw std::logic_error("GDN history materialization requires bound replay records");
+    }
+    const std::int32_t slot = LinearStateSlots::current_state_slot(lane, max_concurrency);
+    ops::gdn_history_materialize(*replay_records, *gdn_history,
+                                 decoder->linear_attention.all_layers_view(),
+                                 std::span<const std::int32_t>(&slot, 1), device.stream);
+    gdn_history_lengths[lane] = 0;
+}
+
+void ProgramImplCore::reset_gdn_history(std::uint32_t lane) {
+    if (!gdn_history) { return; }
+    ops::gdn_history_reset_slot(
+        *gdn_history, LinearStateSlots::current_state_slot(lane, max_concurrency), device.stream);
+    gdn_history_lengths[lane] = 0;
+}
+
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     decoder->linear_attention.zero_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
+    reset_gdn_history(sequence.lane);
     work.reset();
     set_device_i32(io.pos, 0);
     set_device_i32(io.rope_pos, 0);
@@ -3287,6 +3343,7 @@ void ProgramImplCore::prepare_graphs() {
         for (std::uint32_t row = 0; row < batch_size; ++row) {
             decoder->linear_attention.zero_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
+            reset_gdn_history(row);
             if (dflash) {
                 zero_cyclic_lane(dflash->local, row);
                 const Tensor pending =
@@ -3375,7 +3432,8 @@ void ProgramImplCore::prepare_graphs() {
                                        proposal_head,
                                        keep_frac,
                                        xattn_tau,
-                                       xattn_min_len};
+                                       xattn_min_len,
+                                       gdn_history ? &*gdn_history : nullptr};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -3565,6 +3623,11 @@ void ProgramImplCore::prepare_graphs() {
     for (Tensor& tensor : decoder->linear_attention.recurrent) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
+    if (gdn_history) {
+        ops::gdn_history_reset_all(*gdn_history, device.stream);
+        gdn_history_lengths.fill(0);
+    }
+
     if (dflash) {
         const auto zero_cyclic_cache = [&](CyclicKVCache& cache) {
             for (std::uint32_t layer = 0; layer < cache.layer_count(); ++layer) {
@@ -3729,11 +3792,11 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
     ops::prepare_ragged_prefix(dflash_persistent.pending_features, lane_tensor, device_starts,
                                device_ends, features, positions, device_counts, device.stream);
 
-    schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
-                                         replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head, keep_frac,
-                                         xattn_tau, xattn_min_len},
-                                        dflash_persistent};
+    schedule::DFlashAppendContext state{
+        {device, model, work, decoder->linear_attention,
+         replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+         proposal_head, keep_frac, xattn_tau, xattn_min_len, gdn_history ? &*gdn_history : nullptr},
+        dflash_persistent};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
                                     table_rows, {minimum_count, maximum_count});
@@ -3792,13 +3855,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        materialize_gdn_history(sequence.lane);
         const bool rewrite_capture_pending =
             staged.rewrite_checkpoint_capture &&
             staged.cursor < staged.rewrite_checkpoint_capture->frontier;
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, keep_frac, xattn_tau, xattn_min_len},
+             proposal_head, keep_frac, xattn_tau, xattn_min_len,
+             gdn_history ? &*gdn_history : nullptr},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -4125,7 +4190,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, keep_frac, xattn_tau, xattn_min_len},
+             proposal_head, keep_frac, xattn_tau, xattn_min_len,
+             gdn_history ? &*gdn_history : nullptr},
             decoder->text_kv,
             io.ordinary.value(),
             *ordinary_host_ingress,
@@ -4310,7 +4376,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                  keep_frac, xattn_tau, xattn_min_len},
+                                                  keep_frac, xattn_tau, xattn_min_len,
+                                                  gdn_history ? &*gdn_history : nullptr},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -4619,7 +4686,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, keep_frac, xattn_tau, xattn_min_len},
+             proposal_head, keep_frac, xattn_tau, xattn_min_len,
+             gdn_history ? &*gdn_history : nullptr},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,

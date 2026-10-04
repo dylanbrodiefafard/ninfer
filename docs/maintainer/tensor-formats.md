@@ -170,6 +170,29 @@ communication formats are runtime-state codecs. They are outside this persistent
 even if they also use signed integers and grouped scales. In particular, an INT8 KV-cache format
 must not be labeled `W8G32_F16S` merely because some of its fields look similar.
 
+The internal `A4Activation` contract in `include/ninfer/ops/a4_activation.h` passes a
+caller-owned NVFP4 activation between closed producers and explicit projection consumers.
+For represented BF16 values `v` and positive finite divisor `d`, each group of 16 stores
+`E4M3FN_satfinite_rn(FP32(d * max(abs(v))) / 6)` and signed
+`E2M1_satfinite_rn(FP32(d * v) / decoded_scale)`. Products and divisions round in FP32;
+a zero stored scale produces zero codes. Its represented value is signed code times stored
+scale divided by `d`. The consumer pairs that divisor with the immutable weight divisor.
+
+Codes pack consecutive logical values low nibble first in token-major order. Scales use the
+native token-tile-major `[256 tokens, 16 groups]` layout, with token-major entries within each
+tile. Codes cover the real token count; scales cover its rounded-up 256-token extent, and
+padding scales are zero. The disjoint spans are 256-byte aligned and remain live through
+stream completion. This runtime handoff does not alter persistent NVFP4 weight decoding or
+storage. RMS and sigmoid producers declare the BF16 cast before this codec; their complete
+independent oracles evaluate the logical formula in FP64 before that explicit boundary.
+
+The Qwen3.8 NVFP4 target uses this handoff for existing AllowA4 tiled attention input projections
+at `T == 256` or `T > 384`, and attention residual projections at `T > 512`. The post-mixer selects its packed SwiGLU
+output and direct down projection only at the qualified `T == 1024` and `T == 4096` extents;
+its native BF16 shared epilogue supplies the explicit BF16 codec boundary. Other token extents
+and verify A8 routes retain their native contracts. Selected consumers read the packed value
+directly without another quantizer, repacking, or allocation.
+
 ## 3. Canonical identities and format semantics
 
 ### 3.1 Direct scalar formats

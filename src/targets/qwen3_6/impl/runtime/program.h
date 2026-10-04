@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -478,6 +479,9 @@ public:
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
+    std::optional<GdnHistory> gdn_history;
+    // Host frontier mirrors the validated main-stream count publications, including the anchor.
+    std::array<std::uint32_t, kMaximumConcurrency> gdn_history_lengths{};
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
@@ -526,6 +530,8 @@ private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void retain_committed_sequence(SequenceState& sequence, RequestControl& request);
     void ordered_reset(SequenceState& sequence);
+    void materialize_gdn_history(std::uint32_t lane);
+    void reset_gdn_history(std::uint32_t lane);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);

@@ -1,0 +1,236 @@
+{
+  "phase": 7,
+  "status": "complete",
+  "baseline": "945515ea",
+  "scope": "All remaining 18 Phase4 ready-to-implement mechanisms; prior 6 experiments and one prior rejection remain closed. Native RTX5090 experiments after current-source refresh; papers and broad discovery remain separate.",
+  "total": 18,
+  "completed": 18,
+  "questions": [
+    {
+      "id": "swiglu-nvfp4-output",
+      "owner": "activation",
+      "status": "complete",
+      "decision": "retained_exact1024_4096_math_sanitizer_engine_qualified",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/activation-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "gated-norm-a8-output",
+      "owner": "activation",
+      "status": "complete",
+      "decision": "superseded_native_covered",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/activation-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "rmsnorm-nvfp4-output",
+      "owner": "activation",
+      "status": "complete",
+      "decision": "retained_practical_shapes_math_sanitizer_operator_qualified",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/activation-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "sigmoid-nvfp4-output",
+      "owner": "activation",
+      "status": "complete",
+      "decision": "retained_practical_shapes_math_sanitizer_operator_qualified",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/activation-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "adaptive-nvfp4-scale",
+      "owner": "activation",
+      "status": "complete",
+      "decision": "reject_measured_complete_chain_cost",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/activation-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "gdn-long-prefill-affine-partitions",
+      "owner": "gdn_state",
+      "status": "complete",
+      "decision": "reject_measured_exact_summary_complete_compound",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/gdn_state-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "gdn-projection-conv-recurrence",
+      "owner": "gdn_state",
+      "status": "complete",
+      "decision": "reject_classifier",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/gdn_state-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "causal-prefill-wave-tile-selection",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "retained_selected_short_exact_br64_math_sanitizer_qualified",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "deterministic-topk-histogram",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "reject_measured_complete_engine_cost",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "gdn-fp16-high-low-mma",
+      "owner": "gdn_state",
+      "status": "complete",
+      "decision": "reject_measured_native_mapping",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/gdn_state-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "confidence-ranked-verify-prefixes",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "reject_measured_same_q_physical_cost_gate",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "committed-suffix-proposals",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "reject_measured_quality_and_complete_round_cost",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "mtp-target-anchor",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "fixed_anchor_not_admitted",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "gdn-accepted-history-checkpoint-amortization",
+      "owner": "gdn_state",
+      "status": "complete",
+      "decision": "retained_math_lifecycle_sanitizer_engine_qualified",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/gdn_state-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "tool-close-search-cursor",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "reject_measured_publication_cost_ceiling",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "target-nll-draft-length-predictor",
+      "owner": "policy_frontend",
+      "status": "complete",
+      "decision": "reject_measured_holdout_incremental_policy_gate",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/policy_frontend-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "activation-global-amax-scale",
+      "owner": "activation",
+      "status": "complete",
+      "decision": "tested_global_profile_quality_gate_rejected",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/activation-outcomes.jsonl"
+      ],
+      "next_action": null
+    },
+    {
+      "id": "gdn-dependent-launch-edge",
+      "owner": "gdn_state",
+      "status": "complete",
+      "decision": "reject_measured_complete_engine_cost",
+      "evidence": [
+        "research/inference-engine-triage/evidence/phase7/gdn_state-outcomes.jsonl"
+      ],
+      "next_action": null
+    }
+  ],
+  "publication": "This commit publishes the five retained Phase7 implementations, affected tests/active authorities and compact experiment/review findings. 945515ea published the preceding Phase6 fusion. Broader research inventory and paper investigation remain separate.",
+  "resource_policy": {
+    "build_jobs": 4,
+    "nvcc_optimization_threads": 1,
+    "builder_memory_gib": 16,
+    "builder_cpu_cores": 4,
+    "gpu_lock": "/tmp/ninfer-gpu-queue.lock",
+    "foreign_builds": false,
+    "clones": false
+  },
+  "verification": {
+    "full_cpp": {
+      "registered": 128,
+      "passed": 126,
+      "skipped": 2,
+      "failed": 0,
+      "log": "profiles/bench/phase7/final-full-cpp.log"
+    },
+    "final_host_static_cleanup": "Affected A4/history/real-terminal targets rebuilt and focused checks passed after non-arithmetic index/optional-access fixes.",
+    "static": "clang-tidy22.1.8: 50 affected TUs zero diagnostics; final A4 index fix focused TU zero diagnostics.",
+    "sanitizers": "Selected A4/Exact memcheck and racecheck; history global compound memcheck and bounded unfiltered record racecheck; final A4/history initcheck: zero errors/hazards.",
+    "material_limits": [
+      "Full repeated all-layer history racecheck exceeded16GiB; bounded record racecheck passed.",
+      "Hard k4/W5 speculative-versus-ordinary output check fails identically in baseline and candidate; primary FP64 state/output oracles and supported lifecycle checks pass.",
+      "Standalone partial513 SwiGLU primary precision criterion fails identically in native/packed; caller excluded."
+    ],
+    "outcome_counts": {
+      "activation": 6,
+      "gdn_state": 5,
+      "policy_frontend": 7
+    },
+    "owned_cleanup": {
+      "reclaimed_gib": 4.571,
+      "receipt": "profiles/bench/phase7/owned-cleanup-summary.json"
+    },
+    "documentation": "Active references reconciled and git diff --check passed.",
+    "independent_final_review": "Three subagents independently cross-reviewed GDN Op/test, A4 Op/test and family/target integration; root reviewed Exact tile changes. No concrete commit blockers. Receipt: evidence/phase7/final-cross-review.json.",
+    "publication_gate": "Pinned commit-stage format/lint/file-hygiene checks passed. Formatter-only changes followed by successful affected-target rebuild, A4/history oracles, real short-terminal continuation, and A4/history initcheck (zero errors)."
+  },
+  "retained_questions": [
+    "swiglu-nvfp4-output",
+    "rmsnorm-nvfp4-output",
+    "sigmoid-nvfp4-output",
+    "causal-prefill-wave-tile-selection",
+    "gdn-accepted-history-checkpoint-amortization"
+  ]
+}

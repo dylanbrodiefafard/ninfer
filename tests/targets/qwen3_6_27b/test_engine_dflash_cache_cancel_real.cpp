@@ -328,13 +328,73 @@ void exercise_c2_admission(const char* artifact) {
     std::cout << "DFlash C2 disk admission with full RAM and retained lanes passed\n";
 }
 
+// Two outputs commit exactly one post-prefill anchor. Compare the same DFlash continuation
+// from its resident state and its dense RAM snapshot, rather than a different prefill profile.
+void exercise_short_terminal_restore(const char* artifact) {
+    Tokens first_tokens;
+    Tokens resident_tokens;
+    const Tokens prompt = {248045, 846, 198, 5834, 248046, 198};
+    for (const bool evict : {false, true}) {
+        ninfer::EngineOptions options;
+        options.artifact_path             = artifact;
+        options.max_concurrency           = 1;
+        options.max_context               = 256;
+        options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(256);
+        options.prefill_chunk             = 128;
+        options.kv_ram_capacity_bytes     = 2ULL << 30;
+        options.enable_vision             = false;
+        options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+        options.speculative.draft_tokens  = 4;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        ninfer::Engine engine(options);
+        C2Deadline deadline(engine);
+        deadline.phase   = "short terminal checkpoint";
+        const auto first = engine.generate(engine.prepare_tokens(prompt), greedy(2, false));
+        // The final one-token budget verifies only its anchor and is counted as a fallback.
+        if (first.generated_token_ids.size() != 2 || first.speculative.fallback_steps != 1) {
+            throw std::runtime_error(
+                "short terminal fixture did not execute its one-anchor commit");
+        }
+        if (!evict) {
+            first_tokens = first.generated_token_ids;
+        } else if (first.generated_token_ids != first_tokens) {
+            throw std::runtime_error("short terminal fixture changed its initial DFlash input");
+        }
+        Tokens exact = prompt;
+        exact.push_back(first.generated_token_ids.front());
+        if (evict) {
+            deadline.phase           = "short terminal RAM capture";
+            const Tokens replacement = {248045, 846, 198, 9906, 248046, 198};
+            (void)engine.generate(engine.prepare_tokens(replacement), greedy(2, false));
+        }
+        deadline.phase     = "short terminal observable continuation";
+        const auto resumed = engine.generate(engine.prepare_tokens(exact), greedy(8, true));
+        const auto expected_source =
+            evict ? ninfer::PrefixReuseSource::HostRam : ninfer::PrefixReuseSource::VramResident;
+        if (resumed.prefix_reuse_source != expected_source ||
+            resumed.reused_prompt_tokens != exact.size() || resumed.speculative.rounds == 0) {
+            throw std::runtime_error(
+                "short terminal fixture did not consume its intended checkpoint");
+        }
+        if (!evict) {
+            resident_tokens = resumed.generated_token_ids;
+        } else if (resumed.generated_token_ids != resident_tokens) {
+            throw std::runtime_error(
+                "short terminal dense RAM snapshot changed DFlash continuation");
+        }
+    }
+    std::cout << "DFlash short terminal resident/RAM continuation passed\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const bool c2_only =
         argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "c2";
-    if (argc != 1 && !c2_only) {
-        std::cerr << "usage: dflash_cache_cancel_real [--case c2]\n";
+    const bool short_only =
+        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "short";
+    if (argc != 1 && !c2_only && !short_only) {
+        std::cerr << "usage: dflash_cache_cancel_real [--case c2|short]\n";
         return 1;
     }
     const char* artifact = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
@@ -343,12 +403,13 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        if (!c2_only) {
+        if (!c2_only && !short_only) {
             for (int tier = 0; tier < 3; ++tier) {
                 for (unsigned publications : {2U, 3U}) { exercise(artifact, tier, publications); }
             }
         }
-        exercise_c2_admission(artifact);
+        if (!short_only) { exercise_c2_admission(artifact); }
+        if (!c2_only) { exercise_short_terminal_restore(artifact); }
     } catch (const std::exception& error) {
         std::cerr << "DFlash cache cancellation: " << error.what() << '\n';
         return 1;

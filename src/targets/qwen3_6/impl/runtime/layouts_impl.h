@@ -153,6 +153,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .value_dim     = TextConfig::gdn_value_head_dim,
             });
     }
+    if constexpr (TextConfig::gdn_layers() == 48 && TextConfig::gdn_value_heads == 48 &&
+                  TextConfig::gdn_key_heads == 16 && TextConfig::gdn_key_head_dim == 128 &&
+                  TextConfig::gdn_value_head_dim == 128) {
+        if (plan.features.dflash()) {
+            out.gdn_history = plan_gdn_history(
+                builder, {
+                             .layers      = TextConfig::gdn_layers(),
+                             .slots       = static_cast<std::int32_t>(plan.max_concurrency),
+                             .width       = static_cast<std::int32_t>(plan.dflash_verify_width),
+                             .capacity    = 4,
+                             .qk_heads    = TextConfig::gdn_key_heads,
+                             .value_heads = TextConfig::gdn_value_heads,
+                             .key_dim     = TextConfig::gdn_key_head_dim,
+                             .value_dim   = TextConfig::gdn_value_head_dim,
+                         });
+        }
+    }
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();

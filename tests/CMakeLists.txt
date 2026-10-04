@@ -416,6 +416,10 @@ endforeach()
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_a4_activation_test
+  SOURCES ops/test_a4_activation.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
 ninfer_add_op_test(ninfer_gqa_xattn_sort_test
   SOURCES ops/test_gqa_xattn_sort.cu
   LIBRARIES ninfer_ops)
@@ -428,6 +432,16 @@ ninfer_add_op_test(ninfer_swa_test
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_history_test
+  SOURCES ops/test_gdn_history.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_sanitizer_cases(ninfer_gdn_history_test)
+# The all-layer commit/count cadence belongs to memcheck. Racecheck exercises the
+# record's shared-memory chain/tree paths once, keeping instrumentation bounded.
+set_property(TEST ninfer_gdn_history_test_sanitizer PROPERTY LABELS sanitizer)
+add_test(NAME ninfer_gdn_history_record_racecheck
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_gdn_history_test> --racecheck)
+set_property(TEST ninfer_gdn_history_record_racecheck PROPERTY LABELS sanitizer racecheck)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)

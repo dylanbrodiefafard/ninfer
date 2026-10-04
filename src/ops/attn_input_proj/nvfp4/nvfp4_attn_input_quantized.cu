@@ -110,7 +110,12 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
         nvfp4_w4a4_projection_scale_layout(Nvfp4AttnInputGeometry::kOutputRows,
                                            Nvfp4AttnInputGeometry::kInputRows, x.ne[1]),
         stream);
-    const std::int32_t tokens = x.ne[1];
+    nvfp4_attn_input_w4a4_project(weight, x.ne[1], workspace, q, gate, k, v, stream);
+}
+
+void nvfp4_attn_input_w4a4_project(const Weight& weight, std::int32_t tokens,
+                                   Nvfp4W4a4Workspace workspace, Tensor& q, Tensor& gate, Tensor& k,
+                                   Tensor& v, cudaStream_t stream) {
     if (nvfp4_w4a4_tma_route(Nvfp4AttnInputGeometry::kOutputRows,
                              Nvfp4AttnInputGeometry::kInputRows, tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);

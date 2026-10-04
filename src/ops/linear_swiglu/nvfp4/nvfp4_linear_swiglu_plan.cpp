@@ -154,4 +154,20 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
              scratch.projected.slice(0, kIntermediate, kIntermediate), out, stream);
 }
 
+void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor* normalized,
+                                   A4Activation& activation, WorkspaceArena& workspace,
+                                   cudaStream_t stream) {
+    auto scope         = workspace.scope();
+    const auto scratch = allocate_fused_workspace(workspace, x.ne[1]);
+    launch_nvfp4_w4a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled, stream);
+    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    launch_nvfp4_linear_swiglu_w4a4_tma_packed(
+        scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales),
+        normalized != nullptr ? static_cast<__nv_bfloat16*>(normalized->data) : nullptr,
+        static_cast<std::uint8_t*>(activation.codes.data),
+        static_cast<std::uint8_t*>(activation.scales.data), x.ne[1], alpha, activation.divisor,
+        stream);
+}
+
 } // namespace ninfer::ops::detail

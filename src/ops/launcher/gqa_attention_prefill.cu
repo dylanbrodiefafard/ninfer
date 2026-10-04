@@ -93,21 +93,29 @@ void gqa_attention_prompt_attention_launch_for(
     } else if (cache.dtype == DType::U8) {
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        const auto launch_attention = [&]<bool Split>(std::int32_t splits,
-                                                      GqaPrefillNvfp4SplitPartials partials) {
-            const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillNvfp4Br)),
-                                      static_cast<unsigned>(Geometry::QHeads),
-                                      static_cast<unsigned>(splits));
-            gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Split>
-                <<<attention_grid, kGqaPrefillNvfp4Threads, kGqaPrefillNvfp4SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::uint8_t*>(cache_k.data),
-                    static_cast<const std::uint8_t*>(cache_v.data),
-                    static_cast<const std::uint8_t*>(cache_k_scale.data),
-                    static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens, partials);
-        };
+        const auto launch_attention =
+            [&]<bool Split, int QueryRows = 128>(std::int32_t splits,
+                                                 GqaPrefillNvfp4SplitPartials partials) {
+                using Tile = GqaPrefillNvfp4Tile<QueryRows>;
+                if constexpr (QueryRows == 64) {
+                    static const cudaError_t attr = cudaFuncSetAttribute(
+                        gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Split, QueryRows>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, Tile::SmemBytes);
+                    CUDA_CHECK(attr);
+                }
+                const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, Tile::Br)),
+                                          static_cast<unsigned>(Geometry::QHeads),
+                                          static_cast<unsigned>(splits));
+                gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Split, QueryRows>
+                    <<<attention_grid, Tile::Threads, Tile::SmemBytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::uint8_t*>(cache_k.data),
+                        static_cast<const std::uint8_t*>(cache_v.data),
+                        static_cast<const std::uint8_t*>(cache_k_scale.data),
+                        static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens, partials);
+            };
         if (split.splits > 1) {
             const GqaPrefillNvfp4SplitPartials partials{static_cast<float*>(split.acc.data),
                                                         static_cast<float*>(split.m.data),
@@ -120,7 +128,12 @@ void gqa_attention_prompt_attention_launch_for(
                                                     static_cast<__nv_bfloat16*>(out.data), tokens,
                                                     split.splits);
         } else {
-            launch_attention.template operator()<false>(1, {});
+            // Short native query batches need more independent CTAs to fill the GPU.
+            if (Geometry::QHeads == 24 && tokens <= 256) {
+                launch_attention.template operator()<false, 64>(1, {});
+            } else {
+                launch_attention.template operator()<false>(1, {});
+            }
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),

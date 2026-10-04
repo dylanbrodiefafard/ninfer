@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -31,5 +32,17 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
  */
 void sigmoid_mul_a8(const Tensor& gate, const Tensor& x, A8Activation& activation,
                     cudaStream_t stream);
+
+/**
+ * Publishes the A4 codec of BF16(x * sigmoid(gate)) without modifying either input.
+ * The domain is aligned contiguous BF16 gate/x[6144,T] and tiled A4[6144,T].
+ * Optional normalized publishes the same represented BF16 values; all operands are disjoint.
+ * The primary oracle is the complete FP64 formula, explicit BF16 cast, and independent exact
+ * signed G16 codec. Private FP32 evaluation may differ at BF16 cast ties. There is no workspace
+ * or persistent state; caller-owned outputs remain live through stream completion. Invalid
+ * shapes, dtypes, pointers, alignment, divisors or overlaps throw before submitting work.
+ */
+void sigmoid_mul_a4(const Tensor& gate, const Tensor& x, Tensor* normalized,
+                    A4Activation& activation, cudaStream_t stream);
 
 } // namespace ninfer::ops

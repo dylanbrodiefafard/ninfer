@@ -1,6 +1,7 @@
 #include "ninfer/ops/linear_add.h"
 
 #include "ops/common/a8_activation_check.h"
+#include "ops/common/a4_activation_check.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -270,6 +271,28 @@ void linear_add(const A8Activation& x, const Weight& w, Tensor& residual, cudaSt
     }
     detail::nvfp4_linear_add_w4a8_project(
         w, t, {static_cast<std::uint8_t*>(x.codes.data), static_cast<float*>(x.scales.data)},
+        residual, stream);
+}
+
+void linear_add(const A4Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+    detail::validate_a4_activation(x);
+    if ((x.rows != 6144 && x.rows != 17408) || x.tokens <= 512 || w.qtype != QType::NVFP4 ||
+        w.n != 5120 || w.k != x.rows || w.input_scale_divisor != x.divisor) {
+        throw std::invalid_argument("linear_add: A4 weight shape or divisor mismatch");
+    }
+    detail::validate_nvfp4_weight(w, "A4 linear_add");
+    require_tensor(residual, DType::BF16, w.n, x.tokens, "residual");
+    if (!aligned_to(residual.data, 16)) {
+        throw std::invalid_argument("linear_add: residual must be 16-byte aligned");
+    }
+    detail::require_disjoint(w.payload, w.payload_bytes, x.codes.data, x.codes.bytes);
+    detail::require_disjoint(w.payload, w.payload_bytes, x.scales.data, x.scales.bytes);
+    detail::require_disjoint(w.payload, w.payload_bytes, residual.data, residual.bytes());
+    detail::require_disjoint(residual.data, residual.bytes(), x.codes.data, x.codes.bytes);
+    detail::require_disjoint(residual.data, residual.bytes(), x.scales.data, x.scales.bytes);
+    detail::nvfp4_linear_add_w4a4_project(
+        w, x.tokens,
+        {static_cast<std::uint8_t*>(x.codes.data), static_cast<std::uint8_t*>(x.scales.data)},
         residual, stream);
 }
 

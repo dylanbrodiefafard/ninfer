@@ -7,6 +7,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
@@ -191,7 +192,8 @@ public:
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_linear_state_slot(std::int32_t current_slot);
-    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records,
+                              const GdnHistory* history = nullptr);
     void set_tree_verify(const Tensor* parent_index, const Tensor* gdn_tree_schedule,
                          const Tensor* ancestor_mask, const Tensor* prefix_lengths);
 
@@ -344,6 +346,7 @@ private:
     std::int32_t linear_state_current_slot_               = 0;
     GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_               = nullptr;
+    const GdnHistory* gdn_history_                        = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     std::span<const std::uint32_t> prefill_split_frontiers_{};
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
