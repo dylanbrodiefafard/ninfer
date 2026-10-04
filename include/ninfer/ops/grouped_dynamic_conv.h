@@ -80,4 +80,35 @@ void grouped_dynamic_conv_prepare(const Tensor& hidden, const Tensor& base_kerne
 void grouped_dynamic_conv_finish(const Tensor& hidden, const Tensor& base_kernel,
                                  const Tensor& finish_dynamic, Tensor& out, cudaStream_t stream);
 
+/**
+ * Op: grouped_dynamic_conv_finish_residual_rmsnorm
+ *
+ * Math / indexing:
+ *   C[d,t,b] is the phase-1 convolution defined by grouped_dynamic_conv_finish.
+ *   residual_ideal[d,t,b] = old_residual[d,t,b] + C[d,t,b].
+ *   The published BF16 residual is the observable input to plain RMS normalization:
+ *     out[d,t,b] = weight[d] * residual[d,t,b]
+ *                    / sqrt(sum_i residual[i,t,b]^2 / 5120 + epsilon).
+ *
+ * Logical shapes / supported domain:
+ *   hidden, residual, out are contiguous BF16 [5120,T] or [5120,T,B], with the finish domain.
+ *   base_kernel and finish_dynamic have the finish shapes; weight is contiguous BF16 [5120].
+ *   Every pointer is 4-byte aligned. epsilon is finite and positive. All operands are disjoint.
+ *
+ * Numeric:
+ *   The complete residual oracle evaluates C and the residual sum in FP64 from represented
+ *   inputs. Only the published residual BF16 boundary is semantic; finish staging is private.
+ *   The normalization oracle evaluates the complete plain RMS formula in FP64 from that
+ *   represented residual. Output rounding and private arithmetic follow numerical qualification.
+ *
+ * Effects / workspace / execution:
+ *   Updates all of residual in place and writes all of out; other inputs are preserved.
+ *   No workspace or persistent state. Operands remain valid through execution on stream;
+ *   capture and replay require stable addresses. Invalid operands throw before submitting work.
+ */
+void grouped_dynamic_conv_finish_residual_rmsnorm(const Tensor& hidden, const Tensor& base_kernel,
+                                                  const Tensor& finish_dynamic, Tensor& residual,
+                                                  const Tensor& weight, float epsilon, Tensor& out,
+                                                  cudaStream_t stream);
+
 } // namespace ninfer::ops

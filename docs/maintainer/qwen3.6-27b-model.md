@@ -383,10 +383,17 @@ One propose block:
    - `h = RMSNorm(residual, post_attention_norm)`
    - `h, mlp_k1 = mlp_conv.prepare(h)`; SiLU-GLU MLP; `mlp_conv.finish`; residual add
 3. Final RMSNorm → draft-head logits on the `k` mask columns (not the anchor).
-   Concurrent C>1 runs each compact row as a C=1-shaped propose (`T=width`, `B=1`) so those
-   Linears, SWA, and the draft head use the sequential kernels rather than a `T=width*B`
-   specialization. Eager execution also resolves SWA's direct/split route from that row's
-   frontier rather than the batch maximum; graph replay retains the fixed profile envelope.
+   DFlash2 proposes all compact rows in one batched pass. Packed Linear calls retain the
+   original sequence width when resolving their qualified routes; SWA is invoked separately
+   for each row. Eager SWA resolves its direct/split route from that row's frontier rather than
+   the batch maximum; graph replay retains the fixed profile envelope.
+   The normalized `[5120,width*B]` panel lives outside attention/MLP arena scopes. The first
+   layer performs input RMS once; the closed `grouped_dynamic_conv_finish_residual_rmsnorm`
+   Op publishes attention's BF16 residual plus post-attention RMS, then each nonfinal MLP's
+   BF16 residual plus the next layer's input RMS. Finish BF16 rounding is the qualified private
+   arithmetic profile, kept in registers. The final MLP performs finish/residual only, so final
+   normalization remains restricted to emitted columns. Both tree proposal passes rebind
+   current-width views of the same outer panel; startup workspace planning uses that ownership.
 4. Path selector (`dflash2_path_select`): unsorted top-16 of those logits, then the Markov score
    `score = unary + ⟨pred_code(prev) ⊙ W_h h_t , succ_code(cand)⟩`. Greedy chooses the maximum.
    Sampling draws from the temperature-scaled 16-way distribution and retains that row as `q`.

@@ -62,6 +62,10 @@ ninfer_add_op_test(ninfer_linear_kv_projection_test
 ninfer_add_op_test(ninfer_normalized_rope_kv_append_test
   SOURCES ops/test_normalized_rope_kv_append.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_grouped_dynamic_conv_composite_test
+  SOURCES ops/test_grouped_dynamic_conv_composite.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_sanitizer_cases(ninfer_grouped_dynamic_conv_composite_test)
 
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}

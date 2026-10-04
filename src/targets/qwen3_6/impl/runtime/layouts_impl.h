@@ -600,7 +600,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 matrix(layout, DType::I32, width, batch);
                 matrix(layout, DType::I32, std::max(width - 1, 1), batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
+                Tensor normalized;
                 if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
+                    normalized =
+                        workspace_recipe::matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
                     const auto linear_scratch = [&](std::int32_t n, std::int32_t k) {
                         return std::max(
                             {ops::linear_workspace_capacity_bytes(QType::W8G32_F16S, n, k,
@@ -614,7 +617,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     };
                     {
                         auto attention = layout.scope();
-                        (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
+                        (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens,
+                                                                               normalized);
                         scratch(layout, ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
                                                                           width, batch));
                         scratch(layout,
@@ -633,7 +637,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     {
                         auto mlp = layout.scope();
-                        (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
+                        (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens,
+                                                                         normalized);
                         scratch(layout, linear_scratch(2 * DFlashConfig::intermediate,
                                                        DFlashConfig::hidden));
                         scratch(layout,
@@ -718,7 +723,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         };
                         {
                             auto attention = layout.scope();
-                            (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
+                            (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens,
+                                                                                   normalized);
                             scratch(layout, ops::swa_workspace_capacity_bytes({0, plan.capacity},
                                                                               width, width, batch));
                             scratch(layout, linear_scratch(DFlashConfig::query_size +
@@ -737,7 +743,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         }
                         {
                             auto mlp = layout.scope();
-                            (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
+                            (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens,
+                                                                             normalized);
                             scratch(layout, linear_scratch(2 * DFlashConfig::intermediate,
                                                            DFlashConfig::hidden));
                             scratch(layout, linear_scratch(DFlashConfig::hidden,

@@ -360,6 +360,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                   pos_full, state.execution.device.stream);
         Tensor residual_full =
             state.execution.work.alloc(DType::BF16, {Config::hidden, full_width * batch_size});
+        Tensor normalized_full;
+        if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
+            normalized_full =
+                state.execution.work.alloc(DType::BF16, {Config::hidden, full_width * batch_size});
+        }
         Tensor residual             = residual_full;
         const auto run_embed_layers = [&] {
             ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
@@ -369,14 +374,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 (void)full_rows;
                 (void)frontiers;
                 [&](const auto& dflash) {
+                    Tensor normalized = normalized_full.slice(1, 0, columns);
+                    ops::rmsnorm(residual, dflash.layers.front().input_norm, Config::rms_epsilon,
+                                 false, normalized, state.execution.device.stream);
                     for (int layer = 0; layer < Config::layers; ++layer) {
                         const auto& weight = dflash.layers.at(static_cast<std::size_t>(layer));
                         {
                             auto attention_scope = state.execution.work.scope();
                             auto roots           = workspace_recipe::dflash_attention<Config>(
-                                state.execution.work, columns);
-                            ops::rmsnorm(residual, weight.input_norm, Config::rms_epsilon, false,
-                                         roots.hidden, state.execution.device.stream);
+                                state.execution.work, columns, normalized);
                             Tensor hidden_batch =
                                 roots.hidden.view({Config::hidden, width, batch_size});
                             Tensor prepared_batch =
@@ -471,20 +477,19 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 state.execution.work, state.execution.device.stream, width);
                             Tensor delta_batch =
                                 roots.delta.view({Config::hidden, width, batch_size});
-                            Tensor finished_batch =
-                                roots.prepared.view({Config::hidden, width, batch_size});
-                            ops::grouped_dynamic_conv_finish(
+                            Tensor residual_batch =
+                                residual.view({Config::hidden, width, batch_size});
+                            Tensor normalized_batch =
+                                normalized.view({Config::hidden, width, batch_size});
+                            ops::grouped_dynamic_conv_finish_residual_rmsnorm(
                                 delta_batch, weight.attention_conv.base_kernel, finish_dynamic,
-                                finished_batch, state.execution.device.stream);
-                            ops::residual_add(roots.prepared, residual,
-                                              state.execution.device.stream);
+                                residual_batch, weight.post_attention_norm, Config::rms_epsilon,
+                                normalized_batch, state.execution.device.stream);
                         }
                         {
                             auto mlp_scope = state.execution.work.scope();
-                            auto roots =
-                                workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
-                            ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon,
-                                         false, roots.hidden, state.execution.device.stream);
+                            auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work,
+                                                                              columns, normalized);
                             Tensor hidden_batch =
                                 roots.hidden.view({Config::hidden, width, batch_size});
                             Tensor prepared_batch =
@@ -509,11 +514,22 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 state.execution.device.stream, width);
                             Tensor mlp_in  = roots.delta.view({Config::hidden, width, batch_size});
                             Tensor mlp_out = roots.hidden.view({Config::hidden, width, batch_size});
-                            ops::grouped_dynamic_conv_finish(mlp_in, weight.mlp_conv.base_kernel,
-                                                             finish_dynamic, mlp_out,
-                                                             state.execution.device.stream);
-                            ops::residual_add(roots.hidden, residual,
-                                              state.execution.device.stream);
+                            if (layer + 1 < Config::layers) {
+                                Tensor residual_batch =
+                                    residual.view({Config::hidden, width, batch_size});
+                                const auto& next_weight =
+                                    dflash.layers.at(static_cast<std::size_t>(layer + 1));
+                                ops::grouped_dynamic_conv_finish_residual_rmsnorm(
+                                    mlp_in, weight.mlp_conv.base_kernel, finish_dynamic,
+                                    residual_batch, next_weight.input_norm, Config::rms_epsilon,
+                                    mlp_out, state.execution.device.stream);
+                            } else {
+                                ops::grouped_dynamic_conv_finish(
+                                    mlp_in, weight.mlp_conv.base_kernel, finish_dynamic, mlp_out,
+                                    state.execution.device.stream);
+                                ops::residual_add(roots.hidden, residual,
+                                                  state.execution.device.stream);
+                            }
                         }
                     }
                 }(weights);

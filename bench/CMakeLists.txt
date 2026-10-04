@@ -21,6 +21,8 @@ ninfer_add_op_bench(ninfer_normalized_rope_kv_append_bench
   SOURCES ops/normalized_rope_kv_append_bench.cpp)
 target_include_directories(ninfer_normalized_rope_kv_append_bench PRIVATE ${PROJECT_SOURCE_DIR}/tests)
 ninfer_add_op_bench(ninfer_residual_rmsnorm_bench SOURCES ops/residual_rmsnorm_bench.cu)
+ninfer_add_op_bench(ninfer_grouped_dynamic_conv_bench
+  SOURCES ops/grouped_dynamic_conv_bench.cu)
 ninfer_add_op_bench(ninfer_l2norm_bench SOURCES ops/l2norm_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_bench SOURCES ops/gdn_gating_bench.cu)
 ninfer_add_op_bench(ninfer_gdn_gating_proj_bench SOURCES ops/gdn_gating_proj_bench.cu)

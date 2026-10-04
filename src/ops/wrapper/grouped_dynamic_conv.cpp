@@ -4,7 +4,10 @@
 #include "ninfer/ops/linear.h"
 #include "ops/launcher/grouped_dynamic_conv.h"
 
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -175,6 +178,48 @@ void grouped_dynamic_conv_finish(const Tensor& hidden, const Tensor& base_kernel
                      "grouped_dynamic_conv: out must not alias finish_dynamic");
     require_disjoint(out, base_kernel, "grouped_dynamic_conv: out must not alias base_kernel");
     detail::grouped_dynamic_conv_finish_launch(hidden, base_kernel, finish_dynamic, out, stream);
+}
+
+void grouped_dynamic_conv_finish_residual_rmsnorm(const Tensor& hidden, const Tensor& base_kernel,
+                                                  const Tensor& finish_dynamic, Tensor& residual,
+                                                  const Tensor& weight, float epsilon, Tensor& out,
+                                                  cudaStream_t stream) {
+    require_hidden_layout(hidden, "hidden");
+    require_matching_activation(hidden, residual, "residual");
+    require_matching_activation(hidden, out, "out");
+    require_base_kernel(base_kernel);
+    require_finish_dynamic(hidden, finish_dynamic, "finish_dynamic");
+    if (weight.dtype != DType::BF16 || !weight.is_contiguous() || weight.data == nullptr ||
+        weight.ne[0] != kGroupedDynamicConvHidden || weight.ne[1] != 1 || weight.ne[2] != 1 ||
+        weight.ne[3] != 1 || !std::isfinite(epsilon) || epsilon <= 0.0F) {
+        throw std::invalid_argument(
+            "grouped_dynamic_conv_finish_residual_rmsnorm: invalid weight or epsilon");
+    }
+    const std::array<const Tensor*, 6> operands{&hidden,   &base_kernel, &finish_dynamic,
+                                                &residual, &weight,      &out};
+    std::array<std::uintptr_t, 6> starts{};
+    std::array<std::uintptr_t, 6> ends{};
+    for (std::size_t index = 0; index < operands.size(); ++index) {
+        starts[index] = reinterpret_cast<std::uintptr_t>(operands[index]->data);
+        if (!aligned_to(operands[index]->data, 4)) {
+            throw std::invalid_argument(
+                "grouped_dynamic_conv_finish_residual_rmsnorm: pointers must be 4-byte aligned");
+        }
+        const std::size_t bytes = operands[index]->bytes();
+        if (starts[index] > std::numeric_limits<std::uintptr_t>::max() - bytes) {
+            throw std::overflow_error(
+                "grouped_dynamic_conv_finish_residual_rmsnorm: storage interval overflows uintptr");
+        }
+        ends[index] = starts[index] + bytes;
+        for (std::size_t other = 0; other < index; ++other) {
+            if (starts[index] < ends[other] && starts[other] < ends[index]) {
+                throw std::invalid_argument(
+                    "grouped_dynamic_conv_finish_residual_rmsnorm: operands must not overlap");
+            }
+        }
+    }
+    detail::grouped_dynamic_conv_finish_residual_rmsnorm_launch(
+        hidden, base_kernel, finish_dynamic, residual, weight, epsilon, out, stream);
 }
 
 } // namespace ninfer::ops

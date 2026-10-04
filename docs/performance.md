@@ -18,6 +18,55 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash finish/residual/plain RMS and two rejected optimizations (2026-10-03)
+
+Against `442099cb`, `grouped_dynamic_conv_finish_residual_rmsnorm` combines the
+5120-wide convolution finish, observable BF16 residual update and plain RMS in
+one launch. DFlash2 retains one normalized panel outside stage arena scopes;
+attention publishes post-attention normalization, and each nonfinal MLP publishes
+the next layer's input normalization. The final MLP keeps its existing residual
+update and emitted-subset normalization. No weight repacking or runtime allocation
+is added.
+
+RTX5090, `sm_120a`, CUDA13.1: 300 alternating public-Op graph pairs, warm L2 and
+untimed residual reset, measured B6/W8 7.552→5.760us (three nodes→one), paired
+mean saving 1.610us with 95% interval [1.481,1.739]. All B1,2,6/W3,8,12 points
+favored fusion. The retained public benchmark independently measured B6/W8
+7.552→5.568us. Graph dispatch/event overhead belongs to these edge measurements.
+
+The isolated Engine old/new/old comparison used pp512/tg128, optimized DFlash
+head, NVFP4 target KV, CUDA Graphs, one warmup and three measured repetitions
+per run. Its DFlash2 artifact has NVFP4 target weights and W8 MTP matrices;
+draft-local KV remains BF16. Acceptance was identical within each comparison.
+
+| Workload | Baseline → fused output tokens/s | Change |
+|---|---:|---:|
+| C1/k3 chain | 170.812 → 170.982 | +0.10% |
+| C6/k3 chain | 735.754 → 736.088 | +0.05% |
+| C6/k7/W12 tree | 252.370 → 252.484 | +0.05% |
+
+These Engine changes overlap measurement variation: the retained benefit is at
+the operator edge, with effectively flat sampled Engine throughput. Workspace
+high-water values are unchanged because another phase governs the sampled peak.
+
+Two additional experiments were removed. Dense B6/W3 full-head GDN recurrence
+plus gated normalization passed independent FP64 output and exact record/state/A8
+checks, but its two-node complete edge regressed 14.624→16.672us in 300 alternating
+pairs. It retained the token-wide A8 encoding launch and BF16 handoff while reducing
+head parallelism. Separate-stream accepted-state replay had a legal measured
+overlap window, but the same Engine bracket regressed C1/k3 by 1.91%, C6/k3 by
+1.45% and C6/k7/W12 by 1.22%, with identical acceptance. Its entire stream/event
+path and lifecycle changes were removed; an overlap window is not a throughput win.
+
+The retained Op is qualified against complete represented-input FP64 mathematics,
+a per-column condition bound and a tight independent RMS oracle at its observable
+residual boundary; eager/capture and B6/W12 memcheck/racecheck pass. C6 k7 chain,
+W12 tree/isolation and adaptive RAM restore checks pass; the full C++ gate passed
+121 checks with two unavailable legacy artifact skips and no failures. The experiment
+decisions and final integration gates are in
+`research/inference-engine-triage/phase6-experiments.md`; bounded local evidence is
+under `profiles/bench/phase6/`.
+
 ## Producer-side A8 activations (2026-10-03)
 
 In DFlash verification every NVFP4 A8 projection quantized its BF16 input in a standalone
