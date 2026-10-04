@@ -362,8 +362,13 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
 
     Tensor e = roots.normalized_embedding;
     Tensor h = roots.normalized_hidden;
-    ops::rmsnorm(emb, *mtp_.pre_fc_norm_embedding, kCfg.rms_eps, true, e, s);
-    ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, true, h, s);
+    if constexpr (kCfg.hidden == 5120) {
+        ops::dual_offset_rmsnorm(emb, *mtp_.pre_fc_norm_embedding, flat_hidden,
+                                 *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, e, h, s);
+    } else {
+        ops::rmsnorm(emb, *mtp_.pre_fc_norm_embedding, kCfg.rms_eps, true, e, s);
+        ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, true, h, s);
+    }
 
     x = roots.residual;
     Variant::mtp_fc(e, h, *mtp_.fc, x, work_, s,

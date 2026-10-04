@@ -22,4 +22,8 @@ void rmsnorm_a8_launch(const Tensor& x, const Tensor& weight, float eps, Tensor*
 void gated_rmsnorm_a8_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                              A8Activation& activation, cudaStream_t stream);
 
+void dual_offset_rmsnorm_launch(const Tensor& x0, const Tensor& weight0, const Tensor& x1,
+                                const Tensor& weight1, float eps, Tensor& out0, Tensor& out1,
+                                cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

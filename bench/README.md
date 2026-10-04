@@ -159,6 +159,38 @@ bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidt
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
 
+## Selected K/V projection and normalization Op benchmarks
+
+These executables measure retained public Ops on RTX5090. They have no candidate
+forcing or comparison routes; production dispatch owns the implementation.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_linear_kv_projection_bench \
+  ninfer_dual_rmsnorm_bench ninfer_normalized_rope_kv_append_bench
+./build/bench/ninfer_linear_kv_projection_bench \
+  --batch 6 --widths 3,8,128,2048 --mode graph --cold --repeat 100
+./build/bench/ninfer_dual_rmsnorm_bench --tokens 18 --repeat 200
+./build/bench/ninfer_normalized_rope_kv_append_bench \
+  --batch 6 --width 8 --count 8 --repeat 100
+```
+
+`linear_kv_projection` uses an original NVFP4 `[6144,5120]` weight and writes
+separate contiguous K/V `[1024,W*B]` outputs. `--batch` accepts 1..6;
+`--widths` accepts widths 1..2048. `--mode` selects eager or captured execution.
+`--cold` flushes L2 outside the event interval; otherwise buffers remain resident.
+`--layers 5` measures five distinct weights with the same output storage reused.
+
+`dual_offset_rmsnorm` normalizes two independent BF16 `[5120,T]` panels and reports
+eager and captured timings. Without `--tokens`, it covers the distinct extents
+from B1/2/6 and W1..6.
+
+`normalized_rope_kv_append` measures the complete plain K RMS/RoPE/accepted BF16
+cyclic-cache update, including exact V copies. Defaults cover B1/2/6, W3..8,
+and counts zero/one/mixed/full. `--count -1` selects mixed device counts; width
+2048 with count2048 measures complete ring replacement. All timings exclude
+fixture setup and cache initialization. Independent numerical and state
+qualification lives in the corresponding Op tests.
+
 ## Embedding Op benchmark
 
 `ninfer_embedding_bench` measures the three registered quantized public `embedding()` profiles:

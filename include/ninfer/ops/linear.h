@@ -151,4 +151,30 @@ void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, Line
 void linear_packed_sequences(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
                              std::int32_t sequence_width);
 
+/**
+ * @brief Projects the K and V row ranges of one registered fused QKV weight.
+ *
+ * @details `w` is the original immutable `[6144,5120]` descriptor in block-scaled NVFP4 or
+ * RowSplit W8G32_F16S/Q4G64_F16S, including its full payload and original scale planes.
+ * `x` is contiguous BF16 `[5120,T]`; `key` and
+ * `value` are distinct contiguous BF16 `[1024,T]` outputs. The ideal results are the complete
+ * dot products of represented BF16 inputs with exactly decoded original weight rows
+ * `[4096,5120)` and `[5120,6144)`, respectively. Outputs use Linear's A16 numerical criterion;
+ * activation quantization is not admitted. No Q output is produced.
+ *
+ * Tensor and weight-plane pointers must be non-null and 16-byte aligned. Outputs cannot overlap
+ * each other, the input, or the original weight payload. Inputs and weights remain unchanged. `T`
+ * and `sequence_width` are positive; `T` is a multiple of `sequence_width` representing one to six
+ * packed sequences. Packed requests retain their C=1 arithmetic route: NVFP4 width 1 uses
+ * independent GEMV panels and widths >= 2 share the qualified ascending-K A16 MMA reduction.
+ * RowSplit formats retain independent per-sequence Linear calls on their valid K/V row views.
+ * No workspace or internal device allocation is required.
+ *
+ * Execution is enqueued on `stream`; caller-owned tensors and weight planes must remain live
+ * until execution completes. Invalid tensors, original weight descriptors, or packed shapes
+ * throw `std::invalid_argument`; CUDA failures propagate with launch context.
+ */
+void linear_kv_projection(const Tensor& x, const Weight& w, Tensor& key, Tensor& value,
+                          cudaStream_t stream, std::int32_t sequence_width);
+
 } // namespace ninfer::ops

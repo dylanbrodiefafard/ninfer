@@ -7,6 +7,15 @@ benchmark-report, and external protocol behavior. Repository verification princi
 
 ## Organization
 
+The selected-row `ninfer_linear_kv_projection_test` evaluates complete FP64 dots
+from independently decoded original NVFP4/W8/Q4 weights, including packed rows,
+capture and exact storage preservation. `ninfer_dual_rmsnorm_test` applies the
+independent RMS oracle separately to both panels and both alignment routes.
+`ninfer_normalized_rope_kv_append_test` evaluates the complete FP64 norm/rotation
+formula and exact accepted-prefix V/cache state, including wrap, ring replacement
+and graph replay. Their contract headers define the admitted domains; their
+numerical criteria do not reproduce production staging casts.
+
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
   using independent numerical/state-transition oracles at real supported shapes;

@@ -228,7 +228,6 @@ struct DFlashContextLayerRoots {
     Tensor key_raw;
     Tensor value;
     Tensor key;
-    Tensor fused_qkv;
 };
 
 template <class Config, class Allocator>
@@ -236,12 +235,10 @@ DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, std::int32_t 
     DFlashContextLayerRoots out{
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
         {},
     };
-    if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
-        out.fused_qkv =
-            matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens);
+    if constexpr (Config::kind == qwen3_6::DFlashKind::V1) {
+        out.key = matrix(allocator, DType::BF16, Config::kv_size, tokens);
     }
     return out;
 }

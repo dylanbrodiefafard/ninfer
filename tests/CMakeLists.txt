@@ -53,6 +53,16 @@ function(ninfer_add_sanitizer_cases name)
   set_property(TEST ${name}_sanitizer PROPERTY LABELS sanitizer racecheck)
 endfunction()
 
+ninfer_add_op_test(ninfer_dual_rmsnorm_test
+  SOURCES ops/test_dual_rmsnorm.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_kv_projection_test
+  SOURCES ops/linear/test_context_kv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_normalized_rope_kv_append_test
+  SOURCES ops/test_normalized_rope_kv_append.cpp
+  LIBRARIES ninfer_ops)
+
 function(ninfer_add_linear_test name source)
   ninfer_add_op_test(${name}
     SOURCES ${source}
@@ -530,10 +540,14 @@ ninfer_add_sanitizer_cases(ninfer_speculative_round_test)
 ninfer_add_sanitizer_cases(ninfer_gqa_attention_test)
 ninfer_add_sanitizer_cases(ninfer_attn_input_proj_test)
 ninfer_add_sanitizer_cases(ninfer_a8_activation_test)
+ninfer_add_sanitizer_cases(ninfer_normalized_rope_kv_append_test)
+ninfer_add_sanitizer_cases(ninfer_linear_kv_projection_test)
+set_property(TEST ninfer_linear_kv_projection_test_sanitizer PROPERTY LABELS sanitizer)
 set(ninfer_sanitizer_racecheck_tests
   ninfer_kv_cache_test
   ninfer_embedding_test
   ninfer_rmsnorm_test
+  ninfer_dual_rmsnorm_test
   ninfer_gated_rmsnorm_test
   ninfer_rope_test
   ninfer_position_test

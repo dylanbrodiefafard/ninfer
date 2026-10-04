@@ -15,6 +15,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/normalized_rope_kv_append.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -228,15 +229,9 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             Tensor value_flat = value.view({Config::kv_size, layer_columns});
             if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
                 [&](const auto& layer_weight) {
-                    ops::linear_packed_sequences(
-                        layer_context, layer_weight.query_key_value, layer_roots.fused_qkv,
-                        dflash_weight_policy(layer_weight.query_key_value.qtype),
-                        state.execution.work, state.execution.device.stream, layer_width);
-                    copy_fused_row_range(layer_roots.fused_qkv, Config::query_size, key_flat,
-                                         state.execution.device.stream);
-                    copy_fused_row_range(layer_roots.fused_qkv,
-                                         Config::query_size + Config::kv_size, value_flat,
-                                         state.execution.device.stream);
+                    ops::linear_kv_projection(layer_context, layer_weight.query_key_value, key_flat,
+                                              value_flat, state.execution.device.stream,
+                                              layer_width);
                 }(weight);
             } else {
                 [&](const auto& layer_weight) {
@@ -250,24 +245,40 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                         });
                 }(weight);
             }
-            Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
-            ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
-                         state.execution.device.stream);
-            ops::rope(layer_positions.view({layer_columns}), Config::head_dim, Config::rope_theta,
-                      key, state.execution.device.stream);
-            Tensor key_batch = key.view({Config::head_dim, Config::kv_heads, layer_width, batch});
-            Tensor value_batch =
-                value.view({Config::head_dim, Config::kv_heads, layer_width, batch});
-            Tensor position_batch = layer_positions.view({layer_width, batch});
-            if (local_layer) {
-                ops::kv_cache_append_prefix(
-                    key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
+            if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
+                static_assert(Config::local_layers == Config::layers);
+                Tensor raw_batch =
+                    key_raw.view({Config::head_dim, Config::kv_heads, layer_width, batch});
+                Tensor value_batch =
+                    value.view({Config::head_dim, Config::kv_heads, layer_width, batch});
+                Tensor position_batch = layer_positions.view({layer_width, batch});
+                ops::normalized_rope_kv_append(
+                    raw_batch, value_batch, weight.key_norm, position_batch, local_counts, lanes,
+                    Config::rms_epsilon, Config::rope_theta, local_envelope,
                     dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
                     state.execution.device.stream);
-            } else if constexpr (Config::kind == qwen3_6::DFlashKind::V1) {
-                ops::kv_cache_append_prefix(
-                    key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,
-                    dflash_state(state).full_batch_layer(0), state.execution.device.stream);
+            } else {
+                Tensor key =
+                    layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
+                ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
+                             state.execution.device.stream);
+                ops::rope(layer_positions.view({layer_columns}), Config::head_dim,
+                          Config::rope_theta, key, state.execution.device.stream);
+                Tensor key_batch =
+                    key.view({Config::head_dim, Config::kv_heads, layer_width, batch});
+                Tensor value_batch =
+                    value.view({Config::head_dim, Config::kv_heads, layer_width, batch});
+                Tensor position_batch = layer_positions.view({layer_width, batch});
+                if (local_layer) {
+                    ops::kv_cache_append_prefix(
+                        key_batch, value_batch, position_batch, local_counts, lanes, local_envelope,
+                        dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
+                        state.execution.device.stream);
+                } else if constexpr (Config::kind == qwen3_6::DFlashKind::V1) {
+                    ops::kv_cache_append_prefix(
+                        key_batch, value_batch, position_batch, commit_counts, table_rows, envelope,
+                        dflash_state(state).full_batch_layer(0), state.execution.device.stream);
+                }
             }
         }
     }

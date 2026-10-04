@@ -589,24 +589,6 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 {
                     auto layer = layout.scope();
                     (void)workspace_recipe::dflash_context_layer<DFlashConfig>(layout, tokens);
-                    if constexpr (DFlashConfig::kind == qwen3_6::DFlashKind::DFlash2) {
-                        scratch(layout,
-                                std::max({ops::linear_workspace_capacity_bytes(
-                                              QType::W8G32_F16S,
-                                              DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
-                                              DFlashConfig::hidden, ops::LinearPolicy::A16Only,
-                                              tokens, tokens),
-                                          ops::linear_workspace_capacity_bytes(
-                                              QType::Q4G64_F16S,
-                                              DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
-                                              DFlashConfig::hidden, ops::LinearPolicy::A16Only,
-                                              tokens, tokens),
-                                          ops::linear_workspace_capacity_bytes(
-                                              QType::NVFP4,
-                                              DFlashConfig::query_size + 2 * DFlashConfig::kv_size,
-                                              DFlashConfig::hidden, ops::LinearPolicy::AllowA4,
-                                              tokens, tokens)}));
-                    }
                 }
                 return finish(layout);
             };

@@ -369,11 +369,15 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
 }
 
 template <class Geometry, class Epilogue, class Output, class RowPolicy = Nvfp4W4a4IdentityRows,
-          bool PairRows = false, class Activation = Fp8A8Workspace>
+          bool PairRows = false, class Activation = Fp8A8Workspace,
+          int OutputRows = Geometry::kOutputRows>
 void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspace,
                            Epilogue epilogue, Output output, cudaStream_t stream) {
+    static_assert(OutputRows > 0 && OutputRows <= Geometry::kOutputRows && OutputRows % 128 == 0);
     constexpr bool kBf16           = std::is_same_v<Activation, Nvfp4Bf16Activation>;
     constexpr int kActivationBytes = kBf16 ? 2 : 1;
+    // OutputRows bounds the selected grid, while Geometry retains original plane strides and
+    // route selection. RowPolicy maps each selected row into that original geometry.
     // Output rows are partitioned without splitting K or replaying weights. N<=6144 places tokens
     // on MMA M (N16 tiles for T<=16, N32 above) and streams K512 of FP8 over three stages; wider
     // projections place sixteen weight rows on MMA M (SwapAB) and compile the exact eight-token
@@ -397,7 +401,7 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
             return true;
         }();
         (void)configured;
-        const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, (tokens + BM - 1) / BM);
+        const dim3 grid(OutputRows / Schedule::kBlockN, (tokens + BM - 1) / BM);
         kernel<<<grid, Schedule::kThreads, smem, stream>>>(
             workspace, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), tokens,
