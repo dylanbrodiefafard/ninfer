@@ -73,4 +73,30 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_nvfp4_linear_swiglu_w4a4_tma_packed(
+    const std::uint8_t* activation_codes, const std::uint8_t* activation_scales,
+    const std::uint8_t* weight_codes, const std::uint8_t* weight_scales, __nv_bfloat16* diagnostic,
+    std::uint8_t* codes, std::uint8_t* scales, std::int32_t tokens, float alpha,
+    float output_divisor, cudaStream_t stream) {
+    if (tokens < 256) { throw std::invalid_argument("packed LinearSwiGLU TMA requires T>=256"); }
+    using Geometry                     = Nvfp4MlpGateUpGeometry;
+    constexpr std::size_t kSharedBytes = sizeof(Nvfp4LinearSwiGluTmaSharedStorage<M256N128S3>);
+    static const bool kConfigured      = [] {
+        CUDA_CHECK(cudaFuncSetAttribute(
+            nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes)));
+        return true;
+    }();
+    (void)kConfigured;
+    const auto descriptors = make_descriptors<Geometry, M256N128S3>(
+        activation_codes, activation_scales, weight_codes, weight_scales, tokens);
+    constexpr int kPairN = M256N128S3::kBlockN / 2;
+    const dim3 grid((Geometry::kOutputRows / 2) / kPairN,
+                    (tokens + M256N128S3::kBlockM - 1) / M256N128S3::kBlockM);
+    nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3, true>
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(
+            descriptors, alpha, diagnostic, tokens, codes, scales, output_divisor);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

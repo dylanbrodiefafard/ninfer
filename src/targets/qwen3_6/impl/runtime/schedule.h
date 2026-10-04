@@ -50,6 +50,7 @@ struct ExecutionCore {
     float keep_frac;
     float xattn_tau;
     std::int32_t xattn_min_len;
+    const GdnHistory* gdn_history;
 };
 
 struct PrefillContext {

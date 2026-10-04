@@ -286,7 +286,8 @@ x  = x + out_projection(on)
 For `C=max_concurrency`, the Program reserves `C` complete all-layer GDN state slots when speculation
 is off, and `C+1` when MTP or DFlash is on:
 
-- `[0,C)` is the current committed convolution history and FP32 recurrent state for each lane;
+- `[0,C)` is the current committed convolution history and FP32 recurrent checkpoint for each lane;
+  DFlash also owns the accepted history described below, so its logical current state may be deferred;
 - slot `C` (MTP or DFlash) is Engine-wide GDN storage: the hot turn-rollback occupant, borrowed by
   prefill context-checkpoint freeze (then reloaded). Staging hidden is a separate `[5120,1]` BF16
   tensor, not `[5120,C]`.
@@ -304,6 +305,24 @@ capture D2Hs on the compute stream. Only its `[5120,1]` hidden stays on the devi
 When MTP is enabled, a separate Program-owned ReplaySSM arena holds `C` physical record rows of
 width `draft_window+1` for every GDN layer. Records are pending-round scratch, not sequence state or
 additional checkpoint slots.
+
+For DFlash, current recurrent state is represented by a dense FP32 checkpoint and a bounded
+accepted history. Capacity four stores FP32 normalized keys shared across each three value
+heads, FP32 innovations and decay per value head, and one length per lane shared by all 48 GDN
+layers. The closed record Op derives these private values from represented BF16 raw K/V and
+FP32 controls and the actual parent state. A selected commit includes the anchor and consumes
+only an ancestor-complete path from that invocation. Retained corrections apply sequentially as
+`S = alpha*S + u outer k`, including zero decay without division. A total retained-plus-accepted
+length of at least four flushes the complete checkpoint and resets length to zero; smaller totals
+remain deferred. Every observable readout and materialized FP32 state is qualified directly
+against the complete naive FP64 recurrence. Raw BF16 records remain observable, and convolution
+history commits every round. MTP keeps its native dense replay-fold state transition.
+
+Dense consumers and prefix/snapshot exports materialize accepted history first. Restore and
+slot reset install dense state and clear the length. The Program startup arena owns both the
+capacity-four history and provisional derived records at the maximum verify width; neither is
+a checkpoint staging slot. All-layer commit precedes a separate ordered count publication on
+the main stream, preserving stable CUDA Graph addresses and compact-row-to-lane ownership.
 
 ## 6. Text prefill and decode
 
@@ -741,6 +760,7 @@ Let `C=max_concurrency`.
 | GDN convolution history | 48 layers × 10240 × 3 × `C` BF16, plus one staging slot when MTP or DFlash is on | Program lifetime; current and checkpoint staging slots |
 | GDN recurrent matrices | 48 layers × 48 heads × 128 × 128 × `C` FP32, plus one staging slot when MTP or DFlash is on | Program lifetime; current and checkpoint staging slots |
 | Turn-checkpoint host image | per lane: one GDN slot (146.8 MiB) plus, under DFlash, one local K/V lane (40 MiB), pinned host | lane lifetime after its first capture or tier restore |
+| DFlash accepted history | 48 layers × `C` × capacity 4 normalized keys/innovations/decay, plus provisional derived records at the verify-width ceiling | Program lifetime; one retained length per lane; main-stream commit/materialize |
 | ReplaySSM records | 48 layers × `C` rows × `dflash_verify_width` (`draft_window+1` for chain verify) convolution/key/value/gate columns | Program lifetime when MTP or DFlash enabled; one pending round |
 | DFlash2 local K/V | current: 5 layers × 2048 × 8 heads × 128 × 2 planes × `C` lanes; plus one 1-lane checkpoint staging window | Program lifetime when DFlash enabled |
 | DFlash2 target features | prefill `[25600,P]` plus pending `[25600,dflash_verify_width,C]` BF16 | Program lifetime when DFlash enabled |
@@ -785,6 +805,7 @@ complete artifact inventory is still validated before these resident views are p
 | Qwen3.8 NVFP4 DFlash2 conversion | [`qwen3.8-27b-artifact.md`](qwen3.8-27b-artifact.md), `tools/convert/qwen3_8_27b/convert_nvfp4.py` |
 | growing GQA paged cache pools, allocations, and per-layer views | `src/core/paged_kv_cache.*` |
 | GDN layout/views/reset/copy and Text/MTP/GDN composition | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/decoder_state.h`, `src/targets/qwen3_6/impl/state/decoder_state.cpp` |
+| DFlash checkpoint/accepted-history physical planes and closed transition | `src/core/gdn_history.*`, `include/ninfer/ops/gdn_history.h`, `src/ops/linear_attention/gated_delta_net/history.*` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | generated-round buffer schema, MTP alignment, and Vision control | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/`, `src/targets/qwen3_6/impl/state/round_state.cpp`, `src/targets/qwen3_6/impl/vision/control.cpp` |
 | `.ninfer` tensor assignment and binding | [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md), `tools/reference/qwen3_6_27b/bindings.py` |

@@ -1,0 +1,282 @@
+[
+  {
+    "id": "swiglu-nvfp4-output",
+    "source_anchors": [
+      {
+        "original_id": "repo:anai-guo/sglang",
+        "repository": "anai-guo/sglang",
+        "head": "4b755622a4498f80cdac47a5913dfa25825fc274",
+        "path": "python/sglang/srt/layers/quantization/nvfp4_gemm_swiglu_nvfp4_quant.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6_27b/impl/variant.cpp",
+        "range": [
+          510,
+          540
+        ]
+      },
+      {
+        "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_quantized.cu",
+        "range": [
+          73,
+          94
+        ]
+      }
+    ],
+    "priority": 4,
+    "title": "Produce packed activation at the SwiGLU-to-down-projection boundary",
+    "original_ids": [
+      "repo:anai-guo/sglang",
+      "repo:pst2154/tensorrt-llm"
+    ],
+    "decision": "Native qualifying W4A4 routes materialize BF16 activation then quantize separately for down projection. The foreign source illustrates fused activation/output-codec production, but its SM100 TCGEN/TMEM producer cannot be transplanted to sm120.",
+    "next_step": "Classify a native SwiGLU+NVFP4 output producer and explicit prequantized down consumer only for actually admitted W4A4 shapes. Distinguish prefill AllowA4 from verify AllowA8 and include residual addition in the complete formula.",
+    "qualification": "Use represented up/gate inputs and exact stored down scales; state explicit output codec/cast boundaries, code/scale plane layout, global divisor, zero behavior, workspace lifetime and graph stability. Compare against the independent complete oracle and measure the real operator/schedule before claiming gain.",
+    "owner": "activation_and_codec",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "gated-norm-a8-output",
+    "source_anchors": [
+      {
+        "original_id": "repo:jiangjb01/tensorrt-llm",
+        "repository": "jiangjb01/tensorrt-llm",
+        "head": "e9f99a88f5286d80ad737fcaaf9466271c84ec63",
+        "path": "tensorrt_llm/_torch/modules/mamba/layernorm_gated.py"
+      },
+      {
+        "original_id": "repo:wzhao18/vllm",
+        "repository": "wzhao18/vllm",
+        "head": "0cfe020a9608e14adcf26aceb1ffcbd543463522",
+        "path": "vllm/models/kimi_k3/nvidia/ops/fused_kda_rms_gated_quant.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+        "range": [
+          976,
+          1008
+        ]
+      },
+      {
+        "path": "src/ops/linear/nvfp4/nvfp4_w4a8.cu",
+        "range": [
+          16,
+          33
+        ]
+      }
+    ],
+    "priority": 4.5,
+    "title": "Write admitted A8 activations directly from gated normalization",
+    "original_ids": [
+      "repo:jiangjb01/tensorrt-llm",
+      "repo:wzhao18/vllm",
+      "repo:zhendonghua/sglang"
+    ],
+    "decision": "Foreign gated-RMS kernels optionally encode FP8 output using a loaded downstream static scale. A second actual producer/caller emits packed UE8M0-scaled FP8 from RMS times sigmoid for a keyed small-width projection consumer. A third reached plain RMS/SiLU producer and keyed out-projection caller corroborate packed output/fallback and partial scale ownership. These support the producer/consumer composition, with different gate and scale laws. Current native verify performs gated RMS into BF16, followed by a separate activation quantizer on admitted W4A8 output-projection routes. This exposes a different fusion boundary from recurrence plus normalization.",
+    "next_step": "Classify a closed gated-RMS-to-native-A8 producer with an explicit prequantized output-projection consumer at actual verify widths and batch sizes. Evaluate other activation profiles separately rather than adding a generic FP8 checkpoint lane.",
+    "qualification": "Preserve the native plain-weight RMS times SiLU formula and define represented activation/cast boundaries against an independent oracle. Native quantizer scales/layout and stored NVFP4 weight law are authoritative; foreign sigmoid, single static FP8 QDQ scale, UE8M0 power-of-two scale and rounded reciprocal cannot replace them. Match actual48-head128 geometry, route admission, workspace and graph lifetimes, and measure any removed materialization/launch cost. Source performance is unqualified.",
+    "owner": "activation_and_codec",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "rmsnorm-nvfp4-output",
+    "priority": 4.75,
+    "title": "Encode admitted A4 activations during offset RMS normalization",
+    "original_ids": [
+      "repo:junyixu-nv/tensorrt-llm",
+      "repo:sparkecho/vllm",
+      "repo:soodoshll/vllm",
+      "repo:tanmay-bakshi/sglang",
+      "repo:tcherckez-nvidia/tensorrt-llm"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:junyixu-nv/tensorrt-llm",
+        "repository": "junyixu-nv/TensorRT-LLM",
+        "head": "d499d3d0976f3802f18b3fdb3c23926628c9b5c6",
+        "path": "cpp/tensorrt_llm/thop/allreduceOp.cpp"
+      },
+      {
+        "original_id": "repo:junyixu-nv/tensorrt-llm",
+        "repository": "junyixu-nv/TensorRT-LLM",
+        "head": "d499d3d0976f3802f18b3fdb3c23926628c9b5c6",
+        "path": "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu"
+      },
+      {
+        "original_id": "repo:sparkecho/vllm",
+        "repository": "sparkecho/vllm",
+        "head": "270d4dbda249b24c7df9a4956691a94faaef48e5",
+        "path": "csrc/quantization/fp4/rmsnorm_nvfp4_quant_kernels.cu"
+      },
+      {
+        "original_id": "repo:tanmay-bakshi/sglang",
+        "repository": "flashinfer-ai/flashinfer",
+        "head": "a0a6b019b9b27d49d209f85d028a1ae5a9b347d7",
+        "path": "flashinfer/cute_dsl/add_rmsnorm_fp4quant.py"
+      },
+      {
+        "original_id": "repo:tcherckez-nvidia/tensorrt-llm",
+        "repository": "NVIDIA/TensorRT-LLM",
+        "head": "827e94cfb7f7d81dc51ea4b5a3bad007a2a48914",
+        "path": "cpp/tensorrt_llm/kernels/fusedLayernormKernels/fp4_converter.cuh"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6_27b/impl/variant.cpp",
+        "range": [
+          510,
+          531
+        ]
+      },
+      {
+        "path": "src/ops/linear/nvfp4/nvfp4_w4a4.cu",
+        "range": [
+          140,
+          153
+        ]
+      },
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+        "range": [
+          832,
+          855
+        ]
+      },
+      {
+        "path": "src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_quantized.cu",
+        "range": [
+          99,
+          114
+        ]
+      }
+    ],
+    "decision": "A reached local no-allreduce producer emits BF16 normalized output and packed NVFP4 activation in one pass. Native already fuses residual/norm and selected A8 norm/linear routes, but nonverify AllowA4 post-mixer still materializes RMS-normalized BF16 before standalone activation encoding. Two further reached add-RMS-to-A4 sources corroborate the attention-input boundary: input RMS at text_context832\u2013855 precedes attention projection and its A4 route separately quantizes. Existing fused post-mixer/A8 and bypassed A16 admissions are excluded. This differs from SwiGLU-output encoding and plain-weight gated-RMS A8 output. Two final source-bound residual/RMS-to-FP4 producers corroborate the same admitted-A4 output boundary: the declared FlashInfer0.6.17 tag resolves to an inspected CuTe producer, and the represented TRT C++ entry/FP4 converter is directly available. These are separate precision/layout/schedule profiles, not two new implementation questions.",
+    "next_step": "Classify an explicit offset-RMS-to-NVFP4 producer and preencoded W4A4 consumer at admitted native5120-width nonverify shapes. First price removed launch/reread versus reduction, encoded-output layout and any required BF16 shared output. Preserve existing A8 verification and A16 admission.",
+    "qualification": "Use native unit-offset weights, fixed artifact input divisor, signed E2M1/rounded E4M3 G16 codec and actual row-major/tiled scale ownership. Keep explicit semantic BF16 boundaries wherever another consumer observes them; unobservable fused intermediates may use a qualified private profile. In a residual-output composition, the native RMS denominator uses the represented rounded BF16 residual; Sparkecho instead accumulates variance from unrounded FP32 addition and cannot substitute that profile unchanged. Check the complete represented-input formula and codec against independent oracles, including zero/overflow/padding, residual ownership, workspace and graph lifetime. Foreign ordinary gamma, static factors, DSA and distributed allreduce do not define native semantics. Soodoshll is SM100/API-gated imported producer composition, not a qualified sm120 kernel. No numerical or speed benefit is established. Tanmay also forms variance from unrounded FP32 residual while storing BF16 residual; its cluster-one normalization stages BF16 privately. Tcher consumes InputType-rounded normalized values and uses approximate reciprocal/FTZ; the converter requires CUDA_ARCH>=1000, so a host major>=9 gate alone does not prove executable SM90 FP4 support. Preserve observable native residual and offset semantics; independently qualify complete norm/codec outputs and actual SM120/A4/layout admission without requiring identical private staging. Source tag identity does not prove installed-wheel identity.",
+    "owner": "activation_and_codec",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "sigmoid-nvfp4-output",
+    "priority": 4.875,
+    "title": "Encode sigmoid-gated attention output directly for admitted A4 projection",
+    "original_ids": [
+      "repo:peaceh-nv/tensorrt-llm"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:peaceh-nv/tensorrt-llm",
+        "repository": "peaceh-nv/TensorRT-LLM",
+        "head": "c4b579c73fa0aec4db8d1229c0751252bc508db0",
+        "path": "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_gemm_persistent_nvfp4_epilogue.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+        "range": [
+          883,
+          895
+        ]
+      },
+      {
+        "path": "src/ops/linear/nvfp4/nvfp4_w4a4.cu",
+        "range": [
+          140,
+          153
+        ]
+      }
+    ],
+    "decision": "The actual foreign FP32 BMM epilogue emits roundedscale signed FP4, but its SM100 MLA expansion and SM107 TCGEN schedule are outside the native model/hardware. Its separable producer-to-codec composition identifies native sigmoid_mul output followed by an independent A4 quantizer; this differs from SwiGLU or RMS output encoding.",
+    "next_step": "Classify one native sigmoid_mul plus NVFP4 encode producer and explicit preencoded attention-output projection consumer only for admitted nonverify AllowA4 shapes. Include codec reduction/layout work against the removed launch and reread.",
+    "qualification": "Use complete represented-input sigmoid formula, native global divisor and exact registered code/scale output oracle. Preserve semantic BF16 outputs observed by other consumers; unobservable staging may use a qualified private arithmetic profile. Verify A4 admission, tail/scale layout, persistent capture addresses and real phase cost. No imported SM100/107 instructions, model projection, measured gain or foreign normalization constants are credited.",
+    "owner": "activation_and_codec",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "adaptive-nvfp4-scale",
+    "source_anchors": [
+      {
+        "original_id": "repo:georgeliu95/tensorrt-llm",
+        "repository": "georgeliu95/TensorRT-LLM",
+        "head": "5e37d912707ee93a9b3e86738bf6b450e55b93fa",
+        "path": "cpp/tensorrt_llm/kernels/fp4QuantizeAdaptive.cuh"
+      },
+      {
+        "original_id": "repo:ch2lab/vllm",
+        "repository": "ch2lab/vllm",
+        "head": "d8a75d5666817a980302d4ce726d47e63b9c2664",
+        "path": "csrc/libtorch_stable/nvfp4_kv_cache_kernels.cu"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/ops/linear/nvfp4/nvfp4_codec.cuh",
+        "range": [
+          71,
+          120
+        ]
+      }
+    ],
+    "priority": 5,
+    "title": "Evaluate two rounded block-scale candidates",
+    "original_ids": [
+      "repo:georgeliu95/tensorrt-llm",
+      "repo:ch2lab/vllm",
+      "repo:georgeliu95/vllm"
+    ],
+    "decision": "Foreign producers compare decoded E2M1 reconstruction errors for two rounded E4M3 scales rather than one. Georgeliu supplies an activation/weight profile with dynamic global amax/alpha; Ch2lab supplies group16 KV max/6 versus max/4 with strict L2 improvement and baseline6 on ties. These corroborate one scale-search algorithm, with separate consumer and numerical profiles.",
+    "next_step": "Investigate classifier-admitted activation and KV codec experiments as distinct routes preserving their current stored representation. Retain fixed artifact divisors for W4A4 activations; retain KV code/scale consumer and state criterion for KV. Keep weight requantization, MoE/SVD factors and hardware-specific fused gather outside this question.",
+    "qualification": "Define exact scale-rounding and error metric/tie rule, quantify private staging and approximate-reciprocal profiles against represented inputs, then evaluate quantization error and downstream numerical acceptance. KV adoption changes the quantizer law and needs appropriate attention/model criteria, not an assumption of identical codes. Additional arithmetic, synchronization and store/consumer cost must be included; no accuracy or speed gain is established.",
+    "owner": "activation_and_codec",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "activation-global-amax-scale",
+    "priority": 8.5,
+    "title": "Price dynamic activation-global scaling with paired GEMM alpha",
+    "original_ids": [
+      "repo:wolfcomos/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:wolfcomos/sglang",
+        "repository": "wolfcomos/sglang",
+        "head": "cce7255ffa16c1e3d93de53b15b14d1507d90614",
+        "path": "python/sglang/srt/layers/quantization/fp4_utils.py"
+      },
+      {
+        "original_id": "repo:wolfcomos/sglang",
+        "repository": "wolfcomos/sglang",
+        "head": "cce7255ffa16c1e3d93de53b15b14d1507d90614",
+        "path": "python/sglang/srt/layers/quantization/modelopt_quant.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/ops/linear/nvfp4/nvfp4_codec.cuh",
+        "range": [
+          63,
+          120
+        ]
+      },
+      {
+        "path": "src/ops/linear_add/nvfp4/nvfp4_linear_add_quantized.cu",
+        "range": [
+          75,
+          93
+        ]
+      }
+    ],
+    "decision": "Actual reached foreign producer computes tensor-global absolute maximum, sets encode=min(448*6/amax,F32max) with zero/empty handling, updates persistent encoding scalar and paired alpha=weightglobal/encode, then invokes signed group16 quantization/GEMM. Native uses configured activation divisor and paired constant alpha. Fixed native divisor is an implementation profile, not proof a consistent alternative is forbidden. This is a global quality-versus-reduction-cost question, distinct from two rounded block-scale error candidates.",
+    "next_step": "First classify extra amax reduction/scalar update and explicit producer-to-consumer alpha ownership at supported native activation shapes. Compare reconstruction/output criteria to the fixed-divisor profile before any implementation; keep original packed weights and evaluate full-round acceptance/cost only if a cheap quality and cost gate admits a route.",
+    "qualification": "Use complete independent represented activation quantization plus GEMM oracle, both global and decoded rounded block scales, signed code law, allzero/subnormal/overflow behavior and appropriate output criterion. A tensor-global scale can couple active requests; require supported request/round semantics or a separately priced per-row design. Preserve graph addresses with explicit device scalar ownership and avoid added host synchronization. Foreign BF16 amax staging and mutable framework buffer broadcast are not mandatory native profiles. No new checkpoint, runtime weight repacking, numerical benefit or speed gain is claimed.",
+    "owner": "activation_and_codec",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  }
+]

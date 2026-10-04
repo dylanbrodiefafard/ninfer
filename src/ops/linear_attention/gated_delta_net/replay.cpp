@@ -1,5 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/gdn_history.h"
+#include "core/device.h"
 
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -308,7 +310,80 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
     return packed;
 }
 
+void validate_history_layer(const GdnHistoryLayer& history, std::int32_t rows, std::int32_t width) {
+    constexpr const char* op = "gated_delta_net_history_record";
+    const auto slots         = history.counts.ne[0];
+    const auto ceiling       = history.provisional_key.ne[2];
+    if (slots < 1 || slots > 6 || width > ceiling || ceiling > 16) {
+        throw std::invalid_argument("GDN history layer extent is invalid");
+    }
+    require_tensor(history.key, DType::FP32, {128, 16, 4, slots}, 16, op, "retained keys");
+    require_tensor(history.innovation, DType::FP32, {128, 48, 4, slots}, 16, op,
+                   "retained innovations");
+    require_tensor(history.alpha, DType::FP32, {48, 4, slots}, 16, op, "retained decay");
+    require_tensor(history.counts, DType::I32, {slots}, 4, op, "retained lengths");
+    require_tensor(history.provisional_key, DType::FP32, {128, 16, ceiling, rows}, 16, op,
+                   "provisional keys");
+    require_tensor(history.provisional_innovation, DType::FP32, {128, 48, ceiling, rows}, 16, op,
+                   "provisional innovations");
+    require_tensor(history.provisional_alpha, DType::FP32, {48, ceiling, rows}, 16, op,
+                   "provisional decay");
+}
 
+void validate_history(const GdnHistory& history, const GdnReplayRecords& records,
+                      LinearAttentionStateAllLayersView states) {
+    constexpr const char* op = "gdn_history_commit";
+    const auto& spec         = history.spec;
+    if (spec.layers != 48 || spec.slots < 1 || spec.slots > 6 || spec.capacity != 4 ||
+        spec.qk_heads != 16 || spec.value_heads != 48 || spec.key_dim != 128 ||
+        spec.value_dim != 128 || spec.width != records.spec.width ||
+        spec.slots != records.spec.record_capacity || states.spec.layers != 48 ||
+        states.spec.value_heads != 48 || states.spec.slot_count < spec.slots) {
+        throw std::invalid_argument("GDN accepted-history profile is unsupported");
+    }
+    const int outer = 48 * spec.slots;
+    require_tensor(history.key, DType::FP32, {128, 16, 4, outer}, 256, op, "retained keys");
+    require_tensor(history.innovation, DType::FP32, {128, 48, 4, outer}, 256, op,
+                   "retained innovations");
+    require_tensor(history.alpha, DType::FP32, {48, 4, outer}, 256, op, "retained decay");
+    require_tensor(history.counts, DType::I32, {spec.slots}, 256, op, "retained lengths");
+    require_tensor(history.provisional_key, DType::FP32, {128, 16, spec.width, outer}, 256, op,
+                   "provisional keys");
+    require_tensor(history.provisional_innovation, DType::FP32, {128, 48, spec.width, outer}, 256,
+                   op, "provisional innovations");
+    require_tensor(history.provisional_alpha, DType::FP32, {48, spec.width, outer}, 256, op,
+                   "provisional decay");
+    const std::array<const Tensor*, 7> planes{&history.key,
+                                              &history.innovation,
+                                              &history.alpha,
+                                              &history.counts,
+                                              &history.provisional_key,
+                                              &history.provisional_innovation,
+                                              &history.provisional_alpha};
+    const std::array<const Tensor*, 4> raw{&records.conv, &records.key, &records.value,
+                                           &records.gate};
+    for (std::size_t index = 0; index < planes.size(); ++index) {
+        const auto range = tensor_range(*planes[index], op);
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (overlaps(range, tensor_range(*planes[previous], op))) {
+                throw std::invalid_argument("GDN history planes overlap");
+            }
+        }
+        for (const Tensor* record : raw) {
+            if (overlaps(range, tensor_range(*record, op))) {
+                throw std::invalid_argument("GDN history overlaps raw records");
+            }
+        }
+        for (int layer = 0; layer < 48; ++layer) {
+            if (overlaps(range, layer_range(states.recurrent_layer0,
+                                            states.recurrent_layer_stride_bytes, layer, op)) ||
+                overlaps(range, layer_range(states.conv_layer0, states.conv_layer_stride_bytes,
+                                            layer, op))) {
+                throw std::invalid_argument("GDN history overlaps dense state");
+            }
+        }
+    }
+}
 
 } // namespace
 
@@ -356,6 +431,118 @@ void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLay
         validate_fold_rows(records, states, rows);
     detail::gated_delta_net::launch_replay_fold(records, states, packed,
                                                 static_cast<std::int32_t>(rows.size()), stream);
+}
+
+void gated_delta_net_history_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                    const Tensor& g, const Tensor& beta, float scale,
+                                    const Tensor& states, const Tensor& valid_columns,
+                                    const Tensor& initial_slots, Tensor& key_record,
+                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                    const GdnHistoryLayer& history, cudaStream_t stream,
+                                    const Tensor* tree_schedule) {
+    validate_replay_record(q, k, v, g, beta, scale, states, valid_columns, initial_slots,
+                           key_record, value_record, gate_record, out, tree_schedule);
+    if (q.ne[1] != 16 || v.ne[1] != 48 || states.ne[3] < history.counts.ne[0]) {
+        throw std::invalid_argument("GDN history record requires the D128/Hq16/Hv48 profile");
+    }
+    validate_history_layer(history, q.ne[3], q.ne[2]);
+    const std::array<const Tensor*, 7> planes{&history.key,
+                                              &history.innovation,
+                                              &history.alpha,
+                                              &history.counts,
+                                              &history.provisional_key,
+                                              &history.provisional_innovation,
+                                              &history.provisional_alpha};
+    const std::array<const Tensor*, 12> inputs{&q,
+                                               &k,
+                                               &v,
+                                               &g,
+                                               &beta,
+                                               &states,
+                                               &valid_columns,
+                                               &initial_slots,
+                                               &key_record,
+                                               &value_record,
+                                               &gate_record,
+                                               &out};
+    for (std::size_t index = 0; index < planes.size(); ++index) {
+        const auto range = tensor_range(*planes[index], "GDN history record");
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (overlaps(range, tensor_range(*planes[previous], "GDN history record"))) {
+                throw std::invalid_argument("GDN history record planes overlap");
+            }
+        }
+        for (const Tensor* input : inputs) {
+            if (input->data != nullptr &&
+                overlaps(range, tensor_range(*input, "GDN history record"))) {
+                throw std::invalid_argument("GDN history record aliases a public input/output");
+            }
+        }
+    }
+    const auto* schedule =
+        tree_schedule != nullptr ? static_cast<const std::int32_t*>(tree_schedule->data) : nullptr;
+    detail::gated_delta_net::launch_history_record(q, k, v, g, beta, scale, states, valid_columns,
+                                                   initial_slots, key_record, value_record,
+                                                   gate_record, out, history, stream, schedule);
+}
+
+void gdn_history_commit(const GdnReplayRecords& records, const GdnHistory& history,
+                        LinearAttentionStateAllLayersView states,
+                        std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) {
+    validate_fold_records(records);
+    validate_fold_states(records, states);
+    require_records_disjoint_from_states(records, states);
+    validate_history(history, records, states);
+    const auto packed = validate_fold_rows(records, states, rows);
+    for (const auto& row : rows) {
+        if (row.linear_state_slot >= history.spec.slots) {
+            throw std::invalid_argument("GDN history commit targets a non-current slot");
+        }
+    }
+    detail::gated_delta_net::launch_history_commit(
+        records, history, states, packed, static_cast<std::int32_t>(rows.size()), false, stream);
+}
+
+void gdn_history_materialize(const GdnReplayRecords& records, const GdnHistory& history,
+                             LinearAttentionStateAllLayersView states,
+                             std::span<const std::int32_t> slots, cudaStream_t stream) {
+    if (slots.empty() || slots.size() > static_cast<std::size_t>(history.spec.slots)) {
+        throw std::invalid_argument("GDN history materialization slot count is invalid");
+    }
+    validate_fold_records(records);
+    validate_fold_states(records, states);
+    require_records_disjoint_from_states(records, states);
+    validate_history(history, records, states);
+    std::array<GdnReplayFoldRow, 6> rows{};
+    for (std::size_t index = 0; index < slots.size(); ++index) {
+        if (slots[index] < 0 || slots[index] >= history.spec.slots) {
+            throw std::invalid_argument("GDN history materialization slot is invalid");
+        }
+        rows[index].linear_state_slot = slots[index];
+        rows[index].commit_columns    = 0;
+        rows[index].path_length       = -1;
+    }
+    const auto packed = validate_fold_rows(
+        records, states, std::span<const GdnReplayFoldRow>(rows.data(), slots.size()));
+    detail::gated_delta_net::launch_history_commit(
+        records, history, states, packed, static_cast<std::int32_t>(slots.size()), true, stream);
+}
+
+void gdn_history_reset_slot(const GdnHistory& history, std::int32_t slot, cudaStream_t stream) {
+    if (slot < 0 || slot >= history.spec.slots || history.counts.dtype != DType::I32 ||
+        history.counts.ne[0] != history.spec.slots || history.counts.data == nullptr) {
+        throw std::invalid_argument("GDN history reset slot is invalid");
+    }
+    CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(history.counts.data) + slot, 0,
+                               sizeof(std::int32_t), stream));
+}
+
+void gdn_history_reset_all(const GdnHistory& history, cudaStream_t stream) {
+    if (history.spec.slots < 1 || history.spec.slots > 6 || history.counts.dtype != DType::I32 ||
+        history.counts.ne[0] != history.spec.slots || history.counts.data == nullptr) {
+        throw std::invalid_argument("GDN history reset extent is invalid");
+    }
+    CUDA_CHECK(cudaMemsetAsync(history.counts.data, 0, history.counts.bytes(), stream));
 }
 
 } // namespace ninfer::ops

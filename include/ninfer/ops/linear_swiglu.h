@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/ops/a4_activation.h"
+
 // ninfer::ops - fused gate/up projection followed by SwiGLU.
 
 #include "core/arena.h"
@@ -77,5 +79,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
+
+/**
+ * Publishes signed G16 A4 of the BF16 SwiGLU result from represented BF16 input and
+ * exact stored NVFP4 gate/up weights [34816,5120]. T>=256 selects the native tiled
+ * producer. Caller-owned output stays live through its consumer; workspace is scoped
+ * to private input codec storage. The optional BF16 diagnostic is disjoint from all
+ * inputs, weights and packed outputs. Invalid shape, alignment or alias throws.
+ */
+void linear_swiglu_a4(const Tensor& x, const Weight& gate_up_weight, Tensor* normalized,
+                      A4Activation& activation, WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

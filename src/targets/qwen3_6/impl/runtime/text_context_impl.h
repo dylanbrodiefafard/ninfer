@@ -13,6 +13,7 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/gdn_history.h"
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -261,10 +262,15 @@ void TextContext::set_linear_state_slot(std::int32_t current_slot) {
 }
 
 void TextContext::set_gdn_state_action(GdnStateAction action,
-                                       const GdnReplayRecords* replay_records) {
+                                       const GdnReplayRecords* replay_records,
+                                       const GdnHistory* history) {
     if ((action == GdnStateAction::RecordForReplay) != (replay_records != nullptr)) {
         throw std::invalid_argument("TextContext GDN state action has inconsistent records");
     }
+    if (history != nullptr && action != GdnStateAction::RecordForReplay) {
+        throw std::invalid_argument("accepted GDN history requires replay recording");
+    }
+    gdn_history_      = history;
     gdn_state_action_ = action;
     replay_records_   = replay_records;
 }
@@ -991,10 +997,20 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             const bool tree =
                 active_parent_index_ != nullptr && active_parent_index_->data != nullptr;
-            ops::gated_delta_net_replay_record(
-                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
-                *active_linear_state_slots_, live_records.key, live_records.value,
-                live_records.gate, out_batch, s, tree ? active_gdn_tree_schedule_ : nullptr);
+            if (gdn_history_ != nullptr) {
+                const auto history =
+                    gdn_history_->layer(gdn_index, active_sequence_row_, active_sequence_batch_);
+                ops::gated_delta_net_history_record(
+                    q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states,
+                    valid, *active_linear_state_slots_, live_records.key, live_records.value,
+                    live_records.gate, out_batch, history, s,
+                    tree ? active_gdn_tree_schedule_ : nullptr);
+            } else {
+                ops::gated_delta_net_replay_record(
+                    q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states,
+                    valid, *active_linear_state_slots_, live_records.key, live_records.value,
+                    live_records.gate, out_batch, s, tree ? active_gdn_tree_schedule_ : nullptr);
+            }
             if (pack_replay) {
                 qwen3_6::pack_replay_record_layer(persistent_records, live_records, s);
             }

@@ -30,86 +30,6 @@ __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], fl
     store_vec(base + dqk_base, load_vec<float4>(reg));
 }
 
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_fp32_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                          const float* __restrict__ v, const float* __restrict__ g,
-                          const float* __restrict__ beta, float* __restrict__ ssm_state,
-                          float* __restrict__ out, std::int64_t T, head_map heads, float scale) {
-    const int lane           = threadIdx.x;
-    const int warp_id        = threadIdx.y;
-    const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
-    const std::uint32_t h_qk = static_cast<std::uint32_t>(heads.qk_head(static_cast<int>(h_v)));
-
-    const std::uint32_t dv_base =
-        static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
-    const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * kQkPerLane);
-
-    float* state_h = ssm_state + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
-
-    __align__(16) float s_tile[kDvPerWarp][kQkPerLane];
-#pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        load_qk_lane(s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
-                     dqk_base);
-    }
-
-    __align__(16) float k_reg[kQkPerLane];
-    load_qk_lane(k_reg, k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
-
-    for (std::int64_t t = 0; t < T; ++t) {
-        const float* v_t          = v + (t * heads.H_v + h_v) * kStateDim;
-        const std::int64_t gb_off = t * heads.H_v + h_v;
-        const float beta_val      = beta[gb_off];
-        const float alpha         = expf(g[gb_off]);
-
-        float v_local = 0.0f;
-        if (lane < kDvPerWarp) { v_local = v_t[dv_base + lane]; }
-
-#pragma unroll
-        for (int r = 0; r < kDvPerWarp; ++r) {
-            float partial = 0.0f;
-#pragma unroll
-            for (int c = 0; c < kQkPerLane; ++c) { partial += s_tile[r][c] * k_reg[c]; }
-            partial = warp_sum<kWarpSize>(partial);
-
-            const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
-            const float delta = beta_val * (v_r - alpha * partial);
-
-#pragma unroll
-            for (int c = 0; c < kQkPerLane; ++c) {
-                s_tile[r][c] = alpha * s_tile[r][c] + delta * k_reg[c];
-            }
-        }
-
-        if (t + 1 < T) {
-            load_qk_lane(k_reg, k + ((t + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
-        }
-
-        __align__(16) float q_reg[kQkPerLane];
-        load_qk_lane(q_reg, q + (t * heads.H_qk + h_qk) * kStateDim, dqk_base);
-
-        float attn_val = 0.0f;
-#pragma unroll
-        for (int r = 0; r < kDvPerWarp; ++r) {
-            float partial = 0.0f;
-#pragma unroll
-            for (int c = 0; c < kQkPerLane; ++c) { partial += s_tile[r][c] * q_reg[c]; }
-            partial = warp_sum<kWarpSize>(partial);
-            if (lane == r) { attn_val = partial; }
-        }
-
-        if (lane < kDvPerWarp) {
-            out[(t * heads.H_v + h_v) * kStateDim + dv_base + lane] = attn_val * scale;
-        }
-    }
-
-#pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        store_qk_lane(s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
-                      dqk_base);
-    }
-}
-
 inline constexpr float kQkL2NormEps = 1.0e-6f;
 
 struct RawQkLane {
@@ -177,10 +97,24 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
-__device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
-                                                     const float (&key)[kQkPerLane], float v_local,
-                                                     float g, float beta) {
+struct GdnInnovationStore {
+    float* key             = nullptr;
+    float* innovation      = nullptr;
+    float* alpha           = nullptr;
+    std::uint32_t dqk_base = 0;
+    std::uint32_t dv_base  = 0;
+    int lane               = 0;
+};
+
+template <bool StoreInnovation = false>
+__device__ __forceinline__ void
+apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane], const float (&key)[kQkPerLane],
+                     float v_local, float g, float beta, GdnInnovationStore store = {}) {
     const float alpha = expf(g);
+    if constexpr (StoreInnovation) {
+        if (store.key != nullptr) { store_qk_lane(key, store.key, store.dqk_base); }
+        if (store.alpha != nullptr && store.lane == 0) { *store.alpha = alpha; }
+    }
 
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
@@ -191,6 +125,9 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 
         const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
         const float delta = beta * (v_r - alpha * partial);
+        if constexpr (StoreInnovation) {
+            if (store.lane == r) { store.innovation[store.dv_base + r] = delta; }
+        }
 
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
@@ -637,7 +574,7 @@ struct FoldAccess {
     }
 };
 
-template <RecurrentMode Mode, bool NormalizeInputs, class Access>
+template <RecurrentMode Mode, bool NormalizeInputs, bool History = false, class Access>
 __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                                                     const RecurrentCoordinates& coord,
                                                     std::int32_t width, std::int32_t valid) {
@@ -670,6 +607,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                          initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
                          coord.dqk_base);
         }
+        if constexpr (History) { access.initialize_history(root, coord); }
         // Column inputs do not depend on the recurrent state, so the next step's key, gate, and
         // value loads are issued before the current step's transition.
         std::int32_t column   = steps_sm[0] & 0xff;
@@ -713,7 +651,12 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                 access.store_gate(coord, token, gate);
             }
             normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
-            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+            if constexpr (History) {
+                apply_gdn_transition<true>(state, key.value, value.value, gate.g, gate.beta,
+                                           access.innovation_store(coord, token));
+            } else {
+                apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+            }
             const int save = (code >> 3) & 7;
             if (save != 0) {
 #pragma unroll
@@ -751,6 +694,8 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                      coord.dqk_base);
     }
 
+    if constexpr (History) { access.initialize_history(state, coord); }
+
     RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
     if constexpr (Mode == RecurrentMode::Record) { access.store_key(coord, 0, key); }
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
@@ -764,7 +709,12 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
             access.store_gate(coord, token, gate);
         }
 
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        if constexpr (History) {
+            apply_gdn_transition<true>(state, key.value, value.value, gate.g, gate.beta,
+                                       access.innovation_store(coord, token));
+        } else {
+            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        }
 
         if (token + 1 < valid) {
             key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
@@ -822,65 +772,6 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                                    access.active_columns(coord));
 }
 
-// One CTA (single thread) per row compiles the packed tree into the step list documented on
-// gated_delta_net_tree_schedule. It runs once per round; the serial walk over at most 16 columns
-// is negligible beside the 48 record launches that reuse it.
-__global__ void tree_schedule_kernel(const std::int32_t* parent_index,
-                                     const std::int32_t* valid_columns, std::int32_t width,
-                                     std::int32_t* schedule) {
-    constexpr int kBranchSlots     = 3;
-    constexpr int kResumeRoot      = 1;
-    constexpr int kEmit            = 1 << 6;
-    const int row                  = static_cast<int>(blockIdx.x);
-    const std::int32_t* parent_row = parent_index + static_cast<std::int64_t>(row) * width;
-    std::int32_t* out = schedule + static_cast<std::int64_t>(row) * kGdnTreeScheduleWords;
-    int columns       = valid_columns != nullptr ? valid_columns[row] : width;
-    columns           = columns < 1 ? 1 : (columns > width ? width : columns);
-    int parents[kGdnTreeMaxColumns];
-    int children[kGdnTreeMaxColumns];
-    int slot_of[kGdnTreeMaxColumns];
-    for (int c = 0; c < columns; ++c) {
-        parents[c]  = parent_row[c];
-        children[c] = 0;
-        slot_of[c]  = -1;
-    }
-    for (int c = 1; c < columns; ++c) {
-        if (parents[c] >= 0) { ++children[parents[c]]; }
-    }
-    unsigned free_slots = (1U << kBranchSlots) - 1U;
-    int steps           = 0;
-    for (int c = 0; c < columns; ++c) {
-        const int parent = parents[c];
-        int resume       = 0;
-        if (parent < 0) {
-            resume = kResumeRoot;
-        } else if (parent != c - 1) {
-            if (slot_of[parent] >= 0) {
-                resume = 2 + slot_of[parent];
-            } else {
-                int path[kGdnTreeMaxColumns];
-                int depth = 0;
-                for (int n = parent; n >= 0 && depth < kGdnTreeMaxColumns; n = parents[n]) {
-                    path[depth++] = n;
-                }
-                for (int i = depth - 1; i >= 0; --i) {
-                    out[1 + steps++] = path[i] | ((i == depth - 1 ? kResumeRoot : 0) << 8);
-                }
-            }
-        }
-        if (parent >= 0 && --children[parent] == 0 && slot_of[parent] >= 0) {
-            free_slots |= 1U << slot_of[parent];
-        }
-        int save = 0;
-        if (children[c] >= 2 && free_slots != 0) {
-            const int slot = __ffs(static_cast<int>(free_slots)) - 1;
-            free_slots &= ~(1U << slot);
-            slot_of[c] = slot;
-            save       = 1 + slot;
-        }
-        out[1 + steps++] = c | ((resume | (save << 3) | kEmit) << 8);
-    }
-    out[0] = steps;
-}
+
 
 } // namespace ninfer::ops::detail::gated_delta_net

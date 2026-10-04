@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
@@ -82,5 +83,14 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
  * Invalid arguments throw std::invalid_argument. No workspace.
  */
 void linear_add(const A8Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream);
+
+/**
+ * Adds an NVFP4 [5120,K] projection of caller-owned tiled A4[K,T] to BF16 residual.
+ * K is 6144 or 17408 and T>512, matching the native tiled consumer.
+ * The independent oracle decodes signed codes, exact stored scales and divisors, then sums
+ * the FP64 projection with represented residual. Operands must be disjoint; residual is
+ * aligned contiguous BF16[5120,T]. No quantization, repacking, allocation or workspace.
+ */
+void linear_add(const A4Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream);
 
 } // namespace ninfer::ops

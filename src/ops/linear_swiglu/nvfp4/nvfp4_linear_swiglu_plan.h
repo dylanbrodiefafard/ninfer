@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/a4_activation.h"
 
 #include <cuda_runtime.h>
 
@@ -30,5 +31,9 @@ void nvfp4_rmsnorm_linear_swiglu_launch(const Tensor& x, const Tensor& norm_weig
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream);
+
+void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor* normalized,
+                                   A4Activation& activation, WorkspaceArena& workspace,
+                                   cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

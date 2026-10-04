@@ -1,6 +1,7 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
 #include "ninfer/ops/a8_activation.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -116,6 +117,12 @@ std::size_t verify_a8_activation_capacity_bytes(qwen3_6::TextPhase phase, std::i
     if (phase != qwen3_6::TextPhase::Verify) { return 0; }
     WorkspaceLayoutBuilder layout;
     (void)ops::allocate_a8_activation(layout, input_rows, last);
+    return layout.peak_bytes(1);
+}
+
+std::size_t a4_activation_capacity_bytes(std::int32_t rows, std::int32_t tokens) {
+    WorkspaceLayoutBuilder layout;
+    (void)ops::allocate_a4_activation(layout, rows, tokens, 1.0F);
     return layout.peak_bytes(1);
 }
 
@@ -360,6 +367,17 @@ void Variant::attention_projection(const Tensor& residual, const Tensor& norm_we
         }
         return;
     }
+    if (fused.qtype == QType::NVFP4 && !panels &&
+        attn_input_packed_policy(fused, phase, route_tokens, tokens) ==
+            ops::LinearPolicy::AllowA4 &&
+        (tokens == 256 || tokens > 384)) {
+        auto scope      = workspace.scope();
+        auto activation = ops::allocate_a4_activation(workspace, TextConfig::hidden, tokens,
+                                                      fused.input_scale_divisor);
+        ops::rmsnorm_a4(residual, norm_weight, eps, nullptr, activation, stream);
+        ops::attn_input_proj(activation, fused, query, gate, key, value, stream);
+        return;
+    }
     ops::rmsnorm(residual, norm_weight, eps, true, hidden, stream);
     if (panels) {
         for (std::int32_t offset = 0; offset < tokens; offset += route_tokens) {
@@ -393,6 +411,15 @@ void Variant::attention_output_projection(const Tensor& gate, Tensor& attention,
             ops::allocate_a8_activation(workspace, TextConfig::query_size, tokens);
         ops::sigmoid_mul_a8(gate, attention, activation, stream);
         residual_project_a8(activation, weight, residual, panels ? route_tokens : 0, stream);
+        return;
+    }
+    if (weight.qtype == QType::NVFP4 && !panels && tokens > 512 &&
+        residual_packed_policy(weight, phase, route_tokens, tokens) == ops::LinearPolicy::AllowA4) {
+        auto scope      = workspace.scope();
+        auto activation = ops::allocate_a4_activation(workspace, TextConfig::query_size, tokens,
+                                                      weight.input_scale_divisor);
+        ops::sigmoid_mul_a4(gate, attention, nullptr, activation, stream);
+        ops::linear_add(activation, weight, residual, stream);
         return;
     }
     ops::sigmoid_mul(gate, attention, stream);
@@ -633,6 +660,20 @@ void Variant::post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidd
                          qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream,
                          std::int32_t route_tokens) {
     auto scope        = workspace.scope();
+    const auto tokens = hidden.ne[1];
+    if (weights.gate_up.qtype == QType::NVFP4 && weights.down.qtype == QType::NVFP4 &&
+        (tokens == 1024 || tokens == 4096) && !split_verify_panels(phase, route_tokens, tokens) &&
+        text_policy(weights.gate_up, phase, route_tokens > 0 ? route_tokens : tokens) ==
+            ops::LinearPolicy::AllowA4 &&
+        residual_packed_policy(weights.down, phase, route_tokens, tokens) ==
+            ops::LinearPolicy::AllowA4) {
+        auto packed = ops::allocate_a4_activation(workspace, TextConfig::intermediate, tokens,
+                                                  weights.down.input_scale_divisor);
+        ops::rmsnorm(residual, norm_weight, norm_eps, true, hidden, stream);
+        ops::linear_swiglu_a4(hidden, weights.gate_up, nullptr, packed, workspace, stream);
+        ops::linear_add(packed, weights.down, residual, stream);
+        return;
+    }
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     const int width   = route_tokens > 0 ? route_tokens : hidden.ne[1];
     const bool fused_norm =
@@ -798,7 +839,11 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                 QType::NVFP4, 14336, TextConfig::hidden,
                 phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
                 last),
-            verify_a8_activation_capacity_bytes(phase, TextConfig::hidden, last));
+            std::max(verify_a8_activation_capacity_bytes(phase, TextConfig::hidden, last),
+                     phase != qwen3_6::TextPhase::Verify &&
+                             ((first <= 256 && last >= 256) || last > 384)
+                         ? a4_activation_capacity_bytes(TextConfig::hidden, last)
+                         : 0));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -828,7 +873,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
                 QType::NVFP4, TextConfig::hidden, TextConfig::query_size,
                 phase == qwen3_6::TextPhase::Verify ? kNvfp4VerifyPolicy : kNvfp4TextPolicy, first,
                 last),
-            verify_a8_activation_capacity_bytes(phase, TextConfig::query_size, last));
+            std::max(verify_a8_activation_capacity_bytes(phase, TextConfig::query_size, last),
+                     phase != qwen3_6::TextPhase::Verify && last > 512
+                         ? a4_activation_capacity_bytes(TextConfig::query_size, last)
+                         : 0));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -1015,7 +1063,19 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
     }
-    return layout.peak_bytes(1);
+    std::size_t maximum = layout.peak_bytes(1);
+    const std::int32_t qualified_tokens =
+        first <= 4096 && last >= 4096 ? 4096 : (first <= 1024 && last >= 1024 ? 1024 : 0);
+    if (gate_up_qtype == QType::NVFP4 && down_qtype == QType::NVFP4 &&
+        policy == ops::LinearPolicy::AllowA4 && qualified_tokens != 0) {
+        WorkspaceLayoutBuilder packed;
+        (void)ops::allocate_a4_activation(packed, TextConfig::intermediate, qualified_tokens, 1.0F);
+        (void)packed.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
+            QType::NVFP4, 2 * TextConfig::intermediate, TextConfig::hidden,
+            ops::LinearPolicy::AllowA4, qualified_tokens, qualified_tokens));
+        maximum = std::max(maximum, packed.peak_bytes(1));
+    }
+    return maximum;
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,

@@ -22,6 +22,7 @@ add_library(ninfer_core STATIC
   core/device.cu
   core/dtype.cpp
   core/gdn_replay_records.cpp
+  core/gdn_history.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
   core/paged_kv_scatter.cu
@@ -96,6 +97,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
+  ops/launcher/rmsnorm_a4.cu
   ops/launcher/residual_rmsnorm.cu
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
@@ -104,6 +106,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
+  ops/launcher/sigmoid_a4.cu
   ops/launcher/silu_and_mul.cu
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
@@ -111,6 +114,7 @@ add_library(ninfer_ops STATIC
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
   ops/linear_attention/gated_delta_net/recurrent.cu
+  ops/linear_attention/gated_delta_net/history.cu
   ops/linear_attention/gated_delta_net/chunked/launch.cu
   ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ops/linear_attention/gated_delta_net/chunked/state_passing.cu
@@ -276,6 +280,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
+  ops/wrapper/rmsnorm_a4.cpp
   ops/wrapper/residual_rmsnorm.cpp
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp

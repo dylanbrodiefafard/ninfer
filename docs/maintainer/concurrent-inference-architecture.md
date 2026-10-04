@@ -1120,6 +1120,7 @@ Resident Model Runtime 是 model-instance object，不是 request object。它�
 - 一份 shared execution workspace；
 - 一份最大容量为 `C` 的 `DecodeBatchFrame`；
 - speculative backend 启用时，一份容量为 `C`、宽度为 `draft_window+1` 的 all-layer ReplaySSM record arena；
+- DFlash 的 capacity-four accepted-history planes、每行 provisional innovations 和每 lane retained length；
 - startup-captured graph definitions 和 topology executables。
 
 每个 request 的持久状态只存在于 slot control 和该 slot 当前拥有的 `SequenceState`。Model Runtime 不保存
@@ -1300,12 +1301,34 @@ prefix，不改变其他行的 commit result。
 A round sampled with model stop tokens excluded may commit only through the first completed
 `</tool_call>`; `resolve_pending_batch` then folds that shorter prefix.
 
-Speculative backend 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
+MTP 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
 Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，
 `resolve_pending_batch` 先用原始 `B` 行执行一次 all-layer Fold，再完成必要的 hidden/backend correction，
 同步成功后才推进 host frontiers。取消行以 `commit_columns=0` 参与原始 row mapping，Fold 对该行严格
 no-op，随后 retain 该行已 commit 的 continuation，而不是释放 bundle。Executor 只能在这个 commit tail
 成功后提交 output preview，并在 streaming 模式发布 output event。
+
+DFlash target GDN uses a Program-owned FP32 checkpoint plus capacity-four accepted history.
+The startup arena contains shared normalized keys, per-value-head innovations and decay, one
+retained length per lane across all 48 layers, and separate provisional records at the captured
+verify-width ceiling. Record reads the checkpoint and retained history, then derives innovations
+from represented BF16 raw K/V and FP32 controls using the actual provisional parent. A commit
+consumes only that same invocation's chain prefix or ancestor-complete selected tree path,
+including the anchor. It appends history while the total length is below four; otherwise it
+materializes the complete FP32 checkpoint and publishes length zero. Conv3 commits every round.
+An abort commits zero and leaves the logical state unchanged. Arbitrary edited raw records or
+records derived from another parent cannot use this compound profile. MTP retains native Fold.
+
+All history work uses the main compute stream. All-layer state/ring writes finish before a
+separate count publication; the next verify cannot overwrite provisional records until commit
+finishes. Program mirrors the same validated accepted/path count on the host, including the
+anchor, with the same flush-to-zero rule. An already dense slot requires no materialization
+launch. Dense prefill, current-to-staging or host snapshots, and retained-prefix publication
+materialize first. Restoring or zeroing a dense checkpoint resets the device length in stream
+order. Lane discard clears host ownership; acquisition/reset or restore clears the device count
+before reuse. The single staging slot and RAM/disk images always contain dense FP32 state.
+Existing copy-stream completion events protect snapshot reads; history adds no stream or event.
+All storage addresses are fixed before graph warmup; ordinary/MTP execution has no history owner.
 
 全部 rows resolve 后，`RoundMembership` 销毁，frame 可以被下一 unit 覆盖。继续运行的 slots 在下一
 boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下一 frame。

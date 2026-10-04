@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -61,5 +62,17 @@ void rmsnorm_a8(const Tensor& x, const Tensor& weight, float eps, Tensor* normal
 void dual_offset_rmsnorm(const Tensor& x0, const Tensor& weight0, const Tensor& x1,
                          const Tensor& weight1, float eps, Tensor& out0, Tensor& out1,
                          cudaStream_t stream);
+
+/**
+ * Unit-offset RMSNorm publishing the A4 codec of its explicitly BF16-rounded logical output.
+ * The route admits contiguous BF16 x[5120,T], weight[5120], eps positive finite,
+ * and tiled activation[5120,T]. Optional normalized publishes the same BF16 values.
+ * Inputs and all outputs must be disjoint; x/normalized are 16-byte aligned, weight 4-byte.
+ * No allocation, workspace or persistent state. Invalid arguments throw before submission.
+ * The independent primary oracle evaluates FP64 RMS, rounds to BF16, independently encodes
+ * G16, then decodes that value; private normalization association may differ at cast ties.
+ */
+void rmsnorm_a4(const Tensor& x, const Tensor& weight, float eps, Tensor* normalized,
+                A4Activation& activation, cudaStream_t stream);
 
 } // namespace ninfer::ops

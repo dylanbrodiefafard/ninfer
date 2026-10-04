@@ -83,7 +83,12 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     launch_nvfp4_w4a4_quantize(x, weight, workspace,
                                nvfp4_w4a4_projection_scale_layout(weight.n, weight.k, x.ne[1]),
                                stream);
-    const std::int32_t tokens  = x.ne[1];
+    nvfp4_linear_add_w4a4_project(weight, x.ne[1], workspace, residual, stream);
+}
+
+void nvfp4_linear_add_w4a4_project(const Weight& weight, std::int32_t tokens,
+                                   Nvfp4W4a4Workspace workspace, Tensor& residual,
+                                   cudaStream_t stream) {
     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
     if (nvfp4_w4a4_tma_route(weight.n, weight.k, tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);

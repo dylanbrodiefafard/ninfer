@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma.cuh"
@@ -42,7 +43,7 @@ struct Nvfp4LinearSwiGluTmaSharedStorage {
     alignas(8) std::uint64_t empty[Schedule::kStages];
 };
 
-template <class Geometry, class Schedule>
+template <class Geometry, class Schedule, bool Packed = false>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
@@ -51,7 +52,12 @@ __global__ __launch_bounds__(
                                                                           descriptors,
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output,
-                                                                  int token_count) {
+                                                                  int token_count,
+                                                                  std::uint8_t* packed_codes =
+                                                                      nullptr,
+                                                                  std::uint8_t* packed_scales =
+                                                                      nullptr,
+                                                                  float output_divisor = 1.0F) {
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
@@ -265,21 +271,55 @@ __global__ __launch_bounds__(
     }
 
     asm volatile("bar.sync 1, %0;" : : "r"(Schedule::kConsumerThreads) : "memory");
-    constexpr int kVectorsPerRow = kPairN / 8;
-    constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
-    for (int task = consumer_thread; task < kOutputVectors; task += Schedule::kConsumerThreads) {
-        const int token_local = task / kVectorsPerRow;
-        const int row_vector  = task - token_local * kVectorsPerRow;
-        const int token       = token_begin + token_local;
-        // The last M tile may be partial: TMA zero-filled code rows past token_count and the
-        // quantizer zeroed the padded scales; the epilogue reads nothing else, so only the stores
-        // need bounding.
-        if (token >= token_count) { continue; }
-        const uint4 values =
-            load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
-        store_vec(output + static_cast<std::int64_t>(token) * kIntermediate + pair_begin +
-                      row_vector * 8,
-                  values);
+    if constexpr (Packed) {
+        // The existing consumer barrier publishes every BF16 output before it is read here.
+        // Each consumer task owns one contiguous G16 in the shared result. No extra barrier or
+        // cross-CTA reduction is needed; each output CTA owns four complete scale groups.
+        constexpr int kGroupsPerTileRow = kPairN / 16;
+        constexpr int kOutputGroups     = Schedule::kBlockM * kGroupsPerTileRow;
+        for (int task = consumer_thread; task < kOutputGroups; task += Schedule::kConsumerThreads) {
+            const int token_local = task / kGroupsPerTileRow;
+            const int group_local = task % kGroupsPerTileRow;
+            const int token       = token_begin + token_local;
+            const int group       = pair_begin / 16 + group_local;
+            const std::int64_t scale_tile =
+                static_cast<std::int64_t>(token / 256) * (kIntermediate / 256) + group / 16;
+            const std::int64_t scale_index = scale_tile * 4096 + (token % 256) * 16 + group % 16;
+            if (token >= token_count) {
+                packed_scales[scale_index] = 0;
+                continue;
+            }
+            const auto* source = shared_output + token_local * kOutputStride + group_local * 16;
+            const auto encoded = quantize_nvfp4_k16(source, output_divisor);
+            store_vec(packed_codes + static_cast<std::int64_t>(token) * (kIntermediate / 2) +
+                          group * 8,
+                      make_uint2(encoded.codes_lo, encoded.codes_hi));
+            packed_scales[scale_index] = encoded.scale;
+            if (output != nullptr) {
+                auto* destination =
+                    output + static_cast<std::int64_t>(token) * kIntermediate + group * 16;
+                store_vec(destination, load_vec<uint4>(source));
+                store_vec(destination + 8, load_vec<uint4>(source + 8));
+            }
+        }
+    } else {
+        constexpr int kVectorsPerRow = kPairN / 8;
+        constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
+        for (int task = consumer_thread; task < kOutputVectors;
+             task += Schedule::kConsumerThreads) {
+            const int token_local = task / kVectorsPerRow;
+            const int row_vector  = task - token_local * kVectorsPerRow;
+            const int token       = token_begin + token_local;
+            // The last M tile may be partial: TMA zero-filled code rows past token_count and the
+            // quantizer zeroed the padded scales; the epilogue reads nothing else, so only the
+            // stores need bounding.
+            if (token >= token_count) { continue; }
+            const uint4 values =
+                load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
+            store_vec(output + static_cast<std::int64_t>(token) * kIntermediate + pair_begin +
+                          row_vector * 8,
+                      values);
+        }
     }
 }
 

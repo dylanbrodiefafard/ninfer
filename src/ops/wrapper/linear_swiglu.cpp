@@ -1,4 +1,6 @@
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/common/a4_activation_check.h"
+#include <array>
 #include "ninfer/ops/rmsnorm_linear_swiglu.h"
 
 #include "ops/linear/fp8/fp8_format.h"
@@ -168,6 +170,45 @@ void rmsnorm_linear_swiglu(const Tensor& x, const Tensor& norm_weight, float eps
     (void)detail::validate_nvfp4_weight(gate_up, "rmsnorm_linear_swiglu");
     detail::nvfp4_rmsnorm_linear_swiglu_launch(x, norm_weight, eps, gate_up, out, workspace,
                                                stream);
+}
+
+void linear_swiglu_a4(const Tensor& x, const Weight& gate_up_weight, Tensor* normalized,
+                      A4Activation& activation, WorkspaceArena& workspace, cudaStream_t stream) {
+    detail::validate_a4_activation(activation);
+    if (activation.rows != 17408 || activation.tokens < 256 ||
+        gate_up_weight.qtype != QType::NVFP4 || gate_up_weight.n != 34816 ||
+        gate_up_weight.k != 5120) {
+        throw std::invalid_argument(
+            "linear_swiglu_a4: requires NVFP4 [34816,5120] and A4 [17408,T>=256]");
+    }
+    detail::validate_nvfp4_weight(gate_up_weight, "linear_swiglu_a4");
+    const auto valid = [&](const Tensor& t, int rows) {
+        return t.dtype == DType::BF16 && t.ne[0] == rows && t.ne[1] == activation.tokens &&
+               t.ne[2] == 1 && t.ne[3] == 1 && t.is_contiguous() && aligned_to(t.data, 16);
+    };
+    if (!valid(x, 5120) || (normalized != nullptr && !valid(*normalized, 17408))) {
+        throw std::invalid_argument(
+            "linear_swiglu_a4: invalid contiguous BF16 input or diagnostic");
+    }
+    const std::array<DeviceSpan, 3> outputs{
+        activation.codes,
+        activation.scales,
+        normalized != nullptr ? DeviceSpan{normalized->data, normalized->bytes()} : DeviceSpan{},
+    };
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        if (outputs[i].data == nullptr) { continue; }
+        detail::require_disjoint(x.data, x.bytes(), outputs[i].data, outputs[i].bytes);
+        detail::require_disjoint(gate_up_weight.payload, gate_up_weight.payload_bytes,
+                                 outputs[i].data, outputs[i].bytes);
+        for (std::size_t j = i + 1; j < outputs.size(); ++j) {
+            if (outputs[j].data != nullptr) {
+                detail::require_disjoint(outputs[i].data, outputs[i].bytes, outputs[j].data,
+                                         outputs[j].bytes);
+            }
+        }
+    }
+    detail::nvfp4_linear_swiglu_a4_launch(x, gate_up_weight, normalized, activation, workspace,
+                                          stream);
 }
 
 } // namespace ninfer::ops

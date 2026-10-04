@@ -18,6 +18,63 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Direct A4 activation handoffs and short Exact attention (2026-10-04)
+
+RTX5090, `sm_120a`, CUDA13.1, Qwen3.8-27B NVFP4: direct producer-side group16
+NVFP4 handoffs avoid separate activation encoding before existing projections.
+Qualified T1024 complete RMS/projection graph medians improve120.064→114.688us;
+sigmoid/residual projection improves65.056→61.184us, including identical fixture
+reset. Practical-shape independent complete FP64 formulas, explicit BF16 boundaries,
+exact signed codec, padding and guards pass. These are operator-chain gains.
+
+SwiGLU publishes packed output only at exactly T1024/4096. Four alternating saved-
+binary Engine process pairs, C1 DFlashk7, default NVFP4 target KV, optimized draft
+head, `-p 1024,4096 --prefill-chunk 4096`, three repetitions and one warmup,
+improve prefill throughput in every pair: mean+0.716% at1024 and+1.563% at4096.
+The supplied artifact uses W8 MTP matrices and BF16 draft-local KV. Its synthetic
+T4096 eager microbenchmark loses, so the actual Engine result decides selection.
+The existing standalone T513 SwiGLU producer precision floor fails the unchanged
+primary criterion in both native and packed implementations; its packed caller
+is excluded. Closed partial513 composite/codec/guard checks remain qualified.
+
+Short Exact prefill selects Br64 at T≤256 on the unsplit native24-query-head route;
+Br128 serves longer panels. At128/256 tokens, baseline→selected medians are
+22.048→16.208/30.688→22.528us fresh, and55.296→42.656/65.008→48.832us after512
+cached tokens. Full independent causal attention and fragmented partial-page
+checks pass, including memcheck/racecheck. Sage precision is a separate profile.
+
+Combined RMS/sigmoid/short-Exact Engine prefill comparisons improve mean0.178%/
+0.096% at1024/4096 across four positive pairs. They do not isolate individual
+Engine gains. The permanent activation test passes independent closed-chain
+oracles, exact codec/guards, memcheck and racecheck. The finite18-question report
+and bounded evidence are in `research/inference-engine-triage/phase7-experiments.md`
+and `profiles/bench/phase7/`. The full C++ gate passed 126 checks with two
+unavailable legacy-artifact skips and zero failures. Final host-only static
+cleanup was followed by successful affected-target builds, oracle and real
+short-terminal checks; changed-line static analysis and focused A4/history
+initcheck also pass with zero diagnostics/errors.
+
+DFlash GDN also retains capacity-four accepted history between dense checkpoint
+writes. All48-layer FP64 state/query, raw records/conv3, compact row windows and
+width ceilings, snapshot/restore, short terminal retention and real Engine cache
+lifecycles pass. A four-round global compound passes memcheck; bounded one-layer
+W4-chain/W12-tree record passes unfiltered racecheck, eager and graph. Repeated
+all-layer racecheck exceeds16GiB, so it is excluded from the racecheck label;
+its global state/commit checks remain in the memcheck set.
+
+Against a saved prehistory binary with the same A4/Exact routes, two alternating
+final Engine pairs (`-pg 512,128 -r 2 --warmup 1`, optimized DFlash head, default
+NVFP4 target KV) improve C6/k3/W4 decode by2.325%/2.461%, mean**+2.393%**, and
+C6/k7/W12 tree by.242%/.507%, mean**+.374%**. Speculative statistics match in
+every pair. C1/k7/W8 is flat in four prior pairs. AtC6/W12 the history ring adds
+36.21MiB and provisional innovations108.63MiB; planning includes both. Terminal
+publication materializes before the existing commit-tail synchronization.
+
+The hard64-token k4/W5 speculative-versus-ordinary test still diverges at token21
+in both prehistory and retained binaries, with exactly matching respective
+outputs. It is a known baseline failure, not a passed test. Direct numerical
+oracles and the existing chain/tree/isolation/lifecycle tests qualify the change.
+
 ## DFlash finish/residual/plain RMS and two rejected optimizations (2026-10-03)
 
 Against `442099cb`, `grouped_dynamic_conv_finish_residual_rmsnorm` combines the

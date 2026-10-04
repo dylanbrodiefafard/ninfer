@@ -1,5 +1,6 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ops/common/a8_activation_check.h"
+#include "ops/common/a4_activation_check.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -296,6 +297,42 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
 
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+}
+
+void attn_input_proj(const A4Activation& x, const Weight& weight, Tensor& q, Tensor& gate,
+                     Tensor& k, Tensor& v, cudaStream_t stream) {
+    detail::validate_a4_activation(x);
+    if (x.rows != 5120 || (x.tokens != 256 && x.tokens <= 384)) {
+        throw std::invalid_argument("attn_input_proj: A4 requires K5120");
+    }
+    if (weight.qtype != QType::NVFP4 || weight.n != 14336 || weight.k != 5120 ||
+        weight.input_scale_divisor != x.divisor) {
+        throw std::invalid_argument("attn_input_proj: A4 weight shape or divisor mismatch");
+    }
+    detail::validate_nvfp4_weight(weight, "A4 attn_input_proj");
+    detail::require_disjoint(weight.payload, weight.payload_bytes, x.codes.data, x.codes.bytes);
+    detail::require_disjoint(weight.payload, weight.payload_bytes, x.scales.data, x.scales.bytes);
+    require_matrix(q, 6144, x.tokens, "q");
+    require_matrix(gate, 6144, x.tokens, "gate");
+    require_matrix(k, 1024, x.tokens, "k");
+    require_matrix(v, 1024, x.tokens, "v");
+    const Tensor* outputs[] = {&q, &gate, &k, &v};
+    for (int i = 0; i < 4; ++i) {
+        detail::require_disjoint(outputs[i]->data, outputs[i]->bytes(), weight.payload,
+                                 weight.payload_bytes);
+        detail::require_disjoint(outputs[i]->data, outputs[i]->bytes(), x.codes.data,
+                                 x.codes.bytes);
+        detail::require_disjoint(outputs[i]->data, outputs[i]->bytes(), x.scales.data,
+                                 x.scales.bytes);
+        for (int j = i + 1; j < 4; ++j) {
+            detail::require_disjoint(outputs[i]->data, outputs[i]->bytes(), outputs[j]->data,
+                                     outputs[j]->bytes());
+        }
+    }
+    detail::nvfp4_attn_input_w4a4_project(
+        weight, x.tokens,
+        {static_cast<std::uint8_t*>(x.codes.data), static_cast<std::uint8_t*>(x.scales.data)}, q,
+        gate, k, v, stream);
 }
 
 } // namespace ninfer::ops

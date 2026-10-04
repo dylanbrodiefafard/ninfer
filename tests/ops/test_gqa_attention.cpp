@@ -4284,6 +4284,10 @@ int run_geometry(const Geometry& geometry, bool full) {
         if (dtype == DType::U8 && !sage_only) {
             failures +=
                 run_a1_case(geometry, dtype, {128, 64, 256, 210u}, MappingPattern::Identity);
+            if (geometry.q_heads == 24) {
+                failures += run_a1_case(geometry, dtype, {129, 512, 641, 1103u},
+                                        MappingPattern::Fragmented);
+            }
             if (full) {
                 failures +=
                     run_a1_case(geometry, dtype, {129, 64, 256, 211u}, MappingPattern::Identity);
