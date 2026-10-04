@@ -16,6 +16,14 @@ formula and exact accepted-prefix V/cache state, including wrap, ring replacemen
 and graph replay. Their contract headers define the admitted domains; their
 numerical criteria do not reproduce production staging casts.
 
+`ninfer_grouped_dynamic_conv_composite_test` evaluates convolution finish,
+residual addition and plain RMS normalization against complete FP64 mathematics
+from represented inputs. Its per-column condition bound propagates convolution
+and BF16 residual error; an additional tight oracle checks RMS directly from the
+published residual. Random and cancellation fixtures cover B1,2,6,8 and W1,3,8,12,16,
+plus B1/W32, signed/zero gains, eager execution, repeated graph replay, input
+preservation and guards. Its `--sanitizer` case covers B6/W12.
+
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
   using independent numerical/state-transition oracles at real supported shapes;

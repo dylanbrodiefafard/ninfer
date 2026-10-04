@@ -159,6 +159,20 @@ bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidt
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
 
+## Convolution finish, residual and plain RMS benchmark
+
+`ninfer_grouped_dynamic_conv_bench` measures the complete public convolution
+finish/residual/plain-RMS edge, comparing its three-Op composition with
+`grouped_dynamic_conv_finish_residual_rmsnorm`. Both use D=5120, represented BF16
+inputs, warm-L2 captured graphs and untimed residual resets. Timing includes graph
+dispatch/event overhead; it is an operator-edge comparison, not Engine throughput.
+The retained benchmark selects production dispatch and has no private route controls.
+
+```bash
+cmake --build build --parallel 4 --target ninfer_grouped_dynamic_conv_bench
+./build/bench/ninfer_grouped_dynamic_conv_bench --batch 6 --width 8 --repeat 300
+```
+
 ## Selected K/V projection and normalization Op benchmarks
 
 These executables measure retained public Ops on RTX5090. They have no candidate

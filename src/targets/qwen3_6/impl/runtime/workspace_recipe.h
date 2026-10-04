@@ -272,10 +272,12 @@ struct DFlashAttentionRoots {
     Tensor prepared;
 };
 
+// hidden is caller-owned and remains live across every stage that consumes its normalized values.
 template <class Config, class Allocator>
-DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
+DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens,
+                                      const Tensor& hidden) {
     DFlashAttentionRoots out{
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        hidden,
         matrix(allocator, DType::BF16, Config::query_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
         matrix(allocator, DType::BF16, Config::kv_size, tokens),
@@ -298,6 +300,13 @@ DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens)
     return out;
 }
 
+template <class Config, class Allocator>
+DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
+    static_assert(Config::kind != qwen3_6::DFlashKind::DFlash2);
+    const Tensor hidden = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    return dflash_attention<Config>(allocator, tokens, hidden);
+}
+
 struct DFlashMlpRoots {
     Tensor hidden;
     Tensor intermediate;
@@ -306,14 +315,11 @@ struct DFlashMlpRoots {
     Tensor delta;
 };
 
+// hidden is caller-owned and remains live across every stage that consumes its normalized values.
 template <class Config, class Allocator>
-DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
+DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens, const Tensor& hidden) {
     DFlashMlpRoots out{
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::intermediate, tokens),
-        {},
-        {},
-        {},
+        hidden, matrix(allocator, DType::BF16, Config::intermediate, tokens), {}, {}, {},
     };
     if constexpr (Config::kind == qwen3_6::DFlashKind::DFlash2) {
         out.gate_up = matrix(allocator, DType::BF16, 2 * Config::intermediate, tokens);
@@ -322,6 +328,13 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
         out.delta = matrix(allocator, DType::BF16, Config::hidden, tokens);
     }
     return out;
+}
+
+template <class Config, class Allocator>
+DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
+    static_assert(Config::kind != qwen3_6::DFlashKind::DFlash2);
+    const Tensor hidden = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    return dflash_mlp<Config>(allocator, tokens, hidden);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe
