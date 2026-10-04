@@ -2,6 +2,7 @@
 #include "ops/launcher/rmsnorm.h"
 
 #include "ops/kernel/rmsnorm.cuh"
+#include "ops/kernel/dual_rmsnorm.cuh"
 #include "core/device.h"
 
 #include <cstdint>
@@ -120,6 +121,34 @@ void rmsnorm_a8_launch(const Tensor& x, const Tensor& weight, float eps, Tensor*
         launch_rmsnorm_a8_5120<RmsOutput::Bf16AndA8>(x, weight, eps, out, activation, stream);
     } else {
         launch_rmsnorm_a8_5120<RmsOutput::A8>(x, weight, eps, out, activation, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void dual_offset_rmsnorm_launch(const Tensor& x0, const Tensor& weight0, const Tensor& x1,
+                                const Tensor& weight1, float eps, Tensor& out0, Tensor& out1,
+                                cudaStream_t stream) {
+    const auto addresses =
+        reinterpret_cast<std::uintptr_t>(x0.data) | reinterpret_cast<std::uintptr_t>(weight0.data) |
+        reinterpret_cast<std::uintptr_t>(x1.data) | reinterpret_cast<std::uintptr_t>(weight1.data) |
+        reinterpret_cast<std::uintptr_t>(out0.data) | reinterpret_cast<std::uintptr_t>(out1.data);
+    const auto rows = static_cast<std::int64_t>(x0.ne[1]);
+    const dim3 grid(static_cast<unsigned int>(rows), 2);
+    if ((addresses & (alignof(__nv_bfloat162) - 1)) == 0) {
+        dual_offset_rmsnorm_bf16x2_kernel<<<grid, 512, 0, stream>>>(
+            static_cast<const __nv_bfloat162*>(x0.data),
+            static_cast<const __nv_bfloat162*>(weight0.data),
+            static_cast<const __nv_bfloat162*>(x1.data),
+            static_cast<const __nv_bfloat162*>(weight1.data),
+            static_cast<__nv_bfloat162*>(out0.data), static_cast<__nv_bfloat162*>(out1.data), rows,
+            eps);
+    } else {
+        dual_offset_rmsnorm_generic_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x0.data),
+            static_cast<const __nv_bfloat16*>(weight0.data),
+            static_cast<const __nv_bfloat16*>(x1.data),
+            static_cast<const __nv_bfloat16*>(weight1.data), static_cast<__nv_bfloat16*>(out0.data),
+            static_cast<__nv_bfloat16*>(out1.data), rows, eps);
     }
     CUDA_CHECK(cudaGetLastError());
 }

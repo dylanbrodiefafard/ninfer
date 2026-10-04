@@ -277,7 +277,14 @@ compute_nvfp4_rows(Activation activation, const std::uint8_t* __restrict__ codes
     }
 }
 
-template <class Geometry, class Schedule, class Epilogue, class Output, class Activation>
+// grid.x partitions consecutive M128 tiles starting at FirstRow; grid.y selects input columns.
+// Each warp owns RowsPerWarp rows from interleaved 32-row quartiles and its lanes partition K.
+// StagedRaw keeps [RowsPerCta,GroupsPerRow] E4M3 bytes in shared memory with one CTA barrier
+// before reads; Direct uses no shared scale plane. The warp reduction precedes lane 0 stores.
+// The launcher bounds the selected rows within the original geometry and supplies 16-byte-aligned
+// code, scale and BF16 planes. FirstRow preserves original 128-row scale-tile alignment.
+template <class Geometry, class Schedule, class Epilogue, class Output, class Activation,
+          int FirstRow = 0>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_gemv_kernel(
     Activation activation, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, float inverse_weight_divisor, Epilogue epilogue,
@@ -285,11 +292,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     static_assert((Geometry::kOutputRows % 128) == 0);
     static_assert((Schedule::kRowsPerCta % 4) == 0);
     static_assert((128 % Schedule::kRowsPerCta) == 0);
+    static_assert(FirstRow >= 0 && FirstRow % 128 == 0 && FirstRow < Geometry::kOutputRows);
 
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
-    const int m_tile           = static_cast<int>(blockIdx.x) / kCtasPerM128;
-    const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
+    const int selected_tile    = static_cast<int>(blockIdx.x) / kCtasPerM128;
+    const int m_tile           = FirstRow / 128 + selected_tile;
+    const int cta_in_tile      = static_cast<int>(blockIdx.x) - selected_tile * kCtasPerM128;
     const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
     stage_nvfp4_scales<Geometry, Schedule>(scales, shared, m_tile, rmod_base);
 

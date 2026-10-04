@@ -1,7 +1,6 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ops/norm_test_common.h"
 
-#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -12,32 +11,6 @@ using namespace ninfer::test;
 using namespace ninfer::test::norm;
 
 namespace {
-
-constexpr ReductionCriterion rmsnorm_bf16_criterion() {
-    return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 1.0e-5,
-            /*gross_relative_to_max_reference*/ 3.4e-3};
-}
-
-std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
-                                   const std::vector<float>& weight, const Shape& shape,
-                                   bool unit_offset) {
-    std::vector<double> output(input.size());
-    const auto row_count = static_cast<std::int64_t>(shape.rows) * shape.tokens;
-    for (std::int64_t row = 0; row < row_count; ++row) {
-        const std::size_t base = static_cast<std::size_t>(row) * shape.d;
-        double sum_squares     = 0.0;
-        for (std::int32_t column = 0; column < shape.d; ++column) {
-            const double value = input[base + column];
-            sum_squares += value * value;
-        }
-        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + kEps);
-        for (std::int32_t column = 0; column < shape.d; ++column) {
-            const double gain     = static_cast<double>(weight[column]) + (unit_offset ? 1.0 : 0.0);
-            output[base + column] = static_cast<double>(input[base + column]) * inverse * gain;
-        }
-    }
-    return output;
-}
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
              float input_scale = 4.0F, bool bf16x2_unaligned = false) {

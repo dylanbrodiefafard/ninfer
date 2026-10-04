@@ -133,7 +133,8 @@ stage_nvfp4_w4a4_activation(Nvfp4W4a4MaterializedActivation source,
     }
 }
 
-// Storage supplies b_codes/b_scales with the Nvfp4W4a4SharedStorage weight layout.
+// Storage supplies b_codes/b_scales with the Nvfp4W4a4SharedStorage weight layout. Contiguous
+// row policies preserve ordered 32-row scale quartiles, including the original plane offset.
 template <class Geometry, class Schedule, class RowPolicy, Cache WeightCache = Cache::cg,
           class Storage>
 __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __restrict__ codes,
@@ -188,7 +189,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
             const int local_k64        = remainder / 32;
             const int row_mod32        = remainder - local_k64 * 32;
             const int global_k64       = k_tile * Schedule::kK64PerStage + local_k64;
-            const int global_row_begin = row_begin + row_tile * 128;
+            const int global_row_begin = row_policy.weight_row(row_begin, row_tile * 128);
             const int persistent_tile  = global_row_begin / 128;
             const int first_quartile   = (global_row_begin & 127) / 32;
             auto* destination = shared.b_scales[stage] +

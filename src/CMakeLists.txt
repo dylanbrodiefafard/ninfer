@@ -236,6 +236,8 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
+  ops/linear/linear_kv_projection.cpp
+  ops/linear/nvfp4/nvfp4_kv_projection.cu
   ops/linear/fp8/fp8_format.cpp
   ops/linear/fp8/fp8_gemv.cu
   ops/linear/fp8/fp8_small_t.cu
@@ -257,6 +259,8 @@ add_library(ninfer_ops STATIC
   ops/wrapper/swa.cpp
   ops/wrapper/gqa_attention.cpp
   ops/wrapper/kv_cache_append_prefix.cpp
+  ops/wrapper/normalized_rope_kv_append.cpp
+  ops/launcher/normalized_rope_kv_append.cu
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp

@@ -53,6 +53,62 @@ The megakernel assessment behind this change, including the measured L2-prefetch
 [performance_enhancements.md](maintainer/performance_enhancements.md). Evidence:
 `profiles/bench/mk-glue/`, traces `profiles/nsys/mk-{base,a8b}-c{1,4,6}`.
 
+## Selected DFlash context rows, fused local append and dual MTP RMS (2026-10-03)
+
+Target `qwen3.8-27b/nvfp4`, RTX5090 / `sm_120a` / CUDA13.1, changes on
+`48eb0b01` after the producer-side A8/tree/calibration changes. Three
+repository-derived mechanisms remain retained:
+
+- DFlash2 context projection schedules only the K/V rows of the original full
+  NVFP4/W8/Q4 matrix and emits separate contiguous panels. Weight/scale metadata
+  and backing remain unchanged; context QKV output and copy workspace are removed.
+- The 5120-wide MTP stem normalizes its embedding and hidden panels independently
+  in one launch with separate weights and statistics.
+- DFlash2 local append combines plain K RMS, split-half RoPE and accepted-prefix
+  BF16 cyclic K/V writes in one launch. Native normalization reduction and BF16
+  rounding stay in registers; normalized-K global storage is removed.
+
+Public-Op CUDA-event graph measurements, baseline → retained median µs, 300 pairs.
+Samples alternate execution order; all listed mean-saving 95% intervals are positive:
+
+| Boundary | Median µs | Mean saving µs, sampled normal 95% interval |
+|---|---:|---:|
+| KV projection B1/W3, cold weights | 20.480 → 14.336 | 6.827 [6.711,6.943] |
+| Five distinct KV projections B6/W3, cold weights | 165.888 → 77.824 | 86.714 [86.559,86.868] |
+| Dual RMS T3 | 6.272 → 4.192 | 2.014 [1.926,2.102] |
+| Fused append B6/W8, all accepted | 6.464 → 4.192 | 2.319 [2.231,2.406] |
+| Fused append W2048, full ring replacement | 14.528 → 8.064 | 6.694 [6.587,6.800] |
+
+Engine A/B uses `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, default NVFP4 target KV,
+fixed three drafts, CUDA Graphs, `ninfer_bench -pg 512,128 --warmup 1
+--repetitions 5 -o json`. Fixed-k3 baseline means average the initial and repeated
+controls bracketing the candidate. DFlash2 decode mean tok/s is 155.107→161.275
+at C1 (+3.98%) and 653.775→656.377 at C6 (+0.40%). Acceptance differs: rounds/accepted
+per repetition are 57/70→55/72 at C1 and 338/425→339/425 at C6. The C1 gain thus
+includes fewer rounds; these are corpus-specific outcomes, not universal Engine
+gains or historical bitwise parity. The initial one-round-normalization profile
+was discarded after a C6 Engine regression despite its positive Op savings.
+
+Adaptive DFlash2 C6 (`--draft-tokens 7 --adaptive-draft --lm-head-draft`) measures
+704.518→713.959tok/s (+1.34%) in one baseline/candidate pair. Average rounds change
+340.0→336.2; arm choice and acceptance change, so this remains corpus-specific.
+
+This artifact contains W8 MTP matrices. MTP means are 145.357→145.194 at C1 and
+641.120→641.294 at C6 with unchanged acceptance. These tiny differences are
+within baseline drift and do not establish an Engine gain or an NVFP4-MTP-matrix
+result. No such local MTP artifact was available.
+
+The new Ops qualify directly against independent complete FP64 formulas and
+exact codec/cache-state checks, including capture/replay. The dual-RMS gross
+criterion accounts for BF16's storage rounding floor; the append criterion
+covers two BF16 roundings without inserting production staging into its oracle.
+Experiment scope, numerical bounds, final checks and limitations are in
+[the three-experiment report](../research/inference-engine-triage/phase5-experiments.md).
+The shared RMS extraction preserves upstream's `RmsOutput` and exact A8 outputs;
+independent oracle cases also cover W12/B1,B2,B6 for the latest tree frame.
+Current raw measurements: `profiles/bench/phase5-refresh/`; original snapshot:
+`profiles/bench/phase5/`.
+
 ## Parallel p-less tile choice and BF16/conv verify aggregation at every width (2026-10-02)
 
 nsys at C=1..6 (k=3..5) put `speculative_sampling_p_less_mass_finalize_kernel` at 1.5–1.95 ms

@@ -214,11 +214,11 @@ __launch_bounds__(Block) __global__
 // a8_block_column_scale adds two __syncthreads(); every thread of the CTA reaches it.
 template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread,
           RmsOutput Output = RmsOutput::Bf16>
-__launch_bounds__(Block) __global__
-    void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                   const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
-                                   std::int64_t rows, float eps, std::uint8_t* codes = nullptr,
-                                   float* scales = nullptr) {
+__device__ __forceinline__ void
+rmsnorm_cta_bf16x2_body(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                        const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                        std::int64_t rows, float eps, std::uint8_t* codes = nullptr,
+                        float* scales = nullptr) {
     static_assert(Block % kWarpSize == 0);
     constexpr bool kWritesBf16 = Output != RmsOutput::A8;
     constexpr bool kWritesA8   = Output != RmsOutput::Bf16;
@@ -285,6 +285,17 @@ __launch_bounds__(Block) __global__
     }
 }
 
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread,
+          RmsOutput Output = RmsOutput::Bf16>
+__launch_bounds__(Block) __global__
+    void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                   const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                                   std::int64_t rows, float eps, std::uint8_t* codes = nullptr,
+                                   float* scales = nullptr) {
+    rmsnorm_cta_bf16x2_body<Epilogue, Block, MaxPairsPerThread, Output>(x, weight, z, out, d, rows,
+                                                                        eps, codes, scales);
+}
+
 // Implements: include/ninfer/ops/rmsnorm.h
 // Match: aligned contiguous BF16, plain epilogue, D=2048, sm_120a.
 // Algorithm assumptions: exactly two BF16x2 values per thread; one 512-thread CTA owns one row.
@@ -333,10 +344,9 @@ __launch_bounds__(512) __global__
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
 // implementation over another family of shape-specific paths.
 template <RmsEpilogue Epilogue>
-__launch_bounds__(256) __global__
-    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
-                                std::int64_t rows, float eps) {
+__device__ __forceinline__ void
+rmsnorm_generic_body(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* z,
+                     __nv_bfloat16* out, std::int32_t d, std::int64_t rows, float eps) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -364,6 +374,14 @@ __launch_bounds__(256) __global__
         if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
+}
+
+template <RmsEpilogue Epilogue>
+__launch_bounds__(256) __global__
+    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
+                                std::int64_t rows, float eps) {
+    rmsnorm_generic_body<Epilogue>(x, weight, z, out, d, rows, eps);
 }
 
 } // namespace ninfer::ops

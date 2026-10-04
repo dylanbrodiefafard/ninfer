@@ -2,6 +2,8 @@
 
 #include "ops/op_tester.h"
 
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -24,6 +26,34 @@ struct Shape {
 inline Tensor tensor_for(void* data, const Shape& shape) {
     if (shape.tokens == 1) return Tensor(data, DType::BF16, {shape.d, shape.rows});
     return Tensor(data, DType::BF16, {shape.d, shape.rows, shape.tokens});
+}
+
+inline constexpr ReductionCriterion rmsnorm_bf16_criterion() {
+    return {/*relative_l2*/ 1.85e-3, /*gross_absolute*/ 1.0e-5,
+            /*gross_relative_to_max_reference*/ 3.4e-3};
+}
+
+// The RMS family oracle evaluates each complete row naively in FP64 from represented BF16
+// values. Output rounding and private reduction or staging choices are absent from this formula.
+inline std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
+                                          const std::vector<float>& weight, const Shape& shape,
+                                          bool unit_offset, float eps = kEps) {
+    std::vector<double> output(input.size());
+    const auto row_count = static_cast<std::int64_t>(shape.rows) * shape.tokens;
+    for (std::int64_t row = 0; row < row_count; ++row) {
+        const std::size_t base = static_cast<std::size_t>(row) * shape.d;
+        double sum_squares     = 0.0;
+        for (std::int32_t column = 0; column < shape.d; ++column) {
+            const double value = input[base + column];
+            sum_squares += value * value;
+        }
+        const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + eps);
+        for (std::int32_t column = 0; column < shape.d; ++column) {
+            const double gain     = static_cast<double>(weight[column]) + (unit_offset ? 1.0 : 0.0);
+            output[base + column] = static_cast<double>(input[base + column]) * inverse * gain;
+        }
+    }
+    return output;
 }
 
 struct DeviceInput {
