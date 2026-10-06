@@ -2410,6 +2410,32 @@ requests' greedy-stream parity at widths 512 with one or two decode rounds per c
 Evidence is under `profiles/bench/medium-prefill-20261005/`,
 `profiles/nsys/medium-prefill-20261005/`, and `profiles/ncu/medium-prefill-20261005/`.
 
+### LinearAdd A4 numerical follow-up (2026-10-06)
+
+The T=1500 diagnostic above is a sampling false positive rather than a GEMM defect. Its 49
+sampled outputs have relative L2 error 0.16065 against the unchanged 0.16 criterion. An
+independent activation-codec control gives 23.9442 at the reported coordinate, versus the
+kernel's BF16 output 24 and the original BF16-input FP64 oracle's 17.1818. The error comes from
+private A4 quantization; the control supplements rather than replaces the canonical oracle.
+
+The complete logical output was checked with the same naive FP64 dot product plus residual,
+using the fixture's represented BF16 inputs and independently decoded signed weight codes and
+stored scales. All 7,680,000 outputs pass: relative L2 error is 0.1021163, and maximum absolute
+error is 10.44873 against the gross-error limit 16.05848. Both base commit `945515ea` and the
+retained implementation at `74541d23` produce the same statistics on the RTX 5090 with CUDA
+13.1. The sparse sample underestimated the reference norm and maximum used by the whole-output
+criterion.
+
+LinearAdd's qualification samples an evenly spaced 32-point grid on each output axis, together
+with every original edge and quarter coordinate. The failing coordinate remains included, and
+T=1500 is retained for both real residual geometries. No oracle, criterion, quantizer, or kernel
+was changed. The expanded suite passes every A16, A8, and A4 case; at T=1500 its 1369-point
+samples have relative L2 error 0.10261 for K=6144 and 0.09189 for K=17408. The final fast suite
+passes 119 tests with two artifact-dependent skips; the affected translation unit has zero
+clang-tidy diagnostics, and formatting and file checks pass. Read-only review found no blocker.
+Full-output diagnostic source and summarized statistics are under
+`profiles/bench/a4-linear-add-20261006/`.
+
 ## Qwen3.8-27B NVFP4 mixed-phase prefill campaign
 
 The 2026-09-05 follow-up kept the preceding DFlash4/MTP4 decode implementation and targeted
