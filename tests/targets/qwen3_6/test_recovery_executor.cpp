@@ -35,6 +35,7 @@ using ninfer::TokenId;
 using ninfer::runtime::AdmissionResources;
 using ninfer::runtime::BatchedGeneratedRound;
 using ninfer::runtime::CacheRestoreFailure;
+using ninfer::runtime::PrefillPace;
 using ninfer::runtime::PrefillStepResult;
 using ninfer::runtime::RequestPlanSummary;
 using ninfer::runtime::RoundBudget;
@@ -580,7 +581,7 @@ public:
     [[nodiscard]] virtual PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                PreparedPrompt prompt,
                                                                ProbePlan plan, TransientRegion,
-                                                               const OutputSession*) {
+                                                               PrefillPace, const OutputSession*) {
         note("start_prefill");
         ++prefill_count;
         aborts_at_prefill  = abort_count;
@@ -682,8 +683,16 @@ public:
 
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t) { return true; }
 
-    [[nodiscard]] PrefillStepResult advance_prefill_lane(std::uint32_t) {
+    [[nodiscard]] PrefillStepResult advance_prefill_lane(std::uint32_t, PrefillPace) {
         throw std::logic_error("cold prefill did not complete in one step");
+    }
+
+    [[nodiscard]] bool prefill_mixable(std::uint32_t) const { return false; }
+
+    [[nodiscard]] ninfer::runtime::MixedGeneratedRound
+    decode_batch_with_prefill(std::span<const std::uint32_t>, std::span<const RoundBudget>,
+                              std::uint32_t) {
+        throw std::logic_error("probe prefill is never mixable");
     }
 
     [[nodiscard]] virtual BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
@@ -1617,7 +1626,7 @@ public:
     }
 
     [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
-                                                       ProbePlan, TransientRegion,
+                                                       ProbePlan, TransientRegion, PrefillPace,
                                                        const OutputSession*) override {
         prefills.fetch_add(1);
         if (lane < retained_.size()) { retained_[lane].store(false); }

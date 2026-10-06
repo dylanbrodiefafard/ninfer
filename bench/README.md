@@ -264,9 +264,9 @@ Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and opti
 prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
 interval.
 
-`--running` measures the public running-state entry across recurrent-only, complete 64-token
-chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the snapshot entry over the
-production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+`--running` measures the public running-state entry across its recurrent route (T < 60) and
+its chunked route, whose last 64-token chunk may be partial. `--snapshot` measures the snapshot
+entry over the production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
 `--chunked-only` measures the complete pre-normalized BF16 pipeline through the public Op. Adding
 `--breakdown` reports isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings. These
 three intrinsic algorithm stages are the benchmark's sole private-launcher exception; the complete

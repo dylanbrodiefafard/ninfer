@@ -468,12 +468,14 @@ void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Wei
 
 namespace {
 
-// The composed schedules' standalone unit-offset RMSNorm, publishing h's A8 activation as well
-// when the caller requests it.
+// The composed schedules' standalone unit-offset RMSNorm, publishing h's A8 or A4 activation as
+// well when the caller requests it.
 void normalize(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
-               A8Activation* h_activation, cudaStream_t stream) {
-    if (h_activation != nullptr) {
-        rmsnorm_a8(x, norm_weight, eps, &h, *h_activation, stream);
+               Bf16GdnHiddenActivation h_activation, cudaStream_t stream) {
+    if (h_activation.a8 != nullptr) {
+        rmsnorm_a8(x, norm_weight, eps, &h, *h_activation.a8, stream);
+    } else if (h_activation.a4 != nullptr) {
+        rmsnorm_a4(x, norm_weight, eps, &h, *h_activation.a4, stream);
     } else {
         rmsnorm(x, norm_weight, eps, true, h, stream);
     }
@@ -482,7 +484,7 @@ void normalize(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
 } // namespace
 
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
-                                   A8Activation* h_activation, const Weight& a_weight,
+                                   Bf16GdnHiddenActivation h_activation, const Weight& a_weight,
                                    const Weight& b_weight, const Tensor& A_log,
                                    const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
                                    Tensor& beta, cudaStream_t stream) {
@@ -495,8 +497,9 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
         return;
     }
 
-    if (h_activation != nullptr) {
-        throw std::invalid_argument("gdn_norm_gating_proj: an A8 h output needs the 27B profile");
+    if (h_activation.a8 != nullptr || h_activation.a4 != nullptr) {
+        throw std::invalid_argument(
+            "gdn_norm_gating_proj: a quantized h output needs the 27B profile");
     }
     auto scratch_scope = ws.scope();
     DeviceSpan scratch{};
@@ -514,7 +517,7 @@ void bf16_gdn_norm_gating_packed_dispatch(const Tensor& x, const Tensor& norm_we
                                           cudaStream_t stream) {
     const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
     const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_packed_plan(problem);
-    normalize(x, norm_weight, eps, h, h_activation, stream);
+    normalize(x, norm_weight, eps, h, {h_activation, nullptr}, stream);
     execute_resolved(plan, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
 }
 

@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -64,9 +65,9 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. W8 and fused NVFP4 A16 require zero bytes; W4A4/W4A8 routes use
- * caller-owned activation and, where selected, private projection storage. There is no persistent
- * state side effect.
+ *   scoped to the call. W8 and fused NVFP4 A16 require zero bytes; NVFP4 W4A4/W4A8 routes use it
+ *   for the quantized activation, and Q4 A16 routes for their materialized gate/up projection.
+ *   There is no persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);
@@ -76,6 +77,26 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
  * only through T=20; larger NVFP4 extents require the policy-bearing AllowA4 or AllowA8 form.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
+                   cudaStream_t stream);
+
+/**
+ * The NVFP4 AllowA4 LinearSwiGLU of an already quantized activation (ninfer/ops/a4_activation.h)
+ * of [5120,T], T >= kA4MlpGateUpMinTokens, whose input scale divisor equals the weight's. For the
+ * same BF16 activation the output is bit-identical to the policy form's with AllowA4. The weight
+ * is NVFP4 [34816,5120]; out is contiguous 16-byte aligned BF16 [17408,T] and does not overlap x.
+ * The oracle is the policy form's, evaluated on the represented activation. Invalid arguments
+ * throw std::invalid_argument. No workspace.
+ */
+void linear_swiglu(const A4Activation& x, const Weight& gate_up_weight, Tensor& out,
+                   cudaStream_t stream);
+
+/**
+ * The A4-input LinearSwiGLU above publishing its [17408,T] output as an NVFP4 activation for a
+ * down projection with out.input_scale_divisor: `out` encodes, bit for bit, the BF16 values the
+ * Tensor-output form writes. out does not overlap x. Invalid arguments throw
+ * std::invalid_argument. No workspace.
+ */
+void linear_swiglu(const A4Activation& x, const Weight& gate_up_weight, A4Activation& out,
                    cudaStream_t stream);
 
 } // namespace ninfer::ops

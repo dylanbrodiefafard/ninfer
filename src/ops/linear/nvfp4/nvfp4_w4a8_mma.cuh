@@ -383,9 +383,10 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
     // projections place sixteen weight rows on MMA M (SwapAB) and compile the exact eight-token
     // panel count, streaming K256 over three stages (M16) or two (M32). T=33..48 (C=5/6 verify)
     // uses one M48 tile so every weight byte is read once; it streams K256 over the same stage
-    // counts (N<=6144 at K512 would exceed shared memory at three stages). BF16 activations halve
-    // BK to keep the same staged bytes. Every schedule keeps each output's ascending K order, so
-    // neither tile height nor panel count changes an output.
+    // counts (N<=6144 at K512 would exceed shared memory at three stages). Above 48 tokens the
+    // DFlash context projections instead take the 64-token prefill tiles their nvfp4_config.h
+    // tables select. BF16 activations halve BK to keep the same staged bytes. Every schedule keeps
+    // each output's ascending K order, so neither tile height nor panel count changes an output.
     const auto launch = [&]<int BM, int Panels>() {
         constexpr bool narrow = Geometry::kOutputRows <= 6144;
         constexpr int BN      = narrow ? (BM == 16 ? 16 : 32) : 64;
@@ -407,6 +408,48 @@ void launch_nvfp4_w4a8_mma(const Weight& weight, int tokens, Activation workspac
             static_cast<const std::uint8_t*>(weight.scales), tokens,
             1.0F / weight.weight_scale_divisor, epilogue, output, RowPolicy{});
     };
+    constexpr bool kDflashFeature = kBf16 && std::is_same_v<Geometry, Nvfp4DflashFeatureGeometry>;
+    constexpr bool kDflashKv =
+        kBf16 && std::is_same_v<Geometry, Nvfp4DflashQkvGeometry> && OutputRows == 2048;
+    if constexpr (kDflashFeature || kDflashKv) {
+        // Prefill-chunk widths of the DFlash context projections (nvfp4_config.h tables). These
+        // schedules keep the narrow family's ascending-K accumulation of each output.
+        const auto launch_prefill = [&]<int BlockN, int WarpsN>() {
+            using Schedule =
+                Nvfp4W4a4MmaSchedule<64, BlockN, 128, 2, WarpsN, BlockN == 32 ? 3 : 2, 1>;
+            constexpr auto kernel = nvfp4_w4a8_mma_kernel<Geometry, Schedule, Epilogue, Output,
+                                                          RowPolicy, PairRows, 0, Activation>;
+            constexpr int smem    = sizeof(Nvfp4W4a8SharedStorage<Schedule, kActivationBytes>);
+            static const bool configured = [] {
+                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                smem));
+                return true;
+            }();
+            (void)configured;
+            const dim3 grid(OutputRows / Schedule::kBlockN,
+                            (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
+            kernel<<<grid, Schedule::kThreads, smem, stream>>>(
+                workspace, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), tokens,
+                1.0F / weight.weight_scale_divisor, epilogue, output, RowPolicy{});
+            CUDA_CHECK(cudaGetLastError());
+        };
+        const Nvfp4A16PrefillTile tile = kDflashFeature ? nvfp4_dflash_feature_a16_tile(tokens)
+                                                        : nvfp4_dflash_kv_a16_tile(tokens);
+        switch (tile) {
+        case Nvfp4A16PrefillTile::Narrow:
+            break;
+        case Nvfp4A16PrefillTile::M64N32:
+            launch_prefill.template operator()<32, 2>();
+            return;
+        case Nvfp4A16PrefillTile::M64N64:
+            launch_prefill.template operator()<64, 2>();
+            return;
+        case Nvfp4A16PrefillTile::M64N128:
+            launch_prefill.template operator()<128, 4>();
+            return;
+        }
+    }
     if constexpr (Geometry::kOutputRows <= 6144) {
         if (tokens <= 16) {
             launch.template operator()<16, 0>();

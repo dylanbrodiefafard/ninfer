@@ -497,7 +497,7 @@ int run_nvfp4_target() {
         }
     }
     for (const std::int32_t tokens :
-         {1, 4, 15, 36, 255, 256, 257, 384, 385, 777, 1024, 1025, 1500}) {
+         {1, 4, 15, 36, 100, 160, 240, 255, 256, 257, 384, 385, 777, 1024, 1025, 1500}) {
         failures += run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4);
     }
     for (const std::int32_t tokens :

@@ -27,6 +27,11 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream);
 
+// The W4A4 projection of an already quantized [5120, tokens] activation (codes and tiled scales).
+void nvfp4_attn_input_w4a4_project(const Weight& weight, std::int32_t tokens,
+                                   Nvfp4W4a4Workspace activation, Tensor& q, Tensor& gate,
+                                   Tensor& k, Tensor& v, cudaStream_t stream);
+
 void nvfp4_attn_input_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Fp8A8Workspace workspace,
                                   cudaStream_t stream);

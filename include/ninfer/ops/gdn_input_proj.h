@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 #include "ninfer/ops/linear.h"
 
@@ -83,6 +84,18 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  */
 void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream);
+
+/**
+ * The NVFP4 AllowA4 single-parent projection of an already quantized activation
+ * (ninfer/ops/a4_activation.h) of [5120,T], T >= kA4GdnInputMinTokens (the widths at which
+ * AllowA4 selects W4A4), whose input scale divisor equals the weight's. For the same BF16
+ * activation qkv and z are bit-identical to the policy form's with AllowA4. The weight is NVFP4
+ * [16384,5120]; qkv/z are as above. The activation, qkv, and z must not overlap. The oracle is the
+ * policy form's, evaluated on the represented activation. Invalid arguments throw
+ * std::invalid_argument. No workspace.
+ */
+void gdn_input_proj(const A4Activation& x, const Weight& query_key_value_z_weight, Tensor& qkv,
+                    Tensor& z, cudaStream_t stream);
 
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8

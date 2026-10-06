@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/context_checkpoint.h"
+#include "targets/qwen3_6/impl/runtime/prefill_schedule.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -313,6 +314,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                std::int32_t max_width) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
+        // The prefill A4 hidden activation lives from the norm leaf to the input projection.
+        if (const std::size_t a4_bytes =
+                Variant::gdn_input_a4_activation_capacity_bytes(plan.weights_profile, phase, last);
+            a4_bytes != 0) {
+            (void)layout.alloc_bytes(a4_bytes);
+        }
         if (path == GdnWorkspacePath::ReplayRecord) {
             (void)workspace_recipe::gdn_input_activation<TextConfig>(layout, last);
         }
@@ -848,8 +855,26 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             merged, std::min(merged, kFrontendSegmentLimit));
     }
 
-    out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                             out.dflash_context, out.dflash_round, out.vision_encode});
+    // A mixed round holds its verify round's allocations and then an owner chunk of the
+    // mixed-forward width; the sum of the two peaks bounds it.
+    if (plan.speculative_backend == SpeculativeBackend::DFlash && plan.mixed_forward != 0) {
+        const auto width = static_cast<std::int32_t>(plan.mixed_forward);
+        WorkspaceLayoutBuilder owner;
+        text_common_root(owner, width);
+        target_body(owner, 1, width, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1, 1,
+                    width, text_envelope);
+        scratch(owner, ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1));
+        // The owner's first allocation aligns to 256 bytes past the verify round's live cursor.
+        constexpr std::size_t kAllocationAlignment = 256;
+        const std::size_t verify_bytes =
+            checked_add(out.dflash_round, kAllocationAlignment - 1, "mixed DFlash round") /
+            kAllocationAlignment * kAllocationAlignment;
+        out.dflash_mixed = checked_add(verify_bytes, finish(owner), "mixed DFlash round");
+    }
+
+    out.capacity =
+        std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
+                  out.dflash_context, out.dflash_round, out.dflash_mixed, out.vision_encode});
     return out;
 }
 
@@ -859,6 +884,18 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
+    }
+    // At most the irregular-split extent, so a Shared step never advances further than an
+    // Exclusive step from the same cursor and the Shared-width service projection bounds every
+    // pace sequence.
+    if (options.mixed_forward % qwen3_6::detail::kMixedForwardAlignment != 0 ||
+        options.mixed_forward > options.prefill_chunk ||
+        options.mixed_forward > qwen3_6::detail::kIrregularPrefillSplit) {
+        throw std::invalid_argument(
+            "mixed_forward must be a multiple of 256 and at most min(prefill_chunk, 4096)");
+    }
+    if (options.mixed_forward_rounds == 0) {
+        throw std::invalid_argument("mixed_forward_rounds must be at least 1");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,6]");
@@ -962,6 +999,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency          = inputs.max_concurrency;
     impl->prefill_chunk            = inputs.prefill_chunk;
+    impl->mixed_forward            = inputs.mixed_forward;
     impl->draft_window             = inputs.draft_window;
     impl->adaptive_draft           = inputs.adaptive_draft;
     impl->p_less_draft_temperature = inputs.p_less_draft_temperature;
@@ -1124,6 +1162,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .capacity                 = options.max_context,
         .max_concurrency          = options.max_concurrency,
         .prefill_chunk            = std::min(options.prefill_chunk, options.max_context),
+        .mixed_forward            = std::min(options.mixed_forward, options.max_context),
         .draft_window             = options.speculative.draft_tokens,
         .dflash_verify_width      = options.speculative.dflash_verify_width,
         .adaptive_draft           = options.speculative.adaptive_draft,

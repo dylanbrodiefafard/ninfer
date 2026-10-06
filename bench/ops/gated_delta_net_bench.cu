@@ -86,8 +86,8 @@ struct BenchRow {
     const char* normalization = "";
     std::string implementation;
     std::int32_t tokens               = 0;
-    std::int32_t full_chunks          = 0;
-    std::int32_t tail_tokens          = 0;
+    std::int32_t chunks               = 0;
+    std::int32_t partial_chunk_tokens = 0;
     std::size_t workspace_bytes       = 0;
     std::size_t graph_nodes           = 0;
     double logical_bytes              = 0.0;
@@ -229,8 +229,8 @@ void print_help(const char* program) {
                 "\n"
                 "Workload:\n"
                 "  --tokens N         exact token extent (running/chunked default: 1024)\n"
-                "  --sweep            running: 1,63,64,65,128,1024; snapshot: 1..16;\n"
-                "                     chunked: 64,128,256,512,1024,4096\n"
+                "  --sweep            running: 1,59,60,63,64,65,128,1024; snapshot: 1..16;\n"
+                "                     chunked: 60,64,100,128,256,512,1024,4096\n"
                 "  --qk-heads N       Q/K heads (default: 16)\n"
                 "  --value-heads N    divisible value heads >= Q/K heads (default: 48)\n"
                 "  --batch B          exact snapshot batch in [1,8] (default: 1)\n"
@@ -257,16 +257,17 @@ std::vector<std::int32_t> token_values(const Options& options) {
         return tokens;
     }
     if (!options.sweep) { return {kDefaultTokens}; }
-    if (options.mode == Mode::ChunkedOnly) { return {64, 128, 256, 512, 1024, 4096}; }
-    return {1, 63, 64, 65, 128, 1024};
+    if (options.mode == Mode::ChunkedOnly) { return {60, 64, 100, 128, 256, 512, 1024, 4096}; }
+    return {1, 59, 60, 63, 64, 65, 128, 1024};
 }
 
 void validate_tokens(const Options& options, std::int32_t tokens) {
     if (options.mode == Mode::Snapshot && tokens > 16) {
         fail("snapshot benchmark supports the production T range [1,16]");
     }
-    if (options.mode == Mode::ChunkedOnly && (tokens % gated_delta_net_detail::kChunkSize) != 0) {
-        fail("--chunked-only requires tokens to be a multiple of kChunkSize (64)");
+    if (options.mode == Mode::ChunkedOnly && tokens < gated_delta_net_detail::kChunkedMinTokens) {
+        fail("--chunked-only requires at least kChunkedMinTokens (60) tokens; narrower T is "
+             "recurrent");
     }
     if (options.mode == Mode::Snapshot && options.batch > 1 && tokens > 16) {
         fail("batched snapshot supports W in [1,16]");
@@ -464,10 +465,11 @@ double state_tensor_bytes(const Problem& problem) {
 }
 
 double chunk_state_tensor_bytes(const Problem& problem) {
-    // Only full chunks publish a chunk state; a partial tail chunk does not.
-    const std::int32_t full_chunks = problem.tokens / gated_delta_net_detail::kChunkSize;
-    const double chunks            = static_cast<double>(full_chunks);
-    return state_tensor_bytes(problem) * chunks * 0.5;
+    // Every chunk, a partial last one included, publishes a chunk state.
+    const std::int64_t chunks =
+        (static_cast<std::int64_t>(problem.tokens) + gated_delta_net_detail::kChunkSize - 1) /
+        gated_delta_net_detail::kChunkSize;
+    return state_tensor_bytes(problem) * static_cast<double>(chunks) * 0.5;
 }
 
 TrafficBytes chunked_prepare_traffic(const Problem& problem) {
@@ -514,26 +516,16 @@ TrafficBytes chunked_pipeline_traffic(const Problem& problem) {
 }
 
 TrafficBytes running_traffic(const Problem& problem) {
-    const std::int32_t full_tokens =
-        (problem.tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
-    if (full_tokens == 0) { return {running_logical_bytes(problem), 0.0}; }
-
-    const Problem full{problem.qk_heads, problem.value_heads, full_tokens};
-    const std::int32_t tail_tokens = problem.tokens - full_tokens;
-    const double qk_all            = qk_tensor_bytes(problem);
-    const double normalization     = 4.0 * qk_all;
-    const TrafficBytes chunked     = chunked_pipeline_traffic(full);
-
-    TrafficBytes traffic{
-        normalization + chunked.total,
-        2.0 * qk_all + 4.0 * qk_tensor_bytes(full) + chunked.intermediate,
-    };
-    if (tail_tokens > 0) {
-        const Problem tail{problem.qk_heads, problem.value_heads, tail_tokens};
-        traffic.total += running_logical_bytes(tail);
-        traffic.intermediate += 2.0 * qk_tensor_bytes(tail);
+    if (problem.tokens < gated_delta_net_detail::kChunkedMinTokens) {
+        return {running_logical_bytes(problem), 0.0};
     }
-    return traffic;
+    // Normalization reads raw q/k and writes the FP16 copies the chunked stages read.
+    const double qk_all        = qk_tensor_bytes(problem);
+    const TrafficBytes chunked = chunked_pipeline_traffic(problem);
+    return {
+        4.0 * qk_all + chunked.total,
+        6.0 * qk_all + chunked.intermediate,
+    };
 }
 
 TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
@@ -547,11 +539,8 @@ TrafficBytes snapshot_traffic(const Problem& problem, bool composed) {
 }
 
 std::string running_implementation(std::int32_t tokens) {
-    const std::int32_t full_tokens =
-        (tokens / gated_delta_net_detail::kChunkSize) * gated_delta_net_detail::kChunkSize;
-    if (full_tokens == 0) { return "public.recurrent.qk_fused"; }
-    if (full_tokens == tokens) { return "public.l2norm_x2+chunked"; }
-    return "public.l2norm_x2+chunked+recurrent_tail";
+    if (tokens < gated_delta_net_detail::kChunkedMinTokens) { return "public.recurrent.qk_fused"; }
+    return "public.l2norm_x2+chunked";
 }
 
 BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& flush,
@@ -587,14 +576,16 @@ BenchRow run_running(const Options& options, std::int32_t tokens, DeviceBuffer& 
     const GraphMeasurement measurement = measure_graph(launch, flush, stream, options);
     const TrafficBytes traffic         = running_traffic(problem);
 
-    const std::int32_t full_chunks = tokens / gated_delta_net_detail::kChunkSize;
+    const bool chunked = tokens >= gated_delta_net_detail::kChunkedMinTokens;
     return {
         "running",
         "fused",
         running_implementation(tokens),
         tokens,
-        full_chunks,
-        tokens % gated_delta_net_detail::kChunkSize,
+        chunked
+            ? (tokens + gated_delta_net_detail::kChunkSize - 1) / gated_delta_net_detail::kChunkSize
+            : 0,
+        chunked ? tokens % gated_delta_net_detail::kChunkSize : 0,
         workspace_bytes,
         measurement.graph_nodes,
         running_logical_bytes(problem),
@@ -745,8 +736,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
         "pre_normalized",
         "public.chunked.qk_pre_normalized",
         tokens,
-        tokens / gated_delta_net_detail::kChunkSize,
-        0,
+        (tokens + gated_delta_net_detail::kChunkSize - 1) / gated_delta_net_detail::kChunkSize,
+        tokens % gated_delta_net_detail::kChunkSize,
         workspace_bytes,
         pipeline_measurement.graph_nodes,
         running_logical_bytes(problem),
@@ -812,8 +803,8 @@ std::vector<BenchRow> run_chunked(const Options& options, std::int32_t tokens, D
             "pre_normalized",
             implementation,
             tokens,
-            tokens / gated_delta_net_detail::kChunkSize,
-            0,
+            (tokens + gated_delta_net_detail::kChunkSize - 1) / gated_delta_net_detail::kChunkSize,
+            tokens % gated_delta_net_detail::kChunkSize,
             workspace_bytes,
             measurement.graph_nodes,
             0.0,
@@ -867,7 +858,7 @@ double traffic_gbps(const BenchRow& row) {
 void print_csv_header() {
     std::printf(
         "state_form,normalization,implementation,dtype,state_dim,qk_heads,value_heads,tokens,"
-        "batch,full_chunks,tail_tokens,workspace_bytes,logical_bytes,traffic_bytes,"
+        "batch,chunks,partial_chunk_tokens,workspace_bytes,logical_bytes,traffic_bytes,"
         "intermediate_traffic_bytes,graph_nodes,cache,execution,warmup,repeat,"
         "median_us,min_us,p95_us,logical_gbps,traffic_gbps,stage_share_pct,"
         "relative_to_e2e_pct\n");
@@ -879,7 +870,7 @@ void print_row(const BenchRow& row, const Options& options) {
                     "cold_l2,cuda_graph,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,",
                     row.state_form, row.normalization, row.implementation.c_str(),
                     gated_delta_net_detail::kStateDim, options.qk_heads, options.value_heads,
-                    row.tokens, options.batch, row.full_chunks, row.tail_tokens,
+                    row.tokens, options.batch, row.chunks, row.partial_chunk_tokens,
                     row.workspace_bytes, row.logical_bytes, row.traffic_bytes,
                     row.intermediate_traffic_bytes, row.graph_nodes, options.warmup, options.repeat,
                     row.timing.median_us, row.timing.min_us, row.timing.p95_us, logical_gbps(row),
@@ -891,9 +882,9 @@ void print_row(const BenchRow& row, const Options& options) {
         return;
     }
 
-    std::printf("%-8s T=%-4d B=%-2d chunks=%-2d tail=%-2d nodes=%zu ws=%7.2f MiB "
+    std::printf("%-8s T=%-4d B=%-2d chunks=%-2d partial=%-2d nodes=%zu ws=%7.2f MiB "
                 "median=%8.3f us min=%8.3f us p95=%8.3f us",
-                row.state_form, row.tokens, options.batch, row.full_chunks, row.tail_tokens,
+                row.state_form, row.tokens, options.batch, row.chunks, row.partial_chunk_tokens,
                 row.graph_nodes,
                 static_cast<double>(row.workspace_bytes) / static_cast<double>(1ULL << 20),
                 row.timing.median_us, row.timing.min_us, row.timing.p95_us);

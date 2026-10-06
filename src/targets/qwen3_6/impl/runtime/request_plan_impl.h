@@ -72,11 +72,11 @@ planned_prompt_hashes(const RequestBasePlanImpl& base) {
 
 std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      const PreparedPromptData& prompt, std::uint32_t reuse_base,
-                                     std::uint32_t prefill_chunk,
+                                     std::uint32_t prefill_step_tokens,
                                      std::span<const VisionUseSpan> vision_uses,
                                      const std::optional<RewriteCheckpointSpec>& rewrite) noexcept {
     const std::uint64_t prefill_units = qwen3_6::detail::projected_prefill_work(
-        prompt, reuse_base, prefill_chunk, vision_uses,
+        prompt, reuse_base, prefill_step_tokens, vision_uses,
         rewrite ? std::optional<std::uint32_t>(rewrite->frontier) : std::nullopt);
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
@@ -214,12 +214,16 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
+    // Service quanta project Shared-pace steps, the most steps the prompt can take.
     base->summary.service_work_quanta = projected_service_work(
-        base->summary, prompt, 0, prefill_chunk, cold_vision_uses, base->rewrite_checkpoint);
+        base->summary, prompt, 0, prefill_step_tokens(runtime::PrefillPace::Shared),
+        cold_vision_uses, base->rewrite_checkpoint);
     if (prompt.generation_recovery && base->sampling.p_less) {
         base->summary.service_work_quanta +=
             qwen3_6::GenerationRecoveryContext::maximum_attempts *
-            (schedule::prefill_chunk_count(reserved_context_tokens, prefill_chunk) + 2ULL);
+            (schedule::prefill_chunk_count(reserved_context_tokens,
+                                           prefill_step_tokens(runtime::PrefillPace::Shared)) +
+             2ULL);
     }
     return RequestBasePlan(std::move(base));
 }
@@ -354,11 +358,11 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         }
     }
 
-    plan.summary.service_work_quanta =
-        projected_service_work(plan.summary, prompt, plan.reuse_base, prefill_chunk,
-                               plan.vision ? std::span<const VisionUseSpan>(plan.vision->uses)
-                                           : std::span<const VisionUseSpan>{},
-                               plan.rewrite_checkpoint_capture);
+    plan.summary.service_work_quanta = projected_service_work(
+        plan.summary, prompt, plan.reuse_base, prefill_step_tokens(runtime::PrefillPace::Shared),
+        plan.vision ? std::span<const VisionUseSpan>(plan.vision->uses)
+                    : std::span<const VisionUseSpan>{},
+        plan.rewrite_checkpoint_capture);
     if (prompt.generation_recovery && plan.sampling.p_less) {
         plan.summary.service_work_quanta +=
             qwen3_6::GenerationRecoveryContext::maximum_attempts *
@@ -366,7 +370,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
                                                (plan.summary.effective_output_tokens == 0
                                                     ? 0U
                                                     : plan.summary.effective_output_tokens - 1U),
-                                           prefill_chunk) +
+                                           prefill_step_tokens(runtime::PrefillPace::Shared)) +
              2ULL);
     }
 }

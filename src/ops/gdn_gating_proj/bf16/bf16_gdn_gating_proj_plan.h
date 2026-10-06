@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
@@ -89,10 +90,19 @@ void bf16_gdn_gating_execute_candidate(Bf16GdnGatingScheduleId schedule, const T
 void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                               const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                               Tensor& g, Tensor& beta, cudaStream_t stream);
-// A non-null h_activation also receives the A8 activation of h. It requires the composed
-// (27B) schedule, whose normalization is a standalone RMSNorm; other schedules throw.
+
+// The quantized forms of the normalized input h a caller asks the norm to publish besides the
+// BF16 h: none, its A8 activation, or its A4 activation (at most one is non-null).
+struct Bf16GdnHiddenActivation {
+    A8Activation* a8 = nullptr;
+    A4Activation* a4 = nullptr;
+};
+
+// A quantized h output requires the composed (27B) schedule, whose normalization is a
+// standalone RMSNorm; other schedules throw.
+
 void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
-                                   A8Activation* h_activation, const Weight& a_weight,
+                                   Bf16GdnHiddenActivation h_activation, const Weight& a_weight,
                                    const Weight& b_weight, const Tensor& A_log,
                                    const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
                                    Tensor& beta, cudaStream_t stream);

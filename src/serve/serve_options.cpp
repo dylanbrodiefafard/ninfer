@@ -111,7 +111,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-disk-capacity off|N] [--kv-disk-location PATH] [--kv-disk-compress off|zstd] "
            "[--max-concurrency N] [--no-generation-recovery] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--mixed-forward N] [--mixed-forward-rounds N] "
+           "[--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F] "
@@ -236,6 +237,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--mixed-forward") {
+            options.mixed_forward = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--mixed-forward"), "mixed-forward"));
+        } else if (arg == "--mixed-forward-rounds") {
+            options.mixed_forward_rounds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--mixed-forward-rounds"), "mixed-forward-rounds"));
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -390,6 +397,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.mixed_forward % 256 != 0 || options.mixed_forward > options.prefill_chunk ||
+        options.mixed_forward > 4096) {
+        throw std::invalid_argument(
+            "--mixed-forward must be a multiple of 256 and at most min(--prefill-chunk, 4096)");
+    }
+    if (options.mixed_forward_rounds == 0) {
+        throw std::invalid_argument("--mixed-forward-rounds must be positive");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (default_max_tokens_explicit) {

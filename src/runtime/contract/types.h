@@ -105,12 +105,27 @@ struct BatchedGeneratedRound {
     std::array<bool, kMaximumConcurrency> cycle_exclusions{};
 };
 
+// Whether other requests are decode-ready while a prefill step runs. An Exclusive step advances
+// up to the startup prefill chunk; a Shared step advances up to the startup mixed-forward width so
+// the decode-ready requests run between steps.
+enum class PrefillPace : std::uint8_t {
+    Exclusive,
+    Shared,
+};
+
 struct PrefillStepResult {
     BeginSummary summary;
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
     bool host_input_consumed              = false;
+};
+
+// A decode round that also advanced the prefill owner by one step: a mixed DFlash round, whose
+// target forward runs the owner's prompt chunk beside the verify columns.
+struct MixedGeneratedRound {
+    BatchedGeneratedRound round;
+    PrefillStepResult prefill;
 };
 
 struct RoundBudget {

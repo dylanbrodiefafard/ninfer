@@ -11,9 +11,9 @@ int main() {
 
     try {
         constexpr std::array<std::int32_t, 11> kA16Cases{1, 4, 5, 8, 10, 15, 16, 17, 18, 19, 20};
-        constexpr std::array<std::int32_t, 25> kA4Cases{
-            1,  2,  3,   4,   5,   6,   8,   10,  12,   15,   18,   24,   36,
-            48, 49, 128, 255, 256, 257, 512, 777, 1024, 1500, 2048, 4096,
+        constexpr std::array<std::int32_t, 26> kA4Cases{
+            1,  2,  3,   4,   5,   6,   8,   10,  12,  15,   18,   24,   36,
+            48, 49, 128, 160, 255, 256, 257, 512, 777, 1024, 1500, 2048, 4096,
         };
         int failures = 0;
         failures += run_profile(

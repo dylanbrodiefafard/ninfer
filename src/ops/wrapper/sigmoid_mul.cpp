@@ -3,6 +3,7 @@
 // See docs/op-development.md §2.
 #include "ninfer/ops/sigmoid_mul.h"
 
+#include "ops/common/a4_activation_check.h"
 #include "ops/common/a8_activation_check.h"
 #include "ops/launcher/sigmoid_gate_mul.h"
 
@@ -68,6 +69,25 @@ void sigmoid_mul_a8(const Tensor& gate, const Tensor& x, A8Activation& activatio
         throw std::invalid_argument("sigmoid_mul_a8: activation must be [6144,T]");
     }
     detail::sigmoid_gate_mul_a8_launch(gate, x, activation, stream);
+}
+
+void sigmoid_mul_a4(const Tensor& gate, const Tensor& x, A4Activation& activation,
+                    cudaStream_t stream) {
+    constexpr std::int32_t kRows = 6144;
+    const std::int32_t tokens    = x.ne[1];
+    const auto valid             = [&](const Tensor& t) {
+        return t.dtype == DType::BF16 && t.ne[0] == kRows && t.ne[1] == tokens && t.ne[2] == 1 &&
+               t.ne[3] == 1 && t.is_contiguous() && t.data != nullptr &&
+               (reinterpret_cast<std::uintptr_t>(t.data) % 16) == 0;
+    };
+    if (tokens <= 0 || !valid(gate) || !valid(x)) {
+        throw std::invalid_argument(
+            "sigmoid_mul_a4: gate/x must be aligned contiguous BF16 [6144,T] with T>0");
+    }
+    if (detail::validate_a4_activation(activation, kRows, "sigmoid_mul_a4") != tokens) {
+        throw std::invalid_argument("sigmoid_mul_a4: activation must be [6144,T]");
+    }
+    detail::sigmoid_gate_mul_a4_launch(gate, x, activation, stream);
 }
 
 } // namespace ninfer::ops

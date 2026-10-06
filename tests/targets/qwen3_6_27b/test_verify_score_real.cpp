@@ -104,8 +104,11 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
             std::vector<TokenId>(documents[row].begin(), documents[row].begin() + prefix)));
         auto base   = p.plan_request_base(prompt, request);
         auto plan   = p.plan_request_for_lane(row, prompt, base);
-        auto step   = p.start_prefill_lane(row, std::move(prompt), std::move(plan), {});
-        while (!step.complete) { step = p.advance_prefill_lane(row); }
+        auto step   = p.start_prefill_lane(row, std::move(prompt), std::move(plan), {},
+                                           ninfer::runtime::PrefillPace::Exclusive);
+        while (!step.complete) {
+            step = p.advance_prefill_lane(row, ninfer::runtime::PrefillPace::Exclusive);
+        }
         p.resolve_prefill_lane(row, false);
         // Prefill consumed [0,prefix). Replace only its unexecuted sampled anchor with gold.
         p.sequences[row].ledger.back() = documents[row][prefix];
@@ -205,8 +208,8 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
                 const auto& first = p.model.gdn_layers[0];
                 target::Variant::gdn_norm_control_projection(
                     embedding, first.input_norm, target::TextConfig::rms_epsilon, first.projection,
-                    normalized, nullptr, g, beta, ninfer::targets::qwen3_6::TextPhase::Verify,
-                    p.work, p.device.stream, w);
+                    normalized, nullptr, nullptr, g, beta,
+                    ninfer::targets::qwen3_6::TextPhase::Verify, p.work, p.device.stream, w);
                 std::vector<std::uint16_t> bits(
                     static_cast<std::size_t>(target::TextConfig::hidden) * columns);
                 CUDA_CHECK(cudaMemcpyAsync(bits.data(), normalized.data,
@@ -393,8 +396,11 @@ void check_decode(execution::ProgramImplCore& p, const family::Frontend& fronten
             std::vector<TokenId>(documents[row].begin(), documents[row].begin() + prefix)));
         auto base   = p.plan_request_base(prompt, request);
         auto plan   = p.plan_request_for_lane(row, prompt, base);
-        auto step   = p.start_prefill_lane(row, std::move(prompt), std::move(plan), {});
-        while (!step.complete) { step = p.advance_prefill_lane(row); }
+        auto step   = p.start_prefill_lane(row, std::move(prompt), std::move(plan), {},
+                                           ninfer::runtime::PrefillPace::Exclusive);
+        while (!step.complete) {
+            step = p.advance_prefill_lane(row, ninfer::runtime::PrefillPace::Exclusive);
+        }
         p.resolve_prefill_lane(row, false);
         generated[row].push_back(p.sequences[row].ledger.back());
         budgets[row].generated_tokens_remaining = limit - 1;

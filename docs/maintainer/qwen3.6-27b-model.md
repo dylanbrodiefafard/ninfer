@@ -229,9 +229,9 @@ causal width-4 convolution and SiLU while storing the three channel ranges direc
 Q/K/V planes; it does not materialize and then split a second interleaved tensor. Q and K are then
 L2-normalized per head with epsilon `1e-6`. The production GDN Op always receives raw BF16
 convolution outputs. Its recurrent implementation keeps normalized values in FP32 registers; when
-it selects the chunked implementation, it privately materializes normalized BF16 q/k for the
-chunked body and recurrent tail. The decay and update controls `g` and `beta` are observable FP32
-values with the logical formula:
+it selects the chunked implementation (T >= 60, the last chunk possibly partial), it privately
+materializes normalized FP16 q/k for it. The decay and update controls `g` and `beta` are
+observable FP32 values with the logical formula:
 
 ```text
 g    = -exp(A_log) * softplus(a + dt_bias)

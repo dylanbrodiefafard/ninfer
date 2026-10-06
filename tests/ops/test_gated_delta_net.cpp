@@ -660,15 +660,22 @@ int main() {
         "gated_delta_net workspace accepted a non-divisible head map");
     failures += contract_rejection_cases();
 
-    // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
-    // boundary are all qualified directly against the same complete FP64 recurrence.
+    // Registered 27B/35B-A3B geometries, public state forms, the recurrent route, and the chunked
+    // route with a full or partial last chunk are all qualified directly against the same complete
+    // FP64 recurrence.
     failures += inplace_case({"27b decode fused-qk-norm", 16, 48, 1, true}, 12001u);
     failures += distinct_state_case({"27b raw-qk small-T", 16, 48, 7, false}, 12007u);
-    failures += distinct_state_case({"35b pre-chunk fused-qk-norm", 16, 32, 63, true}, 12063u);
+    failures += distinct_state_case({"27b widest recurrent raw-qk", 16, 48, 59, false}, 12059u);
+    failures +=
+        distinct_state_case({"27b narrowest chunked fused-qk-norm", 16, 48, 60, true}, 12060u);
+    failures +=
+        distinct_state_case({"35b single partial chunk fused-qk-norm", 16, 32, 63, true}, 12063u);
     failures += distinct_state_case({"27b exact chunk fused-qk-norm", 16, 48, 64, true}, 12064u);
     failures += distinct_state_case({"27b exact chunk raw-qk", 16, 48, 64, false}, 12164u);
     failures += inplace_case({"35b chunk-tail fused-qk-norm", 16, 32, 65, true}, 12065u);
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
+    failures += distinct_state_case({"27b raw-qk partial chunk", 16, 48, 100, false}, 12100u);
+    failures += distinct_state_case({"27b widest tail fused-qk-norm", 16, 48, 127, true}, 12127u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures +=
         distinct_state_case({"27b production-tail fused-qk-norm", 16, 48, 3404, true}, 15404u);

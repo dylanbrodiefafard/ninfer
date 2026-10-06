@@ -165,18 +165,24 @@ struct K16View {
     }
 };
 
+// K is the caller's input, whose last chunk may hold fewer than BT tokens: rows at or past
+// valid_rows are zero-filled without reading global memory. A zero K row adds nothing to the
+// state update.
 template <int THREADS, class T>
 __device__ __forceinline__ void issue_load_k_16(K16View<T> view, const T* gmem_base_row0,
-                                                int64_t gmem_row_stride, int tid) {
+                                                int64_t gmem_row_stride, int valid_rows, int tid) {
     constexpr int ELEMS_PER_COPY = 8;
     constexpr int COPIES_PER_ROW = kStateDim / ELEMS_PER_COPY;
     constexpr int COPIES         = BT * COPIES_PER_ROW;
 #pragma unroll
     for (int copy = tid; copy < COPIES; copy += THREADS) {
-        const int row = copy / COPIES_PER_ROW;
-        const int col = (copy - row * COPIES_PER_ROW) * ELEMS_PER_COPY;
-        cp_async<16>(view.logical_ptr(row, col),
-                     gmem_base_row0 + static_cast<int64_t>(row) * gmem_row_stride + col);
+        const int row    = copy / COPIES_PER_ROW;
+        const int col    = (copy - row * COPIES_PER_ROW) * ELEMS_PER_COPY;
+        const bool valid = row < valid_rows;
+        cp_async_zfill<16>(view.logical_ptr(row, col),
+                           gmem_base_row0 +
+                               static_cast<int64_t>(valid ? row : 0) * gmem_row_stride + col,
+                           valid ? 16 : 0);
     }
 }
 
@@ -201,7 +207,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                               const void* __restrict__ k_raw, const float* __restrict__ g_cumsum,
                               const float* state_in, void* __restrict__ v_new_raw,
                               void* __restrict__ h_chunk_raw, float* state_out, head_map qk_map,
-                              int chunks) {
+                              int tokens, int chunks) {
     using D                         = kernel_dims<NStrip>;
     using KType                     = std::conditional_t<K_F16, __half, __nv_bfloat16>;
     const auto* const k_in          = static_cast<const KType*>(k_raw);
@@ -330,7 +336,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     {
         issue_load_w_16<THREADS_K>(W_view, W_in + W_block_base, W_stride, tid);
         cp_commit();
-        issue_load_k_16<THREADS_K>(k_view, k_in + k_block_base, k_stride, tid);
+        issue_load_k_16<THREADS_K>(k_view, k_in + k_block_base, k_stride, min(BT, tokens), tid);
         cp_commit();
         if constexpr (K_F16) {
             issue_load_f16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
@@ -564,7 +570,8 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         if (chunk + 1 < chunks) {
             issue_load_w_16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
             cp_commit();
-            issue_load_k_16<THREADS_K>(k_view, k_in + k_base_next, k_stride, tid);
+            issue_load_k_16<THREADS_K>(k_view, k_in + k_base_next, k_stride,
+                                       min(BT, tokens - (chunk + 1) * BT), tid);
             cp_commit();
             if constexpr (K_F16) {
                 issue_load_f16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(

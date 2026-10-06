@@ -350,9 +350,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  std::unique_ptr<HostPinnedArena> kv_ram_arena)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), dflash_verify_width(plan.dflash_verify_width),
-      adaptive_draft(plan.adaptive_draft), p_less_draft_temperature(plan.p_less_draft_temperature),
-      captured_ks(plan.captured_ks), dflash_shapes(plan.dflash_shapes), dflash_arms_by_batch([&] {
+      mixed_forward(plan.mixed_forward), draft_window(plan.draft_window),
+      dflash_verify_width(plan.dflash_verify_width), adaptive_draft(plan.adaptive_draft),
+      p_less_draft_temperature(plan.p_less_draft_temperature), captured_ks(plan.captured_ks),
+      dflash_shapes(plan.dflash_shapes), dflash_arms_by_batch([&] {
           std::array<std::vector<std::uint32_t>, kMaximumConcurrency> arms;
           for (std::uint32_t b = 1; b <= kMaximumConcurrency; ++b) {
               arms[b - 1] = dflash_batch_arms(plan.dflash_shapes, b);
@@ -760,6 +761,7 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 runtime::PrefillStepResult
 ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& prompt,
                                     RequestPlan&& plan, runtime::TransientRegion transient,
+                                    runtime::PrefillPace pace,
                                     const qwen3_6::OutputSession* output) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence                    = sequences[lane];
@@ -1046,13 +1048,6 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
                     throw std::logic_error("DFlash prefill state is incomplete");
                 }
             }
-            *dflash_host_ingress          = {};
-            dflash_host_ingress->lanes[0] = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
         }
 
         const bool host_input_consumed = prompt.has_media() && !request_plan.vision;
@@ -1085,7 +1080,7 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
-        const runtime::PrefillStepResult first = advance_prefill(sequence, request);
+        const runtime::PrefillStepResult first = advance_prefill(sequence, request, pace);
         sequence.use_tick                      = next_use_tick_++;
         return first;
     } catch (...) {
@@ -1095,9 +1090,64 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
     }
 }
 
-runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t lane) {
+runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t lane,
+                                                                 runtime::PrefillPace pace) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(sequences[lane], requests[lane]);
+    return advance_prefill(sequences[lane], requests[lane], pace);
+}
+
+bool ProgramImplCore::prefill_mixable(std::uint32_t lane) const {
+    if (speculative_backend != SpeculativeBackend::DFlash || mixed_forward == 0 ||
+        lane >= max_concurrency) {
+        return false;
+    }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return false; }
+    const RequestControl::Prefill& staged = *request.prefill;
+    if (staged.vision || staged.vision_plan || staged.prompt.has_media() || staged.prepare_mtp ||
+        staged.mtp_bridge != MtpBridgeMode::None || staged.cursor >= staged.prompt_tokens) {
+        return false;
+    }
+    const std::uint32_t step = schedule::select_prefill_chunk(
+        staged.prompt_tokens - staged.cursor, prefill_step_tokens(runtime::PrefillPace::Shared));
+    const bool final_step = staged.cursor + step == staged.prompt_tokens;
+    return !(final_step && request.output != nullptr && request.output->has_tool_grammar());
+}
+
+runtime::MixedGeneratedRound
+ProgramImplCore::decode_batch_with_prefill(std::span<const std::uint32_t> lanes,
+                                           std::span<const runtime::RoundBudget> budgets,
+                                           std::uint32_t owner_lane) {
+    if (!prefill_mixable(owner_lane) ||
+        std::find(lanes.begin(), lanes.end(), owner_lane) != lanes.end()) {
+        throw std::logic_error("mixed DFlash round requires a mixable owner outside the batch");
+    }
+    runtime::MixedGeneratedRound mixed;
+    const PrefillChunkRunner runner =
+        [&](schedule::PrefillContext& state, std::span<const TokenId> ids,
+            std::uint32_t nominal_length, std::optional<std::uint32_t> rewrite_checkpoint_frontier,
+            bool finalize_at_end) {
+            schedule::MixedPrefillOwner chunk(state, ids, nominal_length,
+                                              rewrite_checkpoint_frontier, finalize_at_end);
+            const MixedRoundOwner owner{sequences[owner_lane], chunk};
+            mixed.round = decode_dflash_batch(lanes, budgets, &owner);
+            return chunk.result();
+        };
+    mixed.prefill = advance_prefill(sequences[owner_lane], requests[owner_lane],
+                                    runtime::PrefillPace::Shared, &runner);
+    return mixed;
+}
+
+void ProgramImplCore::stage_dflash_prefill_owner(const SequenceState& sequence) {
+    const std::uint32_t row                        = max_concurrency - 1U;
+    dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(sequence.lane);
+    const SequenceKVBundle& kv                     = sequence.kv.value();
+    dflash_host_ingress->dflash_kv_table_rows[row] = kv.backend ? kv.backend->bound_row() : 0;
+}
+
+std::uint32_t ProgramImplCore::prefill_step_tokens(runtime::PrefillPace pace) const noexcept {
+    return pace == runtime::PrefillPace::Shared && mixed_forward != 0 ? mixed_forward
+                                                                      : prefill_chunk;
 }
 
 void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
@@ -3620,11 +3670,16 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                            request.sampling_host.frequency_penalty != 0.0F;
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
+    bind_prefill_sampling(sequence, request);
+}
+
+void ProgramImplCore::bind_prefill_sampling(const SequenceState& sequence,
+                                            RequestControl& request) {
     const std::array<const qwen3_6::OutputSession*, 1> outputs{request.output};
     const std::array<ops::SamplingConfig, 1> configs{request.sampling_host};
     tool_masks->bind(outputs, configs);
-    // The prefill owner is exclusive. Root storage can be shared with later
-    // compact rounds; request sampling itself keeps no compact-row pointer.
+    // Root storage is shared with compact decode rounds; request sampling itself keeps no
+    // compact-row pointer.
     request.prefill_sampling_host = tool_masks->root(0, device.stream);
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.prefill_sampling_host,
@@ -3777,7 +3832,9 @@ static void prefill_tail_rate(const std::vector<std::uint32_t>& step_tokens,
 }
 
 runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& sequence,
-                                                            RequestControl& request) {
+                                                            RequestControl& request,
+                                                            runtime::PrefillPace pace,
+                                                            const PrefillChunkRunner* runner) {
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
     }
@@ -3843,13 +3900,24 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                schedule::select_prefill_chunk(staged.prompt_tokens - staged.cursor, prefill_chunk);
+            const std::uint32_t nominal = schedule::select_prefill_chunk(
+                staged.prompt_tokens - staged.cursor, prefill_step_tokens(pace));
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
+            if (final_candidate && staged.cursor != staged.base && request.output != nullptr &&
+                request.output->has_tool_grammar()) {
+                bind_prefill_sampling(sequence, request);
+            }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
-            if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (speculative_backend == SpeculativeBackend::DFlash && runner == nullptr) {
                 mark_workspace_usage(workspace_plan.dflash_context);
+                // Decode rounds between this owner's steps rewrite the whole ingress, so every
+                // chunk restages the owner's context-append row; a mixed round stages it with
+                // its verify rows.
+                stage_dflash_prefill_owner(sequence);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    io.dflash_decode.value().ingress.data, dflash_host_ingress,
+                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice, device.stream));
             }
             schedule::PrefillChunkResult result;
             const std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier =
@@ -3859,6 +3927,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             // A vision-free suffix of a multimodal prompt still has 3-axis positions. The text
             // prefill path would continue with 1-D RoPE and a zero delta, so a later cold prefill
             // of the same tokens would not match the checkpoint this suffix captures.
+            if (runner != nullptr && (staged.vision || staged.prompt.has_media())) {
+                throw std::logic_error("a prefill chunk runner takes text-only prompts");
+            }
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -3868,6 +3939,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 result = schedule::prefill_mrope_text_chunk(schedule_state, staged.prompt, nominal,
                                                             rewrite_checkpoint_capture_frontier,
                                                             final_candidate);
+            } else if (runner != nullptr) {
+                result =
+                    (*runner)(schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                              nominal, rewrite_checkpoint_capture_frontier, final_candidate);
             } else {
                 result = schedule::prefill_text_chunk(
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,
@@ -4456,7 +4531,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
-                                     std::span<const runtime::RoundBudget> budgets) {
+                                     std::span<const runtime::RoundBudget> budgets,
+                                     const MixedRoundOwner* owner) {
     std::array<bool, kMaximumConcurrency> cycle_exclusions{};
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
@@ -4566,7 +4642,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable   = nullptr;
         schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, width);
         ops::GqaExecutionEnvelope target_envelope{maximum_frontier + 1, maximum_target_tokens};
-        if (use_cuda_graph) {
+        // A mixed round's owner chunk has no captured graph; it runs eagerly.
+        if (use_cuda_graph && owner == nullptr) {
             DecodeGraphProfile& profile = select_graph_profile(
                 dflash_graphs, static_cast<std::uint32_t>(lanes.size()), maximum_frontier,
                 "DFlash batch", batch_k, dflash_exchange, live_w);
@@ -4615,6 +4692,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                     DFlashConfig::full_layers > 0 ? frontier : 0U);
             realized_extent = std::max(realized_extent, extent);
         }
+        // The row loop reset the ingress; the owner's context-append row follows the verify rows.
+        if (owner != nullptr) { stage_dflash_prefill_owner(owner->sequence); }
 
         schedule::DFlashBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
@@ -4630,15 +4709,18 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             calibrate_p_less};
 
         bind_tool_mask_batch(lanes, dflash_host_ingress->sampling);
-        mark_workspace_usage(workspace_plan.dflash_round);
+        mark_workspace_usage(owner != nullptr ? workspace_plan.dflash_mixed
+                                              : workspace_plan.dflash_round);
         const auto started = Clock::now();
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      batch_k, live_w, envelopes, target_envelope, !use_cuda_graph,
-                                      executable);
+                                      batch_k, live_w, envelopes, target_envelope,
+                                      !use_cuda_graph || owner != nullptr, executable,
+                                      owner != nullptr ? &owner->chunk : nullptr);
         const double seconds = synchronize_round_seconds(device, started);
         tool_masks->rethrow_error();
-        // Fallback (extent 0) is not a k-draft round; do not fit T(batch_k) from it.
-        if (adaptive_draft && realized_extent > 0) {
+        // Fallback (extent 0) is not a k-draft round, and a mixed round's time includes its
+        // owner's chunk; neither fits T(batch_k).
+        if (adaptive_draft && realized_extent > 0 && owner == nullptr) {
             qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_arm,
                                                  static_cast<float>(seconds), maximum_frontier);
         }
@@ -5013,14 +5095,14 @@ void ProgramImplCore::run_prefill_score(PreparedPromptData&& prompt, RequestPlan
                                         ScoreResult& result) {
     std::uint32_t cursor = 0;
     try {
-        runtime::PrefillStepResult step =
-            start_prefill_lane(0, std::move(prompt), std::move(plan), transient);
+        runtime::PrefillStepResult step = start_prefill_lane(
+            0, std::move(prompt), std::move(plan), transient, runtime::PrefillPace::Exclusive);
         if (step.processed_prompt_tokens > 0) {
             accumulate_prefill_nll(ids, cursor, step.processed_prompt_tokens, skip, result);
             cursor += step.processed_prompt_tokens;
         }
         while (!step.complete) {
-            step = advance_prefill_lane(0);
+            step = advance_prefill_lane(0, runtime::PrefillPace::Exclusive);
             if (step.processed_prompt_tokens > 0) {
                 accumulate_prefill_nll(ids, cursor, step.processed_prompt_tokens, skip, result);
                 cursor += step.processed_prompt_tokens;
@@ -5073,9 +5155,9 @@ void ProgramImplCore::run_decode_score(PreparedPromptData&& prompt,
     RequestPlan plan                  = plan_request_for_lane(0, prompt, base);
 
     try {
-        runtime::PrefillStepResult step =
-            start_prefill_lane(0, std::move(prompt), std::move(plan), transient);
-        while (!step.complete) { step = advance_prefill_lane(0); }
+        runtime::PrefillStepResult step = start_prefill_lane(
+            0, std::move(prompt), std::move(plan), transient, runtime::PrefillPace::Exclusive);
+        while (!step.complete) { step = advance_prefill_lane(0, runtime::PrefillPace::Exclusive); }
         SequenceState& sequence = sequences[0];
         if (sequence.ledger.size() != prefix + 1) {
             throw std::logic_error("decode score prefix ledger is not prompt plus sampled token");

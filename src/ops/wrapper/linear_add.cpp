@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear_add.h"
 
+#include "ops/common/a4_activation_check.h"
 #include "ops/common/a8_activation_check.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
@@ -270,6 +271,40 @@ void linear_add(const A8Activation& x, const Weight& w, Tensor& residual, cudaSt
     }
     detail::nvfp4_linear_add_w4a8_project(
         w, t, {static_cast<std::uint8_t*>(x.codes.data), static_cast<float*>(x.scales.data)},
+        residual, stream);
+}
+
+void linear_add(const A4Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+    if (w.qtype != QType::NVFP4) {
+        throw std::invalid_argument("linear_add: an A4 activation requires an NVFP4 weight");
+    }
+    detail::validate_nvfp4_weight(w, "nvfp4 linear_add");
+    std::int32_t min_tokens = 0;
+    if (w.n == detail::Nvfp4Residual6144Geometry::kOutputRows &&
+        w.k == detail::Nvfp4Residual6144Geometry::kInputRows) {
+        min_tokens = kA4Residual6144MinTokens;
+    } else if (w.n == detail::Nvfp4Residual17408Geometry::kOutputRows &&
+               w.k == detail::Nvfp4Residual17408Geometry::kInputRows) {
+        min_tokens = kA4Residual17408MinTokens;
+    } else {
+        throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
+    }
+    const std::int32_t t = detail::validate_a4_activation(x, w.k, "linear_add");
+    if (t < min_tokens) {
+        throw std::invalid_argument("linear_add: A4 activation narrower than the W4A4 route");
+    }
+    if (x.input_scale_divisor != w.input_scale_divisor) {
+        throw std::invalid_argument(
+            "linear_add: A4 activation input scale divisor differs from the weight's");
+    }
+    require_tensor(residual, DType::BF16, w.n, t, "residual");
+    if (!aligned_to(residual.data, 16) || overlaps(x.codes, residual) ||
+        overlaps(x.scales, residual)) {
+        throw std::invalid_argument(
+            "linear_add: residual must be 16-byte aligned and not overlap the activation");
+    }
+    detail::nvfp4_linear_add_w4a4_project(
+        w, t, {static_cast<std::uint8_t*>(x.codes.data), static_cast<std::uint8_t*>(x.scales.data)},
         residual, stream);
 }
 

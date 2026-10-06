@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -30,6 +31,18 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
  * sigmoid_mul output. Invalid arguments throw std::invalid_argument. No workspace.
  */
 void sigmoid_mul_a8(const Tensor& gate, const Tensor& x, A8Activation& activation,
+                    cudaStream_t stream);
+
+/**
+ * sigmoid_mul over gate/x [6144,T] whose BF16 result, bit-identical to sigmoid_mul's, is
+ * published only as an NVFP4 activation (ninfer/ops/a4_activation.h) of [6144,T] for a weight
+ * with activation.input_scale_divisor; x is not modified.
+ *
+ * gate/x are contiguous, 16-byte aligned BF16 with T >= 1. No input overlaps an output. The
+ * codes/scales are checked exactly against the A4 codec of the sigmoid_mul output. Invalid
+ * arguments throw std::invalid_argument. No workspace.
+ */
+void sigmoid_mul_a4(const Tensor& gate, const Tensor& x, A4Activation& activation,
                     cudaStream_t stream);
 
 } // namespace ninfer::ops
