@@ -10,6 +10,7 @@
 #include <utility>
 #include <iostream>
 #include <span>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -758,6 +759,25 @@ void test_p_less_calibration_picks_by_block_length() {
         q36::p_less_calibration_observe(calibration, 1.5f, alphas, k);
     } catch (const std::runtime_error&) { rejected = true; }
     expect(rejected, "p-less calibration: an overlap above one is rejected");
+    // The Program poisons the egress with NaN, so a round without the scoring kernel lands here.
+    rejected  = false;
+    alphas[3] = std::numeric_limits<float>::quiet_NaN();
+    try {
+        q36::p_less_calibration_observe(calibration, 1.5f, alphas, k);
+    } catch (const std::runtime_error&) { rejected = true; }
+    expect(rejected, "p-less calibration: an unwritten (NaN) overlap is rejected");
+
+    // Evidence that does not separate the grid resolves to the temperature nearest the prior
+    // rather than to the first grid entry.
+    q36::PLessDraftCalibration flat;
+    const std::vector<float> equal(grid * k, 0.0f);
+    for (int round = 0; round < 12; ++round) {
+        q36::p_less_calibration_observe(flat, 2.0f, equal, k);
+    }
+    static_assert(ninfer::ops::kPLessProposalCalibrationTemperatures[6] == 1.0f);
+    expect(q36::p_less_calibrated_draft_temperature(flat, 2.0f, k, 0.8f) == 0.8f &&
+               q36::p_less_calibrated_draft_temperature(flat, 2.0f, k, 0.95f) == 1.0f,
+           "p-less calibration: tied predictions stay at the prior's grid neighbour");
 }
 
 int main() {

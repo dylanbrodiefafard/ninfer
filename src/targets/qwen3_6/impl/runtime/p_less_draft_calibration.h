@@ -16,7 +16,14 @@
 // grid temperature with the greatest prediction for the round's k. The estimate scores token
 // verification of the drafted prefix; block verification accepts at least as much, and offline
 // replay ranked proposal laws identically under both. Until a temperature has kWarmRounds of
-// evidence, the Variant's prior applies.
+// evidence, the Variant's prior applies, and grid temperatures the evidence does not separate
+// resolve to the one nearest that prior.
+//
+// The product of per-hop overlaps is a deliberately low-variance estimate. The exact
+// block-verification acceptance P(tau >= j) = E[W_{j-1} * sum_c min(q'_j(c), p_{j-1} p'_j(c))],
+// with p the verifier's carried weight and W the importance weight of the realized prefix under
+// T', is unbiased for every T' but its per-round spread is about ten times larger on recorded
+// rounds, and inside this memory it selects worse than the product does.
 
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/targets/qwen3_6/round_state.h"
@@ -26,6 +33,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 
@@ -43,6 +51,8 @@ inline constexpr double kPLessCalibrationDiscount = 1.0 - 1.0 / 256.0;
 inline constexpr double kPLessCalibrationWarmRounds = 8.0;
 // The kernel's FP32 overlap may exceed 1 by rounding.
 inline constexpr float kPLessCalibrationRoundingSlack = 1.0e-3f;
+// Predicted lengths within this relative distance of the best are not separated by the evidence.
+inline constexpr double kPLessCalibrationTieTolerance = 1.0e-6;
 
 struct PLessDraftCalibrationBucket {
     float temperature       = 0.0f;
@@ -74,17 +84,27 @@ p_less_calibrated_draft_temperature(const PLessDraftCalibration& calibration, fl
         return prior;
     }
     const std::size_t hops = std::min<std::size_t>(k, kPLessCalibrationHops);
-    std::size_t best       = 0;
-    double best_length     = -1.0;
+    std::array<double, kPLessCalibrationGrid> lengths{};
+    double best_length = 0.0;
     for (std::size_t g = 0; g < kPLessCalibrationGrid; ++g) {
-        double length = 1.0;
+        lengths[g] = 1.0;
         for (std::size_t j = 0; j < hops; ++j) {
             // A hop no round has drafted adds nothing to any grid temperature.
-            if (bucket->weight[j] > 0.0) { length += bucket->prefix[j][g] / bucket->weight[j]; }
+            if (bucket->weight[j] > 0.0) { lengths[g] += bucket->prefix[j][g] / bucket->weight[j]; }
         }
-        if (length > best_length) {
-            best_length = length;
-            best        = g;
+        best_length = std::max(best_length, lengths[g]);
+    }
+    // Among the temperatures tied with the best, the nearest to the prior in log temperature.
+    std::size_t best     = 0;
+    double best_distance = std::numeric_limits<double>::infinity();
+    for (std::size_t g = 0; g < kPLessCalibrationGrid; ++g) {
+        if (lengths[g] < best_length * (1.0 - kPLessCalibrationTieTolerance)) { continue; }
+        const double distance =
+            std::abs(std::log(static_cast<double>(ops::kPLessProposalCalibrationTemperatures[g])) -
+                     std::log(static_cast<double>(prior)));
+        if (distance < best_distance) {
+            best_distance = distance;
+            best          = g;
         }
     }
     return ops::kPLessProposalCalibrationTemperatures[best];

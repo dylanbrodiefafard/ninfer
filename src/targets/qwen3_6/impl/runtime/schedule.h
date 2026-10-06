@@ -97,8 +97,10 @@ struct DFlashBatchContext {
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
     qwen3_6::ToolMaskExchange* tool_masks = nullptr;
-    // This chain round scores the p-less proposal calibration grid into host_egress; the Program
-    // reads it back exactly when it sets this.
+    // DFlash2 chain rounds score the p-less proposal calibration grid into host_egress. A
+    // captured graph fixes whether the scoring kernel exists, so this is the Program's startup
+    // property (calibrates_p_less_drafts()) at warm-up, capture, and every round alike, never a
+    // per-round choice. Packed-tree rounds do not score, and the Program does not read them.
     bool calibrate_p_less_drafts = false;
 };
 

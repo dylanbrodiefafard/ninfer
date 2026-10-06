@@ -888,7 +888,8 @@ in the same copy span). They are not admission wait. Live-lane context-checkpoin
 VRAM-resident restore that unpacks already-pinned lane GDN are not included. Throughput events repeat
 those two keys as interval sums. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, `live_draft_tokens`,
-and `rounds_per_draft`. Rates can be
+`p_less_draft_temperature` (the DFlash2 draft temperature of the request's last p-less chain round,
+calibrated or pinned; `0` when it ran none), and `rounds_per_draft`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`

@@ -308,9 +308,10 @@ int main() {
     outcome.metrics.speculative_draft_tokens    = 900;
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
-    outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
-    outcome.metrics.speculative_live_draft_tokens     = 3;
-    outcome.metrics.speculative_rounds_per_draft      = {0, 0, 0, 300};
+    outcome.metrics.speculative_accepted_per_position    = {290, 240, 190};
+    outcome.metrics.speculative_live_draft_tokens        = 3;
+    outcome.metrics.speculative_p_less_draft_temperature = 0.5F;
+    outcome.metrics.speculative_rounds_per_draft         = {0, 0, 0, 300};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -564,6 +565,8 @@ int main() {
               "speculative position counts missing");
     failures += check(done.at("speculative").at("live_draft_tokens") == 3,
                       "speculative live draft tokens missing");
+    failures += check(done.at("speculative").at("p_less_draft_temperature") == 0.5,
+                      "speculative p-less draft temperature missing");
     failures += check(done.at("speculative").at("rounds_per_draft") == Json::array({0, 0, 0, 300}),
                       "speculative rounds_per_draft missing");
 

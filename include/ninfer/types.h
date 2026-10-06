@@ -566,7 +566,10 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
-    std::uint32_t live_draft_tokens = 0;         // last live K used this request
+    std::uint32_t live_draft_tokens = 0; // last live K used this request
+    // DFlash2 draft temperature of the request's last p-less chain round, calibrated or pinned;
+    // 0 when the request ran none (greedy drafts, packed-tree rounds, or another backend).
+    float p_less_draft_temperature = 0.0F;
     std::vector<std::uint64_t> rounds_per_draft; // index = K, size N+1
 };
 

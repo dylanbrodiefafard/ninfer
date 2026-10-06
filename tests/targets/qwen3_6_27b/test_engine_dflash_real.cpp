@@ -1711,6 +1711,40 @@ int exercise_p_less_tool_history_reuse(const char* artifact) {
     return 0;
 }
 
+// The online p-less draft-temperature calibration must run in the captured graphs. The Program
+// poisons the calibration egress at startup and every scoring launch overwrites it, so a chain
+// round replayed from a graph without the scoring kernel fails the request instead of calibrating
+// on unwritten values. The run is long enough to leave the cold-start prior.
+int exercise_p_less_calibration_under_graphs(const char* artifact,
+                                             const std::vector<ninfer::TokenId>& prompt) {
+    constexpr const char* label     = "DFlash2 p-less calibration under CUDA Graphs";
+    constexpr std::uint32_t kTokens = 192;
+    ninfer::EngineOptions options =
+        speculative_engine_options(artifact, ninfer::SpeculativeBackend::DFlash, 4, 1);
+    options.speculative.dflash_p_less_draft_temperature.reset();
+    options.use_cuda_graph = true;
+    ninfer::Engine engine(options);
+    const ninfer::GenerationResult generated =
+        engine.generate(engine.prepare_tokens(prompt), p_less_options(kTokens, 7));
+    if (generated.generated_token_ids.size() != kTokens) {
+        std::cerr << label << " generation did not complete\n";
+        return 1;
+    }
+    if (generated.speculative.rounds < 24) {
+        std::cerr << label << " ran only " << generated.speculative.rounds
+                  << " speculative rounds\n";
+        return 1;
+    }
+    if (!(generated.speculative.p_less_draft_temperature > 0.0F)) {
+        std::cerr << label << " reported no p-less draft temperature\n";
+        return 1;
+    }
+    std::cout << "ok " << label
+              << " draft_temperature=" << generated.speculative.p_less_draft_temperature
+              << " rounds=" << generated.speculative.rounds << '\n';
+    return 0;
+}
+
 int exercise_p_less_target_likelihood(const char* artifact,
                                       const std::vector<ninfer::TokenId>& prompt) {
     constexpr const char* label     = "DFlash2 adaptive p-less target likelihood";
@@ -2052,6 +2086,9 @@ int main() {
         },
     };
 
+    if (std::getenv("NINFER_DFLASH_TEST_CALIBRATION_ONLY") != nullptr) {
+        return exercise_p_less_calibration_under_graphs(artifact, prompts[0]);
+    }
     if (std::getenv("NINFER_DFLASH_TEST_TREE_STATE_ONLY") != nullptr) {
         return exercise_p_less_tree_commit_matches_reconstruction(artifact, prompts[0]);
     }
@@ -2088,6 +2125,10 @@ int main() {
     }
 
     if (std::getenv("NINFER_DFLASH_TEST_SKIP_LIKELIHOOD") == nullptr) {
+        if (const int result = exercise_p_less_calibration_under_graphs(artifact, prompts[0]);
+            result != 0) {
+            return result;
+        }
         if (const int result = exercise_p_less_target_likelihood(artifact, prompts[0]);
             result != 0) {
             return result;

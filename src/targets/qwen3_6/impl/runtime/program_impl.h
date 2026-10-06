@@ -550,6 +550,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
     prepare_graphs();
+    if (calibrates_p_less_drafts()) {
+        // Poison the calibration egress with NaN. Every chain round's scoring launch rewrites
+        // the entries the host reads, so a NaN reaching p_less_calibration_observe proves a round
+        // ran without the scoring kernel, and that fails loudly instead of calibrating on stale
+        // values.
+        Tensor& calibration = io.dflash_decode.value().proposal_calibration;
+        CUDA_CHECK(cudaMemsetAsync(calibration.data, 0xFF, calibration.bytes(), device.stream));
+        device.synchronize();
+    }
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
@@ -3558,8 +3567,9 @@ void ProgramImplCore::prepare_graphs() {
         const std::uint32_t warm_k   = dflash_shapes.back().k;
         const std::uint32_t warm_w   = dflash_shapes.back().verify_width;
         schedule::DFlashBatchContext dflash_state{
-            execution_core(),     decoder->text_kv,    dflash.value(),    io.dflash_decode.value(),
-            *dflash_host_ingress, *dflash_host_egress, tail_hidden_store, tool_masks.get()};
+            execution_core(),         decoder->text_kv,     dflash.value(),
+            io.dflash_decode.value(), *dflash_host_ingress, *dflash_host_egress,
+            tail_hidden_store,        tool_masks.get(),     calibrates_p_less_drafts()};
         const auto batch_one_profiles         = dflash_graph_profiles(capacity, warm_k, 1, warm_w);
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
@@ -4664,8 +4674,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
     const bool dflash_exchange = kDFlashExchangeVariants == 1 || any_tool_grammar(lanes);
     // Packed-tree rounds draw at the Variant tree temperature and produce no calibration.
-    const bool calibrate_p_less =
-        calibrates_p_less_drafts() && !dflash_uses_tree_verify(batch_k, live_w);
+    const bool chain_round      = !dflash_uses_tree_verify(batch_k, live_w);
+    const bool calibrate_p_less = calibrates_p_less_drafts() && chain_round;
 
     try {
         DecodeGraphExecutable* executable   = nullptr;
@@ -4717,6 +4727,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     p_less_calibration, row_sampling.temperature, batch_k,
                     row_sampling.draft_temperature);
             }
+            if (chain_round && row_sampling.p_less != 0 && row_sampling.temperature > 0.0f &&
+                extent > 0) {
+                request.speculative_stats.p_less_draft_temperature = row_sampling.draft_temperature;
+            }
             materialize_sequence_kv(sequence, std::min(capacity, frontier + dflash_verify_width),
                                     DFlashConfig::full_layers > 0 ? frontier : 0U);
             realized_extent = std::max(realized_extent, extent);
@@ -4734,7 +4748,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *dflash_host_egress,
             tail_hidden_store,
             dflash_exchange ? tool_masks.get() : nullptr,
-            calibrate_p_less};
+            calibrates_p_less_drafts()};
 
         bind_tool_mask_batch(lanes, dflash_host_ingress->sampling);
         mark_workspace_usage(workspace_plan.dflash_round);
