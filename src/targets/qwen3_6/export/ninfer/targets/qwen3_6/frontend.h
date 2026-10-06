@@ -97,6 +97,13 @@ public:
                                                   std::uint32_t budget_remaining,
                                                   FinishReason limit_reason);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
+    // The channel each token accepted by the pending preview publishes its text to, in token
+    // order; nullopt for a token that publishes to neither channel (a reasoning marker, tool-call
+    // markup when tool output is enabled, a stop token, or whitespace stripped after reasoning).
+    // The attribution is per token: text a token contributed may still be held back or later
+    // trimmed by a stop string. Valid from preview() until commit_preview() or discard_preview().
+    [[nodiscard]] std::span<const std::optional<OutputChannel>>
+    preview_token_channels() const noexcept;
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     void discard_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
@@ -144,6 +151,9 @@ public:
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    // The exact bytes of one vocabulary token, special tokens included; valid while a copy of
+    // this Frontend lives. Throws std::out_of_range for an id outside the vocabulary.
+    [[nodiscard]] std::string_view token_bytes(TokenId token) const;
 
 private:
     class Impl;

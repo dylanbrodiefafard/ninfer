@@ -14,6 +14,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -301,8 +302,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 output.on_reasoning = [&](const std::string& text) {
                     write_stream_items(sink, *stream, stream->encoder->reasoning_delta(text));
                 };
-                output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, *stream, stream->encoder->content_delta(text));
+                output.on_content = [&](const std::string& text,
+                                        std::span<const TokenLogprobEntry> logprobs) {
+                    write_stream_items(sink, *stream,
+                                       stream->encoder->content_delta(text, logprobs));
                 };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||

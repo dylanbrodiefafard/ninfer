@@ -68,6 +68,16 @@ void synchronize_for_failure_cleanup(const DeviceContext& device) noexcept {
     }
 }
 
+// The host view of a frame's logprob records, or empty spans when no row of the round asked.
+template <std::size_t Slots>
+runtime::RoundLogprobs round_logprob_spans(const qwen3_6::RoundLogprobRecords<Slots>& records,
+                                           bool requested) {
+    if (!requested) { return {}; }
+    return runtime::RoundLogprobs{.token_logprobs = records.token_logprobs,
+                                  .top_ids        = records.top_ids,
+                                  .top_logprobs   = records.top_logprobs};
+}
+
 // Wall time of in-flight compute after host ingress is already filled. Graph
 // select, host packing, and KV materialize stay outside decode.ms so tok_s
 // matches the GPU round the engine log times, not the CPU setup around it.
@@ -370,7 +380,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
-      round_host(sizeof(TokenId)),
+      round_host(sizeof(PrefillRoundHost)),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::OrdinaryDecodeIngress) +
@@ -499,7 +509,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
 
-    host_tokens = static_cast<TokenId*>(round_host.data());
+    static_assert(std::is_standard_layout_v<PrefillRoundHost>);
+    auto* prefill_round_host = static_cast<PrefillRoundHost*>(round_host.data());
+    *prefill_round_host      = {};
+    host_tokens              = &prefill_round_host->token;
+    host_prefill_logprobs    = &prefill_round_host->logprobs;
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_6::OrdinaryDecodeIngress*>(ordinary_host->data());
         ordinary_host_egress  = reinterpret_cast<qwen3_6::OrdinaryDecodeEgress*>(
@@ -1013,7 +1027,9 @@ ProgramImplCore::start_prefill_lane(std::uint32_t lane, PreparedPromptData&& pro
                 ? prompt_tokens
                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
-        request.output = output;
+        request.output         = output;
+        request.token_logprobs = request_plan.token_logprobs;
+        set_device_i32(io.prefill_logprobs.row_enabled, request.token_logprobs ? 1 : 0);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -3701,6 +3717,11 @@ bool ProgramImplCore::any_tool_grammar(std::span<const std::uint32_t> lanes) con
     });
 }
 
+bool ProgramImplCore::any_token_logprobs(std::span<const std::uint32_t> lanes) const {
+    return std::any_of(lanes.begin(), lanes.end(),
+                       [&](std::uint32_t lane) { return requests[lane].token_logprobs; });
+}
+
 void ProgramImplCore::bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
                                            std::span<const ops::SamplingConfig> configs) {
     std::array<const qwen3_6::OutputSession*, kMaximumConcurrency> outputs{};
@@ -3721,6 +3742,14 @@ void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
 
 void ProgramImplCore::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
+                               device.stream));
+}
+
+void ProgramImplCore::copy_prefill_logprobs() {
+    CUDA_CHECK(cudaMemcpyAsync(host_prefill_logprobs,
+                               static_cast<const unsigned char*>(io.prefill_logprob_frame.data) +
+                                   offsetof(qwen3_6::PrefillLogprobFrame, records),
+                               sizeof(*host_prefill_logprobs), cudaMemcpyDeviceToHost,
                                device.stream));
 }
 
@@ -4019,6 +4048,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         copy_round_token();
+        const bool token_logprobs = request.token_logprobs;
+        if (token_logprobs) { copy_prefill_logprobs(); }
         std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp.value().draft_tokens.data,
@@ -4111,7 +4142,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
             .summary = summary,
-            .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
+            .round = runtime::GeneratedRound{.tokens   = std::span<const TokenId>(host_tokens, 1),
+                                             .logprobs = round_logprob_spans(*host_prefill_logprobs,
+                                                                             token_logprobs)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
             .host_input_consumed     = host_input_consumed,
@@ -4178,8 +4211,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->rope_positions[row] =
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv.value().text.bound_row();
-            ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->lanes[row]        = static_cast<std::int32_t>(sequence.lane);
+            ordinary_host_ingress->logprob_rows[row] = request.token_logprobs ? 1 : 0;
+            ordinary_host_ingress->sampling[row]     = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
 
@@ -4225,6 +4259,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         return runtime::BatchedGeneratedRound{
             .tokens =
                 std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(), lanes.size()),
+            .logprobs =
+                round_logprob_spans(ordinary_host_egress->logprobs, any_token_logprobs(lanes)),
             .cycle_exclusions = cycle_exclusions};
     } catch (...) {
         synchronize_for_failure_cleanup(device);
@@ -4367,6 +4403,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->mtp_kv_table_rows[row]  = kv.backend.value().bound_row();
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
+            mtp_host_ingress->logprob_rows[row]       = request.token_logprobs ? 1 : 0;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + extent + 1,
                                     std::min(capacity, frontier + extent + draft_window));
@@ -4508,6 +4545,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
                                                    lanes.size() * width),
+            .logprobs   = round_logprob_spans(mtp_host_egress->logprobs, any_token_logprobs(lanes)),
             .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
                                                         lanes.size()),
             .row_stride = width,
@@ -4669,10 +4707,11 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] =
                 sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
-            dflash_host_ingress->lanes[row]       = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->rope_deltas[row] = sequence.rope_delta;
-            dflash_host_ingress->sampling[row]    = request.sampling_host;
-            ops::SamplingConfig& row_sampling     = dflash_host_ingress->sampling[row];
+            dflash_host_ingress->lanes[row]        = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->rope_deltas[row]  = sequence.rope_delta;
+            dflash_host_ingress->logprob_rows[row] = request.token_logprobs ? 1 : 0;
+            dflash_host_ingress->sampling[row]     = request.sampling_host;
+            ops::SamplingConfig& row_sampling      = dflash_host_ingress->sampling[row];
             if (calibrate_p_less && row_sampling.draft_temperature > 0.0f) {
                 row_sampling.draft_temperature = qwen3_6::p_less_calibrated_draft_temperature(
                     p_less_calibration, row_sampling.temperature, batch_k,
@@ -4861,8 +4900,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
         }
         return runtime::BatchedGeneratedRound{
-            .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),
-                                                   lanes.size() * width),
+            .tokens = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),
+                                               lanes.size() * width),
+            .logprobs =
+                round_logprob_spans(dflash_host_egress->logprobs, any_token_logprobs(lanes)),
             .row_counts = std::span<const std::int32_t>(dflash_host_egress->licensed_counts.data(),
                                                         lanes.size()),
             .row_stride = width,

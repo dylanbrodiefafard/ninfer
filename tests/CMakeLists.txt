@@ -265,6 +265,10 @@ ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_logprobs_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_logprobs_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_logprobs_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash_capacity_real_test
   SOURCES targets/qwen3_6_27b/test_dflash_capacity_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)
@@ -393,6 +397,7 @@ set(ninfer_op_tests
   embedding
   argmax
   nll_from_logits
+  token_logprobs
   gdn_gating
   gdn_gating_proj
   rope
@@ -554,6 +559,7 @@ endforeach()
 # quick under racecheck, which tracks every shared-memory access; the GEMM-heavy linear and
 # projection sweeps take 5 to 50 minutes each under it and stay outside that label.
 ninfer_add_sanitizer_cases(ninfer_sampling_test)
+ninfer_add_sanitizer_cases(ninfer_token_logprobs_test)
 ninfer_add_sanitizer_cases(ninfer_speculative_round_test)
 ninfer_add_sanitizer_cases(ninfer_gqa_attention_test)
 ninfer_add_sanitizer_cases(ninfer_attn_input_proj_test)

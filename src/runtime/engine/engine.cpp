@@ -28,8 +28,12 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.requested_output_tokens    = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse         = options.execution.allow_prefix_reuse;
     resolved.execution.capture_context_checkpoint = options.execution.capture_context_checkpoint;
-    resolved.stop                                 = std::move(options.stop);
-    resolved.output                               = options.output;
+    if (options.output.top_logprobs && *options.output.top_logprobs > kMaximumTopLogprobs) {
+        throw std::invalid_argument("top_logprobs exceeds kMaximumTopLogprobs");
+    }
+    resolved.execution.token_logprobs = options.output.top_logprobs.has_value();
+    resolved.stop                     = std::move(options.stop);
+    resolved.output                   = options.output;
     return resolved;
 }
 
@@ -262,6 +266,16 @@ PromptCapabilities Engine::prompt_capabilities() const {
         [](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
             return target_ptr->loaded->frontend.prompt_capabilities();
+        },
+        impl_->active);
+}
+
+std::string Engine::token_bytes(TokenId token) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [token](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return std::string(target_ptr->loaded->frontend.token_bytes(token));
         },
         impl_->active);
 }

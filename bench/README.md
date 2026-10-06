@@ -697,6 +697,14 @@ cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_sele
 ./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
 ```
 
+`ninfer_token_logprobs_bench` times public `token_logprobs` at the same head geometry for the
+ordinary, chain, and widest verify frames, once with every slot active and once with every row
+disabled (the cost of a round in which no request asked for logprobs):
+
+```bash
+./build/bench/ninfer_token_logprobs_bench
+```
+
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence
 counts, batched sampling at `B=1,2,4,8`, and every MTP window `K=1..5`. With no arguments it runs
 the full greedy/stochastic matrix; individual routes are suitable for Nsight Compute capture:

@@ -232,11 +232,33 @@ void check_preparation_control(Clock::time_point deadline,
     }
 }
 
+// Resolves Engine token ids to the byte strings the wire formats report.
+std::vector<TokenLogprobEntry> to_logprob_entries(const ninfer::Engine& engine,
+                                                  std::span<const ninfer::TokenLogprob> records) {
+    std::vector<TokenLogprobEntry> entries;
+    entries.reserve(records.size());
+    for (const ninfer::TokenLogprob& record : records) {
+        TokenLogprobEntry entry{.bytes   = engine.token_bytes(record.token),
+                                .logprob = static_cast<double>(record.logprob),
+                                .top     = {}};
+        entry.top.reserve(record.top_count);
+        for (const ninfer::TokenAlternative& alternative : record.alternatives()) {
+            entry.top.push_back(
+                TokenLogprobAlternative{.bytes   = engine.token_bytes(alternative.token),
+                                        .logprob = static_cast<double>(alternative.logprob)});
+        }
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink* sink, std::uint64_t request_id,
+    ServiceOutputSink(const ninfer::Engine& engine, const StreamSink* sink,
+                      std::uint64_t request_id,
                       std::function<void(const ninfer::RecoveryEvent&)> on_recovery)
-        : sink_(sink), request_id_(request_id), on_recovery_(std::move(on_recovery)) {}
+        : engine_(engine), sink_(sink), request_id_(request_id),
+          on_recovery_(std::move(on_recovery)) {}
 
     void recovery_event(const ninfer::RecoveryEvent& event) override {
         write_console_log(event.kind == ninfer::RecoveryEventKind::Exhausted
@@ -246,24 +268,26 @@ public:
         if (on_recovery_) { on_recovery_(event); }
     }
 
+    // The wire formats report logprobs for content only, so reasoning records stop here.
     void publish(ninfer::OutputDelta delta) override {
-        if (sink_ == nullptr || delta.text.empty()) { return; }
+        if (sink_ == nullptr) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-        } else {
-            publish_content(delta.text);
+            if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+        } else if (!delta.text.empty() || !delta.logprobs.empty()) {
+            publish_content(delta.text, to_logprob_entries(engine_, delta.logprobs));
         }
     }
 
     std::size_t content_bytes() const noexcept { return content_bytes_; }
 
 private:
-    void publish_content(const std::string& text) {
-        if (text.empty() || !sink_->on_content) { return; }
-        sink_->on_content(text);
+    void publish_content(const std::string& text, std::span<const TokenLogprobEntry> logprobs) {
+        if (!sink_->on_content) { return; }
+        sink_->on_content(text, logprobs);
         content_bytes_ += text.size();
     }
 
+    const ninfer::Engine& engine_;
     const StreamSink* sink_    = nullptr;
     std::uint64_t request_id_  = 0;
     std::size_t content_bytes_ = 0;
@@ -475,7 +499,7 @@ GenerationOutcome
 GenerationService::run(PreparedRequest& prepared, std::uint64_t request_id, const StreamSink* sink,
                        std::function<bool()> is_cancelled,
                        std::function<void(const ninfer::RecoveryEvent&)> on_recovery) {
-    ServiceOutputSink output_sink(sink, request_id, std::move(on_recovery));
+    ServiceOutputSink output_sink(*engine_, sink, request_id, std::move(on_recovery));
     ninfer::OutputSink* public_sink = &output_sink;
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
@@ -492,6 +516,7 @@ GenerationService::run(PreparedRequest& prepared, std::uint64_t request_id, cons
     GenerationOutcome outcome;
     outcome.text              = std::move(result.content);
     outcome.reasoning         = std::move(result.reasoning);
+    outcome.content_logprobs  = to_logprob_entries(*engine_, result.content_logprobs);
     outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);

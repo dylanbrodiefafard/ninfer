@@ -182,6 +182,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .tool_masks      = state.tool_masks,
                              },
                              envelopes.target_verify, !compact);
+        qwen3_6::record_round_logprobs(frame.logprobs, target_logits, licensed_tokens,
+                                       &licensed_counts, nullptr, TextConfig::token_domain,
+                                       state.execution.device.stream);
         if (compact) {
             Tensor licensed_frame =
                 frame.licensed_tokens.slice(1, 0, batch_size).slice(0, 0, width);

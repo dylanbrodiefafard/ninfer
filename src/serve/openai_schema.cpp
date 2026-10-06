@@ -438,6 +438,82 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     }
 }
 
+// OpenAI: `logprobs` enables the report and `top_logprobs` (0..20) requires it.
+void parse_logprobs(const Json& body, GenerationRequest& out) {
+    const bool enabled                    = get_bool(body, "logprobs", false);
+    const std::optional<int> alternatives = get_int(body, "top_logprobs");
+    if (alternatives && (*alternatives < 0 || *alternatives > 20)) {
+        bad_request("top_logprobs must be between 0 and 20", "top_logprobs");
+    }
+    if (alternatives && !enabled) {
+        bad_request("top_logprobs requires logprobs to be true", "top_logprobs");
+    }
+    if (enabled) { out.top_logprobs = alternatives.value_or(0); }
+}
+
+// Valid UTF-8 for a JSON string: each maximal ill-formed subpart of `bytes` becomes U+FFFD
+// (Unicode 3.9, Table 3-7 well-formed byte sequences).
+std::string utf8_lossy(std::string_view bytes) {
+    std::string out;
+    out.reserve(bytes.size());
+    std::size_t at = 0;
+    while (at < bytes.size()) {
+        const auto lead = static_cast<unsigned char>(bytes[at]);
+        if (lead < 0x80) {
+            out.push_back(static_cast<char>(lead));
+            ++at;
+            continue;
+        }
+        std::size_t continuation = 0;
+        unsigned char low        = 0x80;
+        unsigned char high       = 0xBF;
+        if (lead >= 0xC2 && lead <= 0xDF) {
+            continuation = 1;
+        } else if (lead >= 0xE0 && lead <= 0xEF) {
+            continuation = 2;
+            if (lead == 0xE0) { low = 0xA0; }
+            if (lead == 0xED) { high = 0x9F; }
+        } else if (lead >= 0xF0 && lead <= 0xF4) {
+            continuation = 3;
+            if (lead == 0xF0) { low = 0x90; }
+            if (lead == 0xF4) { high = 0x8F; }
+        }
+        std::size_t length = 1;
+        bool well_formed   = continuation != 0;
+        for (std::size_t k = 0; well_formed && k < continuation; ++k) {
+            if (at + length >= bytes.size()) {
+                well_formed = false;
+                break;
+            }
+            const auto next = static_cast<unsigned char>(bytes[at + length]);
+            if (next < low || next > high) {
+                well_formed = false;
+                break;
+            }
+            ++length;
+            low  = 0x80;
+            high = 0xBF;
+        }
+        if (well_formed) {
+            out.append(bytes.substr(at, length));
+        } else {
+            out.append("\xEF\xBF\xBD");
+        }
+        at += length;
+    }
+    return out;
+}
+
+Json token_bytes_json(std::string_view bytes) {
+    Json out = Json::array();
+    for (const char byte : bytes) { out.push_back(static_cast<unsigned char>(byte)); }
+    return out;
+}
+
+Json choice_logprobs_json(std::span<const TokenLogprobEntry> entries) {
+    return Json{{"content", token_logprobs_json(entries)}, {"refusal", nullptr}};
+}
+
 void reject_unsupported_features(const Json& body) {
     for (const char* key : {"functions", "function_call"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
@@ -795,6 +871,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    parse_logprobs(body, out);
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
@@ -820,20 +897,38 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     return out;
 }
 
+Json token_logprobs_json(std::span<const TokenLogprobEntry> entries) {
+    Json out = Json::array();
+    for (const TokenLogprobEntry& entry : entries) {
+        Json alternatives = Json::array();
+        for (const TokenLogprobAlternative& alternative : entry.top) {
+            alternatives.push_back(Json{{"token", utf8_lossy(alternative.bytes)},
+                                        {"logprob", alternative.logprob},
+                                        {"bytes", token_bytes_json(alternative.bytes)}});
+        }
+        out.push_back(Json{{"token", utf8_lossy(entry.bytes)},
+                           {"logprob", entry.logprob},
+                           {"bytes", token_bytes_json(entry.bytes)},
+                           {"top_logprobs", std::move(alternatives)}});
+    }
+    return out;
+}
+
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
                                           const CompletionUsage& usage,
-                                          const CompletionTimings* timings) {
+                                          const CompletionTimings* timings,
+                                          const std::vector<TokenLogprobEntry>* logprobs) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
+    Json choice = {{"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}};
+    if (logprobs != nullptr) { choice["logprobs"] = choice_logprobs_json(*logprobs); }
     Json payload = {{"id", id},
                     {"object", "chat.completion"},
                     {"created", created},
                     {"model", model},
-                    {"choices", Json::array({Json{{"index", 0},
-                                                  {"message", std::move(message)},
-                                                  {"finish_reason", finish_reason}}})},
+                    {"choices", Json::array({std::move(choice)})},
                     {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
@@ -843,18 +938,19 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
                                                const CompletionUsage& usage,
-                                               const CompletionTimings* timings) {
+                                               const CompletionTimings* timings,
+                                               const std::vector<TokenLogprobEntry>* logprobs) {
     Json message = {{"role", "assistant"},
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
                     {"tool_calls", tool_calls_json(tool_calls, false)}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
+    Json choice = {{"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}};
+    if (logprobs != nullptr) { choice["logprobs"] = choice_logprobs_json(*logprobs); }
     Json payload = {{"id", id},
                     {"object", "chat.completion"},
                     {"created", created},
                     {"model", model},
-                    {"choices", Json::array({Json{{"index", 0},
-                                                  {"message", std::move(message)},
-                                                  {"finish_reason", "tool_calls"}}})},
+                    {"choices", Json::array({std::move(choice)})},
                     {"usage", usage_to_json(usage, timings)}};
     return payload.dump();
 }
@@ -879,6 +975,19 @@ std::string make_chat_chunk_content(const std::string& id, const std::string& mo
                                     std::int64_t created, const std::string& delta_text,
                                     bool include_usage) {
     return make_delta_chunk(id, model, created, "content", delta_text, include_usage);
+}
+
+std::string make_chat_chunk_content_logprobs(const std::string& id, const std::string& model,
+                                             std::int64_t created, const std::string& delta_text,
+                                             std::span<const TokenLogprobEntry> logprobs,
+                                             bool include_usage) {
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array({Json{{"index", 0},
+                                           {"delta", Json{{"content", delta_text}}},
+                                           {"logprobs", choice_logprobs_json(logprobs)},
+                                           {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
+    return sse_event(payload);
 }
 
 std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
