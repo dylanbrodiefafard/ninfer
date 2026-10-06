@@ -222,7 +222,6 @@ constexpr const char* kApiErrorCodes[] = {
     "parameter_not_supported",
     "unknown_parameter",
     "parallel_tool_calls_not_supported",
-    "logprobs_not_supported",
     "truncation_not_supported",
     "service_tier_not_supported",
     "stream_option_not_supported",

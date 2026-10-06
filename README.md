@@ -331,6 +331,8 @@ All three registered model IDs support:
 - compatible-prefix reuse;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;
+- per-token `logprobs` / `top_logprobs` on the OpenAI endpoints, scored from the target model's
+  full-vocabulary distribution under every decode route, speculative ones included;
 - prompt-rendered function tools and parsed tool calls.
 
 The supported identity additionally supports DFlash2 speculative decoding with draft windows from

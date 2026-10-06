@@ -74,6 +74,9 @@ public:
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
+    // The exact bytes a vocabulary token decodes to, special tokens included. One token may hold a
+    // partial UTF-8 sequence. Throws std::out_of_range for an id outside the vocabulary.
+    [[nodiscard]] std::string token_bytes(TokenId token) const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
     // Establishes queue membership synchronously. Delivery intent is fixed before queue

@@ -882,6 +882,8 @@ public:
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;
+    // One entry per token of the pending preview; see preview_token_channels().
+    std::vector<std::optional<OutputChannel>> preview_channels;
     bool preview_ready = false;
     std::unique_ptr<fi::ToolGrammarState> tool_grammar;
     std::shared_ptr<const ToolGrammarData> grammar_data;
@@ -973,8 +975,10 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         !model_stop_allowed(impl_->state, impl_->raw, impl_->tool_output_enabled);
     bool saw_tool_region = in_tool_region(impl_->state, impl_->tool_output_enabled);
 
+    impl_->preview_channels.clear();
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               bool reject_generated_round = false) {
+        impl_->preview_channels.resize(count);
         if (impl_->tool_grammar) { impl_->tool_grammar->preview(tokens.first(count)); }
         if (impl_->grammar_data && !impl_->raw) {
             impl_->preview_tools = impl_->tools;
@@ -1019,8 +1023,22 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         StopMatch match;
         const std::string_view bytes =
             impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+        const bool was_reasoning = impl_->preview_state.in_reasoning;
+        const bool was_stripping = impl_->preview_state.strip_content_leading;
+        const bool was_tool      = in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match, impl_->tool_output_enabled);
+        std::optional<OutputChannel> channel;
+        if (stop_token || model_stop || bytes.empty()) {
+            // Publishes no text.
+        } else if (was_reasoning) {
+            // The token that closes reasoning is the marker, not reasoning text.
+            if (impl_->preview_state.in_reasoning) { channel = OutputChannel::Reasoning; }
+        } else if (!was_tool && !in_tool_region(impl_->preview_state, impl_->tool_output_enabled) &&
+                   !(was_stripping && impl_->preview_state.strip_content_leading)) {
+            channel = OutputChannel::Content;
+        }
+        impl_->preview_channels.push_back(channel);
 
         if (match.found) {
             impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
@@ -1070,6 +1088,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     }
     impl_->preview_state = impl_->state;
     impl_->preview_output.clear();
+    impl_->preview_channels.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0,
                 impl_->tool_output_enabled);
     if (impl_->tool_grammar) { impl_->tool_grammar->preview({}); }
@@ -1079,6 +1098,12 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     }
     impl_->preview_ready = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
+}
+
+std::span<const std::optional<OutputChannel>>
+OutputSession::preview_token_channels() const noexcept {
+    if (impl_ == nullptr || !impl_->preview_ready) { return {}; }
+    return impl_->preview_channels;
 }
 
 PublishedOutput OutputSession::commit_preview() noexcept {
@@ -1415,6 +1440,14 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
+
+std::string_view Frontend::token_bytes(TokenId token) const {
+    if (!impl_->tokenizer->is_valid_token(token)) {
+        throw std::out_of_range("token is outside the checkpoint vocabulary: " +
+                                std::to_string(token));
+    }
+    return impl_->tokenizer->decode_token_bytes(token);
+}
 
 PreparedPrompt EncodedHistoryPrepare::prepare(const Frontend& frontend, PromptInput input,
                                               frontend_internal::EncodedHistoryCache& cache) {

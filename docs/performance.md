@@ -18,6 +18,35 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## Token logprobs (2026-10-06)
+
+`ops::token_logprobs` runs at the end of every decode round and scores a row only when its
+request asked for logprobs. RTX 5090, CUDA 13.1, 248077-token head, median of the public Op
+(`ninfer_token_logprobs_bench`):
+
+| Frame | every slot active | every row disabled |
+|---|---:|---:|
+| W=1 B=1 (ordinary) | 146.2 µs | 2.0 µs |
+| W=8 B=1 | 152.7 µs | 2.0 µs |
+| W=8 B=6 | 152.1 µs | 2.0 µs |
+| W=16 B=6 | 149.1 µs | 2.0 µs |
+
+One block owns one token slot, so the active time does not grow with the frame. It is set by the
+20 ranked selections (a block reduction each) after two passes over the column.
+
+Engine level, `ninfer_bench -pg 512,256 --spec dflash --draft-tokens 4 --lm-head-draft`, greedy,
+C=1, 83 rounds per repetition, mean decode seconds over interleaved runs against the build
+before the change:
+
+| Build | decode s | vs before |
+|---|---:|---:|
+| before the change (10 runs) | 1.1618 | |
+| no request asks (10 runs) | 1.1648 | +0.26% |
+| every request asks, 20 alternatives (4 runs) | 1.1694 | +0.9% (4-run baseline 1.1594) |
+
+Run-to-run spread is about 0.5%, so the disabled-row difference is not resolved from zero; the
+Op measurement puts it at 2 µs of a 14 ms round. The active cost matches 83 rounds of 0.15 ms.
+
 ## Direct A4 activation handoffs and short Exact attention (2026-10-04)
 
 RTX5090, `sm_120a`, CUDA13.1, Qwen3.8-27B NVFP4: direct producer-side group16

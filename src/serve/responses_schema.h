@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,8 @@ struct ResponsesRequest {
     nlohmann::json tool_choice = "auto";
     bool store                 = true;
     bool stream                = false;
+    // The request's top_logprobs value, echoed in the response object.
+    int top_logprobs = 0;
 };
 
 struct ResponsesRuntimeValues {
@@ -92,7 +95,10 @@ public:
 
     std::vector<std::string> start();
     std::vector<std::string> reasoning_delta(const std::string& text);
-    std::vector<std::string> content_delta(const std::string& text);
+    // `logprobs` holds the content tokens committed with this delta for a request that asked
+    // for them; a delta with tokens and no text is still emitted.
+    std::vector<std::string> content_delta(const std::string& text,
+                                           std::span<const TokenLogprobEntry> logprobs = {});
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltResponse& response);
     std::string failed(const ApiError& error);

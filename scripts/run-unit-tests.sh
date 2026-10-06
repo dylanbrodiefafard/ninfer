@@ -124,7 +124,7 @@ weight_tests() {
       echo "prefix, ram, recovery-kv, checkpoint, serve-prepend, load-plan"
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
-      echo "ninfer_qwen3_8_27b_dflash_real_test, recovery-kv"
+      echo "ninfer_qwen3_8_27b_dflash_real_test, logprobs, recovery-kv"
       ;;
     NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS)
       echo "ninfer_qwen3_8_27b_mtp_nvfp4_real_test, recovery-kv"

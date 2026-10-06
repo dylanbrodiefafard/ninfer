@@ -530,6 +530,8 @@ private:
         std::vector<TokenId> generated;
         std::string content;
         std::string reasoning;
+        std::vector<TokenLogprob> content_logprobs;
+        std::vector<TokenLogprob> reasoning_logprobs;
         std::optional<std::uint32_t> lane;
         std::atomic<bool> cancelled{false};
         bool decode_ready            = false;
@@ -651,13 +653,67 @@ private:
         return false;
     }
 
+    // The records of one committed round, split by the channel their tokens publish to.
+    struct ChannelLogprobs {
+        std::vector<TokenLogprob> content;
+        std::vector<TokenLogprob> reasoning;
+    };
+
+    // Builds the records of the tokens the pending preview accepted. `tokens` is the accepted
+    // prefix and `first_slot` its first slot in the round's logprob storage. Must run between
+    // preview() and commit_preview(), while the session still reports the token channels.
+    [[nodiscard]] static ChannelLogprobs collect_token_logprobs(const Request& request,
+                                                                const RoundLogprobs& logprobs,
+                                                                std::size_t first_slot,
+                                                                std::span<const TokenId> tokens) {
+        ChannelLogprobs records;
+        if (!request.options.output.top_logprobs || tokens.empty()) { return records; }
+        if (logprobs.empty()) {
+            throw std::logic_error("target round carries no token logprobs for a request row");
+        }
+        const auto channels = request.output.preview_token_channels();
+        if (channels.size() != tokens.size()) {
+            throw std::logic_error("output preview does not cover the accepted tokens");
+        }
+        const std::uint32_t top_count = *request.options.output.top_logprobs;
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            const std::optional<OutputChannel> channel = channels[i];
+            if (!channel) { continue; }
+            auto& channel_records =
+                *channel == OutputChannel::Reasoning ? records.reasoning : records.content;
+            channel_records.push_back(logprobs.record(first_slot + i, tokens[i], top_count));
+        }
+        return records;
+    }
+
+    // Moves each channel's records onto that channel's delta. A channel whose tokens published no
+    // text this round (text held for a stop-string or UTF-8 boundary) gets a textless delta.
+    static void attach_token_logprobs(targets::qwen3_6::PublishedOutput& output,
+                                      ChannelLogprobs records) {
+        const auto attach = [&output](OutputChannel channel, std::vector<TokenLogprob>& tokens) {
+            if (tokens.empty()) { return; }
+            for (OutputDelta& delta : output) {
+                if (delta.channel == channel) {
+                    delta.logprobs = std::move(tokens);
+                    return;
+                }
+            }
+            output.push_back(
+                OutputDelta{.channel = channel, .text = {}, .logprobs = std::move(tokens)});
+        };
+        attach(OutputChannel::Reasoning, records.reasoning);
+        attach(OutputChannel::Content, records.content);
+    }
+
     void append_output(const std::shared_ptr<Request>& request,
                        targets::qwen3_6::PublishedOutput output, bool notify = true) {
         if (output.empty()) { return; }
         for (OutputDelta& delta : output) {
-            std::string& full =
-                delta.channel == OutputChannel::Reasoning ? request->reasoning : request->content;
+            const bool reasoning = delta.channel == OutputChannel::Reasoning;
+            std::string& full    = reasoning ? request->reasoning : request->content;
             full += delta.text;
+            auto& logprobs = reasoning ? request->reasoning_logprobs : request->content_logprobs;
+            logprobs.insert(logprobs.end(), delta.logprobs.begin(), delta.logprobs.end());
         }
         if (request->delivery == OutputDelivery::TerminalOnly) { return; }
         {
@@ -787,6 +843,8 @@ private:
         result.generated_token_ids = std::move(request->generated);
         result.content             = std::move(request->content);
         result.reasoning           = std::move(request->reasoning);
+        result.content_logprobs    = std::move(request->content_logprobs);
+        result.reasoning_logprobs  = std::move(request->reasoning_logprobs);
         const auto calls           = request->output.tool_calls();
         if (reason != FinishReason::Cancelled) {
             result.tool_calls.assign(calls.begin(), calls.end());
@@ -1255,8 +1313,9 @@ private:
         complete_success(request, reason);
     }
 
-    bool resolve_round(const std::shared_ptr<Request>& request, TokenId token,
+    bool resolve_round(const std::shared_ptr<Request>& request, const GeneratedRound& round,
                        bool cancel_at_boundary) {
+        const TokenId token      = round.tokens.front();
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
             (void)request->output.preview_terminal(FinishReason::Cancelled);
@@ -1279,7 +1338,10 @@ private:
         request->generated.push_back(token);
         instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
+        ChannelLogprobs token_logprobs =
+            collect_token_logprobs(*request, round.logprobs, 0, tokens);
         auto published = request->output.commit_preview();
+        attach_token_logprobs(published, std::move(token_logprobs));
         if (!decision.finished()) { synchronize_stop_suppression(request, lane); }
         if (!request->first_token) { request->first_token = Clock::now(); }
         append_output(request, std::move(published), !decision.finished());
@@ -1488,9 +1550,7 @@ private:
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
         }
-        if (!resolve_round(request, step.round.tokens.front(), false)) {
-            request->decode_ready = true;
-        }
+        if (!resolve_round(request, step.round, false)) { request->decode_ready = true; }
         return true;
     }
 
@@ -2583,15 +2643,20 @@ private:
                 request->output.discard_preview();
                 continue;
             }
+            ChannelLogprobs token_logprobs;
             if (!cancelled[row]) {
-                const auto row_tokens = round.tokens.subspan(
-                    row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                const std::size_t first_slot = row * round.row_stride;
+                const auto row_tokens =
+                    round.tokens.subspan(first_slot, static_cast<std::size_t>(accepted[row]));
                 request->generated.insert(request->generated.end(), row_tokens.begin(),
                                           row_tokens.end());
                 request->budget->commit(accepted[row]);
                 consume_service_work(request, accepted[row]);
+                token_logprobs =
+                    collect_token_logprobs(*request, round.logprobs, first_slot, row_tokens);
             }
             auto published = request->output.commit_preview();
+            attach_token_logprobs(published, std::move(token_logprobs));
             if (!terminal[row]) { synchronize_stop_suppression(request, lane); }
             if (!request->first_token && accepted[row] != 0) {
                 request->first_token = Clock::now();

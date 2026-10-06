@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -297,9 +298,15 @@ struct ExecutionOptions {
     bool capture_context_checkpoint       = false;
 };
 
+// Largest number of ranked alternatives a TokenLogprob carries.
+inline constexpr std::uint32_t kMaximumTopLogprobs = 20;
+
 struct OutputOptions {
     bool raw                     = false;
     bool preserve_special_tokens = false;
+    // Set to report a TokenLogprob for every token published to a channel, each carrying this many
+    // ranked alternatives, in [0, kMaximumTopLogprobs]. Unset reports none.
+    std::optional<std::uint32_t> top_logprobs;
 };
 
 struct RequestOptions {
@@ -446,9 +453,38 @@ enum class FinishReason : std::uint8_t {
     Cancelled,
 };
 
+struct TokenAlternative {
+    TokenId token = 0;
+    float logprob = 0.0F;
+};
+
+// One generated token under the model's next-token distribution: the log-softmax of the
+// target model's logits at temperature 1 over the whole vocabulary, at the position that produced
+// the token. Sampling temperature, truncation, penalties, and tool-grammar masks do not
+// participate, so a token the sampler was steered to can carry a low logprob. With speculative
+// decoding the distribution is the target model's, never the draft's.
+struct TokenLogprob {
+    TokenId token = 0;
+    float logprob = 0.0F;
+    // The first top_count entries are the most likely tokens, most likely first, with the lower
+    // token id first among equal logits.
+    std::array<TokenAlternative, kMaximumTopLogprobs> top{};
+    std::uint32_t top_count = 0;
+
+    [[nodiscard]] std::span<const TokenAlternative> alternatives() const noexcept {
+        return std::span<const TokenAlternative>(top.data(), top_count);
+    }
+};
+
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+    // With OutputOptions::top_logprobs: the tokens committed to this channel by the round that
+    // produced the delta. Records are token-aligned rather than text-aligned: text held back for a
+    // stop-string or UTF-8 boundary arrives in a later delta, so text may be empty here, and a
+    // token trimmed by a stop string still has its record. Tokens that publish to no channel
+    // (reasoning markers, tool-call markup, stop tokens) have no record.
+    std::vector<TokenLogprob> logprobs;
 };
 
 enum class OutputDelivery : std::uint8_t {
@@ -585,6 +621,10 @@ struct GenerationResult {
     std::vector<TokenId> generated_token_ids;
     std::string content;
     std::string reasoning;
+    // Every OutputDelta::logprobs record of the request per channel, in generation order; empty
+    // without OutputOptions::top_logprobs.
+    std::vector<TokenLogprob> content_logprobs;
+    std::vector<TokenLogprob> reasoning_logprobs;
     // Complete, schema-validated calls. Tool markup is not streamed as content.
     std::vector<ToolCall> tool_calls;
     // Diagnostic names only when tools were not declared; never executable.

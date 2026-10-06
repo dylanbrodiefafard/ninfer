@@ -169,6 +169,10 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    qwen3_6::record_round_logprobs(
+        state.execution.io.prefill_logprobs, Tensor(logits.data, DType::BF16, {logits.ne[0], 1, 1}),
+        Tensor(state.execution.io.token.data, DType::I32, {1, 1}), nullptr, nullptr,
+        TextConfig::token_domain, state.execution.device.stream);
     state.execution.work.reset();
 }
 

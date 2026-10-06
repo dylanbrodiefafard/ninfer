@@ -1516,6 +1516,84 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+// Token logprob records follow preview_token_channels(): one entry per accepted token.
+int test_preview_token_channels(const Frontend& frontend) {
+    using Channel        = std::optional<ninfer::OutputChannel>;
+    const auto user_turn = [] {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        return message;
+    };
+    const auto channels_of = [](const ninfer::targets::qwen3_6::OutputSession& session) {
+        const auto span = session.preview_token_channels();
+        return std::vector<Channel>(span.begin(), span.end());
+    };
+    const Channel none;
+    const Channel content   = ninfer::OutputChannel::Content;
+    const Channel reasoning = ninfer::OutputChannel::Reasoning;
+
+    ninfer::PromptInput thinking_input;
+    thinking_input.messages.push_back(user_turn());
+    thinking_input.options.enable_thinking = true;
+    auto thinking_prompt                   = frontend.prepare(std::move(thinking_input));
+
+    // Reasoning text, the close marker, the stripped separator, answer text, and the model stop.
+    auto session = frontend.make_output_session(thinking_prompt, {});
+    const std::array<ninfer::TokenId, 5> turn{1, 248069, 14, 15, 6};
+    const auto decision = session.preview(turn, 8, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 5 &&
+                                    decision.finish_reason == ninfer::FinishReason::StopToken,
+                                "token channel preview did not accept the whole turn");
+    failures +=
+        check(channels_of(session) == std::vector<Channel>{reasoning, none, none, content, none},
+              "tokens of a thinking turn were attributed to the wrong channels");
+    (void)session.commit_preview();
+    failures += check(session.preview_token_channels().empty(),
+                      "token channels outlived their committed preview");
+
+    // A token that closes reasoning is the marker even when it also carries answer bytes.
+    auto split = frontend.make_output_session(thinking_prompt, {});
+    (void)split.preview(std::array<ninfer::TokenId, 2>{3, 4}, 4, ninfer::FinishReason::OutputLimit);
+    failures += check(channels_of(split) == std::vector<Channel>{reasoning, none},
+                      "the reasoning-closing token was attributed to a channel");
+    split.discard_preview();
+    failures += check(split.preview_token_channels().empty(),
+                      "token channels outlived their discarded preview");
+
+    // Attribution is per token: both tokens of a trimmed stop string stay content tokens.
+    ninfer::StopPolicy stop;
+    stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    auto stopped = frontend.make_output_session(frontend.prepare_tokens({0}), stop);
+    const auto stop_decision =
+        stopped.preview(std::array<ninfer::TokenId, 2>{1, 2}, 4, ninfer::FinishReason::OutputLimit);
+    failures += check(stop_decision.finish_reason == ninfer::FinishReason::StopString &&
+                          channels_of(stopped) == std::vector<Channel>{content, content},
+                      "stop-string tokens lost their content attribution");
+    (void)stopped.commit_preview();
+
+    // With tool output enabled, tool-call markup publishes to neither channel.
+    ninfer::ChatMessage assistant_call;
+    assistant_call.role = ninfer::ChatRole::Assistant;
+    assistant_call.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "", .media = {}});
+    assistant_call.tool_calls.push_back(
+        ninfer::ToolCall{.id = "", .name = "f", .arguments_json = "{}"});
+    ninfer::PromptInput tool_input;
+    tool_input.messages.push_back(user_turn());
+    tool_input.messages.push_back(std::move(assistant_call));
+    tool_input.messages.push_back(user_turn());
+    tool_input.options.enable_thinking = false;
+    auto tool = frontend.make_output_session(frontend.prepare(std::move(tool_input)), {});
+    (void)tool.preview(std::array<ninfer::TokenId, 4>{22, 21, 23, 20}, 8,
+                       ninfer::FinishReason::OutputLimit);
+    failures += check(channels_of(tool) == std::vector<Channel>{content, none, none, none},
+                      "tool-call markup tokens were attributed to content");
+    (void)tool.commit_preview();
+    return failures;
+}
+
 int test_structured_model_stop_eligibility(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2407,6 +2485,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_preview_token_channels(frontend);
     failures += test_structured_model_stop_eligibility(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_disabled_vision();

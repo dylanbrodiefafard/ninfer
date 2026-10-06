@@ -1,7 +1,8 @@
 #pragma once
 
-// Shared implementation primitives for include/ninfer/ops/sampling.h and
-// include/ninfer/ops/speculative_round.h. The ordering key is exact for finite BF16
+// Shared implementation primitives for include/ninfer/ops/sampling.h,
+// include/ninfer/ops/speculative_round.h, and the ordering key and block reductions of
+// include/ninfer/ops/token_logprobs.h. The ordering key is exact for finite BF16
 // logits (including numeric-zero ties); candidate storage is bounded by the
 // semantic top-20 cap and all global staging is supplied by the caller.
 

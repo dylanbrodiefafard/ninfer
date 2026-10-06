@@ -82,6 +82,8 @@ The endpoint supports:
 - `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`
   (top-p/top-k/penalties are ignored by default p-less; `--no-p-less-sampling` opts out);
 - one stop string or an array of stop strings;
+- `logprobs` and `top_logprobs` (0 to 20, which requires `logprobs: true`); see
+  [Token log probabilities](#token-log-probabilities);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages.
@@ -197,6 +199,39 @@ request's `save_ms` / `load_ms` (and disk `h2d_ms`). Process occupancy and lifet
 counters are on `GET /metrics`, not on the OpenAI usage object. The objects are omitted when this
 request did not copy.
 
+### Token log probabilities
+
+`logprobs: true` adds `choices[0].logprobs` to the response, and `top_logprobs: N` adds the `N`
+most likely alternatives at each position:
+
+```json
+{"content": [{"token": "42", "logprob": -0.0021, "bytes": [52, 50],
+              "top_logprobs": [{"token": "42", "logprob": -0.0021, "bytes": [52, 50]},
+                               {"token": "41", "logprob": -6.83, "bytes": [52, 49]}]}],
+ "refusal": null}
+```
+
+- **Distribution.** Each value is the log-softmax of the target model's logits at temperature 1
+  over the whole vocabulary, at the position that produced the token. Sampling temperature,
+  p-less truncation, penalties, and tool-grammar masks do not participate, so the values are
+  comparable across requests and a token the sampler was steered to can have a low logprob.
+  Speculative decoding does not change them: every emitted token is scored by the target model's
+  verification of that position, never by the draft. Ranked alternatives are ordered by logit,
+  lower token id first among equal logits.
+- **Which tokens.** `content` lists the tokens of the answer text. Reasoning tokens, reasoning
+  markers, tool-call markup of a tool-enabled request, and stop tokens are not listed.
+- **Token alignment.** Entries follow tokens, not released text. In a stream each content chunk
+  carries the tokens committed with it; a chunk may carry tokens with `content: ""` while their
+  text is held for a stop-string or UTF-8 boundary, and text released later arrives with an empty
+  list. A token trimmed from `content` by a stop string keeps its entry.
+- **`token` and `bytes`.** `bytes` is the token's exact byte string. `token` is the same bytes as
+  UTF-8 with each ill-formed sequence replaced by U+FFFD, because one token can hold part of a
+  multi-byte character.
+
+A request that asks for logprobs adds one scoring pass per decode round (about 0.15 ms on an RTX
+5090), shared by the requests batched in that round. Requests that do not ask pay nothing
+measurable.
+
 ### Multimodal request
 
 Start the server with `--vision` before sending media:
@@ -293,10 +328,10 @@ wire response contains typed `output` Items.
 | `tool_choice` | `auto` or `none` |
 | `parallel_tool_calls` | omitted or `true` |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
-| `top_logprobs` | omitted or `0` |
+| `top_logprobs` | integer in `[0,20]`: ranked alternatives per output-text token; a positive value also enables the logprob report |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, empty, or `["message.output_text.logprobs"]`, which enables the logprob report |
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
@@ -503,6 +538,11 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
 
+When the request enables the logprob report, the `output_text` part carries `logprobs`: one
+`{token, logprob, bytes, top_logprobs}` object per output-text token, with the semantics of the
+Chat Completions [token log probabilities](#token-log-probabilities). The response echoes the
+request's `top_logprobs`.
+
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
 an SSE response has started produce `response.failed`; validation and preparation errors remain
@@ -544,6 +584,10 @@ The normal lifecycle is:
 3. zero or more `response.reasoning_text.delta` or `response.output_text.delta` events;
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
+
+With the logprob report enabled, each `response.output_text.delta` carries the `logprobs` of the
+tokens committed with it (a delta may carry tokens and an empty `delta` while their text is
+held), and `response.output_text.done` carries the complete list.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
@@ -602,8 +646,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+any `include` other than `message.output_text.logprobs`, background execution, compaction,
+files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+accepted placeholders.
 
 ## Anthropic Messages
 

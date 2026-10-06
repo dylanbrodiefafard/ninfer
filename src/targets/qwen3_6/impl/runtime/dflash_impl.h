@@ -1246,6 +1246,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         }
         target_verify_accept(state.execution, state.continuation_hidden_store, card, verify_frame,
                              target_envelope, !compact);
+        // A tree round's token i was drawn at node fold_path[i]; a chain round's at column i.
+        qwen3_6::record_round_logprobs(frame.logprobs, target_logits, licensed_tokens,
+                                       &licensed_counts, use_tree ? &fold_path : nullptr,
+                                       TextConfig::token_domain, state.execution.device.stream);
         if (compact) {
             qwen3_6::copy_i32_panel(frame.licensed_tokens.slice(0, 0, vw).slice(1, 0, batch_size),
                                     licensed_tokens, state.execution.device.stream);

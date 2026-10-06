@@ -223,6 +223,11 @@ profile; the artifact identity selects the target. Qwen3.6-27B and Qwen3.8-27B b
 `NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` (BF16-sourced NVFP4 MTP). C=1 greedy MTP must emit 24
 tokens with speculative rounds; overlapping C=2 and C=3 must complete the requested
 lengths with MTP decode (packed MTP verify is not C=1-token-identical). k=3 and k=5.
+`ninfer_qwen3_8_27b_logprobs_real_test` (`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`) qualifies
+token logprobs through the public Engine on the ordinary, DFlash chain, packed-tree, adaptive,
+eager, and two-row concurrent routes: a greedy token must be rank 0 of its own record, records
+must agree with teacher-forced `Engine::score` on a non-speculative Engine, a row that did not
+ask must report nothing, and a streamed thinking turn's records must spell its published text.
 The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
 VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
 `allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,

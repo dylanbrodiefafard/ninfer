@@ -1275,6 +1275,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
                 }
+                // The MTP bridge below reuses io_.logits, so the token is scored here.
+                qwen3_6::record_round_logprobs(
+                    io_.prefill_logprobs, Tensor(logits.data, DType::BF16, {logits.ne[0], 1, 1}),
+                    Tensor(io_.token.data, DType::I32, {1, 1}), nullptr, nullptr, kCfg.token_domain,
+                    s);
             }
 
             if (prepare_mtp_prompt) {

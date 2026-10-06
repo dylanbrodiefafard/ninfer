@@ -15,6 +15,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -573,14 +574,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             const CompletionTimings timings = completion_timings_from_outcome(outcome);
             std::string response_body;
+            const std::vector<TokenLogprobEntry>* logprobs =
+                request.top_logprobs ? &outcome.content_logprobs : nullptr;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
                     id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage,
-                    &timings);
+                    &timings, logprobs);
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage, &timings);
+                    finish_reason_wire(outcome.finish_reason), usage, &timings, logprobs);
             }
             record_generation(log_context, std::move(outcome), generation_tools, generation_capture,
                               generation_media, generation_started);
@@ -600,6 +603,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
     const bool include_usage = stream->prepared.include_usage;
     const bool tool_capable  = stream->prepared.tool_capable;
+    const bool logprobs      = request.top_logprobs.has_value();
 
     // SSE hints: disable client/proxy caching and reverse-proxy response buffering
     // so tokens flush immediately. Content-Type is set by the chunked provider.
@@ -608,7 +612,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable, log_context,
+        [this, stream, id, created, model, include_usage, tool_capable, logprobs, log_context,
          generation_started, generation_tools, generation_capture,
          generation_media](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
@@ -619,11 +623,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             try {
                 write_stream_item(sink, *stream,
                                   make_chat_chunk_role(id, model, created, include_usage));
+                // Every content chunk of a logprobs request carries its token list, which is
+                // empty for text released without a newly committed content token.
+                const auto content_chunk = [&](const std::string& text,
+                                               std::span<const TokenLogprobEntry> tokens) {
+                    return logprobs
+                               ? make_chat_chunk_content_logprobs(id, model, created, text, tokens,
+                                                                  include_usage)
+                               : make_chat_chunk_content(id, model, created, text, include_usage);
+                };
                 StreamSink output;
-                output.on_content = [&](const std::string& text) {
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_content(id, model, created, text, include_usage));
+                output.on_content = [&](const std::string& text,
+                                        std::span<const TokenLogprobEntry> tokens) {
+                    write_stream_item(sink, *stream, content_chunk(text, tokens));
                 };
                 output.on_reasoning = [&](const std::string& text) {
                     write_stream_item(
@@ -641,10 +653,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
+                        write_stream_item(sink, *stream, content_chunk(std::string(remaining), {}));
                     }
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_tool_calls(
@@ -655,10 +664,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                             include_usage, &timings, &usage));
                 } else {
                     if (tool_capable && !remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
+                        write_stream_item(sink, *stream, content_chunk(std::string(remaining), {}));
                     }
                     const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                     write_stream_item(
@@ -873,7 +879,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     write_stream_item(sink, *stream,
                                       make_content_block_delta_thinking(thinking_index, text));
                 };
-                output.on_content = [&](const std::string& text) {
+                output.on_content = [&](const std::string& text,
+                                        std::span<const TokenLogprobEntry>) {
                     if (thinking_open) {
                         write_stream_item(sink, *stream,
                                           make_content_block_delta_signature(thinking_index, id));

@@ -88,6 +88,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     bool allow_prefix_reuse         = false;
     bool force_cold_prefill         = false;
     bool capture_context_checkpoint = false;
+    bool token_logprobs             = false;
 };
 
 template <>
@@ -113,6 +114,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint64_t disk_committed_generation = 0;
     bool capture_context_checkpoints        = false;
     bool capture_context_checkpoint         = false;
+    bool token_logprobs                     = false;
     std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
 };
 
@@ -289,7 +291,9 @@ struct RequestControl {
     std::optional<Prefill> prefill;
     qwen3_6::AdaptiveDraftState adaptive;
     bool typical_cycle_reasoning = false;
-    std::uint32_t prompt_tokens  = 0;
+    // The occupying request reports token logprobs: its rounds set the frame's row flag.
+    bool token_logprobs         = false;
+    std::uint32_t prompt_tokens = 0;
 };
 
 class ProgramImplCore {
@@ -332,6 +336,7 @@ public:
     void bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
                               std::span<const ops::SamplingConfig> configs);
     [[nodiscard]] bool any_tool_grammar(std::span<const std::uint32_t> lanes) const;
+    [[nodiscard]] bool any_token_logprobs(std::span<const std::uint32_t> lanes) const;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -502,8 +507,15 @@ public:
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
 
+    // Pinned landing area of the prefill-sampled token and its logprob record.
+    struct PrefillRoundHost {
+        TokenId token = 0;
+        qwen3_6::RoundLogprobRecords<1> logprobs;
+    };
+
     PinnedHostBuffer round_host;
-    TokenId* host_tokens = nullptr;
+    TokenId* host_tokens                                   = nullptr;
+    qwen3_6::RoundLogprobRecords<1>* host_prefill_logprobs = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
@@ -538,6 +550,7 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void copy_prefill_logprobs();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
