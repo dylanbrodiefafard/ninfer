@@ -42,6 +42,17 @@ std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
             result.push_back(index);
         }
     }
+    // Normwise and gross-error estimates need a spread across the logical output. Include the
+    // edge and quarter coordinates above alongside an evenly spaced grid.
+    constexpr std::int32_t kSamples = 32;
+    for (std::int32_t sample = 0; sample < kSamples; ++sample) {
+        const std::int32_t index = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(extent - 1) * sample) / (kSamples - 1));
+        if (std::find(result.begin(), result.end(), index) == result.end()) {
+            result.push_back(index);
+        }
+    }
+    std::sort(result.begin(), result.end());
     return result;
 }
 
@@ -137,8 +148,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{512, ops::LinearPolicy::AllowA4},  Invocation{513, ops::LinearPolicy::AllowA4},
         Invocation{752, ops::LinearPolicy::AllowA4},  Invocation{777, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4}, Invocation{1025, ops::LinearPolicy::AllowA4},
-        Invocation{1279, ops::LinearPolicy::AllowA4}, Invocation{2048, ops::LinearPolicy::AllowA4},
-        Invocation{4096, ops::LinearPolicy::AllowA4},
+        Invocation{1279, ops::LinearPolicy::AllowA4}, Invocation{1500, ops::LinearPolicy::AllowA4},
+        Invocation{2048, ops::LinearPolicy::AllowA4}, Invocation{4096, ops::LinearPolicy::AllowA4},
     };
     constexpr std::int32_t kMaximumTokens = 4096;
     quantized_weight::PatternedWeightOptions options;

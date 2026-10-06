@@ -172,6 +172,17 @@ The restored `-Werror` build passes. Focused NVFP4 Linear/LinearAdd, BF16 Linear
 projection oracles pass. Both original real DFlash mixed cases pass with two actual mixed rounds
 and owner/decode-lane greedy parity. The follow-up is complete.
 
+The prefill work is committed at `74541d23` and pushed on
+`perf/mixed-prefill-small-chunks`; the remote `experimental` branch contains a separate
+concurrent commit. The A4 T=1500 diagnostic reproduces on base `945515ea`. Its complete
+7,680,000-output FP64 oracle passes the unchanged criterion on both base and retained trees;
+the 49-output sample was unrepresentative. LinearAdd now retains every original sampled
+coordinate, adds a 32-point grid on each axis, and includes T=1500 for both residual geometries.
+The expanded A16/A8/A4 suite passes. Numerical evidence is recorded in `docs/performance.md`,
+section "LinearAdd A4 numerical follow-up (2026-10-06)". The fix is complete: read-only review,
+`-Werror` build, the fast suite (119 passes and two artifact-dependent skips), affected
+clang-tidy (zero diagnostics), and formatting/file checks pass.
+
 Score-table measurement and scheduling await the next joint decision with the user; no
 scheduling policy is selected.
 
