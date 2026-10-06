@@ -5,6 +5,7 @@
 // See docs/op-development.md §2.
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h>
@@ -19,6 +20,10 @@ void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cu
 
 // [6144,T] gate/x publishing only the A8 activation; assumes validated inputs.
 void sigmoid_gate_mul_a8_launch(const Tensor& gate, const Tensor& x, A8Activation& activation,
+                                cudaStream_t stream);
+
+// [6144,T] gate/x publishing only the A4 activation; assumes validated inputs.
+void sigmoid_gate_mul_a4_launch(const Tensor& gate, const Tensor& x, A4Activation& activation,
                                 cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

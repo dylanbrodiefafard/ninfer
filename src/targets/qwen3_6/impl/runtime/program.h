@@ -21,6 +21,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/tool_masks.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -28,6 +29,7 @@
 
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -317,12 +319,24 @@ public:
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult
     start_prefill_lane(std::uint32_t lane, PreparedPromptData&& prompt, RequestPlan&& plan,
-                       runtime::TransientRegion transient,
+                       runtime::TransientRegion transient, runtime::PrefillPace pace,
                        const qwen3_6::OutputSession* output = nullptr);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane,
+                                                                  runtime::PrefillPace pace);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    // Whether the prefilling request on `lane` can advance its next step inside a DFlash decode
+    // round: DFlash with a mixed-forward width, a text-only prompt with tokens left, and no
+    // tool-grammar sampling in that step (its root mask shares tool-mask row 0 with verify).
+    [[nodiscard]] bool prefill_mixable(std::uint32_t lane) const;
+    // One mixed DFlash round: decodes `lanes` and advances the prefill owner on `owner_lane` by
+    // one Shared-pace step in the same target forward. Requires prefill_mixable(owner_lane) and
+    // an owner outside `lanes`.
+    [[nodiscard]] runtime::MixedGeneratedRound
+    decode_batch_with_prefill(std::span<const std::uint32_t> lanes,
+                              std::span<const runtime::RoundBudget> budgets,
+                              std::uint32_t owner_lane);
     void set_suppressed_tokens_lane(std::uint32_t lane, std::span<const TokenId> tokens);
     void clear_suppressed_tokens_lane(std::uint32_t lane);
     void set_typical_cycle_reasoning_lane(std::uint32_t lane, bool enabled);
@@ -428,6 +442,8 @@ public:
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
+    // Shared-pace prefill step width; 0 runs Shared steps at the full prefill chunk.
+    const std::uint32_t mixed_forward;
     const std::uint32_t draft_window;
     const std::uint32_t dflash_verify_width;
     const bool adaptive_draft;
@@ -534,8 +550,29 @@ private:
     void copy_round_token();
     void resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                          std::uint32_t accepted_tokens, bool terminal);
-    [[nodiscard]] runtime::PrefillStepResult advance_prefill(SequenceState& sequence,
-                                                             RequestControl& request);
+    // Runs one owner text chunk in place of the ordinary chunk launch.
+    using PrefillChunkRunner = std::function<schedule::PrefillChunkResult(
+        schedule::PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+        std::optional<std::uint32_t> rewrite_checkpoint_frontier, bool finalize_at_end)>;
+
+    // The owner of a mixed DFlash round and its chunk.
+    struct MixedRoundOwner {
+        const SequenceState& sequence;
+        schedule::MixedPrefillOwner& chunk;
+    };
+
+    [[nodiscard]] runtime::PrefillStepResult
+    advance_prefill(SequenceState& sequence, RequestControl& request, runtime::PrefillPace pace,
+                    const PrefillChunkRunner* runner = nullptr);
+    // Rebinds the owner's first-token sampling, whose tool-grammar root mask lives in tool-mask
+    // row 0 that decode rounds between the owner's steps rebind.
+    void bind_prefill_sampling(const SequenceState& sequence, RequestControl& request);
+    // Writes the prefill owner's lane and DFlash KV row into the last DFlash ingress row, the row
+    // the DFlash prefill sink appends through. A verify batch beside an owner holds at most
+    // max_concurrency - 1 rows, so it never uses that row.
+    void stage_dflash_prefill_owner(const SequenceState& sequence);
+    // The most prompt tokens one prefill step at `pace` advances.
+    [[nodiscard]] std::uint32_t prefill_step_tokens(runtime::PrefillPace pace) const noexcept;
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -549,7 +586,8 @@ private:
                      std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
-                        std::span<const runtime::RoundBudget> budgets);
+                        std::span<const runtime::RoundBudget> budgets,
+                        const MixedRoundOwner* owner = nullptr);
     // Reserves the lane's KV bundle and returns it; the lane must not already own one.
     SequenceKVBundle& reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                                           std::uint32_t backend_pages);

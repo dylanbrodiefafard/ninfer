@@ -189,9 +189,18 @@ void Variant::mtp_attention_output(const Tensor& attention, const Weight& weight
     ops::linear_add(attention, weight, residual, workspace, stream);
 }
 
-void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                   Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
+bool Variant::allocate_gdn_input_a4(const GdnProjectionWeights&, qwen3_6::TextPhase, std::int32_t,
+                                    std::int32_t, WorkspaceArena&, ops::A4Activation&) {
+    return false;
+}
+
+void Variant::gdn_input_projection(const Tensor& hidden, const ops::A4Activation* hidden_a4,
+                                   const GdnProjectionWeights& weights, Tensor& qkv,
+                                   Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena&,
+                                   cudaStream_t stream) {
+    if (hidden_a4 != nullptr) {
+        throw std::logic_error("qwen3_6_35b_a3b: the GDN input projection takes no A4 activation");
+    }
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1] * hidden.ne[2])});
     ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, stream);
@@ -236,10 +245,13 @@ void Variant::gdn_output_projection(const Tensor& output, const Tensor& norm_wei
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                           float eps, const GdnProjectionWeights& weights,
-                                          Tensor& hidden, ops::A8Activation*, Tensor& g,
-                                          Tensor& beta, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream,
-                                          std::int32_t route_tokens) {
+                                          Tensor& hidden, ops::A8Activation*,
+                                          ops::A4Activation* hidden_a4, Tensor& g, Tensor& beta,
+                                          qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                          cudaStream_t stream, std::int32_t route_tokens) {
+    if (hidden_a4 != nullptr) {
+        throw std::logic_error("qwen3_6_35b_a3b: the GDN norm publishes no A4 activation");
+    }
     if (route_tokens > 0 && route_tokens < residual.ne[1]) {
         for (std::int32_t offset = 0; offset < residual.ne[1]; offset += route_tokens) {
             Tensor hidden_panel = hidden.slice(1, offset, route_tokens);
@@ -365,6 +377,11 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
                                                                           std::int32_t last) {
     return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
                                                               TextConfig::hidden, first, last);
+}
+
+std::size_t Variant::gdn_input_a4_activation_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
+                                                            std::int32_t) {
+    return 0;
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,

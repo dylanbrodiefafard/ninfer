@@ -796,6 +796,11 @@ int main() {
     ctx.synchronize();
     failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "zeroed conv slot0");
     failures += expect_device_byte(slotted.recurrent_slot(0, 0), 0, "zeroed recurrent slot0");
+    failures += expect_device_byte(slotted.conv_slot(1, 0), 0, "zeroed conv layer1 slot0");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(1, 0), 0, "zeroed recurrent layer1 slot0");
+    failures +=
+        expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "zero kept recurrent layer1 slot2");
     failures += expect_device_byte(slotted.conv_slot(0, 1), 0xaa, "zero kept 2d conv dest");
     failures +=
         expect_device_byte(slotted.recurrent_slot(0, 1), 0xbb, "zero kept 2d recurrent dest");

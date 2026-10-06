@@ -9,7 +9,8 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope, bool reset_workspace) {
+                          ops::GqaExecutionEnvelope envelope, bool reset_workspace,
+                          const MixedOwnerForward* owner) {
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
@@ -21,6 +22,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         tree != (frame.accepted_column.data != nullptr) ||
         tree != (frame.fold_path.data != nullptr)) {
         throw std::logic_error("speculative tree verify frame is incomplete");
+    }
+    if (owner != nullptr && frame.feature_sink == nullptr) {
+        throw std::logic_error("a mixed verify forward requires a DFlash feature sink");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
     cudaEvent_t masks_ready = nullptr;
@@ -43,7 +47,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens,
-                                 *frame.feature_sink, reset_workspace, masks_ready);
+                                 *frame.feature_sink, reset_workspace, masks_ready, owner);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,

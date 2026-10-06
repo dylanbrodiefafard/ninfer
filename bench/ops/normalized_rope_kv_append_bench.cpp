@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
         }
         if (test::require_cuda() != 0) { return 1; }
         DeviceContext device;
-        const cudaStream_t stream = device.stream;
+        cudaStream_t stream = device.stream;
         std::puts("B,W,C,execution,median_us,min_us,p95_us,graph_nodes");
         const std::vector<int> batches =
             selected_batch == 0 ? std::vector<int>{1, 2, 6} : std::vector<int>{selected_batch};

@@ -25,7 +25,8 @@ struct KvRows {
     }
 };
 
-// Every 16/32-row MMA tile and every 128-row GEMV scale tile stays within one 1024-row output.
+// Every MMA tile (at most 128 output rows) and every 128-row GEMV scale tile stays within one
+// 1024-row output.
 // The original 6144-row weight geometry controls strides; only the output grid is shortened.
 template <int RowOffset>
 struct KvOutput {

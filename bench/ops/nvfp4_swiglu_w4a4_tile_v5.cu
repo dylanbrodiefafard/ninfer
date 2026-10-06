@@ -94,13 +94,11 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const SwiGluRows<Schedule> row_policy{};
     const SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, SwiGluOutput,
-                          SwiGluRows<Schedule>, true, WeightCache>
-        <<<grid, Schedule::kThreads, 0, stream>>>(
-            activation, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), kT, alpha, Nvfp4IdentityEpilogue{},
-            output, row_policy);
-    CUDA_CHECK(cudaGetLastError());
+    launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4IdentityEpilogue, SwiGluOutput,
+                          SwiGluRows<Schedule>, true, WeightCache>(
+        grid, stream, activation, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), kT, alpha, Nvfp4IdentityEpilogue{}, output,
+        row_policy);
 }
 
 using LaunchFn = void (*)(const Tensor&, const Weight&, Tensor&, Nvfp4W4a4Workspace, cudaStream_t);
@@ -194,7 +192,7 @@ int main() {
                 }
                 auto scope         = ws_w4.scope();
                 const auto scratch = allocate_nvfp4_w4a4_workspace(ws_w4, kT, kHidden);
-                launch_nvfp4_w4a4_quantize(x, gate.weight, scratch, Nvfp4ScaleLayout::RowMajor, s);
+                launch_nvfp4_w4a4_quantize(x, gate.weight, scratch, s);
                 c.gemm(x, gate.weight, m, scratch, s);
             };
             auto pair = [&](cudaStream_t s) {

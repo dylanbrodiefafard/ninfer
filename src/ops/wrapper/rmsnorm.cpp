@@ -2,6 +2,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 
+#include "ops/common/a4_activation_check.h"
 #include "ops/common/a8_activation_check.h"
 #include "ops/launcher/rmsnorm.h"
 
@@ -153,6 +154,24 @@ void rmsnorm_a8(const Tensor& x, const Tensor& weight, float eps, Tensor* normal
     detail::rmsnorm_a8_launch(x, weight, eps, normalized, activation, stream);
 }
 
+void rmsnorm_a4(const Tensor& x, const Tensor& weight, float eps, Tensor* normalized,
+                A4Activation& activation, cudaStream_t stream) {
+    constexpr std::int32_t kD = 5120;
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 0) { throw std::invalid_argument("rmsnorm_a4: T must be positive"); }
+    require_bf16_matrix(x, kD, tokens, "rmsnorm_a4: x must be aligned contiguous BF16 [5120,T]");
+    require_bf16_vector(weight, kD, "rmsnorm_a4: weight must be contiguous BF16 [5120]");
+    if (normalized != nullptr) {
+        require_bf16_matrix(*normalized, kD, tokens,
+                            "rmsnorm_a4: normalized must be aligned contiguous BF16 [5120,T]");
+    }
+    require_eps(eps, "rmsnorm_a4: eps must be positive and finite");
+    if (detail::validate_a4_activation(activation, kD, "rmsnorm_a4") != tokens) {
+        throw std::invalid_argument("rmsnorm_a4: activation must be [5120,T]");
+    }
+    detail::rmsnorm_a4_launch(x, weight, eps, normalized, activation, stream);
+}
+
 void gated_rmsnorm_a8(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                       A8Activation& activation, cudaStream_t stream) {
     constexpr std::int32_t kHeadDim = 128;
@@ -175,6 +194,29 @@ void gated_rmsnorm_a8(const Tensor& x, const Tensor& weight, const Tensor& z, fl
         throw std::invalid_argument("gated_rmsnorm_a8: activation must be [6144,T]");
     }
     detail::gated_rmsnorm_a8_launch(x, weight, z, eps, activation, stream);
+}
+
+void gated_rmsnorm_a4(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                      A4Activation& activation, cudaStream_t stream) {
+    constexpr std::int32_t kHeadDim = 128;
+    constexpr std::int32_t kHeads   = 48;
+    const std::int32_t tokens       = x.ne[2];
+    const auto valid_heads          = [&](const Tensor& t) {
+        return t.dtype == DType::BF16 && t.ne[0] == kHeadDim && t.ne[1] == kHeads &&
+               t.ne[2] == tokens && t.ne[3] == 1 && t.is_contiguous() && t.data != nullptr &&
+               aligned16(t.data);
+    };
+    if (tokens <= 0 || !valid_heads(x) || !valid_heads(z)) {
+        throw std::invalid_argument(
+            "gated_rmsnorm_a4: x/z must be aligned contiguous BF16 [128,48,T] with T>0");
+    }
+    require_bf16_vector(weight, kHeadDim, "gated_rmsnorm_a4: weight must be contiguous BF16 [128]");
+    require_eps(eps, "gated_rmsnorm_a4: eps must be positive and finite");
+    if (detail::validate_a4_activation(activation, kHeadDim * kHeads, "gated_rmsnorm_a4") !=
+        tokens) {
+        throw std::invalid_argument("gated_rmsnorm_a4: activation must be [6144,T]");
+    }
+    detail::gated_rmsnorm_a4_launch(x, weight, z, eps, activation, stream);
 }
 
 void dual_offset_rmsnorm(const Tensor& x0, const Tensor& weight0, const Tensor& x1,

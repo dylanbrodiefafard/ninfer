@@ -2,6 +2,7 @@
 
 #include "targets/qwen3_6_35b_a3b/impl/config.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 #include <ninfer/targets/qwen3_6/runtime.h>
 
@@ -92,8 +93,18 @@ struct Variant {
     static void mtp_attention_output(const Tensor& attention, const Weight& weight,
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream, std::int32_t route_tokens = 0);
-    static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                     Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
+    // Prefill: when the GDN input projection consumes an A4 activation of the normalized hidden
+    // at this width, allocates it from `workspace` into `activation` and returns true. The layout
+    // reserves gdn_input_a4_activation_capacity_bytes for it.
+    [[nodiscard]] static bool allocate_gdn_input_a4(const GdnProjectionWeights& weights,
+                                                    qwen3_6::TextPhase phase, std::int32_t tokens,
+                                                    std::int32_t route_tokens,
+                                                    WorkspaceArena& workspace,
+                                                    ops::A4Activation& activation);
+    // hidden_a4 is null or the A4 activation gdn_norm_control_projection published for hidden.
+    static void gdn_input_projection(const Tensor& hidden, const ops::A4Activation* hidden_a4,
+                                     const GdnProjectionWeights& weights, Tensor& qkv,
+                                     Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);
     static void
     gdn_input_projection_snapshot(const Tensor& hidden, const GdnProjectionWeights& weights,
@@ -123,9 +134,9 @@ struct Variant {
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, ops::A8Activation* hidden_activation,
-                                            Tensor& g, Tensor& beta, qwen3_6::TextPhase phase,
-                                            WorkspaceArena& workspace, cudaStream_t stream,
-                                            std::int32_t route_tokens = 0);
+                                            ops::A4Activation* hidden_a4, Tensor& g, Tensor& beta,
+                                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                            cudaStream_t stream, std::int32_t route_tokens = 0);
     // Normalize the raw residual for the post-mixer; hidden is caller-owned scratch.
     static void post_mixer(const Tensor& norm_weight, float norm_eps, Tensor& hidden,
                            const PostMixerWeights& weights, Tensor& residual,
@@ -169,6 +180,9 @@ struct Variant {
                                                    std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t
+    gdn_input_a4_activation_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
+                                           std::int32_t last);
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);

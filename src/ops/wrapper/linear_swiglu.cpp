@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/rmsnorm_linear_swiglu.h"
+#include "ops/common/a4_activation_check.h"
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
@@ -146,6 +147,70 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream) {
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
+}
+
+namespace {
+
+constexpr std::int32_t kA4Hidden       = 5120;
+constexpr std::int32_t kA4Intermediate = 17408;
+
+// Validates the A4 input and NVFP4 [34816,5120] gate/up weight of the A4 overloads; returns T.
+std::int32_t validate_a4_swiglu_input(const A4Activation& x, const Weight& gate_up_weight) {
+    const std::int32_t t = detail::validate_a4_activation(x, kA4Hidden, "linear_swiglu");
+    if (t < kA4MlpGateUpMinTokens) {
+        throw std::invalid_argument("linear_swiglu: A4 activation must be [5120,T] with T >= 2");
+    }
+    if (gate_up_weight.qtype != QType::NVFP4 || gate_up_weight.n != 2 * kA4Intermediate ||
+        gate_up_weight.k != kA4Hidden) {
+        throw std::invalid_argument("linear_swiglu: an A4 activation requires NVFP4 [34816,5120]");
+    }
+    detail::validate_nvfp4_weight(gate_up_weight, "linear_swiglu");
+    if (x.input_scale_divisor != gate_up_weight.input_scale_divisor) {
+        throw std::invalid_argument(
+            "linear_swiglu: A4 activation input scale divisor differs from the weight's");
+    }
+    return t;
+}
+
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
+detail::Nvfp4W4a4Workspace a4_storage(const A4Activation& activation) {
+    return {static_cast<std::uint8_t*>(activation.codes.data),
+            static_cast<std::uint8_t*>(activation.scales.data)};
+}
+
+} // namespace
+
+void linear_swiglu(const A4Activation& x, const Weight& gate_up_weight, Tensor& out,
+                   cudaStream_t stream) {
+    const std::int32_t t = validate_a4_swiglu_input(x, gate_up_weight);
+    if (out.dtype != DType::BF16 || out.ne[0] != kA4Intermediate || out.ne[1] != t ||
+        out.ne[2] != 1 || out.ne[3] != 1 || !out.is_contiguous() || !aligned_to(out.data, 16)) {
+        throw std::invalid_argument(
+            "linear_swiglu: out must be contiguous 16-byte aligned BF16 [17408,T]");
+    }
+    if (overlaps(x.codes, out) || overlaps(x.scales, out)) {
+        throw std::invalid_argument("linear_swiglu: out overlaps the A4 activation");
+    }
+    detail::nvfp4_linear_swiglu_w4a4_project(gate_up_weight, t, a4_storage(x), out, stream);
+}
+
+void linear_swiglu(const A4Activation& x, const Weight& gate_up_weight, A4Activation& out,
+                   cudaStream_t stream) {
+    const std::int32_t t = validate_a4_swiglu_input(x, gate_up_weight);
+    if (detail::validate_a4_activation(out, kA4Intermediate, "linear_swiglu") != t) {
+        throw std::invalid_argument("linear_swiglu: A4 output must be [17408,T]");
+    }
+    if (overlaps(x.codes, out.codes) || overlaps(x.codes, out.scales) ||
+        overlaps(x.scales, out.codes) || overlaps(x.scales, out.scales)) {
+        throw std::invalid_argument("linear_swiglu: A4 output overlaps the input");
+    }
+    detail::nvfp4_linear_swiglu_w4a4_project_a4(gate_up_weight, t, a4_storage(x), a4_storage(out),
+                                                out.input_scale_divisor, stream);
 }
 
 std::size_t rmsnorm_linear_swiglu_workspace_capacity_bytes(std::int32_t tokens) {

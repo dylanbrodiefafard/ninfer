@@ -2280,6 +2280,136 @@ Reports are under `profiles/bench/multi-request-kernel-final-config-sweep-clean-
 `profiles/bench/multi-request-kernel-mtp5-baseline-isolation-20260905`, plus
 `profiles/ppl/multi-request-kernel-final-20260905.json`.
 
+## Qwen3.8-27B NVFP4 small-chunk prefill (2026-10-05)
+
+Programmatic dependent launch (PDL) reduces eager prefill latency beyond the inherited fused-A4
+implementation. The Engine still selects A4 only for prefill; speculative verification retains A8.
+The CUDA arithmetic, represented weights, activation codec, and persistent-state formats are
+unchanged. Scheduling policy is outside this measurement.
+
+The retained launch profile uses PDL for the A4 quantizer, W4A4 MMA projections, and A4 RMSNorm
+consumers. Consumers wait before dependent reads and writes, including padding stores in reused
+workspace. MMA producers release launch setup at the epilogue. The M64N64 residual projection
+at 113–128 tokens uses ordinary stream ordering: making it a programmatic consumer consistently
+regressed the 128-token phase by about 2%, despite a smaller launch gap. All projection epilogues
+share one family launcher and the same mathematical kernel.
+
+Measurements use an RTX 5090, `sm_120a`, CUDA 13.1, driver 580.173.02, the DFlash2 NVFP4 artifact
+with a BF16 selector codebook, NVFP4 KV, C1, adaptive DFlash k5, and the optimized proposal head.
+The eager benchmark uses `--no-cuda-graph`, `--max-ctx 8192`, and the default 4096-token prefill
+chunk. Each row below is a single prompt chunk, measured in three alternating baseline/candidate
+pairs with three warmups and seven repetitions per variant. Times are active prefill latency,
+averaged across pairs. The baseline is the resumed fused-A4 tree before PDL, so these gains are
+additional to the earlier prefill work, rather than a comparison with its original base commit.
+
+| Tokens | Baseline ms | Retained ms | Latency change |
+|---:|---:|---:|---:|
+| 4 | 12.646 | 12.329 | −2.50% |
+| 16 | 13.273 | 12.692 | −4.38% |
+| 32 | 14.012 | 13.388 | −4.45% |
+| 64 | 15.888 | 15.150 | −4.65% |
+| 65 | 17.029 | 16.326 | −4.13% |
+| 96 | 17.490 | 16.752 | −4.22% |
+| 128 | 18.262 | 17.666 | −3.27% |
+| 129 | 20.991 | 20.389 | −2.87% |
+| 160 | 21.207 | 20.793 | −1.95% |
+| 192 | 22.136 | 21.757 | −1.71% |
+| 256 | 24.749 | 24.343 | −1.64% |
+| 257 | 30.224 | 29.541 | −2.26% |
+| 384 | 32.738 | 32.266 | −1.44% |
+| 512 | 37.887 | 37.555 | −0.88% |
+| 1024 | 65.928 | 65.872 | −0.08% |
+| 4095 | 252.263 | 252.411 | +0.06% |
+
+The complete sweep also covers T=1, 7, 31, 33, 48, 59, 60, 63, 112, 113, 120, 127, 255,
+320, 640, 1000, and 2048. T=1 and the larger chunks are effectively unchanged; individual
+large-chunk paired differences range by roughly half a percent.
+
+An 8192-token prompt additionally checks repeated chunks against a growing KV context. These
+runs use `--max-ctx 16384`, one warmup, three repetitions, and two alternating pairs:
+
+| Prefill chunk | Baseline owner ms | Retained owner ms | Latency change |
+|---:|---:|---:|---:|
+| 128 | 1172.128 | 1135.246 | −3.15% |
+| 256 | 820.621 | 807.715 | −1.57% |
+| 1024 | 565.817 | 564.747 | −0.19% |
+
+Fresh Nsight Systems captures retain the same 935 kernels per chunk. At T=64 the GPU kernel
+span falls from 15.771 to 15.027 ms, while positive inter-kernel gaps fall from 1.506 to
+0.732 ms. At T=128 the span falls from 18.093 to 17.498 ms. Dependent kernels can overlap
+while waiting, so summed kernel durations are not the phase-latency metric.
+
+The public Linear benchmark at NVFP4/A4 `(N,K,T)=(5120,17408,64)`, including quantization and
+cold-L2 weights, improves from 42.624–43.008 to 40.960 microseconds across three alternating
+pairs. A narrower output-row tile was admitted by same-kernel Nsight Compute evidence
+(160 CTAs, 1197.6 GB/s DRAM reads), but its public-Op measurement was about 14% slower at T=64;
+that candidate was deleted.
+
+Numerical qualification uses the independent complete Linear and LinearAdd FP64 oracles at the
+real matrix shapes, plus exact A4 producer/consumer codec checks. CUDA Graph replay at T=64 and
+T=128 refreshes inputs between replays and compares with the same oracle. Focused memcheck and
+racecheck cover the A4 producers and dependent launches. The final affected-Op suite passes all
+10 cases, covering normalization, A4 codecs, Linear, LinearAdd, SwiGLU, attention projection, and
+GDN projection/state routes. The real DFlash mixed-forward regression passes with two actual
+mixed rounds and owner/decode-lane greedy streams equal to their solo runs. The resumed full
+unit suite passed 123 cases with two artifact-dependent skips; the available real-artifact suite
+passed 12 cases with eight skips before this launch optimization. Those earlier suite results
+are separate from the focused qualification of PDL and do not constitute complete merge
+qualification. The final `-Werror` build and clang-tidy check pass (209 affected translation
+units, zero diagnostics).
+
+Paired CSVs and the full width summary are under
+`profiles/bench/small-chunk-prefill-20261005/`; timelines are under
+`profiles/nsys/small-chunk-20261005/`; the named DRAM and register questions are under
+`profiles/ncu/small-chunk-20261005/`. CUDA ordering semantics are described in the
+[NVIDIA CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html).
+
+## Qwen3.8-27B NVFP4 128–4096-token prefill follow-up (2026-10-05)
+
+No additional production change was retained from this follow-up. Its baseline is the completed
+small-chunk PDL implementation above. Measurements use the same RTX 5090, CUDA 13.1, DFlash2
+artifact, NVFP4 KV, eager Engine execution, optimized proposal head, and adaptive k5 draft.
+Paired Engine runs use three alternating baseline/candidate pairs, three warmups, and seven
+repetitions at each width. Public-Op pairs use five warmups and 50 cold-L2 repetitions.
+
+Nsight Systems attributes 18.585 ms to ordinary W4A4 TMA projections and 18.083 ms to fused
+SwiGLU at T=1024, within a 60.521 ms GPU span. At T=4096 those categories take 74.120 and
+69.847 ms within a 240.792 ms span. The six BF16 attention-input projections take 16.497 ms
+at T=4096. These named costs informed the candidates below; overlapping kernel durations are
+not a substitute for the measured phase span.
+
+| Candidate in the existing kernel family | Result and disposition |
+|---|---|
+| Residual M128N128, three stages, one CTA/SM | Most widths lose about 15–24% in the public Op. A localized 1153–1280-token route improves the two residual projections by about 3–7%, but unprofiled Engine latency is +0.89% at 1153, −0.22% at 1200, and +0.15% at 1280. Deleted. |
+| Residual M128N128, two stages, two CTAs/SM | Public-Op latency loses across the measured range. Deleted. |
+| PDL for ordinary and SwiGLU TMA projections | Public residual Ops improve by 2.94% and 1.34% at T=1024; Engine changes by −0.33% at 1024, +0.02% at 2048, and +0.13% at 4096. No reliable whole-prefill gain; deleted. |
+| BF16 attention-input 128×128 tile, 32×32 warp tile | Public attention-projection latency loses about 8–18% at 1024–4096. Deleted. |
+| Same BF16 tile with a 64×32 warp tile | Fewer fragment loads do not pay; public attention-projection latency loses about 1–12% at 512–4096. Deleted. |
+
+The localized residual trace confirms that both M128 routes actually executed. Its profiled GPU
+span improves from 78.211 to 77.463 ms at T=1280, while the three unprofiled Engine pairs show
+no corresponding reliable improvement. Retention follows the unprofiled Engine measurements.
+The classifier admitted the compute-bound tile/pipeline candidates before implementation.
+Matching MMA calibration measures 2019.1 TFLOP/s for NVFP4 and 254.4 TFLOP/s for BF16. The BF16
+recipe explicitly passes its matching 62.10316 billion MMA/s rate; the recipe's automatic
+non-FP8 rate selection would otherwise read the NVFP4 entry.
+
+Candidate qualification includes independent Linear, LinearAdd, and attention-input oracles,
+exact A4 codec/consumer checks where applicable, and focused memcheck/racecheck. The localized
+route passes full/partial tiles and the 1152/1153 and 1280/1281 boundaries. A diagnostic
+LinearAdd case at T=1500, outside that narrowed route, reproduces an existing A4 criterion
+failure on both the original and candidate routes: `[5120,6144]`, sampled output 24 versus
+FP64 reference 17.1818. An isolated build of base commit `945515ea`, with the same inputs,
+oracle, and criterion, reproduces the identical failure, establishing that it predates these
+changes. No criterion was weakened and no broader numerical qualification is claimed from
+that diagnostic. All candidate code and candidate-only cases were removed. The
+restored `-Werror` build, focused NVFP4 Linear/LinearAdd and BF16 Linear/attention oracle checks,
+and both real DFlash mixed cases pass. The latter confirm two actual mixed rounds and both
+requests' greedy-stream parity at widths 512 with one or two decode rounds per chunk.
+
+Evidence is under `profiles/bench/medium-prefill-20261005/`,
+`profiles/nsys/medium-prefill-20261005/`, and `profiles/ncu/medium-prefill-20261005/`.
+
 ## Qwen3.8-27B NVFP4 mixed-phase prefill campaign
 
 The 2026-09-05 follow-up kept the preceding DFlash4/MTP4 decode implementation and targeted

@@ -29,7 +29,7 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 ### 1.2 Non-goals
 
 - request preemption、swap、pause/resume，或把 **active** request 的 KV 迁出 GPU；
-- 多请求 batched prefill 或 prefill/decode mixed forward；
+- 多请求 batched prefill；
 - 多 GPU 或 distributed inference；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；
 - 面向数十至数百请求的通用 continuous batching；
@@ -87,7 +87,9 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 ### 2.5 One prefill owner
 
 同一时刻最多有一个 admitted request 拥有 prefill/finalization path。Suffix prefill 以 bounded chunk 为
-单位连续运行到 finalization；只在整个 owner 完成、取消或失败后选择下一次 admission 或 decode。
+单位推进到 finalization；owner 完成、取消或失败前不选择下一次 admission。`mixed_forward = 0` 时
+owner 连续运行；`mixed_forward > 0` 且其他 request 为 `DECODE_READY` 时，owner 每一步以 Shared pace
+最多推进 `mixed_forward` tokens，并在每两步之间让出 `mixed_forward_rounds` 个 DecodeRound（§7.3）。
 其他等待请求仍留在 host queue，不占 slot 或 model state。
 
 ### 2.6 Single GPU execution owner
@@ -1046,7 +1048,14 @@ else if an admitted copy-hold exists:
     else:
         complete it and start its prefill
 else if a prefill owner exists:
-    run the next PrefillChunk
+    if mixed_forward > 0 and requests are DECODE_READY:
+        if the target can mix the owner's next chunk into DFlash verification:
+            run mixed_forward_rounds - 1 ordinary DecodeRounds, then one DecodeRound
+            containing the owner's next Shared-pace chunk
+        else:
+            run mixed_forward_rounds ordinary DecodeRounds, then the next Shared-pace chunk
+    else:
+        run the next Exclusive-pace PrefillChunk (at most prefill_chunk)
 else if a generation-recovery retry is queued:
     start it (a host restore parks it as a copy-hold)
 else if a pending request is admissible and decode-admission budget permits:
@@ -1067,6 +1076,9 @@ Prefill[A, all chunks] -> Prefill[B, all chunks] -> Prefill[C, all chunks]
 已有 A decode-ready、另有 B/C pending 且 lanes/resources/budget 可用时，B 完整 prefill 后立即 admission
 C；B/C 都 decode-ready 后才运行 `DecodeRound[A,B,C]`。若 B 在 prefill token terminal，其 bind 仍消费
 budget，持续 ingress 不能跳过 mandatory donor decode。
+
+Request plan 以 Shared-pace step 宽度投影 prefill service work：`mixed_forward` 不超过 4096
+（irregular-split extent），因此任何 Shared/Exclusive 交替都不会比投影多走一步。
 
 Prefill chunk profile 限制一次不可取消 GPU unit 的时间；完整 admission burst 的 wall time 可以包含最多
 `C-1` 个完整 request prefills。其具体 token/media extent 是经过 target 和 hardware qualification 的配置，
@@ -1315,9 +1327,12 @@ boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下
 `B=1` 使用完全相同的 membership、frame、whole-model schedule 和 commit transaction，不保留独立的
 request-local ordinary decode path。
 
-Prefill 仍是单 sequence unit。它独占自己的 `SequenceState`，但复用 Model Runtime 和 shared workspace；
-它不占有一个长期 `DecodeBatchFrame` row。Final prefill 建立完整 decode cursor 后，该 request 只在下一
-boundary 通过正常 batch assembly 加入 ordinary decode。
+Prefill has one sequence owner. An eligible DFlash mixed round evaluates that owner alongside
+the decode rows while preserving separate state and activation storage. Exclusive prefill remains
+a single-sequence unit. The owner exclusively owns its `SequenceState` and reuses the Model Runtime
+and shared workspace without holding a persistent `DecodeBatchFrame` row. After final prefill
+establishes its complete decode cursor, the request joins ordinary decode through batch assembly
+at the next boundary.
 
 ---
 

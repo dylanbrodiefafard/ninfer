@@ -1246,15 +1246,34 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                     ops::detail::nvfp4_w4a4_workspace_capacity_bytes(aggregate, kHidden));
                 const auto scratch =
                     ops::detail::allocate_nvfp4_w4a4_workspace(codec_workspace, aggregate, kHidden);
-                ops::detail::launch_nvfp4_w4a4_quantize(
-                    x.view({kHidden, aggregate}), parent.view(), scratch,
-                    ops::detail::Nvfp4ScaleLayout::RowMajor, nullptr);
+                ops::detail::launch_nvfp4_w4a4_quantize(x.view({kHidden, aggregate}), parent.view(),
+                                                        scratch, nullptr);
+                // The quantizer writes [256 tokens x 16 groups] scale tiles (nvfp4_config.h);
+                // gather them back into the reference's row-major [token, group] order.
+                constexpr std::int32_t kGroups     = kHidden / 16;
+                constexpr std::int32_t kTileGroups = ops::detail::kNvfp4ScaleTileGroups;
+                constexpr std::int32_t kTileTokens = ops::detail::kNvfp4TmaBlockM;
                 std::vector<std::uint8_t> codes(encoded.codes.size()),
+                    tiled_scales(
+                        static_cast<std::size_t>(ops::detail::nvfp4_w4a4_padded_tokens(aggregate)) *
+                        kGroups),
                     scales(encoded.scales.size());
                 CUDA_CHECK(
                     cudaMemcpy(codes.data(), scratch.codes, codes.size(), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(scales.data(), scratch.scales, scales.size(),
+                CUDA_CHECK(cudaMemcpy(tiled_scales.data(), scratch.scales, tiled_scales.size(),
                                       cudaMemcpyDeviceToHost));
+                for (std::int32_t token = 0; token < aggregate; ++token) {
+                    for (std::int32_t group = 0; group < kGroups; ++group) {
+                        const std::size_t tile = static_cast<std::size_t>(token / kTileTokens) *
+                                                     (kGroups / kTileGroups) +
+                                                 group / kTileGroups;
+                        scales[static_cast<std::size_t>(token) * kGroups + group] =
+                            tiled_scales[tile * kTileTokens * kTileGroups +
+                                         static_cast<std::size_t>(token % kTileTokens) *
+                                             kTileGroups +
+                                         group % kTileGroups];
+                    }
+                }
                 if (codes != encoded.codes || scales != encoded.scales) {
                     std::cerr << label
                               << ": activation codec differs from exact independent reference\n";

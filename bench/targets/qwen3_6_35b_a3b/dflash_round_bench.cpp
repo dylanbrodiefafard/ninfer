@@ -251,8 +251,11 @@ int run(const Options& options) {
         request_memory.activate(request_plan.summary().transient_bytes,
                                 request_plan.summary().transient_alignment);
         auto prefill = program->start_prefill_lane(lane, std::move(prompt), std::move(request_plan),
-                                                   request_memory.region());
-        while (!prefill.complete) { prefill = program->advance_prefill_lane(lane); }
+                                                   request_memory.region(),
+                                                   ninfer::runtime::PrefillPace::Exclusive);
+        while (!prefill.complete) {
+            prefill = program->advance_prefill_lane(lane, ninfer::runtime::PrefillPace::Exclusive);
+        }
         request_memory.deactivate();
         if (prefill.round.tokens.size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");

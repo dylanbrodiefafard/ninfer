@@ -685,6 +685,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `4096` |
+| `--mixed-forward N` | prefill step width while other requests decode: the prefilling request advances at most `N` tokens per step and yields `--mixed-forward-rounds` decode rounds between steps; a multiple of `256`, at most `--prefill-chunk` and `4096`; `0` prefills the whole prompt first | `0` |
+| `--mixed-forward-rounds N` | decode rounds between those prefill steps | `1` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |

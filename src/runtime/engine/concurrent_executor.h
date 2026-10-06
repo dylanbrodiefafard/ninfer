@@ -82,9 +82,12 @@ public:
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()),
           context_capacity_(options.max_context), load_progress_(options.load_progress),
-          generation_recovery_(options.generation_recovery) {
+          generation_recovery_(options.generation_recovery),
+          shared_prefill_(options.mixed_forward != 0),
+          mixed_forward_rounds_(options.mixed_forward_rounds) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
+            mixed_forward_rounds_ == 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
@@ -314,8 +317,9 @@ public:
             published_computed_prefill_tokens_.load(std::memory_order_relaxed);
         out.committed_decode_tokens =
             published_committed_decode_tokens_.load(std::memory_order_relaxed);
-        out.decode_rounds     = published_decode_rounds_.load(std::memory_order_relaxed);
-        out.decode_row_rounds = published_decode_row_rounds_.load(std::memory_order_relaxed);
+        out.decode_rounds       = published_decode_rounds_.load(std::memory_order_relaxed);
+        out.decode_row_rounds   = published_decode_row_rounds_.load(std::memory_order_relaxed);
+        out.mixed_decode_rounds = published_mixed_decode_rounds_.load(std::memory_order_relaxed);
         // Background spill changes tier counters while the scheduler sleeps idle, so observers
         // read the RAM tier live and the disk tier whenever its index lock is free.
         assign_kv_ram_stats(out, instance_.program->kv_ram_snapshot());
@@ -342,6 +346,8 @@ private:
         published_decode_rounds_.store(cumulative_stats_.decode_rounds, std::memory_order_relaxed);
         published_decode_row_rounds_.store(cumulative_stats_.decode_row_rounds,
                                            std::memory_order_relaxed);
+        published_mixed_decode_rounds_.store(cumulative_stats_.mixed_decode_rounds,
+                                             std::memory_order_relaxed);
     }
 
     static void assign_kv_ram_stats(RuntimeStats& out, const auto& ram) noexcept {
@@ -916,10 +922,11 @@ private:
         const RequestPlanSummary summary = plan.summary();
         instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
         prefill_lane_                 = lane;
+        decode_rounds_since_prefill_  = 0;
         const auto prefill_started    = Clock::now();
         const PrefillStepResult first = instance_.program->start_prefill_lane(
             lane, std::move(request->prompt), std::move(plan), instance_.request_memory.region(),
-            &request->output);
+            prefill_pace(), &request->output);
         request->recovery.prefill_seconds +=
             std::chrono::duration<double>(Clock::now() - prefill_started).count();
         return first;
@@ -1412,6 +1419,16 @@ private:
         return have_pending;
     }
 
+    // A prefill step shares the device when another request is decode-ready and a mixed-forward
+    // width is configured; it then advances at most that width so the decode rounds interleave.
+    [[nodiscard]] PrefillPace prefill_pace() const noexcept {
+        if (!shared_prefill_) { return PrefillPace::Exclusive; }
+        for (const auto& request : slots_) {
+            if (request != nullptr && request->decode_ready) { return PrefillPace::Shared; }
+        }
+        return PrefillPace::Exclusive;
+    }
+
     [[nodiscard]] RoundMembership build_round_membership() const {
         RoundMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1501,8 +1518,9 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const auto started           = Clock::now();
-        const PrefillStepResult step = instance_.program->advance_prefill_lane(lane);
+        const auto started = Clock::now();
+        const PrefillStepResult step =
+            instance_.program->advance_prefill_lane(lane, prefill_pace());
         if (request->recovery.attempts != 0) {
             request->recovery.prefill_seconds +=
                 std::chrono::duration<double>(Clock::now() - started).count();
@@ -2015,13 +2033,14 @@ private:
                 const RequestPlanSummary summary = hold.plan.summary();
                 instance_.request_memory.activate(summary.transient_bytes,
                                                   summary.transient_alignment);
-                prefill_lane_ = lane;
-                transient     = instance_.request_memory.region();
+                prefill_lane_                = lane;
+                decode_rounds_since_prefill_ = 0;
+                transient                    = instance_.request_memory.region();
             }
             end_copy_hold(request);
             const auto prefill_started    = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(hold.plan), transient,
+                lane, std::move(request->prompt), std::move(hold.plan), transient, prefill_pace(),
                 &request->output);
             if (hold.recovery_base) {
                 request->recovery.prefill_seconds +=
@@ -2473,7 +2492,10 @@ private:
         return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
     }
 
-    void run_decode_round(const RoundMembership& membership) {
+    // With `owner`, the round is mixed: the prefill owner's next step runs in the same target
+    // forward (Program::decode_batch_with_prefill) and resolves after the decode rows.
+    void run_decode_round(const RoundMembership& membership,
+                          std::optional<std::uint32_t> owner = std::nullopt) {
         RoundMembership live;
         for (std::size_t index = 0; index < membership.size; ++index) {
             const std::uint32_t lane = membership.lanes[index];
@@ -2490,11 +2512,23 @@ private:
             live.budgets[live.size] = membership.budgets[index];
             ++live.size;
         }
-        if (live.empty()) { return; }
+        if (live.empty()) {
+            if (owner) { run_prefill_step(); }
+            return;
+        }
 
         const std::span<const std::uint32_t> lanes = live.lane_span();
-        const BatchedGeneratedRound round =
-            instance_.program->decode_batch(lanes, live.budget_span());
+        std::optional<PrefillStepResult> owner_step;
+        BatchedGeneratedRound round;
+        const auto started = Clock::now();
+        if (owner) {
+            MixedGeneratedRound mixed =
+                instance_.program->decode_batch_with_prefill(lanes, live.budget_span(), *owner);
+            round = mixed.round;
+            owner_step.emplace(mixed.prefill);
+        } else {
+            round = instance_.program->decode_batch(lanes, live.budget_span());
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!round.cycle_exclusions[row]) { continue; }
             const auto& request = slots_[lanes[row]];
@@ -2568,6 +2602,7 @@ private:
             std::span<const std::uint8_t>(rejected.data(), lanes.size()));
 
         ++cumulative_stats_.decode_rounds;
+        if (owner_step) { ++cumulative_stats_.mixed_decode_rounds; }
         cumulative_stats_.decode_row_rounds += lanes.size();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!cancelled[row] && !rejected[row]) {
@@ -2601,6 +2636,18 @@ private:
                 finish_generation(request, finish_reasons[row]);
             } else {
                 recover_persistent_reasoning(request);
+            }
+        }
+
+        if (owner_step) {
+            const auto request = slots_[*owner];
+            if (request->recovery.attempts != 0) {
+                request->recovery.prefill_seconds +=
+                    std::chrono::duration<double>(Clock::now() - started).count();
+            }
+            const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
+            if (resolve_prefill_step(request, *owner_step, cancel_at_boundary)) {
+                publish_runtime_stats();
             }
         }
     }
@@ -2752,7 +2799,31 @@ private:
                 }
 
                 if (prefill_lane_) {
+                    // A Shared-pace owner advances once per mixed_forward_rounds decode rounds:
+                    // inside the last of them when the Program can mix its step into the round,
+                    // otherwise as a separate step after them.
+                    if (shared_prefill_ && !membership.empty()) {
+                        const auto& owner = slots_[*prefill_lane_];
+                        if (owner == nullptr || owner->decode_ready) {
+                            throw std::logic_error("staged prefill lane has invalid request state");
+                        }
+                        const bool mixable = instance_.program->prefill_mixable(*prefill_lane_);
+                        const std::uint32_t rounds_before_step =
+                            mixable ? mixed_forward_rounds_ - 1U : mixed_forward_rounds_;
+                        if (decode_rounds_since_prefill_ < rounds_before_step) {
+                            run_membership_decode();
+                            ++decode_rounds_since_prefill_;
+                            continue;
+                        }
+                        if (mixable) {
+                            run_decode_round(membership, prefill_lane_);
+                            decode_admission_burst.complete_decode();
+                            decode_rounds_since_prefill_ = 0;
+                            continue;
+                        }
+                    }
                     run_prefill_step();
+                    decode_rounds_since_prefill_ = 0;
                     continue;
                 }
 
@@ -2797,6 +2868,8 @@ private:
     const std::uint32_t context_capacity_;
     LoadProgress load_progress_;
     const bool generation_recovery_;
+    const bool shared_prefill_;
+    const std::uint32_t mixed_forward_rounds_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
@@ -2809,6 +2882,8 @@ private:
     std::uint64_t next_queue_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
+    // Decode rounds run since the prefill owner's last step.
+    std::uint32_t decode_rounds_since_prefill_ = 0;
     std::optional<CopyHold> copy_hold_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
@@ -2823,6 +2898,7 @@ private:
     std::atomic<std::uint64_t> published_committed_decode_tokens_{0};
     std::atomic<std::uint64_t> published_decode_rounds_{0};
     std::atomic<std::uint64_t> published_decode_row_rounds_{0};
+    std::atomic<std::uint64_t> published_mixed_decode_rounds_{0};
     std::atomic<std::uint32_t> published_waiting_requests_{0};
     std::atomic<bool> control_dirty_{true};
     bool stopping_ = false;

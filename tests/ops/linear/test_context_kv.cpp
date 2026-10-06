@@ -72,10 +72,12 @@ int run_case(DeviceContext& device, const Weight& weight, const std::vector<doub
     };
 
     // Full short-append outputs are checked. For ingest, complete dots cover all output rows
-    // at every 48-column tile boundary and the last column; every stored output is scanned finite.
+    // at every 48- and 64-column tile boundary and the last column; every stored output is scanned
+    // finite.
     std::vector<std::int32_t> columns;
     for (std::int32_t column = 0; column < tokens; ++column) {
-        if (width <= 8 || column % 48 == 0 || column % 48 == 47 || column == tokens - 1) {
+        if (width <= 8 || column % 48 == 0 || column % 48 == 47 || column % 64 == 0 ||
+            column % 64 == 63 || column == tokens - 1) {
             columns.push_back(column);
         }
     }
@@ -179,9 +181,11 @@ int main(int argc, char** argv) {
         const auto weight = packed.device_weight(payload.p);
         int failures      = check_admission(device, weight);
         if (test::sanitizer_scope(argc, argv)) {
-            // Cover GEMV, both narrow MMA schedules, M48 and a partial ingest tile.
-            for (const auto& shape : {std::array{1, 1}, std::array{3, 2}, std::array{3, 6},
-                                      std::array{8, 6}, std::array{128, 1}}) {
+            // Cover GEMV, both narrow MMA schedules, M48 (with a partial ingest tile at 160), and
+            // the M64N32, M64N64 and M64N128 prefill tiles with partial last tiles.
+            for (const auto& shape :
+                 {std::array{1, 1}, std::array{3, 2}, std::array{3, 6}, std::array{8, 6},
+                  std::array{100, 1}, std::array{160, 1}, std::array{300, 1}, std::array{600, 1}}) {
                 failures += run_case(device, weight, logical, shape[0], shape[1]);
             }
         } else {
@@ -190,7 +194,9 @@ int main(int argc, char** argv) {
                     failures += run_case(device, weight, logical, width, batch);
                 }
             }
-            for (const auto width : {128, 512, 2048}) {
+            // Widths inside every prefill tier of nvfp4_dflash_kv_a16_tile, partial last tiles
+            // included.
+            for (const auto width : {100, 128, 160, 300, 400, 512, 700, 900, 1000, 2048}) {
                 failures += run_case(device, weight, logical, width, 1);
             }
         }

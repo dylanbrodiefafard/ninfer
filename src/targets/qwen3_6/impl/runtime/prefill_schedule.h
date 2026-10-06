@@ -13,6 +13,9 @@ namespace ninfer::targets::qwen3_6::detail {
 
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kIrregularPrefillSplit = 4096;
+// Mixed-forward widths are whole 256-token activation scale tiles, where the W4A4 projections
+// run full TMA tiles.
+inline constexpr std::uint32_t kMixedForwardAlignment = 256;
 
 // Large aligned extents use the full 8192-token workspace efficiently. A large
 // unaligned tail uses 4096 first so only the smaller final unit pays the tail cost.

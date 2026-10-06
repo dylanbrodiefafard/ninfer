@@ -153,6 +153,54 @@ void dual_offset_rmsnorm_launch(const Tensor& x0, const Tensor& weight0, const T
     CUDA_CHECK(cudaGetLastError());
 }
 
+void rmsnorm_a4_launch(const Tensor& x, const Tensor& weight, float eps, Tensor* out,
+                       A4Activation& activation, cudaStream_t stream) {
+    constexpr std::int32_t kD = 5120;
+    const std::int64_t rows   = x.ne[1];
+    // One CTA per token, padding CTAs up to the next 16-token fragment (rmsnorm_a4_kernel).
+    const auto blocks   = static_cast<unsigned int>((rows + 15) / 16 * 16);
+    const auto* input   = static_cast<const __nv_bfloat162*>(x.data);
+    const auto* gain    = static_cast<const __nv_bfloat162*>(weight.data);
+    auto* codes         = static_cast<std::uint8_t*>(activation.codes.data);
+    auto* scales        = static_cast<std::uint8_t*>(activation.scales.data);
+    const float divisor = activation.input_scale_divisor;
+    const pdl::LaunchConfig launch{dim3(blocks), dim3(512), 0, stream};
+    if (out != nullptr) {
+        CUDA_CHECK(pdl::launch_dependent(
+            launch, rmsnorm_a4_kernel<512, 8, kD, RmsOutput::Bf16AndA4>, input, gain,
+            static_cast<__nv_bfloat162*>(out->data), rows, eps, codes, scales, divisor));
+    } else {
+        CUDA_CHECK(pdl::launch_dependent(launch, rmsnorm_a4_kernel<512, 8, kD, RmsOutput::A4>,
+                                         input, gain, static_cast<__nv_bfloat162*>(nullptr), rows,
+                                         eps, codes, scales, divisor));
+    }
+}
+
+void gated_rmsnorm_a4_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                             A4Activation& activation, cudaStream_t stream) {
+    constexpr int kHeadDim       = 128;
+    constexpr int kHeads         = 48;
+    constexpr int kBlock         = 512;
+    constexpr int kWarpsPerBlock = kBlock / kWarpSize;
+    const std::int32_t tokens    = x.ne[2];
+    // One warp per head row, padding rows up to the next 16-token fragment
+    // (gated_rmsnorm_a4_kernel).
+    const std::int64_t rows = static_cast<std::int64_t>((tokens + 15) / 16 * 16) * kHeads;
+    // The kernel indexes rows in 32 bits.
+    if (rows > std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument("gated_rmsnorm_a4: T exceeds the 32-bit row index");
+    }
+    CUDA_CHECK(pdl::launch_dependent(
+        pdl::LaunchConfig{
+            dim3(static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock)),
+            dim3(kBlock), 0, stream},
+        gated_rmsnorm_a4_kernel<kHeadDim, kHeads, kBlock>,
+        static_cast<const __nv_bfloat162*>(x.data), static_cast<const __nv_bfloat162*>(weight.data),
+        static_cast<const __nv_bfloat162*>(z.data), tokens, eps,
+        static_cast<std::uint8_t*>(activation.codes.data),
+        static_cast<std::uint8_t*>(activation.scales.data), activation.input_scale_divisor));
+}
+
 void gated_rmsnorm_a8_launch(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                              A8Activation& activation, cudaStream_t stream) {
     // One CTA per token column. At verify widths the grid is only T CTAs, so the per-head chain

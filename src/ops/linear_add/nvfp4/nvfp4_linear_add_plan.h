@@ -27,6 +27,11 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream);
+// The W4A4 residual projection of an already quantized [weight.k, tokens] activation (codes and
+// tiled scales).
+void nvfp4_linear_add_w4a4_project(const Weight& weight, std::int32_t tokens,
+                                   Nvfp4W4a4Workspace activation, Tensor& residual,
+                                   cudaStream_t stream);
 void nvfp4_linear_add_w4a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Fp8A8Workspace workspace, cudaStream_t stream);
 // The W4A8 projection of an already quantized [weight.k, tokens] activation.

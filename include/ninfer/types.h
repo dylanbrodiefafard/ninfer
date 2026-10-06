@@ -138,6 +138,13 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 4096;
+    // Forward width (tokens) of each prefill step while other requests are decode-ready; 0 runs
+    // the owner's whole prefill before the next decode round. Otherwise the owner advances one
+    // step of at most mixed_forward tokens after every mixed_forward_rounds decode rounds of the
+    // other requests. A multiple of 256 (the activation scale tile), at most prefill_chunk, and at
+    // most 4096.
+    std::uint32_t mixed_forward        = 0;
+    std::uint32_t mixed_forward_rounds = 1;
     std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
@@ -717,8 +724,10 @@ struct RuntimeStats {
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
-    std::uint64_t decode_rounds         = 0;
-    std::uint64_t decode_row_rounds     = 0;
+    std::uint64_t decode_rounds     = 0;
+    std::uint64_t decode_row_rounds = 0;
+    // Decode rounds that also evaluate a prefill owner in the target forward.
+    std::uint64_t mixed_decode_rounds   = 0;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;

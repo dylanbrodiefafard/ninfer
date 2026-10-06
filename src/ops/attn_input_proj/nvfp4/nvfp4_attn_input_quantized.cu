@@ -54,13 +54,6 @@ struct Nvfp4W4a4AttentionOutput {
     }
 };
 
-using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
-using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N64            = Nvfp4W4a4MmaSchedule<64, 64, 256, 4, 2, 2, 1>;
-using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-
 template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                  Nvfp4W4a4Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
@@ -74,12 +67,10 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
         static_cast<__nv_bfloat16*>(v.data),
     };
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4W4a4AttentionOutput>
-        <<<grid, Schedule::kThreads, 0, stream>>>(activation,
-                                                  static_cast<const std::uint8_t*>(weight.qdata),
-                                                  static_cast<const std::uint8_t*>(weight.scales),
-                                                  tokens, alpha, Nvfp4IdentityEpilogue{}, output);
-    CUDA_CHECK(cudaGetLastError());
+    launch_nvfp4_w4a4_mma<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4W4a4AttentionOutput>(
+        grid, stream, activation, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
+        output, Nvfp4W4a4IdentityRows{});
 }
 
 } // namespace
@@ -105,37 +96,26 @@ void nvfp4_attn_input_w4a8_project(const Weight& weight, std::int32_t tokens,
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(
-        x, weight, workspace,
-        nvfp4_w4a4_projection_scale_layout(Nvfp4AttnInputGeometry::kOutputRows,
-                                           Nvfp4AttnInputGeometry::kInputRows, x.ne[1]),
-        stream);
-    const std::int32_t tokens = x.ne[1];
-    if (nvfp4_w4a4_tma_route(Nvfp4AttnInputGeometry::kOutputRows,
-                             Nvfp4AttnInputGeometry::kInputRows, tokens)) {
+    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    nvfp4_attn_input_w4a4_project(weight, x.ne[1], workspace, q, gate, k, v, stream);
+}
+
+void nvfp4_attn_input_w4a4_project(const Weight& weight, std::int32_t tokens,
+                                   Nvfp4W4a4Workspace activation, Tensor& q, Tensor& gate,
+                                   Tensor& k, Tensor& v, cudaStream_t stream) {
+    const Nvfp4W4a4Route route = nvfp4_w4a4_route(Nvfp4Problem::AttnInput, tokens);
+    if (route == Nvfp4W4a4Route::Tma) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_attention(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(k.data),
             static_cast<__nv_bfloat16*>(v.data), tokens, alpha, stream);
-    } else if (tokens <= 32) {
-        launch_gemm<M32N64>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 64) {
-        launch_gemm<M64N64>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 96) {
-        launch_gemm<M32N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 128) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 192) {
-        launch_gemm<M64N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 384) { // NOLINT(bugprone-branch-clone): independently tuned token tier.
-        launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 512) {
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else {
-        launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
+        return;
     }
+    visit_nvfp4_w4a4_mma_schedule<Nvfp4Problem::AttnInput>(route, [&]<class Schedule>() {
+        launch_gemm<Schedule>(weight, q, gate, k, v, activation, tokens, stream);
+    });
 }
 
 } // namespace ninfer::ops::detail

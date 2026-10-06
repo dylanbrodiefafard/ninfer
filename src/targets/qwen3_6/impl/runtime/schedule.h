@@ -157,13 +157,48 @@ struct TargetVerifyFrameView {
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
                          std::uint32_t mtp_proposal_extent);
+// With `owner`, the verify forward drives that prefill owner's chunk layer by layer (a mixed
+// round); the frame must then carry a DFlash feature sink.
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope, bool reset_workspace = true);
+                          ops::GqaExecutionEnvelope envelope, bool reset_workspace = true,
+                          const MixedOwnerForward* owner = nullptr);
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
+
+// The prefill owner of a mixed DFlash round: one text chunk (no media, no MTP) of the request
+// that `state` describes. The round runs forward() inside its verify forward, then
+// append_context() after accept, since the owner's DFlash context append resets the workspace
+// the verify forward still holds. Lives on the stack of the round that runs it.
+class MixedPrefillOwner {
+public:
+    MixedPrefillOwner(PrefillContext& state, std::span<const TokenId> ids,
+                      std::uint32_t nominal_length,
+                      std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
+                      bool finalize_at_end);
+    MixedPrefillOwner(const MixedPrefillOwner&)            = delete;
+    MixedPrefillOwner& operator=(const MixedPrefillOwner&) = delete;
+
+    [[nodiscard]] const MixedOwnerForward& forward() const noexcept { return forward_; }
+
+    // Appends the chunk's captured DFlash context; requires forward() to have run.
+    void append_context();
+    // The chunk's progress; requires append_context().
+    [[nodiscard]] PrefillChunkResult result() const;
+
+private:
+    PrefillContext& state_;
+    TextContext card_;
+    DFlashFeatureSink sink_;
+    std::span<const int> prompt_;
+    std::uint32_t nominal_length_;
+    bool finalize_at_end_;
+    std::optional<PrefillChunkResult> forwarded_;
+    bool appended_ = false;
+    MixedOwnerForward forward_;
+};
 
 [[nodiscard]] PrefillChunkResult prefill_mrope_text_chunk(
     PrefillContext& state, const qwen3_6::PreparedPromptData& prompt, std::uint32_t nominal_length,
@@ -221,9 +256,11 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  DFlashEnvelopes envelopes,
                                  ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition);
+// With `owner` (eager, exact envelopes only) the round is mixed: the verify forward runs the
+// owner's prefill chunk beside it, and the owner's DFlash context append follows the egress copy.
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          std::uint32_t verify_width, DFlashEnvelopes envelopes,
                          ops::GqaExecutionEnvelope target_envelope, bool exact_sequence_envelopes,
-                         DecodeGraphExecutable* executable);
+                         DecodeGraphExecutable* executable, MixedPrefillOwner* owner = nullptr);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -32,6 +32,17 @@ int run_nvfp4_a16() {
         Invocation{30, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
     };
+    // One width inside every DFlash feature-projection prefill tier
+    // (nvfp4_dflash_feature_a16_tile).
+    constexpr std::array feature_prefill_invocations{
+        Invocation{60, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{100, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{200, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{300, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{450, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{600, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{1000, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
     int failures = 0;
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {14336, 5120, 701U, Comparison::Sampled, true, attn_invocations});
@@ -45,6 +56,9 @@ int run_nvfp4_a16() {
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 25600, 709U, Comparison::Sampled, true, new_problem_invocations});
+    failures +=
+        run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                  {5120, 25600, 710U, Comparison::Sampled, true, feature_prefill_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {6144, 5120, 711U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,

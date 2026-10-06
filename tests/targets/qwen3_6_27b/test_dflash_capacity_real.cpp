@@ -116,11 +116,12 @@ void exercise(const char* artifact) {
         auto lane_plan = program.plan_request_for_lane(lane, prompt, base);
         require(lane_plan.summary().transient_bytes == 0,
                 "text fixture unexpectedly needs request transient storage");
-        auto step = program.start_prefill_lane(lane, std::move(prompt), std::move(lane_plan), {});
+        auto step = program.start_prefill_lane(lane, std::move(prompt), std::move(lane_plan), {},
+                                               ninfer::runtime::PrefillPace::Exclusive);
         std::size_t processed = step.processed_prompt_tokens;
         full_chunks += step.processed_prompt_tokens == 4096;
         while (!step.complete) {
-            step = program.advance_prefill_lane(lane);
+            step = program.advance_prefill_lane(lane, ninfer::runtime::PrefillPace::Exclusive);
             processed += step.processed_prompt_tokens;
             full_chunks += step.processed_prompt_tokens == 4096;
             if (processed % 65536 == 0) {

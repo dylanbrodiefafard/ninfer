@@ -25,6 +25,7 @@ namespace ninfer::ops::detail::gated_delta_net::chunked::output {
 
 using ninfer::ops::Cache;
 using ninfer::ops::cp_async;
+using ninfer::ops::cp_async_zfill;
 using ninfer::ops::cp_commit;
 using ninfer::ops::cp_wait;
 using ninfer::ops::exp2_approx;
@@ -100,6 +101,26 @@ __device__ __forceinline__ void issue_cp_16(Smem16Tile<T, COLS> dst, const T* __
     }
 }
 
+// issue_cp_16 for a caller-owned input whose last chunk may be partial: rows at or past
+// valid_rows are zero-filled without reading global memory.
+template <int ROWS, int COLS, int BLOCK_THREADS, class T>
+__device__ __forceinline__ void
+issue_cp_16_rows(Smem16Tile<T, COLS> dst, const T* __restrict__ src_row0,
+                 std::int64_t src_row_stride, int valid_rows, int tid) {
+    static_assert(COLS % 8 == 0);
+    constexpr int VECS_PER_ROW = COLS / 8;
+    constexpr int N_VECS       = ROWS * VECS_PER_ROW;
+#pragma unroll
+    for (int v = tid; v < N_VECS; v += BLOCK_THREADS) {
+        const int row    = v / VECS_PER_ROW;
+        const int col8   = (v - row * VECS_PER_ROW) * 8;
+        const bool valid = row < valid_rows;
+        const T* src =
+            src_row0 + static_cast<std::int64_t>(valid ? row : 0) * src_row_stride + col8;
+        cp_async_zfill<16, Cache::cg>(dst.ptr(row, col8), src, valid ? 16 : 0);
+    }
+}
+
 template <bool F16, int N_TILES, int K_TILES, int A_STRIDE, int B_STRIDE>
 __device__ __forceinline__ void
 mma_16_panel(float (&D)[N_TILES][4],
@@ -159,7 +180,7 @@ __device__ __forceinline__ void
 output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
            const void* __restrict__ v_new_raw, const float* __restrict__ g_cumsum_in,
            const void* __restrict__ h_chunk_raw, __nv_bfloat16* __restrict__ attn_out,
-           head_map qk_map, float scale, int chunk, int h_v, float* smem) {
+           head_map qk_map, float scale, int tokens, int chunk, int h_v, float* smem) {
     using QKType                 = std::conditional_t<QK_F16, __half, __nv_bfloat16>;
     const auto* const q_in       = static_cast<const QKType*>(q_raw);
     const auto* const k_in       = static_cast<const QKType*>(k_raw);
@@ -193,11 +214,14 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
         (static_cast<std::int64_t>(chunk) * H_v + h_v) * kStateDim * kStateDim;
 
     const std::int64_t value_row_stride = H_v * kStateDim;
+    // Only the last chunk may hold fewer than BT real tokens. Its padding rows load zero Q/K, so
+    // they add nothing to the real rows' scores, and their outputs are not stored.
+    const int valid_rows = min(BT, tokens - static_cast<int>(cs));
 
     // Q is permanent. K uses two 64x32 16-bit buffers and is prefetched one
     // panel ahead while the current panel feeds native 16-bit MMA.
-    issue_cp_16<BT, kStateDim, THREADS>(q_view, q_in + q_base, qk_stride_t, tid);
-    issue_cp_16<BT, K_PANEL, THREADS>(k_stage0, k_in + k_base, qk_stride_t, tid);
+    issue_cp_16_rows<BT, kStateDim, THREADS>(q_view, q_in + q_base, qk_stride_t, valid_rows, tid);
+    issue_cp_16_rows<BT, K_PANEL, THREADS>(k_stage0, k_in + k_base, qk_stride_t, valid_rows, tid);
     cp_commit();
     cp_wait<0>();
     __syncthreads();
@@ -209,9 +233,9 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
         Smem16Tile<QKType, K_PANEL> current = (panel & 1) == 0 ? k_stage0 : k_stage1;
         if (panel + 1 < N_K_PANELS) {
             Smem16Tile<QKType, K_PANEL> next = (panel & 1) == 0 ? k_stage1 : k_stage0;
-            issue_cp_16<BT, K_PANEL, THREADS>(
+            issue_cp_16_rows<BT, K_PANEL, THREADS>(
                 next, k_in + k_base + static_cast<std::int64_t>(panel + 1) * K_PANEL, qk_stride_t,
-                tid);
+                valid_rows, tid);
             cp_commit();
         } else if (tid < BT) {
             // stage0 was consumed by panel 2 and is now dead. Reuse its
@@ -333,12 +357,16 @@ output_job(const void* __restrict__ q_raw, const void* __restrict__ k_raw,
                 __floats2bfloat162_rn(scale * D_frag[nt][0], scale * D_frag[nt][1]);
             const __nv_bfloat162 out1 =
                 __floats2bfloat162_rn(scale * D_frag[nt][2], scale * D_frag[nt][3]);
-            store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g0) * value_row_stride +
-                                d_global],
-                      out0);
-            store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g1) * value_row_stride +
-                                d_global],
-                      out1);
+            if (row_g0 < valid_rows) {
+                store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g0) * value_row_stride +
+                                    d_global],
+                          out0);
+            }
+            if (row_g1 < valid_rows) {
+                store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g1) * value_row_stride +
+                                    d_global],
+                          out1);
+            }
         }
 
         if (panel + 1 < N_D_PANELS) {
@@ -353,7 +381,7 @@ __launch_bounds__(THREADS, 4) __global__
     void output_kernel(const void* __restrict__ q_in, const void* __restrict__ k_in,
                        const void* __restrict__ v_new_in, const float* __restrict__ g_cumsum_in,
                        const void* __restrict__ h_chunk_in, __nv_bfloat16* __restrict__ attn_out,
-                       head_map qk_map, float scale, int chunks) {
+                       head_map qk_map, float scale, int tokens, int chunks) {
     extern __shared__ float smem[];
 
     const int h_v = static_cast<int>(blockIdx.y);
@@ -361,12 +389,12 @@ __launch_bounds__(THREADS, 4) __global__
         const int chunk_stride = static_cast<int>(gridDim.x);
         for (int chunk = static_cast<int>(blockIdx.x); chunk < chunks; chunk += chunk_stride) {
             output_job<QK_F16>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map,
-                               scale, chunk, h_v, smem);
+                               scale, tokens, chunk, h_v, smem);
             if (chunk + chunk_stride < chunks) { __syncthreads(); }
         }
     } else {
         output_job<QK_F16>(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
-                           static_cast<int>(blockIdx.x), h_v, smem);
+                           tokens, static_cast<int>(blockIdx.x), h_v, smem);
     }
 }
 

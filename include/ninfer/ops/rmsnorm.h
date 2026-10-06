@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/a4_activation.h"
 #include "ninfer/ops/a8_activation.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -38,6 +39,23 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
  */
 void rmsnorm_a8(const Tensor& x, const Tensor& weight, float eps, Tensor* normalized,
                 A8Activation& activation, cudaStream_t stream);
+
+/**
+ * Unit-offset RMSNorm over D=5120 that publishes its output as an NVFP4 activation
+ * (ninfer/ops/a4_activation.h) for a weight with activation.input_scale_divisor: the activation
+ * encodes BF16(ideal) column by column, where `ideal` is rmsnorm's with unit_offset = true, so it
+ * is bit-identical to rmsnorm followed by the W4A4 projections' quantizer. When `normalized` is
+ * non-null the same BF16 values are also written there, bit-identical to
+ * rmsnorm(x, weight, eps, true, *normalized).
+ *
+ * x is contiguous 16-byte aligned BF16 [5120,T] with T >= 1 (no further dimensions), weight
+ * contiguous BF16 [5120], `normalized` (optional) has x's shape and is 16-byte aligned, and
+ * `activation` is an A4 activation of [5120,T]. No input overlaps an output. The codes/scales are
+ * checked exactly against the A4 codec of rmsnorm's BF16 output. Invalid arguments throw
+ * std::invalid_argument. No workspace.
+ */
+void rmsnorm_a4(const Tensor& x, const Tensor& weight, float eps, Tensor* normalized,
+                A4Activation& activation, cudaStream_t stream);
 
 /**
  * Applies two independent offset RMS normalizations. For panel p in {0,1}, row r, and d:

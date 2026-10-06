@@ -184,17 +184,15 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             std::int32_t value_heads, std::int32_t tokens,
                                             bool normalize_qk) {
     ChunkedWorkspace out;
-    const std::int32_t full =
-        (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
-    if (full == 0) { return out; }
+    if (tokens < detail::gated_delta_net::kChunkedMinTokens) { return out; }
     if (normalize_qk) {
         out.normalized_q =
             allocator.alloc(DType::FP16, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
         out.normalized_k =
             allocator.alloc(DType::FP16, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
     }
-    out.stage =
-        allocator.alloc_bytes(detail::gated_delta_net::chunked_workspace_bytes(value_heads, full));
+    out.stage = allocator.alloc_bytes(
+        detail::gated_delta_net::chunked_workspace_bytes(value_heads, tokens));
     return out;
 }
 
@@ -247,49 +245,23 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
 
-    auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
-    const std::int32_t T_full =
-        (T / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
-    ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
-    if (normalize_qk && T_full > 0) {
-        Tensor q_source     = q.slice(2, 0, T_full);
-        Tensor k_source     = k.slice(2, 0, T_full);
-        Tensor q_normalized = scratch.normalized_q.slice(2, 0, T_full);
-        Tensor k_normalized = scratch.normalized_k.slice(2, 0, T_full);
-        detail::gated_delta_net::launch_normalize_fp16(q_source, q_normalized, stream);
-        detail::gated_delta_net::launch_normalize_fp16(k_source, k_normalized, stream);
-    }
-    if (T_full > 0) {
-        Tensor q_full =
-            normalize_qk ? scratch.normalized_q.slice(2, 0, T_full) : q.slice(2, 0, T_full);
-        Tensor k_full =
-            normalize_qk ? scratch.normalized_k.slice(2, 0, T_full) : k.slice(2, 0, T_full);
-        Tensor v_full    = v.slice(2, 0, T_full);
-        Tensor g_full    = g.slice(1, 0, T_full);
-        Tensor beta_full = beta.slice(1, 0, T_full);
-        Tensor out_full  = out.slice(2, 0, T_full);
-        detail::gated_delta_net::launch_chunked(q_full, k_full, v_full, g_full, beta_full, scale,
-                                                ssm_state_in, ssm_state_out, out_full,
-                                                scratch.stage.data, scratch.stage.bytes, stream);
+    if (T < detail::gated_delta_net::kChunkedMinTokens) {
+        detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
+                                                        ssm_state_in, ssm_state_out, out, stream);
+        return;
     }
 
-    const std::int32_t tail = T - T_full;
-    if (tail > 0) {
-        Tensor q_tail    = q.slice(2, T_full, tail);
-        Tensor k_tail    = k.slice(2, T_full, tail);
-        Tensor v_tail    = v.slice(2, T_full, tail);
-        Tensor g_tail    = g.slice(1, T_full, tail);
-        Tensor beta_tail = beta.slice(1, T_full, tail);
-        Tensor out_tail  = out.slice(2, T_full, tail);
-        // After full chunks the running state lives in ssm_state_out; a tail-only run (no full
-        // chunks) reads the caller-provided ssm_state_in. Either way the tail publishes to
-        // ssm_state_out.
-        const Tensor& tail_in = (T_full > 0) ? ssm_state_out : ssm_state_in;
-        detail::gated_delta_net::launch_recurrent_inout(q_tail, k_tail, v_tail, g_tail, beta_tail,
-                                                        scale, normalize_qk, tail_in, ssm_state_out,
-                                                        out_tail, stream);
+    auto scratch_scope       = ws.scope();
+    ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
+    if (normalize_qk) {
+        detail::gated_delta_net::launch_normalize_fp16(q, scratch.normalized_q, stream);
+        detail::gated_delta_net::launch_normalize_fp16(k, scratch.normalized_k, stream);
     }
+    detail::gated_delta_net::launch_chunked(normalize_qk ? scratch.normalized_q : q,
+                                            normalize_qk ? scratch.normalized_k : k, v, g, beta,
+                                            scale, ssm_state_in, ssm_state_out, out,
+                                            scratch.stage.data, scratch.stage.bytes, stream);
 }
 
 } // namespace ninfer::ops

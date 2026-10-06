@@ -17,10 +17,12 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(state, [&state](const Tensor& features, const Tensor& positions) {
-        auto& frame  = *state.execution.io.dflash_decode;
-        Tensor count = frame.append_counts.slice(0, 0, 1);
-        Tensor lane  = frame.lanes.slice(0, 0, 1);
-        Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
+        // The program stages the owner in the last ingress row (stage_dflash_prefill_owner).
+        auto& frame              = *state.execution.io.dflash_decode;
+        const std::int32_t owner = frame.lanes.ne[0] - 1;
+        Tensor count             = frame.append_counts.slice(0, owner, 1);
+        Tensor lane              = frame.lanes.slice(0, owner, 1);
+        Tensor row               = frame.dflash_kv_table_rows.slice(0, owner, 1);
         ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
         const auto exact = static_cast<std::uint32_t>(features.ne[1]);
         dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
@@ -66,6 +68,46 @@ PrefillChunkResult prefill_text_chunk(
                                   sink);
     }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+}
+
+MixedPrefillOwner::MixedPrefillOwner(
+    PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
+    std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end)
+    : state_(state), card_(state.execution.device, state.execution.model, state.execution.work,
+                           state.text_kv, state.execution.linear_attention, state.execution.io,
+                           state.execution.prefill_hidden, state.execution.prefill_chunk,
+                           state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache),
+      sink_(make_dflash_prefill_sink(state)), prompt_(ids.data(), ids.size()),
+      nominal_length_(nominal_length), finalize_at_end_(finalize_at_end) {
+    if (state.dflash == nullptr || state.mtp_kv.valid()) {
+        throw std::logic_error("a mixed-round prefill owner requires DFlash without MTP");
+    }
+    configure_text_card(card_, state.execution, state.sampling, state.current_state_slot,
+                        state.mtp_proposal_extent);
+    card_.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
+    card_.set_prefill_rewrite_checkpoint_frontier(
+        rewrite_checkpoint_capture_frontier
+            ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
+            : -1);
+    forward_ = [this](const LayerPartner& partner) {
+        if (forwarded_) { throw std::logic_error("mixed-round prefill owner ran twice"); }
+        forwarded_ = card_.prefill_chunk(prompt_, state_.text_kv_base, nominal_length_,
+                                         finalize_at_end_, sink_, partner);
+    };
+}
+
+void MixedPrefillOwner::append_context() {
+    if (!forwarded_ || appended_) {
+        throw std::logic_error("mixed-round prefill owner appends once, after its forward");
+    }
+    state_.execution.work.reset();
+    sink_.consume_prefill_chunk(static_cast<std::int32_t>(forwarded_->processed_tokens));
+    appended_ = true;
+}
+
+PrefillChunkResult MixedPrefillOwner::result() const {
+    if (!appended_) { throw std::logic_error("mixed-round prefill owner has not completed"); }
+    return forwarded_.value();
 }
 
 PrefillChunkResult prefill_mrope_text_chunk(

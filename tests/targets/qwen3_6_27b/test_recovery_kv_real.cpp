@@ -81,11 +81,12 @@ std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, 
 PrefillRun finish_prefill(execution::ProgramImplCore& program, family::PreparedPromptData prompt,
                           execution::RequestPlan plan) {
     PrefillRun run;
-    auto step     = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {});
+    auto step     = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {},
+                                               ninfer::runtime::PrefillPace::Exclusive);
     run.summary   = step.summary;
     run.processed = step.processed_prompt_tokens;
     while (!step.complete) {
-        step = program.advance_prefill_lane(0);
+        step = program.advance_prefill_lane(0, ninfer::runtime::PrefillPace::Exclusive);
         run.processed += step.processed_prompt_tokens;
     }
     require(!step.round.tokens.empty(), "prefill completed without a sampled token");
