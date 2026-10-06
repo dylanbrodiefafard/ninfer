@@ -953,6 +953,9 @@ private:
         total.drafted_tokens += part.drafted_tokens;
         total.accepted_tokens += part.accepted_tokens;
         total.fallback_steps += part.fallback_steps;
+        if (part.p_less_draft_temperature > 0.0F) {
+            total.p_less_draft_temperature = part.p_less_draft_temperature;
+        }
         auto add = [](auto& into, const auto& values) {
             if (into.size() < values.size()) { into.resize(values.size()); }
             for (std::size_t i = 0; i < values.size(); ++i) { into[i] += values[i]; }

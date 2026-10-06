@@ -608,9 +608,22 @@ that drafted hop j, predicts a k-draft chain's committed length `1 + Σ_{j<k} me
 drafts the next round at the grid temperature with the greatest prediction for that round's k.
 Every candidate is scored on the same verified content, so the choice needs no exploration and
 carries no selection bias. The prediction scores token verification of the drafted prefix; block
-verification accepts at least as much, and offline replay ranked proposal laws identically under
-both. Until a temperature has eight discounted rounds, the Variant prior applies:
-`clamp(0.8·(T−1), 0.2, 1.25)` for 27B, which passes through the measured optima at T=1.5 and T=2.
+verification accepts at least as much, and the prediction's argmax sits at the measured optimum
+at both T=1.5 and T=2 ([measurements](../performance.md#dflash2-p-less-calibration-under-cuda-graphs-2026-10-06)).
+The exact block-verification acceptance is also computable per round,
+`P(τ ≥ j) = E[W_{j−1} · Σ_c min(q'_j(c), p_{j−1} p'_j(c))]` with `p` the verifier's carried weight
+and `W` the importance weight of the realized prefix under `T'`, but its per-round spread is about
+ten times that of the α product, and within a 256-round memory it selects worse. Until a
+temperature has eight discounted rounds, the Variant prior applies:
+`clamp(0.8·(T−1), 0.2, 1.25)` for 27B, which passes through the measured optima at T=1.5 and T=2;
+predictions the evidence does not separate resolve to the grid temperature nearest that prior.
+
+The scoring launch is part of every DFlash2 chain round, captured or eager, whenever the
+temperature is not pinned: it is a startup property of the Program, because a captured graph fixes
+whether the kernel exists. The Program poisons the calibration egress with NaN at startup and each
+scoring launch rewrites what the host reads, so a round without the kernel fails the request rather
+than calibrating on unwritten values. The temperature in use is reported as
+`SpeculativeStats::p_less_draft_temperature` and in the serve request log.
 Packed-tree rounds draw at the Variant tree temperature and contribute no calibration. The
 calibration changes only which valid proposal is drawn; output remains the p-less target
 distribution. Like adaptive k, it makes a request's realized sample (for a fixed seed) depend on

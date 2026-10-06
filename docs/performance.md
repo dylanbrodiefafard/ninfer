@@ -18,6 +18,49 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## DFlash2 p-less calibration under CUDA Graphs (2026-10-06)
+
+The [online draft-temperature calibration](#dflash2-p-less-proposal-calibration-2026-10-03) was
+never captured into the DFlash graphs: the capture context left the scoring flag clear, so a
+replayed round returned an unwritten (zero) calibration egress, every grid temperature predicted
+the same length, and the argmax settled on the first grid entry, 0.2, after eight rounds. Eager
+rounds calibrated correctly. The scoring launch is now a startup property set at capture as well.
+
+RTX 5090, CUDA 13.1, `qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`, NVFP4 KV, CUDA Graphs, optimized
+proposal head, thinking on, 512 new tokens on each of the 40 corpus prompts in one Engine
+(`profiles/dflash_tau/dflash_lab.cpp`), decode tok/s. "Before" is the collapse to 0.2; the pinned
+column is the prior `0.8·(T−1)`:
+
+| Config | p-less T | before | pinned prior | calibrated |
+|---|---:|---:|---:|---:|
+| chain k=7, C=1 | 2.0 | 246.6 | 270.0 | 263.0 |
+| chain k=7, C=1 | 1.5 | 281.2 | 292.2 | 286.1 |
+| adaptive k=7, C=1 | 2.0 | 268.2 | 262.5 | 260.9 |
+| adaptive k=7, C=1 | 1.5 | 307.1 | 303.2 | 307.0 |
+| adaptive k=7, C=2 | 2.0 | 407.5 | 456.9 | 461.6 |
+| adaptive k=7, C=2 | 1.5 | 492.7 | 486.1 | 490.8 |
+
+One-request adaptive rounds mostly run the packed tree, which does not use this temperature. A
+repeat of the same policy agrees within 0.2%, but different policies sample different text: over
+seeds 1-4 at chain k=7, T=2, calibrated against pinned 0.8 measured -2.6%, +1.7%, +3.3%, +0.3%,
+so differences of that size are not resolved. The calibration is therefore equal to the best
+fixed temperature and 7-13% above the collapsed path at T=2 wherever chains run.
+
+Pinned sweep, chain k=7, C=1, seed 1 (tau), against what the calibration chose in the same run:
+
+| p-less T | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.8 | 1.0 | 1.25 | calibration chose |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 2.0 | 3.63 | 3.66 | 3.66 | 3.85 | 3.78 | 3.96 | 3.99 | 3.77 | 0.8 (73%), 1.0 (25%) |
+| 1.5 | 4.19 | 4.15 | 4.29 | 4.28 | 4.25 | 4.20 | 4.00 | 3.80 | 0.4 (77%), 0.3 (21%) |
+
+Two alternative estimators were evaluated on 3,902 recorded p-less rounds (k=7, T=2, drafted at
+0.3) by replaying a 256-round memory. The exact block-verification acceptance with importance
+weights on the realized prefix is unbiased (its on-policy value 2.81 matches the realized 2.79
+accepted drafts) but its per-round spread is 4.0 against 0.44 for the overlap product, and its
+choice scatters across 0.6-1.25. Carrying the verifier's weight without the importance weights
+is biased hot and always chooses 1.25, which the sweep measures 5% below the optimum. The overlap
+product is kept.
+
 ## Token logprobs (2026-10-06)
 
 `ops::token_logprobs` runs at the end of every decode round and scores a row only when its
@@ -342,9 +385,10 @@ proposal head, `--draft-tokens 7 --adaptive-draft`, thinking on, C=1, 512 new to
 | 2 | pinned 0.6 | 4.13 | 252.3 |
 | 2 | pinned 0.8 | 4.14 | 253.3 |
 
-At T=2 the calibration matches the best pinned values within run-to-run noise; at T=1.5 it beats
-the hand-tuned value, since per-k calibration also covers the block-length effect the old scale
-approximated.
+These rows predate the [capture fix](#dflash2-p-less-calibration-under-cuda-graphs-2026-10-06):
+with CUDA Graphs the "calibrated" runs drafted at the collapsed 0.2, and one-request adaptive
+rounds mostly run the packed tree, so the table does not measure the calibration. The later
+section has the valid comparison.
 
 ## DFlash2 best-first tree arm (2026-10-03)
 

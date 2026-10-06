@@ -194,6 +194,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position},
                 {"live_draft_tokens", metrics.speculative_live_draft_tokens},
+                {"p_less_draft_temperature", metrics.speculative_p_less_draft_temperature},
                 {"rounds_per_draft", metrics.speculative_rounds_per_draft}};
 }
 

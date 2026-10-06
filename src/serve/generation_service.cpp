@@ -559,7 +559,9 @@ GenerationService::run(PreparedRequest& prepared, std::uint64_t request_id, cons
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
     outcome.metrics.speculative_live_draft_tokens = result.speculative.live_draft_tokens;
-    outcome.metrics.speculative_rounds_per_draft  = std::move(result.speculative.rounds_per_draft);
+    outcome.metrics.speculative_p_less_draft_temperature =
+        result.speculative.p_less_draft_temperature;
+    outcome.metrics.speculative_rounds_per_draft = std::move(result.speculative.rounds_per_draft);
 
     for (auto& call : result.tool_calls) {
         outcome.tool_calls.push_back(ToolCall{.id             = std::move(call.id),
