@@ -519,9 +519,9 @@ int main() {
             engine.generate(engine.prepare_tokens(prompts[0]), greedy_reuse(8, false));
         if (first.generated_token_ids.size() != 8 ||
             check_adaptive_stats(first, 5, {3, 4, 5}, label) != 0 ||
-            first.speculative.rounds_per_draft.size() < 5 ||
-            first.speculative.rounds_per_draft[4] == 0) {
-            std::cerr << label << " source did not record seeded k=4 rounds\n";
+            first.speculative.rounds_per_draft.size() < 4 ||
+            first.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " source did not record seeded k=3 rounds\n";
             dump_speculative("  spec", first.speculative);
             return 1;
         }
