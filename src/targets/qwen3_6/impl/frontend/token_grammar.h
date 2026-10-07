@@ -16,13 +16,14 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-struct ToolGrammarData {
+struct TokenGrammarData {
     struct Definition {
         std::string name;
         nlohmann::ordered_json parameters;
         std::optional<xgrammar::CompiledGrammar> arguments_validator;
     };
 
+    // Tool grammars have declarations; response grammars have no tool-publication metadata.
     std::vector<Definition> definitions;
     xgrammar::CompiledGrammar compiled;
     [[nodiscard]] std::optional<ToolCall> decode_call(std::string_view text) const;
@@ -32,11 +33,11 @@ namespace frontend_internal {
 
 // The OutputSession owns this state. Draft-mask construction forks committed
 // state and never advances it; only a committed publication advances grammar.
-class ToolGrammarState {
+class TokenGrammarState {
 public:
     static constexpr std::size_t mask_words = (248077 + 31) / 32;
-    explicit ToolGrammarState(std::shared_ptr<const ToolGrammarData> grammar,
-                              std::vector<TokenId> ignored_model_stops = {});
+    explicit TokenGrammarState(std::shared_ptr<const TokenGrammarData> grammar,
+                               std::vector<TokenId> ignored_model_stops = {});
     void preview(std::span<const TokenId> tokens);
     void commit_preview() noexcept;
     void discard_preview() noexcept;
@@ -50,7 +51,7 @@ public:
 
 private:
     bool accept(xgrammar::GrammarMatcher& matcher, TokenId token) const;
-    std::shared_ptr<const ToolGrammarData> grammar_;
+    std::shared_ptr<const TokenGrammarData> grammar_;
     std::vector<TokenId> ignored_model_stops_;
     xgrammar::GrammarMatcher committed_;
     std::optional<xgrammar::GrammarMatcher> preview_;
@@ -58,11 +59,12 @@ private:
 
 // One compiler per resident frontend/tokenizer. Request grammars are immutable;
 // mutable matching/publication state belongs to the request's OutputSession.
-class ToolGrammarCompiler {
+class TokenGrammarCompiler {
 public:
-    explicit ToolGrammarCompiler(std::shared_ptr<const Tokenizer> tokenizer);
-    [[nodiscard]] std::shared_ptr<const ToolGrammarData> compile(std::span<const std::string> tools,
-                                                                 bool starts_in_reasoning);
+    explicit TokenGrammarCompiler(std::shared_ptr<const Tokenizer> tokenizer);
+    [[nodiscard]] std::shared_ptr<const TokenGrammarData>
+    compile(std::span<const std::string> tools, bool starts_in_reasoning,
+            const std::optional<OutputConstraint>& constraint = std::nullopt);
 
 private:
     std::shared_ptr<const Tokenizer> tokenizer_;

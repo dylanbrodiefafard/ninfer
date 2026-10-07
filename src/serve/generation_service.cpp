@@ -82,6 +82,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     error.message  = exception.what();
     error.recovery = exception.recovery();
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::InvalidOutputConstraint:
+        error.status = 400;
+        error.code   = "invalid_output_constraint";
+        error.param  = "response_format";
+        break;
     case ninfer::RequestErrorKind::InvalidToolSchema:
         error.status = 400;
         error.code   = "invalid_tool_schema";
@@ -219,8 +224,13 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     return media;
 }
 
-[[noreturn]] void throw_request_error(const ninfer::RequestError& exception) {
-    throw ApiException(request_error_to_api_error(exception));
+[[noreturn]] void throw_request_error(const ninfer::RequestError& exception,
+                                      std::string_view constraint_param = "response_format") {
+    auto error = request_error_to_api_error(exception);
+    if (exception.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint) {
+        error.param = constraint_param;
+    }
+    throw ApiException(std::move(error));
 }
 
 void check_preparation_control(Clock::time_point deadline,
@@ -455,7 +465,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                             prepared.lifetime->deadline, std::move(host_input));
         prepared.sampling = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception);
+        throw_request_error(exception, request.output_constraint_param);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
     return prepared;
 }
@@ -491,7 +501,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
-        throw_request_error(exception);
+        throw_request_error(exception, request.output_constraint_param);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 }
 

@@ -443,10 +443,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     prefill_hidden  = plan.persistent.prefill_hidden.bind(backing);
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
-    tool_masks      = std::make_unique<qwen3_6::ToolMaskExchange>(
-        plan.persistent.tool_token_masks.bind(backing),
-        plan.persistent.tool_sampling_config.bind(backing),
-        plan.persistent.tool_nodes.bind(backing));
+    token_masks     = std::make_unique<qwen3_6::TokenMaskExchange>(
+        plan.persistent.grammar_masks.bind(backing),
+        plan.persistent.grammar_sampling_config.bind(backing),
+        plan.persistent.grammar_nodes.bind(backing), device.stream);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
     if (plan.persistent.staging_hidden) {
@@ -3506,7 +3506,7 @@ void ProgramImplCore::prepare_graphs() {
         const std::uint32_t warm_k   = captured_ks.empty() ? draft_window : captured_ks.back();
         schedule::MtpBatchContext mtp_state{
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), io.mtp_decode.value(),
-            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store,     tool_masks.get()};
+            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store,     token_masks.get()};
         const auto warm_profiles              = mtp_graph_profiles(capacity, warm_k);
         const GraphExecutionProfile code_warm = warm_profiles.front();
         prepare_representative(code_warm.min, 1, warm_k);
@@ -3526,7 +3526,7 @@ void ProgramImplCore::prepare_graphs() {
             const auto planned_profiles = mtp_graph_profiles(capacity, k);
             for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
                 for (const bool exchange : {false, true}) {
-                    mtp_state.tool_masks = exchange ? tool_masks.get() : nullptr;
+                    mtp_state.token_masks = exchange ? token_masks.get() : nullptr;
                     for (const GraphExecutionProfile planned : planned_profiles) {
                         mtp_graphs.profiles.emplace_back();
                         DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
@@ -3569,7 +3569,7 @@ void ProgramImplCore::prepare_graphs() {
         schedule::DFlashBatchContext dflash_state{
             execution_core(),         decoder->text_kv,     dflash.value(),
             io.dflash_decode.value(), *dflash_host_ingress, *dflash_host_egress,
-            tail_hidden_store,        tool_masks.get(),     calibrates_p_less_drafts()};
+            tail_hidden_store,        token_masks.get(),    calibrates_p_less_drafts()};
         const auto batch_one_profiles         = dflash_graph_profiles(capacity, warm_k, 1, warm_w);
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
@@ -3598,8 +3598,8 @@ void ProgramImplCore::prepare_graphs() {
                 const auto planned_profiles = dflash_graph_profiles(capacity, k, batch_size, wk);
                 validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 for (std::uint32_t variant = 0; variant < kDFlashExchangeVariants; ++variant) {
-                    const bool exchange     = kDFlashExchangeVariants == 1 || variant == 1;
-                    dflash_state.tool_masks = exchange ? tool_masks.get() : nullptr;
+                    const bool exchange      = kDFlashExchangeVariants == 1 || variant == 1;
+                    dflash_state.token_masks = exchange ? token_masks.get() : nullptr;
                     for (const GraphExecutionProfile planned : planned_profiles) {
                         dflash_graphs.profiles.emplace_back();
                         DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
@@ -3711,19 +3711,19 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     const std::array<const qwen3_6::OutputSession*, 1> outputs{request.output};
     const std::array<ops::SamplingConfig, 1> configs{request.sampling_host};
-    tool_masks->bind(outputs, configs);
+    token_masks->bind(outputs, configs);
     // The prefill owner is exclusive. Root storage can be shared with later
     // compact rounds; request sampling itself keeps no compact-row pointer.
-    request.prefill_sampling_host = tool_masks->root(0, device.stream);
+    request.prefill_sampling_host = token_masks->root(0, device.stream);
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.prefill_sampling_host,
                                sizeof(request.prefill_sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
 }
 
-bool ProgramImplCore::any_tool_grammar(std::span<const std::uint32_t> lanes) const {
+bool ProgramImplCore::any_token_grammar(std::span<const std::uint32_t> lanes) const {
     return std::any_of(lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
-        return requests[lane].output && requests[lane].output->has_tool_grammar();
+        return requests[lane].output && requests[lane].output->has_token_grammar();
     });
 }
 
@@ -3738,7 +3738,7 @@ void ProgramImplCore::bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         outputs[row] = requests[lanes[row]].output;
     }
-    tool_masks->bind({outputs.data(), lanes.size()}, configs.first(lanes.size()));
+    token_masks->bind({outputs.data(), lanes.size()}, configs.first(lanes.size()));
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -4229,7 +4229,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
         bind_tool_mask_batch(lanes, ordinary_host_ingress->sampling);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            ordinary_host_ingress->sampling[row] = tool_masks->root(row, device.stream);
+            ordinary_host_ingress->sampling[row] = token_masks->root(row, device.stream);
         }
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
@@ -4367,7 +4367,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
     }
 
-    const bool grammar_exchange = any_tool_grammar(lanes);
+    const bool grammar_exchange = any_token_grammar(lanes);
 
     try {
         DecodeGraphExecutable* executable = nullptr;
@@ -4431,7 +4431,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  tail_hidden_store,
-                                                 grammar_exchange ? tool_masks.get() : nullptr};
+                                                 grammar_exchange ? token_masks.get() : nullptr};
 
         bind_tool_mask_batch(lanes, mtp_host_ingress->sampling);
         mark_workspace_usage(workspace_plan.mtp_round);
@@ -4439,7 +4439,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()), batch_k,
                                    envelopes, executable);
         const double seconds = synchronize_round_seconds(device, started);
-        tool_masks->rethrow_error();
+        token_masks->rethrow_error();
         // Fallback (extent 0) is not a k-draft round; do not fit T(batch_k) from it.
         if (adaptive_draft && realized_extent > 0) {
             qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_k,
@@ -4672,7 +4672,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             std::max(maximum_target_tokens, sequences[lanes[row]].execution_frontier + live_w);
     }
 
-    const bool dflash_exchange = kDFlashExchangeVariants == 1 || any_tool_grammar(lanes);
+    const bool dflash_exchange = kDFlashExchangeVariants == 1 || any_token_grammar(lanes);
     // Packed-tree rounds draw at the Variant tree temperature and produce no calibration.
     const bool chain_round      = !dflash_uses_tree_verify(batch_k, live_w);
     const bool calibrate_p_less = calibrates_p_less_drafts() && chain_round;
@@ -4747,7 +4747,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *dflash_host_ingress,
             *dflash_host_egress,
             tail_hidden_store,
-            dflash_exchange ? tool_masks.get() : nullptr,
+            dflash_exchange ? token_masks.get() : nullptr,
             calibrates_p_less_drafts()};
 
         bind_tool_mask_batch(lanes, dflash_host_ingress->sampling);
@@ -4757,7 +4757,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       batch_k, live_w, envelopes, target_envelope, !use_cuda_graph,
                                       executable);
         const double seconds = synchronize_round_seconds(device, started);
-        tool_masks->rethrow_error();
+        token_masks->rethrow_error();
         // Fallback (extent 0) is not a k-draft round; do not fit T(batch_k) from it.
         if (adaptive_draft && realized_extent > 0) {
             qwen3_6::adaptive_observe_round_time(adaptive_t_by_batch[batch_idx], batch_arm,

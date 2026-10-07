@@ -46,9 +46,9 @@ struct PersistentLayout {
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
-    TensorLayout tool_token_masks;
-    TensorLayout tool_sampling_config;
-    TensorLayout tool_nodes;
+    TensorLayout grammar_masks;
+    TensorLayout grammar_sampling_config;
+    TensorLayout grammar_nodes;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
     std::optional<TensorLayout> staging_hidden;

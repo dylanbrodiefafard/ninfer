@@ -136,10 +136,15 @@ Backfill 只改变 waiting request 的 admission order。它不取得 active req
 资源，不产生 partial admission，不抢占已经 admitted 的 request，也不建立第二套 decode priority。所有
 backfilled decode-ready requests 仍进入同一个 maximal compact batch。
 
-### 2.10 Constrained calls and bounded recovery
+### 2.10 Constrained output and bounded recovery
 
-The Qwen frontend owns compiled tool schemas, transactional grammar state and typed
-completed calls. Program owns planner-accounted device masks and pinned host exchange
+The Qwen frontend owns compiled tool/response schemas and EBNF constraints, transactional grammar
+state, and typed completed calls. `PromptOptions::output_constraint` constrains answer content
+without injecting schema text into the prompt. Response schemas use JSON Schema defaults and
+fixed property order; unsupported assertions fail preparation. Reasoning remains unconstrained
+until `</think>`. Constrained content preserves literal special-token bytes and EBNF whitespace;
+ignored model-stop bytes retain their ordinary publication policy. Tool definitions and response
+constraints cannot be combined. Tool-call parsing is enabled only for tool grammars. Program owns planner-accounted device masks and pinned host exchange
 storage. Ordinary sampling uses one mask per compact row; speculative verification uses
 one mask per row and actual chain/tree node. CUDA Graph host nodes fork grammar state
 after draft IDs/parents have arrived on the host, then upload masks for target sampling.

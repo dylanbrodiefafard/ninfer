@@ -344,8 +344,25 @@ int test_explicit_rejections() {
     Json structured    = base;
     structured["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_code([&] { (void)parse_responses_request(structured, limits()); }) ==
-                          "structured_outputs_not_supported",
-                      "structured output rejected");
+                          "invalid_output_constraint",
+                      "incomplete schema format rejected");
+
+    structured["text"]["format"] = {{"type", "json_schema"},
+                                    {"name", "result"},
+                                    {"schema", {{"type", "object"}}},
+                                    {"strict", true}};
+    const auto constrained       = parse_responses_request(structured, limits());
+    failures += check(constrained.generation.output_constraint &&
+                          constrained.generation.output_constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonSchema &&
+                          constrained.text_format == structured["text"]["format"],
+                      "Responses flattened schema was not preserved");
+    structured["text"]["format"]   = {{"type", "json_object"}};
+    const auto json_object_request = parse_responses_request(structured, limits());
+    failures += check(json_object_request.generation.output_constraint &&
+                          json_object_request.generation.output_constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonObject,
+                      "Responses JSON object format was not translated");
 
     Json background          = base;
     background["background"] = true;

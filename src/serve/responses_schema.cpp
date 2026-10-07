@@ -678,17 +678,7 @@ void reject_server_managed_features(const Json& body) {
         }
         if (body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
             const Json& format = body.at("text").at("format");
-            if (!format.is_object() || !format.contains("type") || !format.at("type").is_string() ||
-                format.at("type").get<std::string>() != "text") {
-                bad_request("only text.format {type:'text'} is supported", "text",
-                            "structured_outputs_not_supported");
-            }
-            for (auto it = format.begin(); it != format.end(); ++it) {
-                if (it.key() != "type") {
-                    bad_request("only text.format {type:'text'} is supported", "text",
-                                "structured_outputs_not_supported");
-                }
-            }
+            (void)parse_output_format(format, false, "text.format");
         }
     }
 }
@@ -721,6 +711,13 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     reject_server_managed_features(body);
 
     ResponsesRequest out;
+    if (body.contains("text") && body.at("text").is_object() &&
+        body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
+        out.text_format                        = body.at("text").at("format");
+        out.generation.output_constraint_param = "text.format";
+        out.generation.output_constraint =
+            parse_output_format(out.text_format, false, "text.format");
+    }
     if (!body.contains("model") || !body.at("model").is_string() ||
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");
@@ -777,6 +774,10 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     } else {
         out.generation.max_tokens     = limits.default_max_tokens;
         out.generation.max_tokens_set = false;
+    }
+    if (out.generation.output_constraint && !out.generation.tools.empty()) {
+        bad_request("output constraints cannot be combined with tools", "text.format",
+                    "invalid_output_constraint");
     }
     out.generation.messages = out.input_turns;
     return out;
@@ -843,7 +844,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"service_tier", "default"},
         {"store", request.store},
         {"temperature", runtime.temperature},
-        {"text", Json{{"format", Json{{"type", "text"}}}}},
+        {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
         {"top_logprobs", request.top_logprobs},

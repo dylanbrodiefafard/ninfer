@@ -129,6 +129,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--no-p-less-sampling]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
+           "       [--json-object|--json-schema FILE|--grammar FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh]\n"
            "       [--vision] [--no-cuda-graph] [--capture-context-checkpoint]\n"
@@ -178,6 +179,12 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
+        } else if (arg == "--json-object") {
+            options.json_object = true;
+        } else if (arg == "--json-schema") {
+            options.json_schema_path = value(arg);
+        } else if (arg == "--grammar") {
+            options.grammar_path = value(arg);
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
@@ -295,6 +302,12 @@ Options parse_options(int argc, char** argv) {
             static_cast<std::size_t>(*kv_capacity_headroom_mib * mib);
     }
 
+    if (static_cast<int>(options.json_object) +
+            static_cast<int>(!options.json_schema_path.empty()) +
+            static_cast<int>(!options.grammar_path.empty()) >
+        1) {
+        throw std::invalid_argument("select only one of --json-object, --json-schema or --grammar");
+    }
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
     if (has_prompt == has_messages) {

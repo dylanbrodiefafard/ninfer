@@ -524,19 +524,6 @@ void reject_unsupported_features(const Json& body) {
             throw ApiException(std::move(error));
         }
     }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
-    }
 }
 
 Json base_chunk(const std::string& id, const std::string& model, std::int64_t created) {
@@ -721,6 +708,58 @@ Json usage_to_json(const CompletionUsage& usage, const CompletionTimings* timing
 
 } // namespace
 
+std::optional<ninfer::OutputConstraint> parse_output_format(const Json& format, bool nested_schema,
+                                                            std::string_view param) {
+    const auto invalid = [&](const std::string& message) {
+        bad_request(message, std::string(param), "invalid_output_constraint");
+    };
+    if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+        invalid("output format requires a string type");
+    }
+    const auto type = format.at("type").get<std::string>();
+    if (type == "text" || type == "json_object") {
+        if (format.size() != 1) { invalid("output format only accepts type for " + type); }
+        if (type == "text") { return std::nullopt; }
+        return ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonObject, {}};
+    }
+    if (type != "json_schema") { invalid("unsupported output format type: " + type); }
+    if (nested_schema && (!format.contains("json_schema") ||
+                          !format.at("json_schema").is_object() || format.size() != 2)) {
+        invalid("json_schema output format requires a json_schema object");
+    }
+    const Json& schema = nested_schema ? format.at("json_schema") : format;
+    for (auto it = schema.begin(); it != schema.end(); ++it) {
+        if (it.key() != "name" && it.key() != "schema" && it.key() != "strict" &&
+            it.key() != "description" && !(it.key() == "type" && !nested_schema)) {
+            invalid("unsupported json_schema option: " + it.key());
+        }
+    }
+    if (!schema.contains("name") || !schema.at("name").is_string()) {
+        invalid("json_schema requires a name");
+    }
+    const auto name = schema.at("name").get<std::string>();
+    if (name.empty() || name.size() > 64 ||
+        !std::all_of(name.begin(), name.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '_' || c == '-';
+        })) {
+        invalid("json_schema name must contain 1 to 64 letters, digits, underscores or hyphens");
+    }
+    if (schema.contains("strict") && !schema.at("strict").is_null() &&
+        !schema.at("strict").is_boolean()) {
+        invalid("json_schema strict must be a boolean or null");
+    }
+    if (schema.contains("description") && !schema.at("description").is_string()) {
+        invalid("json_schema description must be a string");
+    }
+    if (!schema.contains("schema") ||
+        (!schema.at("schema").is_object() && !schema.at("schema").is_boolean())) {
+        invalid("json_schema requires an object or boolean schema");
+    }
+    return ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonSchema,
+                                    schema.at("schema").dump()};
+}
+
 CompletionTimings make_completion_timings(int prompt_tokens, int completion_tokens,
                                           double prefill_seconds, double decode_seconds,
                                           int draft_n, int draft_n_accepted,
@@ -868,6 +907,30 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
+    if (body.contains("response_format") && !body.at("response_format").is_null()) {
+        out.output_constraint =
+            parse_output_format(body.at("response_format"), true, "response_format");
+    }
+    if (body.contains("structured_outputs") && !body.at("structured_outputs").is_null()) {
+        const auto& structured = body.at("structured_outputs");
+        if (out.output_constraint) {
+            bad_request("structured_outputs conflicts with response_format", "structured_outputs",
+                        "invalid_output_constraint");
+        }
+        if (!structured.is_object() || structured.size() != 1 || !structured.contains("grammar") ||
+            !structured.at("grammar").is_string() ||
+            structured.at("grammar").get<std::string>().empty()) {
+            bad_request("structured_outputs requires one nonempty EBNF grammar string",
+                        "structured_outputs", "invalid_output_constraint");
+        }
+        out.output_constraint = ninfer::OutputConstraint{
+            ninfer::OutputConstraintKind::Grammar, structured.at("grammar").get<std::string>()};
+        out.output_constraint_param = "structured_outputs";
+    }
+    if (out.output_constraint && !out.tools.empty()) {
+        bad_request("output constraints cannot be combined with tools", out.output_constraint_param,
+                    "invalid_output_constraint");
+    }
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);

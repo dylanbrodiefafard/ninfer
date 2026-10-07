@@ -30,6 +30,7 @@ struct ResponsesRequest {
 
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    nlohmann::json text_format = {{"type", "text"}};
     nlohmann::json metadata    = nlohmann::json::object();
     nlohmann::json tools       = nlohmann::json::array();
     nlohmann::json tool_choice = "auto";

@@ -1,0 +1,381 @@
+--- a/json_schema_converter.cc
++++ b/json_schema_converter.cc
+@@ -1789,12 +1789,10 @@
+ void JSONSchemaConverter::AddBasicRules() {
+   AddHelperRules();
+ 
+-  // Create basic rules with a temporary indent manager for compact format
++  // Preserve caller separators; whitespace-flexible rules do not need indentation.
+   auto saved_indent_manager = indent_manager_;
+   if (any_whitespace_) {
+     indent_manager_ = IndentManager(std::nullopt, ",", true, max_whitespace_cnt_);
+-  } else {
+-    indent_manager_ = IndentManager(std::nullopt, ", ", false, std::nullopt);
+   }
+ 
+   // basic_any - use "{}" as the cache key for empty schema
+@@ -1863,7 +1861,12 @@
+ 
+ void JSONSchemaConverter::AddHelperRules() {
+   ebnf_script_creator_.AddRule(
+-      kBasicEscape, "[\"\\\\/bfnrt] | \"u\" [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9] [A-Fa-f0-9]"
++      "canonical_key_tail", R"([\x20-\x21\x23-\x5b\x5d-\x7e]* "\"")"
++  );
++  ebnf_script_creator_.AddRule(
++      // JSON escapes represent Unicode scalars, including paired UTF-16 surrogates.
++      kBasicEscape,
++      R"(["\\/bfnrt] | "u" ([0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2} | [dD] [89aAbB] [0-9a-fA-F]{2} "\\u" [dD] [c-fC-F] [0-9a-fA-F]{2}))"
+   );
+   std::string whitespace_part = GetWhitespacePattern();
+   ebnf_script_creator_.AddRule(
+@@ -1908,19 +1911,18 @@
+     add("\"\\\"\"");
+   }
+ 
+-  // 2. Negated char class - excludes edge chars + JSON specials
+-  std::string neg = "[^";
+-  for (const auto& [c, _] : node.children) {
+-    if (c == ']' || c == '\\' || c == '^' || c == '-') {
+-      neg += "\\";
+-    }
+-    neg += c;
+-  }
+-  neg += "\\0-\\x1f\\\"\\\\\\r\\n]";
+-  add(neg + " " + JSONSchemaConverter::kBasicStringSub);
+-
+-  // 3. Escape sequence
+-  add("\"\\\\\" " + JSONSchemaConverter::kBasicEscape + " " + JSONSchemaConverter::kBasicStringSub);
++  // Additional keys have one canonical printable-ASCII spelling. Escaped aliases cannot
++  // overwrite a named property's value after a client JSON parser decodes the key.
++  std::string other = "[";
++  for (int code = 32; code < 127; ++code) {
++    const char c = static_cast<char>(code);
++    if (c == '"' || c == '\\' || node.children.count(c)) continue;
++    if (c == ']' || c == '[' || c == '^' || c == '-') other += "\\";
++    other += c;
++  }
++  if (other.size() != 1) {
++    add(other + "] canonical_key_tail");
++  }
+ 
+   // 4. Trie edges - recurse
+   for (const auto& [c, child] : node.children) {
+@@ -1949,10 +1951,12 @@
+     return GetKeyPattern();
+   }
+ 
+-  // Build trie from property names
+-  // TODO(linzhang): The trie only excludes the literal unescaped spelling of each property name.
++  // Only printable-ASCII names can collide with the canonical additional-key language.
+   TrieNode root;
+   for (const auto& prop : properties) {
++    if (std::any_of(prop.name.begin(), prop.name.end(), [](unsigned char c) {
++          return c < 32 || c >= 127 || c == '"' || c == '\\';
++        })) continue;
+     TrieNode* cur = &root;
+     for (char c : prop.name) {
+       cur = &cur->children[c];
+@@ -2073,6 +2077,8 @@
+ 
+   if (start.has_value() || end.has_value()) {
+     std::string range_regex = GenerateRangeRegex(start, end);
++    XGRAMMAR_CHECK(range_regex != "^()$")
++        << "Number bounds have no representable value at six fractional digits";
+     return RegexToEBNF(range_regex, false);
+   }
+   return "(\"0\" | \"-\"? [1-9] [0-9]*)";
+@@ -2143,6 +2149,8 @@
+   if (start.has_value() || end.has_value()) {
+     std::string range_regex =
+         GenerateFloatRangeRegex(start, end, 6, exclusive_start, exclusive_end);
++    XGRAMMAR_CHECK(range_regex != "^()$")
++        << "Number bounds have no representable value at six fractional digits";
+     return RegexToEBNF(range_regex, false);
+   }
+   // Note: The format must be "-"? ("0" | ...) not ("0" | "-"? ...)
+@@ -2173,7 +2181,10 @@
+ 
+   // Check for length constraints
+   if (spec.min_length != 0 || spec.max_length != -1) {
+-    std::string char_pattern = "[^\"\\\\\\r\\n]";
++    // One grammar unit is one decoded Unicode scalar, including a JSON escape.
++    // A surrogate pair contributes one scalar; isolated surrogate escapes are excluded.
++    std::string char_pattern =
++        R"(([^\x00-\x1f"\\] | "\\" (["\\/bfnrt] | "u" ([0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2} | [dD] [89aAbB] [0-9a-fA-F]{2} "\\u" [dD] [c-fC-F] [0-9a-fA-F]{2}))))";
+     std::string repetition;
+     if (spec.max_length == -1) {
+       repetition = "{" + std::to_string(spec.min_length) + ",}";
+--- a/support/encoding.h
++++ b/support/encoding.h
+@@ -181,10 +181,10 @@
+     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+-     2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
++    -1, -1,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+      2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,
+      3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,
+-    4,  4,  4,  4,  4,  4,  4,  4, -1, -1, -1, -1, -1, -1, -1, -1,
++    4,  4,  4,  4,  4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+   };
+   // clang-format on
+   auto num_bytes = kUtf8Bytes[static_cast<uint8_t>(byte)];
+@@ -194,11 +194,25 @@
+   return {true, num_bytes, byte & kFirstByteMask[num_bytes]};
+ }
+ 
++inline bool IsUTF8ContinuationByte(uint8_t byte, int32_t remaining, TCodepoint partial) {
++  if ((byte & 0xC0) != 0x80) return false;
++  // After a valid four-byte second byte, partial is at least 16. E0/ED prefixes
++  // therefore remain distinguishable using the existing partial codepoint.
++  if (remaining == 2) {
++    if (partial == 0 && byte < 0xA0) return false;
++    if (partial == 0xD && byte > 0x9F) return false;
++  } else if (remaining == 3) {
++    if (partial == 0 && byte < 0x90) return false;
++    if (partial == 4 && byte > 0x8F) return false;
++  }
++  return true;
++}
++
+ inline std::pair<TCodepoint, int32_t> ParseNextUTF8(const char* utf8) {
+   auto [accepted, num_bytes, res] = HandleUTF8FirstByte(utf8[0]);
+   if (accepted) {
+     for (int i = 1; i < num_bytes; ++i) {
+-      if (utf8[i] == 0 || (static_cast<uint8_t>(utf8[i]) & 0xC0) != 0x80) {
++      if (!IsUTF8ContinuationByte(static_cast<uint8_t>(utf8[i]), num_bytes - i, res)) {
+         // invalid utf8
+         accepted = false;
+         break;
+--- a/earley_parser.cc
++++ b/earley_parser.cc
+@@ -628,7 +628,7 @@
+ 
+   // The state is matching a UTF8 character (continuation bytes).
+   if (state.sub_element_id > 0) {
+-    if ((ch & 0xC0) == 0x80) {
++    if (IsUTF8ContinuationByte(ch, state.sub_element_id, state.partial_codepoint)) {
+       auto new_state = state;
+       new_state.sub_element_id--;
+       // Accumulate the codepoint from continuation byte
+@@ -763,7 +763,7 @@
+ 
+   // The state is matching a UTF8 character (continuation bytes).
+   if (state.sub_element_id > 0) {
+-    if ((ch & 0xC0) == 0x80) {
++    if (IsUTF8ContinuationByte(ch, state.sub_element_id, state.partial_codepoint)) {
+       auto new_state = state;
+       new_state.sub_element_id--;
+       // Accumulate the codepoint from continuation byte
+--- a/grammar_functor.cc
++++ b/grammar_functor.cc
+@@ -7,6 +7,7 @@
+ 
+ #include <xgrammar/xgrammar.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <bitset>
+ #include <cstdint>
+@@ -18,6 +19,7 @@
+ #include <stack>
+ #include <string>
+ #include <tuple>
++#include <utility>
+ #include <vector>
+ 
+ #include "compiled_grammar_impl.h"
+@@ -1041,12 +1043,12 @@
+ class GrammarFSMBuilderImpl {
+  public:
+   const static uint32_t kMax1ByteUnicode = 0x7F;
+-  const static uint32_t kMin2BytesUnicode = 0xC080;
++  const static uint32_t kMin2BytesUnicode = 0xC280;
+   const static uint32_t kMax2BytesUnicode = 0xDFBF;
+-  const static uint32_t kMin3BytesUnicode = 0xE08080;
++  const static uint32_t kMin3BytesUnicode = 0xE0A080;
+   const static uint32_t kMax3BytesUnicode = 0xEFBFBF;
+-  const static uint32_t kMin4BytesUnicode = 0xF0808080;
+-  const static uint32_t kMax4BytesUnicode = 0xF7BFBFBF;
++  const static uint32_t kMin4BytesUnicode = 0xF0908080;
++  const static uint32_t kMax4BytesUnicode = 0xF48FBFBF;
+ 
+   void Apply(Grammar* grammar) {
+     FSM complete_fsm;
+@@ -1256,136 +1258,61 @@
+   return;
+ }
+ 
+-// This function will add a range [min, max] of unicode characters to the FSM.
++// Intersect packed-byte endpoints with the canonical encodings of Unicode scalars.
++// These ranges retain optimized byte transitions while excluding malformed UTF-8.
+ void GrammarFSMBuilderImpl::AddCharacterRange(
+     FSMWithStartEnd& fsm, int from, int to, uint32_t min, uint32_t max
+ ) {
+   XGRAMMAR_CHECK(min <= max) << "Invalid character range: min (" << min << ") > max (" << max
+                              << ")";
+-  // Ensure max and min are valid unicode value.
+-  if (max > kMax4BytesUnicode) {
+-    max = kMax4BytesUnicode;
+-  } else if (max > kMax3BytesUnicode) {
+-    if (max < kMin4BytesUnicode) {
+-      max = kMax3BytesUnicode;
+-    }
+-  } else if (max > kMax2BytesUnicode) {
+-    if (max < kMin3BytesUnicode) {
+-      max = kMax2BytesUnicode;
+-    }
+-  } else if (max < kMin2BytesUnicode && (max > kMax1ByteUnicode)) {
+-    max = kMax1ByteUnicode;
+-  }
+-
+-  if (min > kMax4BytesUnicode) {
+-    min = kMax4BytesUnicode;
+-  } else if (min > kMax3BytesUnicode) {
+-    if (min < kMin4BytesUnicode) {
+-      min = kMin4BytesUnicode;
+-    }
+-  } else if (min > kMax2BytesUnicode) {
+-    if (min < kMin3BytesUnicode) {
+-      min = kMin3BytesUnicode;
+-    }
+-  } else if (min < kMin2BytesUnicode && (min > kMax1ByteUnicode)) {
+-    min = kMin2BytesUnicode;
+-  }
+-
+-  // Step2. Divide the range into several ranges, which contain characters with different lengths.
+-  if (max <= kMax1ByteUnicode) {
+-    AddSameLengthCharacterRange(fsm, from, to, min, max);
+-    return;
+-  }
+-  if (max <= kMax2BytesUnicode) {
+-    if (min >= kMin2BytesUnicode) {
+-      AddSameLengthCharacterRange(fsm, from, to, min, max);
+-    } else {
+-      AddSameLengthCharacterRange(fsm, from, to, min, kMax1ByteUnicode);
+-      AddSameLengthCharacterRange(fsm, from, to, kMin2BytesUnicode, max);
+-    }
+-    return;
+-  }
+-  if (max <= kMax3BytesUnicode) {
+-    if (min >= kMin3BytesUnicode) {
+-      AddSameLengthCharacterRange(fsm, from, to, min, max);
+-    } else if (min >= kMin2BytesUnicode) {
+-      AddSameLengthCharacterRange(fsm, from, to, min, kMax2BytesUnicode);
+-      AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, max);
+-    } else {
+-      AddSameLengthCharacterRange(fsm, from, to, min, kMax1ByteUnicode);
+-      AddSameLengthCharacterRange(fsm, from, to, kMin2BytesUnicode, kMax2BytesUnicode);
+-      AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, max);
+-    }
+-    return;
+-  }
+-  XGRAMMAR_CHECK(max <= kMax4BytesUnicode);
+-  if (min >= kMin4BytesUnicode) {
+-    AddSameLengthCharacterRange(fsm, from, to, min, max);
+-  } else if (min >= kMin3BytesUnicode) {
+-    AddSameLengthCharacterRange(fsm, from, to, min, kMax3BytesUnicode);
+-    AddSameLengthCharacterRange(fsm, from, to, kMin4BytesUnicode, max);
+-  } else if (min >= kMin2BytesUnicode) {
+-    AddSameLengthCharacterRange(fsm, from, to, min, kMax2BytesUnicode);
+-    AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, kMax3BytesUnicode);
+-    AddSameLengthCharacterRange(fsm, from, to, kMin4BytesUnicode, max);
+-  } else {
+-    AddSameLengthCharacterRange(fsm, from, to, min, kMax1ByteUnicode);
+-    AddSameLengthCharacterRange(fsm, from, to, kMin2BytesUnicode, kMax2BytesUnicode);
+-    AddSameLengthCharacterRange(fsm, from, to, kMin3BytesUnicode, kMax3BytesUnicode);
+-    AddSameLengthCharacterRange(fsm, from, to, kMin4BytesUnicode, max);
+-  }
+-  return;
++  static constexpr std::array<std::pair<uint32_t, uint32_t>, 9> scalar_ranges = {{
++      {0, kMax1ByteUnicode},
++      {kMin2BytesUnicode, kMax2BytesUnicode},
++      {kMin3BytesUnicode, 0xE0BFBF},
++      {0xE18080, 0xECBFBF},
++      {0xED8080, 0xED9FBF},
++      {0xEE8080, kMax3BytesUnicode},
++      {kMin4BytesUnicode, 0xF0BFBFBF},
++      {0xF1808080, 0xF3BFBFBF},
++      {0xF4808080, kMax4BytesUnicode},
++  }};
++  for (const auto& [lower, upper] : scalar_ranges) {
++    const uint32_t first = std::max(min, lower);
++    const uint32_t last = std::min(max, upper);
++    if (first <= last) AddSameLengthCharacterRange(fsm, from, to, first, last);
++  }
+ }
+ 
+ FSMWithStartEnd GrammarFSMBuilderImpl::BuildNegativeCharacterClass(const GrammarExpr& expr) {
+   XGRAMMAR_DCHECK(
+       expr.type == ExprType::kCharacterClass || expr.type == ExprType::kCharacterClassStar
+   );
+-  XGRAMMAR_DCHECK(expr[0]);  // Negative character class should be true.
+-  std::bitset<128> char_set;
++  XGRAMMAR_DCHECK(expr[0]);
++  std::vector<std::pair<uint32_t, uint32_t>> excluded;
+   for (int i = 1; i < static_cast<int>(expr.size()); i += 2) {
+-    uint8_t byte_min = static_cast<uint8_t>(expr[i]);
+-    uint8_t byte_max = static_cast<uint8_t>(expr[i + 1]);
+-    if (byte_max > 128) {
+-      XGRAMMAR_LOG(WARNING) << "Negative Character class contains byte greater than 127, "
+-                            << "clamping to 127.";
+-      byte_max = 127;
+-    }
+-    for (uint8_t j = byte_min; j <= byte_max; ++j) {
+-      char_set.set(j);
+-    }
+-  }
+-
+-  // Construct the basic FSM.
++    XGRAMMAR_CHECK(expr[i] >= 0 && expr[i] <= expr[i + 1] && expr[i + 1] <= 0x10FFFF)
++        << "Invalid Unicode character-class range";
++    excluded.emplace_back(static_cast<uint32_t>(expr[i]), static_cast<uint32_t>(expr[i + 1]));
++  }
++  std::sort(excluded.begin(), excluded.end());
+   FSMWithStartEnd result_fsm;
+-  int start_state = result_fsm.AddState();
+-  bool is_star = expr.type == ExprType::kCharacterClassStar;
++  const int start_state = result_fsm.AddState();
+   result_fsm.SetStartState(start_state);
+-  int end_state = -1;
+-  if (is_star) {
+-    end_state = start_state;
+-  } else {
+-    end_state = result_fsm.AddState();
+-  }
++  const int end_state = expr.type == ExprType::kCharacterClassStar
++                            ? start_state : result_fsm.AddState();
+   result_fsm.AddEndState(end_state);
+-  int left_bound = -1;
+-  for (int i = 0; i < 128; ++i) {
+-    if (!char_set[i]) {
+-      left_bound = i;
+-      int right_bound = i + 1;
+-      while (right_bound < 128 && !char_set[right_bound]) {
+-        right_bound++;
+-      }
+-      result_fsm.GetFsm().AddEdge(
+-          start_state,
+-          end_state,
+-          static_cast<uint8_t>(left_bound),
+-          static_cast<uint8_t>(right_bound - 1)
+-      );
+-      i = right_bound;
+-    }
+-  }
+-  AddCharacterRange(result_fsm, start_state, end_state, kMin2BytesUnicode, kMax4BytesUnicode);
++  uint32_t next = 0;
++  for (const auto& [lower, upper] : excluded) {
++    if (next < lower) {
++      AddCharacterRange(result_fsm, start_state, end_state,
++                        CodepointToPackedUTF8(next), CodepointToPackedUTF8(lower - 1));
++    }
++    next = std::max(next, upper + 1);
++  }
++  if (next <= 0x10FFFF) {
++    AddCharacterRange(result_fsm, start_state, end_state,
++                      CodepointToPackedUTF8(next), CodepointToPackedUTF8(0x10FFFF));
++  }
+   return result_fsm;
+ }
+ 

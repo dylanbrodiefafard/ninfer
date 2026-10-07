@@ -368,7 +368,11 @@ private:
         av_packet_free(&packet_);
         avcodec_free_context(&codec_);
         if (format_ != nullptr) { avformat_close_input(&format_); }
-        if (io_ != nullptr) { avio_context_free(&io_); }
+        if (io_ != nullptr) {
+            // FFmpeg may replace the buffer while probing; free the current allocation.
+            av_freep(static_cast<void*>(&io_->buffer));
+            avio_context_free(&io_);
+        }
     }
 
     AVFormatContext* format_ = nullptr;

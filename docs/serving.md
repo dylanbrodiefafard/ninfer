@@ -96,6 +96,74 @@ The endpoint supports:
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 - the vendor `ninfer` object (`capture_context_checkpoint`).
 
+### Constrained output
+
+Chat Completions accepts the standard OpenAI `response_format`:
+
+```json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "result",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Use `{"type":"json_object"}` for arbitrary JSON objects, or `{"type":"text"}` for
+unconstrained content. Responses accepts the same modes through `text.format`; its schema
+format is flattened: `{"type":"json_schema","name":"result","strict":true,"schema":{...}}`.
+The terminal Response echoes this format. Schema names contain 1–64 letters, digits,
+underscores, or hyphens. `strict` accepts boolean or null; every admitted schema assertion is
+enforced regardless of this flag.
+
+The shared JSON triggers match the official
+[llama.cpp grammar guide](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md),
+[vLLM structured-output contract](https://docs.vllm.ai/en/latest/features/structured_outputs/), and
+[SGLang structured-output contract](https://docs.sglang.io/docs/advanced_features/structured_outputs).
+Their raw grammar fields differ: llama.cpp uses `grammar` with GBNF, vLLM uses
+`structured_outputs.grammar`, and SGLang uses `ebnf`. NInfer selects the vLLM EBNF interface.
+
+For an explicit EBNF grammar, Chat Completions accepts the vLLM-style extension
+`"structured_outputs":{"grammar":"root ::= \"yes\" | \"no\""}`. The start rule is `root`;
+syntax follows XGrammar EBNF. This extension cannot be combined with a constrained
+`response_format`. llama.cpp GBNF and SGLang's `ebnf` request field are separate interfaces.
+
+Constraints apply to content after the reasoning close; thinking remains free text. Include
+instructions for the desired response in the prompt: the schema is not injected into messages.
+Streaming uses the usual content deltas. Caller stop strings/tokens, cancellation, and token or
+context limits can leave incomplete constrained output; inspect the finish reason and validate
+truncated output before consuming it. Tool declarations and output constraints cannot be combined.
+
+The supported JSON Schema subset includes objects, arrays, primitive types and type unions,
+`properties`, `required`, `additionalProperties`, `items`, `prefixItems`, size and length bounds,
+numeric bounds, `enum`, `const`, `anyOf`, and local JSON-pointer `$ref`/`$defs`/`definitions`.
+Type-specific assertions require an explicit `type`; count bounds are nonnegative 32-bit integers.
+Regex `pattern` assertions, anchor references, assertion siblings of `$ref`/`anyOf`/`enum`/`const` (except checked typed literals),
+and unsupported assertions such as `uniqueItems`, `oneOf`, `allOf`, or conditionals fail
+admission with HTTP 400 `invalid_output_constraint`; they are never silently relaxed.
+JSON is generated compactly, without optional formatting whitespace, and properties follow schema order to avoid an exponential unordered-property
+state space. Additional keys alongside named properties use printable ASCII without escapes,
+quotes, or backslashes to prevent aliases overwriting named values. A positive `minProperties`
+above one with additional keys requires at least that many distinct required properties;
+otherwise admission rejects the combination because arbitrary repeated keys cannot establish a
+distinct-property count. Bounded-number emission uses up to six fractional digits and inward-rounded
+bounds; intervals with no representable value fail admission. Integer bounds must fit the
+compiler's signed 64-bit representation. Omitted `additionalProperties` and `items` retain JSON Schema's permissive defaults.
+
+The resident frontend shares a bounded compiled-grammar/tokenizer cache. Each request owns its
+matcher, and the existing packed GPU token mask constrains target sampling, including MTP and
+DFlash verification. Speculative matcher forks only advance on committed output, and mask
+construction overlaps target GPU execution. Unconstrained requests retain the mask-free route.
+
 The request `model` is informational: NInfer runs one resident model, so it serves that model
 regardless of the identifier and echoes the requested value back (llama.cpp-compatible). The
 advertised alias is the artifact `identity.model_id` by default, or the explicit `--model-id`
@@ -323,7 +391,7 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | `text`, `json_object`, or flattened `json_schema`; see constrained output above |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
 | `parallel_tool_calls` | omitted or `true` |
@@ -420,9 +488,10 @@ JSON objects use the same order-independent rules, including through local
 references and supported alternatives. Completed-call validation rejects duplicate
 keys (including in nested JSON values); arbitrary additional key names are checked
 for duplication during this final validation, not by the finite named-key grammar.
-In nested JSON, an escaped alias of a declared key can also pass the library's
-additional-key grammar; final validation decodes the key before checking its
-value and uniqueness, and never publishes a call that fails those checks.
+Nested JSON additional keys alongside named properties use a canonical printable-ASCII
+spelling without quotes, backslashes, or escapes, preventing aliases of declared keys.
+Final validation also rejects repeated arbitrary additional keys and never publishes a
+call that fails decoded-value or uniqueness checks.
 These rules apply on ordinary and every speculative target position, with grammar
 state committed only for published tokens. They do not shorten reasoning, force an
 end-of-turn after a call, or change sampling/recovery settings.
@@ -1083,8 +1152,8 @@ context-capacity finishes map to `length`/ `max_tokens`; ordinary model or strin
 `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. NInfer does not execute tools. Response schemas constrain decoded answer content;
+tool schemas use the separately documented tool-call constraint policy.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

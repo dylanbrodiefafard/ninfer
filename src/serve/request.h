@@ -251,7 +251,9 @@ struct GenerationRequest {
     SamplingParams sampling;
     // Set to report every content token's logprob with this many ranked alternatives (0..20).
     std::optional<int> top_logprobs;
-    bool capture_context_checkpoint = false;
+    std::optional<ninfer::OutputConstraint> output_constraint;
+    std::string output_constraint_param = "response_format";
+    bool capture_context_checkpoint     = false;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
