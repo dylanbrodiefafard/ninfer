@@ -11,7 +11,7 @@
 
 namespace ninfer::targets::qwen3_6 {
 
-struct ToolGrammarData;
+struct TokenGrammarData;
 
 enum class PromptModality : std::uint8_t {
     Image = 1,
@@ -83,7 +83,7 @@ struct PreparedPromptData {
     PromptIdentity identity;
     bool starts_in_reasoning = false;
     bool tool_output_enabled = false;
-    std::shared_ptr<const ToolGrammarData> tool_grammar;
+    std::shared_ptr<const TokenGrammarData> token_grammar;
     std::shared_ptr<const GenerationRecoveryContext> generation_recovery;
     PrepareStats prepare;
 

@@ -23,7 +23,7 @@
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "targets/qwen3_6/impl/runtime/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
@@ -335,7 +335,7 @@ public:
     // ingress), so masked accept configs match the drafted rows.
     void bind_tool_mask_batch(std::span<const std::uint32_t> lanes,
                               std::span<const ops::SamplingConfig> configs);
-    [[nodiscard]] bool any_tool_grammar(std::span<const std::uint32_t> lanes) const;
+    [[nodiscard]] bool any_token_grammar(std::span<const std::uint32_t> lanes) const;
     [[nodiscard]] bool any_token_logprobs(std::span<const std::uint32_t> lanes) const;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
@@ -491,7 +491,7 @@ public:
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
-    std::unique_ptr<qwen3_6::ToolMaskExchange> tool_masks;
+    std::unique_ptr<qwen3_6::TokenMaskExchange> token_masks;
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;

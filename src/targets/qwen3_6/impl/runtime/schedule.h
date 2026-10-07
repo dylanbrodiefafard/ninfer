@@ -13,7 +13,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "targets/qwen3_6/impl/runtime/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -85,7 +85,7 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -96,7 +96,7 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
     // DFlash2 chain rounds score the p-less proposal calibration grid into host_egress. A
     // captured graph fixes whether the scoring kernel exists, so this is the Program's startup
     // property (calibrates_p_less_drafts()) at warm-up, capture, and every round alike, never a
@@ -150,11 +150,11 @@ struct TargetVerifyFrameView {
     Tensor draft_selector_q;
     // Optional FP32 [G,k,B] chain proposal calibration output; requires the draft selectors.
     Tensor proposal_calibration;
-    bool tree_verify                       = false;
-    const GdnReplayRecords* replay_records = nullptr;
-    const ops::SamplingConfig* sampling    = nullptr;
-    DFlashFeatureSink* feature_sink        = nullptr;
-    qwen3_6::ToolMaskExchange* tool_masks  = nullptr;
+    bool tree_verify                        = false;
+    const GdnReplayRecords* replay_records  = nullptr;
+    const ops::SamplingConfig* sampling     = nullptr;
+    DFlashFeatureSink* feature_sink         = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

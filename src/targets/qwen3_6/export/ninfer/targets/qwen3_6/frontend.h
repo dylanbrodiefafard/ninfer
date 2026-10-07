@@ -110,15 +110,15 @@ public:
     [[nodiscard]] bool in_reasoning() const noexcept;
     [[nodiscard]] bool model_stop_tokens_allowed() const noexcept;
     [[nodiscard]] bool reasoning_cycle_exclusion_allowed(TokenId token) const;
-    [[nodiscard]] bool has_tool_grammar() const noexcept;
+    [[nodiscard]] bool has_token_grammar() const noexcept;
     [[nodiscard]] std::span<const ToolCall> tool_calls() const noexcept;
     [[nodiscard]] std::shared_ptr<const GenerationRecoveryContext>
     generation_recovery_context() const noexcept;
     [[nodiscard]] bool terminal() const noexcept;
     // Read-only snapshot of committed grammar, node-major. Node zero is the
     // committed root; other nodes consume their token from an earlier parent.
-    void fill_tool_masks(std::span<const TokenId> tokens, std::span<const std::int32_t> parents,
-                         std::span<std::uint32_t> words) const;
+    void fill_token_masks(std::span<const TokenId> tokens, std::span<const std::int32_t> parents,
+                          std::span<std::uint32_t> words) const;
 
 private:
     class Impl;

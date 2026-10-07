@@ -567,3 +567,19 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## Constrained-output Engine integration
+
+`ninfer_qwen3_8_27b_output_constraint_real_test` exercises JSON Schema and EBNF alongside an
+unconstrained request at concurrency three with NVFP4 KV, CUDA Graphs, ordinary decode, and each
+available MTP/DFlash backend. It checks parsed schema values, exact EBNF content, EOS completion,
+streaming/result agreement, and speculative verification; a second pass exercises compiler caching.
+Set `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` and/or
+`NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` to explicit local artifacts and run:
+
+```bash
+./scripts/run-unit-tests.sh --real -R ninfer_qwen3_8_27b_output_constraint_real_test
+```
+
+The frontend CPU suite independently checks schema acceptance and JSON string/escape syntax,
+including special-token literals, reasoning transitions, ignored EOS, and speculative rollback.

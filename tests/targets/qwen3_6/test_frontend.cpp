@@ -7,6 +7,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+#include "targets/qwen3_6/impl/frontend/token_grammar.h"
 #include "targets/qwen3_6/official_tokenizer_dir.h"
 #include "text/unicode.h"
 
@@ -2079,6 +2080,383 @@ int run_encode_bench() {
     return 0;
 }
 
+int test_constrained_output() {
+    auto owned          = resources();
+    auto tokenizer_json = nlohmann::json::parse(owned.tokenizer_json);
+    auto& vocab         = tokenizer_json["model"]["vocab"];
+    std::array<ninfer::TokenId, 256> byte_tokens{};
+    for (int c = 0; c < 256; ++c) {
+        const auto symbol = byte_level_symbol(static_cast<std::uint8_t>(c));
+        if (!vocab.contains(symbol)) { vocab[symbol] = 1000 + c; }
+        byte_tokens[c] = vocab.at(symbol).get<ninfer::TokenId>();
+    }
+    tokenizer_json["added_tokens"].push_back(added(25, R"(nk>{"value":)"));
+    owned.tokenizer_json  = tokenizer_json.dump();
+    auto tokenizer_config = nlohmann::json::parse(owned.tokenizer_config_json);
+    tokenizer_config["added_tokens_decoder"]["25"] = decoder_added(R"(nk>{"value":)");
+    owned.tokenizer_config_json                    = tokenizer_config.dump();
+    const Frontend frontend                        = FrontendFactory::create_component(owned);
+    const fi::Tokenizer tokenizer(
+        {owned.tokenizer_json, owned.tokenizer_config_json, owned.generation_config_json});
+    int failures = 0;
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.parts.push_back({.text = "x"});
+    input.messages.push_back(user);
+    input.options.enable_thinking   = false;
+    input.options.output_constraint = ninfer::OutputConstraint{
+        ninfer::OutputConstraintKind::JsonSchema,
+        R"({"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false})"};
+    const std::string answer = R"({"value":"<|vision_start|></think><tool_call>"})";
+    auto prompt              = frontend.prepare(input);
+    auto output              = frontend.make_output_session(prompt, {});
+    failures += check(output.has_token_grammar(), "response constraint has no token grammar");
+    const auto& grammar = FrontendFactory::inspect(prompt).token_grammar;
+    // Independent schema oracle for this finite set: one string property and no other keys.
+    for (const auto& [text, valid] :
+         std::vector<std::pair<std::string, bool>>{{answer, true},
+                                                   {R"({"value":"ok"})", true},
+                                                   {R"({"value":3})", false},
+                                                   {R"({})", false},
+                                                   {R"({"value":"ok","extra":1})", false},
+                                                   {R"([])", false}}) {
+        xgrammar::GrammarMatcher matcher(grammar->compiled);
+        failures += check((matcher.AcceptString(text) && matcher.IsCompleted()) == valid,
+                          "response grammar disagrees with object-schema oracle");
+    }
+    auto tokens = tokenizer.encode(answer);
+    tokens.push_back(6);
+    std::string visible;
+    for (const auto token : tokens) {
+        const auto decision = output.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
+                                             ninfer::FinishReason::OutputLimit);
+        for (const auto& delta : output.commit_preview()) { visible += delta.text; }
+        if (token == 6) {
+            failures += check(decision.finish_reason == ninfer::FinishReason::StopToken,
+                              "constrained JSON did not stop after completion");
+        }
+    }
+    failures += check(visible == answer && output.tool_calls().empty(),
+                      "constrained publication changed literal framing bytes");
+
+    xgrammar::GrammarMatcher compact(grammar->compiled);
+    failures +=
+        check(compact.AcceptString(answer) && compact.IsCompleted() && !compact.AcceptString("\n"),
+              "completed compact JSON can extend with formatting whitespace");
+
+    auto thinking_input                    = input;
+    thinking_input.options.enable_thinking = true;
+    auto thinking_output = frontend.make_output_session(frontend.prepare(thinking_input), {});
+    std::vector<ninfer::TokenId> fused_tokens{3, 25};
+    const auto after_prefix = tokenizer.encode(answer.substr(std::string("{\"value\":").size()));
+    fused_tokens.insert(fused_tokens.end(), after_prefix.begin(), after_prefix.end());
+    fused_tokens.push_back(6);
+    const auto thinking_decision =
+        thinking_output.preview(fused_tokens, 100, ninfer::FinishReason::OutputLimit);
+    std::string thinking_content;
+    std::string reasoning_text;
+    for (const auto& delta : thinking_output.commit_preview()) {
+        (delta.channel == ninfer::OutputChannel::Content ? thinking_content : reasoning_text) +=
+            delta.text;
+    }
+    failures += check(thinking_decision.finish_reason == ninfer::FinishReason::StopToken &&
+                          thinking_content == answer && reasoning_text == "thought",
+                      "a fused reasoning-close/JSON token changed constrained output");
+
+    ninfer::StopPolicy ignore_model_stops;
+    ignore_model_stops.include_model_defaults = false;
+    auto continued = frontend.make_output_session(prompt, ignore_model_stops);
+    (void)continued.preview(tokens, 100, ninfer::FinishReason::OutputLimit);
+    std::string ignored_stop_content;
+    for (const auto& delta : continued.commit_preview()) { ignored_stop_content += delta.text; }
+    failures +=
+        check(ignored_stop_content == answer, "disabled model EOS leaked into constrained content");
+
+    ninfer::PromptInput length_input = input;
+    length_input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonSchema,
+                                 R"({"type":"string","minLength":1,"maxLength":1})"};
+    const auto length_prompt  = frontend.prepare(length_input);
+    const auto length_grammar = FrontendFactory::inspect(length_prompt).token_grammar;
+    for (const auto& [text, valid] :
+         std::vector<std::pair<std::string, bool>>{{R"("a")", true},
+                                                   {R"("\n")", true},
+                                                   {R"("\"")", true},
+                                                   {R"("\\")", true},
+                                                   {R"("\u0001")", true},
+                                                   {R"("\uD83D\uDE00")", true},
+                                                   {"\"😀\"", true},
+                                                   {R"("")", false},
+                                                   {R"("aa")", false},
+                                                   {R"("\u0061b")", false},
+                                                   {R"("\uD83D")", false},
+                                                   {R"("\q")", false},
+                                                   {"\"a\"b\"", false}}) {
+        xgrammar::GrammarMatcher matcher(length_grammar->compiled);
+        const bool accepted = matcher.AcceptString(text) && matcher.IsCompleted();
+        failures += check(accepted == valid, "length grammar disagrees with Unicode string oracle");
+        if (accepted) {
+            failures += check(nlohmann::json::accept(text), "length grammar accepted invalid JSON");
+        }
+    }
+    for (int control = 0; control < 32; ++control) {
+        const std::string invalid = std::string("\"") + static_cast<char>(control) + "\"";
+        xgrammar::GrammarMatcher matcher(length_grammar->compiled);
+        failures +=
+            check(!matcher.AcceptString(invalid), "length grammar accepted a raw control byte");
+    }
+    length_input.options.output_constraint = ninfer::OutputConstraint{
+        ninfer::OutputConstraintKind::JsonSchema, R"({"type":"object","minProperties":1})"};
+    const auto open_prompt = frontend.prepare(length_input);
+    xgrammar::GrammarMatcher open_object(
+        FrontendFactory::inspect(open_prompt).token_grammar->compiled);
+    failures += check(open_object.AcceptString(R"({"extra":1})") && open_object.IsCompleted(),
+                      "response compiler changed additionalProperties default");
+
+    length_input.options.output_constraint = ninfer::OutputConstraint{
+        ninfer::OutputConstraintKind::JsonSchema,
+        R"({"type":"object","properties":{"a":{"type":"string"}},"required":["a"],"additionalProperties":true})"};
+    const auto named_prompt = frontend.prepare(length_input);
+    for (const auto& [text, valid] :
+         std::vector<std::pair<std::string, bool>>{{R"({"a":"ok","other":0})", true},
+                                                   {R"({"a":"ok","a":0})", false},
+                                                   {R"({"a":"ok","\u0061":0})", false}}) {
+        xgrammar::GrammarMatcher matcher(
+            FrontendFactory::inspect(named_prompt).token_grammar->compiled);
+        failures += check((matcher.AcceptString(text) && matcher.IsCompleted()) == valid,
+                          "additional key grammar allowed a named-property alias");
+    }
+
+    // Failed speculative branches cannot alter the committed mask or publication.
+    auto transactional = frontend.make_output_session(prompt, {});
+    const auto first   = tokenizer.encode("{");
+    const std::array<ninfer::TokenId, 3> nodes{0, first.front(), 15};
+    const std::array<std::int32_t, 3> parents{-1, 0, 0};
+    std::vector<std::uint32_t> masks(3 * fi::TokenGrammarState::mask_words);
+    transactional.fill_token_masks(nodes, parents, masks);
+    const auto root_masks = std::vector<std::uint32_t>(
+        masks.begin(), masks.begin() + fi::TokenGrammarState::mask_words);
+    (void)transactional.preview(first, 100, ninfer::FinishReason::OutputLimit);
+    transactional.discard_preview();
+    transactional.fill_token_masks(nodes, parents, masks);
+    failures += check(std::equal(root_masks.begin(), root_masks.end(), masks.begin()),
+                      "discarded constrained prefix advanced the matcher");
+    const auto invalid_node = std::span(masks).subspan(2 * fi::TokenGrammarState::mask_words);
+    failures += check(std::all_of(invalid_node.begin(), invalid_node.end(),
+                                  [](std::uint32_t word) { return word == ~std::uint32_t{0}; }),
+                      "unreachable speculative branch did not use the inactive mask");
+
+    input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::Grammar, "root ::= \"  answer\""};
+    input.options.enable_thinking = true;
+    prompt                        = frontend.prepare(input);
+    auto reasoning                = frontend.make_output_session(prompt, {});
+    const auto reasoning_tokens   = tokenizer.encode("thought</think>  answer");
+    (void)reasoning.preview(reasoning_tokens, 100, ninfer::FinishReason::OutputLimit);
+    std::string content;
+    std::string thought;
+    for (const auto& delta : reasoning.commit_preview()) {
+        (delta.channel == ninfer::OutputChannel::Content ? content : thought) += delta.text;
+    }
+    failures += check(content == "  answer" && thought == "thought",
+                      "reasoning transition changed whitespace-sensitive grammar content");
+
+    // Historical tool messages must not activate tool-region tracking for constrained literals.
+    input.options.enable_thinking = false;
+    input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::Grammar, "root ::= \"<tool_call>\""};
+    ninfer::ChatMessage historical;
+    historical.role = ninfer::ChatRole::Tool;
+    historical.parts.push_back({.text = "x"});
+    input.messages.insert(input.messages.begin(), historical);
+    prompt                 = frontend.prepare(input);
+    auto historical_output = frontend.make_output_session(prompt, {});
+    auto literal_tokens    = tokenizer.encode("<tool_call>");
+    literal_tokens.push_back(6);
+    const auto historical_decision =
+        historical_output.preview(literal_tokens, 100, ninfer::FinishReason::OutputLimit);
+    failures += check(historical_decision.finish_reason == ninfer::FinishReason::StopToken,
+                      "tool history suppressed constrained literal EOS");
+    (void)historical_output.commit_preview();
+
+    input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::Grammar, "root ::= \"   \""};
+    auto whitespace_output = frontend.make_output_session(frontend.prepare(input), {});
+    auto whitespace_tokens = tokenizer.encode("   ");
+    whitespace_tokens.push_back(6);
+    failures +=
+        check(whitespace_output.preview(whitespace_tokens, 100, ninfer::FinishReason::OutputLimit)
+                      .finish_reason == ninfer::FinishReason::StopToken,
+              "whitespace-only grammar suppressed EOS");
+    (void)whitespace_output.commit_preview();
+
+    input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonObject, {}};
+    auto object_prompt = frontend.prepare(input);
+    xgrammar::GrammarMatcher object(
+        FrontendFactory::inspect(object_prompt).token_grammar->compiled);
+    failures += check(!object.AcceptString("[]"), "JSON-object constraint accepted an array");
+    xgrammar::GrammarMatcher nonempty(
+        FrontendFactory::inspect(object_prompt).token_grammar->compiled);
+    failures +=
+        check(nonempty.AcceptString(R"({"arbitrary":[1,true,null]})") && nonempty.IsCompleted(),
+              "JSON-object mode excluded arbitrary properties");
+
+    const auto object_grammar = FrontendFactory::inspect(object_prompt).token_grammar;
+    input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonSchema, R"({"type":"string"})"};
+    const auto string_prompt  = frontend.prepare(input);
+    const auto string_grammar = FrontendFactory::inspect(string_prompt).token_grammar;
+    for (const auto& [scalar, valid] :
+         std::vector<std::pair<std::string, bool>>{{R"("")", true},
+                                                   {R"("\n\"\\\/")", true},
+                                                   {R"("\u0000")", true},
+                                                   {R"("\uD7FF")", true},
+                                                   {R"("\uE000")", true},
+                                                   {R"("\uFFFF")", true},
+                                                   {R"("\uD800\uDC00")", true},
+                                                   {R"("\uDBFF\uDFFF")", true},
+                                                   {R"("\ud83d\ude00")", true},
+                                                   {R"("\uD800")", false},
+                                                   {R"("\uDBFF")", false},
+                                                   {R"("\uDC00")", false},
+                                                   {R"("\uDFFF")", false},
+                                                   {R"("\uD800a")", false},
+                                                   {R"("\uD800\uD800")", false},
+                                                   {R"("\uDC00\uD800")", false}}) {
+        for (const auto& [text, compiled] :
+             std::array<std::pair<std::string, const xgrammar::CompiledGrammar*>, 3>{
+                 {{scalar, &string_grammar->compiled},
+                  {R"({"value":[)" + scalar + "]}", &object_grammar->compiled},
+                  {"{" + scalar + ":1}", &object_grammar->compiled}}}) {
+            failures += check(nlohmann::json::accept(text) == valid,
+                              "Unicode escape fixture disagrees with the independent JSON parser");
+            xgrammar::GrammarMatcher matcher(*compiled);
+            failures += check((matcher.AcceptString(text) && matcher.IsCompleted()) == valid,
+                              "unbounded JSON string/key grammar disagrees with its parser oracle");
+        }
+    }
+
+    using PreparedPrompt        = ninfer::targets::qwen3_6::PreparedPrompt;
+    const auto check_byte_masks = [&](const PreparedPrompt& prepared, const std::string& text,
+                                      bool valid) {
+        auto session = frontend.make_output_session(prepared, {});
+        std::vector<std::uint32_t> byte_mask(fi::TokenGrammarState::mask_words);
+        bool accepted = true;
+        std::string published;
+        // One vocabulary token per byte forces UTF-8 validation across token boundaries.
+        for (const unsigned char byte : text) {
+            session.fill_token_masks(std::array<ninfer::TokenId, 1>{0},
+                                     std::array<std::int32_t, 1>{-1}, byte_mask);
+            const auto token = byte_tokens[byte];
+            if (((byte_mask[token / 32] >> (token % 32)) & 1U) == 0) {
+                accepted = false;
+                break;
+            }
+            (void)session.preview(std::span<const ninfer::TokenId>(&token, 1), 100,
+                                  ninfer::FinishReason::OutputLimit);
+            for (const auto& delta : session.commit_preview()) { published += delta.text; }
+        }
+        if (accepted) {
+            session.fill_token_masks(std::array<ninfer::TokenId, 1>{0},
+                                     std::array<std::int32_t, 1>{-1}, byte_mask);
+            accepted = ((byte_mask[0] >> 6) & 1U) != 0;
+        }
+        failures += check(accepted == valid, "token masks accepted malformed split UTF-8");
+        if (valid) {
+            failures += check(published == text, "valid split UTF-8 changed during publication");
+        }
+    };
+
+    for (const auto& [bytes, valid] :
+         std::vector<std::pair<std::string, bool>>{{"\xC2\x80", true},
+                                                   {"\xDF\xBF", true},
+                                                   {"\xE0\xA0\x80", true},
+                                                   {"\xED\x9F\xBF", true},
+                                                   {"\xEE\x80\x80", true},
+                                                   {"\xEF\xBF\xBF", true},
+                                                   {"\xF0\x90\x80\x80", true},
+                                                   {"\xF4\x8F\xBF\xBF", true},
+                                                   {"\x80", false},
+                                                   {"\xC0\xAF", false},
+                                                   {"\xC1\xBF", false},
+                                                   {"\xE0\x80\x80", false},
+                                                   {"\xED\xA0\x80", false},
+                                                   {"\xF0\x80\x80\x80", false},
+                                                   {"\xF4\x90\x80\x80", false},
+                                                   {"\xF5\x80\x80\x80", false},
+                                                   {"\xC2", false},
+                                                   {"\xE0\xA0", false},
+                                                   {"\xF0\x90\x80", false}}) {
+        const std::string scalar = "\"" + bytes + "\"";
+        for (const auto& [text, prepared] :
+             std::array<std::pair<std::string, const PreparedPrompt*>, 4>{
+                 {{scalar, &string_prompt},
+                  {scalar, &length_prompt},
+                  {R"({"value":[)" + scalar + "]}", &object_prompt},
+                  {"{" + scalar + ":1}", &object_prompt}}}) {
+            failures += check(nlohmann::json::accept(text) == valid,
+                              "raw UTF-8 fixture disagrees with the independent JSON parser");
+            xgrammar::GrammarMatcher matcher(
+                FrontendFactory::inspect(*prepared).token_grammar->compiled);
+            failures += check((matcher.AcceptString(text) && matcher.IsCompleted()) == valid,
+                              "JSON character-class grammar accepts malformed UTF-8");
+            check_byte_masks(*prepared, text, valid);
+        }
+    }
+
+    for (bool repeated : {false, true}) {
+        const std::string source =
+            std::string(R"(root ::= "\"" [^\u00e9])") + (repeated ? "*" : "") + R"( "\"")";
+        input.options.output_constraint =
+            ninfer::OutputConstraint{ninfer::OutputConstraintKind::Grammar, source};
+        const auto excluded_prompt = frontend.prepare(input);
+        for (const auto& [text, valid] :
+             std::vector<std::pair<std::string, bool>>{{"\"è\"", true},
+                                                       {"\"ê\"", true},
+                                                       {"\"😀\"", true},
+                                                       {"\"é\"", false},
+                                                       {"\"èé\"", false},
+                                                       {"\"\"", repeated}}) {
+            xgrammar::GrammarMatcher matcher(
+                FrontendFactory::inspect(excluded_prompt).token_grammar->compiled);
+            failures += check((matcher.AcceptString(text) && matcher.IsCompleted()) == valid,
+                              "negative Unicode character class ignored its excluded scalar");
+            check_byte_masks(excluded_prompt, text, valid);
+        }
+    }
+
+    for (const std::string& invalid :
+         {std::string(R"({"type":"array","uniqueItems":true})"), std::string(R"({"minLength":3})"),
+          std::string(R"({"type":"string","pattern":"^.*$"})"),
+          std::string(R"({"type":"string","minLength":4294967296})"),
+          std::string(R"({"$ref":"#missing"})"),
+          std::string(R"({"type":"object","minProperties":2})"),
+          std::string(R"({"type":"number","minimum":0.0000001,"maximum":0.0000002})"),
+          std::string("{")}) {
+        input.options.output_constraint =
+            ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonSchema, invalid};
+        bool rejected = false;
+        try {
+            (void)frontend.prepare(input);
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint;
+        }
+        failures += check(rejected, "invalid response schema was not rejected at admission");
+    }
+    input.options.output_constraint =
+        ninfer::OutputConstraint{ninfer::OutputConstraintKind::JsonObject, {}};
+    input.options.tool_jsons.push_back(R"({"type":"function","function":{"name":"f"}})");
+    bool tools_rejected = false;
+    try {
+        (void)frontend.prepare(input);
+    } catch (const ninfer::RequestError& error) {
+        tools_rejected = error.kind() == ninfer::RequestErrorKind::InvalidOutputConstraint;
+    }
+    failures += check(tools_rejected, "tools combined with response constraint were accepted");
+    return failures;
+}
+
 int test_declared_tool_publication() {
     auto owned     = resources();
     auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
@@ -2103,7 +2481,7 @@ int test_declared_tool_publication() {
         R"({"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}})");
     auto prompt  = frontend.prepare(std::move(input));
     auto output  = frontend.make_output_session(prompt, {});
-    int failures = check(output.has_tool_grammar(), "declared tools did not attach a grammar");
+    int failures = check(output.has_token_grammar(), "declared tools did not attach a grammar");
     const std::vector<ninfer::TokenId> tokens{22, 16, 17, 32, 18, 32, 32, 19, 32, 20};
     std::string visible;
     for (auto token : tokens) {
@@ -2347,7 +2725,7 @@ int test_recovery_prompt_splice(const Frontend& frontend) {
             data.position_axis(2)[static_cast<std::ptrdiff_t>(i)] == static_cast<std::int32_t>(i);
     }
     failures += check(positions && data.starts_in_reasoning && data.identity.reusable &&
-                          !data.tool_grammar && data.identity.rewrite_checkpoint &&
+                          !data.token_grammar && data.identity.rewrite_checkpoint &&
                           data.identity.rewrite_checkpoint->kind ==
                               ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
                           data.identity.rewrite_checkpoint->frontier == data.token_ids.size(),
@@ -2376,7 +2754,7 @@ int test_recovery_prompt_splice(const Frontend& frontend) {
     tools.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
     const auto with_tools = frontend.splice_recovery_prompt(prefix, tools, insert, recovery);
-    failures += check(with_tools && FrontendFactory::inspect(*with_tools).tool_grammar != nullptr,
+    failures += check(with_tools && FrontendFactory::inspect(*with_tools).token_grammar != nullptr,
                       "declared tools did not compile a grammar onto the spliced prompt");
     return failures;
 }
@@ -2490,5 +2868,6 @@ int main() {
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_disabled_vision();
     failures += test_declared_tool_publication();
+    failures += test_constrained_output();
     return failures == 0 ? 0 : 1;
 }

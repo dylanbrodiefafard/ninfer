@@ -399,11 +399,47 @@ int test_reject_unsupported() {
         throws_api([&] { (void)parse_chat_completion_request(function_call, default_limits()); }),
         "deprecated function_call rejected");
 
-    Json rf               = base;
-    rf["response_format"] = Json{{"type", "json_object"}};
+    Json rf                   = base;
+    rf["response_format"]     = Json{{"type", "json_object"}};
+    const auto object_request = parse_chat_completion_request(rf, default_limits());
     failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+        check(object_request.output_constraint && object_request.output_constraint->kind ==
+                                                      ninfer::OutputConstraintKind::JsonObject,
+              "json response_format was not translated");
+
+    Json schema_format               = base;
+    schema_format["response_format"] = Json{
+        {"type", "json_schema"},
+        {"json_schema", {{"name", "result"}, {"schema", {{"type", "object"}}}, {"strict", true}}}};
+    const auto schema_request = parse_chat_completion_request(schema_format, default_limits());
+    failures += check(schema_request.output_constraint &&
+                          schema_request.output_constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonSchema &&
+                          Json::parse(schema_request.output_constraint->source)["type"] == "object",
+                      "JSON schema format was not translated");
+    schema_format["response_format"]["json_schema"]["strict"] = "true";
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(schema_format, default_limits()); }),
+        "invalid strict type accepted");
+    Json grammar_request                  = base;
+    grammar_request["structured_outputs"] = {{"grammar", "root ::= \"yes\""}};
+    const auto parsed_grammar = parse_chat_completion_request(grammar_request, default_limits());
+    failures += check(parsed_grammar.output_constraint && parsed_grammar.output_constraint->kind ==
+                                                              ninfer::OutputConstraintKind::Grammar,
+                      "EBNF grammar was not translated");
+    grammar_request["response_format"] = {{"type", "json_object"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(grammar_request, default_limits()); }),
+        "conflicting output constraints accepted");
+    for (const Json& invalid :
+         {Json("json_object"), Json{{"type", "unknown"}}, Json{{"type", "json_schema"}},
+          Json{{"type", "json_object"}, {"schema", true}}}) {
+        Json request               = base;
+        request["response_format"] = invalid;
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(request, default_limits()); }),
+            "malformed output format accepted");
+    }
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};

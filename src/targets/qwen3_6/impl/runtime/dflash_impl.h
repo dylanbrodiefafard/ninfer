@@ -518,7 +518,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 Tensor residual_batch =
                                     residual.view({Config::hidden, width, batch_size});
                                 const auto& next_weight =
-                                    dflash.layers.at(static_cast<std::size_t>(layer + 1));
+                                    dflash.layers.at(static_cast<std::size_t>(layer) + 1);
                                 ops::grouped_dynamic_conv_finish_residual_rmsnorm(
                                     mlp_in, weight.mlp_conv.base_kernel, finish_dynamic,
                                     residual_batch, next_weight.input_norm, Config::rms_epsilon,
@@ -1212,7 +1212,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             .replay_records  = state.execution.replay_records,
             .sampling        = frame.sampling,
             .feature_sink    = &sink,
-            .tool_masks      = state.tool_masks,
+            .token_masks     = state.token_masks,
         };
         if (use_tree) {
             verify_frame.parent_index      = parent_index;

@@ -42,6 +42,7 @@ struct StreamingResponse {
 
 ApiError responses_error(ApiError error) {
     if (error.param == "messages") { error.param = "input"; }
+    if (error.param == "response_format") { error.param = "text.format"; }
     return error;
 }
 

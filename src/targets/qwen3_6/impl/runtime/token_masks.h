@@ -17,12 +17,14 @@ namespace ninfer::targets::qwen3_6 {
 // memory. The executor changes bindings only at synchronized round boundaries;
 // the CUDA host node makes no CUDA API calls. Program teardown and error paths
 // drain the DeviceContext host stream before destroying bound OutputSessions.
-class ToolMaskExchange {
+class TokenMaskExchange {
 public:
-    ToolMaskExchange(Tensor masks, Tensor sampling, Tensor nodes);
-    ~ToolMaskExchange();
-    ToolMaskExchange(const ToolMaskExchange&)            = delete;
-    ToolMaskExchange& operator=(const ToolMaskExchange&) = delete;
+    // Initializes staging on `compute`; submissions use that stream or wait for
+    // its startup work before using the exchange on another compute stream.
+    TokenMaskExchange(Tensor masks, Tensor sampling, Tensor nodes, cudaStream_t compute);
+    ~TokenMaskExchange();
+    TokenMaskExchange(const TokenMaskExchange&)            = delete;
+    TokenMaskExchange& operator=(const TokenMaskExchange&) = delete;
     void bind(std::span<const OutputSession* const> outputs,
               std::span<const ops::SamplingConfig> sampling);
     // Ordinary/prefill root sampling; called at a synchronized CPU boundary.

@@ -415,6 +415,21 @@ struct PromptCapabilities {
     ReasoningEffortCapabilities reasoning_effort;
 };
 
+enum class OutputConstraintKind : std::uint8_t {
+    JsonObject,
+    JsonSchema,
+    Grammar,
+};
+
+// Owns the schema JSON or XGrammar EBNF source (root rule: root). Constraints apply to answer
+// content after reasoning. A generation prompt is required, and tool declarations are forbidden.
+// Unsupported schemas/grammars fail preparation with InvalidOutputConstraint. Caller stops and
+// output/context limits can truncate a valid prefix before the grammar completes.
+struct OutputConstraint {
+    OutputConstraintKind kind = OutputConstraintKind::JsonObject;
+    std::string source;
+};
+
 struct PromptOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
@@ -422,6 +437,7 @@ struct PromptOptions {
     bool preserve_thinking = false;
     bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
+    std::optional<OutputConstraint> output_constraint;
 };
 
 struct PromptInput {
@@ -431,6 +447,7 @@ struct PromptInput {
 
 enum class RequestErrorKind : std::uint8_t {
     InvalidToolSchema,
+    InvalidOutputConstraint,
     ContextLengthExceeded,
     MediaBudgetExceeded,
     Overloaded,

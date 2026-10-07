@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -376,6 +377,26 @@ int main(int argc, char** argv) {
                 : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         cli.enable_vision);
         input.options.reasoning_effort = cli.reasoning_effort;
+        if (cli.json_object || !cli.json_schema_path.empty() || !cli.grammar_path.empty()) {
+            ninfer::OutputConstraint constraint;
+            if (!cli.json_schema_path.empty() || !cli.grammar_path.empty()) {
+                const bool schema = !cli.json_schema_path.empty();
+                const auto& path  = schema ? cli.json_schema_path : cli.grammar_path;
+                std::ifstream file(path, std::ios::binary);
+                if (!file) {
+                    throw std::runtime_error("cannot read output constraint: " + path.string());
+                }
+                std::ostringstream source;
+                source << file.rdbuf();
+                if (file.bad() || source.bad()) {
+                    throw std::runtime_error("failed reading output constraint: " + path.string());
+                }
+                constraint.kind   = schema ? ninfer::OutputConstraintKind::JsonSchema
+                                           : ninfer::OutputConstraintKind::Grammar;
+                constraint.source = std::move(source).str();
+            }
+            input.options.output_constraint = std::move(constraint);
+        }
 
         ninfer::RequestOptions request;
         request.execution.sampling                   = cli.sampling;

@@ -856,7 +856,7 @@ private:
         }
         result.recovery                  = request->recovery;
         result.recovery.cycle_exclusions = request->cycle_exclusions;
-        if (!request->output.has_tool_grammar()) {
+        if (!request->output.has_token_grammar()) {
             result.undeclared_tool_call_names =
                 targets::qwen3_6::unconstrained_tool_call_names(result.content, 128);
         }

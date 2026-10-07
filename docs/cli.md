@@ -387,3 +387,21 @@ growth.
 
 All weight, sequence, workspace, request-transient, and graph allocations are released when the
 Engine is destroyed.
+
+## Constrained output
+
+Use `--json-object` for an arbitrary JSON object, `--json-schema FILE` to read a JSON Schema,
+or `--grammar FILE` to read an XGrammar EBNF grammar with a `root` rule. Select one constraint:
+
+```bash
+build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt 'Return a JSON object with an answer.' \
+  --json-schema answer.schema.json --no-thinking --max-new 256
+```
+
+The constraint applies to answer content after reasoning, and supports CUDA Graphs, MTP, and
+DFlash through the same token masks used for tools. Schema assertions are enforced at decoding;
+unsupported assertions are rejected at preparation rather than relaxed. Describe the desired
+answer in the prompt; the schema is not added to the conversation. Tools and output constraints
+cannot be combined. Stops, cancellation, or output/context limits may truncate a valid prefix;
+complete JSON validity requires finishing the grammar. See the constrained-output contract in
+`docs/serving.md` for the supported schema subset and HTTP triggers.
