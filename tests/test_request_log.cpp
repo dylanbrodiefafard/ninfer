@@ -146,7 +146,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 18, "request-log schema is not version 18");
+    failures += check(kRequestLogSchemaVersion == 19, "request-log schema is not version 19");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -243,9 +243,12 @@ int main() {
     prepared.sampling.frequency_penalty        = 0.0F;
     prepared.sampling.seed                     = 7632647173703958409ULL;
 
+    request.cache_write = false;
     const RequestLogContext context =
         make_request_log_context(7, "openai_chat_completions", request, prepared);
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
+    failures += check(started.at("request").at("cache_write") == false,
+                      "disposable write policy missing from request log");
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
@@ -271,6 +274,8 @@ int main() {
         make_request_rejection_log_context(8, "anthropic_messages", request, preparation_error);
     const Json rejected =
         Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
+    failures += check(rejected.at("request").at("cache_write") == false,
+                      "disposable write policy missing from rejection log");
     failures +=
         check(rejected.at("event") == "request_rejected" && rejected.at("phase") == "prepare",
               "preparation rejection event or phase mismatch");

@@ -661,6 +661,51 @@ void unpack_paged_kv_allocation_from_host(PagedKVAllocation& allocation, const P
     }
 }
 
+void copy_paged_kv_allocation(const PagedKVAllocation& source, PagedKVAllocation& destination,
+                              const PagedKVPool& pool, std::uint32_t page_count,
+                              cudaStream_t stream) {
+    if (!source.belongs_to(pool) || !destination.belongs_to(pool) ||
+        page_count > source.mapped_page_count() || page_count > destination.mapped_page_count()) {
+        throw std::invalid_argument(
+            "Paged KV copy requires mapped allocations from the named pool");
+    }
+    const auto source_pages      = source.page_ids().first(page_count);
+    const auto destination_pages = destination.page_ids().first(page_count);
+    if (&source == &destination) {
+        throw std::invalid_argument("Paged KV copy requires disjoint physical pages");
+    }
+    // Distinct allocations from one pool own disjoint pages. Coalesce paired physical runs
+    // so a resident prefix usually transfers in one DMA per plane, including scale planes.
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const Tensor& plane = pool.plane(index);
+        auto* bytes         = static_cast<unsigned char*>(plane.data);
+        for (std::uint32_t first = 0; first < page_count;) {
+            std::uint32_t end = first + 1;
+            while (end < page_count && source_pages[end] == source_pages[end - 1] + 1 &&
+                   destination_pages[end] == destination_pages[end - 1] + 1) {
+                ++end;
+            }
+            const auto count = static_cast<std::size_t>(end - first);
+            if (pool.plane_order() == PagedKVPlaneOrder::PageMajor) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    bytes + static_cast<std::int64_t>(destination_pages[first]) * plane.nb[3],
+                    bytes + static_cast<std::int64_t>(source_pages[first]) * plane.nb[3],
+                    count * static_cast<std::size_t>(plane.nb[3]), cudaMemcpyDeviceToDevice,
+                    stream));
+            } else {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    bytes + static_cast<std::int64_t>(destination_pages[first]) * plane.nb[2],
+                    static_cast<std::size_t>(plane.nb[3]),
+                    bytes + static_cast<std::int64_t>(source_pages[first]) * plane.nb[2],
+                    static_cast<std::size_t>(plane.nb[3]),
+                    count * static_cast<std::size_t>(plane.nb[2]),
+                    static_cast<std::size_t>(plane.ne[3]), cudaMemcpyDeviceToDevice, stream));
+            }
+            first = end;
+        }
+    }
+}
+
 std::size_t paged_kv_logical_page_bytes(const PagedKVPool& pool) {
     return paged_kv_host_image_bytes(pool, 1);
 }

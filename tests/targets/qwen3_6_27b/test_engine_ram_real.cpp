@@ -1646,9 +1646,9 @@ int exercise_restore_allocation_fallback(const char* artifact, bool dflash = fal
                 }
             }
             const auto after = engine.runtime_stats();
-            if ((!planning && after.kv_ram_evictions <= before.kv_ram_evictions) ||
+            if (after.kv_ram_evictions != before.kv_ram_evictions ||
                 after.kv_ram_restores != before.kv_ram_restores) {
-                return fail("RAM fallback did not discard its failed source without consuming it");
+                return fail("RAM allocation fallback discarded or consumed its healthy source");
             }
             const auto oracle = engine.generate(engine.prepare_tokens(history), greedy(1, false));
             if (restored.generated_token_ids != oracle.generated_token_ids) {

@@ -141,6 +141,7 @@ Json request_json(const RequestLogContext& context) {
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
+                {"cache_write", context.cache_write},
                 {"message_count", context.message_count},
                 {"requested_output_tokens", context.requested_output_tokens},
                 {"requested_output_tokens_source",
@@ -159,6 +160,7 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
+                {"cache_write", context.cache_write},
                 {"message_count", context.message_count},
                 {"media_item_count", context.media_item_count},
                 {"requested_output_tokens", context.requested_output_tokens},
@@ -310,6 +312,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
+    context.cache_write                        = request.cache_write;
     context.message_count                      = request.messages.size();
     context.requested_output_tokens            = request.max_tokens;
     context.requested_output_tokens_client_set = request.max_tokens_set;
@@ -332,6 +335,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
+    context.cache_write                        = request.cache_write;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;

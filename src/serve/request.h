@@ -253,6 +253,7 @@ struct GenerationRequest {
     std::optional<int> top_logprobs;
     std::optional<ninfer::OutputConstraint> output_constraint;
     std::string output_constraint_param = "response_format";
+    bool cache_write                    = true;
     bool capture_context_checkpoint     = false;
 
     [[nodiscard]] bool uses_tools() const noexcept {

@@ -85,6 +85,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     // checkpoint or host tier can key on it, and shared by every lane, RAM, and disk plan of
     // the request and by the occupied sequence.
     std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
+    bool cache_write                = true;
     bool allow_prefix_reuse         = false;
     bool force_cold_prefill         = false;
     bool capture_context_checkpoint = false;
@@ -110,11 +111,12 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint64_t ram_entry_id                = 0;
     std::uint64_t disk_entry_id               = 0;
     PrefixHash128 disk_hash_f{};
-    std::uint32_t disk_execution_frontier   = 0;
-    std::uint64_t disk_committed_generation = 0;
-    bool capture_context_checkpoints        = false;
-    bool capture_context_checkpoint         = false;
-    bool token_logprobs                     = false;
+    std::uint32_t disk_execution_frontier      = 0;
+    std::uint64_t disk_committed_generation    = 0;
+    runtime::CacheReadIntent cache_read_intent = runtime::CacheReadIntent::Consume;
+    bool capture_context_checkpoints           = false;
+    bool capture_context_checkpoint            = false;
+    bool token_logprobs                        = false;
     std::shared_ptr<const std::vector<PrefixHash128>> prompt_hashes;
 };
 
@@ -198,6 +200,8 @@ struct DecodeGraphFamily {
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
+enum class CacheCaptureMode : std::uint8_t { ReachableTurn, CompleteOriginal };
+
 struct SequenceState {
     std::optional<SequenceKVBundle> kv;
     Tensor tail_hidden;
@@ -215,9 +219,13 @@ struct SequenceState {
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
-    std::uint32_t mtp_draft_count = 0;
-    bool tail_hidden_valid        = false;
-    bool retained                 = false;
+    std::uint32_t mtp_draft_count           = 0;
+    bool tail_hidden_valid                  = false;
+    bool retained                           = false;
+    runtime::CacheRetention cache_retention = runtime::CacheRetention::Ordinary;
+    // A fork has already installed the selected checkpoint as current state, without carrying
+    // auxiliary reuse images into the destination.
+    bool fork_initialized = false;
     // The retained request stopped (stop token or string) without a tool call. With its own
     // TurnClosure checkpoint at its generation opener (closure_frontier), the next preserve-off
     // prompt re-renders the reply without reasoning and diverges there, so RAM/disk tiers store
@@ -355,6 +363,15 @@ public:
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t lane);
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool retained_lane_cache_writable(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool retained_lane_precedes(std::uint32_t left,
+                                              std::uint32_t right) const noexcept;
+    // Copies only the selected reusable prefix into an empty independently reserved lane.
+    // The executor protects the retained source until the compute stream completes the copy.
+    void fork_retained_lane(std::uint32_t destination, std::uint32_t source,
+                            const RequestPlan& plan);
+    // A full-original RAM capture preserves exactly the state described by the resident plan.
+    void retarget_plan_to_ram(RequestPlan& plan, std::uint64_t entry_id);
     void evict_retained_lane(std::uint32_t lane) noexcept;
     // The retained lane's request finished without a tool call (see SequenceState::turn_closed).
     void mark_turn_closed(std::uint32_t lane) noexcept;
@@ -364,10 +381,13 @@ public:
     // returns false with `*deferred` set; retry after kv_ram_reclaim_pending() clears.
     // `attempt_ram_ids` are this admission's earlier captures, which a deferral
     // rolls back, so reclaim never targets them.
-    [[nodiscard]] bool capture_retained_lane(std::uint32_t lane,
-                                             std::uint64_t* ram_entry_id = nullptr,
-                                             bool may_block = true, bool* deferred = nullptr,
-                                             std::span<const std::uint64_t> attempt_ram_ids = {});
+    [[nodiscard]] bool
+    capture_retained_lane(std::uint32_t lane, std::uint64_t* ram_entry_id = nullptr,
+                          bool may_block = true, bool* deferred = nullptr,
+                          std::span<const std::uint64_t> attempt_ram_ids = {},
+                          CacheCaptureMode mode = CacheCaptureMode::ReachableTurn);
+    [[nodiscard]] bool preserve_retained_lane(std::uint32_t lane, std::uint64_t& entry_id,
+                                              bool may_block, bool& deferred);
     void restore_ram_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     void restore_disk_entry(std::uint32_t lane, std::uint64_t entry_id, const RequestPlan& plan);
     [[nodiscard]] bool ram_restore_ready(std::uint64_t entry_id) const;
@@ -375,7 +395,7 @@ public:
     [[nodiscard]] bool kv_ram_reclaim_pending() const;
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
-    void consume_ram_entry(std::uint64_t entry_id);
+    void finish_ram_restore(std::uint64_t entry_id, runtime::CacheReadIntent intent);
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
                                         std::uint32_t expected_reuse_base,
@@ -544,6 +564,7 @@ private:
     void ordered_reset(SequenceState& sequence);
     void materialize_gdn_history(std::uint32_t lane);
     void reset_gdn_history(std::uint32_t lane);
+    void zero_dflash_local_cache(CyclicKVCache& cache);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
@@ -607,7 +628,8 @@ private:
     [[nodiscard]] bool capture_cuts_at_rewrite(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::detail::RamCaptureSource
     ram_capture_source(SequenceState& sequence,
-                       qwen3_6::detail::ResidentPrefixIdentity& cut_identity);
+                       qwen3_6::detail::ResidentPrefixIdentity& cut_identity,
+                       CacheCaptureMode mode);
     [[nodiscard]] qwen3_6::detail::RamCaptureSource
     cut_ram_capture_source(SequenceState& sequence,
                            qwen3_6::detail::ResidentPrefixIdentity& cut_identity);

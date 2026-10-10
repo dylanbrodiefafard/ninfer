@@ -316,9 +316,10 @@ int test_missing_and_bad_fields() {
     Json ninfer = {{"model", "m"},
                    {"max_tokens", 8},
                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                   {"ninfer", Json{{"capture_context_checkpoint", true}}}};
+                   {"ninfer", Json{{"capture_context_checkpoint", true}, {"cache_write", false}}}};
     const GenerationRequest ignored = parse_messages_request(ninfer, default_limits());
-    failures += check(!ignored.capture_context_checkpoint, "Anthropic ninfer object does not pin");
+    failures += check(!ignored.capture_context_checkpoint && ignored.cache_write,
+                      "Anthropic ignores the ninfer object and keeps ordinary caching");
     return failures;
 }
 

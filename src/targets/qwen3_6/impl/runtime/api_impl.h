@@ -257,6 +257,34 @@ std::uint64_t Program<Variant>::retained_use_tick(std::uint32_t lane) const noex
 }
 
 template <>
+bool Program<Variant>::retained_lane_cache_writable(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_cache_writable(lane);
+}
+
+template <>
+bool Program<Variant>::retained_lane_precedes(std::uint32_t left,
+                                              std::uint32_t right) const noexcept {
+    return impl_->retained_lane_precedes(left, right);
+}
+
+template <>
+void Program<Variant>::fork_retained_lane(std::uint32_t destination, std::uint32_t source,
+                                          const RequestPlan<Variant>& plan) {
+    impl_->fork_retained_lane(destination, source, plan);
+}
+
+template <>
+void Program<Variant>::retarget_plan_to_ram(RequestPlan<Variant>& plan, std::uint64_t entry_id) {
+    impl_->retarget_plan_to_ram(plan, entry_id);
+}
+
+template <>
+bool Program<Variant>::preserve_retained_lane(std::uint32_t lane, std::uint64_t& entry_id,
+                                              bool may_block, bool& deferred) {
+    return impl_->preserve_retained_lane(lane, entry_id, may_block, deferred);
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
 }
@@ -311,8 +339,8 @@ void Program<Variant>::release_ram_entry(std::uint64_t entry_id) {
 }
 
 template <>
-void Program<Variant>::consume_ram_entry(std::uint64_t entry_id) {
-    impl_->consume_ram_entry(entry_id);
+void Program<Variant>::finish_ram_restore(std::uint64_t entry_id, runtime::CacheReadIntent intent) {
+    impl_->finish_ram_restore(entry_id, intent);
 }
 
 template <>

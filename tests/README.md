@@ -583,3 +583,24 @@ Set `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` and/or
 
 The frontend CPU suite independently checks schema acceptance and JSON string/escape syntax,
 including special-token literals, reasoning transitions, ignored EOS, and speculative rollback.
+
+### Disposable-turn cache behavior
+
+`ninfer_qwen3_8_27b_cache_write_real_test` uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` and, when provided,
+`NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` to verify consuming continuation and disposable turns.
+It covers independent VRAM forks, one-lane and shared-page-pressure RAM preservation,
+checkpoint reads without capture, disposable-first eviction, bounded capacity rejection with
+multiple matching sources, promotion, disk reads, cancellation, and shutdown persistence.
+It exercises ordinary execution and each supplied speculative backend with NVFP4 KV.
+
+`ninfer_qwen3_8_27b_fork_state_real_test` checks exact main/backend KV, GDN convolution and FP32
+recurrent state, hidden state, and DFlash cyclic-state copies for current and rewrite frontiers.
+It also checks complete-original preservation of a closed preserve-off chat whose normal
+capture cuts at its rewrite checkpoint. This real-model route is in the sanitizer set; its
+GEMM-heavy inference exceeds racecheck host-memory capacity. The RAM-cache unit test is in
+both sanitizer and racecheck sets and checks the changed copies. The recovery executor tests cover non-consuming restores, stale-plan replanning,
+destination-failure cleanup, and cancelled readers beside decoding peers. The RAM-cache unit
+test verifies physical copies across storage layouts, source isolation, and restore/release
+followed by consuming continuation. Serving schema tests cover the strict flag and conflict
+in both response modes.

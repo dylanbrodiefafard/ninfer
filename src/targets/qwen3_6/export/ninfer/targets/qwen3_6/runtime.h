@@ -192,6 +192,14 @@ public:
     [[nodiscard]] bool revert_cancelled_prefill_lane(std::uint32_t lane);
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] std::uint64_t retained_use_tick(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool retained_lane_cache_writable(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool retained_lane_precedes(std::uint32_t left,
+                                              std::uint32_t right) const noexcept;
+    void fork_retained_lane(std::uint32_t destination, std::uint32_t source,
+                            const RequestPlan<Variant>& plan);
+    void retarget_plan_to_ram(RequestPlan<Variant>& plan, std::uint64_t entry_id);
+    [[nodiscard]] bool preserve_retained_lane(std::uint32_t lane, std::uint64_t& entry_id,
+                                              bool may_block, bool& deferred);
     void evict_retained_lane(std::uint32_t lane) noexcept;
     void mark_turn_closed(std::uint32_t lane) noexcept;
     [[nodiscard]] bool capture_retained_lane(std::uint32_t lane,
@@ -208,7 +216,7 @@ public:
     [[nodiscard]] bool kv_ram_reclaim_pending() const;
     void claim_ram_entry(std::uint64_t entry_id);
     void release_ram_entry(std::uint64_t entry_id);
-    void consume_ram_entry(std::uint64_t entry_id);
+    void finish_ram_restore(std::uint64_t entry_id, runtime::CacheReadIntent intent);
     [[nodiscard]] bool claim_disk_entry(std::uint64_t entry_id, std::uint32_t expected_frontier,
                                         std::uint64_t hash_lo, std::uint64_t hash_hi,
                                         std::uint32_t expected_reuse_base,

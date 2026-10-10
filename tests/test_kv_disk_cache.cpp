@@ -400,24 +400,28 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
     for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
         const ninfer::Tensor& tensor = pool.plane(plane);
         std::vector<unsigned char> host(tensor.bytes(), 0);
-        CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < pages.size(); ++i) {
             const unsigned char value =
                 static_cast<unsigned char>(seed + plane * 17U + static_cast<unsigned>(i) + 1U);
             if (order == ninfer::PagedKVPlaneOrder::PageMajor) {
                 const std::size_t begin = static_cast<std::size_t>(pages[i] * tensor.nb[3]);
-                std::memset(host.data() + begin, value, static_cast<std::size_t>(tensor.nb[3]));
+                std::fill(host.begin() + static_cast<std::ptrdiff_t>(begin),
+                          host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[3]), value);
+                CUDA_CHECK(cudaMemcpy(static_cast<unsigned char*>(tensor.data) + begin,
+                                      host.data() + begin, tensor.nb[3], cudaMemcpyHostToDevice));
             } else {
-                for (std::int64_t head = 0; head < tensor.ne[3]; ++head) {
+                for (std::int32_t head = 0; head < tensor.ne[3]; ++head) {
                     const std::size_t begin =
-                        static_cast<std::size_t>(pages[i]) *
-                            static_cast<std::size_t>(tensor.nb[2]) +
-                        static_cast<std::size_t>(head) * static_cast<std::size_t>(tensor.nb[3]);
-                    std::memset(host.data() + begin, value, static_cast<std::size_t>(tensor.nb[2]));
+                        static_cast<std::size_t>(head * tensor.nb[3] + pages[i] * tensor.nb[2]);
+                    std::fill(host.begin() + static_cast<std::ptrdiff_t>(begin),
+                              host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[2]),
+                              static_cast<unsigned char>(value + static_cast<unsigned>(head)));
+                    CUDA_CHECK(cudaMemcpy(static_cast<unsigned char*>(tensor.data) + begin,
+                                          host.data() + begin, tensor.nb[2],
+                                          cudaMemcpyHostToDevice));
                 }
             }
         }
-        CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
@@ -1358,6 +1362,7 @@ int test_mtp_f1_backend_pages(ninfer::DeviceContext& ctx) {
     auto text_alloc    = text.reserve(2);
     auto backend_alloc = backend.reserve(2);
     text_alloc.materialize_pages(1, ctx.stream);
+    fill_logical_pages(text, text_alloc, 41);
     TmpDir dir("mtp");
     q36::detail::KVRamCache ram(16ULL << 20);
     auto prompt   = text_prompt({42});
@@ -1481,6 +1486,9 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     const auto cyclic_layout = ninfer::plan_cyclic_kv_cache(cyclic_builder, 2, 32, 2, 8, 3);
     ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
     ninfer::CyclicKVCache cyclic({cyclic_arena.base(), cyclic_arena.capacity()}, cyclic_layout);
+    std::vector<unsigned char> cyclic_state(cyclic.lane_host_bytes(), 0x5a);
+    cyclic.copy_lane_from_host(cyclic_state.data(), 0, ctx.stream);
+    ctx.synchronize_all();
     ninfer::CyclicKVCacheLayerView layer = cyclic.layer_view(0);
     std::vector<unsigned char> k_pattern(layer.k.slice(3, 0, 1).bytes(), 0x3c);
     CUDA_CHECK(cudaMemcpy(layer.k.slice(3, 0, 1).data, k_pattern.data(), k_pattern.size(),
@@ -2348,8 +2356,8 @@ int test_disk_claim_rejects_refreshed_generation(ninfer::DeviceContext& ctx,
     const auto stale_restore_misses = [&](auto&& restore) {
         try {
             restore();
-        } catch (const ninfer::runtime::CacheRestoreFailure&) {
-            return true;
+        } catch (const ninfer::runtime::CacheRestoreFailure& error) {
+            return error.kind() == ninfer::runtime::CacheRestoreFailureKind::StalePlan;
         } catch (const std::exception& e) {
             std::cerr << "stale-generation restore threw " << e.what() << '\n';
         }
@@ -9310,6 +9318,9 @@ int test_dflash_open_skips_missing_cyclic(ninfer::DeviceContext& ctx, ninfer::Pa
     const auto cyclic_layout = ninfer::plan_cyclic_kv_cache(cyclic_builder, 2, 32, 2, 8, 3);
     ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
     ninfer::CyclicKVCache cyclic({cyclic_arena.base(), cyclic_arena.capacity()}, cyclic_layout);
+    std::vector<unsigned char> cyclic_state(cyclic.lane_host_bytes(), 0x5a);
+    cyclic.copy_lane_from_host(cyclic_state.data(), 0, ctx.stream);
+    ctx.synchronize_all();
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
     alloc.materialize_pages(1, ctx.stream);
@@ -10883,20 +10894,29 @@ int test_spill_pin_waits_only_its_entry(ninfer::DeviceContext& ctx, ninfer::Page
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
     alloc.materialize_pages(3, ctx.stream);
+    fill_logical_pages(pool, alloc, 87);
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
     auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
                            64ULL << 20, 4096);
     q36::detail::KVDiskCache disk(std::move(cfg));
     cudaStream_t side = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
-    constexpr std::size_t kDelayBytes = 256ULL << 20;
-    ninfer::DeviceBuffer delay_src(kDelayBytes);
-    void* delay_dst = nullptr;
-    CUDA_CHECK(cudaMallocHost(&delay_dst, kDelayBytes));
     int failures = 0;
     {
         ninfer::test::StreamCopyGate gate;
-        gate.launch(side);
+        auto own_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 24));
+        auto own        = own_prompt;
+        own.token_ids.push_back(0);
+        q36::detail::ResidentPrefixIdentity own_identity;
+        auto source         = make_source(own, own_identity, alloc, pool, ctx.copy_stream, 64);
+        const auto captured = ram.capture(source);
+        std::optional<std::uint64_t> own_id;
+        if (captured.status == q36::detail::RamCaptureStatus::Captured) {
+            own_id = captured.entry_id;
+        } else {
+            failures += fail("spill-own-copy capture failed");
+        }
+        gate.arm(ram);
         auto unrelated_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 23));
         auto unrelated        = unrelated_prompt;
         unrelated.token_ids.push_back(0);
@@ -10904,22 +10924,6 @@ int test_spill_pin_waits_only_its_entry(ninfer::DeviceContext& ctx, ninfer::Page
         auto gated = make_source(unrelated, unrelated_identity, alloc, pool, side, 64);
         if (ram.capture(gated).status != q36::detail::RamCaptureStatus::Captured) {
             failures += fail("spill-own-copy gated capture failed");
-        }
-        // Keep the spilled entry's own D2H in flight briefly behind a large copy.
-        CUDA_CHECK(cudaMemcpyAsync(delay_dst, delay_src.p, kDelayBytes, cudaMemcpyDeviceToHost,
-                                   ctx.copy_stream));
-        auto own_prompt = text_prompt(std::vector<ninfer::TokenId>(64, 24));
-        auto own        = own_prompt;
-        own.token_ids.push_back(0);
-        q36::detail::ResidentPrefixIdentity own_identity;
-        auto source = make_source(own, own_identity, alloc, pool, ctx.copy_stream, 64);
-        // capture_or_evict synchronizes the device, which would wait on the gate.
-        const auto captured = ram.capture(source);
-        std::optional<std::uint64_t> own_id;
-        if (captured.status == q36::detail::RamCaptureStatus::Captured) {
-            own_id = captured.entry_id;
-        } else {
-            failures += fail("spill-own-copy capture failed");
         }
         if (failures == 0) {
             disk.note_ram_resident(own_id.value(), 0);
@@ -10943,7 +10947,6 @@ int test_spill_pin_waits_only_its_entry(ninfer::DeviceContext& ctx, ninfer::Page
     ctx.synchronize_all();
     CUDA_CHECK(cudaStreamSynchronize(side));
     CUDA_CHECK(cudaStreamDestroy(side));
-    CUDA_CHECK(cudaFreeHost(delay_dst));
     disk.wait_idle_and_fsync();
     alloc.release();
     return failures;
@@ -13499,6 +13502,8 @@ int test_mtp_frontier_beyond_valid_backend_is_not_reused(ninfer::DeviceContext& 
     auto backend_alloc = backend.reserve(4);
     text_alloc.materialize_pages(3, ctx.stream);
     backend_alloc.materialize_pages(1, ctx.stream);
+    fill_logical_pages(text, text_alloc, 67);
+    fill_logical_pages(backend, backend_alloc, 91);
     TmpDir dir("mtp-short");
     q36::detail::KVRamCache ram(64ULL << 20);
     std::vector<ninfer::TokenId> t129(129, 42);
@@ -15452,23 +15457,24 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
                 }
                 ctx.synchronize_all();
 
-                struct GateEvent {
-                    cudaEvent_t event = nullptr;
-
-                    ~GateEvent() {
-                        if (event) { (void)cudaEventDestroy(event); }
-                    }
-                } gate_event;
-
                 ninfer::test::StreamCopyGate gate;
-                if (state_dma) {
-                    CUDA_CHECK(cudaEventCreateWithFlags(&gate_event.event, cudaEventDisableTiming));
-                    gate.launch(ctx.stream);
-                    CUDA_CHECK(cudaEventRecord(gate_event.event, ctx.stream));
-                    disk->test_gate_state_h2d(gate_event.event);
-                } else {
-                    gate.launch(ctx.copy_stream);
-                }
+                disk->test_before_restore_completion(
+                    state_dma,
+                    [](void* context, cudaStream_t stream) {
+                        static_cast<ninfer::test::StreamCopyGate*>(context)->launch(stream);
+                    },
+                    &gate);
+
+                struct ClearCompletionArm {
+                    q36::detail::KVDiskCache* disk;
+
+                    ~ClearCompletionArm() {
+                        if (disk != nullptr) {
+                            disk->test_before_restore_completion(false, nullptr, nullptr);
+                        }
+                    }
+                } completion_arm{disk.get()};
+
                 q36::detail::DiskRestoreTarget target;
                 target.text           = &destination;
                 target.text_pool      = &pool;
@@ -15511,6 +15517,8 @@ int test_disk_retirement_with_blocked_dma(ninfer::DeviceContext& ctx) {
                     disk->cancel_restore();
                 }
                 controller.join();
+                completion_arm.disk->test_before_restore_completion(false, nullptr, nullptr);
+                completion_arm.disk = nullptr;
                 if (!saw_drain) {
                     return fail("disk retired pending DMA without entering its CUDA drain");
                 }

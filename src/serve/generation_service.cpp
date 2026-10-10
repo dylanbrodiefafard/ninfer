@@ -82,6 +82,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     error.message  = exception.what();
     error.recovery = exception.recovery();
     switch (exception.kind()) {
+    case ninfer::RequestErrorKind::CacheWriteConflict:
+        error.status = 400;
+        error.code   = "cache_write_conflict";
+        error.param  = "ninfer.capture_context_checkpoint";
+        break;
     case ninfer::RequestErrorKind::InvalidOutputConstraint:
         error.status = 400;
         error.code   = "invalid_output_constraint";
@@ -403,6 +408,12 @@ std::size_t GenerationService::in_flight_requests() const {
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    if (!request.cache_write && request.capture_context_checkpoint) {
+        throw_request_error(
+            ninfer::RequestError(ninfer::RequestErrorKind::CacheWriteConflict,
+                                 "capture_context_checkpoint=true requires cache_write=true "
+                                 "because it creates a retained context checkpoint."));
+    }
     reject_unavailable_context_checkpoint_capture(request.capture_context_checkpoint,
                                                   options_.allow_prefix_reuse,
                                                   options_.speculative.backend);

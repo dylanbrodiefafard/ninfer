@@ -354,10 +354,11 @@ lane 的 backing 中，但不再存在 active request control，也不计入 act
 - prefix identity 和 target-defined reusable checkpoints。
 
 `SequenceState` 不包含 stop/output/transport state，不拥有 batch row、round activations、logits、shared
-workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained state 不搬到另一 lane，planner 在
+workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：ordinary consuming reuse 留在同一 lane，planner 在
 所有 free lanes 中寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
-state 始终重新创建。
+state 始终重新创建。Disposable forks copy into an independently owned destination lane under
+the source-preserving transaction described in §6.4.
 
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state；MTP 或 DFlash 引擎额外保留 slot `C` 作为 Engine-wide
@@ -376,6 +377,14 @@ image copy 后 H2D。其他 staging writer 或 RAM/SSD tier restore（在 host �
 Checkpoint hidden `[hidden,1]` 仍在 device。因此 per-lane device fixed state 只剩 current GDN 与 DFlash
 current local，不随 rewrite checkpoint 翻倍。Decode round
 不在 `SequenceState` 中维护随 speculative position 变化的 state selector。
+
+The Program initializes the text and speculative backend pools' physical KV payload planes and
+every DFlash local K/V lane's complete padded payload once at startup, even when CUDA Graph capture
+is disabled. Tier images and disposable forks copy whole pages and complete fixed images; unused
+page tails and cyclic positions therefore contain defined bytes without extending valid frontiers
+or the live attention window. Block tables and unrelated arena storage are outside this initialization.
+The Program also initializes each complete ordinary, MTP, and DFlash decode egress frame once, so
+full-frame host transfers include defined inactive entries and padding.
 
 ### 4.4 Batch row
 
@@ -848,14 +857,16 @@ reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并�
 主动 full reset。只有 incoming prefix 不匹配任何完整 checkpoint 时才 full reset。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
-sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
+sequence state，也不使用 copy-on-write branching。`cache_write: false` uses independent copied state
+and a protected cache source as described below. Request-local RNG、sampling、stop、generation
 limit 和 output state 始终由新 request 创建。
 
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
 retained entries。VRAM retained physical state 仍留在原 lane，Planner 在 free lanes 中选择最大合法
-reuse，不在 GPU 上复制或迁移 page mapping。Equal reuse prefers a free lane with no retained
-bundle; among equal-reuse dirty free lanes it covers the least-recently-admitted retained chat
+reuse。Ordinary consuming hits do not copy or migrate GPU page mappings; disposable forks
+copy payloads into independently owned mappings. Equal reuse prefers a free lane with no retained
+bundle; among equal-reuse dirty free lanes disposable state precedes ordinary state, then it covers the least-recently-admitted retained chat
 (monotonic occupy tick assigned after the first non-throwing `advance_prefill` in
 `start_prefill_lane`), then lowest lane index. An
 optional host-RAM second tier snapshots a completed
@@ -867,6 +878,43 @@ satisfied.
 Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地
 缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active
 request 都进入相同 prefill/decode schedule 和 compact batch formation。
+
+#### Disposable cache reads
+
+`ExecutionOptions.cache_write` defaults to true. False selects a source-preserving fork, with
+source identity and destination lane planned independently. Longest preservation-feasible reuse
+wins, with direct VRAM, RAM, and disk tie preference; full-original RAM preservation is attempted
+when direct VRAM admission cannot coexist with its source. Reclaim unrelated idle retention
+before giving up. An infeasible longer hit does not exclude a shorter feasible hit or preserving
+cold path. Active lanes keep ordinary FIFO/deadline/head-protection semantics.
+
+The family Program composes the selected current/checkpoint state into independent main/backend
+KV allocations, GDN state, hidden state, and DFlash cyclic state. Sampling and output control are
+request-local. Source mutation, page reclamation, and image/staging reuse wait through its readers;
+the single executor copy-hold owns initialization and cancellation. No page sharing or copy-on-write
+is used. The fork's durable disk association is cleared before execution.
+
+An ordinary original may be captured to RAM when its lane or pages must be freed. This capture
+bypasses preserve-off rewrite cutting and preserves the complete original resume frontier plus
+existing checkpoints. Before eviction, failed/deferred admission can release the source claim and
+roll back that capture; after eviction, the saved original is committed and cancellation cannot
+remove its only image. A fork releases successful RAM restores instead of consuming them and
+keeps RAM-to-disk bookkeeping intact. Disk restore completion keeps the inclusive durable entry.
+A disposable original cannot be offloaded. Permanently impossible preservation on an idle Engine
+returns a request-local overload; temporary active/copy/reclaim pressure queues and replans.
+
+False requests suppress future-reuse captures while retaining required execution transaction
+state. Their valid terminal state carries disposable retention. Empty eligible lanes are preferred;
+among retained victims disposable state precedes ordinary state, then admission recency and lane
+index decide. Apply the same order to destination replacement and shared-page reclamation.
+All capture entry points and both shutdown passes reject disposable persistence. A later true
+continuation sets ordinary retention for its resulting state.
+
+Restore failure disposition distinguishes invalid source, stale plan, and destination resource
+failure. Only invalid source discards/quarantines the entry. Stale disk generation/claim races
+release pins and replan; destination resource failures keep a healthy source and can cold-prefill.
+Device-integrity failures remain Engine-wide. Request logs carry the write flag; saving an original
+is billed to its triggering request, without counting it as a disposable checkpoint capture.
 
 ### 6.5 Host RAM second tier
 
@@ -923,19 +971,19 @@ further disk restore work and records a fence on the copy stream behind the copi
 the hold stays parked while DecodeRounds continue, and the drain below runs once
 `copy_hold_cancel_settled` (or membership is empty), so it no longer waits on in-flight SSD reads.
 A shutdown with such a hold parked finishes it as cancelled.
-A `CacheRestoreFailure` before prefill consumes the prompt parks the hold the same way; once it
-settles, best-effort cleanup releases the claims and drops the failed RAM/disk entry, then a retry
-cold-prefills its lane and a new request re-enters FIFO admission as a cold fallback. Any other
-request-local failure (`RequestError`, or a `CacheRestoreFailure` after prefill starts) of an
-admission, copy-hold, or generation-recovery retry drains and fails only that request (a drain
-after any `CacheRestoreFailure`, or of a cancelled failed hold, also drops the failed entry);
-other exceptions remain Engine-fatal.
+A `CacheRestoreFailure` before prefill consumes the prompt parks the hold the same way. Once it
+settles, cleanup releases the claims. An invalid source is discarded and the request falls back
+to cold prefill; a stale plan preserves the source and replans admission; an unavailable destination
+preserves the source and falls back to cold prefill. Generation recovery keeps its lane and output
+while restoring or cold-prefilling the retry. It refreshes a stale host lookup once, then cold-prefills
+if that refreshed restore is also stale. Other request-local failures drain and fail only the
+request; other exceptions remain Engine-fatal.
 If the held request is cancelled or fails before admit-complete, drain waits for those copies,
-harvests, releases unused RAM/disk claims (after a `CacheRestoreFailure` it also drops the failed
-entry, as above), and calls `evict_retained_lane` on every selected victim not yet evicted; a
-failed restore's fallback evicts them the same way.
+harvests, releases unused RAM/disk claims, discards only sources classified invalid, and calls
+`evict_retained_lane` on every selected victim not yet evicted. A failed restore releases those
+victims the same way.
 If capture succeeded, the completed D2H image is the only remaining copy. A later RAM hit
-exclusive-claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
+claims the matching host entry (pinned entries are invisible to later `plan_match`). `capture` and `unpack` record a start CUDA event before the copies and a done event
 after them so other-lane decode can overlap the DMA. The pinned rewrite-checkpoint and ladder
 images (GDN conv/recurrent, about 150 MB per image, plus DFlash cyclic) copy host-to-host through
 `enqueue_host_copies`, a stream-ordered `cudaLaunchHostFunc` callback, because a host-to-host
@@ -944,7 +992,7 @@ fence is stream-waited before and re-recorded after those copies; disk restore d
 its state stream. A RAM restore's installed ladder heads copy out of the entry on that host-copy
 stream behind only their own fences: no stream joins them and the entry's copy fence, which gates
 the lane's first prefill chunk, excludes them; a separate block fence keeps the entry's block
-allocated until they land. Consume then erases that entry wherever it
+allocated until they land. Ordinary consume then erases that entry wherever it
 sits in the FIFO and retires the host block, including after an incomplete first chunk; a throw
 before consume releases the claim and leaves the host row in place. After consume the bundle lives
 only in VRAM until a later spill recaptures it. Occupancy `used`/`entries` (human `kv-ram=` / `n=`)
@@ -955,8 +1003,8 @@ occupancy looks low.
 The planner picks the larger `reusable_prompt_tokens` between VRAM and RAM; equal reuse keeps
 VRAM. VRAM `FullReset` and RAM restore both prefer a free lane with no retained bundle and cover a
 dirty lane only when no empty lane is feasible. Among those equal-reuse dirty lanes, the victim is
-the least-recently-admitted retained bundle, then lowest lane index. Page-reclaim eviction of
-other free retained lanes uses the same recency order and never captures the selected lane twice.
+disposable before ordinary retention, then the least-recently-admitted bundle and lowest lane
+index. Page-reclaim eviction of other free retained lanes uses the same order and never captures the selected lane twice.
 The admitted `RequestPlan` is the winner: RAM pass 1 keeps `evict_retained=false` even if the
 target lane is dirty, and restore captures that lane's old bundle. `GenerationResult` uses
 `prefix_reuse_source` for `none` / `vram_resident` / `host_ram` / `host_disk`; `prefix_reuse_path` still describes

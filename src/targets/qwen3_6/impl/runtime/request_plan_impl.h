@@ -130,6 +130,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             Variant::dflash_p_less_draft_temperature_prior(base->sampling.temperature));
     }
     install_suppressed_tokens(base->sampling, options);
+    base->cache_write = options.cache_write;
+    if (!options.cache_write && options.capture_context_checkpoint) {
+        throw RequestError(RequestErrorKind::CacheWriteConflict,
+                           "capture_context_checkpoint=true requires cache_write=true because it "
+                           "creates a retained context checkpoint.");
+    }
     base->allow_prefix_reuse = options.allow_prefix_reuse;
     // Only checkpoint heads and the RAM/disk tiers key on prefix hashes.
     if (options.allow_prefix_reuse && prompt.identity.reusable &&
@@ -274,7 +280,7 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         view->rewrite_checkpoint.valid && view->ledger != nullptr && view->identity != nullptr &&
         view->rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, *view->ledger, *view->identity, desired->frontier);
-    if (!desired) {
+    if (!base.cache_write || !desired) {
         plan.rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
     } else if (existing_checkpoint_matches) {
         plan.rewrite_checkpoint_action = view->rewrite_checkpoint.kind == desired->kind
@@ -323,9 +329,12 @@ void ProgramImplCore::finish_request_plan(RequestPlanImpl& plan, const ResidentS
         }
     }
 
+    plan.cache_read_intent =
+        base.cache_write ? runtime::CacheReadIntent::Consume : runtime::CacheReadIntent::Fork;
     plan.capture_context_checkpoints = qwen3_6::detail::capture_prefill_context_checkpoints(
-        base.allow_prefix_reuse, speculative_backend == SpeculativeBackend::Mtp ||
-                                     speculative_backend == SpeculativeBackend::DFlash);
+        base.cache_write && base.allow_prefix_reuse,
+        speculative_backend == SpeculativeBackend::Mtp ||
+            speculative_backend == SpeculativeBackend::DFlash);
     plan.capture_context_checkpoint = base.capture_context_checkpoint;
 
     if (base.vision_control != nullptr) {

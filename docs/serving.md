@@ -94,7 +94,7 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
-- the vendor `ninfer` object (`capture_context_checkpoint`).
+- the vendor `ninfer` object (`cache_write`, `capture_context_checkpoint`).
 
 ### Constrained output
 
@@ -227,6 +227,37 @@ chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--s
 or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
+
+`ninfer.cache_write` is a strict boolean defaulting to `true`. Set it to `false` for a disposable
+turn that may read cached state without consuming or overwriting the original chat:
+
+```json
+{ "ninfer": { "cache_write": false } }
+```
+
+A VRAM hit copies the selected prefix and complete continuation state into an independent lane.
+A RAM/disk hit restores without consuming the source. If keeping the ordinary VRAM source
+prevents admission, the Engine attempts to save its full state and existing checkpoints to RAM
+before freeing its lane; this preserves the original, not the disposable result. All active
+lanes cause normal queueing. If an otherwise idle Engine cannot preserve the source using a
+separate lane, configured RAM capacity, or a preserving cold-prefill path, the request returns
+HTTP 429 `server_overloaded` with a capacity explanation. A disposable source itself is never
+saved to RAM to make another disposable turn possible.
+
+The disposable result can remain in VRAM for an exact continuation. It is evicted before ordinary
+retention when a lane or shared pages are needed and never goes to RAM/disk, including at idle
+or shutdown. It captures no context ladder, turn-rollback, or turn/response rewrite checkpoint;
+existing checkpoints may be read, and execution snapshots required for speculation/recovery
+remain. Edited or rerendered follow-ups may therefore need prefill. A later `cache_write: true`
+continuation can make its own resulting state normally cacheable. Originals remain subject to
+ordinary cache eviction after initialization; this option does not permanently pin or purge them.
+
+Combining `cache_write: false` with `capture_context_checkpoint: true` returns HTTP 400
+`cache_write_conflict`, parameter `ninfer.capture_context_checkpoint`, before enqueue or streaming:
+`capture_context_checkpoint=true requires cache_write=true because it creates a retained context checkpoint.`
+Saving an original may increase RAM/disk capture counters and copy time, but the disposable
+request reports zero captured context-checkpoint tokens. Request-log schema 19 records
+`request.cache_write` on generation and preparation-rejection events.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -929,7 +960,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v18 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v19 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
