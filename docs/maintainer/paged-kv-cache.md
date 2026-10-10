@@ -862,9 +862,24 @@ allocations，使相应 IDs 不属于各自 free sets；不需要 page refcount 
 pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuation state 一起切换到该 checkpoint。
 该过程不复制 retained KV payload。
 
-多个 active requests 不从同一 retained bundle 分叉。若未来产品需要同一大 prefix 同时 fan-out，必须
-连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
-可继续的 sequence state。
+Ordinary requests consume one retained bundle in place. `cache_write: false` forks a selected
+retained prefix into independent allocations and complete continuation state. It does not share
+writable pages, mutate source checkpoints, or consume a RAM/disk original. Copy main/backend KV
+in their stored representations, including scale planes and partial final pages; preserve exact
+logical frontiers and initialize GDN, hidden, position/media metadata, and MTP/DFlash state at the
+same selected frontier. Transfer readers protect source allocations and images through fences.
+
+If the source prevents admission, ordinary state may migrate into a full-original RAM image,
+without the normal closed-turn rewrite cut, before its GPU bundle is released. Preserve existing
+checkpoints without capturing new ones. An independently retained disposable source may only be
+forked when another preserving destination is feasible; it is never offloaded.
+
+Disposable completion retains only coherent current continuation state in VRAM, with no reuse
+checkpoint captures and no RAM/disk persistence. It is the first eligible retained victim for
+both lane replacement and page pressure. A later true request can promote its own result.
+Insufficient permanent preservation capacity returns a bounded overload rather than destructively
+claiming the source. Cancellation releases destination resources after reader fences; a committed
+original migration remains cached. See the concurrent architecture for admission and cleanup.
 
 ### 10.4 Host RAM second tier
 
@@ -882,7 +897,7 @@ after each image's fence, so they overlap the entry's KV/GDN D2H or H2D; that st
 ready; unpack is not ordered behind block-table publish on the compute stream. Restore writes the
 host image onto a new page mapping of the chosen free lane (an empty lane
 first; a dirty lane only when none is empty, and among equal-reuse dirty lanes the
-least-recently-admitted retained bundle), records H2D completion on the same event, then
+disposable bundle before ordinary bundles, then the least-recently-admitted bundle), records H2D completion on the same event, then
 `device.stream` waits on that event only immediately before this lane's `start_prefill_lane`.
 Capture and restore both require a selected
 free lane; a queued request that cannot admit does not dump in-flight or other retained GPU

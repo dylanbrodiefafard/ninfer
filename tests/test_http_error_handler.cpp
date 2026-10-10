@@ -30,6 +30,14 @@ int main() {
     ServeOptions options;
     options.max_request_bytes = 1234;
 
+    const auto conflict = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::CacheWriteConflict,
+                             "capture_context_checkpoint=true requires cache_write=true because it "
+                             "creates a retained context checkpoint."));
+    failures += check(conflict.status == 400 && conflict.code == "cache_write_conflict" &&
+                          conflict.param == "ninfer.capture_context_checkpoint",
+                      "Engine conflict maps to HTTP 400");
+
     const auto tool_schema = ninfer::serve::request_error_to_api_error(ninfer::RequestError(
         ninfer::RequestErrorKind::InvalidToolSchema, "unsupported tool schema assertion: not"));
     failures +=

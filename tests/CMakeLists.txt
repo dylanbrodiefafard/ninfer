@@ -217,6 +217,10 @@ target_include_directories(ninfer_qwen3_6_27b_recovery_kv_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 set_tests_properties(ninfer_qwen3_6_27b_recovery_kv_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME ninfer_qwen3_8_27b_fork_state_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_recovery_kv_real_test> --fork-state)
+set_tests_properties(ninfer_qwen3_8_27b_fork_state_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS "sanitizer")
 ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
   SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)
@@ -253,6 +257,11 @@ set_tests_properties(ninfer_qwen3_6_27b_disk_real_test PROPERTIES SKIP_RETURN_CO
 add_test(NAME ninfer_qwen3_6_27b_disk_metadata_real_test
   COMMAND ninfer_qwen3_6_27b_disk_real_test --case metadata)
 set_tests_properties(ninfer_qwen3_6_27b_disk_metadata_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
+ninfer_add_test(ninfer_qwen3_8_27b_cache_write_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_cache_write_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_cache_write_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_qwen3_6_27b_context_checkpoint_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_checkpoint_real.cpp
@@ -573,6 +582,7 @@ ninfer_add_sanitizer_cases(ninfer_linear_kv_projection_test)
 set_property(TEST ninfer_linear_kv_projection_test_sanitizer PROPERTY LABELS sanitizer)
 set(ninfer_sanitizer_racecheck_tests
   ninfer_kv_cache_test
+  ninfer_kv_ram_cache_test
   ninfer_embedding_test
   ninfer_rmsnorm_test
   ninfer_dual_rmsnorm_test

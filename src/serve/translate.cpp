@@ -245,6 +245,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens    = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse         = server.allow_prefix_reuse;
+    options.execution.cache_write                = request.cache_write;
     options.execution.capture_context_checkpoint = request.capture_context_checkpoint;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;

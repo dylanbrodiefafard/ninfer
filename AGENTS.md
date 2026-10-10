@@ -79,7 +79,11 @@ one GPU, one resident model instance, and a startup-fixed one to six active requ
 Engine forms one compact decode batch per round boundary with bounded FIFO ingress and no
 preemption. Large-scale or preemptive continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current
-product. This is a trusted local, single-owner project, and requirements from a different
+product. Per-request `cache_write: false` supports disposable turns that fork coherent cached
+state into independent allocations, preserve the original through initialization, suppress reuse
+checkpoint captures and RAM/disk writes for the branch, and prioritize disposable idle state for
+eviction. An ordinary original may migrate to full-state RAM storage to free a lane; this is not
+branch persistence. This is a trusted local, single-owner project, and requirements from a different
 workload, trust model, or deployment model are out of scope until the contract is explicitly
 changed.
 

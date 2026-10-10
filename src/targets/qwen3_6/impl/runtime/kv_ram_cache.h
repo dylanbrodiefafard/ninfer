@@ -210,6 +210,8 @@ public:
     void release(std::uint64_t entry_id);
     // Retires a claimed entry after its restore.
     void consume(std::uint64_t entry_id);
+    // Completes a successful restore without retiring its source.
+    void release_restored(std::uint64_t entry_id);
     // Retires an unclaimed entry the caller rolls back, even while a spill still reads it.
     void discard(std::uint64_t entry_id);
     [[nodiscard]] bool is_claimed(std::uint64_t entry_id) const;
@@ -327,6 +329,14 @@ public:
     }
 
     [[nodiscard]] std::uint32_t test_io_pins(std::uint64_t entry_id) const;
+
+    // Holds the next completion fence after all transfers have been submitted. The callback
+    // runs on the submitting host thread; its state must outlive the callback invocation.
+    void test_before_copy_completion(void (*callback)(void*, cudaStream_t), void* state) noexcept {
+        before_copy_completion_       = callback;
+        before_copy_completion_state_ = state;
+    }
+
     // While held, blocking copy waits stop before their CUDA sync until released. Every call
     // resets the entered observation.
     void test_hold_copy_sync(bool held);
@@ -394,6 +404,7 @@ private:
     void reap_retired_locked();
     void create_copy_event(cudaEvent_t* event, unsigned int flags);
     void begin_copies(Record& record, cudaStream_t stream);
+    void before_copy_completion(cudaStream_t stream);
     void record_copies(Record& record, cudaStream_t stream);
     [[nodiscard]] bool copies_ready_locked(std::uint64_t entry_id) const;
     void wait_copies(Record& record);
@@ -433,7 +444,9 @@ private:
     int fail_copy_event_allocation_after_       = -1;
     inline static std::atomic<bool> fail_next_restore_metadata_allocation_{false};
     inline static std::atomic<bool> fail_next_plan_metadata_allocation_{false};
-    int fail_copy_snapshot_allocation_stage_ = -1;
+    void (*before_copy_completion_)(void*, cudaStream_t) = nullptr;
+    void* before_copy_completion_state_                  = nullptr;
+    int fail_copy_snapshot_allocation_stage_             = -1;
     std::atomic<bool> copy_sync_held_{false};
     mutable std::atomic<bool> copy_sync_entered_{false};
 };

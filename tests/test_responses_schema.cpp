@@ -391,6 +391,26 @@ int test_explicit_rejections() {
     failures +=
         check(!parse_responses_request(ninfer_null, limits()).generation.capture_context_checkpoint,
               "Responses ninfer null is omit");
+    failures += check(parse_responses_request(base, limits()).generation.cache_write,
+                      "Responses defaults to ordinary caching");
+    for (bool stream : {false, true}) {
+        Json disposable      = base;
+        disposable["stream"] = stream;
+        disposable["ninfer"] = Json{{"cache_write", false}};
+        failures += check(!parse_responses_request(disposable, limits()).generation.cache_write,
+                          "Responses accepts disposable turns");
+        disposable["ninfer"]["capture_context_checkpoint"] = true;
+        failures += check(api_code([&] { (void)parse_responses_request(disposable, limits()); }) ==
+                              "cache_write_conflict",
+                          "Responses rejects disposable capture before execution");
+        disposable["ninfer"] = Json{{"cache_write", "false"}};
+        failures += check(throws_api([&] { (void)parse_responses_request(disposable, limits()); }),
+                          "Responses rejects non-boolean cache_write");
+    }
+    Json ordinary      = base;
+    ordinary["ninfer"] = Json{{"cache_write", true}};
+    failures += check(parse_responses_request(ordinary, limits()).generation.cache_write,
+                      "Responses explicit true retains ordinary caching");
     Json unknown_ninfer      = base;
     unknown_ninfer["ninfer"] = Json{{"capture_context_checkpoint", true}, {"foo", 1}};
     failures += check(api_code([&] { (void)parse_responses_request(unknown_ninfer, limits()); }) ==

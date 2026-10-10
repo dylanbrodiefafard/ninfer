@@ -882,16 +882,23 @@ void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
 void apply_ninfer_object(const Json& ninfer, GenerationRequest& out) {
     if (!ninfer.is_object()) { bad_request("ninfer must be an object", "ninfer"); }
     for (auto it = ninfer.begin(); it != ninfer.end(); ++it) {
-        if (it.key() != "capture_context_checkpoint") {
+        if (it.key() != "capture_context_checkpoint" && it.key() != "cache_write") {
             bad_request("ninfer." + it.key() + " is not supported", "ninfer",
                         "ninfer_option_not_supported");
         }
     }
-    if (!ninfer.contains("capture_context_checkpoint")) { return; }
-    if (!ninfer.at("capture_context_checkpoint").is_boolean()) {
-        bad_request("ninfer.capture_context_checkpoint must be a boolean", "ninfer");
+    for (const char* key : {"cache_write", "capture_context_checkpoint"}) {
+        if (ninfer.contains(key) && !ninfer.at(key).is_boolean()) {
+            bad_request(std::string("ninfer.") + key + " must be a boolean", "ninfer");
+        }
     }
-    out.capture_context_checkpoint = ninfer.at("capture_context_checkpoint").get<bool>();
+    out.cache_write                = ninfer.value("cache_write", true);
+    out.capture_context_checkpoint = ninfer.value("capture_context_checkpoint", false);
+    if (!out.cache_write && out.capture_context_checkpoint) {
+        bad_request("capture_context_checkpoint=true requires cache_write=true because it creates "
+                    "a retained context checkpoint.",
+                    "ninfer.capture_context_checkpoint", "cache_write_conflict");
+    }
 }
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {

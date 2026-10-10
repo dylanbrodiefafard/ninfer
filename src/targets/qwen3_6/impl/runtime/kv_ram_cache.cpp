@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -553,7 +554,16 @@ void KVRamCache::begin_copies(Record& record, cudaStream_t stream) {
     record.copies_timed = false;
 }
 
+void KVRamCache::before_copy_completion(cudaStream_t stream) {
+    if (before_copy_completion_ != nullptr) {
+        const auto callback = std::exchange(before_copy_completion_, nullptr);
+        void* state         = std::exchange(before_copy_completion_state_, nullptr);
+        callback(state, stream);
+    }
+}
+
 void KVRamCache::record_copies(Record& record, cudaStream_t stream) {
+    before_copy_completion(stream);
     if (record.copies_done == nullptr) {
         create_copy_event(&record.copies_done, cudaEventBlockingSync);
     }
@@ -820,6 +830,17 @@ void KVRamCache::consume(std::uint64_t entry_id) {
     if (!record.pinned) { throw std::logic_error("RAM cache consume requires a claimed entry"); }
     ++restores_;
     retire_locked(entry_id);
+}
+
+void KVRamCache::release_restored(std::uint64_t entry_id) {
+    std::lock_guard lock(io_mutex_);
+    Record& record = require(entry_id);
+    if (!record.pinned) {
+        throw std::logic_error("RAM restore completion requires a claimed entry");
+    }
+    record.pinned = false;
+    ++restores_;
+    bump_version();
 }
 
 void KVRamCache::discard(std::uint64_t entry_id) {
@@ -1374,6 +1395,7 @@ RamCaptureResult KVRamCache::capture(const RamCaptureSource& source) try {
             host_copies_.run(host_copies, image_fences, source.stream);
         }
 
+        before_copy_completion(source.stream);
         if (next_id_ == 0) { throw std::logic_error("RAM cache entry id overflow"); }
         Record record;
         record.id                  = next_id_++;

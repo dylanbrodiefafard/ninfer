@@ -7,15 +7,32 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::runtime {
 
-// A failed optional cache read can be retried by recomputing the prompt.
+// Optional cache failures distinguish source integrity, stale plans, and destination pressure.
 // CUDA failures and execution errors must retain their original exception.
+enum class CacheRestoreFailureKind : std::uint8_t {
+    InvalidSource,
+    StalePlan,
+    DestinationUnavailable
+};
+
 class CacheRestoreFailure : public std::runtime_error {
 public:
-    using std::runtime_error::runtime_error;
+    explicit CacheRestoreFailure(
+        const std::string& message,
+        CacheRestoreFailureKind kind = CacheRestoreFailureKind::InvalidSource)
+        : std::runtime_error(message), kind_(kind) {}
+
+    [[nodiscard]] CacheRestoreFailureKind kind() const noexcept { return kind_; }
+private:
+    CacheRestoreFailureKind kind_;
 };
+
+enum class CacheReadIntent : std::uint8_t { Consume, Fork };
+enum class CacheRetention : std::uint8_t { Ordinary, Disposable };
 
 using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;
@@ -36,6 +53,7 @@ struct ResolvedExecutionOptions {
     bool allow_prefix_reuse               = true;
     // Internal cache recovery bypasses existing images without disabling capture.
     bool force_cold_prefill         = false;
+    bool cache_write                = true;
     bool capture_context_checkpoint = false;
     // The target scores every generated token of the request (RoundLogprobs).
     bool token_logprobs = false;

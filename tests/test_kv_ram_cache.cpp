@@ -141,7 +141,6 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
     for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
         const ninfer::Tensor& tensor = pool.plane(plane);
         std::vector<unsigned char> host(tensor.bytes(), 0);
-        CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < pages.size(); ++i) {
             const unsigned char value =
                 static_cast<unsigned char>(seed + plane * 17U + static_cast<unsigned>(i) + 1U);
@@ -149,20 +148,21 @@ void fill_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
                 const std::size_t begin = static_cast<std::size_t>(pages[i] * tensor.nb[3]);
                 std::fill(host.begin() + static_cast<std::ptrdiff_t>(begin),
                           host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[3]), value);
+                CUDA_CHECK(cudaMemcpy(static_cast<unsigned char*>(tensor.data) + begin,
+                                      host.data() + begin, tensor.nb[3], cudaMemcpyHostToDevice));
             } else {
-                const std::size_t bpp =
-                    static_cast<std::size_t>(tensor.ne[3]) * static_cast<std::size_t>(tensor.nb[2]);
                 for (std::int32_t head = 0; head < tensor.ne[3]; ++head) {
                     const std::size_t begin =
                         static_cast<std::size_t>(head * tensor.nb[3] + pages[i] * tensor.nb[2]);
                     std::fill(host.begin() + static_cast<std::ptrdiff_t>(begin),
                               host.begin() + static_cast<std::ptrdiff_t>(begin + tensor.nb[2]),
                               static_cast<unsigned char>(value + static_cast<unsigned>(head)));
+                    CUDA_CHECK(cudaMemcpy(static_cast<unsigned char*>(tensor.data) + begin,
+                                          host.data() + begin, tensor.nb[2],
+                                          cudaMemcpyHostToDevice));
                 }
-                (void)bpp;
             }
         }
-        CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), host.size(), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
     }
 }
@@ -176,12 +176,14 @@ int expect_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocat
     for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
         const ninfer::Tensor& tensor = pool.plane(plane);
         std::vector<unsigned char> host(tensor.bytes());
-        CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < pages.size(); ++i) {
             const unsigned char value =
                 static_cast<unsigned char>(seed + plane * 17U + static_cast<unsigned>(i) + 1U);
             if (order == ninfer::PagedKVPlaneOrder::PageMajor) {
                 const std::size_t begin = static_cast<std::size_t>(pages[i] * tensor.nb[3]);
+                CUDA_CHECK(cudaMemcpy(host.data() + begin,
+                                      static_cast<const unsigned char*>(tensor.data) + begin,
+                                      tensor.nb[3], cudaMemcpyDeviceToHost));
                 for (std::int64_t byte = 0; byte < tensor.nb[3]; ++byte) {
                     if (host[begin + static_cast<std::size_t>(byte)] != value) {
                         std::cerr << label << " PageMajor logical page " << i << " plane " << plane
@@ -195,6 +197,9 @@ int expect_logical_pages(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocat
                         static_cast<unsigned char>(value + static_cast<unsigned>(head));
                     const std::size_t begin =
                         static_cast<std::size_t>(head * tensor.nb[3] + pages[i] * tensor.nb[2]);
+                    CUDA_CHECK(cudaMemcpy(host.data() + begin,
+                                          static_cast<const unsigned char*>(tensor.data) + begin,
+                                          tensor.nb[2], cudaMemcpyDeviceToHost));
                     for (std::int64_t byte = 0; byte < tensor.nb[2]; ++byte) {
                         if (host[begin + static_cast<std::size_t>(byte)] != expected) {
                             std::cerr << label << " HeadMajor logical page " << i << " head "
@@ -275,6 +280,18 @@ int round_trip_pool(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
     } else {
         failures += expect_host_head_major_layout(static_cast<const unsigned char*>(image), pool,
                                                   captured, seed, label);
+    }
+    {
+        const auto fork_pages = std::min(mapped, pool.page_group_count() - pool.entitled_pages());
+        if (fork_pages == 0) { return fail("GPU fork fixture has no free pages"); }
+        auto fork = pool.reserve(fork_pages);
+        fork.materialize_pages(fork_pages, ctx.stream);
+        ninfer::copy_paged_kv_allocation(source, fork, pool, fork_pages, ctx.stream);
+        ctx.synchronize_all();
+        failures += expect_logical_pages(pool, fork, seed, label);
+        fill_logical_pages(pool, fork, static_cast<unsigned char>(seed + 29U));
+        ctx.synchronize_all();
+        failures += expect_logical_pages(pool, source, seed, "fork source remains unchanged");
     }
     source.release();
 
@@ -674,8 +691,32 @@ int test_unpack_consume_and_drop(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
         std::cerr << "restore copy elapsed was not harvested as load\n";
         ++failures;
     }
+    // A read-only restore can release its claim and leave the original available for a later
+    // consuming continuation. Mutating the destination must not change the stored image.
+    cache.release(match->entry_id);
+    const auto released = cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!released || released->entry_id != match->entry_id ||
+        released->reuse_base != match->reuse_base || cache.snapshot().entry_count != 1) {
+        std::cerr << "release after restore did not preserve the original RAM entry\n";
+        ++failures;
+    }
+    failures += expect_logical_pages(pool, full, 13, "released restore");
+    fill_logical_pages(pool, full, 91);
+    ctx.synchronize_all();
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, full_target);
+    ctx.synchronize_all();
+    cache.release_restored(match->entry_id);
+    if (cache.snapshot().restores != 1 ||
+        !cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
+        std::cerr << "successful fork read was not counted or consumed its source\n";
+        ++failures;
+    }
+    cache.claim(match->entry_id);
+    (void)cache.unpack_device(match->entry_id, full_target);
+    ctx.synchronize_all();
     cache.consume(match->entry_id);
-    if (cache.snapshot().entry_count != 0 || cache.snapshot().restores != 1 ||
+    if (cache.snapshot().entry_count != 0 || cache.snapshot().restores != 2 ||
         cache.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
         std::cerr << "consume did not drop the RAM entry from the index\n";
         ++failures;
@@ -736,13 +777,14 @@ int expect_logical_page(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocati
     }
     for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
         const ninfer::Tensor& tensor = pool.plane(plane);
-        std::vector<unsigned char> host(tensor.bytes());
-        CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
+        std::vector<unsigned char> host(static_cast<std::size_t>(tensor.nb[3]));
+        const std::size_t begin = static_cast<std::size_t>(pages[logical_index] * tensor.nb[3]);
+        CUDA_CHECK(cudaMemcpy(host.data(), static_cast<const unsigned char*>(tensor.data) + begin,
+                              host.size(), cudaMemcpyDeviceToHost));
         const unsigned char value = static_cast<unsigned char>(
             seed + plane * 17U + static_cast<unsigned>(logical_index) + 1U);
-        const std::size_t begin = static_cast<std::size_t>(pages[logical_index] * tensor.nb[3]);
         for (std::int64_t byte = 0; byte < tensor.nb[3]; ++byte) {
-            if (host[begin + static_cast<std::size_t>(byte)] != value) {
+            if (host[static_cast<std::size_t>(byte)] != value) {
                 std::cerr << label << " logical page " << logical_index << " plane " << plane
                           << " mismatch\n";
                 return 1;
@@ -1128,7 +1170,7 @@ int test_copy_compute_stream_overlap(ninfer::DeviceContext& ctx, ninfer::PagedKV
     CUDA_CHECK(cudaEventCreate(&compute_done));
     q36::detail::KVRamCache cache(8ULL << 20);
     StreamCopyGate capture_gate;
-    capture_gate.launch(ctx.copy_stream);
+    capture_gate.arm(cache);
     if (!capture_or_evict(cache, cap)) {
         source.release();
         return fail("copy/compute overlap capture failed");
@@ -1181,7 +1223,7 @@ int test_copy_compute_stream_overlap(ninfer::DeviceContext& ctx, ninfer::PagedKV
     cache.claim(match->entry_id);
     CUDA_CHECK(cudaEventCreate(&compute_done));
     StreamCopyGate restore_gate;
-    restore_gate.launch(ctx.copy_stream);
+    restore_gate.arm(cache);
     (void)cache.unpack_device(match->entry_id, target);
 
     CUDA_CHECK(cudaMemsetAsync(scratch.p, 1, 1, ctx.stream));
@@ -1212,6 +1254,11 @@ int test_unpack_without_harvest_keeps_save_and_load(ninfer::DeviceContext& ctx,
     ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {static_cast<std::int32_t>(kBulkBytes)});
     const auto prompt = text_prompt({33, 34, 35, 36});
     q36::detail::KVRamCache cache(64ULL << 20);
+    ninfer::DeviceBuffer scratch(256);
+    cudaEvent_t compute_done{};
+    CUDA_CHECK(cudaEventCreate(&compute_done));
+    StreamCopyGate capture_gate;
+    capture_gate.arm(cache);
     if (capture_with_hidden(cache, pool, source, prompt, hidden, ctx.copy_stream) != 0) {
         source.release();
         return fail("save/load harvest capture failed");
@@ -1221,19 +1268,17 @@ int test_unpack_without_harvest_keeps_save_and_load(ninfer::DeviceContext& ctx,
         source.release();
         return fail("save/load harvest capture did not index");
     }
-    {
-        ninfer::DeviceBuffer scratch(256);
-        cudaEvent_t compute_done{};
-        CUDA_CHECK(cudaEventCreate(&compute_done));
-        CUDA_CHECK(cudaMemsetAsync(scratch.p, 0, 1, ctx.stream));
-        CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
-        CUDA_CHECK(cudaEventSynchronize(compute_done));
+    CUDA_CHECK(cudaMemsetAsync(scratch.p, 0, 1, ctx.stream));
+    CUDA_CHECK(cudaEventRecord(compute_done, ctx.stream));
+    CUDA_CHECK(cudaEventSynchronize(compute_done));
+    if (cache.pending_copies_ready()) {
+        capture_gate.release();
         CUDA_CHECK(cudaEventDestroy(compute_done));
-        if (cache.pending_copies_ready()) {
-            source.release();
-            return fail("pending_copies_ready was true during in-flight capture D2H");
-        }
+        source.release();
+        return fail("pending_copies_ready was true during in-flight capture D2H");
     }
+    capture_gate.release();
+    CUDA_CHECK(cudaEventDestroy(compute_done));
     source.release();
     auto dest = pool.reserve(2);
     dest.materialize_pages(2, ctx.stream);
@@ -1451,12 +1496,14 @@ int test_stream_wait_does_not_block_host(ninfer::DeviceContext& ctx, ninfer::Pag
     q36::detail::KVRamCache cache(64ULL << 20);
     auto source = pool.reserve(2);
     source.materialize_pages(2, ctx.stream);
+    fill_logical_pages(pool, source, 91);
     ninfer::DeviceBuffer bulk(1ULL << 20);
+    bulk.fill(0x5c);
     ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {1 << 20});
     int failures = 0;
     {
         ninfer::test::StreamCopyGate gate;
-        gate.launch(ctx.copy_stream);
+        gate.arm(cache);
         if (capture_with_hidden(cache, pool, source, text_prompt({91, 92, 93}), hidden,
                                 ctx.copy_stream) != 0) {
             gate.release();
@@ -1492,7 +1539,9 @@ int test_failed_unpack_fences_enqueued_reads(ninfer::DeviceContext& ctx,
     {
         auto source = pool.reserve(2);
         source.materialize_pages(2, ctx.stream);
+        fill_logical_pages(pool, source, 101);
         ninfer::DeviceBuffer bulk(1ULL << 20);
+        bulk.fill(0x6d);
         ninfer::Tensor hidden(bulk.p, ninfer::DType::U8, {1 << 20});
         const int rc = capture_with_hidden(cache, pool, source, prompt, hidden, ctx.copy_stream);
         ctx.synchronize_all();
@@ -1516,7 +1565,7 @@ int test_failed_unpack_fences_enqueued_reads(ninfer::DeviceContext& ctx,
     int failures = 0;
     {
         ninfer::test::StreamCopyGate gate;
-        gate.launch(ctx.copy_stream);
+        gate.arm(cache);
         bool threw = false;
         try {
             (void)cache.unpack_device(match->entry_id, target);
@@ -1784,7 +1833,7 @@ int test_destructor_under_allocation_pressure(ninfer::DeviceContext& ctx,
     for (bool restore : {false, true}) {
         auto cache = std::make_unique<q36::detail::KVRamCache>(8ULL << 20);
         StreamCopyGate gate;
-        if (!restore) { gate.launch(ctx.copy_stream); }
+        if (!restore) { gate.arm(*cache); }
         if (capture_text_entry(*cache, pool, source, prompt, ctx.copy_stream)) {
             return fail("allocation-pressure teardown capture failed");
         }
@@ -1792,7 +1841,7 @@ int test_destructor_under_allocation_pressure(ninfer::DeviceContext& ctx,
         if (restore) {
             cache->wait_pending_copies();
             cache->claim(id);
-            gate.launch(ctx.copy_stream);
+            gate.arm(*cache);
             q36::detail::RamRestoreTarget target;
             target.text           = &destination;
             target.text_pool      = &pool;
@@ -1850,7 +1899,7 @@ int test_copy_event_allocation_recovery(ninfer::DeviceContext& ctx, ninfer::Page
         bool observed_wait = false;
         std::jthread controller;
         if (phase == 1) {
-            gate.launch(ctx.copy_stream);
+            gate.arm(cache);
             cache.test_hold_copy_sync(false);
             controller = std::jthread([&] {
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -2068,6 +2117,13 @@ int test_full_state_image(ninfer::DeviceContext& ctx, FullStateRestore mode) {
     ninfer::DeviceArena cyclic_ckpt_arena(cyclic_ckpt_builder.finish(256));
     ninfer::CyclicKVCache dflash_ckpt({cyclic_ckpt_arena.base(), cyclic_ckpt_arena.capacity()},
                                       cyclic_ckpt_layout);
+    gdn.zero_slot(0, ctx.stream);
+    gdn.zero_slot(1, ctx.stream);
+    std::vector<unsigned char> local_state(dflash_local.lane_host_bytes(), 0x5a);
+    std::vector<unsigned char> checkpoint_state(dflash_ckpt.lane_host_bytes(), 0x6b);
+    dflash_local.copy_lane_from_host(local_state.data(), 0, ctx.stream);
+    dflash_ckpt.copy_lane_from_host(checkpoint_state.data(), 0, ctx.stream);
+    ctx.synchronize_all();
 
     auto text = text_pool.reserve(2);
     text.materialize_pages(2, ctx.stream);
@@ -2677,6 +2733,7 @@ int test_context_checkpoint_two_ram_entries(ninfer::DeviceContext& ctx) {
                                                                .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+    gdn.zero_slot(0, ctx.copy_stream);
 
     auto text_a = text_pool.reserve(2);
     auto text_b = text_pool.reserve(2);
@@ -3016,6 +3073,7 @@ int test_context_checkpoint_hash_mismatch(ninfer::DeviceContext& ctx) {
     ninfer::PagedKVPool text_pool({text_arena.base(), text_arena.capacity()}, text_plan.layout);
     auto text = text_pool.reserve(2);
     text.materialize_pages(2, ctx.stream);
+    fill_logical_pages(text_pool, text, 8);
 
     const auto prompt                = text_prompt({1, 2, 3, 4, 5, 6, 7, 8});
     q36::PreparedPromptData retained = prompt;
@@ -3503,6 +3561,7 @@ int test_turn_rollback_kind_roundtrip(ninfer::DeviceContext& ctx) {
     source.text_pool        = &text_pool;
     source.gdn              = &gdn;
     source.gdn_current_slot = 0;
+    gdn.zero_slot(1, ctx.stream);
     const auto source_rewrite =
         ninfer::test::RewriteStateHostImage::packed(gdn, 1, nullptr, 0, ctx.stream);
     source.rewrite_state = source_rewrite.source();
@@ -3880,6 +3939,10 @@ int test_context_checkpoint_dflash_cyclic_isolation(ninfer::DeviceContext& ctx) 
     ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
     ninfer::CyclicKVCache dflash_local({cyclic_arena.base(), cyclic_arena.capacity()},
                                        cyclic_layout);
+
+    std::vector<unsigned char> local_state(dflash_local.lane_host_bytes(), 0x5a);
+    dflash_local.copy_lane_from_host(local_state.data(), 0, ctx.stream);
+    ctx.synchronize_all();
 
     auto text = text_pool.reserve(2);
     text.materialize_pages(2, ctx.stream);
@@ -4587,6 +4650,7 @@ int test_context_checkpoint_same_f_fifo_first_wins(ninfer::DeviceContext& ctx) {
                                                                .conv_dtype = ninfer::DType::BF16});
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
+    gdn.zero_slot(0, ctx.copy_stream);
 
     auto text_a = text_pool.reserve(2);
     auto text_b = text_pool.reserve(2);
@@ -4903,7 +4967,7 @@ int test_copy_snapshot_allocation_failure(ninfer::DeviceContext& ctx, ninfer::Pa
                 cache.claim(cache.fifo_ids().front());
             }
             StreamCopyGate gate;
-            gate.launch(ctx.copy_stream);
+            gate.arm(cache);
             if (restore) {
                 (void)cache.unpack_device(cache.fifo_ids().front(), target);
             } else if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream)) {
@@ -4964,7 +5028,7 @@ int test_restore_metadata_failure_after_dma(ninfer::DeviceContext& ctx, ninfer::
     const auto id = cache.fifo_ids().front();
     cache.claim(id);
     StreamCopyGate gate;
-    gate.launch(ctx.copy_stream);
+    gate.arm(cache);
     cache.test_fail_next_restore_metadata_allocation();
     q36::detail::RamRestoreTarget target;
     target.text           = &destination;
@@ -5040,7 +5104,7 @@ int test_capture_metadata_failure_drops_after_dma(ninfer::DeviceContext& ctx,
     (void)cache.harvest_copy_seconds();
     const auto id_a = cache.fifo_ids().front();
     StreamCopyGate gate;
-    gate.launch(ctx.copy_stream);
+    gate.arm(cache);
     cache.test_fail_next_capture_metadata_allocation();
     cache.test_hold_copy_sync(false);
     bool observed_cleanup_fence = false;
@@ -5146,7 +5210,7 @@ int test_retired_block_waits_for_fence_and_pins(ninfer::DeviceContext& ctx,
         cache.pin_for_io(id);
         cache.claim(id);
         StreamCopyGate gate;
-        gate.launch(ctx.copy_stream);
+        gate.arm(cache);
         (void)cache.unpack_device(id, target);
         {
             Watchdog watchdog(gate);
@@ -5182,7 +5246,7 @@ int test_retired_block_waits_for_fence_and_pins(ninfer::DeviceContext& ctx,
         q36::detail::KVRamCache cache(8ULL << 20);
         std::jthread worker; // Joins after the gate below opens on every exit.
         StreamCopyGate gate;
-        gate.launch(ctx.copy_stream);
+        gate.arm(cache);
         if (capture_text_entry(cache, pool, source, prompt, ctx.copy_stream)) {
             return fail("retired-discard capture failed");
         }
@@ -5345,7 +5409,7 @@ int test_retired_entry_contract(ninfer::DeviceContext& ctx, ninfer::PagedKVPool&
     }
     q36::detail::KVRamCache cache(entry_bytes);
     StreamCopyGate gate;
-    gate.launch(ctx.copy_stream);
+    gate.arm(cache);
     if (capture_text_entry(cache, pool, source, prompt_a, ctx.copy_stream)) {
         return fail("retired-contract capture failed");
     }
@@ -5382,7 +5446,7 @@ int test_retired_entry_contract(ninfer::DeviceContext& ctx, ninfer::PagedKVPool&
 
 // Disk spill pins one source and waits a snapshot of all pending RAM copy events.
 // Exercise both orders of that snapshot versus an unrelated executor capture while
-// CUDA is genuinely blocked. Only the executor mutates residency; the worker holds
+// the worker's host wait is held. Only the executor mutates residency; the worker holds
 // its source pin and reads the completed host image, as the disk worker does.
 int test_ram_worker_wait_with_unrelated_capture(ninfer::DeviceContext& ctx,
                                                 ninfer::PagedKVPool& pool) {
@@ -5400,18 +5464,21 @@ int test_ram_worker_wait_with_unrelated_capture(ninfer::DeviceContext& ctx,
     const auto prompt_b = text_prompt(std::vector<ninfer::TokenId>(64, 39));
     for (const bool capture_before_snapshot : {false, true}) {
         q36::detail::KVRamCache cache(8ULL << 20);
-        StreamCopyGate gate;
-        gate.launch(ctx.copy_stream);
+        StreamCopyGate unrelated_gate;
         if (capture_text_entry(cache, pool, source_a, prompt_a, ctx.copy_stream)) {
             return fail("worker wait initial RAM capture failed");
         }
         const auto id_a      = cache.fifo_ids().front();
         const auto capture_b = [&] {
-            return capture_text_entry(cache, pool, source_b, prompt_b, ctx.copy_stream);
+            // A's worker wait is held on the host, so an API checker can inspect this DMA
+            // before B's completion callback holds its record fence.
+            unrelated_gate.arm(cache);
+            return capture_text_entry(cache, pool, source_b, prompt_b, ctx.stream);
         };
         if (capture_before_snapshot && capture_b()) {
             return fail("worker wait second RAM capture failed");
         }
+        cache.test_hold_copy_sync(true);
         std::exception_ptr worker_error;
         int worker_mismatches = 0;
         std::jthread worker([&] {
@@ -5432,10 +5499,14 @@ int test_ram_worker_wait_with_unrelated_capture(ninfer::DeviceContext& ctx,
         });
 
         struct ReleaseBeforeJoin {
-            StreamCopyGate& gate;
+            q36::detail::KVRamCache& cache;
+            StreamCopyGate& unrelated_gate;
 
-            ~ReleaseBeforeJoin() { gate.release(); }
-        } release_before_join{gate};
+            ~ReleaseBeforeJoin() {
+                cache.test_hold_copy_sync(false);
+                unrelated_gate.release();
+            }
+        } release_before_join{cache, unrelated_gate};
 
         const auto snapshot_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (cache.test_io_pins(id_a) != 2 &&
@@ -5452,8 +5523,8 @@ int test_ram_worker_wait_with_unrelated_capture(ninfer::DeviceContext& ctx,
         if (cache.test_io_pins(id_b) != (capture_before_snapshot ? 1U : 0U)) {
             return fail("worker event snapshot included the wrong capture generation");
         }
-        if (cache.copies_ready(id_a) || cache.copies_ready(id_b)) {
-            return fail("gated worker fixture unexpectedly completed D2H");
+        if (cache.copies_ready(id_b)) {
+            return fail("gated unrelated capture unexpectedly completed its record fence");
         }
         // The executor's own blocking wait overlaps the worker's: its snapshot is the third
         // pin on A (worker lease, worker snapshot, executor snapshot).
@@ -5461,7 +5532,8 @@ int test_ram_worker_wait_with_unrelated_capture(ninfer::DeviceContext& ctx,
         std::jthread controller([&] {
             observed_wait =
                 wait_pred([&] { return cache.test_io_pins(id_a) == 3; }, std::chrono::seconds(10));
-            gate.release();
+            cache.test_hold_copy_sync(false);
+            unrelated_gate.release();
         });
         cache.wait_pending_copies();
         controller.join();
@@ -6025,6 +6097,8 @@ int main(int argc, char** argv) {
     ninfer::DeviceArena gdn_arena(gdn_builder.finish(256));
     ninfer::LinearAttentionStatePool gdn({gdn_arena.base(), gdn_arena.capacity()}, gdn_layout);
     {
+        gdn.zero_slot(0, ctx.stream);
+        ctx.synchronize_all();
         const ninfer::Tensor conv = gdn.conv_slot(0, 0);
         std::vector<unsigned char> pattern(conv.bytes());
         for (std::size_t i = 0; i < pattern.size(); ++i) {
@@ -6064,6 +6138,9 @@ int main(int argc, char** argv) {
     ninfer::DeviceArena cyclic_arena(cyclic_builder.finish(256));
     ninfer::CyclicKVCache cyclic({cyclic_arena.base(), cyclic_arena.capacity()}, cyclic_layout);
     {
+        std::vector<unsigned char> source_state(cyclic.lane_host_bytes(), 0x5a);
+        cyclic.copy_lane_from_host(source_state.data(), 0, ctx.stream);
+        ctx.synchronize_all();
         ninfer::CyclicKVCacheLayerView layer = cyclic.layer_view(0);
         std::vector<unsigned char> k_pattern(layer.k.slice(3, 0, 1).bytes(), 0x3c);
         CUDA_CHECK(cudaMemcpy(layer.k.slice(3, 0, 1).data, k_pattern.data(), k_pattern.size(),

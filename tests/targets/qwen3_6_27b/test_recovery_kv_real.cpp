@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "ninfer/ops/gdn_history.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
@@ -11,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -49,20 +51,139 @@ struct CommittedState {
     bool operator==(const CommittedState&) const = default;
 };
 
-CommittedState committed_state(execution::ProgramImplCore& program) {
+CommittedState committed_state(execution::ProgramImplCore& program, std::uint32_t lane = 0) {
+    if (program.gdn_history && program.gdn_history_lengths[lane] != 0) {
+        require(program.replay_records.has_value(), "GDN history has no replay records");
+        const auto slot =
+            execution::LinearStateSlots::current_state_slot(lane, program.max_concurrency);
+        ninfer::ops::gdn_history_materialize(
+            program.replay_records.value(), program.gdn_history.value(),
+            program.decoder->linear_attention.all_layers_view(),
+            std::span<const std::int32_t>(&slot, 1), program.device.stream);
+        program.gdn_history_lengths[lane] = 0;
+    }
     const auto& state  = program.decoder->linear_attention;
-    const auto& hidden = program.sequences[0].tail_hidden;
+    const auto& hidden = program.sequences[lane].tail_hidden;
     CommittedState result{std::vector<std::byte>(state.conv_host_image_bytes()),
                           std::vector<std::byte>(state.recurrent_host_image_bytes()),
                           std::vector<std::byte>(hidden.bytes())};
-    state.pack_slot_to_host(0, result.conv.data(), result.recurrent.data(), program.device.stream);
+    state.pack_slot_to_host(static_cast<std::int32_t>(lane), result.conv.data(),
+                            result.recurrent.data(), program.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(result.hidden.data(), hidden.data, hidden.bytes(),
                                cudaMemcpyDeviceToHost, program.device.stream));
     program.device.synchronize();
     return result;
 }
 
-std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, int rounds) {
+std::vector<std::byte> kv_prefix_image(execution::ProgramImplCore& program,
+                                       const ninfer::PagedKVAllocation& allocation,
+                                       const ninfer::PagedKVPool& pool, std::uint32_t pages) {
+    const auto page_bytes = ninfer::paged_kv_logical_page_bytes(pool);
+    std::vector<std::byte> image(page_bytes * pages);
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        ninfer::pack_paged_kv_logical_page_to_host(
+            allocation, pool, page, image.data() + page_bytes * page, program.device.stream);
+    }
+    program.device.synchronize();
+    return image;
+}
+
+void exercise_exact_fork(execution::ProgramImplCore& program, family::Frontend& frontend,
+                         ninfer::runtime::ResolvedExecutionOptions options, bool rewrite) {
+    auto& source                 = program.sequences[0];
+    const auto source_state      = committed_state(program);
+    const auto source_ledger     = source.ledger;
+    const auto source_frontier   = source.execution_frontier;
+    const auto source_checkpoint = source.rewrite_checkpoint;
+    const auto frontier          = rewrite ? source_checkpoint.frontier : source_frontier;
+    require(frontier > 0 && source_ledger.size() > frontier,
+            "exact fork source has no continuation");
+    std::vector<ninfer::TokenId> branch(source_ledger.begin(), source_ledger.begin() + frontier);
+    branch.push_back((source_ledger[frontier] + 1) % 248077);
+    auto prompt = family::PreparedPromptAccess::take(frontend.prepare_tokens(std::move(branch)));
+    options.cache_write = false;
+    auto base           = program.plan_request_base(prompt, options);
+    auto plan           = program.plan_request_for_lane(0, prompt, base);
+    require(plan.impl_->reuse_base == frontier &&
+                plan.impl_->reuse == (rewrite ? execution::restore_path(source_checkpoint.kind)
+                                              : execution::ReusePath::AppendAtFrontier),
+            "exact fork did not select its source state: rewrite=" + std::to_string(rewrite) +
+                " frontier=" + std::to_string(frontier) +
+                " dflash=" + std::to_string(source.dflash_context_frontier) +
+                " tail=" + std::to_string(source.tail_hidden_valid) + " matches=" +
+                std::to_string(family::detail::prefix_matches(prompt, source.ledger,
+                                                              source.prefix_identity, frontier)) +
+                " " + plan_text(plan));
+    const auto& source_kv = source.kv.value();
+    const auto text_pages = 1U + (frontier - 1U) / 64U;
+    const auto text_image =
+        kv_prefix_image(program, source_kv.text, program.decoder->text_kv.pool(), text_pages);
+    auto* backend_cache =
+        program.speculative_backend == ninfer::SpeculativeBackend::Mtp
+            ? program.decoder->mtp_cache()
+            : (program.dflash && program.dflash->full ? &*program.dflash->full : nullptr);
+    std::vector<std::byte> backend_image;
+    const auto backend_tokens =
+        program.speculative_backend == ninfer::SpeculativeBackend::Mtp ? frontier - 1 : frontier;
+    const auto backend_pages = backend_tokens == 0 ? 0 : 1U + (backend_tokens - 1U) / 64U;
+    if (source_kv.backend) {
+        backend_image =
+            kv_prefix_image(program, *source_kv.backend, backend_cache->pool(), backend_pages);
+    }
+    CommittedState expected = source_state;
+    std::vector<std::byte> cyclic;
+    if (program.dflash) {
+        cyclic.resize(program.dflash->local.lane_host_bytes());
+        program.dflash->local.copy_lane_to_host(0, cyclic.data(), program.device.stream);
+        program.device.synchronize();
+    }
+    if (rewrite) {
+        CUDA_CHECK(cudaEventSynchronize(source.rewrite_image.copies_done));
+        std::memcpy(expected.conv.data(), source.rewrite_image.conv.data(), expected.conv.size());
+        std::memcpy(expected.recurrent.data(), source.rewrite_image.recurrent.data(),
+                    expected.recurrent.size());
+        CUDA_CHECK(cudaMemcpy(expected.hidden.data(), source.rewrite_checkpoint_hidden.data,
+                              expected.hidden.size(), cudaMemcpyDeviceToHost));
+        if (program.dflash) {
+            std::memcpy(cyclic.data(), source.rewrite_image.dflash.data(), cyclic.size());
+        }
+    }
+    program.fork_retained_lane(1, 0, plan);
+    program.device.synchronize_all();
+    auto& destination          = program.sequences[1];
+    const auto& destination_kv = destination.kv.value();
+    require(committed_state(program, 1) == expected,
+            "fork did not copy exact GDN convolution, FP32 recurrence, and hidden state");
+    require(kv_prefix_image(program, destination_kv.text, program.decoder->text_kv.pool(),
+                            text_pages) == text_image,
+            "fork changed represented main KV bytes");
+    for (const auto source_page : source_kv.text.page_ids()) {
+        require(std::find(destination_kv.text.page_ids().begin(),
+                          destination_kv.text.page_ids().end(),
+                          source_page) == destination_kv.text.page_ids().end(),
+                "fork shared a physical main KV page");
+    }
+    if (destination_kv.backend) {
+        require(kv_prefix_image(program, *destination_kv.backend, backend_cache->pool(),
+                                backend_pages) == backend_image,
+                "fork changed represented backend KV bytes");
+    }
+    if (program.dflash) {
+        std::vector<std::byte> actual(cyclic.size());
+        program.dflash->local.copy_lane_to_host(1, actual.data(), program.device.stream);
+        program.device.synchronize();
+        require(actual == cyclic, "fork changed the DFlash cyclic local image");
+    }
+    require(source.ledger == source_ledger && source.execution_frontier == source_frontier &&
+                source.rewrite_checkpoint.valid == source_checkpoint.valid &&
+                source.rewrite_checkpoint.frontier == source_checkpoint.frontier &&
+                committed_state(program) == source_state,
+            "fork modified source state or checkpoint ownership");
+    program.abort_lane(1);
+}
+
+std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, int rounds,
+                                           bool terminal = false) {
     const std::array<std::uint32_t, 1> lanes{0};
     const std::array<ninfer::runtime::RoundBudget, 1> budgets{{{16}}};
     const std::array<std::uint8_t, 1> flags{0};
@@ -73,7 +194,9 @@ std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, 
         const std::array<std::uint32_t, 1> accepted{
             static_cast<std::uint32_t>(round.row_counts[0])};
         tokens.insert(tokens.end(), round.tokens.begin(), round.tokens.begin() + accepted[0]);
-        program.resolve_pending_batch(lanes, accepted, flags, flags);
+        const std::array<std::uint8_t, 1> final_flags{
+            static_cast<std::uint8_t>(terminal && i + 1 == rounds)};
+        program.resolve_pending_batch(lanes, accepted, final_flags, flags);
     }
     return tokens;
 }
@@ -172,12 +295,70 @@ void require_empty_lane(const execution::ProgramImplCore& program, const char* w
             std::string(when) + " copy still returned a prompt");
 }
 
-void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
+void exercise_full_original_preservation(execution::ProgramImplCore& program,
+                                         family::Frontend& frontend, ninfer::PromptInput input,
+                                         ninfer::runtime::ResolvedExecutionOptions options) {
+    program.abort_lane(0);
+    input.options.preserve_thinking = false;
+    auto prompt                     = family::PreparedPromptAccess::take(frontend.prepare(input));
+    auto base                       = program.plan_request_base(prompt, options);
+    auto plan                       = program.plan_request_for_lane(0, prompt, base);
+    (void)finish_prefill(program, std::move(prompt), std::move(plan));
+    (void)decode_rounds(program, 2, true);
+    require(program.retain_reusable_lane(0), "closed original could not be retained");
+    program.mark_turn_closed(0);
+    exercise_exact_fork(program, frontend, options, false);
+    exercise_exact_fork(program, frontend, options, true);
+    const auto& source    = program.sequences[0];
+    const auto ledger     = source.ledger;
+    const auto frontier   = source.execution_frontier;
+    const auto checkpoint = source.rewrite_checkpoint;
+    const auto state      = committed_state(program);
+    require(checkpoint.valid && checkpoint.frontier < frontier &&
+                source.closure_frontier == checkpoint.frontier && source.turn_closed,
+            "closed original fixture would not use rewrite-cut capture");
+    std::uint64_t cut_id = 0;
+    require(program.capture_retained_lane(0, &cut_id) && cut_id != 0,
+            "normal closed original did not capture");
+    std::uint64_t full_id = 0;
+    bool deferred         = false;
+    require(program.preserve_retained_lane(0, full_id, true, deferred) && full_id != 0 && !deferred,
+            "full original preservation did not capture");
+    program.wait_kv_ram_copies();
+    auto branch         = family::PreparedPromptAccess::take(frontend.prepare_tokens(ledger));
+    options.cache_write = false;
+    auto fork_base      = program.plan_request_base(branch, options);
+    auto fork_plan      = program.plan_ram_reuse(branch, fork_base);
+    require(fork_plan.summary().ram_entry_id == full_id && fork_plan.impl_->reuse_base == frontier,
+            "full preservation was shortened to the normal closed-turn cut");
+    program.claim_ram_entry(full_id);
+    program.restore_ram_entry(1, full_id, fork_plan);
+    program.wait_kv_ram_copies();
+    program.wait_kv_ram_copies_on_compute();
+    program.device.synchronize_all();
+    require(program.sequences[1].ledger == ledger &&
+                program.sequences[1].execution_frontier == frontier &&
+                !program.sequences[1].rewrite_checkpoint.valid &&
+                committed_state(program, 1) == state,
+            "full original preservation lost current state or its existing checkpoint");
+    require(program.kv_ram_cache_.has_value(), "full original has no RAM cache");
+    const auto saved_host = program.kv_ram_cache_.value().load_host(full_id);
+    require(saved_host.rewrite_valid && saved_host.rewrite_frontier == checkpoint.frontier,
+            "full original image lost its rewrite checkpoint");
+    program.finish_ram_restore(full_id, ninfer::runtime::CacheReadIntent::Fork);
+    auto still_saved = program.plan_ram_reuse(branch, fork_base);
+    require(still_saved.summary().ram_entry_id == full_id, "fork consumed the full original image");
+    program.abort_lane(1);
+    program.discard_ram_capture(cut_id);
+    program.discard_ram_capture(full_id);
+}
+
+void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool forks_only) {
     ninfer::DeviceContext device;
     ninfer::EngineOptions options;
     options.artifact_path         = artifact;
     options.max_context           = 4096;
-    options.max_concurrency       = 1;
+    options.max_concurrency       = 2;
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk         = 1024;
     options.kv_cache              = ninfer::KvCacheStorage::Nvfp4;
@@ -253,6 +434,11 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     require(program.requests[0].lifecycle == execution::Lifecycle::Complete &&
                 program.sequences[0].retained && program.sequences[0].kv.has_value(),
             "retain dropped the resident bundle");
+    exercise_exact_fork(program, frontend, execution, false);
+    if (forks_only) {
+        exercise_full_original_preservation(program, frontend, input, execution);
+        return;
+    }
     std::vector<ninfer::TokenId> copied;
     std::uint32_t copied_frontier = 0;
     require(program.copy_reusable_prompt(0, prompt_tokens, copied, copied_frontier),
@@ -350,15 +536,18 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
             "prefill after restore recomputed the restored prefix");
     require(prefix_equals(program.sequences[0].ledger, spliced_ids),
             "prefill after restore lost the spliced prompt");
-    program.consume_ram_entry(entry_id);
+    program.finish_ram_restore(entry_id, ninfer::runtime::CacheReadIntent::Consume);
     std::cout << "restored hit reused=" << restored.summary.reused_prompt_tokens
               << " suffix=" << restored.processed << '\n';
     exercise_decoded_retries(program, frontend, input, execution);
+    exercise_full_original_preservation(program, frontend, input, execution);
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool forks_only = argc == 2 && std::string(argv[1]) == "--fork-state";
+    if (argc != 1 && !forks_only) { return 1; }
     const char* nvfp4                  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* group                  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* dflash                 = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
@@ -382,7 +571,7 @@ int main() {
         return 77;
     }
     try {
-        exercise(artifact, backend);
+        exercise(artifact, backend, forks_only);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

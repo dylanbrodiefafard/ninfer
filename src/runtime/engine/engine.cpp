@@ -27,6 +27,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens    = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse         = options.execution.allow_prefix_reuse;
+    resolved.execution.cache_write                = options.execution.cache_write;
     resolved.execution.capture_context_checkpoint = options.execution.capture_context_checkpoint;
     if (options.output.top_logprobs && *options.output.top_logprobs > kMaximumTopLogprobs) {
         throw std::invalid_argument("top_logprobs exceeds kMaximumTopLogprobs");
@@ -315,6 +316,12 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
     const double prepare_seconds = prompt.impl_->prepare_seconds;
+    if (!resolved_options.execution.cache_write &&
+        resolved_options.execution.capture_context_checkpoint) {
+        throw RequestError(RequestErrorKind::CacheWriteConflict,
+                           "capture_context_checkpoint=true requires cache_write=true because it "
+                           "creates a retained context checkpoint.");
+    }
     if (resolved_options.execution.capture_context_checkpoint &&
         !context_checkpoint_capture_available(resolved_options.execution.allow_prefix_reuse,
                                               impl_->options.speculative.backend)) {

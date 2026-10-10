@@ -129,6 +129,42 @@ int test_ninfer_capture_object() {
     failures +=
         check(!parse_chat_completion_request(base, default_limits()).capture_context_checkpoint,
               "omitted ninfer does not pin");
+    for (const Json& vendor : {Json::object(), Json{{"capture_context_checkpoint", false}},
+                               Json{{"cache_write", true}}}) {
+        Json unpinned      = base;
+        unpinned["ninfer"] = vendor;
+        const auto parsed  = parse_chat_completion_request(unpinned, default_limits());
+        failures += check(
+            !to_request_options(parsed, default_server()).execution.capture_context_checkpoint &&
+                parsed.cache_write,
+            "empty or explicit false vendor options preserve ordinary execution");
+    }
+    failures += check(parse_chat_completion_request(base, default_limits()).cache_write,
+                      "omitted cache_write preserves ordinary caching");
+    for (bool stream : {false, true}) {
+        Json disposable      = base;
+        disposable["stream"] = stream;
+        disposable["ninfer"] = Json{{"cache_write", false}};
+        const auto parsed    = parse_chat_completion_request(disposable, default_limits());
+        failures += check(!parsed.cache_write &&
+                              !to_request_options(parsed, default_server()).execution.cache_write,
+                          "disposable option reaches Engine for both response modes");
+        disposable["ninfer"]["capture_context_checkpoint"] = true;
+        try {
+            (void)parse_chat_completion_request(disposable, default_limits());
+            failures += fail("disposable capture conflict accepted");
+        } catch (const ApiException& error) {
+            failures += check(
+                error.error().status == 400 && error.error().code == "cache_write_conflict" &&
+                    error.error().param == "ninfer.capture_context_checkpoint" &&
+                    error.error().message.find("requires cache_write=true") != std::string::npos,
+                "disposable capture conflict diagnostic");
+        }
+        disposable["ninfer"] = Json{{"cache_write", 0}};
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(disposable, default_limits()); }),
+            "non-boolean cache_write rejected");
+    }
     Json pin                       = base;
     pin["ninfer"]                  = Json{{"capture_context_checkpoint", true}};
     const GenerationRequest pinned = parse_chat_completion_request(pin, default_limits());
