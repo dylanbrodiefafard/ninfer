@@ -600,6 +600,10 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_nvfp4_kernel(
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
+    // A partially valid CTA owns its invalid tail as well as the valid rows.
+    // Split CTAs return above; their merge writes every invalid output row.
+    gqa_prefill_zero_output_rows<Geometry>(out, q_head, max(q0, tokens), min(q0 + Br, width), tid,
+                                           Tile::Threads);
 }
 
 // Stable combine of the context-split partials: one CTA per (token, q head), one thread per
