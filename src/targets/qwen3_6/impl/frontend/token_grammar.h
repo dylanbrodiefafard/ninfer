@@ -70,6 +70,8 @@ private:
     std::shared_ptr<const Tokenizer> tokenizer_;
     std::mutex mutex_;
     std::optional<xgrammar::GrammarCompiler> compiler_;
+    // Completed-call validation consumes UTF-8 bytes and needs no vocabulary token masks.
+    std::optional<xgrammar::GrammarCompiler> arguments_compiler_;
 };
 
 } // namespace frontend_internal

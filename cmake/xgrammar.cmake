@@ -14,12 +14,16 @@ endif()
 # NInfer's global compiler flags. This is the complete upstream C++ library lane.
 set(grammar_root "${ninfer_xgrammar_source_SOURCE_DIR}")
 # Keep downloaded source immutable. Build-copy patches provide exact unordered
-# named properties, Unicode-scalar matching, JSON constraints, and canonical key exclusion.
+# named properties, shared tokenizer-mask rules, Unicode-scalar matching, JSON constraints,
+# and canonical key exclusion.
 # Generation and completed-call validation use the same object constraints.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_LIST_DIR}/xgrammar-qwen-framing.patch"
   "${CMAKE_CURRENT_LIST_DIR}/xgrammar-object-order.patch"
-  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-json-constraints.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-shared-rules.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-json-constraints.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-direct-schema.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-tokenizer.patch")
 set(grammar_patch_dir "${CMAKE_CURRENT_BINARY_DIR}/ninfer_xgrammar_format")
 file(MAKE_DIRECTORY "${grammar_patch_dir}")
 file(COPY "${grammar_root}/cpp/" DESTINATION "${grammar_patch_dir}")
@@ -43,11 +47,32 @@ if(NOT grammar_patch_result EQUAL 0)
   message(FATAL_ERROR "Object grammar order patch failed: ${grammar_patch_error}")
 endif()
 execute_process(COMMAND "${NINFER_PATCH_EXECUTABLE}" --batch --fuzz=0 -p1 -i
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-shared-rules.patch"
+  WORKING_DIRECTORY "${grammar_patch_dir}" RESULT_VARIABLE grammar_patch_result
+  ERROR_VARIABLE grammar_patch_error)
+if(NOT grammar_patch_result EQUAL 0)
+  message(FATAL_ERROR "Shared grammar rule patch failed: ${grammar_patch_error}")
+endif()
+execute_process(COMMAND "${NINFER_PATCH_EXECUTABLE}" --batch --fuzz=0 -p1 -i
   "${CMAKE_CURRENT_LIST_DIR}/xgrammar-json-constraints.patch"
   WORKING_DIRECTORY "${grammar_patch_dir}" RESULT_VARIABLE grammar_patch_result
   ERROR_VARIABLE grammar_patch_error)
 if(NOT grammar_patch_result EQUAL 0)
   message(FATAL_ERROR "JSON constraint grammar patch failed: ${grammar_patch_error}")
+endif()
+execute_process(COMMAND "${NINFER_PATCH_EXECUTABLE}" --batch --fuzz=0 -p1 -i
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-direct-schema.patch"
+  WORKING_DIRECTORY "${grammar_patch_dir}" RESULT_VARIABLE grammar_patch_result
+  ERROR_VARIABLE grammar_patch_error)
+if(NOT grammar_patch_result EQUAL 0)
+  message(FATAL_ERROR "Direct schema grammar patch failed: ${grammar_patch_error}")
+endif()
+execute_process(COMMAND "${NINFER_PATCH_EXECUTABLE}" --batch --fuzz=0 -p1 -i
+  "${CMAKE_CURRENT_LIST_DIR}/xgrammar-tokenizer.patch"
+  WORKING_DIRECTORY "${grammar_patch_dir}" RESULT_VARIABLE grammar_patch_result
+  ERROR_VARIABLE grammar_patch_error)
+if(NOT grammar_patch_result EQUAL 0)
+  message(FATAL_ERROR "Tokenizer prefix metadata patch failed: ${grammar_patch_error}")
 endif()
 add_library(ninfer_token_grammar STATIC
   ${grammar_patch_dir}/compiled_grammar.cc

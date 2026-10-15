@@ -4,6 +4,7 @@
 #include <iostream>
 #include <memory>
 #include <fstream>
+#include <future>
 #include <chrono>
 #include <algorithm>
 #include <array>
@@ -245,6 +246,81 @@ int real_tokenizer_probe(const char* directory, const char* fixture_path) {
     return failures ? 1 : 0;
 }
 
+int reference_alternation_oracle() {
+    struct Language {
+        std::string grammar;
+        std::set<std::string> words;
+    };
+
+    const std::string terminals = "a ::= \"a\"\nb ::= \"b\"\nc ::= \"c\"\n";
+    std::vector<Language> languages{
+        {"root ::= a | a b | a c\n" + terminals, {"a", "ab", "ac"}},
+        {"root ::= a b | a b c\n" + terminals, {"ab", "abc"}},
+        {"root ::= \"\" | a a | a b | a a\n" + terminals, {"", "aa", "ab"}},
+        {"root ::= a b | b a\na ::= \"\" | \"a\"\nb ::= \"\" | \"b\"\n",
+         {"", "a", "b", "ab", "ba"}},
+        {"root ::= \"\"\n", {""}},
+        {"root ::= a b | b a | a a\na ::= \"\" | \"a\" a\nb ::= \"b\"\n", {}}};
+    // The recursive language is a*, a*b, or ba*. Nine a's cover every
+    // enumerated prefix, every vocabulary token, and its shortest completion.
+    for (int count = 0; count <= 9; ++count) {
+        const std::string word(static_cast<std::size_t>(count), 'a');
+        languages.back().words.insert(word);
+        languages.back().words.insert(word + "b");
+        languages.back().words.insert("b" + word);
+    }
+    const std::vector<std::string> vocab{"a", "b", "c", "ab", "ba", "bc", "abc", "<eos>"};
+    xgrammar::GrammarCompiler compiler(
+        xgrammar::TokenizerInfo(vocab, xgrammar::VocabType::RAW, 8, std::vector<std::int32_t>{7}),
+        1, false);
+    int failures = 0;
+    for (const auto& language : languages) {
+        const auto grammar      = compiler.CompileGrammar(language.grammar);
+        const auto can_complete = [&](const std::string& prefix) {
+            const auto found = language.words.lower_bound(prefix);
+            return found != language.words.end() && found->starts_with(prefix);
+        };
+        // Enumerate all a/b/c words up to length five independently of the
+        // grammar. Token spellings span several referenced rules at once.
+        for (int length = 0, combinations = 1; length <= 5; ++length, combinations *= 3) {
+            for (int code = 0; code < combinations; ++code) {
+                int digits = code;
+                std::string word;
+                for (int i = 0; i < length; ++i, digits /= 3) { word.push_back("abc"[digits % 3]); }
+                xgrammar::GrammarMatcher matcher(grammar);
+                const bool prefix   = matcher.AcceptString(word);
+                const bool complete = language.words.contains(word);
+                if ((prefix && matcher.IsCompleted()) != complete || prefix != can_complete(word)) {
+                    std::cerr << "reference-alternative language mismatch: " << word << '\n';
+                    ++failures;
+                }
+                if (!prefix) { continue; }
+                std::uint32_t bits = 0;
+                std::int64_t shape = 1;
+                DLTensor mask{.data        = &bits,
+                              .device      = {kDLCPU, 0},
+                              .ndim        = 1,
+                              .dtype       = {kDLInt, 32, 1},
+                              .shape       = &shape,
+                              .strides     = nullptr,
+                              .byte_offset = 0};
+                (void)matcher.FillNextTokenBitmask(&mask);
+                for (int token = 0; token < 8; ++token) {
+                    const bool expected = token == 7 ? complete : can_complete(word + vocab[token]);
+                    auto branch         = matcher.Fork();
+                    if (((bits & (1u << token)) != 0) != expected ||
+                        branch.AcceptToken(token) != expected) {
+                        std::cerr << "reference-alternative token mismatch: " << word
+                                  << " token=" << token << '\n';
+                        ++failures;
+                    }
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int main(int argc, char** argv) {
     if (argc == 3) { return real_tokenizer_probe(argv[1], argv[2]); }
     if (argc != 1) { return 2; }
@@ -297,7 +373,7 @@ int main(int argc, char** argv) {
     fi::TokenGrammarCompiler compiler(tokenizer);
     const std::vector<std::string> tools{
         R"({"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":["filePath","limit"],"additionalProperties":false}}})"};
-    int failures = 0;
+    int failures = reference_alternation_oracle();
     auto check   = [&](bool condition, const char* label) {
         if (!condition) {
             ++failures;
@@ -311,6 +387,82 @@ int main(int argc, char** argv) {
                                          .dump()},
             false);
     };
+    {
+        fi::TokenGrammarCompiler shared_compiler(tokenizer);
+        auto alternate                = Json::parse(tools.front());
+        alternate["function"]["name"] = "alternate";
+        const std::vector<std::string> alternate_tools{alternate.dump()};
+        auto first =
+            std::async(std::launch::async, [&] { return shared_compiler.compile(tools, false); });
+        auto second = std::async(std::launch::async,
+                                 [&] { return shared_compiler.compile(alternate_tools, true); });
+        const auto first_grammar  = first.get();
+        const auto second_grammar = second.get();
+        const auto first_call     = envelope("read", {{"filePath", "notes"}, {"limit", "2"}});
+        const auto second_call    = envelope("alternate", {{"limit", "3"}, {"filePath", "other"}});
+        xgrammar::GrammarMatcher first_matcher(first_grammar->compiled);
+        xgrammar::GrammarMatcher second_matcher(second_grammar->compiled);
+        check(first_matcher.AcceptString(first_call) && first_matcher.AcceptToken(7) &&
+                  first_grammar->decode_call(first_call).has_value(),
+              "concurrent cold compilation lost the first request's tool validators");
+        check(second_matcher.AcceptString("Reasoning.</think>\n" + second_call) &&
+                  second_matcher.AcceptToken(7) &&
+                  second_grammar->decode_call(second_call).has_value(),
+              "concurrent cold compilation mixed request grammars or validators");
+        check(!first_grammar->decode_call(second_call) && !second_grammar->decode_call(first_call),
+              "concurrent compilation published another request's tool");
+    }
+    {
+        // Local definition names and reference IDs must remain isolated when
+        // independently built tool schemas are assembled and cached together.
+        auto left                 = Json::parse(R"({
+            "type":"function","function":{"name":"left","parameters":{
+                "type":"object",
+                "$defs":{"node":{
+                    "type":"object","properties":{"value":{"const":1}},
+                    "required":["value"],"additionalProperties":false
+                }},
+                "properties":{"payload":{"$ref":"#/$defs/node"}},
+                "required":["payload"],"additionalProperties":false
+            }}
+        })");
+        auto right                = left;
+        right["function"]["name"] = "right";
+        right["function"]["parameters"]["$defs"]["node"]["properties"]["value"]["const"] = 2;
+        const std::vector<std::string> original_tools{left.dump(), right.dump()};
+        const auto original       = compiler.compile(original_tools, false);
+        const auto check_isolated = [&](const auto& grammar, bool reasoning,
+                                        const std::string& name, int value, bool expected) {
+            const auto call = envelope(name, {{"payload", Json{{"value", value}}.dump()}});
+            xgrammar::GrammarMatcher matcher(grammar->compiled);
+            const auto text = reasoning ? "Reasoning.</think>\n" + call : call;
+            check((matcher.AcceptString(text) && matcher.AcceptToken(7)) == expected,
+                  "assembled tool grammar mixed local definition constraints");
+            check(grammar->decode_call(call).has_value() == expected,
+                  "cached tool validator mixed local definition constraints");
+        };
+        left["function"]["parameters"]["$defs"]["node"]["properties"]["value"]["const"] = 3;
+        const auto updated =
+            compiler.compile(std::vector<std::string>{left.dump(), right.dump()}, false);
+        const auto cached_original = compiler.compile(original_tools, false);
+        for (const auto& grammar : {original, cached_original}) {
+            check_isolated(grammar, false, "left", 1, true);
+            check_isolated(grammar, false, "left", 2, false);
+            check_isolated(grammar, false, "left", 3, false);
+            check_isolated(grammar, false, "right", 2, true);
+            check_isolated(grammar, false, "right", 1, false);
+        }
+        check_isolated(updated, false, "left", 3, true);
+        check_isolated(updated, false, "left", 1, false);
+        check_isolated(updated, false, "right", 2, true);
+        check_isolated(updated, false, "right", 3, false);
+        const auto reversed =
+            compiler.compile(std::vector<std::string>{right.dump(), left.dump()}, true);
+        check_isolated(reversed, true, "left", 3, true);
+        check_isolated(reversed, true, "left", 2, false);
+        check_isolated(reversed, true, "right", 2, true);
+        check_isolated(reversed, true, "right", 3, false);
+    }
     // Independent finite-domain oracle: enumerate every key sequence, including
     // omissions, repetitions, unknown keys, all permutations and property bounds.
     // Integer values keep framing unambiguous; raw XML strings are tested below.
@@ -363,6 +515,77 @@ int main(int argc, char** argv) {
         check(grammar->decode_call(text).has_value() == expected,
               "unordered schema decoding mismatch");
     };
+    // The pi subagent schema has thirteen optional properties. Its unordered
+    // grammar must share vocabulary preprocessing across the property subsets.
+    Json subagent_properties = Json::object();
+    const std::array<const char*, 13> subagent_keys{
+        "action", "agent",   "args",   "async", "cwd",      "id",      "message",
+        "model",  "options", "output", "task",  "workflow", "worktree"};
+    for (const char* key : subagent_keys) { subagent_properties[key] = Json{{"type", "string"}}; }
+    subagent_properties["async"] = Json{{"type", "boolean"}};
+    subagent_properties["output"] =
+        Json{{"anyOf", {Json{{"type", "string"}}, Json{{"type", "boolean"}}}}};
+    subagent_properties["args"] = Json{{"type", "object"}, {"additionalProperties", true}};
+    const Json subagent_schema{
+        {"type", "object"}, {"properties", subagent_properties}, {"additionalProperties", false}};
+    auto subagent_grammar      = schema_grammar(subagent_schema);
+    std::size_t compiled_bytes = subagent_grammar->compiled.MemorySizeBytes();
+    for (const auto& definition : subagent_grammar->definitions) {
+        compiled_bytes += definition.arguments_validator->MemorySizeBytes();
+    }
+    check(compiled_bytes < 64 * 1024 * 1024,
+          "thirteen optional tool properties exceeded the compiled grammar memory budget");
+    const auto check_subagent = [&](const std::vector<std::pair<std::string, std::string>>& args,
+                                    bool expected) {
+        const auto text = envelope("check", args);
+        xgrammar::GrammarMatcher matcher(subagent_grammar->compiled);
+        check((matcher.AcceptString(text) && matcher.AcceptToken(7)) == expected,
+              "large optional-property generation changed its argument constraints");
+        check(subagent_grammar->decode_call(text).has_value() == expected,
+              "large optional-property validation changed its argument constraints");
+    };
+    check_subagent({}, true);
+    check_subagent({{"workflow", "review"}, {"agent", "worker"}, {"task", "inspect"}}, true);
+    check_subagent({{"output", "false"},
+                    {"args", R"({"nested":{"value":1}})"},
+                    {"action", "status"},
+                    {"async", "true"}},
+                   true);
+    check_subagent({{"async", "true"}, {"async", "false"}}, false);
+    check_subagent({{"async", "yes"}}, false);
+    check_subagent({{"unknown", "value"}}, false);
+    // Bounded objects can have many declared properties without exponential
+    // state growth. Exercise packed-key boundaries across bytes and 64 bits.
+    Json wide_properties = Json::object();
+    for (int i = 0; i < 70; ++i) { wide_properties["p" + std::to_string(i)] = Json{{"const", 1}}; }
+    Json wide_schema{{"type", "object"},
+                     {"properties", wide_properties},
+                     {"additionalProperties", false},
+                     {"maxProperties", 2}};
+    const auto wide_grammar = schema_grammar(wide_schema);
+    const auto check_wide   = [&](const auto& grammar,
+                                  const std::vector<std::pair<std::string, std::string>>& args,
+                                  bool expected) {
+        const auto text = envelope("check", args);
+        xgrammar::GrammarMatcher matcher(grammar->compiled);
+        check((matcher.AcceptString(text) && matcher.AcceptToken(7)) == expected,
+              "packed subset keys changed bounded-object generation");
+        check(grammar->decode_call(text).has_value() == expected,
+              "packed subset keys changed bounded-object validation");
+    };
+    for (int first : {0, 7, 8, 63, 64, 69}) {
+        for (int second : {0, 7, 8, 63, 64, 69}) {
+            check_wide(wide_grammar,
+                       {{"p" + std::to_string(first), "1"}, {"p" + std::to_string(second), "1"}},
+                       first != second);
+        }
+    }
+    check_wide(wide_grammar, {{"p0", "1"}, {"p64", "1"}, {"p69", "1"}}, false);
+    wide_schema["required"]  = {"p64"};
+    const auto required_wide = schema_grammar(wide_schema);
+    check_wide(required_wide, {{"p69", "1"}, {"p64", "1"}}, true);
+    check_wide(required_wide, {{"p0", "1"}, {"p69", "1"}}, false);
+    check_wide(required_wide, {}, false);
     const Json numeric{{"type", "integer"}, {"minimum", 1}, {"maximum", 2}};
     Json open_schema{{"type", "object"},
                      {"properties", Json{{"a", numeric}, {"ab", numeric}}},
@@ -431,6 +654,25 @@ int main(int argc, char** argv) {
                  false);
     accepts_call(containers,
                  {{"array", R"([{"y":2,"x":1}])"}, {"object", R"({"y":1,"x":2,"y":2})"}}, false);
+    // Recursive argument schemas are assembled into the structural grammar
+    // before normalization, including nested alternatives and forward references.
+    const Json recursive = Json::parse(R"({
+        "type":"object",
+        "$defs":{"node":{
+            "type":"object",
+            "properties":{
+                "value":{"type":"integer","minimum":1,"maximum":2},
+                "next":{"anyOf":[{"type":"null"},{"$ref":"#/$defs/node"}]}
+            },
+            "required":["value","next"],"additionalProperties":false
+        }},
+        "properties":{"node":{"$ref":"#/$defs/node"}},
+        "required":["node"],"additionalProperties":false
+    })");
+    accepts_call(recursive, {{"node", R"({"value":1,"next":null})"}}, true);
+    accepts_call(recursive, {{"node", R"({"next":{"next":null,"value":2},"value":1})"}}, true);
+    accepts_call(recursive, {{"node", R"({"value":1,"next":{"value":2}})"}}, false);
+    accepts_call(recursive, {{"node", R"({"value":1,"next":{"value":false,"next":null}})"}}, false);
     // Upstream's additional JSON key rule admits escaped aliases. They must
     // never become executable calls after canonical decoding, even when the
     // overwritten value alone would satisfy the named property's schema.
@@ -742,6 +984,12 @@ int main(int argc, char** argv) {
             std::cerr << "schema compiler exposed a server error: " << error.what() << '\n';
         }
         check(input_error, "malformed schema compilation did not become a client input error");
+        const auto recovered  = compiler.compile(tools, false);
+        const auto valid_call = envelope("read", {{"limit", "2"}, {"filePath", "notes"}});
+        xgrammar::GrammarMatcher recovered_matcher(recovered->compiled);
+        check(recovered_matcher.AcceptString(valid_call) && recovered_matcher.AcceptToken(7) &&
+                  recovered->decode_call(valid_call).has_value(),
+              "rejected schema left asynchronous compiler caches unusable");
     }
     for (const char* bound : {"minLength", "maxLength"}) {
         auto constrained    = Json::parse(tools[0]);
