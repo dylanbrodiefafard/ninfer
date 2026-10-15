@@ -1,0 +1,534 @@
+--- a/ebnf_script_creator.h
++++ b/ebnf_script_creator.h
+@@ -9,11 +9,12 @@
+ 
+ #include <xgrammar/object.h>
+ 
+-#include <algorithm>
+ #include <string>
+-#include <unordered_set>
++#include <sstream>
+ #include <vector>
+ 
++#include "grammar_builder.h"
++#include "grammar_parser.h"
+ #include "support/encoding.h"
+ #include "support/logging.h"
+ #include "support/utils.h"
+@@ -21,10 +22,9 @@
+ namespace xgrammar {
+ 
+ /*!
+- * \brief A class for creating EBNF grammar scripts.
++ * \brief A builder for schema grammars with EBNF leaf expressions.
+  *
+- * This class helps build EBNF (Extended Backus-Naur Form) grammar scripts
+- * by managing rules and their content.
++ * Builds schema grammars from parsed EBNF leaves and direct rule-reference alternatives.
+  */
+ class EBNFScriptCreator {
+  public:
+@@ -47,14 +47,14 @@
+    * \return The actual name assigned to the rule
+    */
+   std::string AllocateRuleName(const std::string& rule_name_hint) {
+-    if (rule_names_.find(rule_name_hint) == rule_names_.end()) {
+-      rule_names_.insert(rule_name_hint);
++    if (builder_.GetRuleId(rule_name_hint) == -1) {
++      builder_.AddEmptyRule(rule_name_hint);
+       return rule_name_hint;
+     }
+     for (int i = 0; i < NAME_SUFFIX_MAXIMUM; ++i) {
+       std::string rule_name = rule_name_hint + "_" + std::to_string(i);
+-      if (rule_names_.find(rule_name) == rule_names_.end()) {
+-        rule_names_.insert(rule_name);
++      if (builder_.GetRuleId(rule_name) == -1) {
++        builder_.AddEmptyRule(rule_name);
+         return rule_name;
+       }
+     }
+@@ -69,7 +69,7 @@
+    * \return The actual name assigned to the rule
+    */
+   std::string AddRuleWithAllocatedName(const std::string& rule_name, const std::string& rule_body) {
+-    XGRAMMAR_CHECK(rule_names_.find(rule_name) != rule_names_.end())
++    XGRAMMAR_CHECK(builder_.GetRuleId(rule_name) != -1)
+         << "Rule name " << rule_name << " is not allocated";
+     rules_.emplace_back(rule_name, rule_body);
+     return rule_name;
+@@ -150,36 +150,37 @@
+     return ss.str();
+   }
+ 
+-  /*!
+-   * \brief Gets the complete EBNF grammar script
+-   * \return The full EBNF grammar script as a string
+-   */
+-  std::string GetScript() {
+-    std::string script = "";
+-    for (const auto& rule : rules_) {
+-      script += rule.first + " ::= " + rule.second + "\n";
+-    }
+-    return script;
++  // Reference-only rules bypass text serialization and parsing. Their leaves
++  // still use the common parser, including its Unicode and quantifier semantics.
++  int32_t GetRuleId(const std::string& name) const {
++    const auto id = builder_.GetRuleId(name);
++    XGRAMMAR_CHECK(id != -1) << "Rule name " << name << " is not allocated";
++    return id;
+   }
+ 
+-  /*!
+-   * \brief Retrieves the content/definition of a specific rule
+-   * \param rule_name The name of the rule to look up
+-   * \return The EBNF content/definition of the specified rule
+-   */
+-  std::string GetRuleContent(const std::string& rule_name) {
+-    auto it = std::find_if(rules_.begin(), rules_.end(), [rule_name](const auto& rule) {
+-      return rule.first == rule_name;
+-    });
+-    if (it != rules_.end()) {
+-      return it->second;
++  std::string GetRuleName(int32_t id) const { return builder_.GetRule(id).name; }
++
++  void AddReferenceChoices(int32_t id, const std::vector<std::vector<int32_t>>& alternatives) {
++    std::vector<int32_t> choices;
++    choices.reserve(alternatives.size());
++    for (const auto& alternative : alternatives) {
++      std::vector<int32_t> sequence;
++      sequence.reserve(alternative.size());
++      for (int32_t ref : alternative) { sequence.push_back(builder_.AddRuleRef(ref)); }
++      choices.push_back(builder_.AddSequence(sequence));
+     }
+-    return "";
++    builder_.UpdateRuleBody(id, builder_.AddChoices(choices));
++  }
++
++  Grammar GetGrammar() {
++    std::string leaves;
++    for (const auto& [name, body] : rules_) { leaves += name + " ::= " + body + "\n"; }
++    return ParseEBNF(leaves, "root", std::move(builder_));
+   }
+ 
+  private:
+   std::vector<std::pair<std::string, std::string>> rules_;
+-  std::unordered_set<std::string> rule_names_;
++  GrammarBuilder builder_;
+   const int NAME_SUFFIX_MAXIMUM = 10000;
+ };
+ 
+--- a/grammar_parser.h
++++ b/grammar_parser.h
+@@ -12,6 +12,8 @@
+ #include <any>
+ 
+ namespace xgrammar {
++
++class GrammarBuilder;
+ 
+ class EBNFLexer {
+  public:
+@@ -82,6 +84,12 @@
+  */
+ Grammar ParseEBNF(const std::string& ebnf_string, const std::string& root_rule_name = "root");
+ 
++// Parses leaf expressions into an owning builder whose reference rules and
++// forward declarations are already populated. Existing rule bodies cannot be redefined.
++Grammar ParseEBNF(
++    const std::string& ebnf_string, const std::string& root_rule_name, GrammarBuilder builder
++);
++
+ }  // namespace xgrammar
+ 
+ #endif  // XGRAMMAR_GRAMMAR_PARSER_H_
+--- a/grammar_parser.cc
++++ b/grammar_parser.cc
+@@ -426,9 +426,11 @@
+ 
+ class EBNFParser {
+  public:
++  EBNFParser() = default;
++  explicit EBNFParser(GrammarBuilder builder) : builder_(std::move(builder)) {}
+   /*! \brief The logic of parsing the grammar string. */
+   Grammar Parse(
+-      const std::vector<EBNFLexer::Token>& tokens,
++      std::vector<EBNFLexer::Token> tokens,
+       const std::string& root_rule_name,
+       const int& max_nest_layer = 1000
+   );
+@@ -1171,13 +1173,16 @@
+ 
+ void EBNFParser::InitRuleNames() {
+   int delta_element = 0;
++  std::unordered_set<std::string> declarations;
+   for (auto& token : tokens_) {
+     if (token.type == TokenType::RuleName) {
+       auto name = std::any_cast<std::string>(token.value);
+-      if (builder_.GetRuleId(name) != -1) {
++      const auto id = builder_.GetRuleId(name);
++      if (!declarations.insert(name).second ||
++          (id != -1 && builder_.GetRule(id).body_expr_id != -1)) {
+         ReportParseError("Rule \"" + name + "\" is defined multiple times", delta_element);
+       }
+-      builder_.AddEmptyRule(name);
++      if (id == -1) { builder_.AddEmptyRule(name); }
+     }
+     ++delta_element;
+   }
+@@ -1187,13 +1192,13 @@
+ }
+ 
+ Grammar EBNFParser::Parse(
+-    const std::vector<EBNFLexer::Token>& tokens,
++    std::vector<EBNFLexer::Token> tokens,
+     const std::string& root_rule_name,
+     const int& max_nest_layer
+ ) {
+   max_nest_layer_ = max_nest_layer;
+   nest_layer_guard_ = 0;
+-  tokens_ = tokens;
++  tokens_ = std::move(tokens);
+   current_token_ = tokens_.data();
+   root_rule_name_ = root_rule_name;
+ 
+@@ -1210,6 +1215,15 @@
+   return builder_.Get(root_rule_name);
+ }
+ 
++Grammar ParseEBNF(
++    const std::string& ebnf_string, const std::string& root_rule_name, GrammarBuilder builder
++) {
++  EBNFLexer lexer;
++  auto tokens = lexer.Tokenize(ebnf_string);
++  EBNFParser parser(std::move(builder));
++  return parser.Parse(std::move(tokens), root_rule_name);
++}
++
+ Grammar ParseEBNF(const std::string& ebnf_string, const std::string& root_rule_name) {
+   EBNFLexer lexer;
+   auto tokens = lexer.Tokenize(ebnf_string);
+--- a/json_schema_converter.h
++++ b/json_schema_converter.h
+@@ -261,10 +261,10 @@
+ };
+ 
+ /*!
+- * \brief Convert SchemaSpec to EBNF grammar string.
++ * \brief Convert SchemaSpec to an owning unnormalized grammar.
+  *
+- * This is the base class for EBNF generation. It generates JSON-format EBNF by default.
+- * Subclasses can override virtual methods to generate different formats (e.g., XML).
++ * Generates JSON grammars from parsed EBNF leaves and direct reference-only alternatives.
++ * Subclasses override leaf generation for XML tool-call formats.
+  */
+ class JSONSchemaConverter {
+  public:
+@@ -283,11 +283,11 @@
+   virtual ~JSONSchemaConverter() = default;
+ 
+   /*!
+-   * \brief Convert SchemaSpec to EBNF grammar string.
++   * \brief Convert SchemaSpec to an owning unnormalized grammar.
+    * \param spec The SchemaSpec to convert.
+-   * \return The EBNF grammar string.
++   * \return The owning grammar.
+    */
+-  std::string Convert(const SchemaSpecPtr& spec);
++  Grammar Convert(const SchemaSpecPtr& spec);
+ 
+  protected:
+   // ==================== Virtual methods for generation ====================
+@@ -390,9 +390,8 @@
+       const std::string& additional_prop_pattern_override = ""
+   );
+ 
+-  /*! \brief Generate the object rule in "any order" mode: an "item" alternation over all property
+-   *  keys, repeated between max(min_properties, required.size()) and max_properties times. Only the
+-   *  entry count is bounded, not which keys appear.
++  /*! \brief Generate subset states for unique named properties in arbitrary order. Required keys
++   *  and property-count bounds determine which states may close.
+    */
+   std::string GetAnyOrderRuleForProperties(
+       const std::vector<ObjectSpec::Property>& properties,
+@@ -483,7 +482,7 @@
+ // ==================== Public API functions (backward compatible) ====================
+ 
+ /*!
+- * \brief Convert JSON schema string to EBNF grammar string.
++ * \brief Convert JSON schema to an owning unnormalized grammar.
+  * \param schema The JSON schema string.
+  * \param any_whitespace Whether to ignore the indentation restrictions, and allow any whitespace.
+  * Default: true.
+@@ -505,10 +504,10 @@
+  * format of the object. If it's JSONFormat::kJSON, then it will generate a fully JSON-style
+  * grammar. If it's JSONFormat::kXML, then it will generate a grammar with the root format is
+  * XML-style, while the inner format is JSON-style. Default: JSONFormat::kJSON.
+- * \returns The EBNF grammar string.
+- */
+-
+-std::string JSONSchemaToEBNF(
++ * \returns The owning grammar.
++ */
++
++Grammar JSONSchemaToGrammar(
+     const std::string& schema,
+     bool any_whitespace = true,
+     std::optional<int> indent = std::nullopt,
+@@ -520,7 +519,7 @@
+ );
+ 
+ /*!
+- * \brief Convert JSON schema string to EBNF grammar string.
++ * \brief Convert JSON schema to an owning unnormalized grammar.
+  * \param schema The JSON schema object.
+  * \param any_whitespace Whether to ignore the indentation restrictions, and allow any whitespace.
+  * Default: true.
+@@ -542,8 +541,46 @@
+  * then it will generate a fully JSON-style grammar. If it's JSONFormat::kXML, then it will
+  * generate a grammar with the root format is XML-style, while the inner format is JSON-style.
+  * Default: JSONFormat::kJSON.
+- * \returns The EBNF grammar string.
+- */
++ * \returns The owning grammar.
++ */
++Grammar JSONSchemaToGrammar(
++    const picojson::value& schema,
++    bool any_whitespace = true,
++    std::optional<int> indent = std::nullopt,
++    std::optional<std::pair<std::string, std::string>> separators = std::nullopt,
++    bool strict_mode = true,
++    std::optional<int> max_whitespace_cnt = std::nullopt,
++    JSONFormat json_format = JSONFormat::kJSON,
++    bool any_order = false
++);
++
++/*!
++ * \brief Generate regex pattern for integer/float range.
++ * \param start The start of the range (inclusive). If null assume negative infinity.
++ * \param end The end of the range (inclusive). If null assume infinity.
++ * \returns The regex pattern that matches integers/floats in the given range.
++ */
++std::string GenerateRangeRegex(std::optional<int64_t> start, std::optional<int64_t> end);
++
++std::string GenerateFloatRangeRegex(
++    std::optional<double> start,
++    std::optional<double> end,
++    bool exclusive_start = false,
++    bool exclusive_end = false
++);
++
++// Diagnostic text is normalized before rendering, as at public grammar construction boundaries.
++std::string JSONSchemaToEBNF(
++    const std::string& schema,
++    bool any_whitespace = true,
++    std::optional<int> indent = std::nullopt,
++    std::optional<std::pair<std::string, std::string>> separators = std::nullopt,
++    bool strict_mode = true,
++    std::optional<int> max_whitespace_cnt = std::nullopt,
++    JSONFormat json_format = JSONFormat::kJSON,
++    bool any_order = false
++);
++
+ std::string JSONSchemaToEBNF(
+     const picojson::value& schema,
+     bool any_whitespace = true,
+@@ -555,21 +592,6 @@
+     bool any_order = false
+ );
+ 
+-/*!
+- * \brief Generate regex pattern for integer/float range.
+- * \param start The start of the range (inclusive). If null assume negative infinity.
+- * \param end The end of the range (inclusive). If null assume infinity.
+- * \returns The regex pattern that matches integers/floats in the given range.
+- */
+-std::string GenerateRangeRegex(std::optional<int64_t> start, std::optional<int64_t> end);
+-
+-std::string GenerateFloatRangeRegex(
+-    std::optional<double> start,
+-    std::optional<double> end,
+-    bool exclusive_start = false,
+-    bool exclusive_end = false
+-);
+-
+ }  // namespace xgrammar
+ 
+ #endif  // XGRAMMAR_JSON_SCHEMA_CONVERTER_H_
+--- a/json_schema_converter.cc
++++ b/json_schema_converter.cc
+@@ -4,6 +4,7 @@
+  * \brief Implementation of JSONSchemaConverter and related utilities.
+  */
+ #include "json_schema_converter.h"
++#include "grammar_functor.h"
+ 
+ #include <picojson.h>
+ 
+@@ -1761,7 +1762,7 @@
+   }
+ }
+ 
+-std::string JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
++Grammar JSONSchemaConverter::Convert(const SchemaSpecPtr& spec) {
+   AddBasicRules();
+ 
+   // Register the root rule for circular reference handling
+@@ -1783,7 +1784,7 @@
+     ebnf_script_creator_.AddRuleWithAllocatedName(root_rule_name, root_body);
+   }
+ 
+-  return ebnf_script_creator_.GetScript();
++  return ebnf_script_creator_.GetGrammar();
+ }
+ 
+ void JSONSchemaConverter::AddBasicRules() {
+@@ -4071,7 +4072,7 @@
+   return it->second;
+ }
+ 
+-std::string JSONSchemaToEBNF(
++Grammar JSONSchemaToGrammar(
+     const std::string& schema,
+     bool any_whitespace,
+     std::optional<int> indent,
+@@ -4085,7 +4086,7 @@
+   std::string err = picojson::parse(schema_value, schema);
+   XGRAMMAR_CHECK(err.empty()) << "Failed to parse JSON: " << err
+                               << ". The JSON string is:" << schema;
+-  return JSONSchemaToEBNF(
++  return JSONSchemaToGrammar(
+       schema_value,
+       any_whitespace,
+       indent,
+@@ -4097,7 +4098,7 @@
+   );
+ }
+ 
+-std::string JSONSchemaToEBNF(
++Grammar JSONSchemaToGrammar(
+     const picojson::value& schema,
+     bool any_whitespace,
+     std::optional<int> indent,
+@@ -4152,6 +4153,36 @@
+   XGRAMMAR_UNREACHABLE();
+ }
+ 
++std::string JSONSchemaToEBNF(
++    const std::string& schema,
++    bool any_whitespace,
++    std::optional<int> indent,
++    std::optional<std::pair<std::string, std::string>> separators,
++    bool strict_mode,
++    std::optional<int> max_whitespace_cnt,
++    JSONFormat json_format,
++    bool any_order
++) {
++  return GrammarNormalizer().Apply(JSONSchemaToGrammar(
++      schema, any_whitespace, indent, separators, strict_mode,
++      max_whitespace_cnt, json_format, any_order)).ToString();
++}
++
++std::string JSONSchemaToEBNF(
++    const picojson::value& schema,
++    bool any_whitespace,
++    std::optional<int> indent,
++    std::optional<std::pair<std::string, std::string>> separators,
++    bool strict_mode,
++    std::optional<int> max_whitespace_cnt,
++    JSONFormat json_format,
++    bool any_order
++) {
++  return GrammarNormalizer().Apply(JSONSchemaToGrammar(
++      schema, any_whitespace, indent, separators, strict_mode,
++      max_whitespace_cnt, json_format, any_order)).ToString();
++}
++
+ // Wrapper functions for testing
+ std::string GenerateRangeRegex(std::optional<int64_t> start, std::optional<int64_t> end) {
+   return JSONSchemaConverter::GenerateRangeRegex(start, end);
+--- a/json_schema_converter_ext.h
++++ b/json_schema_converter_ext.h
+@@ -17,7 +17,7 @@
+ /*!
+  * \brief Converter for XML Tool Calling format (e.g., Qwen style).
+  *
+- * This converter generates EBNF where:
++ * This converter generates grammars where:
+  * - The outermost object uses XML format: <parameter=name>value</parameter>
+  * - Inner values use standard JSON format
+  */
+@@ -33,9 +33,9 @@
+       bool any_order = false
+   );
+ 
+-  /*! \brief Convert SchemaSpec to EBNF with XML format for root object. Note that this function is
++  /*! \brief Convert SchemaSpec to a grammar with XML format for the root object. Note that this function is
+    * not thread-safe.*/
+-  std::string Convert(const SchemaSpecPtr& spec);
++  Grammar Convert(const SchemaSpecPtr& spec);
+ 
+  protected:
+   // Override methods for XML format
+--- a/json_schema_converter_ext.cc
++++ b/json_schema_converter_ext.cc
+@@ -46,14 +46,14 @@
+       nested_object_level_(0),
+       xml_wrapper_(kKeyWrapperMap.at(json_format)) {}
+ 
+-std::string XMLToolCallingConverter::Convert(const SchemaSpecPtr& spec) {
++Grammar XMLToolCallingConverter::Convert(const SchemaSpecPtr& spec) {
+   nested_object_level_ = 0;
+   AddBasicRules();
+   std::string root_rule_name = ebnf_script_creator_.AllocateRuleName("root");
+   std::string root_body = GenerateFromSpec(spec, root_rule_name);
+   ebnf_script_creator_.AddRuleWithAllocatedName(root_rule_name, root_body);
+ 
+-  return ebnf_script_creator_.GetScript();
++  return ebnf_script_creator_.GetGrammar();
+ }
+ 
+ void XMLToolCallingConverter::AddBasicRules() {
+--- a/grammar.cc
++++ b/grammar.cc
+@@ -51,7 +51,7 @@
+     bool print_converted_ebnf,
+     bool any_order
+ ) {
+-  auto ebnf_string = JSONSchemaToEBNF(
++  auto grammar = JSONSchemaToGrammar(
+       schema,
+       any_whitespace,
+       indent,
+@@ -61,10 +61,11 @@
+       JSONFormat::kJSON,
+       any_order
+   );
++  grammar = GrammarNormalizer().Apply(grammar);
+   if (print_converted_ebnf) {
+-    XGRAMMAR_LOG(INFO) << "Converted EBNF: " << ebnf_string << std::endl;
++    XGRAMMAR_LOG(INFO) << "Converted EBNF: " << grammar.ToString() << std::endl;
+   }
+-  return FromEBNF(ebnf_string);
++  return grammar;
+ }
+ 
+ Grammar Grammar::FromRegex(const std::string& regex, bool print_converted_ebnf) {
+--- a/structural_tag.cc
++++ b/structural_tag.cc
+@@ -1855,7 +1855,7 @@
+     return ResultErr<ISTError>("Unsupported parsing type: " + format.style);
+   }
+   // The whitespace cap comes from the JSONSchemaFormat node (per-tag).
+-  std::string ebnf = JSONSchemaToEBNF(
++  auto sub_grammar = JSONSchemaToGrammar(
+       format.json_schema,
+       /*any_whitespace=*/true,
+       /*indent=*/std::nullopt,
+@@ -1865,7 +1865,6 @@
+       /*json_format=*/*json_format,
+       format.any_order
+   );
+-  auto sub_grammar = Grammar::FromEBNF(ebnf);
+   auto added_root_rule_id = SubGrammarAdder().Apply(&grammar_builder_, sub_grammar);
+   return ResultOk(added_root_rule_id);
+ }

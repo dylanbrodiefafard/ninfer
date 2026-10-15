@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <cctype>
 #include <set>
 #include <limits>
@@ -472,6 +473,26 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
         }
     } release_compile_heap;
 
+    std::future<std::vector<TokenGrammarData::Definition>> arguments;
+    if (!definitions.empty()) {
+        if (!arguments_compiler_) {
+            arguments_compiler_.emplace(xgrammar::TokenizerInfo({}, xgrammar::VocabType::RAW, 0), 1,
+                                        true, 32 * 1024 * 1024);
+        }
+        // The byte validators and vocabulary masks have independent compilers.
+        // One joined worker overlaps their cold builds; the outer lock bounds
+        // compilation to one request and protects both caches until it joins.
+        arguments =
+            std::async(std::launch::async, [this, definitions = std::move(definitions)]() mutable {
+                for (auto& definition : definitions) {
+                    definition.arguments_validator = arguments_compiler_->CompileJSONSchema(
+                        definition.parameters.dump(), true, std::nullopt, std::nullopt, false,
+                        std::nullopt, true);
+                }
+                return std::move(definitions);
+            });
+    }
+
     if (!compiler_) {
         std::vector<std::string> vocab(kTokenDomain);
         for (std::size_t id = 0; id < kTokenDomain; ++id) {
@@ -481,7 +502,8 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
         }
         xgrammar::TokenizerInfo info(vocab, xgrammar::VocabType::RAW, kTokenDomain,
                                      tokenizer_->default_stop_token_ids());
-        compiler_.emplace(info, 4, true, 128 * 1024 * 1024);
+        // Cold vocabulary preprocessing uses the target host's sixteen physical cores.
+        compiler_.emplace(info, 16, true, 128 * 1024 * 1024);
     }
     try {
         if (constraint) {
@@ -503,13 +525,8 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
         }
         auto compiled = compiler_->CompileStructuralTag(
             Json{{"type", "structural_tag"}, {"format", format}}.dump());
-        for (auto& definition : definitions) {
-            definition.arguments_validator =
-                compiler_->CompileJSONSchema(definition.parameters.dump(), true, std::nullopt,
-                                             std::nullopt, false, std::nullopt, true);
-        }
         return std::make_shared<const TokenGrammarData>(
-            TokenGrammarData{std::move(definitions), std::move(compiled)});
+            TokenGrammarData{arguments.get(), std::move(compiled)});
     } catch (const std::runtime_error& error) {
         // This pinned compiler reports malformed patterns/references through
         // runtime_error, including its non-public LogFatalError. Translate only

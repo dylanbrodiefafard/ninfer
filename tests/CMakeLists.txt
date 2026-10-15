@@ -158,6 +158,12 @@ ninfer_add_test(ninfer_qwen3_6_recovery_executor_test
 target_include_directories(ninfer_qwen3_6_recovery_executor_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_qwen3_6_schema_grammar_test
+  SOURCES targets/qwen3_6/test_schema_grammar.cpp
+  LIBRARIES ninfer_token_grammar)
+ninfer_add_test(ninfer_qwen3_6_grammar_tokenizer_test
+  SOURCES targets/qwen3_6/test_grammar_tokenizer.cpp
+  LIBRARIES ninfer_token_grammar)
 ninfer_add_test(ninfer_qwen3_6_tool_grammar_test
   SOURCES targets/qwen3_6/test_tool_grammar.cpp
   LIBRARIES ninfer_engine ninfer_token_grammar)

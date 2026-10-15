@@ -523,6 +523,17 @@ Nested JSON additional keys alongside named properties use a canonical printable
 spelling without quotes, backslashes, or escapes, preventing aliases of declared keys.
 Final validation also rejects repeated arbitrary additional keys and never publishes a
 call that fails decoded-value or uniqueness checks.
+Property payloads and separators share compiled rules, so vocabulary preprocessing is not
+replicated for every combination of previously emitted parameters. Reference-only paths are built
+directly with shared prefixes and terminal states. Subset states use compact keys and direct
+rule references; only leaf expressions pass through EBNF parsing. Immutable references to the
+same rule share one expression, and nested schema grammars are normalized once after assembly.
+Tokenizer prefix metadata
+matches byte prefixes, including duplicate and Unicode token spellings. Completed-call validators
+consume UTF-8 bytes and do not build model-vocabulary token masks. Both compilers cache immutable
+grammars in the resident frontend; matching state remains private to each request. Their cold
+builds run concurrently, with one joined worker for byte validators alongside vocabulary-mask
+compilation, so independent preparation does not accumulate on first-request latency.
 These rules apply on ordinary and every speculative target position, with grammar
 state committed only for published tokens. They do not shorten reasoning, force an
 end-of-turn after a call, or change sampling/recovery settings.
