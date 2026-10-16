@@ -20,6 +20,7 @@ endfunction()
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
+  core/device_copy.cu
   core/dtype.cpp
   core/gdn_replay_records.cpp
   core/gdn_history.cpp

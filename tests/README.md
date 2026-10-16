@@ -453,6 +453,18 @@ NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_6_27b_recovery_kv_real_test$'
 ```
 
+`ninfer_qwen3_6_panel_copy_test` checks exact device bytes for integer panels, BF16 width
+panels, fused QKV row splits, and every GDN replay-record plane. It exercises batches 1–6,
+changed addresses and widths, and graph updates in both directions, checking that graph
+capture/upload preserves destination bytes and that copies preserve padding and source bytes.
+Its replay gate fixture includes the 1536-byte row with a 4608-byte destination pitch at B=3.
+
+`ninfer_qwen3_8_27b_dflash_graph_update_real_test` uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` to construct a graph-enabled Engine with concurrency
+six, adaptive draft length seven, and automatic tree width. Startup validates every captured
+profile; three requests with 124-, 125-, and 127-token prompts exercise the short-context profile
+boundary during generation.
+
 `ninfer_qwen3_8_27b_dflash_capacity_real_test` uses the DFlash artifact named by
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` on an otherwise idle RTX 5090. It resolves automatic
 KV capacity at context 260000, concurrency 4, NVFP4 KV, and prefill chunk 4096. It checks that
