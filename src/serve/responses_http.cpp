@@ -217,6 +217,11 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    log_request_prepare(
+        req_id, "openai_responses", request.generation, req.body.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_started)
+            .count());
+    const auto preparation_started = std::chrono::steady_clock::now();
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
@@ -235,14 +240,17 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         emit_openai_error(res, error);
         return;
     }
+    const double synchronous_prepare_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started)
+            .count();
     const bool generation_tools   = request.generation.uses_tools();
     const bool generation_capture = request.generation.capture_context_checkpoint;
     const bool generation_media   = request.generation.media_item_count() != 0;
 
-    const std::string id       = new_response_id();
-    const std::int64_t created = unix_time_now();
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_responses", request.generation, prepared);
+    const std::string id                = new_response_id();
+    const std::int64_t created          = unix_time_now();
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, "openai_responses", request.generation, prepared, synchronous_prepare_seconds);
     log_request_start(log_context);
 
     if (!request.stream) {

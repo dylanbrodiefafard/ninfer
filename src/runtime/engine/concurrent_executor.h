@@ -357,29 +357,39 @@ private:
     }
 
     static void assign_kv_disk_stats(RuntimeStats& out, const auto& disk) noexcept {
-        out.kv_disk_captures       = disk.captures;
-        out.kv_disk_restores       = disk.restores;
-        out.kv_disk_evictions      = disk.evictions;
-        out.kv_disk_drops          = disk.drops;
-        out.kv_disk_drop_reasons   = disk.drop_reasons;
-        out.kv_disk_save_seconds   = disk.save_seconds;
-        out.kv_disk_load_seconds   = disk.load_seconds;
-        out.kv_disk_capacity_bytes = disk.capacity_bytes;
-        out.kv_disk_used_bytes     = disk.used_bytes;
-        out.kv_disk_entry_count    = disk.entry_count;
+        out.kv_disk_captures              = disk.captures;
+        out.kv_disk_restores              = disk.restores;
+        out.kv_disk_evictions             = disk.evictions;
+        out.kv_disk_drops                 = disk.drops;
+        out.kv_disk_drop_reasons          = disk.drop_reasons;
+        out.kv_disk_save_seconds          = disk.save_seconds;
+        out.kv_disk_load_seconds          = disk.load_seconds;
+        out.kv_disk_capacity_bytes        = disk.capacity_bytes;
+        out.kv_disk_used_bytes            = disk.used_bytes;
+        out.kv_disk_entry_count           = disk.entry_count;
+        out.kv_disk_spill_active          = disk.spill_active;
+        out.kv_disk_compaction_active     = disk.compaction_active;
+        out.kv_disk_restore_active        = disk.restore_active;
+        out.kv_disk_pending_jobs          = disk.pending_jobs;
+        out.kv_disk_spill_elapsed_seconds = disk.spill_elapsed_seconds;
     }
 
     static void copy_kv_disk_stats(RuntimeStats& out, const RuntimeStats& in) noexcept {
-        out.kv_disk_captures       = in.kv_disk_captures;
-        out.kv_disk_restores       = in.kv_disk_restores;
-        out.kv_disk_evictions      = in.kv_disk_evictions;
-        out.kv_disk_drops          = in.kv_disk_drops;
-        out.kv_disk_drop_reasons   = in.kv_disk_drop_reasons;
-        out.kv_disk_save_seconds   = in.kv_disk_save_seconds;
-        out.kv_disk_load_seconds   = in.kv_disk_load_seconds;
-        out.kv_disk_capacity_bytes = in.kv_disk_capacity_bytes;
-        out.kv_disk_used_bytes     = in.kv_disk_used_bytes;
-        out.kv_disk_entry_count    = in.kv_disk_entry_count;
+        out.kv_disk_captures              = in.kv_disk_captures;
+        out.kv_disk_restores              = in.kv_disk_restores;
+        out.kv_disk_evictions             = in.kv_disk_evictions;
+        out.kv_disk_drops                 = in.kv_disk_drops;
+        out.kv_disk_drop_reasons          = in.kv_disk_drop_reasons;
+        out.kv_disk_save_seconds          = in.kv_disk_save_seconds;
+        out.kv_disk_load_seconds          = in.kv_disk_load_seconds;
+        out.kv_disk_capacity_bytes        = in.kv_disk_capacity_bytes;
+        out.kv_disk_used_bytes            = in.kv_disk_used_bytes;
+        out.kv_disk_entry_count           = in.kv_disk_entry_count;
+        out.kv_disk_spill_active          = in.kv_disk_spill_active;
+        out.kv_disk_compaction_active     = in.kv_disk_compaction_active;
+        out.kv_disk_restore_active        = in.kv_disk_restore_active;
+        out.kv_disk_pending_jobs          = in.kv_disk_pending_jobs;
+        out.kv_disk_spill_elapsed_seconds = in.kv_disk_spill_elapsed_seconds;
     }
 
     // Keeps the newest disk snapshot seen from either the scheduler's blocking read or an

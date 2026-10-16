@@ -7659,9 +7659,12 @@ int test_spill_crc_runs_without_index_mutex(ninfer::DeviceContext& ctx, ninfer::
             return fail("spill-crc-unlocked raw spill never reached its encode");
         }
         hold.arm();
+        const auto active   = disk.try_snapshot();
+        const bool visible  = active && active->spill_active &&
+                              active->spill_elapsed_seconds > 0.0 && active->captures == 1;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
-        if (!hold.disarm() || !admitted) {
-            failures += fail("admission waited for a raw spill's state encode and CRC");
+        if (!hold.disarm() || !admitted || !visible) {
+            failures += fail("held spill blocked admission or hid its active snapshot");
         }
         disk.test_hold_spill_encode(false);
         if (!wait_pred([&] { return disk.ram_is_durable(ram_id); }, std::chrono::seconds(10))) {
@@ -7689,6 +7692,13 @@ int test_spill_crc_runs_without_index_mutex(ninfer::DeviceContext& ctx, ninfer::
                 std::chrono::seconds(10))) {
             failures += fail("spill held at its page-batch CRC build did not commit");
         }
+    }
+    disk.wait_idle_and_fsync();
+    const auto idle = disk.snapshot();
+    if (idle.spill_active || idle.pending_jobs != 0 || idle.spill_elapsed_seconds != 0.0 ||
+        idle.captures != 3 || idle.save_seconds <= 0.0) {
+        failures +=
+            fail("completed spills retained active work or lost completed lifetime counters");
     }
     alloc.release();
     return failures;

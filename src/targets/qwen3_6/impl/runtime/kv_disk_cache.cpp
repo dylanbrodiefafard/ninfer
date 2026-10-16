@@ -8457,17 +8457,26 @@ std::optional<KvDiskSnapshot> KVDiskCache::try_snapshot() const noexcept {
 
 KvDiskSnapshot KVDiskCache::snapshot_locked() const noexcept {
     return KvDiskSnapshot{
-        .capacity_bytes = config_.capacity_bytes,
-        .used_bytes     = static_cast<std::size_t>(unique_bytes_),
-        .entry_count    = entries_.size(),
-        .captures       = captures_,
-        .restores       = restores_,
-        .evictions      = evictions_,
-        .drops          = drops_,
-        .drop_reasons   = drop_reasons_,
-        .save_seconds   = save_seconds_,
-        .load_seconds   = load_seconds_,
-        .sequence       = ++snapshot_sequence_,
+        .capacity_bytes    = config_.capacity_bytes,
+        .used_bytes        = static_cast<std::size_t>(unique_bytes_),
+        .entry_count       = entries_.size(),
+        .captures          = captures_,
+        .restores          = restores_,
+        .evictions         = evictions_,
+        .drops             = drops_,
+        .drop_reasons      = drop_reasons_,
+        .save_seconds      = save_seconds_,
+        .load_seconds      = load_seconds_,
+        .spill_active      = spill_.has_value() || idle_pinning_ || emergency_preparing_,
+        .compaction_active = compaction_ != nullptr || compaction_publishing_,
+        .restore_active    = restore_target_.has_value(),
+        .pending_jobs =
+            restore_q_.size() + emergency_q_.size() + idle_q_.size() + prefetch_q_.size(),
+        .spill_elapsed_seconds = spill_ ? std::chrono::duration<double>(
+                                              std::chrono::steady_clock::now() - spill_->started)
+                                              .count()
+                                        : 0.0,
+        .sequence              = ++snapshot_sequence_,
     };
 }
 
