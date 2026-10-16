@@ -95,9 +95,20 @@ int main() {
     metrics.attach(options, load, {}, "id \"quoted\"\nline", "13.1", "13.1");
 
     ScrapeInputs inputs;
-    inputs.stats.kv_ram_used_bytes = 4096;
-    const auto snapshot            = metrics.snapshot(inputs);
-    const std::string text         = snapshot.prometheus_text();
+    inputs.stats.kv_ram_used_bytes             = 4096;
+    inputs.stats.kv_disk_spill_active          = true;
+    inputs.stats.kv_disk_compaction_active     = true;
+    inputs.stats.kv_disk_restore_active        = true;
+    inputs.stats.kv_disk_pending_jobs          = 3;
+    inputs.stats.kv_disk_spill_elapsed_seconds = 12.165;
+    const auto snapshot                        = metrics.snapshot(inputs);
+    const std::string text                     = snapshot.prometheus_text();
+    failures += check(contains(text, "ninfer_kv_disk_spill_active 1\n") &&
+                          contains(text, "ninfer_kv_disk_compaction_active 1\n") &&
+                          contains(text, "ninfer_kv_disk_restore_active 1\n") &&
+                          contains(text, "ninfer_kv_disk_pending_jobs 3\n") &&
+                          contains(text, "ninfer_kv_disk_spill_elapsed_seconds 12.165\n"),
+                      "Prometheus snapshot lost active disk work");
 
     failures +=
         check(text.find("# HELP ninfer_engine_info ") != std::string::npos &&
@@ -243,6 +254,12 @@ int main() {
                             "response_store", "start_time_unix_s"}) {
         failures += check(json.contains(key), "metrics json is missing a required key");
     }
+    failures += check(json.at("kv_disk").at("spill_active") == true &&
+                          json.at("kv_disk").at("compaction_active") == true &&
+                          json.at("kv_disk").at("restore_active") == true &&
+                          json.at("kv_disk").at("pending_jobs") == 3 &&
+                          json.at("kv_disk").at("spill_elapsed_seconds") == 12.165,
+                      "JSON metrics snapshot lost active disk work");
     failures += check(json.at("kv_ram").at("used_bytes") == 4096,
                       "kv_ram.used_bytes drifted from the snapshot");
     failures += check(json.at("phases").at("decode").at("count") == 1,

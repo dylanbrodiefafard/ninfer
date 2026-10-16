@@ -55,6 +55,9 @@ private:
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
+    void log_request_prepare(std::uint64_t id, std::string protocol,
+                             const GenerationRequest& request, std::size_t body_bytes,
+                             double parse_seconds);
     void log_request_start(const RequestLogContext& context);
     void log_request_rejected(const RequestRejectionLogContext& context);
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
