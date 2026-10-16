@@ -1445,6 +1445,12 @@ executable[family,B,topology class]
 kernel 参数和 launch shape 触发 `cudaGraphExecUpdate` 不兼容。资源数量因此是 exact `B` 的有限集合，而不是
 `B × context profile` 的完整笛卡尔积。
 
+Captured adaptive panels, proposal packing, fused QKV splits, and GDN replay-record packing
+use one raw device-copy kernel per panel. CUDA Graph updates cannot change multidimensional
+memcpy parameters, including workspace addresses. The kernel copies exact row payload bytes
+with independent pitches; profile changes can update addresses and extents without changing
+copy-node topology or adding a launch per row.
+
 Profile 在 capture 前按 configured context ceiling 截断，只有实际 reachable 的 topology classes 才实例化
 executable。Backend-specific proposal shape 只有在真实改变 CUDA node topology 时才形成每个 exact `B`
 下的 topology class，不生成 ordinary-tail 或额外 `B=1` compatibility graph。

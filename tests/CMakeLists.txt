@@ -92,6 +92,8 @@ ninfer_add_test(ninfer_media_decode_test
   LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
+ninfer_add_test(ninfer_qwen3_6_panel_copy_test SOURCES targets/qwen3_6/test_panel_copy.cpp)
+set_property(TEST ninfer_qwen3_6_panel_copy_test APPEND PROPERTY LABELS sanitizer)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
@@ -284,6 +286,10 @@ ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash_graph_update_real_test
+  SOURCES targets/qwen3_6_27b/test_dflash_graph_update_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_graph_update_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_logprobs_real_test
   SOURCES targets/qwen3_6_27b/test_engine_logprobs_real.cpp
   LIBRARIES ninfer_engine)

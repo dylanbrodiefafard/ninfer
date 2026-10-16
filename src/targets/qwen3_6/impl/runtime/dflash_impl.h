@@ -1,3 +1,4 @@
+#include "core/device_copy.h"
 #include "targets/qwen3_6/impl/runtime/dflash_candidate_stats.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/panel_copy.h"
@@ -67,11 +68,11 @@ const auto& dflash_weights(const Context& state) {
 [[maybe_unused]] void copy_fused_row_range(const Tensor& fused, std::int32_t row0, Tensor& out,
                                            cudaStream_t stream) {
     const std::size_t elem = dtype_size(DType::BF16);
-    CUDA_CHECK(cudaMemcpy2DAsync(
+    copy_device_rows_async(
         out.data, static_cast<std::size_t>(out.ne[0]) * elem,
         static_cast<const std::byte*>(fused.data) + static_cast<std::size_t>(row0) * elem,
         static_cast<std::size_t>(fused.ne[0]) * elem, static_cast<std::size_t>(out.ne[0]) * elem,
-        static_cast<std::size_t>(fused.ne[1]), cudaMemcpyDeviceToDevice, stream));
+        static_cast<std::size_t>(fused.ne[1]), stream);
 }
 
 // [C,K,B] with C fastest. Copies src hops into dst starting at hop0.
@@ -84,11 +85,11 @@ void copy_selector_hops(Tensor& dst, const Tensor& src, std::int32_t hop0, cudaS
     const std::size_t elem = dtype_size(src.dtype);
     auto* dst_bytes        = static_cast<std::byte*>(dst.data) +
                              static_cast<std::size_t>(hop0) * static_cast<std::size_t>(dst.nb[1]);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        dst_bytes, static_cast<std::size_t>(dst.nb[2]), src.data,
-        static_cast<std::size_t>(src.nb[2]),
-        static_cast<std::size_t>(src.ne[0]) * static_cast<std::size_t>(src.ne[1]) * elem,
-        static_cast<std::size_t>(src.ne[2]), cudaMemcpyDeviceToDevice, stream));
+    copy_device_rows_async(dst_bytes, static_cast<std::size_t>(dst.nb[2]), src.data,
+                           static_cast<std::size_t>(src.nb[2]),
+                           static_cast<std::size_t>(src.ne[0]) *
+                               static_cast<std::size_t>(src.ne[1]) * elem,
+                           static_cast<std::size_t>(src.ne[2]), stream);
 }
 
 ops::LinearPolicy dflash_weight_policy(QType qtype) {
@@ -642,18 +643,16 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor slot = valid_first.slice(0, b, 1);
                 ops::set_i32_scalar(slot, first_width, state.execution.device.stream);
             }
-            CUDA_CHECK(cudaMemcpy2DAsync(
+            copy_device_rows_async(
                 ids_first.data, static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
                 ids_full.data, static_cast<std::size_t>(full_width) * sizeof(std::int32_t),
                 static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
-                static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
-                state.execution.device.stream));
-            CUDA_CHECK(cudaMemcpy2DAsync(
+                static_cast<std::size_t>(batch_size), state.execution.device.stream);
+            copy_device_rows_async(
                 pos_first.data, static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
                 pos_full.data, static_cast<std::size_t>(full_width) * sizeof(std::int32_t),
                 static_cast<std::size_t>(first_width) * sizeof(std::int32_t),
-                static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
-                state.execution.device.stream));
+                static_cast<std::size_t>(batch_size), state.execution.device.stream);
             ids           = ids_first;
             positions     = pos_first;
             valid_columns = valid_first;
@@ -688,10 +687,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         const auto* src = static_cast<const std::byte*>(residual_in.data) +
                                           static_cast<std::size_t>(Config::hidden) *
                                               static_cast<std::size_t>(col0) * element_bytes;
-                        CUDA_CHECK(cudaMemcpy2DAsync(
-                            packed.data, row_bytes, src, source_pitch, row_bytes,
-                            static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
-                            state.execution.device.stream));
+                        copy_device_rows_async(packed.data, row_bytes, src, source_pitch, row_bytes,
+                                               static_cast<std::size_t>(batch_size),
+                                               state.execution.device.stream);
                         ops::rmsnorm(packed, weights.final_norm, Config::rms_epsilon, false,
                                      proposal_hidden, state.execution.device.stream);
                         Tensor hidden_batch =
@@ -742,12 +740,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         state.execution.work.alloc(DType::FP32, {kSel, split, batch_size});
                     emit_path(residual, width, split, 1, anchors, 0, 0ull, path_first,
                               &sel_ids_first, &sel_q_first);
-                    CUDA_CHECK(cudaMemcpy2DAsync(
+                    copy_device_rows_async(
                         drafts.data, static_cast<std::size_t>(k) * sizeof(std::int32_t),
                         path_first.data, static_cast<std::size_t>(split) * sizeof(std::int32_t),
                         static_cast<std::size_t>(split) * sizeof(std::int32_t),
-                        static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
-                        state.execution.device.stream));
+                        static_cast<std::size_t>(batch_size), state.execution.device.stream);
                     copy_selector_hops(sel_ids_view, sel_ids_first, 0,
                                        state.execution.device.stream);
                     copy_selector_hops(sel_q_view, sel_q_first, 0, state.execution.device.stream);
@@ -785,13 +782,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                     }
                     emit_path(residual, width, suffix, 1 + split, anchors2, split,
                               0x9E3779B97F4A7C15ull, path_suffix, &sel_ids_suffix, &sel_q_suffix);
-                    CUDA_CHECK(cudaMemcpy2DAsync(
+                    copy_device_rows_async(
                         static_cast<std::int32_t*>(drafts.data) + split,
                         static_cast<std::size_t>(k) * sizeof(std::int32_t), path_suffix.data,
                         static_cast<std::size_t>(suffix) * sizeof(std::int32_t),
                         static_cast<std::size_t>(suffix) * sizeof(std::int32_t),
-                        static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
-                        state.execution.device.stream));
+                        static_cast<std::size_t>(batch_size), state.execution.device.stream);
                     copy_selector_hops(sel_ids_view, sel_ids_suffix, split,
                                        state.execution.device.stream);
                     copy_selector_hops(sel_q_view, sel_q_suffix, split,
@@ -811,10 +807,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
             Tensor proposal_hidden = state.execution.work.alloc(
                 DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
             const auto pack_proposal = [&] {
-                CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch,
-                                             row_bytes, static_cast<std::size_t>(batch_size),
-                                             cudaMemcpyDeviceToDevice,
-                                             state.execution.device.stream));
+                copy_device_rows_async(packed.data, row_bytes, source, source_pitch, row_bytes,
+                                       static_cast<std::size_t>(batch_size),
+                                       state.execution.device.stream);
                 ops::rmsnorm(packed, weights.final_norm, Config::rms_epsilon, false,
                              proposal_hidden, state.execution.device.stream);
             };
