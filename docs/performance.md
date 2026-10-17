@@ -18,6 +18,100 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## NVFP4 decode scheduling and GDN prefetch (2026-10-16)
+
+RTX 5090, CUDA 13.1.115 compiler, `sm_120a` (host Engine runtime reports CUDA 13.3), artifact
+`qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`,
+NVFP4 KV, greedy DFlash k=7 with the optimized draft head. The retained changes use exact
+byte-permutation FP4-to-FP8 sign expansion and N32/eight-row A8 staging for the T=2..8
+MLP Down projection, plus input prefetch in the GDN accepted-history Record chain.
+The Up, row quantizer, and Down remain separate launches. GDN chains issue query loads
+before the state transition; a single active row also loads the initial key before checkpoint
+reconstruction and the next key before the preceding transition. Normalization, FP32
+recurrence, raw publication, and commit/count ordering are unchanged. Batched chains use
+query-only prefetch; adding next-key prefetch lost its direct C=6 comparison.
+
+Paired Engine runs use `ninfer_bench -pg 512,256 --spec dflash --draft-tokens 7
+--lm-head-draft --kv-dtype nvfp4 --warmup 1 -r 5`, with `--concurrency` as below.
+Before is the saved executable from `6c7e2cce`; after applies these kernel changes to the same base.
+Values are mean decode output tokens/s ± repetition standard deviation; C=6 is aggregate.
+C=1 uses five repetitions per executable. C=6 combines two opposite-order pairs, each with
+five repetitions per executable. The individual C=6 gains are 1.19% and 1.99%; variation
+between baseline processes is larger than its within-process noise.
+
+| Active requests | Before | After | Change |
+|---|---:|---:|---:|
+| 1 | 239.94 ± 0.10 | 244.37 ± 0.15 | +1.85% |
+| 6 | 563.63 ± 2.24 | 572.58 ± 0.48 | +1.59% |
+
+Every repetition preserves 77 request-rounds/179 accepted drafts at C=1 and
+604 request-rounds/929 accepted drafts at C=6. All 65,536 packed codec inputs match an
+independent exact device oracle. Public A8 Linear-family tests and the GDN FP64 recurrence
+oracle pass; focused memory, race, and synchronization checks report no errors or hazards. The fast suite passes 128 tests, with two missing-artifact load-plan skips.
+Verifier scores match the saved baseline exactly at all 2,048 corpus positions with C=1
+and all six replicated lanes with C=6 (12,288 scored positions): mean NLL
+2.1694630021, PPL 8.7535821234, zero changed token scores. Replicated lanes demonstrate
+batch consistency rather than additional independent quality samples.
+
+The complete GDN history-Record benchmark uses B=1, T=8, a non-null valid prefix of eight,
+and coherent retained-history lengths 0..3. It seeds checkpoint/history outside timing through
+public Record/Commit calls and measures one public Record call:
+
+```bash
+./build/bench/ninfer_gdn_replay_bench --component history-record --warmup 30 --repeat 200
+```
+
+Two opposite-order comparisons use 30 warmups and 200 samples per point, with a 256 MiB
+L2 eviction before each cold sample. Values below average the two process medians in µs:
+
+| Retained records | Warm before | Warm after | Cold before | Cold after |
+|---|---:|---:|---:|---:|
+| 0 | 12.40 | 10.47 | 18.43 | 16.38 |
+| 1 | 12.45 | 10.51 | 18.43 | 16.38 |
+| 2 | 12.37 | 10.47 | 18.43 | 16.38 |
+| 3 | 12.40 | 10.55 | 20.48 | 16.38 |
+
+SASS confirms that prefetched packed inputs survive across independent state work and convert
+at their consumers. The masked single-row kernel uses 93 registers versus 86 before prefetch,
+with no stack or local-memory allocation. Extra Up/Down pipeline stages, paired scale decoding,
+scale-word caching, value lookahead, and a two-row GDN warp mapping passed their numerical
+checks but failed to improve their public-Op measurements; their production paths were removed.
+
+A cooperative full Up/SwiGLU/row-A8/Down kernel passed the complete logical FP64 oracle
+(relative L2 limit 0.04 and gross-error limit `1e-5 + 0.06 * max_abs(reference)` per
+output column), matched the native A8 output exactly, and reduced a streaming composed
+MLP microbenchmark to 102.40 µs. It measured 242.28 ± 0.08 tokens/s against the enhanced
+native schedule's 243.06 ± 0.27 in its Engine comparison, so it was removed. Exact row-A8
+normalization still requires producer-wide maximum publication and encoded-input readiness;
+those synchronization costs erased its saved intermediate traffic and quantizer launch.
+The tested fusion variants did not demonstrate sustained 90% hardware DRAM throughput
+or a stall-free kernel. A faster memory subsystem alone does not imply a proportional
+DFlash speedup: draft work, verification efficiency, acceptance, and other operators also
+contribute to each emitted token.
+
+Nsight Compute 2026.2.1 profiles one native CUDA Graph node during measured C=1 decode
+with cold-cache replay (`--cache-control all`):
+
+| Kernel | Time (µs) | DRAM read bytes | DRAM peak sustained (%) | Warp barrier (%) | Warp long scoreboard (%) |
+|---|---:|---:|---:|---:|---:|
+| Up/SwiGLU | 67.648 | 100,337,408 | 86.88 | 14.29 | 26.94 |
+| Down | 36.160 | 50,380,032 | 79.07 | 10.09 | 14.09 |
+
+These are representative kernel counters, not whole-decode bandwidth. Warp-stall fractions
+do not measure recoverable wall time; other warps may issue while a warp waits. Profiler
+replay times are separate from the unprofiled Engine speed measurements above.
+The prefetched GDN chain's representative C=1 node takes 12.896 µs under cold-cache replay;
+its scheduler has 0.266 eligible warps per cycle and 20.64% issue activity. These counters
+still show exposed latency; they do not support a stall-free or whole-decode bandwidth claim.
+Its SourceCounters/SchedulerStats report is
+`profiles/bench/5090-megakernel/overnight/gdn-initial-native-source.ncu-rep`.
+
+Measurement reports and qualification results are under
+`profiles/bench/5090-megakernel/`. The final retained implementation's Engine/Op comparisons,
+score parity, and GDN sanitizer results are under its `overnight/` subdirectory; aggregate
+Engine results are in `overnight/final-engine-comparison.json`. Linear profiler counters are
+under `profiles/ncu/5090-megakernel/`.
+
 ## DFlash2 p-less calibration under CUDA Graphs (2026-10-06)
 
 The [online draft-temperature calibration](#dflash2-p-less-proposal-calibration-2026-10-03) was

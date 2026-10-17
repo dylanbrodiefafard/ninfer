@@ -91,8 +91,8 @@ enum class LinearPolicy : std::uint8_t {
  * LinearPolicy::A16Only and LinearPolicy::AllowA8. NVFP4 admits A16Only, AllowA4 and AllowA8;
  * AllowA4 permits the private resolver to select either a qualified A16 route or activation
  * quantization to NVFP4 at every positive T. The selected route depends only on the registered
- * problem and T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=4 for [14336,5120],
- * [16384,5120], [34816,5120], [5120,6144], and [5120,17408]. Other NVFP4 shapes and T<4
+ * problem and T. NVFP4 AllowA8 selects row-scaled E4M3 activation compute at T>=2 for [14336,5120],
+ * [16384,5120], [34816,5120], [5120,6144], and [5120,17408]. Other NVFP4 shapes and T<2
  * retain A16. Weight codes and per16 E4M3 scales remain unchanged: exact code expansion and
  * separately scaled K16 partials introduce no additional weight quantization. The canonical
  * oracle retains original BF16 inputs; independent codec attribution supplements its check.

@@ -82,17 +82,19 @@ struct HistoryRecordAccess : RecordAccess<Masked, ParentIndexed, kNumWarps> {
     }
 };
 
-// Native grid [Hv,B,8] and128threads retain the current chain/tree traversal and raw publication.
+// Grid [48,B,8] with 128 threads: each warp owns four value rows, and each lane owns four
+// key columns. Chain/tree traversal publishes raw records without changing the checkpoint.
 // Only the first value head/strip0/warp0 writes each shared normalized key, and lane0 writes its
 // alpha; innovation value tiles have disjoint writers. Tree traversal uses the native branch
-// storage mapping.
-template <bool Masked, bool ParentIndexed>
+// storage mapping. Chain queries are prefetched across the transition; a single-row chain also
+// prefetches keys. Normalization and raw publication retain their consumer order.
+template <bool Masked, bool ParentIndexed, bool PrefetchKeys>
 __global__
 __launch_bounds__(128,
                   2) void history_record_kernel(HistoryRecordAccess<Masked, ParentIndexed> access) {
     const auto coord = access.coordinates();
-    recurrent_bf16_body<RecurrentMode::Record, true, true>(access, coord, access.width,
-                                                           access.active_columns(coord));
+    recurrent_bf16_body<RecurrentMode::Record, true, true, PrefetchKeys>(
+        access, coord, access.width, access.active_columns(coord));
 }
 
 using HistoryFold = FoldAccess<FoldGeometry<48, 16, 48, 10240>>;

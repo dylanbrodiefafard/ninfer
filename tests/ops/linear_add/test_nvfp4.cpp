@@ -2,6 +2,7 @@
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#include "ops/sanitizer_scope.h"
 
 #include <cuda_runtime.h>
 
@@ -104,8 +105,9 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
-int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool sanitizer = false) {
     const std::array invocations{
+        Invocation{2, ops::LinearPolicy::AllowA8},    Invocation{9, ops::LinearPolicy::AllowA8},
         Invocation{4, ops::LinearPolicy::AllowA8},    Invocation{8, ops::LinearPolicy::AllowA8},
         Invocation{16, ops::LinearPolicy::AllowA8},   Invocation{5, ops::LinearPolicy::AllowA8},
         Invocation{6, ops::LinearPolicy::AllowA8},    Invocation{10, ops::LinearPolicy::AllowA8},
@@ -157,6 +159,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+        if (sanitizer &&
+            (invocation.policy != ops::LinearPolicy::AllowA8 ||
+             (invocation.tokens != 2 && invocation.tokens != 8 && invocation.tokens != 9))) {
+            continue;
+        }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -341,11 +348,12 @@ int run_aggregate_matches_panels(std::int32_t n, std::int32_t k, std::uint32_t s
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (ninfer::test::cuda_unavailable()) {
         std::cerr << "FAIL: no usable CUDA device\n";
         return 1;
     }
+    if (sanitizer_scope(argc, argv)) { return run_shape(5120, 17408, 821U, true); }
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);

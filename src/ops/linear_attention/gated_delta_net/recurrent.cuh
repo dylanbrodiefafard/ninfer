@@ -136,10 +136,8 @@ apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane], const float (&key)[
 
 template <bool Normalize>
 __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
-                                                  const __nv_bfloat16* query, __nv_bfloat16* output,
-                                                  std::uint32_t dqk_base, std::uint32_t dv_base,
-                                                  int lane, float scale) {
-    RawQkLane q = load_raw_qk_lane(query, dqk_base);
+                                                  RawQkLane q, __nv_bfloat16* output,
+                                                  std::uint32_t dv_base, int lane, float scale) {
     normalize_qk_lane<Normalize>(q.value, lane);
 
     float attn_val = 0.0f;
@@ -152,6 +150,15 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
         if (lane == r) { attn_val = partial; }
     }
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+}
+
+template <bool Normalize>
+__device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
+                                                  const __nv_bfloat16* query, __nv_bfloat16* output,
+                                                  std::uint32_t dqk_base, std::uint32_t dv_base,
+                                                  int lane, float scale) {
+    readout_and_store<Normalize>(state, load_raw_qk_lane(query, dqk_base), output, dv_base, lane,
+                                 scale);
 }
 
 template <bool NormalizeQK>
@@ -574,10 +581,13 @@ struct FoldAccess {
     }
 };
 
-template <RecurrentMode Mode, bool NormalizeInputs, bool History = false, class Access>
+template <RecurrentMode Mode, bool NormalizeInputs, bool History = false, bool PrefetchKeys = false,
+          class Access>
 __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                                                     const RecurrentCoordinates& coord,
                                                     std::int32_t width, std::int32_t valid) {
+    static_assert(!PrefetchKeys ||
+                  (History && Mode == RecurrentMode::Record && !Access::kParentIndexed));
     if constexpr (Mode == RecurrentMode::Record && Access::kParentIndexed) {
         // Execute the row's precompiled step list (see gated_delta_net_tree_schedule). Each
         // step resumes from the live registers, the checkpoint, or a branch slot, applies one
@@ -686,6 +696,11 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         if (valid == 0) { return; }
     }
 
+    RawQkLane key{};
+    // Packed keys overlap checkpoint loading and retained-history reconstruction.
+    if constexpr (PrefetchKeys) {
+        key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    }
     const float* initial = access.state_read_base(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
 #pragma unroll
@@ -696,7 +711,9 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
 
     if constexpr (History) { access.initialize_history(state, coord); }
 
-    RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    if constexpr (!PrefetchKeys) {
+        key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
+    }
     if constexpr (Mode == RecurrentMode::Record) { access.store_key(coord, 0, key); }
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
@@ -709,7 +726,16 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
             access.store_gate(coord, token, gate);
         }
 
+        RawQkLane query{};
+        RawQkLane next_key{};
         if constexpr (History) {
+            // Query loads overlap the state transition; normalization remains at readout.
+            query = load_raw_qk_lane(access.query_ptr(coord, token), coord.dqk_base);
+            if constexpr (PrefetchKeys) {
+                if (token + 1 < valid) {
+                    next_key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+                }
+            }
             apply_gdn_transition<true>(state, key.value, value.value, gate.g, gate.beta,
                                        access.innovation_store(coord, token));
         } else {
@@ -717,7 +743,11 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         }
 
         if (token + 1 < valid) {
-            key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+            if constexpr (PrefetchKeys) {
+                key = next_key;
+            } else {
+                key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
+            }
             if constexpr (Mode == RecurrentMode::Record) {
                 access.store_key(coord, token + 1, key);
             }
@@ -725,9 +755,14 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         }
 
         if constexpr (Mode != RecurrentMode::Fold) {
-            readout_and_store<NormalizeInputs>(state, access.query_ptr(coord, token),
-                                               access.output_ptr(coord, token), coord.dqk_base,
-                                               coord.dv_base, coord.lane, access.scale);
+            if constexpr (History) {
+                readout_and_store<NormalizeInputs>(state, query, access.output_ptr(coord, token),
+                                                   coord.dv_base, coord.lane, access.scale);
+            } else {
+                readout_and_store<NormalizeInputs>(state, access.query_ptr(coord, token),
+                                                   access.output_ptr(coord, token), coord.dqk_base,
+                                                   coord.dv_base, coord.lane, access.scale);
+            }
         }
         if constexpr (Mode == RecurrentMode::Snapshot) {
             access.store_snapshot(coord, token, state);

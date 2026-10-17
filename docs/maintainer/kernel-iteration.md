@@ -41,12 +41,31 @@ python3 -m tools.kdev bound --list-ideas
 The classifier uses the public Linear model-byte floor, 1674.5 GB/s sustained read, and
 1676 TFLOP/s dense FP4. Predicted time is `max(t_mem, t_comp[, t_issue])`.
 
-- **DRAM** (typical decode, `T ≲ 16`, ridge near `T ≈ 380` on 27B NVFP4 attn-in Linear): only ideas that
-  cut extra bytes or raise useful work per weight pass (`weight_replay`, `aggregate_T`).
+- **DRAM** (typical decode, `T ≲ 16`, ridge near `T ≈ 380` on 27B NVFP4 attn-in Linear): ideas that cut
+  extra bytes or raise useful work per weight pass (`weight_replay`, `aggregate_T`), or bounded
+  experiments that address a measured instruction, address, or synchronization bottleneck
+  (`profiled_overhead`). The byte roof classifies the workload; it does not prove that the
+  implementation saturates memory or that other costs cannot limit achieved bandwidth.
 - **tensor-core** (typical prefill chunk `T=1024`): search tile, TMA, pipeline, and epilogue
   fusion inside the existing SM120 NVFP4 family.
 
 If `verdict=refuse` or `sm120=ILLEGAL`, stop. Do not write CUDA.
+
+`--idea profiled_overhead` admits one specific experiment inside the current legal kernel
+family when a positive finite public-Op `--measured-us`, a `--bottleneck` of `instruction`,
+`address`, or `synchronization`, same-kernel `--profile-evidence`, and a concrete `--hypothesis`
+are supplied. Evidence identifies the report, relevant metric or source/SASS attribution,
+and the operation causing the cost; the hypothesis states the bounded change and predicted
+metric effect. Review that causal connection before implementation. Preserve mathematical
+semantics and weight passes; changed precision or a new execution family needs its own
+admission. This route does not authorize blind parameter sweeps or override SM120 legality.
+Confirm the predicted mechanism, independent oracle correctness, and public-Op latency before
+an Engine comparison. Instruction counts and stall shares are not percentages of recoverable
+latency. Reject a candidate when its claimed-scope measurement does not improve.
+
+For example, source-correlated NVFP4-to-FP8 codec instruction overhead can admit an exact
+sign-assembly rewrite despite unchanged DRAM bytes. Exhaustive device codec comparison,
+generated-instruction inspection, and complete-Op timing establish whether it is useful.
 
 The byte roof is a lower bound, not proof that the current launch saturates memory.
 `--idea grid_underfill --profiled-ctas N --profiled-dram-gbs R` admits output-row
@@ -88,7 +107,7 @@ probe excludes operand conversion, activation quantization, loads and epilogues;
 public-Op timings must include those costs.
 
 For NVFP4-storage/A8 use `--qtype nvfp4 --policy a8`. At the five admitted text geometries
-and T>=4, its roof uses the separately measured `fp8_k16` atom from `kdev mma`, while
+and T>=2, its roof uses the separately measured `fp8_k16` atom from `kdev mma`, while
 retaining the packed NVFP4 weight-byte floor. Missing K16 calibration is an error; neither
 the NVFP4 K64 nor FP8 K32 issue rate is interchangeable. This is still a lower bound:
 exact nibble expansion and per16 FP32 scale accumulation are included in public-Op timing,
@@ -117,7 +136,8 @@ python3 -m tools.kdev <op> --fast --bench --profile
 ```
 
 `--profile` / Linear `--profile` is one named NCU question (DRAM vs 1674.5 GB/s, tensor-pipe
-busy, spills, DRAM bytes vs `model_bytes`). Not an open-ended report.
+busy, spills, DRAM bytes vs `model_bytes`, or source/SASS or phase attribution for a stated
+overhead hypothesis). Not an open-ended report.
 
 Correctness still gates performance: oracle first, then bench. Fast-but-wrong is invalid.
 
@@ -137,7 +157,7 @@ task is measurement, not implementation. `STOP` / `MEASURE` / `GO` / `FILL` is t
 1. Public Op, exact `(N,K,T,qtype,policy)`, prefill vs decode.
 2. `model_bytes`, `useful_flops`, AI, `t_mem`, `t_comp`[, `t_issue`]. Bound.
 3. Current measured µs and % of the matching roof (1674.5 GB/s or 1676 TFLOP/s).
-4. Idea class. If it does not attack the bound, stop.
+4. Idea class. Address the bound or a profiler-attributed cost limiting achieved throughput.
 5. SM120 legality: MMA atom, smem, TMA, registers. TMEM / `tcgen05` ⇒ stop.
 6. Parameters inside an existing family, or why a new family is required.
 7. Microbench the public Op at that exact point. No Engine A/B until the Op wins.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 
 # RTX 5090 facts used by the Linear bench contract.
@@ -64,6 +65,7 @@ IDEAS = (
     "new_family",
     "quality_tradeoff",
     "grid_underfill",
+    "profiled_overhead",
     "tcgen05",
     "tmem",
     "sm100",
@@ -156,6 +158,12 @@ IDEA_CATALOG = {
         "tc": "measure",
         "note": "Requires a measured Op baseline, profiled grid below 170 CTAs and DRAM below 80% of sustained read. No split-K, new arithmetic, or duplicated weight pass.",
     },
+    "profiled_overhead": {
+        "lever": "reduce profiler-attributed instruction, address, or synchronization overhead",
+        "dram": "measure",
+        "tc": "measure",
+        "note": "Requires a measured public-Op baseline, same-kernel profiler evidence, and a bounded hypothesis inside the current legal family. Preserve semantics and weight passes; instruction or stall shares are not latency savings.",
+    },
     "tcgen05": {
         "lever": "SM100 tcgen05 MMA",
         "dram": "refuse",
@@ -220,6 +228,13 @@ def add_problem_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--measured-us", type=float, help="current public-Op median µs")
     parser.add_argument("--profiled-ctas", type=int, help="NCU grid size of the measured kernel")
     parser.add_argument("--profiled-dram-gbs", type=float, help="NCU DRAM GB/s of the same kernel")
+    parser.add_argument("--bottleneck", choices=["instruction", "address", "synchronization"])
+    parser.add_argument(
+        "--profile-evidence", help="same-kernel profiler report, metric, and attribution summary"
+    )
+    parser.add_argument(
+        "--hypothesis", help="bounded change and predicted effect on the identified bottleneck"
+    )
     parser.add_argument("--mma-json", help="profiles/kdev/mma_issue.json from `kdev mma`")
     parser.add_argument(
         "--mma-per-s",
@@ -245,7 +260,7 @@ def problem_is_complete(args) -> bool:
 def nvfp4_a8_active(n: int, k: int, t: int, policy: str) -> bool:
     return (
         policy == "a8"
-        and t >= 4
+        and t >= 2
         and any((n, k) == (shape["n"], shape["k"]) for shape in PRESETS.values())
     )
 
@@ -290,6 +305,9 @@ def analyze_from_args(args) -> dict:
         label=label,
         profiled_ctas=args.profiled_ctas,
         profiled_dram_gbs=args.profiled_dram_gbs,
+        bottleneck=args.bottleneck,
+        profile_evidence=args.profile_evidence,
+        hypothesis=args.hypothesis,
     )
     if args.preset:
         card["preset"] = args.preset
@@ -393,8 +411,28 @@ def classify_idea(
     profiled_ctas: int | None = None,
     profiled_dram_gbs: float | None = None,
     measured_us: float | None = None,
+    bottleneck: str | None = None,
+    profile_evidence: str | None = None,
+    hypothesis: str | None = None,
 ) -> dict:
     idea = idea.strip()
+    if idea == "profiled_overhead":
+        admitted = (
+            measured_us is not None
+            and 0 < measured_us < float("inf")
+            and bottleneck in {"instruction", "address", "synchronization"}
+            and bool(profile_evidence and profile_evidence.strip())
+            and bool(hypothesis and hypothesis.strip())
+        )
+        return {
+            "name": idea,
+            "verdict": "allow" if admitted else "measure",
+            "reason": (
+                "Profiler-supported bounded experiment inside the current legal family; preserve semantics and weight passes. Verify the predicted metric change, oracle correctness, and public-Op latency. Profile shares do not predict latency savings."
+                if admitted
+                else "Do not write CUDA: require a positive finite public-Op baseline, --bottleneck, same-kernel --profile-evidence with attribution, and a specific --hypothesis."
+            ),
+        }
     if idea == "grid_underfill":
         admitted = (
             measured_us is not None
@@ -529,6 +567,9 @@ def analyze(
     label: str = "",
     profiled_ctas: int | None = None,
     profiled_dram_gbs: float | None = None,
+    bottleneck: str | None = None,
+    profile_evidence: str | None = None,
+    hypothesis: str | None = None,
 ) -> dict:
     qtype = qtype.lower()
     if qtype not in QTYPES:
@@ -537,6 +578,8 @@ def analyze(
         raise ValueError("n, k, t must be positive")
     if idea is not None and idea.strip() not in IDEAS:
         raise ValueError(f"unknown idea '{idea}'; expected one of: {', '.join(IDEAS)}")
+    if measured_us is not None and (not math.isfinite(measured_us) or measured_us <= 0):
+        raise ValueError("measured_us must be positive and finite")
     w_bytes = weight_bytes(n, k, qtype)
     a_bytes = activation_bytes(n, k, t)
     bytes_ = w_bytes + a_bytes
@@ -594,6 +637,9 @@ def analyze(
             profiled_ctas=profiled_ctas,
             profiled_dram_gbs=profiled_dram_gbs,
             measured_us=measured_us,
+            bottleneck=bottleneck,
+            profile_evidence=profile_evidence,
+            hypothesis=hypothesis,
         )
         if idea
         else None
@@ -615,6 +661,9 @@ def analyze(
             profiled_ctas=profiled_ctas,
             profiled_dram_gbs=profiled_dram_gbs,
             measured_us=measured_us,
+            bottleneck=bottleneck,
+            profile_evidence=profile_evidence,
+            hypothesis=hypothesis,
         )
         if card["verdict"] == "allow":
             allowed.append(name)
@@ -624,7 +673,7 @@ def analyze(
             measured.append(name)
 
     next_step = (
-        "Do not write CUDA. Attack bytes or raise T per weight pass (aggregate_T / weight_replay)."
+        "Attack bytes, raise T per weight pass, or establish a profiled_overhead hypothesis before writing CUDA."
         if bound == "DRAM"
         else "Stay in the current SM120 kernel family. Autotune tile/TMA/pipeline; do not invent a new MMA ISA."
     )
@@ -634,7 +683,9 @@ def analyze(
         next_step = "Allowed. Implement only as a parameter inside the current family, then Layer 2 microbench."
         if idea_card["name"] == "quality_tradeoff":
             next_step = "Requested quality candidate admitted. Verify candidate ISA and oracle, then measure public-Op latency before paired model quality. Existing roof is baseline-only."
-    elif idea_card and idea_card["name"] == "grid_underfill":
+        elif idea_card["name"] == "profiled_overhead":
+            next_step = idea_card["reason"]
+    elif idea_card and idea_card["name"] in {"grid_underfill", "profiled_overhead"}:
         next_step = idea_card["reason"]
 
     measured_pct = None
@@ -648,6 +699,9 @@ def analyze(
         "layer": 0,
         "profiled_ctas": profiled_ctas,
         "profiled_dram_gbs": profiled_dram_gbs,
+        "bottleneck": bottleneck,
+        "profile_evidence": profile_evidence,
+        "hypothesis": hypothesis,
         "label": label,
         "problem": {"n": n, "k": k, "t": t, "qtype": qtype, "policy": policy, "phase": phase},
         "weight_bytes": w_bytes,
@@ -710,6 +764,9 @@ def render(card: dict) -> str:
         lines.append("       sm120=ILLEGAL  " + "; ".join(card["sm120"]["reasons"]))
     if idea:
         lines.append(f"       idea={idea['name']}  verdict={verdict.upper()}  {idea['reason']}")
+    for field in ("bottleneck", "profile_evidence", "hypothesis"):
+        if card.get(field):
+            lines.append(f"       {field}={card[field]}")
     lines.append(f"       allow: {', '.join(card['allowed'])}")
     lines.append(f"       refuse: {', '.join(card['refused'])}")
     lines.append(f"       next: {card['next']}")
@@ -742,7 +799,9 @@ def _self_test() -> int:
     check("nvfp4-a8-padded-count", w4a8["mma_count"] == 1310720)
     check("nvfp4-a8-roof", abs(w4a8["t_issue_us"] - 13.1072) < 1e-8)
     check("nvfp4-a8-compressed-bytes", w4a8["weight_bytes"] == 47185920)
-    check("nvfp4-a8-t3-fallback", not nvfp4_a8_active(5120, 17408, 3, "a8"))
+    check("nvfp4-a8-t1-fallback", not nvfp4_a8_active(5120, 17408, 1, "a8"))
+    check("nvfp4-a8-t2", nvfp4_a8_active(5120, 17408, 2, "a8"))
+    check("nvfp4-a8-t3", nvfp4_a8_active(5120, 17408, 3, "a8"))
     check(
         "nvfp4-a8-t4",
         analyze(5120, 17408, 4, "nvfp4", policy="a8", mma_per_s=1e11)["mma_atom"]
@@ -770,6 +829,42 @@ def _self_test() -> int:
             measured_us=baseline,
         )
         check(f"grid-underfill-{ctas}-{rate}-{baseline}", gate["verdict"] == expected)
+    evidence = dict(
+        measured_us=104.448,
+        bottleneck="instruction",
+        profile_evidence="same-kernel NCU source attribution: FP4 expansion instruction share",
+        hypothesis="replace exact sign assembly with byte permutation; reduce emitted instructions",
+    )
+    for missing in (None, *evidence):
+        inputs = dict(evidence)
+        if missing is not None:
+            inputs[missing] = None
+        gate = classify_idea("profiled_overhead", "DRAM", 8, "decode", **inputs)
+        check(
+            f"profiled-overhead-{missing}",
+            gate["verdict"] == ("allow" if missing is None else "measure"),
+        )
+    for baseline in (0.0, -1.0, float("nan"), float("inf")):
+        gate = classify_idea(
+            "profiled_overhead", "DRAM", 8, "decode", **(evidence | {"measured_us": baseline})
+        )
+        check(f"profiled-overhead-baseline-{baseline}", gate["verdict"] == "measure")
+    for field in ("profile_evidence", "hypothesis"):
+        gate = classify_idea("profiled_overhead", "DRAM", 8, "decode", **(evidence | {field: "  "}))
+        check(f"profiled-overhead-blank-{field}", gate["verdict"] == "measure")
+    for name in ("occupancy", "tile_shape", "new_family", "tcgen05"):
+        gate = classify_idea(name, "DRAM", 8, "decode", **evidence)
+        check(f"profiled-overhead-no-bypass-{name}", gate["verdict"] == "refuse")
+    for baseline in (0.0, -1.0, float("nan"), float("inf")):
+        try:
+            analyze(14336, 5120, 8, "nvfp4", measured_us=baseline)
+            check(f"invalid-baseline-{baseline}", False)
+        except ValueError:
+            check(f"invalid-baseline-{baseline}", True)
+    illegal_profile = analyze(
+        14336, 5120, 8, "nvfp4", idea="profiled_overhead", needs_tcgen05=True, **evidence
+    )
+    check("profiled-overhead-illegal", illegal_profile["idea"]["verdict"] == "refuse")
     d1 = analyze(14336, 5120, 1, "nvfp4")
     check("t1-dram", d1["bound"] == "DRAM", d1["bound"])
     d1024 = analyze(14336, 5120, 1024, "nvfp4")
