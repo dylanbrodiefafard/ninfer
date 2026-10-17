@@ -52,9 +52,19 @@ void record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, 
         static_cast<std::int64_t>(128) * 128 * 48,
         scale};
     const HistoryRecordAccess<Masked, ParentIndexed> access{base, planes(history)};
-    history_record_kernel<Masked, ParentIndexed>
-        <<<dim3(48, static_cast<unsigned>(q.ne[3]), 8), dim3(32, 4), 0, stream>>>(access);
-    CUDA_CHECK(cudaGetLastError());
+    const auto launch = [&]<bool PrefetchKeys>() {
+        history_record_kernel<Masked, ParentIndexed, PrefetchKeys>
+            <<<dim3(48, static_cast<unsigned>(q.ne[3]), 8), dim3(32, 4), 0, stream>>>(access);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    // Batched chains favor query-only prefetch over the extra live prefetched-key registers.
+    if constexpr (!ParentIndexed) {
+        if (q.ne[3] == 1) {
+            launch.template operator()<true>();
+            return;
+        }
+    }
+    launch.template operator()<false>();
 }
 } // namespace
 

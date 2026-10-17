@@ -13,8 +13,9 @@ namespace ninfer::ops::detail {
 // partial in FP32, never rounded into an FP8 weight.
 __device__ __forceinline__ unsigned nvfp4_codes_to_fp8(unsigned codes) {
     const unsigned magnitude = __byte_perm(0x3c383000U, 0x4c484440U, codes & 0x7777U);
-    return magnitude | ((codes & 0x0008U) << 4) | ((codes & 0x0080U) << 8) |
-           ((codes & 0x0800U) << 12) | ((codes & 0x8000U) << 16);
+    // Select shifted byte 0, byte 0, shifted byte 1, and byte 1 to place each nibble sign.
+    const unsigned signs = __byte_perm(codes << 4, codes, 0x5140U);
+    return magnitude | (signs & 0x80808080U);
 }
 
 // Exact E2M1-code expansion to BF16 with the stored E4M3 block scale folded in: every product of
@@ -59,6 +60,15 @@ struct Nvfp4W4a8WeightStorage {
 // tile reuses it.
 template <class Schedule, int ActivationBytes = 1>
 struct Nvfp4W4a8SharedStorage {
+    static constexpr int kStagedInputRows = [] {
+        if constexpr (requires { Schedule::kActivationRows; }) {
+            return Schedule::kActivationRows;
+        } else {
+            return Schedule::kBlockM;
+        }
+    }();
+    static_assert(kStagedInputRows == Schedule::kBlockM ||
+                  (kStagedInputRows == 8 && Schedule::kBlockM == 16 && Schedule::kWarpsM == 1));
     static constexpr int kResultStride = Schedule::kBlockN + 8;
 
     union Staging {
@@ -67,7 +77,7 @@ struct Nvfp4W4a8SharedStorage {
     } staging;
 
     alignas(16) std::uint8_t
-        inputs[Schedule::kStages][Schedule::kBlockM * Schedule::kBlockK * ActivationBytes];
+        inputs[Schedule::kStages][kStagedInputRows * Schedule::kBlockK * ActivationBytes];
     alignas(16) __nv_bfloat16 bf16_result[Schedule::kBlockM * kResultStride];
 };
 
@@ -92,6 +102,8 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
     extern __shared__ __align__(16) std::uint8_t nvfp4_w4a8_shared[];
     auto& shared =
         *reinterpret_cast<Nvfp4W4a8SharedStorage<Schedule, kBf16 ? 2 : 1>*>(nvfp4_w4a8_shared);
+    constexpr int kStagedInputRows = Nvfp4W4a8SharedStorage < Schedule,
+                  kBf16 ? 2 : 1 > ::kStagedInputRows;
     auto& staging     = shared.staging;
     auto& weights     = staging.weights;
     auto& inputs      = shared.inputs;
@@ -118,7 +130,7 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
         }
     }();
     const auto stage_inputs = [&](int stage, int tile) {
-        for (int task = tid; task < BM * kRowBytes / 16; task += Schedule::kThreads) {
+        for (int task = tid; task < kStagedInputRows * kRowBytes / 16; task += Schedule::kThreads) {
             const int row = task / (kRowBytes / 16), column = (task % (kRowBytes / 16)) * 16;
             const int token  = token_begin + row;
             const bool valid = token < tokens;
@@ -145,8 +157,8 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
         }
     };
     constexpr bool SwapAB = SwapPanels > 0;
-    static_assert(!SwapAB ||
-                  (Schedule::kWarpsM == 1 && Schedule::kWarpN % 16 == 0 && SwapPanels * 8 <= BM));
+    static_assert(!SwapAB || (Schedule::kWarpsM == 1 && Schedule::kWarpN % 16 == 0 &&
+                              SwapPanels * 8 <= kStagedInputRows));
     constexpr int kSwapRows = Schedule::kWarpN / 16, kSwapPanels = SwapAB ? SwapPanels : 1;
     float accum[Schedule::kMmaM][Schedule::kMmaN][4]         = {};
     float swap_accum[SwapAB ? kSwapRows : 1][kSwapPanels][4] = {};
@@ -239,7 +251,11 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
                     const int row    = wm * Schedule::kWarpM + m * 16 + lane / 4;
                     const int column = group * 32 + (lane & 3) * 8;
                     a[m][0]          = load_vec<uint2>(inputs[stage] + input_byte(row, column));
-                    a[m][1]          = load_vec<uint2>(inputs[stage] + input_byte(row + 8, column));
+                    if constexpr (kStagedInputRows == 8) {
+                        a[m][1] = make_uint2(0, 0);
+                    } else {
+                        a[m][1] = load_vec<uint2>(inputs[stage] + input_byte(row + 8, column));
+                    }
                 }
 #pragma unroll
                 for (int n = 0; n < Schedule::kMmaN; ++n) {
@@ -265,7 +281,11 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_w4a8_mma_kernel(
                     const int row    = wm * Schedule::kWarpM + m * 16 + lane / 4;
                     const int column = group * 16 + (lane & 3) * 4;
                     a[m][0]          = load_vec<unsigned>(inputs[stage] + input_byte(row, column));
-                    a[m][1] = load_vec<unsigned>(inputs[stage] + input_byte(row + 8, column));
+                    if constexpr (kStagedInputRows == 8) {
+                        a[m][1] = 0;
+                    } else {
+                        a[m][1] = load_vec<unsigned>(inputs[stage] + input_byte(row + 8, column));
+                    }
                 }
 #pragma unroll
                 for (int n = 0; n < Schedule::kMmaN; ++n) {

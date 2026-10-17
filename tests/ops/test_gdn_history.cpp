@@ -1009,14 +1009,14 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--racecheck") {
             for (const bool tree : {false, true}) {
-                AcceptedHistoryFixture fixture(1, tree ? 12 : 4, tree, 4, false);
+                AcceptedHistoryFixture fixture(1, tree ? 12 : 8, tree, 4, false);
                 fixture.qualify_record_racecheck();
             }
             return 0;
         }
         if (tr::sanitizer_scope(argc, argv)) {
             {
-                AcceptedHistoryFixture fixture(1, 4, false, 4);
+                AcceptedHistoryFixture fixture(1, 8, false, 4);
                 fixture.qualify(true, 2);
             }
             {
