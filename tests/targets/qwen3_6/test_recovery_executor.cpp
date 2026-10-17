@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
@@ -230,6 +231,7 @@ const char* cache_case_name(CacheCase script) {
 
 struct ProbePlan {
     RequestPlanSummary fields;
+    ninfer::runtime::ResolvedExecutionOptions execution;
     bool force_cold  = false;
     bool allow_reuse = true;
 
@@ -445,6 +447,7 @@ public:
                                        "probe retry prompt does not fit");
         }
         ProbePlan plan = fitted_plan();
+        plan.execution = options;
         if (lifecycle_retries) {
             plan.fields.prompt_tokens           = prompt.summary().prompt_tokens;
             plan.fields.effective_output_tokens = options.requested_output_tokens;
@@ -804,15 +807,16 @@ public:
 
     virtual void evict_retained_lane(std::uint32_t) noexcept {}
 
-    void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId>) {}
+    virtual void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId>) {}
 
-    void clear_suppressed_tokens_lane(std::uint32_t) {}
+    virtual void clear_suppressed_tokens_lane(std::uint32_t) {}
 
     void set_typical_cycle_reasoning_lane(std::uint32_t, bool) {}
 
-    void resolve_pending_batch(std::span<const std::uint32_t>, std::span<const std::uint32_t>,
-                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
-                               std::span<const std::uint8_t>) {}
+    virtual void resolve_pending_batch(std::span<const std::uint32_t>,
+                                       std::span<const std::uint32_t>,
+                                       std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                                       std::span<const std::uint8_t>) {}
 
 private:
     static constexpr TokenId kPeerStop       = kCallerStop;
@@ -1777,6 +1781,132 @@ struct DeferProbe {
     ProbeMemory request_memory;
 };
 
+// A sampler that ranks the close token first after reasoning. Correct exclusion updates must
+// select answer text instead; speculative proposals also include a second close before that update.
+class ReasoningCloseProgram final : public ProbeProgram {
+public:
+    bool speculative                   = false;
+    bool close_in_prefill              = false;
+    bool initial_close_excluded        = false;
+    bool continued_with_close_excluded = false;
+    std::vector<std::uint32_t> committed_prefixes;
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion,
+                                                       const OutputSession* output) override {
+        excluded_.assign(plan.execution.suppressed_token_ids.begin(),
+                         plan.execution.suppressed_token_ids.begin() +
+                             plan.execution.suppressed_token_count);
+        initial_close_excluded = close_excluded();
+        thinking_              = output->in_reasoning();
+        tokens_[0]             = !thinking_ ? 15 : close_in_prefill ? 248069 : 0;
+        if (close_in_prefill) { emitted_close_ = true; }
+        PrefillStepResult result;
+        result.complete                  = true;
+        result.processed_prompt_tokens   = 1;
+        result.round.tokens              = std::span<const TokenId>(tokens_.data(), 1);
+        result.summary.prompt_tokens     = prompt.summary().prompt_tokens;
+        result.summary.prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+        return result;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
+                                                     std::span<const RoundBudget>) override {
+        if (thinking_ && !emitted_close_) {
+            if (close_excluded()) { throw std::logic_error("first close was excluded"); }
+            tokens_        = {248069, 248069, 15};
+            count_         = speculative ? 3 : 1;
+            emitted_close_ = true;
+        } else if (thinking_ && !emitted_answer_) {
+            continued_with_close_excluded = close_excluded();
+            tokens_[0]                    = close_excluded() ? 15 : 248069;
+            count_                        = 1;
+            emitted_answer_               = true;
+        } else {
+            continued_with_close_excluded = close_excluded();
+            tokens_[0]                    = 6;
+            count_                        = 1;
+        }
+        return {.tokens     = std::span<const TokenId>(tokens_.data(), count_),
+                .row_counts = std::span<const std::int32_t>(&count_, 1),
+                .row_stride = static_cast<std::uint32_t>(count_)};
+    }
+
+    void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId> tokens) override {
+        excluded_.assign(tokens.begin(), tokens.end());
+    }
+
+    void clear_suppressed_tokens_lane(std::uint32_t) override { excluded_.clear(); }
+
+    void resolve_pending_batch(std::span<const std::uint32_t>,
+                               std::span<const std::uint32_t> accepted,
+                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>) override {
+        committed_prefixes.push_back(accepted.front());
+    }
+
+private:
+    bool close_excluded() const {
+        return std::find(excluded_.begin(), excluded_.end(), 248069) != excluded_.end();
+    }
+
+    std::vector<TokenId> excluded_;
+    std::array<TokenId, 3> tokens_{};
+    std::int32_t count_  = 1;
+    bool thinking_       = false;
+    bool emitted_close_  = false;
+    bool emitted_answer_ = false;
+};
+
+int run_reasoning_close_sampling(Frontend& frontend) {
+    int failures = 0;
+    for (const bool thinking : {false, true}) {
+        for (const bool speculative : {false, true}) {
+            for (const bool prefill_close : {false, true}) {
+                if (!thinking && prefill_close) { continue; }
+                ReasoningCloseProgram program;
+                program.lifecycle_retries = true;
+                program.script            = CacheCase::AdmitRamHit;
+                program.speculative       = speculative;
+                program.close_in_prefill  = prefill_close;
+                ProbeLoaded loaded{frontend};
+                RecoveryProbe instance{.program = &program, .loaded = &loaded};
+                auto engine                = engine_options();
+                engine.generation_recovery = false;
+                ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+                auto input                    = thinking_input();
+                input.options.enable_thinking = thinking;
+                auto prompt                   = frontend.prepare(std::move(input));
+                const auto summary            = prompt.summary();
+                ninfer::runtime::ResolvedRequestOptions options;
+                options.execution.allow_prefix_reuse      = false;
+                options.execution.requested_output_tokens = 8;
+                auto submission =
+                    executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                    ninfer::OutputDelivery::TerminalOnly);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                const auto result =
+                    submission.wait(nullptr, ninfer::CancellationView([deadline] {
+                                        return std::chrono::steady_clock::now() >= deadline;
+                                    }));
+                const std::size_t expected_closes = thinking ? 1 : 0;
+                failures += check(
+                    result.finish_reason == FinishReason::StopToken && result.content == "answer" &&
+                        std::count(result.generated_token_ids.begin(),
+                                   result.generated_token_ids.end(),
+                                   248069) == static_cast<std::ptrdiff_t>(expected_closes) &&
+                        program.initial_close_excluded == !thinking &&
+                        program.continued_with_close_excluded,
+                    "executor failed to update close exclusion across prefill/decode");
+                failures += check(!program.committed_prefixes.empty() &&
+                                      program.committed_prefixes.front() == 1,
+                                  "executor committed a repeated close from speculative columns");
+            }
+        }
+    }
+    return failures;
+}
+
 int run_admission_defers_for_reclaim(Frontend& frontend) {
     DeferProgram program;
     // Plans sized from each request (service quanta cover the long decode); no resident reuse.
@@ -1893,7 +2023,7 @@ int main() {
             CacheCase::AdmitRamRestoreThenCold,
             CacheCase::AdmitDiskRestoreThenCold,
         };
-        int failures = 0;
+        int failures = run_reasoning_close_sampling(frontend);
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }

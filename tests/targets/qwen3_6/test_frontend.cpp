@@ -1517,6 +1517,56 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+int test_single_reasoning_close(const Frontend& frontend) {
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back({.text = "x"});
+    input.messages.push_back(user);
+    input.options.enable_thinking = true;
+    const auto prompt             = frontend.prepare(input);
+    auto output                   = frontend.make_output_session(prompt, {});
+    int failures =
+        check(!output.suppressed_reasoning_end_token(), "first reasoning close was suppressed");
+    const std::array<ninfer::TokenId, 4> repeated{1, 248069, 248069, 15};
+    auto decision = output.preview(repeated, 8, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == 2 && !decision.finished(),
+                      "speculative round accepted a second reasoning close");
+    output.discard_preview();
+    failures += check(output.in_reasoning() && !output.suppressed_reasoning_end_token(),
+                      "discarded reasoning close changed committed eligibility");
+    decision         = output.preview(repeated, 8, ninfer::FinishReason::OutputLimit);
+    const auto first = output.commit_preview();
+    failures += check(channel_text(first, ninfer::OutputChannel::Reasoning) == "helloST" &&
+                          channel_text(first, ninfer::OutputChannel::Content).empty() &&
+                          output.suppressed_reasoning_end_token() == 248069,
+                      "reasoning transition leaked its close or failed to exclude a repeat");
+    bool rejected = false;
+    try {
+        (void)output.preview(std::array<ninfer::TokenId, 1>{248069}, 6,
+                             ninfer::FinishReason::OutputLimit);
+    } catch (const std::logic_error&) { rejected = true; }
+    failures += check(rejected, "output policy accepted an excluded reasoning close");
+    decision =
+        output.preview(std::array<ninfer::TokenId, 1>{15}, 1, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                  channel_text(output.commit_preview(), ninfer::OutputChannel::Content) == "answer",
+              "repeat-close guard damaged answer publication or output budget");
+
+    input.options.enable_thinking = false;
+    auto direct                   = frontend.make_output_session(frontend.prepare(input), {});
+    failures += check(direct.suppressed_reasoning_end_token() == 248069,
+                      "no-thinking prompt allowed a structural reasoning close");
+    auto raw = frontend.make_output_session(prompt, {}, {.raw = true});
+    decision = raw.preview(repeated, 4, ninfer::FinishReason::OutputLimit);
+    failures += check(!raw.suppressed_reasoning_end_token() && decision.accepted_tokens == 4 &&
+                          channel_text(raw.commit_preview(), ninfer::OutputChannel::Content) ==
+                              "helloST</think></think>answer",
+                      "raw completion lost literal closing tags");
+    return failures;
+}
+
 // Token logprob records follow preview_token_channels(): one entry per accepted token.
 int test_preview_token_channels(const Frontend& frontend) {
     using Channel        = std::optional<ninfer::OutputChannel>;
@@ -1544,12 +1594,17 @@ int test_preview_token_channels(const Frontend& frontend) {
     auto session = frontend.make_output_session(thinking_prompt, {});
     const std::array<ninfer::TokenId, 5> turn{1, 248069, 14, 15, 6};
     const auto decision = session.preview(turn, 8, ninfer::FinishReason::OutputLimit);
-    int failures        = check(decision.accepted_tokens == 5 &&
-                                    decision.finish_reason == ninfer::FinishReason::StopToken,
-                                "token channel preview did not accept the whole turn");
-    failures +=
-        check(channels_of(session) == std::vector<Channel>{reasoning, none, none, content, none},
-              "tokens of a thinking turn were attributed to the wrong channels");
+    int failures        = check(decision.accepted_tokens == 2 && !decision.finished(),
+                                "thinking round did not stop at the sampling-domain transition");
+    failures += check(channels_of(session) == std::vector<Channel>{reasoning, none},
+                      "reasoning prefix lost its token channels");
+    (void)session.commit_preview();
+    const auto continued = session.preview(std::span<const ninfer::TokenId>(turn).subspan(2), 6,
+                                           ninfer::FinishReason::OutputLimit);
+    failures += check(continued.accepted_tokens == 3 &&
+                          continued.finish_reason == ninfer::FinishReason::StopToken &&
+                          channels_of(session) == std::vector<Channel>{none, content, none},
+                      "answer continuation lost its stop or token channels");
     (void)session.commit_preview();
     failures += check(session.preview_token_channels().empty(),
                       "token channels outlived their committed preview");
@@ -1740,11 +1795,19 @@ int test_structured_model_stop_eligibility(const Frontend& frontend) {
     failures += check(!think_tools.model_stop_tokens_allowed(),
                       "thinking tools session allowed a model stop before content");
     const std::array<ninfer::TokenId, 6> close_then_repeat{248069, 21, 18, 19, 20, 21};
-    decision = think_tools.preview(close_then_repeat, 16, ninfer::FinishReason::OutputLimit);
-    failures += check(!decision.finished() && !decision.reject_generated_round &&
-                          decision.accepted_tokens == 5,
-                      "suppressed-stop round continued past the first complete tool call");
-    (void)think_tools.commit_preview();
+    std::size_t consumed = 0;
+    for (const std::uint32_t expected : {1U, 4U}) {
+        decision = think_tools.preview(
+            std::span<const ninfer::TokenId>(close_then_repeat).subspan(consumed),
+            16 - static_cast<std::uint32_t>(consumed), ninfer::FinishReason::OutputLimit);
+        failures += check(!decision.finished() && !decision.reject_generated_round &&
+                              decision.accepted_tokens == expected,
+                          "tool round crossed a sampling-domain transition");
+        consumed += decision.accepted_tokens;
+        (void)think_tools.commit_preview();
+    }
+    failures +=
+        check(consumed == 5, "suppressed-stop round continued past its first complete call");
     failures += check(!think_tools.in_reasoning() && think_tools.model_stop_tokens_allowed(),
                       "truncated tool-call round did not make the model stop eligible");
 
@@ -2107,7 +2170,7 @@ int test_constrained_output() {
     input.options.output_constraint = ninfer::OutputConstraint{
         ninfer::OutputConstraintKind::JsonSchema,
         R"({"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false})"};
-    const std::string answer = R"({"value":"<|vision_start|></think><tool_call>"})";
+    const std::string answer = R"({"value":"<|vision_start|></think></think><tool_call>"})";
     auto prompt              = frontend.prepare(input);
     auto output              = frontend.make_output_session(prompt, {});
     failures += check(output.has_token_grammar(), "response constraint has no token grammar");
@@ -2863,6 +2926,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
+    failures += test_single_reasoning_close(frontend);
     failures += test_preview_token_channels(frontend);
     failures += test_structured_model_stop_eligibility(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

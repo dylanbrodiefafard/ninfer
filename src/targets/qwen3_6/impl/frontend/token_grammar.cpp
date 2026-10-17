@@ -420,7 +420,7 @@ TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in
                 {"tags", tags},
                 {"excludes",
                  {"</invoke", "</parameter", "</function", "</tool_call", "<invoke", "<parameter",
-                  "<function"}}};
+                  "<function", "</think>"}}};
     if (constraint) {
         try {
             if (constraint->kind == OutputConstraintKind::Grammar) {

@@ -714,8 +714,9 @@ int main(int argc, char** argv) {
         // outside envelopes, regardless of whether a legitimate call precedes
         // them. Normal prose and subsequent complete calls remain licensed.
         for (const auto& tail :
-             {std::string("</invoke>"), std::string("</parameter>"), std::string("</function>"),
-              std::string("</tool_call>"), std::string("\n</function>\n</tool_call>"),
+             {std::string("</think>"), std::string("</think></think>"), std::string("</invoke>"),
+              std::string("</parameter>"), std::string("</function>"), std::string("</tool_call>"),
+              std::string("\n</function>\n</tool_call>"),
               std::string("\n</invoke>\n\n</parameter>\n</function>\n</tool_call>"),
               std::string("</invoke\n\n</parameter=\n</function\n\n<parameter=limit>\n80\n"),
               std::string("</function = null>"), std::string("</function"),
@@ -745,9 +746,9 @@ int main(int argc, char** argv) {
             .append(raw);
         check(multiple.AcceptString(multiple_text),
               "orphan exclusion blocked ordinary XML, inter-call prose, or a second valid call");
-        auto literal_raw = raw;
-        const std::string literal =
-            "literal </invoke </function = null> <parameter=limit> <tool_call = null>";
+        auto literal_raw          = raw;
+        const std::string literal = "literal </think></think> </invoke </function = null> "
+                                    "<parameter=limit> <tool_call = null>";
         literal_raw.replace(literal_raw.find("true"), 4, literal);
         xgrammar::GrammarMatcher literal_argument(grammar->compiled);
         check(literal_argument.AcceptString(reasoning_prefix + literal_raw) &&

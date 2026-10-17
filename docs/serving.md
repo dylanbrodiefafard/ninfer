@@ -170,6 +170,14 @@ advertised alias is the artifact `identity.model_id` by default, or the explicit
 override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
+Chat output allows one structural reasoning close. Requests with thinking disabled already start
+in the content phase and cannot generate the dedicated closing token as prose. Plain requests
+exclude that token through sampling; a speculative round commits through the reasoning close before
+resampling its continuation. Tool grammars reject closing-think markup in free prose, including
+byte-split forms, while preserving literal tags inside schema-constrained arguments. Response JSON
+constraints and raw completion output retain their literal contents. This is a framing guard, not
+text replacement: ordinary-token literal examples are retained in unconstrained text.
+
 For structured Qwen output, registered model stop tokens are excluded from selection while reasoning
 is open and after `</think>` until non-whitespace answer content begins. Tools-enabled output also
 excludes them for an ambiguous `<tool_call>` prefix and until its matching `</tool_call>` is
