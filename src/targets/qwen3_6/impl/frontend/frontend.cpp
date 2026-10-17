@@ -527,6 +527,10 @@ struct DecoderState {
     std::uint32_t reasoning_tokens = 0;
 };
 
+bool suppress_reasoning_end(const DecoderState& state, bool raw, bool grammar_managed) {
+    return !raw && !state.in_reasoning && !grammar_managed;
+}
+
 void track_structured_content(DecoderState& state, std::string_view text,
                               bool tool_output_enabled) {
     if (text.empty()) { return; }
@@ -758,6 +762,11 @@ public:
           token_grammar(tokenizer), processor(processor_options(resources)),
           vision_enabled(vision_enabled_) {
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
+        const auto closing = tokenizer->encode(kThinkClose);
+        if (closing.size() != 1 || tokenizer->decode_token_bytes(closing.front()) != kThinkClose) {
+            throw std::invalid_argument("tokenizer must encode the reasoning close as one token");
+        }
+        reasoning_end_token = closing.front();
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(
@@ -772,7 +781,8 @@ public:
     mutable fi::TokenGrammarCompiler token_grammar;
     fi::ProcessorOptions processor;
     StopPolicy defaults;
-    bool vision_enabled = true;
+    TokenId reasoning_end_token = -1;
+    bool vision_enabled         = true;
 };
 
 class OutputSession::Impl {
@@ -850,7 +860,7 @@ public:
     };
 
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning, bool tool_output_enabled_,
+         bool starts_in_reasoning, bool tool_output_enabled_, TokenId reasoning_end_token_,
          std::span<const TokenId> model_stop_tokens_,
          std::shared_ptr<const TokenGrammarData> grammar,
          std::shared_ptr<const GenerationRecoveryContext> recovery)
@@ -858,7 +868,7 @@ public:
           model_stop_tokens(model_stop_tokens_.begin(), model_stop_tokens_.end()),
           preserve_special(output.raw || output.preserve_special_tokens),
           preserve_model_stops(output.raw || output.preserve_special_tokens), raw(output.raw),
-          tool_output_enabled(tool_output_enabled_) {
+          tool_output_enabled(tool_output_enabled_), reasoning_end_token(reasoning_end_token_) {
         state.in_reasoning            = starts_in_reasoning && !output.raw;
         state.require_initial_content = !output.raw && (state.in_reasoning || tool_output_enabled);
         grammar_data                  = std::move(grammar);
@@ -882,10 +892,11 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::vector<TokenId> model_stop_tokens;
-    bool preserve_special     = false;
-    bool preserve_model_stops = false;
-    bool raw                  = false;
-    bool tool_output_enabled  = false;
+    bool preserve_special       = false;
+    bool preserve_model_stops   = false;
+    bool raw                    = false;
+    bool tool_output_enabled    = false;
+    TokenId reasoning_end_token = -1;
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;
@@ -1006,6 +1017,11 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                     std::to_string(token));
         }
 
+        if (suppress_reasoning_end(impl_->preview_state, impl_->raw,
+                                   impl_->grammar_data != nullptr) &&
+            token == impl_->reasoning_end_token) {
+            throw std::logic_error("sampler selected a reasoning close outside reasoning");
+        }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
 
         const bool stop_token =
@@ -1030,9 +1046,11 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         StopMatch match;
         const std::string_view bytes = impl_->tokenizer->decode_token_bytes(
             token, !impl_->preserve_special || (model_stop && !impl_->preserve_model_stops));
-        const bool was_reasoning = impl_->preview_state.in_reasoning;
-        const bool was_stripping = impl_->preview_state.strip_content_leading;
-        const bool was_tool      = in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
+        const bool was_reasoning      = impl_->preview_state.in_reasoning;
+        const bool was_end_suppressed = suppress_reasoning_end(impl_->preview_state, impl_->raw,
+                                                               impl_->grammar_data != nullptr);
+        const bool was_stripping      = impl_->preview_state.strip_content_leading;
+        const bool was_tool = in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match, impl_->tool_output_enabled);
         std::optional<OutputChannel> channel;
@@ -1063,6 +1081,13 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
             return complete(count, FinishReason::StopToken);
         }
 
+        // Following columns use the round's original exclusions. Commit through a framing
+        // transition, then sample the continuation in its updated eligibility domain.
+        if (was_end_suppressed != suppress_reasoning_end(impl_->preview_state, impl_->raw,
+                                                         impl_->grammar_data != nullptr) &&
+            index + 1 < tokens.size()) {
+            return complete(count, FinishReason::None);
+        }
         saw_tool_region =
             saw_tool_region || in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
         // A round sampled with model stops excluded cannot emit <|im_end|> after
@@ -1146,6 +1171,13 @@ bool OutputSession::in_reasoning() const noexcept {
 bool OutputSession::model_stop_tokens_allowed() const noexcept {
     return impl_ == nullptr ||
            model_stop_allowed(impl_->state, impl_->raw, impl_->tool_output_enabled);
+}
+
+std::optional<TokenId> OutputSession::suppressed_reasoning_end_token() const noexcept {
+    if (impl_ && suppress_reasoning_end(impl_->state, impl_->raw, impl_->grammar_data != nullptr)) {
+        return impl_->reasoning_end_token;
+    }
+    return std::nullopt;
 }
 
 bool OutputSession::reasoning_cycle_exclusion_allowed(TokenId token) const {
@@ -1450,8 +1482,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
-        prompt.data_->tool_output_enabled, impl_->defaults.token_ids, prompt.data_->token_grammar,
-        prompt.data_->generation_recovery));
+        prompt.data_->tool_output_enabled, impl_->reasoning_end_token, impl_->defaults.token_ids,
+        prompt.data_->token_grammar, prompt.data_->generation_recovery));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

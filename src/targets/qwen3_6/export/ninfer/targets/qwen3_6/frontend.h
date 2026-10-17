@@ -109,6 +109,10 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] bool in_reasoning() const noexcept;
     [[nodiscard]] bool model_stop_tokens_allowed() const noexcept;
+    // Chat sessions without a grammar exclude the dedicated close token after reasoning.
+    // Grammar sessions enforce framing in their matcher and retain literal argument values.
+    // Raw output and literal bytes encoded with ordinary tokens are unaffected.
+    [[nodiscard]] std::optional<TokenId> suppressed_reasoning_end_token() const noexcept;
     [[nodiscard]] bool reasoning_cycle_exclusion_allowed(TokenId token) const;
     [[nodiscard]] bool has_token_grammar() const noexcept;
     [[nodiscard]] std::span<const ToolCall> tool_calls() const noexcept;

@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <chrono>
@@ -67,6 +68,7 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
 
     // Both passes admit a mixed batch. The second also exercises cached compilation.
     for (int pass = 0; pass < 2; ++pass) {
+        ordinary.options.enable_thinking   = pass != 0;
         const auto prepare_start           = std::chrono::steady_clock::now();
         auto schema_prompt                 = engine.prepare(schema);
         auto grammar_prompt                = engine.prepare(grammar);
@@ -79,11 +81,16 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
         auto schema_handle                 = engine.submit(std::move(schema_prompt), schema_request,
                                                            ninfer::OutputDelivery::Streaming);
         auto grammar_handle                = engine.submit(std::move(grammar_prompt), request);
-        auto ordinary_handle               = engine.submit(std::move(ordinary_prompt), request);
+        auto ordinary_request              = request;
+        ordinary_request.execution.requested_output_tokens = pass == 0 ? 128 : 512;
+        ordinary_request.output.top_logprobs               = 3;
+        auto ordinary_handle = engine.submit(std::move(ordinary_prompt), ordinary_request,
+                                             ninfer::OutputDelivery::Streaming);
         ContentSink sink;
+        ContentSink ordinary_sink;
         const auto json  = schema_handle.wait(&sink);
         const auto ebnf  = grammar_handle.wait();
-        const auto text  = ordinary_handle.wait();
+        const auto text  = ordinary_handle.wait(&ordinary_sink);
         const auto value = nlohmann::json::parse(json.content);
         if (!value.is_object() || value.size() != 2 || value.at("answer") != "approved" ||
             value.at("count") != 3 || sink.text != json.content ||
@@ -96,10 +103,34 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
         }
         if (json.content_logprobs.empty() || json.content_logprobs.size() != sink.logprobs.size() ||
             json.content_logprobs.size() + 1 != json.generated_token_ids.size() ||
-            !json.reasoning_logprobs.empty() || !ebnf.content_logprobs.empty() ||
-            !text.content_logprobs.empty()) {
+            !json.reasoning_logprobs.empty() || !ebnf.content_logprobs.empty()) {
             std::cerr << "constrained output logprob attribution failed\n";
             return 1;
+        }
+        constexpr ninfer::TokenId reasoning_end = 248069;
+        const auto close_count = std::count(text.generated_token_ids.begin(),
+                                            text.generated_token_ids.end(), reasoning_end);
+        if (close_count != pass || text.content != ordinary_sink.text ||
+            text.content_logprobs.empty() ||
+            text.content_logprobs.size() != ordinary_sink.logprobs.size()) {
+            std::cerr << "plain output lost its close boundary, content, or streamed logprobs\n";
+            return 1;
+        }
+        for (std::size_t i = 0; i < text.content_logprobs.size(); ++i) {
+            const auto& record   = text.content_logprobs[i];
+            const auto& streamed = ordinary_sink.logprobs[i];
+            if (record.token == reasoning_end || record.token != streamed.token ||
+                record.logprob != streamed.logprob || !std::isfinite(record.logprob) ||
+                record.logprob > 0.0F || record.top_count != 3 || streamed.top_count != 3) {
+                std::cerr << "plain output channel attribution failed across reasoning close\n";
+                return 1;
+            }
+        }
+        for (const auto& record : text.reasoning_logprobs) {
+            if (record.token == reasoning_end || !std::isfinite(record.logprob)) {
+                std::cerr << "reasoning close leaked into reasoning logprobs\n";
+                return 1;
+            }
         }
         std::string recorded_text;
         for (std::size_t i = 0; i < json.content_logprobs.size(); ++i) {

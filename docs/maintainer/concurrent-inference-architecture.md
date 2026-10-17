@@ -1364,7 +1364,10 @@ row result
 prefix，不改变其他行的 commit result。
 
 A round sampled with model stop tokens excluded may commit only through the first completed
-`</tool_call>`; `resolve_pending_batch` then folds that shorter prefix.
+`</tool_call>`; `resolve_pending_batch` then folds that shorter prefix. A plain chat round also
+commits through its reasoning close before sampling the continuation with the dedicated closing
+token excluded. Tool grammars enforce the close boundary in their per-node matcher masks and reserve
+closing-think markup only in free prose; constrained argument values retain literal markup.
 
 MTP 的 target GDN 使用 ReplaySSM 时，GPU graph 只读 lane 的 current state 并写
 Program-owned raw records，不推进 committed GDN state。CPU output preview 得到每行最终提交长度后，

@@ -206,16 +206,8 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
-            if (!output.model_stop_tokens_allowed()) {
-                const auto& stop_ids = instance_.loaded->frontend.default_stop_policy().token_ids;
-                if (stop_ids.size() > options.execution.suppressed_token_ids.size()) {
-                    throw std::logic_error("model defines too many default stop tokens");
-                }
-                options.execution.suppressed_token_count =
-                    static_cast<std::uint32_t>(stop_ids.size());
-                std::copy(stop_ids.begin(), stop_ids.end(),
-                          options.execution.suppressed_token_ids.begin());
-            }
+            configure_output_suppression(output, options.execution,
+                                         !output.model_stop_tokens_allowed());
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 delivery, pending_deadline, submitted,
@@ -509,7 +501,7 @@ private:
               resident_prompt_tokens(summary.prompt_tokens), prepare_seconds(frontend_seconds),
               options(std::move(request_options)), delivery(output_delivery), deadline(limit),
               submitted(submit_time), pending_since(submit_time),
-              stop_suppression_active(options.execution.suppressed_token_count != 0) {
+              stop_suppression_active(!output.model_stop_tokens_allowed()) {
             if (generation_recovery && options.execution.sampling.p_less && !options.output.raw) {
                 recovery_context = output.generation_recovery_context();
             }
@@ -1172,11 +1164,7 @@ private:
 
         auto session = instance_.loaded->frontend.make_output_session(
             *spliced, request->options.stop, request->options.output);
-        if (!session.model_stop_tokens_allowed()) {
-            const auto& stops = instance_.loaded->frontend.default_stop_policy().token_ids;
-            execution.suppressed_token_count = static_cast<std::uint32_t>(stops.size());
-            std::copy(stops.begin(), stops.end(), execution.suppressed_token_ids.begin());
-        }
+        configure_output_suppression(session, execution, !session.model_stop_tokens_allowed());
         auto base = instance_.program->plan_request_base(*spliced, execution);
         const bool pages_ok =
             admission_resources_fit(base.summary().admission, request->admission_resources) &&
@@ -1249,7 +1237,7 @@ private:
         request->recovery_reasoning_begin = request->reasoning.size();
         request->recovery_generated_begin = request->generated.size();
         request->reasoning_cycle          = {};
-        request->stop_suppression_active  = execution.suppressed_token_count != 0;
+        request->stop_suppression_active  = !request->output.model_stop_tokens_allowed();
 
         using Route = targets::qwen3_6::RecoveryPrefillRoute;
         switch (decision.route) {
@@ -1379,20 +1367,51 @@ private:
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
 
+    void configure_output_suppression(const targets::qwen3_6::OutputSession& output,
+                                      ResolvedExecutionOptions& execution,
+                                      bool suppress_model_stops) const {
+        execution.suppressed_token_count = 0;
+        const auto append                = [&](TokenId token) {
+            auto& count = execution.suppressed_token_count;
+            if (count == execution.suppressed_token_ids.size()) {
+                throw std::logic_error("output policy exceeds sampling exclusion capacity");
+            }
+            execution.suppressed_token_ids[count++] = token;
+        };
+        if (suppress_model_stops) {
+            for (const TokenId token : instance_.loaded->frontend.default_stop_policy().token_ids) {
+                append(token);
+            }
+        }
+        if (const auto token = output.suppressed_reasoning_end_token()) { append(*token); }
+    }
+
     void enable_stop_suppression(const std::shared_ptr<Request>& request, std::uint32_t lane) {
         if (request->stop_suppression_active) { return; }
-        const auto& stop_ids = instance_.loaded->frontend.default_stop_policy().token_ids;
-        instance_.program->set_suppressed_tokens_lane(lane, stop_ids);
+        auto& execution = request->options.execution;
+        configure_output_suppression(request->output, execution, true);
+        instance_.program->set_suppressed_tokens_lane(
+            lane, std::span<const TokenId>(execution.suppressed_token_ids)
+                      .first(execution.suppressed_token_count));
         request->stop_suppression_active = true;
     }
 
     void synchronize_stop_suppression(const std::shared_ptr<Request>& request, std::uint32_t lane) {
-        const bool suppress = !request->output.model_stop_tokens_allowed();
-        if (suppress) {
-            enable_stop_suppression(request, lane);
-        } else if (request->stop_suppression_active) {
-            instance_.program->clear_suppressed_tokens_lane(lane);
-            request->stop_suppression_active = false;
+        auto& execution                  = request->options.execution;
+        const auto previous_ids          = execution.suppressed_token_ids;
+        const auto previous_count        = execution.suppressed_token_count;
+        request->stop_suppression_active = !request->output.model_stop_tokens_allowed();
+        configure_output_suppression(request->output, execution, request->stop_suppression_active);
+        if (previous_count != execution.suppressed_token_count ||
+            !std::equal(previous_ids.begin(), previous_ids.begin() + previous_count,
+                        execution.suppressed_token_ids.begin())) {
+            if (execution.suppressed_token_count == 0) {
+                instance_.program->clear_suppressed_tokens_lane(lane);
+            } else {
+                instance_.program->set_suppressed_tokens_lane(
+                    lane, std::span<const TokenId>(execution.suppressed_token_ids)
+                              .first(execution.suppressed_token_count));
+            }
         }
         instance_.program->set_typical_cycle_reasoning_lane(
             lane, generation_recovery_ && request->output.in_reasoning());

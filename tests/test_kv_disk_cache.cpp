@@ -7659,9 +7659,17 @@ int test_spill_crc_runs_without_index_mutex(ninfer::DeviceContext& ctx, ninfer::
             return fail("spill-crc-unlocked raw spill never reached its encode");
         }
         hold.arm();
-        const auto active   = disk.try_snapshot();
-        const bool visible  = active && active->spill_active &&
-                              active->spill_elapsed_seconds > 0.0 && active->captures == 1;
+        std::optional<q36::detail::KvDiskSnapshot> preparing;
+        const bool sampled = wait_pred(
+            [&] {
+                if (!preparing) { preparing = disk.try_snapshot(); }
+                return preparing.has_value();
+            },
+            std::chrono::seconds(2));
+        // Encoding precedes publication of the session; preparation is active without a session
+        // age.
+        const bool visible  = sampled && preparing && preparing->spill_active &&
+                              preparing->spill_elapsed_seconds == 0.0 && preparing->captures == 1;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
         if (!hold.disarm() || !admitted || !visible) {
             failures += fail("held spill blocked admission or hid its active snapshot");
@@ -7682,9 +7690,18 @@ int test_spill_crc_runs_without_index_mutex(ninfer::DeviceContext& ctx, ninfer::
             return fail("spill-crc-unlocked spill never reached its page-batch CRC build");
         }
         hold.arm();
+        std::optional<q36::detail::KvDiskSnapshot> active;
+        const bool sampled = wait_pred(
+            [&] {
+                if (!active) { active = disk.try_snapshot(); }
+                return active.has_value();
+            },
+            std::chrono::seconds(2));
+        const bool visible  = sampled && active && active->spill_active &&
+                              active->spill_elapsed_seconds > 0.0 && active->captures == 2;
         const bool admitted = disk_admission_round(disk, resident, resident_entry);
-        if (!hold.disarm() || !admitted) {
-            failures += fail("admission waited for a spill's page-batch CRC build");
+        if (!hold.disarm() || !admitted || !visible) {
+            failures += fail("installed spill blocked admission or hid its active snapshot");
         }
         hold.release();
         if (!wait_pred(
