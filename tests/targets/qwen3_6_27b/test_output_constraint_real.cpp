@@ -173,17 +173,16 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
 
 int main() {
     const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    const char* mtp    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS");
-    if (dflash == nullptr && mtp == nullptr) {
+    const char* base   = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
+    if (dflash == nullptr && base == nullptr) {
         std::cout << "SKIP: constrained-output Engine test needs a Qwen3.8 NVFP4 artifact\n";
         return 77;
     }
-    if (exercise(dflash != nullptr ? dflash : mtp, ninfer::SpeculativeBackend::None) != 0) {
+    if (exercise(dflash != nullptr ? dflash : base, ninfer::SpeculativeBackend::None) != 0) {
         return 1;
     }
     if (dflash != nullptr && exercise(dflash, ninfer::SpeculativeBackend::DFlash) != 0) {
         return 1;
     }
-    if (mtp != nullptr && exercise(mtp, ninfer::SpeculativeBackend::Mtp) != 0) { return 1; }
     return 0;
 }

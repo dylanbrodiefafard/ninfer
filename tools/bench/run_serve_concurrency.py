@@ -121,7 +121,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mode",
         action="append",
         choices=tuple(corpus.SPECULATIVE_MODES),
-        help="speculative mode; repeat to select multiple (default: mtp0 and mtp3)",
+        help="speculative mode; repeat to select multiple (default: ordinary and dflash7)",
     )
     parser.add_argument(
         "--sampling",
@@ -220,7 +220,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--adaptive-draft",
         action="store_true",
-        help="pass --adaptive-draft (live K); requires MTP or DFlash --mode",
+        help="pass --adaptive-draft (live K); requires a DFlash --mode",
     )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
@@ -229,7 +229,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--proposal-head",
         choices=("optimized", "full"),
         default="optimized",
-        help="DFlash/MTP proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
+        help="DFlash proposal head: optimized (--lm-head-draft) or full vocab (default: optimized)",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -558,9 +559,13 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     w.u32(kDiskFormatVersion);
     w.str(fp.model_id);
     w.str(fp.weights_id);
-    w.str(fp.artifact_file_identity);
+    w.str(fp.artifact_tensor_identity);
     w.u8(static_cast<std::uint8_t>(fp.kv_cache));
     w.u8(static_cast<std::uint8_t>(fp.speculative));
+    w.u8(fp.attention.sage_attn ? 1 : 0);
+    w.u32(std::bit_cast<std::uint32_t>(fp.attention.keep_frac));
+    w.u32(std::bit_cast<std::uint32_t>(fp.attention.xattn_tau));
+    w.i32(fp.attention.xattn_min_len);
     w.u32(fp.page_size);
     if (fp.text_planes.size() > std::numeric_limits<std::uint32_t>::max() ||
         fp.backend_planes.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -576,7 +581,6 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     w.u32(fp.cyclic_padded);
     w.i32(fp.cyclic_kv_heads);
     w.i32(fp.cyclic_head_dim);
-    w.i32(fp.cyclic_lane_capacity);
     w.u32(fp.snapshot_version);
     for (const DiskPlaneSchema& plane : fp.text_planes) { encode_plane_schema(w, plane); }
     for (const DiskPlaneSchema& plane : fp.backend_planes) { encode_plane_schema(w, plane); }
@@ -594,9 +598,13 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     DiskFingerprint fp;
     fp.model_id                             = r.str();
     fp.weights_id                           = r.str();
-    fp.artifact_file_identity               = r.str();
+    fp.artifact_tensor_identity             = r.str();
     fp.kv_cache                             = static_cast<KvCacheStorage>(r.u8());
     fp.speculative                          = static_cast<SpeculativeBackend>(r.u8());
+    fp.attention.sage_attn                  = r.u8() != 0;
+    fp.attention.keep_frac                  = std::bit_cast<float>(r.u32());
+    fp.attention.xattn_tau                  = std::bit_cast<float>(r.u32());
+    fp.attention.xattn_min_len              = r.i32();
     fp.page_size                            = r.u32();
     const std::uint32_t text_plane_count    = r.u32();
     const std::uint32_t backend_plane_count = r.u32();
@@ -608,7 +616,6 @@ void encode_plane_schema(OutBuf& w, const DiskPlaneSchema& plane) {
     fp.cyclic_padded                        = r.u32();
     fp.cyclic_kv_heads                      = r.i32();
     fp.cyclic_head_dim                      = r.i32();
-    fp.cyclic_lane_capacity                 = r.i32();
     fp.snapshot_version                     = r.u32();
     const std::uint64_t plane_count =
         static_cast<std::uint64_t>(text_plane_count) + backend_plane_count;
@@ -854,10 +861,17 @@ void compare_fingerprint_field(bool ok, const char* field) {
 void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want) {
     compare_fingerprint_field(have.model_id == want.model_id, "model_id");
     compare_fingerprint_field(have.weights_id == want.weights_id, "weights_id");
-    compare_fingerprint_field(have.artifact_file_identity == want.artifact_file_identity,
-                              "artifact_file_identity");
+    compare_fingerprint_field(have.artifact_tensor_identity == want.artifact_tensor_identity,
+                              "artifact_tensor_identity");
     compare_fingerprint_field(have.kv_cache == want.kv_cache, "kv_cache");
     compare_fingerprint_field(have.speculative == want.speculative, "speculative");
+    compare_fingerprint_field(have.attention.sage_attn == want.attention.sage_attn, "sage_attn");
+    compare_fingerprint_field(have.attention.keep_frac == want.attention.keep_frac, "keep_frac");
+    compare_fingerprint_field(have.attention.xattn_tau == want.attention.xattn_tau, "xattn_tau");
+    if (want.attention.xattn_tau < 1.0f) {
+        compare_fingerprint_field(have.attention.xattn_min_len == want.attention.xattn_min_len,
+                                  "xattn_min_len");
+    }
     compare_fingerprint_field(have.page_size == want.page_size, "page_size");
     compare_fingerprint_field(have.text_planes.size() == want.text_planes.size(),
                               "text_plane_count");
@@ -873,8 +887,6 @@ void check_fingerprint(const DiskFingerprint& have, const DiskFingerprint& want)
     compare_fingerprint_field(have.cyclic_padded == want.cyclic_padded, "cyclic_padded");
     compare_fingerprint_field(have.cyclic_kv_heads == want.cyclic_kv_heads, "cyclic_kv_heads");
     compare_fingerprint_field(have.cyclic_head_dim == want.cyclic_head_dim, "cyclic_head_dim");
-    compare_fingerprint_field(have.cyclic_lane_capacity == want.cyclic_lane_capacity,
-                              "cyclic_lane_capacity");
     compare_fingerprint_field(have.snapshot_version == want.snapshot_version, "snapshot_version");
     compare_fingerprint_field(have.text_planes == want.text_planes, "text_plane_schema");
     compare_fingerprint_field(have.backend_planes == want.backend_planes, "backend_plane_schema");
@@ -1050,18 +1062,19 @@ try_decode_tombstone(const std::vector<std::uint8_t>& bytes) {
 } // namespace
 
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
-                                      std::string artifact_file_identity, KvCacheStorage kv_cache,
+                                      std::string artifact_tensor_identity, KvCacheStorage kv_cache,
                                       SpeculativeBackend speculative, const PagedKVPool& text,
                                       const PagedKVPool* backend,
                                       const LinearAttentionStatePool* gdn,
-                                      const CyclicKVCache* cyclic) {
+                                      const CyclicKVCache* cyclic, DiskAttentionProfile attention) {
     DiskFingerprint fp;
-    fp.model_id               = std::move(model_id);
-    fp.weights_id             = std::move(weights_id);
-    fp.artifact_file_identity = std::move(artifact_file_identity);
-    fp.kv_cache               = kv_cache;
-    fp.speculative            = speculative;
-    fp.page_size              = static_cast<std::uint32_t>(kPagedKVPageSize);
+    fp.model_id                 = std::move(model_id);
+    fp.weights_id               = std::move(weights_id);
+    fp.artifact_tensor_identity = std::move(artifact_tensor_identity);
+    fp.kv_cache                 = kv_cache;
+    fp.speculative              = speculative;
+    fp.attention                = attention;
+    fp.page_size                = static_cast<std::uint32_t>(kPagedKVPageSize);
     fp.text_planes.reserve(text.plane_count());
     for (std::size_t i = 0; i < text.plane_count(); ++i) {
         fp.text_planes.push_back(make_plane_schema(text.plane(i), text.plane_order()));
@@ -1078,19 +1091,24 @@ DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_
         fp.gdn_recurrent_bytes = gdn->recurrent_host_image_bytes();
     }
     if (cyclic != nullptr) {
-        fp.cyclic_lane_bytes    = cyclic->lane_host_bytes();
-        fp.cyclic_layers        = cyclic->layer_count();
-        fp.cyclic_capacity      = cyclic->capacity();
-        fp.cyclic_padded        = cyclic->padded_capacity();
-        fp.cyclic_kv_heads      = cyclic->num_kv_heads();
-        fp.cyclic_head_dim      = cyclic->head_dim();
-        fp.cyclic_lane_capacity = cyclic->lane_capacity();
+        fp.cyclic_lane_bytes = cyclic->lane_host_bytes();
+        fp.cyclic_layers     = cyclic->layer_count();
+        fp.cyclic_capacity   = cyclic->capacity();
+        fp.cyclic_padded     = cyclic->padded_capacity();
+        fp.cyclic_kv_heads   = cyclic->num_kv_heads();
+        fp.cyclic_head_dim   = cyclic->head_dim();
     }
     fp.snapshot_version = kDiskFormatVersion;
     return fp;
 }
 
 KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
+    if (config_.fingerprint.attention.xattn_min_len < 0) {
+        throw std::invalid_argument("KV disk cache requires a non-negative xattn_min_len");
+    }
+    validate_sparse_attn_flags(
+        config_.fingerprint.kv_cache, config_.fingerprint.attention.sage_attn,
+        config_.fingerprint.attention.keep_frac, config_.fingerprint.attention.xattn_tau);
     test_fault_point_.store(config_.test_fault_point, std::memory_order_relaxed);
     if (config_.capacity_bytes == 0) {
         throw std::invalid_argument("KV disk cache requires a positive capacity");
@@ -1098,8 +1116,8 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
     if (config_.location.empty()) {
         throw std::invalid_argument("KV disk cache requires a location");
     }
-    if (config_.fingerprint.artifact_file_identity.empty()) {
-        throw std::invalid_argument("KV disk cache requires an artifact_file_identity");
+    if (config_.fingerprint.artifact_tensor_identity.empty()) {
+        throw std::invalid_argument("KV disk cache requires an artifact_tensor_identity");
     }
     const std::size_t page_bytes = std::max<std::size_t>(config_.logical_page_bytes, 256);
     const std::uint32_t readers  = std::min(

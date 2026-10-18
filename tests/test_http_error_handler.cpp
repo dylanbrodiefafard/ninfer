@@ -79,7 +79,7 @@ int main() {
         } catch (const ninfer::serve::ApiException& error) { return error.error().status; }
     };
     failures += check(
-        ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::Mtp) &&
+        !ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::Mtp) &&
             ninfer::context_checkpoint_capture_available(true,
                                                          ninfer::SpeculativeBackend::DFlash) &&
             !ninfer::context_checkpoint_capture_available(true, ninfer::SpeculativeBackend::None) &&
@@ -89,11 +89,12 @@ int main() {
                               "context_checkpoint_unavailable" &&
                           capture_status(true, true, ninfer::SpeculativeBackend::None) == 400,
                       "no-spec capture did not return HTTP 400 context_checkpoint_unavailable");
-    failures += check(capture_code(true, false, ninfer::SpeculativeBackend::Mtp) ==
+    failures += check(capture_code(true, false, ninfer::SpeculativeBackend::DFlash) ==
                           "context_checkpoint_unavailable",
                       "--no-prefix-reuse capture did not return context_checkpoint_unavailable");
     failures += check(capture_code(false, true, ninfer::SpeculativeBackend::None).empty() &&
-                          capture_code(true, true, ninfer::SpeculativeBackend::Mtp).empty() &&
+                          capture_code(true, true, ninfer::SpeculativeBackend::Mtp) ==
+                              "context_checkpoint_unavailable" &&
                           capture_code(true, true, ninfer::SpeculativeBackend::DFlash).empty(),
                       "available or unrequested capture was rejected");
 

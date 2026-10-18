@@ -16,20 +16,11 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.max_context                = 4096;
     options.kv_capacity                = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk              = 1024;
-    options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.backend        = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens   = 3;
     options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
     options.speculative.adaptive_draft = true;
     options.enable_vision              = true;
-    return options;
-}
-
-ninfer::EngineOptions dflash_engine_options(const char* artifact) {
-    ninfer::EngineOptions options     = engine_options(artifact);
-    options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
-    options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    options.enable_vision             = false;
     return options;
 }
 
@@ -893,23 +884,24 @@ int exercise_vision(ninfer::Engine& engine) {
         return 1;
     }
 
-    ninfer::RequestOptions mtp_options            = options(false);
-    mtp_options.execution.requested_output_tokens = 5;
-    const ninfer::GenerationResult mtp_baseline =
-        engine.generate(engine.prepare(first_input(image_bytes)), mtp_options);
-    if (mtp_baseline.generated_token_ids.size() != 5 ||
-        mtp_baseline.generated_token_ids[0] == mtp_baseline.generated_token_ids[1]) {
+    ninfer::RequestOptions speculative_options            = options(false);
+    speculative_options.execution.requested_output_tokens = 5;
+    const ninfer::GenerationResult speculative_baseline =
+        engine.generate(engine.prepare(first_input(image_bytes)), speculative_options);
+    if (speculative_baseline.generated_token_ids.size() != 5 ||
+        speculative_baseline.generated_token_ids[0] ==
+            speculative_baseline.generated_token_ids[1]) {
         std::cerr << "multimodal stop fixture did not produce distinct leading tokens\n";
         return 1;
     }
-    ninfer::RequestOptions stop_options = mtp_options;
-    stop_options.stop.token_ids.push_back(mtp_baseline.generated_token_ids[1]);
+    ninfer::RequestOptions stop_options = speculative_options;
+    stop_options.stop.token_ids.push_back(speculative_baseline.generated_token_ids[1]);
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare(first_input(image_bytes)), stop_options);
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
         stopped.generated_token_ids.size() != 2 ||
-        stopped.generated_token_ids[0] != mtp_baseline.generated_token_ids[0] ||
-        stopped.generated_token_ids[1] != mtp_baseline.generated_token_ids[1]) {
+        stopped.generated_token_ids[0] != speculative_baseline.generated_token_ids[0] ||
+        stopped.generated_token_ids[1] != speculative_baseline.generated_token_ids[1]) {
         std::cerr << "multimodal custom stop did not terminate at the selected token\n";
         return 1;
     }
@@ -1066,61 +1058,14 @@ int main(int argc, char** argv) {
         std::cerr << "usage: prefix_real [--case vision|mrope-rewrite]\n";
         return 1;
     }
-    const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-    const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-    const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
-        (dflash == nullptr || *dflash == '\0')) {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
-                     "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
-                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
+    const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+    if (dflash == nullptr || *dflash == '\0') {
+        std::cout << "skip: set NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
         return 77;
     }
-    if (mrope_only) {
-        if (dflash == nullptr || *dflash == '\0') {
-            std::cerr << "mrope rewrite requires NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
-            return 77;
-        }
-        auto options          = dflash_engine_options(dflash);
-        options.enable_vision = true;
-        ninfer::Engine engine(options);
-        return exercise_mrope_rewrite(engine);
+    if (vision_only || mrope_only) {
+        ninfer::Engine engine(engine_options(dflash));
+        return vision_only ? exercise_vision(engine) : exercise_mrope_rewrite(engine);
     }
-    if (vision_only && (groupwise == nullptr || *groupwise == '\0') &&
-        (nvfp4 == nullptr || *nvfp4 == '\0')) {
-        std::cerr << "vision case requires the MTP artifact\n";
-        return 1;
-    }
-    if (groupwise != nullptr && *groupwise != '\0') {
-        if (vision_only) {
-            ninfer::Engine engine(engine_options(groupwise));
-            if (const int result = exercise_vision(engine); result != 0) { return result; }
-        } else if (const int result = exercise_artifact(groupwise); result != 0) {
-            return result;
-        }
-    }
-    if (nvfp4 != nullptr && *nvfp4 != '\0') {
-        if (vision_only) {
-            ninfer::Engine engine(engine_options(nvfp4));
-            if (const int result = exercise_vision(engine); result != 0) { return result; }
-        } else if (const int result = exercise_artifact(nvfp4); result != 0) {
-            return result;
-        }
-    }
-    if (!vision_only && dflash != nullptr && *dflash != '\0') {
-        ninfer::Engine engine(dflash_engine_options(dflash));
-        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-        std::cerr << "dflash cancel retain\n";
-        if (const int result = exercise_cancel_retain_rollback(engine); result != 0) {
-            return result;
-        }
-        if (const int result = exercise_prefill_cancel_keeps_checkpoint(engine); result != 0) {
-            return result;
-        }
-        if (const int result = exercise_append_cancel_keeps_turn_rollback(engine); result != 0) {
-            return result;
-        }
-    }
-    std::cout << "ok\n";
-    return 0;
+    return exercise_artifact(dflash);
 }

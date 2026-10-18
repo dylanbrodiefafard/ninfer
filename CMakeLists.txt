@@ -83,6 +83,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 include(cmake/xgrammar.cmake)
 # After the third-party xgrammar target, so its sources keep their upstream diagnostics.
 include(cmake/warnings.cmake)

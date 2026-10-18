@@ -37,7 +37,7 @@ def test_schema_v14_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "max_context": 4096,
                     "prefill_chunk": 1024,
                     "kv_cache": "int8-group64",
-                    "spec": "mtp",
+                    "spec": "dflash",
                     "draft_tokens": 5,
                     "dflash_verify_width": 0,
                     "proposal_head": "optimized",
@@ -107,7 +107,7 @@ def test_schema_v14_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["cuda_graph_allowance_bytes"] == 150_000_000
     assert row["workspace_peak_bytes"] == 1_048_576
     assert row["workspace_allocator_peak_bytes"] == 524_288
-    assert (row["spec"], row["draft_tokens"], row["dflash_verify_width"]) == ("mtp", 5, 0)
+    assert (row["spec"], row["draft_tokens"], row["dflash_verify_width"]) == ("dflash", 5, 0)
     assert row["prefill_active_tok_s_mean"] is None
     assert row["decode_output_tok_s_mean"] == 4.5
     assert row["decode_engine_tok_s_mean"] == 7.5

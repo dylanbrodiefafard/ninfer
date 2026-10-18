@@ -22,7 +22,7 @@ inline constexpr char kDiskTombstoneMagic[8]   = {'N', 'I', 'D', 'K', 'T', 'B', 
 inline constexpr char kDiskPackSetMagic[8]     = {'N', 'I', 'D', 'K', 'P', 'S', '0', '1'};
 inline constexpr char kDiskObjectMapMagic[8]   = {'N', 'I', 'D', 'K', 'O', 'M', '0', '1'};
 
-inline constexpr std::uint32_t kDiskFormatVersion         = 6;
+inline constexpr std::uint32_t kDiskFormatVersion         = 7;
 inline constexpr std::uint32_t kDiskPageHeaderBytes       = 16;
 inline constexpr std::uint32_t kDiskPageIoAlignment       = 4096;
 inline constexpr std::uint32_t kDiskCodecHeaderBytes      = 24;
@@ -87,12 +87,20 @@ struct DiskPlaneSchema {
     [[nodiscard]] bool operator==(const DiskPlaneSchema&) const = default;
 };
 
+struct DiskAttentionProfile {
+    bool sage_attn             = false;
+    float keep_frac            = 1.0f;
+    float xattn_tau            = 1.0f;
+    std::int32_t xattn_min_len = kDefaultXattnMinLen;
+};
+
 struct DiskFingerprint {
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     std::string model_id;
     std::string weights_id;
-    KvCacheStorage kv_cache           = KvCacheStorage::Nvfp4;
-    SpeculativeBackend speculative    = SpeculativeBackend::None;
+    KvCacheStorage kv_cache        = KvCacheStorage::Nvfp4;
+    SpeculativeBackend speculative = SpeculativeBackend::None;
+    DiskAttentionProfile attention;
     std::uint32_t page_size           = static_cast<std::uint32_t>(kPagedKVPageSize);
     std::uint64_t gdn_conv_bytes      = 0;
     std::uint64_t gdn_recurrent_bytes = 0;
@@ -102,7 +110,6 @@ struct DiskFingerprint {
     std::uint32_t cyclic_padded       = 0;
     std::int32_t cyclic_kv_heads      = 0;
     std::int32_t cyclic_head_dim      = 0;
-    std::int32_t cyclic_lane_capacity = 0;
     std::uint32_t snapshot_version    = kDiskFormatVersion;
     std::vector<DiskPlaneSchema> text_planes;
     std::vector<DiskPlaneSchema> backend_planes;

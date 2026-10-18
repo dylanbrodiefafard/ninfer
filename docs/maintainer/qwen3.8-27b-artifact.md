@@ -1,5 +1,8 @@
 # Qwen3.8-27B artifact contract
 
+MTP tensors and conversion recipes remain artifact contracts. MTP execution is disabled;
+ordinary decoding and DFlash2 are the available Engine routes.
+
 This document defines the registered `qwen3.8-27b/groupwise-int` and `qwen3.8-27b/nvfp4`
 artifacts: identity, persistent inventory, conversion entry point, and Engine binding. Model
 mathematics, dimensions, frontend semantics, and state behavior are defined by
@@ -25,8 +28,8 @@ target_key = qwen3_8_27b
 Each artifact contains Text, the optimized MTP draft head, MTP, Vision, and six frontend
 resources. A Qwen3.8-27B NVFP4 file may additionally append 66 DFlash2 objects under `dflash/`.
 Those objects are inventory-conditional: current MTP-only 3.8 files and all 3.6-27B files remain
-valid. `--spec dflash` requires the appended companion; `--spec mtp` on a reconverted file still
-works (DFlash tensors stay host-placed). The identity is read from the version-2 artifact
+valid for ordinary decoding and artifact validation. `--spec dflash` requires the appended
+companion. MTP execution is disabled. The identity is read from the version-2 artifact
 directory; filenames and object counts do not select the target or weight profile.
 
 ## 2. Persistent inventory
@@ -124,9 +127,11 @@ perplexity optimality or elimination of reasoning loops.
 
 ### Mixed FP8/NVFP4 storage profile
 
-Different files under the same artifact identity must not exchange retained numerical state.
-KV disk format v6 binds the opened artifact's local file generation; use a fresh cache directory
-when switching to a composed mixed or selective variant. Old cache directories are not deleted.
+Different numerical tensor inventories under the same artifact identity must not exchange retained
+state. KV disk format v7 binds retained-state tensor descriptors and selected encoded contents with
+SHA-256; use a fresh
+cache directory when switching to a composed mixed or selective variant. Copies of identical
+tensors remain compatible. Old cache directories are not deleted.
 
 The characterized neroued/Unsloth base uses the same `qwen3.8-27b/nvfp4`
 identity with a distinct, validated Text inventory. Its vocabulary endpoints,

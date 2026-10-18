@@ -11,7 +11,7 @@ runs the same cells against every entry and prints a side-by-side table.
 
 Usage (inside the GPU container with the build tree):
   python3 tools/bench/run_kernel_sweep.py --bin-dir /build-dev \
-      --weights /models/qwen3_8_27b_nvfp4.ninfer
+      --weights /models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer
   python3 tools/bench/run_kernel_sweep.py --bench ppl --kernels cpasync,tma-s2
 """
 
@@ -58,9 +58,13 @@ SPEED_CASES_CORE: list[tuple[str, str, list[str]]] = [
     (
         "prefill",
         "prefill_p8192_k3",
-        ["-p", "8192", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"],
+        ["-p", "8192", "--spec", "dflash", "--draft-tokens", "3", "--lm-head-draft"],
     ),
-    ("decode", "tg64_k3", ["-n", "64", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    (
+        "decode",
+        "tg64_k3",
+        ["-n", "64", "--spec", "dflash", "--draft-tokens", "3", "--lm-head-draft"],
+    ),
     (
         "ctx",
         "ctx_p8192_g64_k3",
@@ -70,7 +74,7 @@ SPEED_CASES_CORE: list[tuple[str, str, list[str]]] = [
             "--max-ctx",
             "8256",
             "--spec",
-            "mtp",
+            "dflash",
             "--draft-tokens",
             "3",
             "--lm-head-draft",
@@ -81,14 +85,18 @@ SPEED_CASES_SMOKE: list[tuple[str, str, list[str]]] = [
     (
         "prefill",
         "prefill_p1024_k3",
-        ["-p", "1024", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"],
+        ["-p", "1024", "--spec", "dflash", "--draft-tokens", "3", "--lm-head-draft"],
     ),
-    ("decode", "tg16_k3", ["-n", "16", "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft"]),
+    (
+        "decode",
+        "tg16_k3",
+        ["-n", "16", "--spec", "dflash", "--draft-tokens", "3", "--lm-head-draft"],
+    ),
 ]
 
 WEIGHTS_CANDIDATES = [
-    "/models/qwen3_8_27b_nvfp4.ninfer",
-    str(REPO_ROOT / "out/qwen3_6_27b.ninfer"),
+    "/models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer",
+    str(REPO_ROOT / "models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer"),
 ]
 PPL_CORPUS_CANDIDATES = ["/tmp/corpus.ids", str(REPO_ROOT / "tools/ppl/corpus.ids")]
 BENCH_CORPUS_CANDIDATES = [

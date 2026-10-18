@@ -263,9 +263,7 @@ std::uint32_t BenchTest::required_context(const SpeculativeOptions& spec) const 
         static_cast<std::uint64_t>(kind == TestKind::Decode ? kDecodeSeedTokens : n_prompt);
     const std::uint64_t decode = static_cast<std::uint64_t>(has_decode() ? n_gen : 0);
     std::uint64_t margin       = 0;
-    if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::Mtp) {
-        margin = 2ULL * spec.draft_tokens;
-    } else if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::DFlash) {
+    if (spec.draft_tokens != 0 && spec.backend == SpeculativeBackend::DFlash) {
         // 27B DFlash2 is chain W=k+1. An explicit dflash_verify_width wins. Two
         // verify-widths of headroom cover the transient uncommitted round state.
         const std::uint32_t width =
@@ -302,12 +300,12 @@ std::string usage_text(std::string_view program) {
         << "  --concurrency <1..6>        concurrent Engine lanes (default: 1);\n"
         << "                              pp+tg at C>1 reports batched decode after a sequential\n"
         << "                              prefix-reuse seed so prefill/decode do not interleave\n"
-        << "  --spec <mtp|dflash>       speculative backend (default: mtp); dflash requires\n"
+        << "  --spec <dflash>           speculative backend (default: off); dflash requires\n"
         << "                              the artifact to contain dflash/ objects\n"
-        << "  --draft-tokens <0..7>     speculative draft window: mtp [0,5] (0 = none),\n"
+        << "  --draft-tokens <0..7>     speculative draft window:\n"
         << "                              dflash [1,7] (default: 0)\n"
         << "  --adaptive-draft            pick live K by E[Y]/T(k,C,L): DFlash {3..N} for N>=5, "
-           "MTP {3..5}, within the captured set\n"
+           "within the captured set\n"
         << "  --dflash-verify-width <2..16> DFlash packed verify width; 0 = k-dependent\n"
         << "                              default (dflash only)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires "
@@ -378,12 +376,10 @@ BenchOptions parse_args(int argc, char** argv) {
             }
         } else if (arg == "--spec") {
             const std::string selected = value("--spec");
-            if (selected == "mtp") {
-                options.spec_backend = SpeculativeBackend::Mtp;
-            } else if (selected == "dflash") {
+            if (selected == "dflash") {
                 options.spec_backend = SpeculativeBackend::DFlash;
             } else {
-                throw std::invalid_argument("--spec must be mtp or dflash");
+                throw std::invalid_argument("--spec must be dflash");
             }
         } else if (arg == "--draft-tokens") {
             options.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens", true);
@@ -432,9 +428,9 @@ BenchOptions parse_args(int argc, char** argv) {
     }
     validate_sparse_attn_flags(options.kv_cache, options.sage_attn, options.keep_frac,
                                options.xattn_tau);
-    if (options.spec_backend == SpeculativeBackend::Mtp &&
-        options.draft_tokens > kMaxMtpDraftTokens) {
-        throw std::invalid_argument("--spec mtp requires --draft-tokens in [0,5]");
+    validate_speculative_backend(options.spec_backend);
+    if (options.spec_backend == SpeculativeBackend::None && options.draft_tokens != 0) {
+        throw std::invalid_argument("--draft-tokens requires --spec dflash");
     }
     if (options.spec_backend == SpeculativeBackend::DFlash &&
         (options.draft_tokens == 0 || options.draft_tokens > kMaxDFlashDraftTokens)) {
@@ -450,8 +446,7 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--lm-head-draft requires --draft-tokens greater than zero");
     }
     if (options.adaptive_draft && options.draft_tokens == 0) {
-        throw std::invalid_argument(
-            "--adaptive-draft requires --spec mtp|dflash and --draft-tokens");
+        throw std::invalid_argument("--adaptive-draft requires --spec dflash and --draft-tokens");
     }
     return options;
 }
@@ -559,8 +554,7 @@ std::vector<TokenId> prompt_slice(const std::vector<TokenId>& corpus, int n_prom
 std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec) {
     std::string suffix = use_cuda_graph ? "cuda_graph" : "eager";
     if (spec.draft_tokens == 0) { return suffix; }
-    const std::string kind = spec.backend == SpeculativeBackend::DFlash ? "dflash" : "mtp";
-    return kind + "_" + suffix;
+    return "dflash_" + suffix;
 }
 
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& spec) {

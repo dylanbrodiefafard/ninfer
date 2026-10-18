@@ -1,6 +1,7 @@
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
+#include "targets/qwen3_6_35b_a3b/impl/config.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -93,6 +94,40 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 }
 
 } // namespace
+
+std::vector<artifact::TensorContentSelection>
+cache_tensor_selections(const artifact::Reader& reader, qwen3_6::StartupFeatures features) {
+    validate_speculative_backend(features.speculative);
+    std::vector<artifact::TensorContentSelection> selections;
+    for (const auto& object : reader.objects()) {
+        const auto* tensor = std::get_if<artifact::TensorDescriptor>(&object);
+        if (tensor == nullptr) { continue; }
+        const std::string_view name = tensor->name;
+        const auto whole            = [&] { selections.push_back({name, std::nullopt}); };
+        const auto rows             = [&](std::uint64_t first, std::uint64_t count) {
+            selections.push_back({name, artifact::TensorRowRange{first, count}});
+        };
+        if (name.starts_with("text/")) {
+            if (name != "text/output_head" && name != "text/draft_head" &&
+                name != "text/draft_head_token_ids") {
+                whole();
+            }
+        } else if (name.starts_with("vision/")) {
+            // A directory can retain media entries across Vision on/off reopens.
+            whole();
+        } else if (features.dflash() && name.starts_with("dflash/")) {
+            if (name == "dflash/feature_projection" || name == "dflash/context_norm" ||
+                name.ends_with("/attention/key_norm")) {
+                whole();
+            } else if (name.ends_with("/attention/query_key_value")) {
+                // Context append projects the same target features independently at each
+                // layer. Query, selector, output, and MLP paths produce proposals only.
+                rows(DFlashConfig::query_size, 2 * DFlashConfig::kv_size);
+            }
+        }
+    }
+    return selections;
+}
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;

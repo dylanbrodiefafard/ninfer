@@ -28,12 +28,7 @@ TARGET_MODEL_IDS = {
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
-    "mtp0": ("none", 0, 0),
-    "mtp1": ("mtp", 1, 0),
-    "mtp2": ("mtp", 2, 0),
-    "mtp3": ("mtp", 3, 0),
-    "mtp4": ("mtp", 4, 0),
-    "mtp5": ("mtp", 5, 0),
+    "ordinary": ("none", 0, 0),
     "dflash1": ("dflash", 1, 0),
     "dflash2": ("dflash", 2, 0),
     "dflash3": ("dflash", 3, 0),
@@ -44,7 +39,7 @@ SPECULATIVE_MODES = {
     "dflash7": ("dflash", 7, 0),
     "dflash11": ("dflash", 11, 0),
 }
-DEFAULT_MODES = ("mtp0", "mtp3")
+DEFAULT_MODES = ("ordinary", "dflash7")
 SAMPLING_MODES = ("stochastic", "p-less", "greedy")
 
 SEEDS = (
@@ -306,7 +301,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--mode",
         action="append",
         choices=tuple(SPECULATIVE_MODES),
-        help="benchmark only this mode; repeat to select multiple (default: mtp0 and mtp3)",
+        help="benchmark only this mode; repeat to select multiple (default: ordinary and dflash7)",
     )
     parser.add_argument(
         "--fixture",
@@ -415,7 +410,7 @@ def block_fixture_names(speculative_backend: str) -> tuple[str, ...]:
     scenarios = tuple(name for names in SCENARIO_FIXTURES.values() for name in names)
     if speculative_backend == "none":
         return NIAH_FIXTURES
-    if speculative_backend in {"mtp", "dflash"}:
+    if speculative_backend == "dflash":
         return (*LONG_DECODE_FIXTURES, *scenarios)
     raise CampaignError(f"unsupported speculative backend: {speculative_backend}")
 
@@ -1105,11 +1100,9 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
 def mode_display_name(mode_name: str) -> str:
     if mode_name not in SPECULATIVE_MODES:
         raise CampaignError(f"unsupported summary mode: {mode_name}")
-    backend, draft_tokens, _verify_width = SPECULATIVE_MODES[mode_name]
+    backend, _draft_tokens, _verify_width = SPECULATIVE_MODES[mode_name]
     if backend == "none":
-        return "MTP0"
-    if backend == "mtp":
-        return f"MTP{draft_tokens}"
+        return "Ordinary"
     if mode_name == "dflash3":
         return "DFlash k=3 W=4 chain"
     if mode_name == "dflash4":

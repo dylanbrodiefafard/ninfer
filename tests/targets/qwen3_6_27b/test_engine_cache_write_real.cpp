@@ -196,21 +196,6 @@ void disposable_promotion(const char* artifact) {
             "promoted state was not eligible for RAM capture");
 }
 
-void mtp_single_token_fork(const char* artifact) {
-    ninfer::Engine engine(fork_config(artifact, 2, ninfer::SpeculativeBackend::Mtp));
-    auto ordinary                              = request_options();
-    ordinary.execution.requested_output_tokens = 1;
-    (void)engine.generate(engine.prepare_tokens({198}), ordinary);
-    auto disposable                  = ordinary;
-    disposable.execution.cache_write = false;
-    const auto fork = engine.generate(engine.prepare_tokens({198, 3000}), disposable);
-    require(fork.reused_prompt_tokens == 1 &&
-                fork.prefix_reuse_source == ninfer::PrefixReuseSource::VramResident,
-            "MTP fork did not support an empty backend KV frontier");
-    const auto continued = engine.generate(engine.prepare_tokens({198, 4000}), ordinary);
-    require(continued.reused_prompt_tokens == 1, "single-token MTP fork changed its original");
-}
-
 void concurrent_original_and_fork(const char* artifact, ninfer::SpeculativeBackend backend) {
     ninfer::Engine engine(fork_config(artifact, 2, backend));
     std::vector<ninfer::TokenId> original(67, 198);
@@ -377,32 +362,24 @@ void disk_forks_and_shutdown(const char* artifact) {
 
 int main() {
     const char* dflash     = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    const char* mtp        = std::getenv("NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS");
+    const char* base       = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const bool have_dflash = dflash != nullptr && *dflash != '\0';
-    const bool have_mtp    = mtp != nullptr && *mtp != '\0';
-    if (!have_dflash && !have_mtp) {
-        std::cout << "skip: set a supported NVFP4 DFlash or MTP artifact environment variable\n";
+    if (!have_dflash && (base == nullptr || *base == '\0')) {
+        std::cout << "skip: set a supported NVFP4 artifact environment variable\n";
         return 77;
     }
-    const char* artifact = have_dflash ? dflash : mtp;
+    const char* artifact = have_dflash ? dflash : base;
     try {
         ordinary_continuation(artifact, 1);
         ordinary_continuation(artifact, 2);
         disposable_fork(artifact, 1, ninfer::SpeculativeBackend::None, false);
         disposable_fork(artifact, 2, ninfer::SpeculativeBackend::None, false);
-        for (const auto backend :
-             {ninfer::SpeculativeBackend::Mtp, ninfer::SpeculativeBackend::DFlash}) {
-            const char* speculative_artifact =
-                backend == ninfer::SpeculativeBackend::Mtp ? mtp : dflash;
-            if (!(backend == ninfer::SpeculativeBackend::Mtp ? have_mtp : have_dflash)) {
-                continue;
-            }
+        if (have_dflash) {
             for (const auto lanes : {1U, 2U}) {
-                disposable_fork(speculative_artifact, lanes, backend, false);
-                disposable_fork(speculative_artifact, lanes, backend, true);
+                disposable_fork(dflash, lanes, ninfer::SpeculativeBackend::DFlash, false);
+                disposable_fork(dflash, lanes, ninfer::SpeculativeBackend::DFlash, true);
             }
         }
-        if (have_mtp) { mtp_single_token_fork(mtp); }
         preservation_capacity(artifact);
         disposable_promotion(artifact);
         concurrent_original_and_fork(artifact, ninfer::SpeculativeBackend::None);

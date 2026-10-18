@@ -20,9 +20,7 @@ from pathlib import Path
 
 from schemes import BASELINE, ORDER, SCHEMES
 
-DEFAULT_WEIGHTS = os.environ.get(
-    "NINFER_QWEN3_8_27B_NVFP4_WEIGHTS", "models/qwen3_8_27b_nvfp4.ninfer"
-)
+DEFAULT_WEIGHTS = "models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer"
 DEFAULT_TOKENS = 8192
 LONG_TOKENS = 32768
 PAGE = 64
@@ -33,7 +31,6 @@ REPO = Path(__file__).resolve().parents[2]
 SCHEDULES = ("prefill", "decode")
 TERRIBLE_NLL = 10.0
 DEFAULT_DRAFT_TOKENS = 3
-MTP_EXTRA_DRAFT_TOKENS = 4
 
 
 def default_ppl_bin() -> Path:
@@ -272,10 +269,7 @@ def write_markdown(path: Path, payload: dict) -> None:
         "- cuda graphs: on unless a cell sets cuda_graph=false",
         f"- terrible token: nll >= {TERRIBLE_NLL}",
         f"- baseline: `{payload['baseline']}` per (length, schedule, spec)",
-        (
-            f"- decode spec: {payload.get('spec', '-')} (draft {payload.get('draft_tokens', '-')}) "
-            f"unless a cell sets spec=none; prefill lane is spec-free"
-        ),
+        (f"- spec: {payload.get('spec', 'none')} (draft {payload.get('draft_tokens', 0)})"),
         "",
         "| length | schedule | scheme | spec | graph | skip | scored | mean_nll | max_nll | terrible | ppl | Δ mean_nll | Δ 1σ | σ nll | noise | gate |",
         "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
@@ -342,26 +336,21 @@ def main() -> int:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--ppl-bin", type=Path, default=default_ppl_bin())
     parser.add_argument(
-        "--no-extras", action="store_true", help="skip mid-page, short-context, graphs-off, mtp"
+        "--no-extras", action="store_true", help="skip mid-page, short-context, graphs-off"
     )
     parser.add_argument(
         "--spec",
-        default="mtp",
-        choices=("mtp", "none"),
-        help="speculative backend for decode-lane cells (default: mtp, "
-        "matching production serve; prefill-lane cells are spec-free)",
+        default="none",
+        choices=("dflash", "none"),
+        help="optional DFlash feature capture for prefill-only scoring (default: none)",
     )
     parser.add_argument(
         "--draft-tokens",
         type=int,
         default=DEFAULT_DRAFT_TOKENS,
-        help=f"MTP draft tokens for decode-lane cells (default: {DEFAULT_DRAFT_TOKENS})",
+        help=f"DFlash draft tokens for prefill feature capture (default: {DEFAULT_DRAFT_TOKENS})",
     )
-    parser.add_argument(
-        "--no-mtp",
-        action="store_true",
-        help="run the decode lane spec-free (legacy behavior) and skip the MTP extras",
-    )
+
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     if args.long:
@@ -373,8 +362,10 @@ def main() -> int:
     schemes = select_schemes(None if args.schemes is None else args.schemes.split(","))
     schedules = select_schedules(args.schedule)
     gates = parse_gates(args.gate)
-    spec = "none" if args.no_mtp else args.spec
-    draft_tokens = args.draft_tokens
+    spec = args.spec
+    draft_tokens = args.draft_tokens if spec == "dflash" else 0
+    if spec == "dflash" and "decode" in schedules:
+        raise SystemExit("DFlash scoring requires --schedule prefill")
     if not args.ppl_bin.is_file():
         raise SystemExit(f"ninfer-ppl not found: {args.ppl_bin} (build apps/ninfer-ppl)")
     if not args.weights.is_file():
@@ -393,11 +384,9 @@ def main() -> int:
         for schedule in schedules:
             baseline_nll = None
             base_nlls: list[float] = []
-            # The decode lane scores under the production MTP spec; the prefill lane is
-            # spec-free (MTP is not consulted by chunked prompt scoring).
             spec_extra = (
-                ["--spec", "mtp", "--draft-tokens", str(draft_tokens)]
-                if spec == "mtp" and schedule == "decode"
+                ["--spec", "dflash", "--draft-tokens", str(draft_tokens)]
+                if spec == "dflash"
                 else []
             )
             for name in schemes:
@@ -427,9 +416,6 @@ def main() -> int:
 
     def score_8k_extras() -> None:
         nonlocal failed
-        decode_extra = (
-            ["--spec", "mtp", "--draft-tokens", str(draft_tokens)] if spec == "mtp" else []
-        )
         extras = [
             ("midpage", str(MID_PAGE_SKIP), DEFAULT_TOKENS, []),
             ("short", str(SHORT_SKIP), SHORT_TOKENS, []),
@@ -448,7 +434,7 @@ def main() -> int:
                 args.prefill_chunk,
                 args.device,
                 cell_path,
-                list(decode_extra) + list(extra),
+                list(extra),
             )
             nlls = load_nlls(cell_path)
             attach_nll_stats(cell, nlls)
@@ -456,37 +442,6 @@ def main() -> int:
             cell["gate"] = None
             cell["pass"] = cell_ok(cell)
             failed = failed or not cell["pass"]
-            cells.append(cell)
-
-        # The draft-length probe only adds information when the main matrix does not
-        # already run this draft length (default draft 3 -> probe 4).
-        if spec != "mtp" or draft_tokens == MTP_EXTRA_DRAFT_TOKENS:
-            return
-        mtp_baseline = None
-        mtp_base_nlls: list[float] = []
-        for name in schemes:
-            cell_path = out_dir / f"{DEFAULT_TOKENS}.decode.{name}.mtp.json"
-            cell = run_cell(
-                args.ppl_bin,
-                args.weights,
-                args.ids,
-                name,
-                "decode",
-                args.skip,
-                DEFAULT_TOKENS,
-                args.prefill_chunk,
-                args.device,
-                cell_path,
-                ["--spec", "mtp", "--draft-tokens", str(MTP_EXTRA_DRAFT_TOKENS)],
-            )
-            nlls = load_nlls(cell_path)
-            attach_nll_stats(cell, nlls)
-            if name == BASELINE:
-                mtp_base_nlls = nlls
-            mtp_baseline, cell_failed = apply_baseline(
-                cell, nlls, mtp_baseline, gates, name, mtp_base_nlls if name != BASELINE else None
-            )
-            failed = failed or cell_failed
             cells.append(cell)
 
     for tokens in lengths:

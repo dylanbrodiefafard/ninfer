@@ -93,7 +93,7 @@ struct SequencePlanningInputs {
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     std::string model_id;
     std::string weights_id;
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     std::vector<std::uint32_t> context_checkpoint_marks;
 };
 
@@ -133,7 +133,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     std::string model_id;
     std::string weights_id;
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     std::vector<std::uint32_t> context_checkpoint_marks;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

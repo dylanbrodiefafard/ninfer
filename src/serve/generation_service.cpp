@@ -72,7 +72,7 @@ void reject_unavailable_context_checkpoint_capture(bool capture_requested, bool 
     error.type    = "invalid_request_error";
     error.code    = "context_checkpoint_unavailable";
     error.param   = "ninfer.capture_context_checkpoint";
-    error.message = "capture_context_checkpoint requires prefix reuse and --spec mtp or dflash";
+    error.message = "capture_context_checkpoint requires prefix reuse and --spec dflash";
     throw ApiException(std::move(error));
 }
 

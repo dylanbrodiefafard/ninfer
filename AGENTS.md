@@ -73,9 +73,10 @@ or will be changed, proportionately and without performative apology or praise.
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance,
 compiled for `sm_120a` and tuned on an NVIDIA GeForce RTX 5090. The only supported identity is
-`qwen3.8-27b/nvfp4`; its default artifact, when available, is the MTP-NVFP4 or DFlash2 (NVFP4
-matrices, BF16 selector codebook) variant over the base Ostfralla NVFP4 shell. The workload is
-one GPU, one resident model instance, and a startup-fixed one to six active requests. The
+`qwen3.8-27b/nvfp4`; its default artifact, when available, is the DFlash2 (NVFP4
+matrices, BF16 selector codebook) variant over the base Ostfralla NVFP4 shell. MTP execution is
+disabled; stored MTP tensors remain artifact-validation inputs only. The workload is one GPU,
+one resident model instance, and a startup-fixed one to six active requests. The
 Engine forms one compact decode batch per round boundary with bounded FIFO ingress and no
 preemption. Large-scale or preemptive continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current
@@ -93,7 +94,7 @@ Read only the current authorities relevant to a live decision in the task; this 
 routing map, not a mandatory reading list:
 
 - `README.md` and executable `--help`: delivered capabilities and exact commands;
-- `docs/README.md`: documentation map; `docs/cli.md`: CLI input, sampling, MTP, and runtime
+- `docs/README.md`: documentation map; `docs/cli.md`: CLI input, sampling, speculative decoding, and runtime
   options; `docs/serving.md`: OpenAI/Anthropic HTTP behavior; `docs/performance.md`:
   performance methodology and results;
 - `docs/maintainer/concurrent-inference-architecture.md`: request/slot lifecycle, scheduling,

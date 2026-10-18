@@ -1426,10 +1426,11 @@ private:
 };
 
 DiskFingerprint make_disk_fingerprint(std::string model_id, std::string weights_id,
-                                      std::string artifact_file_identity, KvCacheStorage kv_cache,
+                                      std::string artifact_tensor_identity, KvCacheStorage kv_cache,
                                       SpeculativeBackend speculative, const PagedKVPool& text,
                                       const PagedKVPool* backend,
                                       const LinearAttentionStatePool* gdn,
-                                      const CyclicKVCache* cyclic);
+                                      const CyclicKVCache* cyclic,
+                                      DiskAttentionProfile attention = {});
 
 } // namespace ninfer::targets::qwen3_6::detail

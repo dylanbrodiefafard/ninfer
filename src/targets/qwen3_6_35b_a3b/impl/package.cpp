@@ -32,6 +32,12 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->plan.materialization;
 }
 
+std::string LoadPlan::cache_tensor_identity(const artifact::Reader& reader) const {
+    if (impl_ == nullptr) { throw std::logic_error("target load plan is empty"); }
+    return reader.tensor_content_identity(
+        cache_tensor_selections(reader, impl_->plan.bindings.features));
+}
+
 LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 LoadedModel::~LoadedModel() = default;

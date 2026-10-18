@@ -261,12 +261,11 @@ int main(int argc, char** argv) {
     const std::string selected =
         argc == 3 && std::string(argv[1]) == "--backend" ? argv[2] : "ordinary";
     if ((argc != 1 && argc != 3) || (argc == 3 && std::string(argv[1]) != "--backend") ||
-        (selected != "ordinary" && selected != "mtp" && selected != "dflash")) {
-        std::cerr << "usage: cache_interleavings_real [--backend ordinary|mtp|dflash]\n";
+        (selected != "ordinary" && selected != "dflash")) {
+        std::cerr << "usage: cache_interleavings_real [--backend ordinary|dflash]\n";
         return 1;
     }
     const auto backend = selected == "dflash" ? ninfer::SpeculativeBackend::DFlash
-                         : selected == "mtp"  ? ninfer::SpeculativeBackend::Mtp
                                               : ninfer::SpeculativeBackend::None;
     const char* artifact =
         std::getenv(selected == "dflash" ? "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS"
@@ -279,23 +278,12 @@ int main(int argc, char** argv) {
         return 77;
     }
     try {
-        if (backend == ninfer::SpeculativeBackend::Mtp) {
-            // A first-publication cancellation can leave an invalid-tail image
-            // at the same frontier as a later fresh capture. It must not shadow
-            // that usable entry during the next wave's RAM/disk matching.
-            for (const bool disk : {false, true}) { exercise(artifact, 2, disk, backend, true); }
-        }
         for (const bool disk : {false, true}) {
             for (std::uint32_t concurrency = 1; concurrency <= 4; ++concurrency) {
                 exercise(artifact, concurrency, disk, backend);
             }
         }
     } catch (const std::exception& error) {
-        if (backend == ninfer::SpeculativeBackend::Mtp &&
-            std::string(error.what()).find("mtp/") != std::string::npos) {
-            std::cout << "skip: MTP cache interleavings need MTP artifact objects\n";
-            return 77;
-        }
         std::cerr << "cache interleavings: " << error.what() << '\n';
         return 1;
     }

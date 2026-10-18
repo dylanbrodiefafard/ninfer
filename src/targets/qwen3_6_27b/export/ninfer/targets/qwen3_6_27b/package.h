@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace ninfer {
@@ -16,6 +17,7 @@ struct DeviceContext;
 
 namespace artifact {
 class Binder;
+class Reader;
 class MaterializedArtifact;
 struct ArtifactIdentity;
 struct MaterializationPlan;
@@ -51,6 +53,8 @@ public:
     LoadPlan& operator=(const LoadPlan&) = delete;
 
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    // Hashes the target-owned numerical dependencies of retained cache state.
+    [[nodiscard]] std::string cache_tensor_identity(const artifact::Reader& reader) const;
 
 private:
     class Impl;

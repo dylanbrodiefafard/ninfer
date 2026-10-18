@@ -33,6 +33,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/file.h>
 #include <thread>
 #include <tuple>
@@ -854,16 +855,16 @@ int test_lock_and_fingerprint(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& p
         threw = std::string(e.what()).find("model_id") != std::string::npos;
     }
     if (!threw) { return fail("fingerprint mismatch did not name model_id"); }
-    cfg.fingerprint.model_id               = "qwen3.6-27b";
-    cfg.fingerprint.artifact_file_identity = "different-file-same-model-and-weights";
-    threw                                  = false;
+    cfg.fingerprint.model_id                 = "qwen3.6-27b";
+    cfg.fingerprint.artifact_tensor_identity = "different-file-same-model-and-weights";
+    threw                                    = false;
     try {
         q36::detail::KVDiskCache mismatch(cfg);
     } catch (const std::runtime_error& e) {
-        threw = std::string(e.what()).find("artifact_file_identity") != std::string::npos;
+        threw = std::string(e.what()).find("artifact_tensor_identity") != std::string::npos;
     }
     if (!threw) { return fail("same-profile different artifact reused the disk cache"); }
-    cfg.fingerprint.artifact_file_identity = "disk-test-artifact";
+    cfg.fingerprint.artifact_tensor_identity = "disk-test-artifact";
     { q36::detail::KVDiskCache unchanged(cfg); }
     (void)ctx;
     return 0;
@@ -1048,6 +1049,45 @@ int exercise_vision_disk_reopen_across_pool_capacity(ninfer::DeviceContext& ctx,
     }
     source.release();
     if (!rejected) { return fail("disk cache accepted an incompatible logical plane schema"); }
+    for (const std::string_view setting : {"sage_attn", "keep_frac", "xattn_tau"}) {
+        auto changed = target_cfg;
+        if (setting == "sage_attn") {
+            changed.fingerprint.attention.sage_attn = true;
+        } else if (setting == "keep_frac") {
+            changed.fingerprint.attention.keep_frac = 0.5f;
+        } else {
+            changed.fingerprint.attention.xattn_tau = 0.9f;
+        }
+        rejected = false;
+        try {
+            q36::detail::KVDiskCache incompatible(changed);
+        } catch (const std::runtime_error& error) {
+            rejected = std::string_view(error.what()).find(setting) != std::string_view::npos;
+        }
+        if (!rejected) { return fail("disk cache accepted a changed attention profile"); }
+        // Equal nondefault profiles must also survive serialization and reopen.
+        TmpDir profile_dir("attention-profile");
+        changed.location = profile_dir.path;
+        { q36::detail::KVDiskCache first(changed); }
+        { q36::detail::KVDiskCache reopened(changed); }
+    }
+    auto inactive                                = target_cfg;
+    inactive.fingerprint.attention.xattn_min_len = 0;
+    { q36::detail::KVDiskCache reopened(inactive); }
+    TmpDir xattn_dir("xattn-threshold");
+    auto active                            = target_cfg;
+    active.location                        = xattn_dir.path;
+    active.fingerprint.attention.xattn_tau = 0.9f;
+    { q36::detail::KVDiskCache first(active); }
+    { q36::detail::KVDiskCache reopened(active); }
+    active.fingerprint.attention.xattn_min_len = 0;
+    rejected                                   = false;
+    try {
+        q36::detail::KVDiskCache incompatible(active);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string_view(error.what()).find("xattn_min_len") != std::string_view::npos;
+    }
+    if (!rejected) { return fail("disk cache accepted a changed active XAttention threshold"); }
     return 0;
 }
 
@@ -1527,21 +1567,61 @@ int test_dflash_cyclic(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     cfg.fingerprint = q36::detail::make_disk_fingerprint(
         "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
         ninfer::SpeculativeBackend::DFlash, pool, nullptr, nullptr, &cyclic);
-    q36::detail::KVDiskCache disk(std::move(cfg));
-    disk.note_ram_resident(*id, 0);
-    if (!disk.emergency_spill_ram(*id)) {
-        alloc.release();
-        return fail("DFlash cyclic spill failed");
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        disk.note_ram_resident(*id, 0);
+        if (!disk.emergency_spill_ram(*id)) {
+            alloc.release();
+            return fail("DFlash cyclic spill failed");
+        }
+        const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        if (!match) {
+            alloc.release();
+            return fail("DFlash cyclic match failed");
+        }
+        const auto meta = disk.test_load_meta(match->entry_id);
+        if (meta.ladders[0].dflash_id == 0 || meta.current_cyclic_id == 0) {
+            alloc.release();
+            return fail("DFlash cyclic missing on kept heads");
+        }
     }
-    const auto match = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-    if (!match) {
+    ninfer::LayoutBuilder destination_builder;
+    const auto destination_layout =
+        ninfer::plan_cyclic_kv_cache(destination_builder, 2, 32, 2, 8, 1);
+    ninfer::DeviceArena destination_arena(destination_builder.finish(256));
+    ninfer::CyclicKVCache destination({destination_arena.base(), destination_arena.capacity()},
+                                      destination_layout);
+    cfg.fingerprint = q36::detail::make_disk_fingerprint(
+        "qwen3.6-27b", "groupwise-int", "disk-test-artifact", ninfer::KvCacheStorage::Int8Group64,
+        ninfer::SpeculativeBackend::DFlash, pool, nullptr, nullptr, &destination);
+    q36::detail::KVDiskCache reopened(cfg);
+    const auto match = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match || !reopened.claim(match->entry_id)) {
         alloc.release();
-        return fail("DFlash cyclic match failed");
+        return fail("DFlash cyclic did not reopen across a lane count change");
     }
-    const auto meta = disk.test_load_meta(match->entry_id);
-    if (meta.ladders[0].dflash_id == 0 || meta.current_cyclic_id == 0) {
+    q36::detail::DiskRestoreTarget target;
+    target.text           = &alloc;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.dflash_local   = &destination;
+    target.dflash_lane    = 0;
+    target.stream         = ctx.copy_stream;
+    reopened.restore_device(match->entry_id, target);
+    const int restore_rc = wait_restore_bounded(reopened, ctx, "DFlash lane count restore hung");
+    ctx.synchronize_all();
+    reopened.cancel_restore();
+    reopened.release(match->entry_id);
+    if (restore_rc != 0) {
         alloc.release();
-        return fail("DFlash cyclic missing on kept heads");
+        return restore_rc;
+    }
+    std::vector<unsigned char> restored(destination.lane_host_bytes());
+    destination.copy_lane_to_host(0, restored.data(), ctx.stream);
+    ctx.synchronize_all();
+    if (restored != cyclic_host) {
+        alloc.release();
+        return fail("DFlash cyclic bytes changed across a lane count restore");
     }
     alloc.release();
     return 0;
@@ -13251,7 +13331,7 @@ int test_kind_conflict_is_skipped(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
     std::vector<std::uint8_t> meta((std::istreambuf_iterator<char>(in)),
                                    std::istreambuf_iterator<char>());
     in.close();
-    // encode_meta: magic 8, version 6, then packed scalars through identity_id at
+    // encode_meta: magic 8, version u32, then packed scalars through identity_id at
     // byte 100, current_gdn_id at 108, current_hidden_id at 116.
     constexpr std::size_t kCurrentHiddenIdOff = 116;
     if (meta.size() < kCurrentHiddenIdOff + 8) {

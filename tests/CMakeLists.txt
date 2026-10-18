@@ -84,6 +84,12 @@ endfunction()
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_cache_tensor_identity_test
+  SOURCES test_cache_tensor_identity.cpp
+  LIBRARIES ninfer_engine ninfer_artifact)
+target_include_directories(ninfer_cache_tensor_identity_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
@@ -245,7 +251,7 @@ ninfer_add_test(ninfer_qwen3_6_27b_cache_interleavings_real_test
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_cache_interleavings_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 900)
-foreach(backend mtp dflash)
+foreach(backend dflash)
   add_test(NAME ninfer_qwen3_6_27b_${backend}_cache_interleavings_real_test
     COMMAND ninfer_qwen3_6_27b_cache_interleavings_real_test --backend ${backend})
   set_tests_properties(ninfer_qwen3_6_27b_${backend}_cache_interleavings_real_test PROPERTIES
@@ -308,10 +314,6 @@ target_include_directories(ninfer_qwen3_8_27b_verify_score_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 set_tests_properties(ninfer_qwen3_8_27b_verify_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
-ninfer_add_test(ninfer_qwen3_8_27b_mtp_nvfp4_real_test
-  SOURCES targets/qwen3_6_27b/test_engine_mtp_nvfp4_real.cpp
-  LIBRARIES ninfer_engine)
-set_tests_properties(ninfer_qwen3_8_27b_mtp_nvfp4_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -337,10 +339,6 @@ target_include_directories(ninfer_qwen3_8_27b_vision_trace PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_8_27b_vision_trace PRIVATE
   ninfer_engine ninfer_product_prompt_input ninfer_artifact ninfer_core CUDA::cudart)
-ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
-  SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
-  LIBRARIES ninfer_engine)
-set_tests_properties(ninfer_qwen3_6_35b_a3b_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_ram_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine)

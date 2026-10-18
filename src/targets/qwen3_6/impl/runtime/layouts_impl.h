@@ -1008,7 +1008,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_disk_compress         = inputs.kv_disk_compress;
     impl->model_id                 = inputs.model_id;
     impl->weights_id               = inputs.weights_id;
-    impl->artifact_file_identity   = inputs.artifact_file_identity;
+    impl->artifact_tensor_identity = inputs.artifact_tensor_identity;
     impl->context_checkpoint_marks = inputs.context_checkpoint_marks;
     impl->persistent               = persistent_layout(*impl);
     impl->workspace                = build_workspace_plan(*impl);
@@ -1160,13 +1160,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,
-        .kv_ram_capacity_bytes  = options.kv_ram_capacity_bytes,
-        .kv_disk_capacity_bytes = options.kv_disk_capacity_bytes,
-        .kv_disk_location       = options.kv_disk_location,
-        .kv_disk_compress       = options.kv_disk_compress,
-        .model_id               = options.model_id,
-        .weights_id             = options.weights_id,
-        .artifact_file_identity = options.artifact_file_identity,
+        .kv_ram_capacity_bytes    = options.kv_ram_capacity_bytes,
+        .kv_disk_capacity_bytes   = options.kv_disk_capacity_bytes,
+        .kv_disk_location         = options.kv_disk_location,
+        .kv_disk_compress         = options.kv_disk_compress,
+        .model_id                 = options.model_id,
+        .weights_id               = options.weights_id,
+        .artifact_tensor_identity = options.artifact_tensor_identity,
         .context_checkpoint_marks =
             qwen3_6::detail::resolved_prefill_context_marks(options.context_checkpoint_marks),
     };

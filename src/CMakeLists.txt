@@ -51,7 +51,7 @@ add_library(ninfer_artifact STATIC
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact
   PUBLIC ninfer_core
-  PRIVATE Threads::Threads)
+  PRIVATE Threads::Threads OpenSSL::Crypto)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas

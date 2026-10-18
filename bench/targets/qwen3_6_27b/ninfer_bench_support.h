@@ -26,7 +26,6 @@ inline constexpr int kDefaultWarmup                   = 1;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 4096;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kKvPageTokens          = 64;
-inline constexpr std::uint32_t kMaxMtpDraftTokens     = 5;
 inline constexpr std::uint32_t kMaxDFlashDraftTokens  = 7;
 inline constexpr std::uint32_t kMaxDFlashVerifyWidth  = 16;
 
@@ -70,7 +69,7 @@ struct BenchOptions {
     float keep_frac                   = 1.0f;
     float xattn_tau                   = 1.0f;
     std::uint32_t concurrency         = 1;
-    SpeculativeBackend spec_backend   = SpeculativeBackend::Mtp;
+    SpeculativeBackend spec_backend   = SpeculativeBackend::None;
     std::uint32_t draft_tokens        = 0;
     std::uint32_t dflash_verify_width = 0;
     bool adaptive_draft               = false;

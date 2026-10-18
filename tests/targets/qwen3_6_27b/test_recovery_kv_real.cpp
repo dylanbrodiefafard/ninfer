@@ -377,12 +377,11 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
 
     ninfer::artifact::Reader reader(artifact);
     ninfer::artifact::Binder binder(reader);
-    options.model_id               = reader.identity().model_id;
-    options.weights_id             = reader.identity().weights_id;
-    options.artifact_file_identity = reader.file_identity();
-    const auto profile             = Package::resolve_weights(reader.identity(), binder);
-    auto load         = target::bind_artifact(binder, profile, family::startup_features(options));
-    auto materialized = ninfer::artifact::materialize(reader, load.materialization, device);
+    options.model_id   = reader.identity().model_id;
+    options.weights_id = reader.identity().weights_id;
+    const auto profile = Package::resolve_weights(reader.identity(), binder);
+    auto load          = target::bind_artifact(binder, profile, family::startup_features(options));
+    auto materialized  = ninfer::artifact::materialize(reader, load.materialization, device);
     target::LoadedModelData model(load.bindings, std::move(materialized));
     auto frontend = family::make_frontend(model.frontend, false);
     device.synchronize();
@@ -551,23 +550,17 @@ int main(int argc, char** argv) {
     const char* nvfp4                  = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* group                  = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* dflash                 = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-    const char* mtp                    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS");
     const char* artifact               = nullptr;
-    ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::Mtp;
-    if (mtp != nullptr && *mtp != '\0') {
-        artifact = mtp;
+    ninfer::SpeculativeBackend backend = ninfer::SpeculativeBackend::None;
+    if (dflash != nullptr && *dflash != '\0') {
+        artifact = dflash;
+        backend  = ninfer::SpeculativeBackend::DFlash;
     } else if (nvfp4 != nullptr && *nvfp4 != '\0') {
         artifact = nvfp4;
     } else if (group != nullptr && *group != '\0') {
         artifact = group;
-    } else if (dflash != nullptr && *dflash != '\0') {
-        artifact = dflash;
-        backend  = ninfer::SpeculativeBackend::DFlash;
     } else {
-        std::cout << "skip: set NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, "
-                     "NINFER_QWEN3_6_27B_WEIGHTS, or "
-                     "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS or "
-                     "NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS\n";
+        std::cout << "skip: set a supported base or DFlash artifact environment variable\n";
         return 77;
     }
     try {

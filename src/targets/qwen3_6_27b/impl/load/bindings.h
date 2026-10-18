@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <optional>
 #include <utility>
+#include <vector>
 #include <variant>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -151,6 +152,10 @@ struct ArtifactLoadPlan {
     BindingPlan bindings;
     artifact::MaterializationPlan materialization;
 };
+
+// Selections borrow names from reader and cover every numerical input to persisted state.
+[[nodiscard]] std::vector<artifact::TensorContentSelection>
+cache_tensor_selections(const artifact::Reader& reader, qwen3_6::StartupFeatures features);
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);

@@ -558,10 +558,9 @@ int main(int argc, char** argv) {
             require(bool(output), "failed writing artifact inventory");
         }
         ninfer::artifact::Binder binder(reader);
-        options.model_id               = reader.identity().model_id;
-        options.weights_id             = reader.identity().weights_id;
-        options.artifact_file_identity = reader.file_identity();
-        const auto profile             = Package::resolve_weights(reader.identity(), binder);
+        options.model_id   = reader.identity().model_id;
+        options.weights_id = reader.identity().weights_id;
+        const auto profile = Package::resolve_weights(reader.identity(), binder);
         auto load = target::bind_artifact(binder, profile, family::startup_features(options));
         auto materialized = ninfer::artifact::materialize(reader, load.materialization, device);
         target::LoadedModelData model(load.bindings, std::move(materialized));

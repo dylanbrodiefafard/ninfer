@@ -28,7 +28,13 @@ ServeOptions parse(std::vector<std::string> arguments) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures      = 0;
+    bool mtp_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"});
+    } catch (const std::invalid_argument&) { mtp_rejected = true; }
+    failures += check(mtp_rejected, "MTP execution was accepted");
+
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.prefill_chunk == 4096, "serving prefill chunk default is not 4096");
@@ -107,7 +113,7 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
-    const ServeOptions adaptive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+    const ServeOptions adaptive = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                          "--draft-tokens", "5", "--adaptive-draft"});
     failures += check(adaptive.speculative.adaptive_draft,
                       "--adaptive-draft did not set SpeculativeOptions");

@@ -108,15 +108,6 @@ ninfer::EngineOptions pooled_c3_options(const char* artifact) {
     return options;
 }
 
-ninfer::EngineOptions mtp_options(const char* artifact) {
-    ninfer::EngineOptions options      = ordinary_options(artifact, 1, 4096, kRamHitBytes);
-    options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens   = 5;
-    options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
-    options.speculative.adaptive_draft = true;
-    return options;
-}
-
 int verify_ram_tier(const ninfer::Engine& engine, std::size_t ram_bytes) {
     const ninfer::MemorySummary memory = engine.memory_summary();
     if (memory.kv_ram_capacity_bytes != ram_bytes) {
@@ -1218,62 +1209,6 @@ int exercise_oversize_drop(const char* artifact) {
     return 0;
 }
 
-int exercise_mtp(const char* artifact) {
-    ninfer::Engine engine(mtp_options(artifact));
-    if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
-    if (const int rc = capture_then_hit(engine, tokens_a(), tokens_c(), "MTP site 2"); rc != 0) {
-        return rc;
-    }
-    const auto keep = tokens_d();
-    const ninfer::GenerationResult source =
-        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
-    if (source.generated_token_ids.size() != 8) {
-        return fail("MTP suffix source did not complete");
-    }
-    if (source.speculative.draft_window != 5 || source.speculative.rounds == 0) {
-        std::cerr << "MTP adaptive source live_k=" << source.speculative.live_draft_tokens
-                  << " window=" << source.speculative.draft_window << '\n';
-        return fail("MTP source did not execute speculative rounds with the configured window");
-    }
-    const std::vector<ninfer::TokenId> history   = resume_prefix(keep, source.generated_token_ids);
-    const std::vector<ninfer::TokenId> continued = concat(history, {198, 198, 198, 198});
-    const ninfer::GenerationResult vram =
-        engine.generate(engine.prepare_tokens(continued), greedy(4, true));
-    if (vram.prefix_reuse_source != ninfer::PrefixReuseSource::VramResident ||
-        vram.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
-        vram.reused_prompt_tokens != history.size()) {
-        return fail("MTP suffix VRAM continuation did not reuse the resident prefix");
-    }
-    const ninfer::GenerationResult first =
-        engine.generate(engine.prepare_tokens(keep), greedy(8, false));
-    if (first.generated_token_ids != source.generated_token_ids) {
-        return fail("MTP suffix RAM source did not match the VRAM source");
-    }
-    (void)engine.generate(engine.prepare_tokens(tokens_e()), greedy(4, false));
-    const auto restores_before = engine.runtime_stats().kv_ram_restores;
-    const ninfer::GenerationResult hit =
-        engine.generate(engine.prepare_tokens(continued), greedy(4, true));
-    if (hit.prefix_reuse_source != ninfer::PrefixReuseSource::HostRam ||
-        hit.prefix_reuse_path == ninfer::PrefixReusePath::FullReset ||
-        hit.reused_prompt_tokens != history.size()) {
-        std::cerr << "MTP suffix RAM restore failed: source="
-                  << static_cast<int>(hit.prefix_reuse_source)
-                  << " path=" << static_cast<int>(hit.prefix_reuse_path)
-                  << " reused=" << hit.reused_prompt_tokens << '\n';
-        return 1;
-    }
-    if (engine.runtime_stats().kv_ram_restores != restores_before + 1) {
-        return fail("MTP suffix RAM restore did not increment kv_ram_restores");
-    }
-    if (hit.generated_token_ids != vram.generated_token_ids) {
-        return fail("MTP suffix RAM reuse changed greedy output");
-    }
-    if (hit.speculative.draft_window != 5 || vram.speculative.draft_window != 5) {
-        return fail("MTP RAM/VRAM restore changed the configured draft window");
-    }
-    return 0;
-}
-
 int exercise_checkpoint_dirty_lane(const char* artifact) {
     ninfer::Engine engine(ordinary_options(artifact, 1, 4096, kRamHitBytes));
     if (const int rc = verify_ram_tier(engine, kRamHitBytes); rc != 0) { return rc; }
@@ -1815,27 +1750,22 @@ int exercise_artifact(const char* artifact) {
     }
     std::cerr << "ram_real: closed-turn cut\n";
     if (const int rc = exercise_closed_turn_cut(artifact, false); rc != 0) { return rc; }
-    std::cerr << "ram_real: MTP\n";
-    if (const int rc = exercise_mtp(artifact); rc != 0) { return rc; }
     return 0;
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool mtp_only =
-        argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "mtp";
     const bool fallback_only =
         argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "fallback";
     const bool planning_only =
         argc == 3 && std::string(argv[1]) == "--case" && std::string(argv[2]) == "planning";
-    if (argc != 1 && !mtp_only && !fallback_only && !planning_only) {
-        std::cerr << "usage: " << argv[0] << " [--case mtp|fallback|planning]\n";
+    if (argc != 1 && !fallback_only && !planning_only) {
+        std::cerr << "usage: " << argv[0] << " [--case fallback|planning]\n";
         return 2;
     }
-    const auto run = [mtp_only, fallback_only, planning_only](const char* artifact) {
-        return mtp_only        ? exercise_mtp(artifact)
-               : planning_only ? exercise_restore_allocation_fallback(artifact, false, true)
+    const auto run = [fallback_only, planning_only](const char* artifact) {
+        return planning_only   ? exercise_restore_allocation_fallback(artifact, false, true)
                : fallback_only ? exercise_restore_allocation_fallback(artifact)
                                : exercise_artifact(artifact);
     };
@@ -1856,7 +1786,7 @@ int main(int argc, char** argv) {
     if (nvfp4 != nullptr && *nvfp4 != '\0') {
         if (const int result = run(nvfp4); result != 0) { return result; }
     }
-    if (dflash != nullptr && *dflash != '\0' && !mtp_only) {
+    if (dflash != nullptr && *dflash != '\0') {
         if (!planning_only && !fallback_only) {
             if (const int result = exercise_closed_turn_cut(dflash, true); result != 0) {
                 return result;

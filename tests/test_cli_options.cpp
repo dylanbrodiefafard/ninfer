@@ -24,7 +24,13 @@ ninfer::cli::Options parse(std::vector<std::string> arguments) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures      = 0;
+    bool mtp_rejected = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"});
+    } catch (const std::invalid_argument&) { mtp_rejected = true; }
+    failures += check(mtp_rejected, "MTP execution was accepted");
+
 
     const auto constrained =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--json-schema", "schema.json"});

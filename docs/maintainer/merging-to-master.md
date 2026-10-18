@@ -44,7 +44,7 @@ docker exec -e ASAN_OPTIONS=protect_shadow_gap=0 ninfer-builder \
 
 Notes on scope:
 
-- Gate 5 needs `qwen3_8_27b_nvfp4.ninfer` and its DFlash2 or MTP variant; an Engine test that
+- Gate 5 needs `qwen3_8_27b_nvfp4.ninfer` and its DFlash2 variant; an Engine test that
   skips because its supported artifact is missing has not run. `--print-weights` shows what is
   bound.
 - Gates 6 to 8 run the sanitizer set: the Ops the qwen3.8-27b NVFP4 DFlash2 flow dispatches,

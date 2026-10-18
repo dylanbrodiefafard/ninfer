@@ -1,5 +1,9 @@
 # NInfer 小规模并发推理架构
 
+Current product execution supports ordinary decoding and DFlash2 only. MTP execution is
+rejected at Engine admission. MTP algorithms and layouts below describe dormant private
+machinery, not an available product backend.
+
 本文定义 NInfer 在单 GPU、单模型实例下支持少量并发请求的执行架构。典型
 `max_concurrency` 为 1–6。
 

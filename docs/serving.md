@@ -6,13 +6,13 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 16384 \
   --kv-capacity 32768 \
   --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
+  --spec dflash --draft-tokens 3 \
   --lm-head-draft
 ```
 
@@ -24,7 +24,7 @@ Vision is disabled by default: its weights, Vision scratch phase, and frozen req
 buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
-`--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
+`--spec dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
 Vision-composed target hidden features. A fixed draft window verifies the chain `W=k+1` for `k`
@@ -160,8 +160,7 @@ bounds; intervals with no representable value fail admission. Integer bounds mus
 compiler's signed 64-bit representation. Omitted `additionalProperties` and `items` retain JSON Schema's permissive defaults.
 
 The resident frontend shares a bounded compiled-grammar/tokenizer cache. Each request owns its
-matcher, and the existing packed GPU token mask constrains target sampling, including MTP and
-DFlash verification. Speculative matcher forks only advance on committed output, and mask
+matcher, and the existing packed GPU token mask constrains target sampling, including DFlash verification. Speculative matcher forks only advance on committed output, and mask
 construction overlaps target GPU execution. Unconstrained requests retain the mask-free route.
 
 The request `model` is informational: NInfer runs one resident model, so it serves that model
@@ -231,7 +230,7 @@ frontier `E` on an exact-hit / decode-only request into the one-slot turn-rollba
 (the same slot automatic occupy-append already writes). A later `true` at a new `E` replaces
 that pin; ladder heads stay. If a ladder or rollback head already sits at this `E`, the
 request succeeds with `captured_tokens = 0` and does not fill the rollback slot. A brand-new
-chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--spec mtp|dflash`
+chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--spec dflash`
 or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
@@ -859,9 +858,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--sage` | Sage3 recipe on NVFP4 KV: V is stored with one scale per (dim, 16-key block), and prompt prefill runs PV as FP4 P × FP4 V (with SmoothQ); decode and verify keep BF16 P·V on the same cache. Requires `--kv-dtype nvfp4`; excludes `--keep-frac` / `--xattn-tau` | off |
 | `--keep-frac F` | Sparge prompt-prefill tile skipping on NVFP4 KV: per 128-query tile, keep the top fraction `F` `(0,1]` of 64-key tiles by mean-Q·mean-K score, plus forced leading-sink and local-window tiles. `1` is dense; decode, verify and ≤6-token chunks stay dense | `1` |
 | `--xattn-tau F` | XAttention prompt-prefill block skipping on NVFP4 KV: keep the 128-key blocks covering attention mass `F` `(0,1]` once more than 8,192 keys are visible. `1` is dense; exclusive with `--keep-frac` below `1`; decode and verify stay dense | `1` |
-| `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; 35B DFlash `1..15`; 3.8 DFlash2 `1..7` | unset |
-| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four. MTP captures `{3,4,5}` up to its configured limit | off |
+| `--spec dflash` | speculative backend | off |
+| `--draft-tokens N` | DFlash2 `1..7` | unset |
+| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | off |
 | `--dflash-verify-width N` | pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([calibration](performance.md#dflash2-p-less-proposal-calibration-2026-10-03)) | calibrated |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -869,7 +868,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require `--spec mtp` or `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
+| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--system-prepend TEXT` | prepend TEXT to the leading system/developer instruction on every request; inserts a system turn if none exists | off |
@@ -898,7 +897,7 @@ sampler resolution.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
 p-less remains exact argmax. P-less membership is `p_v ≥ max(L·exp(-2ε/T), 1/M)` with
 `ε = 1/16` and `M = 1024`; L is the unperturbed collision probability, and an empty set
-falls back to the eligible mode. Under MTP or DFlash2, p-less applies at every hop (block verification
+falls back to the eligible mode. Under DFlash2, p-less applies at every hop (block verification
 over the chain with the recorded draft `q`; DFlash2 drafts are sampled at
 the calibrated or pinned `--dflash-p-less-draft-temperature`) and to the bonus. A thinking-cycle exclusion affects only the next token,
 not later hops in the same speculative round. There is
@@ -932,7 +931,7 @@ scrape_configs:
 | RAM cache working? | `ninfer_kv_ram_used_bytes` > 0, restores rising, `ninfer_prefix_reuse_requests_total{source="host_ram"}` |
 | Disk cache working? | `ninfer_kv_disk_*` and `source="host_disk"`; `ninfer_kv_cache_fallbacks_total` staying flat |
 | Prefix hit rate | `rate(ninfer_prefix_cache_hit_tokens_total)/rate(ninfer_prefix_cache_query_tokens_total)` |
-| MTP/DFlash healthy? | `rate(ninfer_speculative_accepted_tokens_total)/rate(ninfer_speculative_draft_tokens_total)` |
+| DFlash healthy? | `rate(ninfer_speculative_accepted_tokens_total)/rate(ninfer_speculative_draft_tokens_total)` |
 | Why is TTFT high? | phase p95 of `queue`, `copy_hold`, `prefill`, `media_fetch`; one JSONL `request_done` for the joint |
 | Disk restore on the critical path? | `copy_hold` p95 and `ninfer_generation_kv_copy_seconds{tier="disk",op="h2d"}` |
 | Recovery burning time? | `ninfer_generation_phase_seconds{phase="recovery"}` vs `{phase="decode"}` |
@@ -970,12 +969,12 @@ counts 32 to 262144, decode rate 5 to 1000 tok/s, and prefill rate 250 to 30000 
 ## Structured request log
 
 `--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
-in append mode and flushes every event, so successive model or MTP blocks may share one campaign
+in append mode and flushes every event, so successive model or speculative blocks may share one campaign
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
@@ -1028,8 +1027,7 @@ and do not receive request IDs.
 
 By default the server also reports aggregate activity every five seconds. `prefill` counts prompt
 suffix tokens actually computed during the interval, excluding prefix-cache hits; `decode` counts
-tokens finally committed by decode rounds, excluding the first token produced by prefill. For MTP
-and DFlash this is the accepted committed output, not draft or rejected tokens.
+tokens finally committed by decode rounds, excluding the first token produced by prefill. For DFlash this is the accepted committed output, not draft or rejected tokens.
 `avg_decode_batch` is decode row-rounds divided by decode rounds during the same interval. The
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
@@ -1085,7 +1083,7 @@ after weights are loaded, leaving `--kv-capacity-headroom` MiB free (default 64;
 desktop or another process shares the GPU). When omitted it follows
 `--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
 and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate pinned-host budget
-in MiB for completed prefix bundles and does not change GPU pool sizing. One long MTP chat with five
+in MiB for completed prefix bundles and does not change GPU pool sizing. One long DFlash chat with five
 context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on
 the live pinned log, but other-lane restore after eviction needs the FIFO.
 `--kv-disk-capacity` is a third-tier SSD budget in unique object bytes. It requires
@@ -1099,15 +1097,21 @@ prefill, the Engine drains the partial restore,
 excludes that entry from reuse, and recomputes the prompt from an empty KV image. The same request
 returns through normal capacity admission; its original queue deadline does not expire this
 already-admitted recovery. This cache fallback does not produce `service_unavailable`.
-Disk format v6 fingerprints canonical logical KV pages rather than the current GPU pool capacity,
-so one location can reopen across `--vision` on/off and automatic resident-capacity changes. Media
-content remains part of each entry identity. The fingerprint also binds the opened artifact's
-local file generation (device, inode, byte length, nanosecond modification/change times), not just
-its shared model/weights names. Replaced or modified artifacts require a fresh cache directory;
-even a byte-identical copy is conservatively a different file. Artifacts must remain immutable
-while an Engine is using them. Pre-v6 locations fail startup: select a new directory and retain
-the old one until its contents are no longer needed. KV dtype, speculative backend, and
-persistent-state incompatibilities also fail startup.
+Disk format v7 fingerprints canonical logical KV pages rather than GPU pool capacity or request
+lane count, so one location can reopen across `--vision` on/off, concurrency, and automatic
+resident-capacity changes when the per-lane state geometry remains compatible. The fingerprint
+binds model/weights identity and a SHA-256 digest of the target-selected tensors and projection
+rows that produce retained Text/Vision and active speculative state. Names, shapes, numeric
+formats, storage layouts, selected ranges, and their encoded bytes determine the digest. File
+paths, device/inode numbers, timestamps, object order/offsets, padding between objects, and
+frontend resource bytes are excluded. Identical tensors remain compatible after copying, repacking,
+or rebooting. Hashing reads the selected tensor bytes once at startup only when disk caching is
+enabled. Artifacts must remain immutable while an Engine is using them. KV dtype, speculative
+backend, page/state schema, and attention settings (`--sage`, `--keep-frac`, `--xattn-tau`, and the
+active C++ `xattn_min_len` option) also define compatibility. Token IDs, positions, and media
+identity are checked per entry; sampling defaults and chat rendering are not directory
+compatibility boundaries. Pre-v7 locations fail startup: select a new directory and retain the old
+one until its contents are no longer needed.
 On stop, orderly shutdown copies active chats into the host cache, saves cache entries that are not
 yet on SSD, and finishes outstanding disk writes. The progress renderer prints `kv-disk`
 `copy active chats` / `save cache entries` / `finish disk writes` counts while shutdown runs.
@@ -1148,7 +1152,7 @@ provide one page per configured lane, or larger than all configured lanes could 
 Compatible resident prefixes are reused for both text and multimodal histories unless the server is
 started with `--no-prefix-reuse`, which also disables prefill context-checkpoint capture and the
 turn-rollback pin. `--context-checkpoints off` disables only the automatic ladder; occupy-append
-rollback and exact-hit `ninfer.capture_context_checkpoint` still pin when MTP/DFlash and prefix
+rollback and exact-hit `ninfer.capture_context_checkpoint` still pin when DFlash and prefix
 reuse are on. A multimodal hit requires matching token types, three-axis MRoPE
 positions, encoded-media digest, grid, and consumer spans; changing an earlier image or video
 therefore resets the prefix instead of reusing placeholder-token KV. Media wholly inside a matched
@@ -1164,7 +1168,7 @@ rewrite checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
 rewritten suffix; matching KV tokens alone never authorize a partial hit. Their recurrent and DFlash
 local state live in one lane-owned pinned host image per lane (outside `--kv-ram-capacity`), so they
-do not reduce GPU KV capacity. MTP or DFlash prefill may also
+do not reduce GPU KV capacity. DFlash prefill may also
 freeze current GDN at committed chunk ends that have reached a context mark (default 24576, 36864,
 53248, 77824, 102400, 151552, or `--context-checkpoints a,b,c`); a later prompt that matches that prefix restores GDN into current and hidden into
 `tail_hidden` as `restore_context_checkpoint`. DFlash2 also restores that lane's cyclic local K/V
@@ -1216,7 +1220,7 @@ history remains eligible for `append_frontier`. If the client modifies, removes,
 historical system message, the token prefix genuinely differs and a miss/reset is correct.
 
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
-or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the
+or usage accounting. If a stop truncates a multi-token DFlash round, the Engine commits the
 exact accepted target prefix so a following compatible turn can still reuse it. Output-limit and
 context-capacity finishes map to `length`/ `max_tokens`; ordinary model or string stops map to
 `stop`/ `end_turn`.

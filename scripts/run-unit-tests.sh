@@ -42,7 +42,6 @@ WEIGHT_VARS=(
   NINFER_QWEN3_6_27B_NVFP4_WEIGHTS
   NINFER_QWEN3_6_27B_WEIGHTS
   NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS
-  NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS
   NINFER_QWEN3_6_35B_A3B_WEIGHTS
 )
 
@@ -106,9 +105,6 @@ weight_filenames() {
         qwen3_8_27b_nvfp4_dflash_w8.ninfer \
         qwen3_8_27b_nvfp4_dflash_nvfp4_codebook.ninfer
       ;;
-    NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS)
-      printf '%s\n' qwen3_8_27b_nvfp4_mtp.ninfer qwen3_8_27b_nvfp4_mtp_nvfp4.ninfer
-      ;;
     NINFER_QWEN3_6_35B_A3B_WEIGHTS)
       printf '%s\n' qwen3_6_35b_a3b.ninfer
       ;;
@@ -125,9 +121,6 @@ weight_tests() {
       ;;
     NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS)
       echo "ninfer_qwen3_8_27b_dflash_real_test, logprobs, recovery-kv"
-      ;;
-    NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS)
-      echo "ninfer_qwen3_8_27b_mtp_nvfp4_real_test, recovery-kv"
       ;;
     NINFER_QWEN3_6_35B_A3B_WEIGHTS)
       echo "35B real, ram, dflash, load-plan"
@@ -377,7 +370,6 @@ print_weights_report() {
 require_real_weights() {
   if [[ -n "${NINFER_QWEN3_6_27B_NVFP4_WEIGHTS:-}" \
      || -n "${NINFER_QWEN3_6_27B_WEIGHTS:-}" \
-     || -n "${NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS:-}" \
      || -n "${NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS:-}" ]]; then
     return 0
   fi

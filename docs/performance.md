@@ -1,5 +1,8 @@
 # Single-GPU serving performance
 
+MTP measurements and commands in this document are historical. Current builds disable MTP
+execution and support ordinary decoding and DFlash2.
+
 Tested Git revisions:
 
 - Concurrent MTP3 decode saturation for the three measured Qwen3.6 artifact profiles:

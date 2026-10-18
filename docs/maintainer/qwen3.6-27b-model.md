@@ -1,5 +1,9 @@
 # Qwen3.6-27B Model Reference
 
+Current product execution supports ordinary decoding and DFlash2 only. MTP execution is
+rejected at Engine admission. MTP algorithms and layouts below describe dormant private
+machinery, not an available product backend.
+
 This reference records the exact Text, MTP, Vision, multimodal-position, numeric, and persistent-state
 semantics used by the registered target. Fixed dimensions are encoded in the target's
 `impl/config.h`; artifact assignment and binding are defined in

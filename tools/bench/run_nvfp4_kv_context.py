@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""INT8 vs NVFP4 KV context sweep for qwen3.8-27b/nvfp4 with MTP.
+"""INT8 vs NVFP4 KV context sweep for qwen3.8-27b/nvfp4 with DFlash.
 
 C=1 measures prefill and decode at 5k/20k/50k/100k/150k with chunk 1024.
 C=2 measures concurrent Engine-lane decode at 20k/50k.
@@ -21,7 +21,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
-DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_8_27b.ninfer"
+DEFAULT_WEIGHTS = REPO_ROOT / "models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
 C1_PROMPTS = (5000, 20000, 50000, 100000, 150000)
@@ -75,7 +75,7 @@ def case_command(
         "--concurrency",
         str(concurrency),
         "--spec",
-        "mtp",
+        "dflash",
         "--draft-tokens",
         "3",
         "--lm-head-draft",

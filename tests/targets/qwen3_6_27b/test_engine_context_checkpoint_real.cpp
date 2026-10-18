@@ -76,7 +76,7 @@ ninfer::EngineOptions
 engine_options(const char* artifact, std::uint32_t max_concurrency = 1,
                std::uint32_t kv_tokens = 32768, bool vision = false,
                std::uint32_t max_context       = 32768,
-               ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
+               ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::DFlash) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = max_context;
@@ -329,7 +329,7 @@ int exercise_decode_past_mark(ninfer::Engine& engine) {
 }
 
 int exercise_single_lane(const char* artifact,
-                         ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
+                         ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::DFlash) {
     ninfer::Engine engine(engine_options(artifact, 1, 32768, false, 32768, spec));
     if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
 
@@ -1435,7 +1435,7 @@ int exercise_150k(const char* artifact, ninfer::SpeculativeBackend spec) {
     return 0;
 }
 
-int exercise_mtp_off(const char* artifact) {
+int exercise_speculation_off(const char* artifact) {
     ninfer::Engine engine(
         engine_options(artifact, 1, 32768, false, 32768, ninfer::SpeculativeBackend::None));
     if (const int rc = verify_loaded(engine); rc != 0) { return rc; }
@@ -1664,7 +1664,7 @@ int exercise_controls(const char* artifact, ninfer::SpeculativeBackend spec) {
 }
 
 int exercise_turn_rollback(const char* artifact,
-                           ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::Mtp) {
+                           ninfer::SpeculativeBackend spec = ninfer::SpeculativeBackend::DFlash) {
     constexpr std::uint32_t kRb = 256;
     const auto p1               = padded(kPadRb1, kRb);
     std::vector<ninfer::TokenId> follow;
@@ -1870,13 +1870,11 @@ int exercise_artifact(const char* artifact, ninfer::SpeculativeBackend spec) {
     if (const int rc = exercise_c2(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_c3(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_c3_cancel_during_decode(artifact, spec); rc != 0) { return rc; }
-    if (spec != ninfer::SpeculativeBackend::DFlash) {
-        if (const int rc = exercise_vision(artifact); rc != 0) { return rc; }
-    }
+    if (const int rc = exercise_vision(artifact); rc != 0) { return rc; }
     if (const int rc = exercise_two_marks(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_ram_shorter_ladder(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_c2_drop_during_decode(artifact, spec); rc != 0) { return rc; }
-    if (const int rc = exercise_mtp_off(artifact); rc != 0) { return rc; }
+    if (const int rc = exercise_speculation_off(artifact); rc != 0) { return rc; }
     if (const int rc = exercise_chat_rewrite_tie(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_rewrite_same_f(artifact, spec); rc != 0) { return rc; }
     if (const int rc = exercise_turn_rollback(artifact, spec); rc != 0) { return rc; }
@@ -1897,25 +1895,10 @@ int main(int argc, char** argv) {
                            : exercise_artifact(artifact, spec);
     };
     try {
-        const char* groupwise = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
-        const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
-        const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
-        if ((groupwise == nullptr || *groupwise == '\0') && (nvfp4 == nullptr || *nvfp4 == '\0') &&
-            (dflash == nullptr || *dflash == '\0')) {
-            std::cout << "skip: set NINFER_QWEN3_6_27B_WEIGHTS, "
-                         "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS, or "
-                         "NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
+        const char* dflash = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
+        if (dflash == nullptr || *dflash == '\0') {
+            std::cout << "skip: set NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS\n";
             return 77;
-        }
-        if (groupwise != nullptr && *groupwise != '\0') {
-            if (const int result = run(groupwise, ninfer::SpeculativeBackend::Mtp); result != 0) {
-                return result;
-            }
-        }
-        if (nvfp4 != nullptr && *nvfp4 != '\0') {
-            if (const int result = run(nvfp4, ninfer::SpeculativeBackend::Mtp); result != 0) {
-                return result;
-            }
         }
         if (dflash != nullptr && *dflash != '\0') {
             if (const int result = run(dflash, ninfer::SpeculativeBackend::DFlash); result != 0) {

@@ -217,32 +217,154 @@ void test_common_validation() {
     }
 }
 
-void test_file_generation_identity() {
-    auto original      = write_fixture(normative_directory(), "file-identity-original");
-    auto replacement   = write_fixture(normative_directory(), "file-identity-replacement");
-    const auto initial = Reader(original.path).file_identity();
-    if (initial.empty() || Reader(original.path).file_identity() != initial) {
-        throw std::runtime_error("unchanged artifact file identity is not stable");
+std::string all_tensor_identity(const Reader& reader) {
+    std::vector<ninfer::artifact::TensorContentSelection> selections;
+    for (const auto& object : reader.objects()) {
+        if (const auto* tensor = std::get_if<TensorDescriptor>(&object)) {
+            selections.push_back({tensor->name, std::nullopt});
+        }
     }
-    if (Reader(replacement.path).file_identity() == initial) {
-        throw std::runtime_error("distinct files with the same artifact identity alias");
+    return reader.tensor_content_identity(selections);
+}
+
+void test_selected_row_identity() {
+    struct Case {
+        NumericFormat format;
+        StorageLayout layout;
+        std::uint64_t rows;
+        ninfer::artifact::TensorRowRange selected;
+        const char* sha256;
+    };
+
+    // Independent Python hashlib vectors use the specified code/scale/divisor ranges and
+    // the fixture's 0x01 payload. They verify the exact encoded selection, not just sensitivity.
+    const std::array cases{
+        Case{NumericFormat::NVFP4,
+             StorageLayout::BlockScaleK16M128x4V1,
+             384,
+             {128, 128},
+             "ca65173f34e86215f12c5a0dfbdbc37e076d86e7b0bd3366e5dc5d9721534b2c"},
+        Case{NumericFormat::W8G32_F16S,
+             StorageLayout::RowSplitK128V1,
+             4,
+             {1, 2},
+             "78f0242f53d877f95142ad09e1cedf9888b953a1570bd7c8629430c667e2217e"},
+        Case{NumericFormat::Q4G64_F16S,
+             StorageLayout::RowSplitK128V1,
+             4,
+             {1, 2},
+             "193a0b3857803a4aa13da1426b077546157a829b2ba2b0aa83680c64b0b383c1"},
+    };
+    for (const auto& test : cases) {
+        const std::array<std::uint64_t, 2> shape{test.rows, 128};
+        const Json directory = {
+            {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
+            {"objects", Json::array({{{"name", "weight"},
+                                      {"kind", "tensor"},
+                                      {"shape", shape},
+                                      {"format", ninfer::artifact::format_name(test.format)},
+                                      {"layout", ninfer::artifact::layout_name(test.layout)},
+                                      {"offset", 0},
+                                      {"bytes", ninfer::artifact::tensor_encoded_size(
+                                                    test.layout, test.format, shape)}}})},
+        };
+        auto fixture = write_fixture(directory, "selected-row-identity");
+        const Reader reader(fixture.path);
+        const std::array selections{
+            ninfer::artifact::TensorContentSelection{"weight", test.selected},
+            ninfer::artifact::TensorContentSelection{"weight", test.selected},
+        };
+        if (reader.tensor_content_identity(selections) !=
+            std::string("tensor-sha256-v1:") + test.sha256) {
+            throw std::runtime_error("selected row SHA-256 disagrees with independent oracle");
+        }
     }
-    // Same pathname, same byte length, same public identity; a new inode must
-    // invalidate persistent state rather than reusing the replaced model's KV.
+}
+
+void test_tensor_content_identity() {
+    const Json single = {
+        {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
+        {"objects", Json::array({{{"name", "weight"},
+                                  {"kind", "tensor"},
+                                  {"shape", {2, 3}},
+                                  {"format", "BF16"},
+                                  {"layout", "contiguous-le-v1"},
+                                  {"offset", 0},
+                                  {"bytes", 12}}})},
+    };
+    auto known = write_fixture(single, "tensor-identity-known");
+    // Python hashlib over the canonical descriptor including [[0,12]], then twelve 0x01 bytes.
+    if (all_tensor_identity(Reader(known.path)) !=
+        "tensor-sha256-v1:6ce24c5548cd0703f4ddb6a8d7bb42c7f90e6d5a4b84404f42e24c0e25ec2179") {
+        throw std::runtime_error("tensor content SHA-256 disagrees with independent oracle");
+    }
+    auto original      = write_fixture(normative_directory(), "tensor-identity-original");
+    auto replacement   = write_fixture(normative_directory(), "tensor-identity-replacement");
+    const auto initial = all_tensor_identity(Reader(original.path));
+    if (initial.empty() || all_tensor_identity(Reader(replacement.path)) != initial) {
+        throw std::runtime_error("identical tensors on different inodes changed identity");
+    }
     std::filesystem::rename(replacement.path, original.path);
-    const auto replaced = Reader(original.path).file_identity();
-    if (replaced == initial) { throw std::runtime_error("artifact replacement was not detected"); }
     const auto before = std::filesystem::last_write_time(original.path);
-    {
-        const auto payload_offset = Reader(original.path).payload_offset();
-        std::fstream file(original.path, std::ios::in | std::ios::out | std::ios::binary);
-        file.seekp(static_cast<std::streamoff>(payload_offset));
-        file.put('Z');
-        if (!file) { throw std::runtime_error("failed to modify artifact fixture payload"); }
-    }
     std::filesystem::last_write_time(original.path, before - std::chrono::seconds(2));
-    if (Reader(original.path).file_identity() == replaced) {
-        throw std::runtime_error("artifact modification was not detected");
+    if (all_tensor_identity(Reader(original.path)) != initial) {
+        throw std::runtime_error("file replacement or timestamp changed tensor identity");
+    }
+    const auto overwrite = [&](std::uint64_t offset, char byte) {
+        std::fstream file(original.path, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(static_cast<std::streamoff>(offset));
+        file.put(byte);
+        if (!file) { throw std::runtime_error("failed to modify artifact fixture"); }
+    };
+    const auto payload_offset = Reader(original.path).payload_offset();
+    overwrite(payload_offset, 'Z');       // Frontend resource bytes are not numerical model state.
+    overwrite(payload_offset + 128, 'P'); // Inter-object padding is not tensor content.
+    if (all_tensor_identity(Reader(original.path)) != initial) {
+        throw std::runtime_error("resource or padding changed tensor identity");
+    }
+
+    auto moved_directory = normative_directory();
+    auto& moved_objects  = moved_directory["objects"];
+    std::reverse(moved_objects.begin(), moved_objects.end());
+    for (std::size_t i = 0; i < moved_objects.size(); ++i) {
+        moved_objects[i]["offset"] = i * std::uint64_t{4096};
+    }
+    auto moved = write_fixture(moved_directory, "tensor-identity-repacked");
+    {
+        Reader source(original.path);
+        Reader destination(moved.path);
+        std::fstream file(moved.path, std::ios::in | std::ios::out | std::ios::binary);
+        for (const auto& object : destination.objects()) {
+            const auto data = source.payload(ninfer::artifact::object_name(object)).data;
+            file.seekp(static_cast<std::streamoff>(destination.payload(object).absolute_offset));
+            file.write(reinterpret_cast<const char*>(data.data()),
+                       static_cast<std::streamsize>(data.size()));
+        }
+        if (!file) { throw std::runtime_error("failed to repack artifact tensors"); }
+    }
+    if (all_tensor_identity(Reader(moved.path)) != initial) {
+        throw std::runtime_error("object placement or order changed tensor identity");
+    }
+    overwrite(payload_offset + 256, 'W');
+    std::filesystem::last_write_time(original.path, before);
+    if (all_tensor_identity(Reader(original.path)) == initial) {
+        throw std::runtime_error("changed tensor bytes with restored mtime were not detected");
+    }
+    for (const auto field : {"shape", "format", "name"}) {
+        auto directory = normative_directory();
+        auto& tensor   = directory["objects"][1];
+        if (std::string_view(field) == "shape") {
+            tensor[field] = {3, 2};
+        } else if (std::string_view(field) == "format") {
+            tensor[field]   = "I32";
+            tensor["shape"] = {3};
+        } else {
+            tensor[field] = "renamed";
+        }
+        auto changed = write_fixture(directory, std::string("tensor-identity-") + field);
+        if (all_tensor_identity(Reader(changed.path)) == initial) {
+            throw std::runtime_error(std::string("changed tensor ") + field + " was not detected");
+        }
     }
 }
 
@@ -254,7 +376,8 @@ int main() {
         test_fp8_row_layout();
         test_normative_fixture();
         test_common_validation();
-        test_file_generation_identity();
+        test_selected_row_identity();
+        test_tensor_content_identity();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

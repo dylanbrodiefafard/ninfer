@@ -201,7 +201,10 @@ public:
     mutable targets::qwen3_6::frontend_internal::EncodedHistoryCache host_encode_cache;
 };
 
-Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
+Engine::Engine(EngineOptions options) {
+    validate_speculative_backend(options.speculative.backend);
+    impl_ = std::make_shared<Impl>(std::move(options));
+}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;

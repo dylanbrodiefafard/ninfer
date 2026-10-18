@@ -72,7 +72,7 @@ binary:   build/bench/ninfer_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
 
-The matrix treats MTP `k=3` with the optimized proposal head as the primary path, keeps `k=0` and
+The matrix treats DFlash `k=3` with the optimized proposal head as the primary path, keeps `k=0` and
 `k=5` as controls, and sweeps `k=0..5` on representative context-decode cases. Decode-bearing cases
 cover CUDA Graph and eager execution; prefill-only cases vary prompt length and prefill chunk.
 
@@ -89,8 +89,8 @@ python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 # Longer run that adds 32k/64k prompt and context-decode points.
 python3 tools/bench/run_ninfer_bench_matrix.py --preset full
 
-# Run only the MTP draft-window sweep.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite mtp_sweep
+# Run only the DFlash draft-window sweep.
+python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite draft_sweep
 ```
 
 Default outputs:
@@ -119,9 +119,9 @@ tokens over complete-wave wall time; `prefill_active_tok_s` separately reports t
 active prefill rate. The matrix manifest is descriptive and records the commands and selected local
 inputs; it does not make repository state part of report validity.
 
-`run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
-artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
-`--mode mtp3` to run only that suite. `--mode dflash7` runs the same decode corpus with DFlash
+`run_serve_corpus.py` runs both registered targets and both ordinary/DFlash suites when both
+artifacts are supplied. Pass one `--artifact` to select a single target and `--mode ordinary` or
+`--mode dflash3` to run only that suite. `--mode dflash7` runs the same decode corpus with DFlash
 block=8 (`k=7`) and the optimized proposal head on 35B-A3B DFlash v1 or Qwen3.8-27B DFlash2.
 It is rejected for `qwen3_6_27b`. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
@@ -154,15 +154,15 @@ position for every request.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
-  --mode mtp3 --suite decode-saturation \
+  --artifact qwen3_8_27b=models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --mode dflash3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 \
   --decode-tokens 8192 \
   --output profiles/bench/concurrent-decode
 
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
-  --mode mtp3 --suite corpus-makespan \
+  --artifact qwen3_8_27b=models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --mode dflash3 --suite corpus-makespan \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus
 ```
@@ -173,7 +173,7 @@ would not preserve either a steady interval or one continuous makespan.
 
 ## NVFP4 KV context sweep
 
-`run_nvfp4_kv_context.py` drives `ninfer_bench` against `qwen3.8-27b/nvfp4` with MTP3 and the
+`run_nvfp4_kv_context.py` drives `ninfer_bench` against `qwen3.8-27b/nvfp4` with DFlash3 and the
 optimized proposal head. It compares INT8-G64 and NVFP4 KV:
 
 - C=1: combined `pp+tg` at 5k/20k/50k/100k/150k (prefill tok/s and decode tok/s)
@@ -181,7 +181,7 @@ optimized proposal head. It compares INT8-G64 and NVFP4 KV:
 
 ```bash
 python3 tools/bench/run_nvfp4_kv_context.py \
-  --weights out/qwen3_8_27b.ninfer \
+  --weights models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --bench build/bench/ninfer_bench
 ```
 
@@ -189,7 +189,7 @@ python3 tools/bench/run_nvfp4_kv_context.py \
 
 `run_speed_suite.py` is the **fast-iteration** tool: it hits the *already-running* serve
 (default `http://127.0.0.1:8081`) — no engine spawn, restart, or reconfiguration — and reports,
-per scenario, prefill tok/s, decode tok/s, time-to-first-token, end-to-end wall, MTP draft
+per scenario, prefill tok/s, decode tok/s, time-to-first-token, end-to-end wall, DFlash draft
 accept, and an output hash. Unlike the offline `ninfer_bench` matrix above, it measures the
 production serve path and is the right instrument for watching a branch while you edit kernels.
 

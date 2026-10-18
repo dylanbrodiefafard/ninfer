@@ -18,7 +18,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--weights", type=Path, required=True)
     ap.add_argument("--server", type=Path, default=Path("/build/apps/ninfer-serve"))
-    ap.add_argument("--spec", choices=("off", "mtp", "dflash"), default="dflash")
+    ap.add_argument("--spec", choices=("off", "dflash"), default="dflash")
     ap.add_argument("--no-cuda-graph", action="store_true")
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()

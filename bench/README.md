@@ -56,7 +56,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|nvfp4>] [--concurrency <1..6>]
-           [--spec <mtp|dflash>] [--draft-tokens <0..5>] [--dflash-verify-width <2..16>]
+           [--spec <dflash>] [--draft-tokens <1..7>] [--dflash-verify-width <2..16>]
            [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -73,10 +73,10 @@ Example:
 ```
 
 `bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `nvfp4` selects the
-NVFP4-G16 KV layout. `--spec mtp` (default) enables MTP with `--draft-tokens 1..5`; `--spec
-dflash` requires the artifact to contain `dflash/` objects and takes `--draft-tokens 1..5`
-(verify width 0 = k-dependent default, or explicit `--dflash-verify-width`). `--lm-head-draft`
-selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
+NVFP4-G16 KV layout. Speculative decoding is off by default. `--spec dflash` requires the
+artifact to contain `dflash/` objects and takes `--draft-tokens 1..7` (verify width 0 selects
+the k-dependent default, or use explicit `--dflash-verify-width`). MTP execution is disabled.
+`--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
 batched-decode check: two Engine lanes, not HTTP.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
@@ -325,7 +325,7 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 `gdn_input_proj_conv_snapshot` forms for exact `B=1..8` and record-producing forms for the product
 domain `B=1..6`. The timed body is exactly one complete public Op call; the benchmark does not
 include private launchers, candidate selection, duplicated compositions, or route labels. Its
-default `T=1..6` sweep is the production MTP verification interval. NVFP4 accepts
+default `T=1..6` sweep is the dormant private MTP verification interval. NVFP4 accepts
 the public `a16` and `a4` policies; the reported profile names the caller policy, not a private
 resolved route.
 
@@ -650,19 +650,6 @@ cmake --build build --parallel --target ninfer_linear_pair_bench
 cmake --build build --parallel --target ninfer_mtp_pack_bench
 ./build/bench/ninfer_mtp_pack_bench --op pack --d 5120 --tokens 1,2,3,4,5,6,48
 ./build/bench/ninfer_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
-```
-
-## Target MTP round benchmark
-
-`ninfer_qwen3_6_27b_mtp_round_bench` measures the registered target's native proposal and
-verification round without introducing a second generation controller. It loads the same `.ninfer`
-artifact through the target-private package facade, prepares a real prompt with that target's
-Frontend, and reports draft/accept statistics for the target-owned MTP schedule:
-
-```bash
-cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
-./build/bench/ninfer_qwen3_6_27b_mtp_round_bench \
-  --artifact out/qwen3_6_27b.ninfer
 ```
 
 ## 35B complete DFlash round benchmark

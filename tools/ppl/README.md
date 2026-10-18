@@ -22,32 +22,27 @@ CUDA graphs default **on**, matching production decode. `--no-cuda-graph` is the
 eager pair. Each cell writes `max_nll`, `terrible_tokens` (nll ≥ 10), and a
 `{cell}.nllf32` sidecar so mean PPL cannot hide a handful of exploding tokens.
 
-Decode-lane cells run under the production MTP spec by default: `--spec mtp
---draft-tokens 3` loads MTP and scores T=1 target-verify (drafts cleared after
-the prefix). It is not a draft-accept-rate test. `--no-mtp` (or `--spec none`)
-reverts to spec-free decode; `--draft-tokens N` overrides the draft length.
-Prefill-lane cells are always spec-free for MTP. `--spec dflash` is admitted on
-`--schedule prefill` only (target teacher-force with DFlash feature capture
-loaded). DFlash decode score is rejected.
+Decode-lane cells use ordinary teacher-forced scoring. MTP execution is disabled.
+`--spec dflash --schedule prefill` optionally loads DFlash feature capture for target
+teacher-forcing. DFlash decode scoring is rejected.
 
 ## Run
 
 Build `ninfer-ppl`, then score. Default is 8k then 32k, both schedules, graphs on,
-plus 8k extras (mid-page skip, short-context decode, graphs-off, MTP × KV dtypes).
+plus 8k extras (mid-page skip, short-context decode, graphs-off).
 BF16 KV always runs first inside each (length, schedule, spec) group.
 
 ```bash
 cmake --build build --parallel --target ninfer-ppl
 
 python3 tools/ppl/run.py \
-  --weights /path/to/models/qwen3.8-nvfp4-Osfralla-mtp-ninfer/qwen3_8_27b_nvfp4.ninfer
+  --weights models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer
 ```
 
 First run bakes WikiText-2 with `ninfer-ppl --encode` (the tokenizer inside the
 `.ninfer` file). The script prints the output directory, which contains
 `results.json` and `results.md`. `--tokens N` scores only that length; `--long`
-is 32k only. `--no-extras` drops the 8k extra cells; `--no-mtp` runs the decode
-lane spec-free (legacy behavior) and skips the MTP extras.
+is 32k only. `--no-extras` drops the 8k extra cells.
 
 Decode is much slower (one T=1 step per scored token):
 

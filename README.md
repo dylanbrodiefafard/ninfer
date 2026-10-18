@@ -20,13 +20,15 @@ runtime:
 The supported identity `qwen3.8-27b/nvfp4` is registered as the `qwen3_8_27b` target and shares
 the 27B execution package while using W8 token-embedding and full-output-head weights. The `nvfp4`
 profile uses W4A4 Tensor Core MMA for prefill and A16 NVFP4 kernels for decode. The artifact
-retains the full Text, Vision, MTP, prefix-reuse, CLI, and serving routes. The other listed
+retains the full Text, Vision, DFlash, prefix-reuse, CLI, and serving routes. The other listed
 artifacts remain loadable but are outside the current product contract.
 
 ## Performance
 
 The published measurements currently cover the three Qwen3.6 artifact profiles. Qwen3.8-27B is
 supported by current NInfer builds but is not yet included in the benchmark campaign.
+
+The MTP measurements below are historical; current builds disable MTP execution.
 
 ### Concurrent MTP3 decode
 
@@ -114,6 +116,7 @@ NInfer currently requires:
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
   `libavutil >= 58`, and `libswscale >= 7`;
 - `libcurl >= 7.85`;
+- OpenSSL development libraries (`libcrypto`) for persistent-cache tensor identity;
 - Ninja, when using the commands below.
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
@@ -231,10 +234,10 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
 ```
 
 The supported identity is `qwen3.8-27b/nvfp4`; when available, the default artifact is the
-MTP-NVFP4 or DFlash2 (NVFP4 matrices, BF16 selector codebook) variant over the base Ostfralla
-NVFP4 shell. Both are built from `qwen3_8_27b_nvfp4.ninfer`, and the MTP-NVFP4 variant
-additionally takes the Qwen3.8-27B BF16 source, using the conversion tooling described in the
+DFlash2 (NVFP4 matrices, BF16 selector codebook) variant over the base Ostfralla
+NVFP4 shell, built using the conversion tooling described in the
 [qwen3.8-27B artifact contract](docs/maintainer/qwen3.8-27b-artifact.md).
+MTP execution is disabled; existing MTP tensors may remain in artifacts.
 
 Current NInfer builds accept only the version-2 artifact container, and all five downloads above
 are version 2. Migration applies only to Qwen3.6 artifacts downloaded before their version-2
@@ -253,7 +256,7 @@ Each `.ninfer` file contains the weights and frontend resources needed by NInfer
 Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 Each artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
-disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
+disabled by default, so DFlash state and the optimized proposal head are not uploaded.
 Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
 request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
 accept image or video input. Disabled capabilities cannot be enabled by a later request. Qwen3.8-27B
@@ -263,11 +266,11 @@ target hidden states and can run with Vision when both capabilities are enabled 
 ## Run the CLI
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
-  --spec mtp --draft-tokens 3 \
+  --spec dflash --draft-tokens 3 \
   --lm-head-draft
 ```
 
@@ -288,11 +291,11 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ## Run the HTTP server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
   --max-context 16384 \
   --kv-capacity auto \
   --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
+  --spec dflash --draft-tokens 3 \
   --lm-head-draft
 ```
 
@@ -324,7 +327,7 @@ All three registered model IDs support:
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
-- MTP speculative decoding with draft windows from one to five;
+- DFlash2 speculative decoding with chain draft windows from one to seven;
 - BF16, INT8 group-64, and NVFP4 KV cache (default NVFP4);
 - default p-less sampling (Qwen3.8 temperature `2.0`) with explicit greedy, temperature, and seed
   overrides; `--no-p-less-sampling` selects the top-k/top-p/min-p/penalty sampler;

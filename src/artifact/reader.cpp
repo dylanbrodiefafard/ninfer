@@ -1,6 +1,7 @@
 #include "artifact/reader.h"
 
 #include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <exception>
 #include <functional>
 #include <limits>
+#include <map>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -210,10 +212,9 @@ public:
                 throw std::system_error(error, std::generic_category(), "mmap " + path.string());
             }
         }
-        fd_     = fd;
-        data_   = static_cast<const std::byte*>(mapping);
-        size_   = size;
-        status_ = status;
+        fd_   = fd;
+        data_ = static_cast<const std::byte*>(mapping);
+        size_ = size;
     }
 
     ~MappedFile() {
@@ -227,15 +228,6 @@ public:
     const std::byte* data() const noexcept { return data_; }
 
     std::size_t size() const noexcept { return size_; }
-
-    std::string file_identity() const {
-        return "linux-file-v1:" + std::to_string(status_.st_dev) + ":" +
-               std::to_string(status_.st_ino) + ":" + std::to_string(status_.st_size) + ":" +
-               std::to_string(status_.st_mtim.tv_sec) + ":" +
-               std::to_string(status_.st_mtim.tv_nsec) + ":" +
-               std::to_string(status_.st_ctim.tv_sec) + ":" +
-               std::to_string(status_.st_ctim.tv_nsec);
-    }
 
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
         constexpr std::size_t alignment = Reader::direct_io_alignment;
@@ -263,7 +255,6 @@ private:
     int fd_                = -1;
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
-    struct stat status_{};
 };
 
 // Applies accessor to the active descriptor through std::get_if, so the noexcept accessors below
@@ -390,7 +381,129 @@ Reader& Reader::operator=(Reader&&) noexcept = default;
 
 const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
 
-std::string Reader::file_identity() const { return impl_->file.file_identity(); }
+std::string
+Reader::tensor_content_identity(std::span<const TensorContentSelection> selections) const {
+    struct ByteRange {
+        std::uint64_t offset;
+        std::uint64_t bytes;
+    };
+
+    struct SelectedTensor {
+        const TensorDescriptor* descriptor;
+        std::vector<ByteRange> ranges;
+    };
+
+    std::map<std::string_view, SelectedTensor> tensors;
+    for (const auto& selection : selections) {
+        const auto* object = find(selection.name);
+        const auto* tensor = object == nullptr ? nullptr : std::get_if<TensorDescriptor>(object);
+        if (tensor == nullptr) {
+            throw ArtifactError("content selection is not a tensor: " +
+                                std::string(selection.name));
+        }
+        auto [entry, inserted] = tensors.try_emplace(tensor->name, SelectedTensor{tensor, {}});
+        (void)inserted;
+        auto& ranges = entry->second.ranges;
+        if (!selection.rows) {
+            ranges.push_back({0, tensor->bytes});
+            continue;
+        }
+        const auto [first, rows] = *selection.rows;
+        if (tensor->shape.size() != 2 || rows == 0 || first >= tensor->shape[0] ||
+            rows > tensor->shape[0] - first) {
+            throw ArtifactError("content row selection is out of range: " + tensor->name);
+        }
+        const auto columns = tensor->shape[1];
+        switch (tensor->layout) {
+        case StorageLayout::ContiguousLeV1: {
+            const auto stride = tensor->bytes / tensor->shape[0];
+            ranges.push_back({first * stride, rows * stride});
+            break;
+        }
+        case StorageLayout::RowSplitK128V1: {
+            const auto geometry     = row_split_geometry(tensor->format, tensor->shape);
+            const auto low_stride   = geometry.groups_per_row * geometry.low_bytes_per_group;
+            const auto high_stride  = geometry.groups_per_row * geometry.high_bytes_per_group;
+            const auto scale_stride = geometry.groups_per_row * 2;
+            ranges.push_back({first * low_stride, rows * low_stride});
+            if (high_stride != 0) {
+                ranges.push_back(
+                    {geometry.high_plane_offset + first * high_stride, rows * high_stride});
+            }
+            ranges.push_back(
+                {geometry.scale_plane_offset + first * scale_stride, rows * scale_stride});
+            break;
+        }
+        case StorageLayout::BlockScaleK16M128x4V1: {
+            if (first % 128 != 0 || rows % 128 != 0) {
+                throw ArtifactError("NVFP4 content rows must align to 128-row tiles: " +
+                                    tensor->name);
+            }
+            const auto geometry = block_scale_geometry(tensor->format, tensor->shape);
+            ranges.push_back({first * (columns / 2), rows * (columns / 2)});
+            // Scale swizzling is contained within each 128-row tile.
+            ranges.push_back(
+                {geometry.scale_plane_offset + first * (columns / 16), rows * (columns / 16)});
+            ranges.push_back({geometry.weight_divisor_offset, 4});
+            break;
+        }
+        case StorageLayout::RowScaleV1: {
+            const auto geometry = row_scale_geometry(tensor->format, tensor->shape);
+            ranges.push_back({first * columns, rows * columns});
+            ranges.push_back({geometry.scale_plane_offset + first * 2, rows * 2});
+            break;
+        }
+        }
+    }
+    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(),
+                                                                          EVP_MD_CTX_free);
+    if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) {
+        throw ArtifactError("cannot initialize artifact tensor SHA-256");
+    }
+    const auto update = [&](const void* data, std::size_t bytes) {
+        if (EVP_DigestUpdate(context.get(), data, bytes) != 1) {
+            throw ArtifactError("cannot update artifact tensor SHA-256");
+        }
+    };
+    for (auto& [name, selected] : tensors) {
+        auto& ranges = selected.ranges;
+        std::sort(ranges.begin(), ranges.end(),
+                  [](const auto& left, const auto& right) { return left.offset < right.offset; });
+        std::vector<ByteRange> merged;
+        for (const auto range : ranges) {
+            if (!merged.empty() && range.offset <= merged.back().offset + merged.back().bytes) {
+                auto& previous = merged.back();
+                previous.bytes =
+                    std::max(previous.bytes, range.offset + range.bytes - previous.offset);
+            } else {
+                merged.push_back(range);
+            }
+        }
+        Json encoded_ranges = Json::array();
+        for (const auto range : merged) { encoded_ranges.push_back({range.offset, range.bytes}); }
+        const auto& tensor           = *selected.descriptor;
+        const std::string descriptor = Json::array({name, tensor.shape, format_name(tensor.format),
+                                                    layout_name(tensor.layout), encoded_ranges})
+                                           .dump();
+        update(descriptor.data(), descriptor.size());
+        const auto data = payload(name).data;
+        for (const auto range : merged) {
+            update(data.data() + range.offset, static_cast<std::size_t>(range.bytes));
+        }
+    }
+    std::array<unsigned char, 32> digest{};
+    unsigned int bytes = 0;
+    if (EVP_DigestFinal_ex(context.get(), digest.data(), &bytes) != 1 || bytes != digest.size()) {
+        throw ArtifactError("cannot finalize artifact tensor SHA-256");
+    }
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string result             = "tensor-sha256-v1:";
+    for (const auto byte : digest) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 15]);
+    }
+    return result;
+}
 
 const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
 

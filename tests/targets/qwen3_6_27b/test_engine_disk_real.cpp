@@ -1517,8 +1517,7 @@ int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = fals
         auto source = tokens_a();
         if (fault != RestoreFault::CorruptPage) { source.resize(192, 198); }
         {
-            // DFlash cyclic capacity is part of the startup fingerprint. Seed
-            // with the same C as the restored Engine, then cover every lane.
+            // Populate every destination lane while retaining compatible cyclic geometry.
             ninfer::Engine seed(options(concurrency));
             const auto first = seed.generate(seed.prepare_tokens(source), greedy(8, false));
             generated        = first.generated_token_ids;
@@ -1599,18 +1598,13 @@ int exercise_corrupt_restore_falls_back(const char* artifact, bool dflash = fals
 // A disk restore decodes the entry's saved ladder head into a Program pool head, installs it on
 // the lane, and a later diverging prompt restores that head from VRAM; the next token matches a
 // cold prefill of the same prompt.
-int exercise_disk_checkpoint_heads(const char* artifact, bool dflash = false) {
+int exercise_disk_checkpoint_heads(const char* artifact) {
     constexpr std::uint32_t kMark = 128; // prefill chunks are multiples of 128
     const auto disk_dir           = make_disk_dir("ckpt-heads");
     auto options                  = [&] {
-        auto result          = dflash ? dflash_disk_options(artifact, disk_dir, 1, kRamBytes)
-                                      : disk_options(artifact, disk_dir, 1, kRamBytes);
-        result.prefill_chunk = kMark;
+        auto result                     = dflash_disk_options(artifact, disk_dir, 1, kRamBytes);
+        result.prefill_chunk            = kMark;
         result.context_checkpoint_marks = std::vector<std::uint32_t>{kMark};
-        if (!dflash) {
-            result.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
-            result.speculative.draft_tokens = 4;
-        }
         return result;
     };
     auto source = tokens_a();
@@ -1633,7 +1627,7 @@ int exercise_disk_checkpoint_heads(const char* artifact, bool dflash = false) {
         }
     } catch (const std::exception& error) {
         const std::string message = error.what();
-        if (message.find(dflash ? "dflash/" : "mtp/") != std::string::npos) {
+        if (message.find("dflash/") != std::string::npos) {
             std::cerr << "skip: checkpoint heads need speculative objects\n";
             return 0;
         }
@@ -1666,7 +1660,7 @@ int exercise_disk_checkpoint_heads(const char* artifact, bool dflash = false) {
     if (reused.generated_token_ids != cold.generated_token_ids) {
         return fail("disk-decoded ladder head restore differs from cold next token");
     }
-    std::cout << "disk checkpoint heads dflash=" << dflash << " passed\n";
+    std::cout << "DFlash disk checkpoint heads passed\n";
     return 0;
 }
 
@@ -1773,13 +1767,21 @@ int exercise_dflash_fingerprint(const char* artifact) {
 }
 
 int exercise_dflash_three_tier(const char* artifact) {
-    const auto disk_dir = make_disk_dir("dflash");
+    const char* label   = "DFlash";
+    const auto disk_dir = make_disk_dir(label);
+    const auto options  = [&] {
+        auto value                      = disk_options(artifact, disk_dir, 1, kRamBytes);
+        value.kv_cache                  = ninfer::KvCacheStorage::Nvfp4;
+        value.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+        value.speculative.draft_tokens  = 4;
+        value.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        return value;
+    };
     std::vector<ninfer::TokenId> generated;
     try {
-        ninfer::Engine engine(dflash_disk_options(artifact, disk_dir, 1, kRamBytes));
+        ninfer::Engine engine(options());
         if (const int rc = verify_disk_tier(engine, kRamBytes); rc != 0) { return rc; }
-        if (const int rc =
-                capture_to_ram(engine, tokens_a(), tokens_b(), &generated, "DFlash land");
+        if (const int rc = capture_to_ram(engine, tokens_a(), tokens_b(), &generated, label);
             rc != 0) {
             return rc;
         }
@@ -1789,23 +1791,22 @@ int exercise_dflash_three_tier(const char* artifact) {
             std::cerr << "disk_real: skip DFlash three-tier (artifact has no dflash objects)\n";
             return 0;
         }
-        std::cerr << "DFlash three-tier Engine failed: " << message << '\n';
+        std::cerr << label << " three-tier Engine failed: " << message << '\n';
         return 1;
     }
-
-    ninfer::Engine engine(dflash_disk_options(artifact, disk_dir, 1, kRamBytes));
+    ninfer::Engine engine(options());
     const auto history = resume_prefix(tokens_a(), generated);
     const auto hit     = engine.generate(engine.prepare_tokens(history), greedy(4, true));
-    if (const int rc =
-            expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
-                       static_cast<std::uint32_t>(history.size()), "DFlash restart HostDisk");
+    if (const int rc = expect_hit(hit, ninfer::PrefixReuseSource::HostDisk,
+                                  static_cast<std::uint32_t>(history.size()), label);
         rc != 0) {
         return rc;
     }
     if (hit.speculative.rounds == 0) {
-        return fail("DFlash HostDisk continuation did not run speculative decode");
+        return fail("HostDisk continuation did not run speculative decode");
     }
-    return 0;
+    const auto cold = engine.generate(engine.prepare_tokens(history), greedy(4, false));
+    return expect_greedy_match(hit, cold, label);
 }
 
 int exercise_artifact(const char* artifact) {
@@ -1939,11 +1940,6 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("disk checkpoint heads install and reuse",
-                           [&] { return exercise_disk_checkpoint_heads(artifact); });
-        rc != 0) {
-        return rc;
-    }
     if (const int rc = run("C=3 suffix disk with occupants",
                            [&] { return exercise_c3_suffix_disk_with_occupants(artifact); });
         rc != 0) {
@@ -1964,7 +1960,7 @@ int exercise_artifact(const char* artifact) {
         rc != 0) {
         return rc;
     }
-    if (const int rc = run("MTP/off vs DFlash directory fingerprint",
+    if (const int rc = run("Ordinary vs DFlash directory fingerprint",
                            [&] { return exercise_dflash_fingerprint(artifact); });
         rc != 0) {
         return rc;
@@ -2001,21 +1997,8 @@ int main(int argc, char** argv) {
     const char* nvfp4     = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
     const char* dflash    = std::getenv("NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS");
     if (heads_only) {
-        int ran = 0;
-        for (const char* artifact : {groupwise, nvfp4}) {
-            if (artifact == nullptr || *artifact == '\0') { continue; }
-            if (const int result = exercise_disk_checkpoint_heads(artifact); result != 0) {
-                return result;
-            }
-            ++ran;
-        }
-        if (dflash != nullptr && *dflash != '\0') {
-            if (const int result = exercise_disk_checkpoint_heads(dflash, true); result != 0) {
-                return result;
-            }
-            ++ran;
-        }
-        return ran == 0 ? 77 : 0;
+        if (dflash == nullptr || *dflash == '\0') { return 77; }
+        return exercise_disk_checkpoint_heads(dflash);
     }
     if (dflash_only) {
         if (dflash == nullptr || *dflash == '\0') { return 77; }
@@ -2069,7 +2052,7 @@ int main(int argc, char** argv) {
         if (const int result = exercise_corrupt_restore_falls_back(dflash, true); result != 0) {
             return result;
         }
-        if (const int result = exercise_disk_checkpoint_heads(dflash, true); result != 0) {
+        if (const int result = exercise_disk_checkpoint_heads(dflash); result != 0) {
             return result;
         }
     }

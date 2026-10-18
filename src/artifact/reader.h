@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -127,6 +128,18 @@ struct ArtifactIdentity {
     bool operator==(const ArtifactIdentity&) const = default;
 };
 
+struct TensorRowRange {
+    std::uint64_t first_row;
+    std::uint64_t rows;
+};
+
+// The name borrows from the Reader's inventory. An absent row range selects the whole tensor;
+// row ranges select a rank-two matrix, including its corresponding codes, scales, and divisor.
+struct TensorContentSelection {
+    std::string_view name;
+    std::optional<TensorRowRange> rows;
+};
+
 class Reader {
 public:
     static constexpr std::size_t direct_io_alignment = 4096;
@@ -140,9 +153,13 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     const ArtifactIdentity& identity() const noexcept;
-    // Identity of this immutable local file generation, not a content checksum.
-    // Reopening the same unchanged inode is stable; replacement/modification is not.
-    std::string file_identity() const;
+    // SHA-256 of selected tensor descriptors and encoded bytes, canonicalized by name/range.
+    // Selection belongs to the caller's numerical/state contract. File metadata, resources,
+    // object placement, and unselected bytes are excluded. Partial NVFP4 rows must align to
+    // 128-row scale tiles. Throws ArtifactError for invalid selections or digest failures.
+    // Reads selected bytes; the artifact must remain immutable during use.
+    [[nodiscard]] std::string
+    tensor_content_identity(std::span<const TensorContentSelection> selections) const;
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 

@@ -29,7 +29,7 @@ def test_summary_retains_one_canonical_weights_id() -> None:
         "qwen3_6_27b",
         "fixture",
         "fixture",
-        "mtp0",
+        "ordinary",
         "greedy",
         records,
     )
@@ -41,7 +41,7 @@ def test_summary_retains_one_canonical_weights_id() -> None:
             "qwen3_6_27b",
             "fixture",
             "fixture",
-            "mtp0",
+            "ordinary",
             "greedy",
             [*records, {"weights_id": "groupwise-int", "metrics": {}}],
         )

@@ -3,7 +3,7 @@
 
 The matrix is intentionally layered instead of fully factorial:
 
-* k=3 is the primary MTP path to evaluate.
+* k=3 is the primary DFlash path to evaluate.
 * k=0 and k=5 are baseline/max-window controls.
 * k=0..5 is swept on representative context-decode cases.
 * CUDA graph is compared only for decode-bearing tests.
@@ -30,7 +30,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
-DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
+DEFAULT_WEIGHTS = REPO_ROOT / "models/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
 PREFILL_LENGTHS_CORE = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -64,9 +64,10 @@ def pair_list(values: Iterable[tuple[int, int]]) -> str:
     return ";".join(f"{p},{g}" for p, g in values)
 
 
-def mtp_args(k: int) -> tuple[str, ...]:
-    args = ("--spec", "mtp", "--draft-tokens", str(k))
-    return (*args, "--lm-head-draft") if k > 0 else args
+def draft_args(k: int) -> tuple[str, ...]:
+    if k == 0:
+        return ()
+    return ("--spec", "dflash", "--draft-tokens", str(k), "--lm-head-draft")
 
 
 def shell_join(command: Sequence[str]) -> str:
@@ -97,12 +98,12 @@ def add_repetition_args(
 def build_cases(preset: str) -> list[BenchCase]:
     if preset == "smoke":
         return [
-            BenchCase("prefill_length", "prefill_p128_k0", ("-p", "128", *mtp_args(0)), 1, 0),
-            BenchCase("pure_decode", "tg8_k3_graph", ("-n", "8", *mtp_args(3)), 1, 0),
+            BenchCase("prefill_length", "prefill_p128_k0", ("-p", "128", *draft_args(0)), 1, 0),
+            BenchCase("pure_decode", "tg8_k3_graph", ("-n", "8", *draft_args(3)), 1, 0),
             BenchCase(
                 "context_decode",
                 "ctx_p128_g8_k3_graph",
-                ("-pg", "128,8", "--max-ctx", "256", *mtp_args(3)),
+                ("-pg", "128,8", "--max-ctx", "256", *draft_args(3)),
                 1,
                 0,
             ),
@@ -120,7 +121,7 @@ def build_cases(preset: str) -> list[BenchCase]:
             BenchCase(
                 "prefill_length",
                 f"prefill_lengths_k{k}",
-                ("-p", csv_list(prefill_lengths), *mtp_args(k)),
+                ("-p", csv_list(prefill_lengths), *draft_args(k)),
                 3,
                 1,
                 "prefill length curve",
@@ -138,7 +139,7 @@ def build_cases(preset: str) -> list[BenchCase]:
                         "8192",
                         "--prefill-chunk",
                         str(chunk),
-                        *mtp_args(k),
+                        *draft_args(k),
                     ),
                     3,
                     1,
@@ -149,7 +150,7 @@ def build_cases(preset: str) -> list[BenchCase]:
     for k in PRIMARY_KS:
         for graph in (True, False):
             graph_suffix = "graph" if graph else "eager"
-            args = ["-n", csv_list(PURE_DECODE_GENS), *mtp_args(k)]
+            args = ["-n", csv_list(PURE_DECODE_GENS), *draft_args(k)]
             if not graph:
                 args.append("--no-cuda-graph")
             cases.append(
@@ -166,7 +167,7 @@ def build_cases(preset: str) -> list[BenchCase]:
     for k in PRIMARY_KS:
         for graph in (True, False):
             graph_suffix = "graph" if graph else "eager"
-            args = ["-pg", pair_list(context_pairs), *mtp_args(k)]
+            args = ["-pg", pair_list(context_pairs), *draft_args(k)]
             if not graph:
                 args.append("--no-cuda-graph")
             cases.append(
@@ -183,12 +184,12 @@ def build_cases(preset: str) -> list[BenchCase]:
     for k in SWEEP_KS:
         cases.append(
             BenchCase(
-                "mtp_sweep",
-                f"mtp_sweep_k{k}_graph",
-                ("-pg", pair_list(sweep_pairs), *mtp_args(k)),
+                "draft_sweep",
+                f"draft_sweep_k{k}_graph",
+                ("-pg", pair_list(sweep_pairs), *draft_args(k)),
                 3,
                 1,
-                "primary MTP draft-window sweep",
+                "primary DFlash draft-window sweep",
             )
         )
 
@@ -200,7 +201,7 @@ def build_cases(preset: str) -> list[BenchCase]:
                 f"{prompt},12",
                 "--max-ctx",
                 "8192",
-                *mtp_args(k),
+                *draft_args(k),
             ]
             if not graph:
                 args.append("--no-cuda-graph")
@@ -386,7 +387,7 @@ def write_manifest(
         "schema_version": 3,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "preset": args.preset,
-        "primary_mtp_draft_tokens": 3,
+        "primary_draft_tokens": 3,
         "primary_proposal_head": "optimized",
         "repo_root": str(REPO_ROOT),
         "bench": str(args.bench),
@@ -398,8 +399,8 @@ def write_manifest(
         "case_count": len(cases),
         "commands": list(commands),
         "notes": [
-            "k=3 with the optimized proposal head is the primary MTP path.",
-            "Use context_decode and mtp_sweep rows for MTP efficiency decisions.",
+            "k=3 with the optimized proposal head is the primary DFlash path.",
+            "Use context_decode and draft_sweep rows for DFlash efficiency decisions.",
             "tg rows use a one-token seed and report G decode tokens after the begin token.",
         ],
     }

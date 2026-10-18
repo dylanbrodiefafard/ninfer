@@ -22,6 +22,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 void validate_options(const EngineOptions& options) {
+    validate_speculative_backend(options.speculative.backend);
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -109,12 +110,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const auto weights_profile                    = Target::resolve_weights(identity, binder);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
-    EngineOptions planned          = options;
-    planned.model_id               = identity.model_id;
-    planned.weights_id             = identity.weights_id;
-    planned.artifact_file_identity = reader.file_identity();
-
+    EngineOptions planned = options;
+    planned.model_id      = identity.model_id;
+    planned.weights_id    = identity.weights_id;
     auto load_plan        = Target::plan_load(binder, planned, weights_profile);
+    if (options.kv_disk_capacity_bytes != 0) {
+        planned.artifact_tensor_identity = load_plan.cache_tensor_identity(reader);
+    }
+
     auto sequence_planner = Target::make_sequence_planner(device, planned, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     const std::size_t preflight_runtime_bytes =

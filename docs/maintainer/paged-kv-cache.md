@@ -1,5 +1,9 @@
 # NInfer Paged KV Context Store
 
+Current product execution supports ordinary decoding and DFlash2 only. MTP execution is
+rejected at Engine admission. MTP algorithms and layouts below describe dormant private
+machinery, not an available product backend.
+
 本文定义 NInfer 在单 GPU、单 resident model、少量并发请求下的 growing KV 存储架构。它是
 [小规模并发推理架构](concurrent-inference-architecture.md)所依赖的 KV substrate。
 
@@ -958,7 +962,7 @@ lease but does not delete the durable entry; a later VRAM or RAM hit likewise le
 available. C=1 does not submit restore reads until the selected retained victim has been captured
 and its GPU pages released.
 
-Disk format v6 stores objects in 1 GiB, per-kind pack segments under an atomically selected
+Disk format v7 stores objects in 1 GiB, per-kind pack segments under an atomically selected
 generation. `PACKSET` names the generation and reserves monotonically increasing object-ID ranges.
 The immutable base map and append-only, CRC-framed log resolve stable object IDs to aligned
 extents. Page and state records carry header/payload CRC32C; ledger and identity records retain
@@ -1016,15 +1020,41 @@ size, logical plane schema, speculative backend, and persistent GDN/DFlash state
 strict compatibility boundaries. Vision media identity remains in each entry's exact identity
 record, so changed image or video content cannot reuse a stored prefix.
 
-The v6 fingerprint additionally requires the opened artifact's local file-generation identity:
-device, inode, byte length, and nanosecond modification/change timestamps, captured from the
-Reader's open descriptor. Distinct quantization variants may share `model_id`/`weights_id` but
-must never share retained numerical state. This is an immutable-local-file identity, not a
-content hash or an integrity check against concurrent/adversarial file mutation. Unchanged
-reopens are stable; replacement, metadata modification, or copying to a different inode may
-conservatively require a fresh cache directory. No model-size hashing pass is introduced at
-startup. The trusted local owner must not mutate an artifact while an Engine is using it.
-Pre-v6 stores lack this boundary and are rejected, not silently adopted or automatically deleted.
+The v7 fingerprint binds model/weights identity and a SHA-256 digest of target-selected tensor
+names, shapes, numeric formats, storage layouts, encoded byte ranges, and their contents. The
+artifact reader maps logical row selections to registered code/scale/divisor ranges and hashes
+in canonical name/range order; dependency selection belongs to each target package. For 27B:
+
+- Text embedding, layers, and final norm produce retained KV/GDN and tail/checkpoint hidden state.
+  Output heads, proposal heads, and proposal token maps are excluded.
+- Vision weights remain included even when Vision is disabled at startup: the directory can
+  retain media entries across Vision on/off reopens.
+- Stored MTP tensors are excluded because MTP execution is disabled.
+- DFlash2 includes feature projection, context norm, per-layer key norms, and fused projection
+  key/value rows. Its query, output, MLP, convolution, final-norm, and selector paths produce
+  proposals, not retained context KV. Inactive backend weights are excluded.
+
+For packed row selections, codes and corresponding stored scales are included; NVFP4 also
+includes the shared weight divisor. Its row selections align to complete 128-row scale tiles.
+Filesystem device/inode numbers, timestamps, pathname, total file length, directory formatting,
+object order/placement, padding between objects, and frontend resources are absent. A copy or
+repack of the same retained-state dependencies is compatible; changing a selected numerical
+value or representation is not. Hashing reads the selected bytes only when disk caching is
+enabled. Artifacts remain immutable while an Engine uses them. Frontend resources determine
+prepared inputs and sampling defaults, not the numerical state for an already represented
+prefix. Each entry independently matches token IDs, token types, MRoPE positions, and exact
+media identity.
+
+The attention profile (`sage_attn`, `keep_frac`, `xattn_tau`, and `xattn_min_len` when `xattn_tau <
+1`) is a directory boundary because it changes the computation that produced retained state. KV
+dtype, speculative backend, page size, logical plane schemas, GDN byte extents, per-lane DFlash
+cyclic geometry, and snapshot version remain boundaries. Allocated DFlash lane count is excluded:
+the disk image stores one lane and restore selects a destination lane. Sampling parameters, draft
+token count, transport settings, RAM/disk budgets, compression choice, GPU resident capacity, and
+request concurrency do not invalidate a directory unless they also change the recorded per-lane
+geometry. Model/weights identity identifies the target's fixed mathematical contract; code changes
+that invalidate persistent state must advance the snapshot version. Pre-v7 stores are rejected
+rather than silently adopted or automatically deleted.
 
 Exact-frontier reuse also requires a valid target tail-hidden image. In particular, speculative
 DFlash cancellation can retain the committed KV/GDN/context frontier while invalidating that

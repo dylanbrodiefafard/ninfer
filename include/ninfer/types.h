@@ -101,13 +101,25 @@ enum class ProposalHead : std::uint8_t {
 
 enum class SpeculativeBackend : std::uint8_t {
     None,
+    // Private artifact/state tag. Product entry points reject MTP execution.
     Mtp,
     DFlash,
 };
 
+inline void validate_speculative_backend(SpeculativeBackend backend) {
+    switch (backend) {
+    case SpeculativeBackend::None:
+    case SpeculativeBackend::DFlash:
+        return;
+    case SpeculativeBackend::Mtp:
+        throw std::invalid_argument("MTP execution is disabled; use DFlash or ordinary decoding");
+    }
+    throw std::invalid_argument("invalid speculative backend");
+}
+
 [[nodiscard]] constexpr bool
 context_checkpoint_capture_available(bool allow_prefix_reuse, SpeculativeBackend spec) noexcept {
-    return allow_prefix_reuse && spec != SpeculativeBackend::None;
+    return allow_prefix_reuse && spec == SpeculativeBackend::DFlash;
 }
 
 struct SpeculativeOptions {
@@ -146,7 +158,7 @@ struct EngineOptions {
     // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.
     std::string model_id;
     std::string weights_id;
-    std::string artifact_file_identity;
+    std::string artifact_tensor_identity;
     // nullopt = default prefill ladder; empty = disable automatic ladder (`off`).
     std::optional<std::vector<std::uint32_t>> context_checkpoint_marks;
     KvCacheStorage kv_cache = KvCacheStorage::Nvfp4;

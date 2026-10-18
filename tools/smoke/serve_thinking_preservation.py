@@ -274,7 +274,7 @@ def exercise(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
-    parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
+    parser.add_argument("--backend", choices=("dflash",), required=True)
     parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
     parser.add_argument(
         "--fixture",
