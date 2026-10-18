@@ -20,8 +20,10 @@ endfunction()
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
+  core/device_copy.cu
   core/dtype.cpp
   core/gdn_replay_records.cpp
+  core/gdn_history.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
   core/paged_kv_scatter.cu
@@ -72,6 +74,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
   ops/launcher/argmax.cu
   ops/launcher/nll_from_logits.cu
+  ops/launcher/token_logprobs.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
@@ -111,6 +114,7 @@ add_library(ninfer_ops STATIC
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ops/linear_attention/gated_delta_net/replay.cpp
   ops/linear_attention/gated_delta_net/recurrent.cu
+  ops/linear_attention/gated_delta_net/history.cu
   ops/linear_attention/gated_delta_net/chunked/launch.cu
   ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ops/linear_attention/gated_delta_net/chunked/state_passing.cu
@@ -248,6 +252,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/nll_from_logits.cpp
+  ops/wrapper/token_logprobs.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp

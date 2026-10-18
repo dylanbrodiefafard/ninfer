@@ -82,6 +82,8 @@ The endpoint supports:
 - `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`
   (top-p/top-k/penalties are ignored by default p-less; `--no-p-less-sampling` opts out);
 - one stop string or an array of stop strings;
+- `logprobs` and `top_logprobs` (0 to 20, which requires `logprobs: true`); see
+  [Token log probabilities](#token-log-probabilities);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages.
@@ -92,13 +94,89 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
-- the vendor `ninfer` object (`capture_context_checkpoint`).
+- the vendor `ninfer` object (`cache_write`, `capture_context_checkpoint`).
+
+### Constrained output
+
+Chat Completions accepts the standard OpenAI `response_format`:
+
+```json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "result",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Use `{"type":"json_object"}` for arbitrary JSON objects, or `{"type":"text"}` for
+unconstrained content. Responses accepts the same modes through `text.format`; its schema
+format is flattened: `{"type":"json_schema","name":"result","strict":true,"schema":{...}}`.
+The terminal Response echoes this format. Schema names contain 1–64 letters, digits,
+underscores, or hyphens. `strict` accepts boolean or null; every admitted schema assertion is
+enforced regardless of this flag.
+
+The shared JSON triggers match the official
+[llama.cpp grammar guide](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md),
+[vLLM structured-output contract](https://docs.vllm.ai/en/latest/features/structured_outputs/), and
+[SGLang structured-output contract](https://docs.sglang.io/docs/advanced_features/structured_outputs).
+Their raw grammar fields differ: llama.cpp uses `grammar` with GBNF, vLLM uses
+`structured_outputs.grammar`, and SGLang uses `ebnf`. NInfer selects the vLLM EBNF interface.
+
+For an explicit EBNF grammar, Chat Completions accepts the vLLM-style extension
+`"structured_outputs":{"grammar":"root ::= \"yes\" | \"no\""}`. The start rule is `root`;
+syntax follows XGrammar EBNF. This extension cannot be combined with a constrained
+`response_format`. llama.cpp GBNF and SGLang's `ebnf` request field are separate interfaces.
+
+Constraints apply to content after the reasoning close; thinking remains free text. Include
+instructions for the desired response in the prompt: the schema is not injected into messages.
+Streaming uses the usual content deltas. Caller stop strings/tokens, cancellation, and token or
+context limits can leave incomplete constrained output; inspect the finish reason and validate
+truncated output before consuming it. Tool declarations and output constraints cannot be combined.
+
+The supported JSON Schema subset includes objects, arrays, primitive types and type unions,
+`properties`, `required`, `additionalProperties`, `items`, `prefixItems`, size and length bounds,
+numeric bounds, `enum`, `const`, `anyOf`, and local JSON-pointer `$ref`/`$defs`/`definitions`.
+Type-specific assertions require an explicit `type`; count bounds are nonnegative 32-bit integers.
+Regex `pattern` assertions, anchor references, assertion siblings of `$ref`/`anyOf`/`enum`/`const` (except checked typed literals),
+and unsupported assertions such as `uniqueItems`, `oneOf`, `allOf`, or conditionals fail
+admission with HTTP 400 `invalid_output_constraint`; they are never silently relaxed.
+JSON is generated compactly, without optional formatting whitespace, and properties follow schema order to avoid an exponential unordered-property
+state space. Additional keys alongside named properties use printable ASCII without escapes,
+quotes, or backslashes to prevent aliases overwriting named values. A positive `minProperties`
+above one with additional keys requires at least that many distinct required properties;
+otherwise admission rejects the combination because arbitrary repeated keys cannot establish a
+distinct-property count. Bounded-number emission uses up to six fractional digits and inward-rounded
+bounds; intervals with no representable value fail admission. Integer bounds must fit the
+compiler's signed 64-bit representation. Omitted `additionalProperties` and `items` retain JSON Schema's permissive defaults.
+
+The resident frontend shares a bounded compiled-grammar/tokenizer cache. Each request owns its
+matcher, and the existing packed GPU token mask constrains target sampling, including MTP and
+DFlash verification. Speculative matcher forks only advance on committed output, and mask
+construction overlaps target GPU execution. Unconstrained requests retain the mask-free route.
 
 The request `model` is informational: NInfer runs one resident model, so it serves that model
 regardless of the identifier and echoes the requested value back (llama.cpp-compatible). The
 advertised alias is the artifact `identity.model_id` by default, or the explicit `--model-id`
 override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
+
+Chat output allows one structural reasoning close. Requests with thinking disabled already start
+in the content phase and cannot generate the dedicated closing token as prose. Plain requests
+exclude that token through sampling; a speculative round commits through the reasoning close before
+resampling its continuation. Tool grammars reject closing-think markup in free prose, including
+byte-split forms, while preserving literal tags inside schema-constrained arguments. Response JSON
+constraints and raw completion output retain their literal contents. This is a framing guard, not
+text replacement: ordinary-token literal examples are retained in unconstrained text.
 
 For structured Qwen output, registered model stop tokens are excluded from selection while reasoning
 is open and after `</think>` until non-whitespace answer content begins. Tools-enabled output also
@@ -158,6 +236,37 @@ or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` be
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
 
+`ninfer.cache_write` is a strict boolean defaulting to `true`. Set it to `false` for a disposable
+turn that may read cached state without consuming or overwriting the original chat:
+
+```json
+{ "ninfer": { "cache_write": false } }
+```
+
+A VRAM hit copies the selected prefix and complete continuation state into an independent lane.
+A RAM/disk hit restores without consuming the source. If keeping the ordinary VRAM source
+prevents admission, the Engine attempts to save its full state and existing checkpoints to RAM
+before freeing its lane; this preserves the original, not the disposable result. All active
+lanes cause normal queueing. If an otherwise idle Engine cannot preserve the source using a
+separate lane, configured RAM capacity, or a preserving cold-prefill path, the request returns
+HTTP 429 `server_overloaded` with a capacity explanation. A disposable source itself is never
+saved to RAM to make another disposable turn possible.
+
+The disposable result can remain in VRAM for an exact continuation. It is evicted before ordinary
+retention when a lane or shared pages are needed and never goes to RAM/disk, including at idle
+or shutdown. It captures no context ladder, turn-rollback, or turn/response rewrite checkpoint;
+existing checkpoints may be read, and execution snapshots required for speculation/recovery
+remain. Edited or rerendered follow-ups may therefore need prefill. A later `cache_write: true`
+continuation can make its own resulting state normally cacheable. Originals remain subject to
+ordinary cache eviction after initialization; this option does not permanently pin or purge them.
+
+Combining `cache_write: false` with `capture_context_checkpoint: true` returns HTTP 400
+`cache_write_conflict`, parameter `ninfer.capture_context_checkpoint`, before enqueue or streaming:
+`capture_context_checkpoint=true requires cache_write=true because it creates a retained context checkpoint.`
+Saving an original may increase RAM/disk capture counters and copy time, but the disposable
+request reports zero captured context-checkpoint tokens. Request-log schema 20 records
+`request.cache_write` on generation and preparation-rejection events.
+
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage. Non-stream responses and the stream usage/finish chunks
@@ -196,6 +305,39 @@ When this request copied KV, the `ninfer` namespace carries `kv_ram` and/or `kv_
 request's `save_ms` / `load_ms` (and disk `h2d_ms`). Process occupancy and lifetime capture
 counters are on `GET /metrics`, not on the OpenAI usage object. The objects are omitted when this
 request did not copy.
+
+### Token log probabilities
+
+`logprobs: true` adds `choices[0].logprobs` to the response, and `top_logprobs: N` adds the `N`
+most likely alternatives at each position:
+
+```json
+{"content": [{"token": "42", "logprob": -0.0021, "bytes": [52, 50],
+              "top_logprobs": [{"token": "42", "logprob": -0.0021, "bytes": [52, 50]},
+                               {"token": "41", "logprob": -6.83, "bytes": [52, 49]}]}],
+ "refusal": null}
+```
+
+- **Distribution.** Each value is the log-softmax of the target model's logits at temperature 1
+  over the whole vocabulary, at the position that produced the token. Sampling temperature,
+  p-less truncation, penalties, and tool-grammar masks do not participate, so the values are
+  comparable across requests and a token the sampler was steered to can have a low logprob.
+  Speculative decoding does not change them: every emitted token is scored by the target model's
+  verification of that position, never by the draft. Ranked alternatives are ordered by logit,
+  lower token id first among equal logits.
+- **Which tokens.** `content` lists the tokens of the answer text. Reasoning tokens, reasoning
+  markers, tool-call markup of a tool-enabled request, and stop tokens are not listed.
+- **Token alignment.** Entries follow tokens, not released text. In a stream each content chunk
+  carries the tokens committed with it; a chunk may carry tokens with `content: ""` while their
+  text is held for a stop-string or UTF-8 boundary, and text released later arrives with an empty
+  list. A token trimmed from `content` by a stop string keeps its entry.
+- **`token` and `bytes`.** `bytes` is the token's exact byte string. `token` is the same bytes as
+  UTF-8 with each ill-formed sequence replaced by U+FFFD, because one token can hold part of a
+  multi-byte character.
+
+A request that asks for logprobs adds one scoring pass per decode round (about 0.15 ms on an RTX
+5090), shared by the requests batched in that round. Requests that do not ask pay nothing
+measurable.
 
 ### Multimodal request
 
@@ -288,15 +430,15 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | `text`, `json_object`, or flattened `json_schema`; see constrained output above |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
 | `parallel_tool_calls` | omitted or `true` |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
-| `top_logprobs` | omitted or `0` |
+| `top_logprobs` | integer in `[0,20]`: ranked alternatives per output-text token; a positive value also enables the logprob report |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | omitted, empty, or `["message.output_text.logprobs"]`, which enables the logprob report |
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
@@ -385,9 +527,21 @@ JSON objects use the same order-independent rules, including through local
 references and supported alternatives. Completed-call validation rejects duplicate
 keys (including in nested JSON values); arbitrary additional key names are checked
 for duplication during this final validation, not by the finite named-key grammar.
-In nested JSON, an escaped alias of a declared key can also pass the library's
-additional-key grammar; final validation decodes the key before checking its
-value and uniqueness, and never publishes a call that fails those checks.
+Nested JSON additional keys alongside named properties use a canonical printable-ASCII
+spelling without quotes, backslashes, or escapes, preventing aliases of declared keys.
+Final validation also rejects repeated arbitrary additional keys and never publishes a
+call that fails decoded-value or uniqueness checks.
+Property payloads and separators share compiled rules, so vocabulary preprocessing is not
+replicated for every combination of previously emitted parameters. Reference-only paths are built
+directly with shared prefixes and terminal states. Subset states use compact keys and direct
+rule references; only leaf expressions pass through EBNF parsing. Immutable references to the
+same rule share one expression, and nested schema grammars are normalized once after assembly.
+Tokenizer prefix metadata
+matches byte prefixes, including duplicate and Unicode token spellings. Completed-call validators
+consume UTF-8 bytes and do not build model-vocabulary token masks. Both compilers cache immutable
+grammars in the resident frontend; matching state remains private to each request. Their cold
+builds run concurrently, with one joined worker for byte validators alongside vocabulary-mask
+compilation, so independent preparation does not accumulate on first-request latency.
 These rules apply on ordinary and every speculative target position, with grammar
 state committed only for published tokens. They do not shorten reasoning, force an
 end-of-turn after a call, or change sampling/recovery settings.
@@ -503,6 +657,11 @@ A terminal wire response has `object: "response"`, one of `completed`, `incomple
 - an assistant `message` containing an `output_text` part;
 - one or more `function_call` Items.
 
+When the request enables the logprob report, the `output_text` part carries `logprobs`: one
+`{token, logprob, bytes, top_logprobs}` object per output-text token, with the semantics of the
+Chat Completions [token log probabilities](#token-log-probabilities). The response echoes the
+request's `top_logprobs`.
+
 Ordinary model/string stops produce `completed`. Output-token or context-capacity exhaustion
 produces `incomplete` with `incomplete_details.reason: "max_output_tokens"`. Errors accepted after
 an SSE response has started produce `response.failed`; validation and preparation errors remain
@@ -544,6 +703,10 @@ The normal lifecycle is:
 3. zero or more `response.reasoning_text.delta` or `response.output_text.delta` events;
 4. matching `*.done`, `response.content_part.done`, and `response.output_item.done` events;
 5. exactly one `response.completed`, `response.incomplete`, or `response.failed` terminal event.
+
+With the logprob report enabled, each `response.output_text.delta` carries the `logprobs` of the
+tokens committed with it (a delta may carry tokens and an empty `delta` while their text is
+held), and `response.output_text.done` carries the complete list.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
@@ -602,8 +765,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+any `include` other than `message.output_text.logprobs`, background execution, compaction,
+files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+accepted placeholders.
 
 ## Anthropic Messages
 
@@ -685,7 +849,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `4096` |
-| `--mixed-forward N` | prefill step width while other requests decode: the prefilling request advances at most `N` tokens per step and yields `--mixed-forward-rounds` decode rounds between steps; a multiple of `256`, at most `--prefill-chunk` and `4096`; `0` prefills the whole prompt first | `0` |
+| `--mixed-forward N` | prefill step width while other requests decode: the prefilling request advances at most `N` tokens per step and yields `--mixed-forward-rounds` decode rounds between steps; a multiple of `256`, at most `--prefill-chunk` and `4096`; `0` prefills the whole prompt first | `4096` |
 | `--mixed-forward-rounds N` | decode rounds between those prefill steps | `1` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
@@ -721,6 +885,47 @@ curl http://127.0.0.1:8080/v1/models \
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
+
+Mixed prefill defaults to `--mixed-forward 4096 --mixed-forward-rounds 1`: advance the
+prefilling request by up to 4,096 tokens per decode round while other requests are ready.
+With DFlash, eligible steps run alongside target verification; initial admission prefill
+remains separate. Other backends yield separate decode rounds between prefill steps.
+The ratio is a chunk/round cadence, not a fixed fraction of GPU time or accepted tokens.
+These are startup options, not per-request API fields. Concurrency and speculation remain
+independent options; mixing takes effect only while another request is decode-ready.
+
+The measured RTX 5090 configuration scored **1.0148** with three decode lanes plus one
+8,192-token prefill owner, NVFP4 KV, adaptive DFlash k=5, and the optimized proposal head.
+The full lane/width score, accepted decode throughput, TTFT, and round-spacing tables are in
+`docs/performance.md`, “Qualified mixed-execution frontier on the merged runtime (2026-10-15)”.
+This is a measured combined-efficiency score for that workload, not a guaranteed speedup or
+preservation of standalone decode speed. A matched confirmation after the October 18
+experimental integration scores **1.0166** for the same configuration; its evidence is
+recorded alongside the historical tables.
+
+To change the prefill/decode ratio:
+
+- Keep `--mixed-forward 4096 --mixed-forward-rounds 1` for the selected throughput default.
+- Use `--mixed-forward 2048 --mixed-forward-rounds 1` for more frequent decode progress,
+  or `1024` for shorter gaps at a larger prefill cost; consult the measured tables.
+- Increase `--mixed-forward-rounds`, for example to `2`, to run more decode rounds per
+  owner step. The table qualifies rounds `1`; other cadences require workload measurement.
+- Use `--mixed-forward 0` to finish the owner's prefill before resuming decode.
+
+A positive mixed width must be a multiple of 256 and no larger than either
+`--prefill-chunk` or 4096. When lowering `--prefill-chunk` below 4096, also set a compatible
+`--mixed-forward` width, or `0` for prefill-first execution. A 128-token prefill chunk requires
+`--mixed-forward 0`.
+
+For the measured three-decode-lane setup:
+
+```bash
+./build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --max-concurrency 4 --max-context 16384 --kv-capacity auto --kv-dtype nvfp4 \
+  --spec dflash --draft-tokens 5 --adaptive-draft --lm-head-draft \
+  --prefill-chunk 4096 --mixed-forward 4096 --mixed-forward-rounds 1
+```
+
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B uses `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking
@@ -817,14 +1022,15 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v18 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v20 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
 | Event | Contents |
 |---|---|
 | `server_start` | target/weights identity and artifact, resolved Engine, registered thinking/non-thinking sampler defaults plus process overrides, thinking-history defaults, weights/sequence/workspace/request-transient arenas, KV sizing ledger, pinned-host KV RAM capacity/occupancy, CUDA Graph observed/allowance bytes, CUDA/GPU environment, and redacted argv |
-| `request_start` | protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_prepare` | parsed request ID/protocol, body size, message/tool counts, and handler parse/context-assembly time; emitted before synchronous preparation begins |
+| `request_start` | completed synchronous `timings_seconds.synchronous_prepare`, protocol, resolved sampler and seed (including `p_less`), thinking modes, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, `reuse_source` (`none` / `vram_resident` / `host_ram` / `host_disk`), `context_checkpoint` (`restored_tokens` / `captured_tokens`), this request's phase clocks, `recovery` (including `cycle_exclusions`), complete speculative-decoding counters, `tool_call_count`, and `ignored_qwen_tool_call_names` (empty unless a tools-off completion contained parseable Qwen `<tool_call>` markup). Process KV occupancy and lifetime counters are not on this event |
 | `recovery` | one line per published engine recovery event: `request.id`, `kind`, raw `cause` (including exhausted detail), attempts, cycle exclusions, discarded tool calls and reasoning tokens, generated tokens, remaining tokens |
@@ -845,7 +1051,8 @@ in the same copy span). They are not admission wait. Live-lane context-checkpoin
 VRAM-resident restore that unpacks already-pinned lane GDN are not included. Throughput events repeat
 those two keys as interval sums. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, `accepted_per_position`, `live_draft_tokens`,
-and `rounds_per_draft`. Rates can be
+`p_less_draft_temperature` (the DFlash2 draft temperature of the request's last p-less chain round,
+calibrated or pinned; `0` when it ran none), and `rounds_per_draft`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
@@ -856,7 +1063,8 @@ parseable Qwen `<tool_call>` markup also writes a `warning` line naming the igno
 the request's `tools` / `tool_choice` / `tool_history` shape; the same names are in
 `request_done.result.ignored_qwen_tool_call_names`. OpenAI Responses, OpenAI Chat, and
 Anthropic generation requests receive a request ID when they enter synchronous preparation.
-Successful preparation produces `request_start`; a preparation failure produces `request_rejected`
+A `request_prepare` event precedes synchronous preparation. Successful preparation produces
+`request_start`; a preparation failure produces `request_rejected`
 without a matching start. Later generation failures produce `request_error`. Schema/model
 validation rejections before preparation and token-count-only calls are not measurement requests
 and do not receive request IDs.
@@ -869,7 +1077,25 @@ and DFlash this is the accepted committed output, not draft or rejected tokens.
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
 the raw token and round deltas as well as derived rates; downstream measurement should prefer those
-raw values.
+raw values. Disk `work` identifies active spill preparation/session, compaction, and restore targets;
+`pending` counts queued disk jobs. An active spill session reports `spill_age` in seconds (zero
+while preparation has not installed a session). These are background cache activities, independent
+of scheduler request occupancy. Active disk work keeps the periodic report visible, including its
+transition to idle. `spill_completed` is the sum of full lifetimes of spills completed during the
+interval, so it can exceed the interval and does not measure time blocking requests. The JSONL
+`timings_seconds.kv_disk_save` and cumulative metric `ninfer_kv_disk_save_seconds_total` have the
+same completed-spill lifetime semantics. JSONL scheduler fields and both metrics encodings expose
+`spill_active`, `compaction_active`, `restore_active`, `pending_jobs`, and `spill_elapsed_seconds`
+(with a `kv_disk_` prefix in JSONL and `ninfer_kv_disk_` in Prometheus).
+
+The preparation line is emitted after JSON/protocol parsing and, for Responses, context assembly;
+`parse` measures that handler work. It does not timestamp network arrival or body reception.
+The submitted line reports `prepare_sync`, the full `service.prepare` call including synchronous
+submission and tool-grammar compilation. JSONL records this as `timings_seconds.synchronous_prepare`;
+it is a separate wall clock from `request_done` phase accounting and must not be added to its phases.
+Disk snapshots use a nonblocking observer: if the disk index mutex is busy, the most recent snapshot
+is retained, so work flags and age may temporarily be stale. A gap with no preparation line can precede
+handler processing; these logs alone cannot attribute such a gap to a client or the network.
 
 ## Execution behavior
 
@@ -1039,8 +1265,8 @@ context-capacity finishes map to `length`/ `max_tokens`; ordinary model or strin
 `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. NInfer does not execute tools. Response schemas constrain decoded answer content;
+tool schemas use the separately documented tool-call constraint policy.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

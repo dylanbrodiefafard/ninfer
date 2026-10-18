@@ -26,10 +26,11 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     if (owner != nullptr && frame.feature_sink == nullptr) {
         throw std::logic_error("a mixed verify forward requires a DFlash feature sink");
     }
-    card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records,
+                              execution.gdn_history);
     cudaEvent_t masks_ready = nullptr;
-    if (frame.tool_masks) {
-        const auto submission = frame.tool_masks->enqueue(
+    if (frame.token_masks) {
+        const auto submission = frame.token_masks->enqueue(
             frame.ids, tree ? &frame.parent_index : nullptr, frame.valid_columns,
             execution.device.stream, execution.device.host_stream);
         frame.sampling = submission.sampling;

@@ -32,6 +32,7 @@ ninfer::EngineOptions engine_options(const char* artifact, std::size_t ram_bytes
     options.max_context           = 4096;
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk         = 1024;
+    options.mixed_forward         = 0;
     options.kv_ram_capacity_bytes = ram_bytes;
     options.enable_vision         = false;
     options.speculative.backend   = ninfer::SpeculativeBackend::None;

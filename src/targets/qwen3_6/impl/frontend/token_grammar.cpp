@@ -1,12 +1,15 @@
-#include "targets/qwen3_6/impl/frontend/tool_grammar.h"
+#include "targets/qwen3_6/impl/frontend/token_grammar.h"
 #include "ninfer/targets/qwen3_6/frontend.h"
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <cctype>
 #include <set>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #if defined(__GLIBC__)
 #    include <malloc.h>
@@ -185,6 +188,70 @@ void check_schema(const Json& schema) {
     }
 }
 
+// The converter only evaluates type-specific assertions on an explicit/inferred type.
+// Reject untyped assertions instead of silently compiling an unrestricted JSON value.
+void check_response_schema(const Json& schema) {
+    check_schema(schema);
+    if (!schema.is_object()) { return; }
+    if (schema.contains("pattern")) {
+        throw std::invalid_argument(
+            "output schema pattern is unsupported: JSON escaping is not enforced by the converter");
+    }
+    if (schema.contains("$ref")) {
+        const auto reference = schema["$ref"].get<std::string>();
+        if (reference != "#" && !reference.starts_with("#/")) {
+            throw std::invalid_argument("output schema references must use local JSON pointers");
+        }
+    }
+    for (const char* key :
+         {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"}) {
+        if (schema.contains(key) && (!schema[key].is_number_integer() || schema[key] < 0 ||
+                                     schema[key] > std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(
+                std::string("output schema bound must be a nonnegative 32-bit integer: ") + key);
+        }
+    }
+    if (schema.contains("minProperties") && schema["minProperties"] > 1 &&
+        schema.value("additionalProperties", Json(true)) != Json(false)) {
+        const auto required = schema.value("required", Json::array());
+        if (!required.is_array() || required.size() < schema["minProperties"].get<std::size_t>()) {
+            throw std::invalid_argument(
+                "minProperties with additional keys requires enough distinct required properties");
+        }
+    }
+    if (schema.contains("required") && schema["required"].is_array()) {
+        std::set<std::string> required;
+        for (const auto& key : schema["required"]) {
+            if (!key.is_string() || !required.insert(key.get<std::string>()).second) {
+                throw std::invalid_argument("required must contain distinct string property names");
+            }
+        }
+    }
+    if (!schema.contains("type")) {
+        for (const char* key : {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+                                "minLength", "maxLength", "pattern", "minItems", "maxItems",
+                                "minProperties", "maxProperties", "required"}) {
+            if (schema.contains(key)) {
+                throw std::invalid_argument(std::string("output schema assertion requires type: ") +
+                                            key);
+            }
+        }
+    }
+    for (const char* map : {"properties", "$defs", "definitions"}) {
+        if (schema.contains(map)) {
+            for (const auto& child : schema[map]) { check_response_schema(child); }
+        }
+    }
+    for (const char* child : {"items", "additionalProperties"}) {
+        if (schema.contains(child)) { check_response_schema(schema[child]); }
+    }
+    for (const char* list : {"prefixItems", "anyOf"}) {
+        if (schema.contains(list)) {
+            for (const auto& child : schema[list]) { check_response_schema(child); }
+        }
+    }
+}
+
 // A required key need not also occur in properties. Give the grammar an
 // explicit named transition for it using its additional-property schema.
 // Otherwise even an unordered converter can mistake another key for it.
@@ -225,12 +292,12 @@ void name_required_properties(Json& schema) {
 }
 } // namespace
 
-ToolGrammarState::ToolGrammarState(std::shared_ptr<const ToolGrammarData> grammar,
-                                   std::vector<TokenId> ignored_model_stops)
+TokenGrammarState::TokenGrammarState(std::shared_ptr<const TokenGrammarData> grammar,
+                                     std::vector<TokenId> ignored_model_stops)
     : grammar_(std::move(grammar)), ignored_model_stops_(std::move(ignored_model_stops)),
       committed_(grammar_->compiled) {}
 
-bool ToolGrammarState::accept(xgrammar::GrammarMatcher& matcher, TokenId token) const {
+bool TokenGrammarState::accept(xgrammar::GrammarMatcher& matcher, TokenId token) const {
     if (std::find(ignored_model_stops_.begin(), ignored_model_stops_.end(), token) !=
         ignored_model_stops_.end()) {
         // Preserve the caller's disabled model-stop semantics. Such a token is
@@ -242,31 +309,31 @@ bool ToolGrammarState::accept(xgrammar::GrammarMatcher& matcher, TokenId token) 
     return matcher.AcceptToken(token);
 }
 
-void ToolGrammarState::preview(std::span<const TokenId> tokens) {
-    if (preview_) { throw std::logic_error("tool grammar already has a preview"); }
+void TokenGrammarState::preview(std::span<const TokenId> tokens) {
+    if (preview_) { throw std::logic_error("token grammar already has a preview"); }
     auto candidate = committed_.Fork();
     for (const auto token : tokens) {
         if (!accept(candidate, token)) {
-            throw std::logic_error("generated token violates the declared tool grammar");
+            throw std::logic_error("generated token violates the declared token grammar");
         }
     }
     preview_.emplace(std::move(candidate));
 }
 
-void ToolGrammarState::commit_preview() noexcept {
+void TokenGrammarState::commit_preview() noexcept {
     if (!preview_) { std::terminate(); }
     committed_ = std::move(*preview_);
     preview_.reset();
 }
 
-void ToolGrammarState::discard_preview() noexcept { preview_.reset(); }
+void TokenGrammarState::discard_preview() noexcept { preview_.reset(); }
 
-void ToolGrammarState::fill_masks(std::span<const TokenId> tokens,
-                                  std::span<const std::int32_t> parents,
-                                  std::span<std::uint32_t> words) const {
+void TokenGrammarState::fill_masks(std::span<const TokenId> tokens,
+                                   std::span<const std::int32_t> parents,
+                                   std::span<std::uint32_t> words) const {
     if (tokens.empty() || tokens.size() != parents.size() ||
         words.size() != tokens.size() * mask_words) {
-        throw std::invalid_argument("invalid tool grammar verification mask shape");
+        throw std::invalid_argument("invalid token grammar verification mask shape");
     }
     std::vector<std::optional<xgrammar::GrammarMatcher>> nodes(tokens.size());
     nodes[0].emplace(committed_.Fork());
@@ -274,7 +341,7 @@ void ToolGrammarState::fill_masks(std::span<const TokenId> tokens,
         if (node != 0) {
             const auto parent = parents[node];
             if (parent < 0 || static_cast<std::size_t>(parent) >= node) {
-                throw std::invalid_argument("tool grammar tree parent must precede child");
+                throw std::invalid_argument("token grammar tree parent must precede child");
             }
             if (nodes[parent]) {
                 auto child = nodes[parent]->Fork();
@@ -300,13 +367,18 @@ void ToolGrammarState::fill_masks(std::span<const TokenId> tokens,
     }
 }
 
-ToolGrammarCompiler::ToolGrammarCompiler(std::shared_ptr<const Tokenizer> tokenizer)
+TokenGrammarCompiler::TokenGrammarCompiler(std::shared_ptr<const Tokenizer> tokenizer)
     : tokenizer_(std::move(tokenizer)) {}
 
-std::shared_ptr<const ToolGrammarData>
-ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_reasoning) {
-    if (tools.empty()) { return {}; }
-    std::vector<ToolGrammarData::Definition> definitions;
+std::shared_ptr<const TokenGrammarData>
+TokenGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_reasoning,
+                              const std::optional<OutputConstraint>& constraint) {
+    if (tools.empty() && !constraint) { return {}; }
+    if (!tools.empty() && constraint) {
+        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                           "output constraints cannot be combined with tools");
+    }
+    std::vector<TokenGrammarData::Definition> definitions;
     auto tags = Json::array();
     std::set<std::string> names;
     for (const auto& text : tools) {
@@ -348,20 +420,45 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
                 {"tags", tags},
                 {"excludes",
                  {"</invoke", "</parameter", "</function", "</tool_call", "<invoke", "<parameter",
-                  "<function"}}};
+                  "<function", "</think>"}}};
+    if (constraint) {
+        try {
+            if (constraint->kind == OutputConstraintKind::Grammar) {
+                if (constraint->source.empty()) {
+                    throw std::invalid_argument("grammar must not be empty");
+                }
+                format = Json{{"type", "grammar"}, {"grammar", constraint->source}};
+            } else {
+                Json schema = constraint->kind == OutputConstraintKind::JsonObject
+                                  ? Json{{"type", "object"}, {"additionalProperties", true}}
+                                  : Json::parse(constraint->source);
+                // Response constraints enforce assertions; tool-schema relaxation does not apply.
+                check_response_schema(schema);
+                name_required_properties(schema);
+                format =
+                    Json{{"type", "json_schema"}, {"json_schema", schema}, {"any_order", false}};
+            }
+        } catch (const Json::exception& error) {
+            throw RequestError(RequestErrorKind::InvalidOutputConstraint, error.what());
+        } catch (const std::invalid_argument& error) {
+            throw RequestError(RequestErrorKind::InvalidOutputConstraint, error.what());
+        }
+    }
     if (starts_in_reasoning) {
-        format =
-            Json{{"type", "sequence"},
-                 {"elements",
-                  Json::array(
-                      {// A tool envelope belongs to the content/call phase. Without this
-                       // exclusion, the model can rehearse complete calls indefinitely
-                       // inside reasoning, where they must never be published as calls.
-                       Json{{"type", "tag"},
-                            {"begin", ""},
-                            {"content", Json{{"type", "any_text"}, {"excludes", {"<tool_call"}}}},
-                            {"end", "</think>"}},
-                       format})}};
+        format = Json{
+            {"type", "sequence"},
+            {"elements",
+             Json::array(
+                 {// A tool envelope belongs to the content/call phase. Without this
+                  // exclusion, the model can rehearse complete calls indefinitely
+                  // inside reasoning, where they must never be published as calls.
+                  Json{{"type", "tag"},
+                       {"begin", ""},
+                       {"content", Json{{"type", "any_text"},
+                                        {"excludes", constraint ? Json::array()
+                                                                : Json::array({"<tool_call"})}}},
+                       {"end", "</think>"}},
+                  format})}};
     }
     std::scoped_lock lock(mutex_);
 
@@ -376,6 +473,26 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
         }
     } release_compile_heap;
 
+    std::future<std::vector<TokenGrammarData::Definition>> arguments;
+    if (!definitions.empty()) {
+        if (!arguments_compiler_) {
+            arguments_compiler_.emplace(xgrammar::TokenizerInfo({}, xgrammar::VocabType::RAW, 0), 1,
+                                        true, 32 * 1024 * 1024);
+        }
+        // The byte validators and vocabulary masks have independent compilers.
+        // One joined worker overlaps their cold builds; the outer lock bounds
+        // compilation to one request and protects both caches until it joins.
+        arguments =
+            std::async(std::launch::async, [this, definitions = std::move(definitions)]() mutable {
+                for (auto& definition : definitions) {
+                    definition.arguments_validator = arguments_compiler_->CompileJSONSchema(
+                        definition.parameters.dump(), true, std::nullopt, std::nullopt, false,
+                        std::nullopt, true);
+                }
+                return std::move(definitions);
+            });
+    }
+
     if (!compiler_) {
         std::vector<std::string> vocab(kTokenDomain);
         for (std::size_t id = 0; id < kTokenDomain; ++id) {
@@ -385,25 +502,41 @@ ToolGrammarCompiler::compile(std::span<const std::string> tools, bool starts_in_
         }
         xgrammar::TokenizerInfo info(vocab, xgrammar::VocabType::RAW, kTokenDomain,
                                      tokenizer_->default_stop_token_ids());
-        compiler_.emplace(info, 4, true, 128 * 1024 * 1024);
+        // Cold vocabulary preprocessing uses the target host's sixteen physical cores.
+        compiler_.emplace(info, 16, true, 128 * 1024 * 1024);
     }
     try {
+        if (constraint) {
+            const auto& content = starts_in_reasoning ? format.at("elements").at(1) : format;
+            auto compiled       = constraint->kind == OutputConstraintKind::Grammar
+                                      ? compiler_->CompileGrammar(constraint->source)
+                                      : compiler_->CompileJSONSchema(
+                                            content.at("json_schema").dump(), false, std::nullopt,
+                                            std::pair<std::string, std::string>{",", ":"}, false);
+            if (starts_in_reasoning) {
+                auto reasoning = compiler_->CompileStructuralTag(Json{
+                    {"type", "structural_tag"},
+                    {"format", format.at("elements").at(0)}}.dump());
+                compiled       = compiler_->CompileGrammar(
+                    xgrammar::Grammar::Concat({reasoning.GetGrammar(), compiled.GetGrammar()}));
+            }
+            return std::make_shared<const TokenGrammarData>(
+                TokenGrammarData{{}, std::move(compiled)});
+        }
         auto compiled = compiler_->CompileStructuralTag(
             Json{{"type", "structural_tag"}, {"format", format}}.dump());
-        for (auto& definition : definitions) {
-            definition.arguments_validator =
-                compiler_->CompileJSONSchema(definition.parameters.dump(), true, std::nullopt,
-                                             std::nullopt, false, std::nullopt, true);
-        }
-        return std::make_shared<const ToolGrammarData>(
-            ToolGrammarData{std::move(definitions), std::move(compiled)});
+        return std::make_shared<const TokenGrammarData>(
+            TokenGrammarData{arguments.get(), std::move(compiled)});
     } catch (const std::runtime_error& error) {
         // This pinned compiler reports malformed patterns/references through
         // runtime_error, including its non-public LogFatalError. Translate only
         // the client-schema compilation boundary; allocation failures and
         // runtime matcher/initialization failures retain their original type.
-        throw RequestError(RequestErrorKind::InvalidToolSchema,
-                           std::string("invalid or unsupported tool schema: ") + error.what());
+        throw RequestError(constraint ? RequestErrorKind::InvalidOutputConstraint
+                                      : RequestErrorKind::InvalidToolSchema,
+                           std::string("invalid or unsupported ") +
+                               (constraint ? "output constraint: " : "tool schema: ") +
+                               error.what());
     }
 }
 
@@ -446,7 +579,7 @@ Json parse_parameter_json(std::string_view text) {
 
 } // namespace
 
-std::optional<ToolCall> ToolGrammarData::decode_call(std::string_view text) const {
+std::optional<ToolCall> TokenGrammarData::decode_call(std::string_view text) const {
     auto consume = [&](std::string_view literal) {
         if (!text.starts_with(literal)) { return false; }
         text.remove_prefix(literal.size());

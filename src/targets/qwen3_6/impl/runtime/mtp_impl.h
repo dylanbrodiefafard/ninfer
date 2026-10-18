@@ -179,9 +179,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .selected_hidden = selected_hidden,
                                  .replay_records  = state.execution.replay_records,
                                  .sampling        = frame.sampling,
-                                 .tool_masks      = state.tool_masks,
+                                 .token_masks     = state.token_masks,
                              },
                              envelopes.target_verify, !compact);
+        qwen3_6::record_round_logprobs(frame.logprobs, target_logits, licensed_tokens,
+                                       &licensed_counts, nullptr, TextConfig::token_domain,
+                                       state.execution.device.stream);
         if (compact) {
             Tensor licensed_frame =
                 frame.licensed_tokens.slice(1, 0, batch_size).slice(0, 0, width);

@@ -26,6 +26,20 @@ ninfer::cli::Options parse(std::vector<std::string> arguments) {
 int main() {
     int failures = 0;
 
+    const auto constrained =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--json-schema", "schema.json"});
+    failures +=
+        check(constrained.json_schema_path == "schema.json", "JSON schema file was not parsed");
+    const auto grammar =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--grammar", "answer.ebnf"});
+    failures += check(grammar.grammar_path == "answer.ebnf", "grammar file was not parsed");
+    bool conflict_rejected = false;
+    try {
+        (void)parse({"ninfer", "model.ninfer", "--prompt", "hi", "--json-object", "--grammar",
+                     "answer.ebnf"});
+    } catch (const std::invalid_argument&) { conflict_rejected = true; }
+    failures += check(conflict_rejected, "CLI accepted competing output constraints");
+
     const ninfer::cli::Options pin =
         parse({"ninfer", "model.ninfer", "--prompt", "hi", "--capture-context-checkpoint"});
     failures += check(pin.capture_context_checkpoint,

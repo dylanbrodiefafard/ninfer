@@ -15,6 +15,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -119,6 +120,10 @@ bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeSt
            report.kv_ram_save_seconds != 0.0 || report.kv_ram_load_seconds != 0.0 ||
            report.kv_ram_used_bytes != previous.kv_ram_used_bytes ||
            report.kv_ram_entry_count != previous.kv_ram_entry_count ||
+           report.scheduler.kv_disk_spill_active || previous.kv_disk_spill_active ||
+           report.scheduler.kv_disk_compaction_active || previous.kv_disk_compaction_active ||
+           report.scheduler.kv_disk_restore_active || previous.kv_disk_restore_active ||
+           report.scheduler.kv_disk_pending_jobs != 0 || previous.kv_disk_pending_jobs != 0 ||
            report.scheduler.kv_disk_captures != previous.kv_disk_captures ||
            report.scheduler.kv_disk_restores != previous.kv_disk_restores ||
            report.scheduler.kv_disk_evictions != previous.kv_disk_evictions ||
@@ -187,6 +192,19 @@ HttpServer::HttpServer(ServeOptions options)
 
 void HttpServer::log_line(const std::string& line) {
     write_console_log(ConsoleLogLevel::Info, line);
+}
+
+void HttpServer::log_request_prepare(std::uint64_t id, std::string protocol,
+                                     const GenerationRequest& request, std::size_t body_bytes,
+                                     double parse_seconds) {
+    const RequestPreparationLogContext context{.id            = id,
+                                               .protocol      = std::move(protocol),
+                                               .body_bytes    = body_bytes,
+                                               .message_count = request.messages.size(),
+                                               .tool_count    = request.tools.size(),
+                                               .parse_seconds = parse_seconds};
+    log_line(format_request_prepare(context));
+    request_jsonl_.write_request_prepare(context);
 }
 
 void HttpServer::log_request_start(const RequestLogContext& context) {
@@ -531,6 +549,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    log_request_prepare(
+        req_id, "openai_chat_completions", request, req.body.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_started)
+            .count());
+    const auto preparation_started = std::chrono::steady_clock::now();
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
@@ -552,6 +575,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         emit_openai_error(res, error);
         return;
     }
+    const double synchronous_prepare_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started)
+            .count();
     const bool generation_tools   = request.uses_tools();
     const bool generation_capture = request.capture_context_checkpoint;
     const bool generation_media   = request.media_item_count() != 0;
@@ -560,8 +586,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::int64_t created = unix_time_now();
     const std::string model    = request.model;
 
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_chat_completions", request, prepared);
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, "openai_chat_completions", request, prepared, synchronous_prepare_seconds);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -573,14 +599,16 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             const CompletionTimings timings = completion_timings_from_outcome(outcome);
             std::string response_body;
+            const std::vector<TokenLogprobEntry>* logprobs =
+                request.top_logprobs ? &outcome.content_logprobs : nullptr;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
                     id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage,
-                    &timings);
+                    &timings, logprobs);
             } else {
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage, &timings);
+                    finish_reason_wire(outcome.finish_reason), usage, &timings, logprobs);
             }
             record_generation(log_context, std::move(outcome), generation_tools, generation_capture,
                               generation_media, generation_started);
@@ -600,6 +628,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
     const bool include_usage = stream->prepared.include_usage;
     const bool tool_capable  = stream->prepared.tool_capable;
+    const bool logprobs      = request.top_logprobs.has_value();
 
     // SSE hints: disable client/proxy caching and reverse-proxy response buffering
     // so tokens flush immediately. Content-Type is set by the chunked provider.
@@ -608,7 +637,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable, log_context,
+        [this, stream, id, created, model, include_usage, tool_capable, logprobs, log_context,
          generation_started, generation_tools, generation_capture,
          generation_media](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
@@ -619,11 +648,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             try {
                 write_stream_item(sink, *stream,
                                   make_chat_chunk_role(id, model, created, include_usage));
+                // Every content chunk of a logprobs request carries its token list, which is
+                // empty for text released without a newly committed content token.
+                const auto content_chunk = [&](const std::string& text,
+                                               std::span<const TokenLogprobEntry> tokens) {
+                    return logprobs
+                               ? make_chat_chunk_content_logprobs(id, model, created, text, tokens,
+                                                                  include_usage)
+                               : make_chat_chunk_content(id, model, created, text, include_usage);
+                };
                 StreamSink output;
-                output.on_content = [&](const std::string& text) {
-                    write_stream_item(
-                        sink, *stream,
-                        make_chat_chunk_content(id, model, created, text, include_usage));
+                output.on_content = [&](const std::string& text,
+                                        std::span<const TokenLogprobEntry> tokens) {
+                    write_stream_item(sink, *stream, content_chunk(text, tokens));
                 };
                 output.on_reasoning = [&](const std::string& text) {
                     write_stream_item(
@@ -641,10 +678,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
+                        write_stream_item(sink, *stream, content_chunk(std::string(remaining), {}));
                     }
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_tool_calls(
@@ -655,10 +689,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                             include_usage, &timings, &usage));
                 } else {
                     if (tool_capable && !remaining.empty()) {
-                        write_stream_item(sink, *stream,
-                                          make_chat_chunk_content(id, model, created,
-                                                                  std::string(remaining),
-                                                                  include_usage));
+                        write_stream_item(sink, *stream, content_chunk(std::string(remaining), {}));
                     }
                     const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                     write_stream_item(
@@ -774,6 +805,11 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    log_request_prepare(
+        req_id, "anthropic_messages", request, req.body.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - generation_started)
+            .count());
+    const auto preparation_started = std::chrono::steady_clock::now();
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(
@@ -795,6 +831,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         emit_messages_error(res, error);
         return;
     }
+    const double synchronous_prepare_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_started)
+            .count();
     const bool generation_tools   = request.uses_tools();
     const bool generation_capture = request.capture_context_checkpoint;
     const bool generation_media   = request.media_item_count() != 0;
@@ -803,8 +842,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const std::string model = request.model; // echo the requested model
     const int input_tokens  = prepared.prompt_tokens;
 
-    const RequestLogContext log_context =
-        make_request_log_context(req_id, "anthropic_messages", request, prepared);
+    const RequestLogContext log_context = make_request_log_context(
+        req_id, "anthropic_messages", request, prepared, synchronous_prepare_seconds);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -873,7 +912,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     write_stream_item(sink, *stream,
                                       make_content_block_delta_thinking(thinking_index, text));
                 };
-                output.on_content = [&](const std::string& text) {
+                output.on_content = [&](const std::string& text,
+                                        std::span<const TokenLogprobEntry>) {
                     if (thinking_open) {
                         write_stream_item(sink, *stream,
                                           make_content_block_delta_signature(thinking_index, id));

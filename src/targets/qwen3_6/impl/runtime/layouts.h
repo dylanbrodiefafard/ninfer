@@ -5,6 +5,7 @@
 #include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -39,14 +40,15 @@ struct DFlashPersistentLayout {
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::optional<GdnReplayRecordLayout> replay_records;
+    std::optional<GdnHistoryLayout> gdn_history;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
-    TensorLayout tool_token_masks;
-    TensorLayout tool_sampling_config;
-    TensorLayout tool_nodes;
+    TensorLayout grammar_masks;
+    TensorLayout grammar_sampling_config;
+    TensorLayout grammar_nodes;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;
     std::optional<TensorLayout> staging_hidden;

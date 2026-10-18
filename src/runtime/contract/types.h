@@ -7,15 +7,32 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::runtime {
 
-// A failed optional cache read can be retried by recomputing the prompt.
+// Optional cache failures distinguish source integrity, stale plans, and destination pressure.
 // CUDA failures and execution errors must retain their original exception.
+enum class CacheRestoreFailureKind : std::uint8_t {
+    InvalidSource,
+    StalePlan,
+    DestinationUnavailable
+};
+
 class CacheRestoreFailure : public std::runtime_error {
 public:
-    using std::runtime_error::runtime_error;
+    explicit CacheRestoreFailure(
+        const std::string& message,
+        CacheRestoreFailureKind kind = CacheRestoreFailureKind::InvalidSource)
+        : std::runtime_error(message), kind_(kind) {}
+
+    [[nodiscard]] CacheRestoreFailureKind kind() const noexcept { return kind_; }
+private:
+    CacheRestoreFailureKind kind_;
 };
+
+enum class CacheReadIntent : std::uint8_t { Consume, Fork };
+enum class CacheRetention : std::uint8_t { Ordinary, Disposable };
 
 using ::ninfer::FinishReason;
 using ::ninfer::KvCapacityMode;
@@ -36,7 +53,10 @@ struct ResolvedExecutionOptions {
     bool allow_prefix_reuse               = true;
     // Internal cache recovery bypasses existing images without disabling capture.
     bool force_cold_prefill         = false;
+    bool cache_write                = true;
     bool capture_context_checkpoint = false;
+    // The target scores every generated token of the request (RoundLogprobs).
+    bool token_logprobs = false;
     std::array<TokenId, kMaximumSuppressedTokens> suppressed_token_ids{};
     std::uint32_t suppressed_token_count = 0;
 };
@@ -92,12 +112,46 @@ struct BeginSummary {
     PrefixReuseSource prefix_reuse_source = PrefixReuseSource::None;
 };
 
+// Logprob records parallel to a round's token storage: token slot s (row * row_stride + i for a
+// batched round) owns token_logprobs[s] and the kMaximumTopLogprobs ranked alternatives starting
+// at top_ids / top_logprobs [s * kMaximumTopLogprobs]. Only the slots of produced tokens in rows
+// whose request set ResolvedExecutionOptions::token_logprobs hold values. The spans are empty
+// when no row of the round asked.
+struct RoundLogprobs {
+    std::span<const float> token_logprobs;
+    std::span<const TokenId> top_ids;
+    std::span<const float> top_logprobs;
+
+    [[nodiscard]] bool empty() const noexcept { return token_logprobs.empty(); }
+
+    // The record of token slot `slot`, truncated to top_count alternatives.
+    [[nodiscard]] TokenLogprob record(std::size_t slot, TokenId token,
+                                      std::uint32_t top_count) const {
+        if (top_count > kMaximumTopLogprobs || slot >= token_logprobs.size() ||
+            (slot + 1) * kMaximumTopLogprobs > top_ids.size() ||
+            top_ids.size() != top_logprobs.size()) {
+            throw std::logic_error("round logprob record is outside its storage");
+        }
+        TokenLogprob out;
+        out.token     = token;
+        out.logprob   = token_logprobs[slot];
+        out.top_count = top_count;
+        for (std::uint32_t rank = 0; rank < top_count; ++rank) {
+            const std::size_t at = slot * kMaximumTopLogprobs + rank;
+            out.top[rank]        = TokenAlternative{top_ids[at], top_logprobs[at]};
+        }
+        return out;
+    }
+};
+
 struct GeneratedRound {
     std::span<const TokenId> tokens;
+    RoundLogprobs logprobs;
 };
 
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
+    RoundLogprobs logprobs;
     std::span<const std::int32_t> row_counts;
     std::uint32_t row_stride = 1;
     // True when the sampler was armed with a protected, valid cycle exclusion for

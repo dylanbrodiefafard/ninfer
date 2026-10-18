@@ -32,6 +32,22 @@ int main() {
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.prefill_chunk == 4096, "serving prefill chunk default is not 4096");
+    failures += check(defaults.mixed_forward == 4096 && defaults.mixed_forward_rounds == 1,
+                      "serving mixed prefill defaults mismatch");
+    const ServeOptions decode_priority =
+        parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "2048", "--mixed-forward", "1024",
+               "--mixed-forward-rounds", "2"});
+    failures +=
+        check(decode_priority.mixed_forward == 1024 && decode_priority.mixed_forward_rounds == 2,
+              "mixed prefill ratio overrides mismatch");
+    const ServeOptions prefill_first =
+        parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "128", "--mixed-forward", "0"});
+    failures += check(prefill_first.mixed_forward == 0, "prefill-first override mismatch");
+    bool oversized_mixed_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-chunk", "2048"});
+    } catch (const std::invalid_argument&) { oversized_mixed_rejected = true; }
+    failures += check(oversized_mixed_rejected, "mixed width exceeding prefill chunk was accepted");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

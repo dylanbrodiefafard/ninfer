@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <exception>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -327,6 +328,10 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             print_metric(backend + " live draft tokens",
                          std::to_string(speculative.live_draft_tokens));
         }
+        if (speculative.p_less_draft_temperature > 0.0F) {
+            print_metric(backend + " p-less draft temperature",
+                         std::to_string(speculative.p_less_draft_temperature));
+        }
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
         print_metric(backend + " drafted tokens", std::to_string(speculative.drafted_tokens));
@@ -372,6 +377,26 @@ int main(int argc, char** argv) {
                 : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         cli.enable_vision);
         input.options.reasoning_effort = cli.reasoning_effort;
+        if (cli.json_object || !cli.json_schema_path.empty() || !cli.grammar_path.empty()) {
+            ninfer::OutputConstraint constraint;
+            if (!cli.json_schema_path.empty() || !cli.grammar_path.empty()) {
+                const bool schema = !cli.json_schema_path.empty();
+                const auto& path  = schema ? cli.json_schema_path : cli.grammar_path;
+                std::ifstream file(path, std::ios::binary);
+                if (!file) {
+                    throw std::runtime_error("cannot read output constraint: " + path.string());
+                }
+                std::ostringstream source;
+                source << file.rdbuf();
+                if (file.bad() || source.bad()) {
+                    throw std::runtime_error("failed reading output constraint: " + path.string());
+                }
+                constraint.kind   = schema ? ninfer::OutputConstraintKind::JsonSchema
+                                           : ninfer::OutputConstraintKind::Grammar;
+                constraint.source = std::move(source).str();
+            }
+            input.options.output_constraint = std::move(constraint);
+        }
 
         ninfer::RequestOptions request;
         request.execution.sampling                   = cli.sampling;
@@ -395,6 +420,7 @@ int main(int argc, char** argv) {
         engine_options.kv_disk_compress         = cli.kv_disk_compress;
         engine_options.context_checkpoint_marks = cli.context_checkpoint_marks;
         engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.mixed_forward            = 0;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.sage_attn                = cli.sage_attn;
         engine_options.keep_frac                = cli.keep_frac;

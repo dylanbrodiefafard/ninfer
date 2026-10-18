@@ -113,6 +113,7 @@ ninfer::EngineOptions disk_options(const char* artifact, const std::filesystem::
     options.kv_capacity            = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.max_concurrency        = max_concurrency;
     options.prefill_chunk          = 1024;
+    options.mixed_forward          = 0;
     options.kv_ram_capacity_bytes  = ram_bytes;
     options.kv_disk_capacity_bytes = kDiskBytes;
     options.kv_disk_location       = disk;
@@ -1606,6 +1607,7 @@ int exercise_disk_checkpoint_heads(const char* artifact, bool dflash = false) {
         auto result          = dflash ? dflash_disk_options(artifact, disk_dir, 1, kRamBytes)
                                       : disk_options(artifact, disk_dir, 1, kRamBytes);
         result.prefill_chunk = kMark;
+        result.mixed_forward = 0;
         result.context_checkpoint_marks = std::vector<std::uint32_t>{kMark};
         if (!dflash) {
             result.speculative.backend      = ninfer::SpeculativeBackend::Mtp;

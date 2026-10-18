@@ -97,21 +97,32 @@ public:
                                                   std::uint32_t budget_remaining,
                                                   FinishReason limit_reason);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
+    // The channel each token accepted by the pending preview publishes its text to, in token
+    // order; nullopt for a token that publishes to neither channel (a reasoning marker, tool-call
+    // markup when tool output is enabled, a stop token, or whitespace stripped after reasoning).
+    // The attribution is per token: text a token contributed may still be held back or later
+    // trimmed by a stop string. Valid from preview() until commit_preview() or discard_preview().
+    [[nodiscard]] std::span<const std::optional<OutputChannel>>
+    preview_token_channels() const noexcept;
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     void discard_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] bool in_reasoning() const noexcept;
     [[nodiscard]] bool model_stop_tokens_allowed() const noexcept;
+    // Chat sessions without a grammar exclude the dedicated close token after reasoning.
+    // Grammar sessions enforce framing in their matcher and retain literal argument values.
+    // Raw output and literal bytes encoded with ordinary tokens are unaffected.
+    [[nodiscard]] std::optional<TokenId> suppressed_reasoning_end_token() const noexcept;
     [[nodiscard]] bool reasoning_cycle_exclusion_allowed(TokenId token) const;
-    [[nodiscard]] bool has_tool_grammar() const noexcept;
+    [[nodiscard]] bool has_token_grammar() const noexcept;
     [[nodiscard]] std::span<const ToolCall> tool_calls() const noexcept;
     [[nodiscard]] std::shared_ptr<const GenerationRecoveryContext>
     generation_recovery_context() const noexcept;
     [[nodiscard]] bool terminal() const noexcept;
     // Read-only snapshot of committed grammar, node-major. Node zero is the
     // committed root; other nodes consume their token from an earlier parent.
-    void fill_tool_masks(std::span<const TokenId> tokens, std::span<const std::int32_t> parents,
-                         std::span<std::uint32_t> words) const;
+    void fill_token_masks(std::span<const TokenId> tokens, std::span<const std::int32_t> parents,
+                          std::span<std::uint32_t> words) const;
 
 private:
     class Impl;
@@ -144,6 +155,9 @@ public:
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    // The exact bytes of one vocabulary token, special tokens included; valid while a copy of
+    // this Frontend lives. Throws std::out_of_range for an id outside the vocabulary.
+    [[nodiscard]] std::string_view token_bytes(TokenId token) const;
 
 private:
     class Impl;

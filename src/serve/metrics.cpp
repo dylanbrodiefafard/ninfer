@@ -195,6 +195,7 @@ constexpr const char* kApiErrorCodes[] = {
     "media_fetch_timeout",
     "invalid_media",
     "invalid_tool_schema",
+    "invalid_output_constraint",
     "modality_not_supported",
     "reasoning_effort_not_supported",
     "conflicting_template_option",
@@ -209,8 +210,6 @@ constexpr const char* kApiErrorCodes[] = {
     "tool_type_not_supported",
     "tool_choice_not_supported",
     "strict_tools_not_supported",
-    "response_format_not_supported",
-    "structured_outputs_not_supported",
     "file_inputs_not_supported",
     "audio_inputs_not_supported",
     "image_detail_not_supported",
@@ -222,7 +221,6 @@ constexpr const char* kApiErrorCodes[] = {
     "parameter_not_supported",
     "unknown_parameter",
     "parallel_tool_calls_not_supported",
-    "logprobs_not_supported",
     "truncation_not_supported",
     "service_tier_not_supported",
     "stream_option_not_supported",
@@ -834,12 +832,22 @@ std::string render_text(const MetricsSnapshotData& data) {
             std::uint64_t{stats.kv_disk_used_bytes});
     w.gauge("ninfer_kv_disk_entries", "Disk prefix cache entries.",
             std::uint64_t{stats.kv_disk_entry_count});
+    w.gauge("ninfer_kv_disk_spill_active", "Disk spill preparation or session active.",
+            std::uint64_t{stats.kv_disk_spill_active});
+    w.gauge("ninfer_kv_disk_compaction_active", "Disk compaction active.",
+            std::uint64_t{stats.kv_disk_compaction_active});
+    w.gauge("ninfer_kv_disk_restore_active", "Disk restore target active.",
+            std::uint64_t{stats.kv_disk_restore_active});
+    w.gauge("ninfer_kv_disk_pending_jobs", "Queued disk cache jobs.",
+            std::uint64_t{stats.kv_disk_pending_jobs});
+    w.gauge("ninfer_kv_disk_spill_elapsed_seconds", "Elapsed active spill session seconds.",
+            stats.kv_disk_spill_elapsed_seconds);
     w.counter("ninfer_kv_disk_captures_total", "Disk prefix captures.", stats.kv_disk_captures);
     w.counter("ninfer_kv_disk_restores_total", "Disk prefix restores.", stats.kv_disk_restores);
     w.counter("ninfer_kv_disk_evictions_total", "Disk prefix evictions.", stats.kv_disk_evictions);
     w.counter("ninfer_kv_disk_drops_total", "Disk prefix drops.", stats.kv_disk_drops);
-    w.counter("ninfer_kv_disk_save_seconds_total", "Disk prefix save seconds.",
-              stats.kv_disk_save_seconds);
+    w.counter("ninfer_kv_disk_save_seconds_total",
+              "Elapsed lifetime of completed disk spills in seconds.", stats.kv_disk_save_seconds);
     w.counter("ninfer_kv_disk_load_seconds_total", "Disk prefix load seconds.",
               stats.kv_disk_load_seconds);
     w.counter("ninfer_kv_disk_h2d_seconds_total", "Disk restore host to device seconds.",
@@ -1052,6 +1060,11 @@ Json render_json(const MetricsSnapshotData& data) {
           {"save_seconds", stats.kv_disk_save_seconds},
           {"load_seconds", stats.kv_disk_load_seconds},
           {"h2d_seconds", stats.kv_disk_h2d_seconds},
+          {"spill_active", stats.kv_disk_spill_active},
+          {"compaction_active", stats.kv_disk_compaction_active},
+          {"restore_active", stats.kv_disk_restore_active},
+          {"pending_jobs", stats.kv_disk_pending_jobs},
+          {"spill_elapsed_seconds", stats.kv_disk_spill_elapsed_seconds},
           {"cache_fallbacks", stats.kv_cache_fallbacks}}},
         {"prefix_reuse",
          {{"requests", std::move(reuse_requests)},

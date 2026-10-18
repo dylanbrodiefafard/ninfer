@@ -311,9 +311,9 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         }
     }
 
-    // Chunk 0 is staged before the loop. Later W/K async groups and converted
-    // U are issued together at the preceding chunk's Phase-E boundary. All
-    // global bases advance additively across the sequential chunk loop.
+    // Chunk 0 is staged before the loop. Later W groups overlap MM2; K groups
+    // and converted U are issued after MM2 completes. Global bases advance
+    // additively across the sequential chunk loop.
     const int64_t W_stride        = H_v * kStateDim;
     const int64_t k_stride        = static_cast<int64_t>(qk_map.H_qk) * kStateDim;
     const int64_t W_chunk_stride  = (int64_t)BT * W_stride;
@@ -531,6 +531,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         cp_wait<0>();
         __syncthreads();
 
+        // MM1 has finished reading W. The next W group overlaps MM2, which reads only
+        // K and v_decay; the next K and aliased U region remain behind MM2's barrier.
+        if (chunk + 1 < chunks) {
+            issue_load_w_16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
+            cp_commit();
+        }
+
         // === Phase E: matmul2 over the full chunk of k ===
 #pragma unroll
         for (int kt = 0; kt < K_TILES_MM2; ++kt) {
@@ -563,13 +570,11 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
             }
         }
 
-        __syncthreads(); // gates MM2 before the next chunk overwrites W/K/U
+        __syncthreads(); // Gates MM2 before the next chunk overwrites K and U.
 
-        // The next chunk repeats the W-then-K async group order used by the
-        // prologue. Its Phase A drains W only; Phase E drains K.
+        // Preserve the prologue's W-then-K async group order: Phase A drains W
+        // and Phase E drains K. U aliases the v_decay region consumed by MM2.
         if (chunk + 1 < chunks) {
-            issue_load_w_16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
-            cp_commit();
             issue_load_k_16<THREADS_K>(k_view, k_in + k_base_next, k_stride,
                                        min(BT, tokens - (chunk + 1) * BT), tid);
             cp_commit();

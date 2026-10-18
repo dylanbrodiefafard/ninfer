@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
@@ -231,6 +232,7 @@ const char* cache_case_name(CacheCase script) {
 
 struct ProbePlan {
     RequestPlanSummary fields;
+    ninfer::runtime::ResolvedExecutionOptions execution;
     bool force_cold  = false;
     bool allow_reuse = true;
 
@@ -269,9 +271,14 @@ struct DiskSnapshot {
     std::uint64_t evictions    = 0;
     std::uint64_t drops        = 0;
     std::array<std::uint64_t, ninfer::kKvDiskDropReasonCount> drop_reasons{};
-    double save_seconds    = 0;
-    double load_seconds    = 0;
-    std::uint64_t sequence = 0;
+    double save_seconds          = 0;
+    double load_seconds          = 0;
+    std::uint64_t sequence       = 0;
+    bool spill_active            = false;
+    bool compaction_active       = false;
+    bool restore_active          = false;
+    std::size_t pending_jobs     = 0;
+    double spill_elapsed_seconds = 0;
 };
 
 struct GpuPoolSnapshot {
@@ -306,7 +313,12 @@ public:
     // DeferProgram overrides the admission, capture, and decode members marked virtual.
     virtual ~ProbeProgram() = default;
 
-    CacheCase script = CacheCase::RecoveryRamRestoreFails;
+    CacheCase script             = CacheCase::RecoveryRamRestoreFails;
+    std::uint32_t stale_failures = 0;
+    bool cache_write             = true;
+    bool saw_disposable_base     = false;
+    ninfer::runtime::CacheRestoreFailureKind restore_failure_kind =
+        ninfer::runtime::CacheRestoreFailureKind::InvalidSource;
     std::vector<std::string> trace;
     std::uint32_t copied_tokens             = 0;
     std::uint32_t abort_count               = 0;
@@ -430,11 +442,13 @@ public:
     plan_request_base(const PreparedPrompt& prompt,
                       const ninfer::runtime::ResolvedExecutionOptions& options) {
         note("plan_base");
+        saw_disposable_base = saw_disposable_base || !options.cache_write;
         if (script == CacheCase::RecoveryPlanFails) {
             throw ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
                                        "probe retry prompt does not fit");
         }
         ProbePlan plan = fitted_plan();
+        plan.execution = options;
         if (lifecycle_retries) {
             plan.fields.prompt_tokens           = prompt.summary().prompt_tokens;
             plan.fields.effective_output_tokens = options.requested_output_tokens;
@@ -508,9 +522,9 @@ public:
     }
 
     [[nodiscard]] virtual bool
-    can_admit_lane_after_releasing(std::uint32_t, const ProbePlan&,
+    can_admit_lane_after_releasing(std::uint32_t lane, const ProbePlan& plan,
                                    std::span<const std::uint32_t>) const noexcept {
-        return false;
+        return can_admit_lane(lane, plan);
     }
 
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {
@@ -545,12 +559,16 @@ public:
     void restore_ram_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_ram");
         ++restore_ram_count;
+        if (restore_ram_count <= stale_failures) {
+            throw CacheRestoreFailure("probe stale RAM plan",
+                                      ninfer::runtime::CacheRestoreFailureKind::StalePlan);
+        }
         if (cancel_held && request_cancellation != nullptr) {
             request_cancellation->store(true, std::memory_order_release);
         }
         if (script == CacheCase::RecoveryRamRestoreFails ||
             (script == CacheCase::AdmitRamRestoreThenCold && restore_ram_count == 1)) {
-            throw CacheRestoreFailure("probe host restore failed");
+            throw CacheRestoreFailure("probe host restore failed", restore_failure_kind);
         }
         ram_timings_pending_ = true;
     }
@@ -664,6 +682,30 @@ public:
         return 0;
     }
 
+    [[nodiscard]] bool retained_lane_cache_writable(std::uint32_t lane) const noexcept {
+        return has_retained_lane(lane);
+    }
+
+    [[nodiscard]] bool retained_lane_precedes(std::uint32_t left,
+                                              std::uint32_t right) const noexcept {
+        return retained_use_tick(left) < retained_use_tick(right) ||
+               (retained_use_tick(left) == retained_use_tick(right) && left < right);
+    }
+
+    [[nodiscard]] bool preserve_retained_lane(std::uint32_t lane, std::uint64_t& id, bool may_block,
+                                              bool& deferred) {
+        return capture_retained_lane(lane, &id, may_block, &deferred, {});
+    }
+
+    void fork_retained_lane(std::uint32_t, std::uint32_t, const ProbePlan&) {
+        throw std::logic_error("recovery probe does not provide resident fork state");
+    }
+
+    void retarget_plan_to_ram(ProbePlan& plan, std::uint64_t id) {
+        plan.fields.reuse_source = PrefixReuseSource::HostRam;
+        plan.fields.ram_entry_id = id;
+    }
+
     virtual void mark_turn_closed(std::uint32_t) noexcept {}
 
     [[nodiscard]] virtual bool capture_retained_lane(std::uint32_t, std::uint64_t* = nullptr,
@@ -724,9 +766,13 @@ public:
         }
     }
 
-    void consume_ram_entry(std::uint64_t) {
-        note("consume_ram");
-        ++consume_ram_count;
+    void finish_ram_restore(std::uint64_t, ninfer::runtime::CacheReadIntent intent) {
+        if (intent == ninfer::runtime::CacheReadIntent::Fork) {
+            note("release_ram_restored");
+        } else {
+            note("consume_ram");
+            ++consume_ram_count;
+        }
     }
 
     void consume_disk_entry(std::uint64_t) {
@@ -747,9 +793,13 @@ public:
     void restore_disk_entry(std::uint32_t, std::uint64_t, const ProbePlan&) {
         note("restore_disk");
         ++restore_disk_count;
+        if (restore_disk_count <= stale_failures) {
+            throw CacheRestoreFailure("probe stale disk plan",
+                                      ninfer::runtime::CacheRestoreFailureKind::StalePlan);
+        }
         if (script == CacheCase::RecoveryDiskRestoreFails ||
             (script == CacheCase::AdmitDiskRestoreThenCold && restore_disk_count == 1)) {
-            throw CacheRestoreFailure("probe disk restore failed");
+            throw CacheRestoreFailure("probe disk restore failed", restore_failure_kind);
         }
         disk_timings_pending_ = true;
     }
@@ -766,15 +816,16 @@ public:
 
     virtual void evict_retained_lane(std::uint32_t) noexcept {}
 
-    void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId>) {}
+    virtual void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId>) {}
 
-    void clear_suppressed_tokens_lane(std::uint32_t) {}
+    virtual void clear_suppressed_tokens_lane(std::uint32_t) {}
 
     void set_typical_cycle_reasoning_lane(std::uint32_t, bool) {}
 
-    void resolve_pending_batch(std::span<const std::uint32_t>, std::span<const std::uint32_t>,
-                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
-                               std::span<const std::uint8_t>) {}
+    virtual void resolve_pending_batch(std::span<const std::uint32_t>,
+                                       std::span<const std::uint32_t>,
+                                       std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                                       std::span<const std::uint8_t>) {}
 
 private:
     static constexpr TokenId kPeerStop       = kCallerStop;
@@ -871,6 +922,13 @@ int fail_case(const ProbeProgram& program, bool ok, const char* message) {
 
 int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& outcome) {
     int failures = 0;
+    if (!program.cache_write) {
+        failures +=
+            fail_case(program,
+                      program.saw_disposable_base && program.consume_ram_count == 0 &&
+                          program.discard_ram_count == 0 && program.invalidate_disk_count == 0,
+                      "disposable recovery changed policy or consumed its healthy source");
+    }
     if (program.cancel_held) {
         failures += fail_case(
             program,
@@ -929,6 +987,24 @@ int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& 
                               outcome.finish ==
                                   (cancelled ? FinishReason::Cancelled : FinishReason::StopToken),
                           "the retry did not keep its output budget and finish");
+    if (program.stale_failures != 0) {
+        const bool ram      = program.script == CacheCase::RecoveryRamHit;
+        const bool restored = program.stale_failures == 1;
+        failures += fail_case(
+            program,
+            (ram ? program.restore_ram_count : program.restore_disk_count) == 2 &&
+                program.discard_ram_count == 0 && program.invalidate_disk_count == 0 &&
+                program.consume_ram_count == (ram && restored && program.cache_write ? 1U : 0U) &&
+                program.prefill_count == 1 &&
+                program.prefill_source ==
+                    (restored ? (ram ? PrefixReuseSource::HostRam : PrefixReuseSource::HostDisk)
+                              : PrefixReuseSource::None) &&
+                program.prefill_reusable == (restored ? (ram ? kRamReuse : kDiskReuse) : 0) &&
+                !outcome.cache_fallback && !outcome.force_cold,
+            "stale recovery did not replan once and preserve its source and session");
+        if (failures != 0) { dump_trace(program); }
+        return failures;
+    }
     const bool ram_hit  = program.script == CacheCase::RecoveryRamHit;
     const bool disk_hit = program.script == CacheCase::RecoveryDiskHit;
     failures += fail_case(program,
@@ -985,12 +1061,15 @@ int check_scripted_recovery(const ProbeProgram& program, const RecoveryOutcome& 
     case CacheCase::RecoveryRamHit:
         failures += fail_case(
             program,
-            program.abort_count == 1 && program.consume_ram_count == 1 &&
+            program.abort_count == 1 &&
+                program.consume_ram_count == (program.cache_write ? 1U : 0U) &&
                 program.discard_ram_count == 0 && program.prefill_count == 1 &&
                 program.prefill_source == PrefixReuseSource::HostRam &&
                 program.prefill_reusable == kRamReuse && program.prefill_ram_entry == kRamEntryId &&
                 event_count(program.trace, "plan_cold") == 0 &&
-                in_order(program.trace, {"abort", "restore_ram", "start_prefill", "consume_ram"}) &&
+                in_order(program.trace,
+                         {"abort", "restore_ram", "start_prefill",
+                          program.cache_write ? "consume_ram" : "release_ram_restored"}) &&
                 !outcome.cache_fallback && !outcome.force_cold && !program.saw_force_cold,
             "a RAM checkpoint was not restored onto the retry");
         break;
@@ -1124,6 +1203,7 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
         ResolvedRequestOptions options;
         options.execution.sampling.p_less    = true;
         options.execution.allow_prefix_reuse = true;
+        options.execution.cache_write        = program.cache_write;
         options.stop                         = stop;
         typename ConcurrentExecutor<ProbeInstance>::Submission submission;
         {
@@ -1181,6 +1261,7 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
     options.execution.allow_prefix_reuse      = true;
     options.execution.force_cold_prefill      = false;
     options.execution.requested_output_tokens = kOutputBudget;
+    options.execution.cache_write             = program.cache_write;
     options.stop                              = stop;
     auto request                              = std::shared_ptr<Request>(
         new Request(1, std::move(prepared), std::move(session), summary, 0.0, std::move(options),
@@ -1255,6 +1336,8 @@ int drive_scripted_recovery(ConcurrentExecutor<ProbeInstance>& executor) {
 } // namespace ninfer::runtime
 
 struct ProbeSetup {
+    bool cache_write                   = true;
+    std::uint32_t stale_failures       = 0;
     bool cancel_on_restore             = false;
     bool peer_decoding                 = false;
     bool cancel_held                   = false;
@@ -1268,6 +1351,8 @@ struct ProbeSetup {
 int run_recovery(Frontend& frontend, CacheCase script, ProbeSetup setup = {}) {
     ProbeProgram program;
     program.script               = script;
+    program.cache_write          = setup.cache_write;
+    program.stale_failures       = setup.stale_failures;
     program.cancel_on_restore    = setup.cancel_on_restore;
     program.peer_decoding        = setup.peer_decoding;
     program.cancel_held          = setup.cancel_held;
@@ -1286,9 +1371,12 @@ int run_recovery(Frontend& frontend, CacheCase script, ProbeSetup setup = {}) {
     return ninfer::runtime::drive_scripted_recovery(executor);
 }
 
-int run_admission(Frontend& frontend, CacheCase script) {
+int run_admission(Frontend& frontend, CacheCase script, bool cache_write = true,
+                  ninfer::runtime::CacheRestoreFailureKind failure_kind =
+                      ninfer::runtime::CacheRestoreFailureKind::InvalidSource) {
     ProbeProgram program;
-    program.script = script;
+    program.script               = script;
+    program.restore_failure_kind = failure_kind;
     ProbeLoaded loaded{frontend};
     RecoveryProbe instance;
     instance.program = &program;
@@ -1300,6 +1388,7 @@ int run_admission(Frontend& frontend, CacheCase script) {
     ninfer::runtime::ResolvedRequestOptions options;
     options.execution.sampling.p_less    = true;
     options.execution.allow_prefix_reuse = true;
+    options.execution.cache_write        = cache_write;
     options.stop.token_ids               = {kCallerStop};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     ninfer::CancellationView cancel(
@@ -1313,6 +1402,28 @@ int run_admission(Frontend& frontend, CacheCase script) {
                           program.prefill_source == PrefixReuseSource::None &&
                           result.reused_prompt_tokens == 0 &&
                           result.prefix_reuse_source == PrefixReuseSource::None;
+        if (failure_kind != ninfer::runtime::CacheRestoreFailureKind::InvalidSource) {
+            const bool stale = failure_kind == ninfer::runtime::CacheRestoreFailureKind::StalePlan;
+            failures += fail_case(
+                program,
+                result.finish_reason == FinishReason::StopToken && program.discard_ram_count == 0 &&
+                    program.invalidate_disk_count == 0 &&
+                    event_count(program.trace, "release_ram") +
+                            event_count(program.trace, "release_disk") ==
+                        1,
+                "healthy source was discarded after a stale plan or destination failure");
+            failures +=
+                fail_case(program,
+                          stale ? (!cold && !program.saw_force_cold &&
+                                   program.restore_ram_count + program.restore_disk_count == 2)
+                                : (cold && program.saw_force_cold),
+                          "restore failure did not replan stale state or cold-prefill unavailable "
+                          "destination");
+            failures += fail_case(program, cache_write || program.consume_ram_count == 0,
+                                  "disposable failure recovery consumed a healthy RAM source");
+            if (failures != 0) { dump_trace(program); }
+            return failures;
+        }
         switch (script) {
         case CacheCase::AdmitRamHit:
             failures += fail_case(program,
@@ -1320,8 +1431,8 @@ int run_admission(Frontend& frontend, CacheCase script) {
                                       result.reused_prompt_tokens == kRamReuse &&
                                       result.prefix_reuse_source == PrefixReuseSource::HostRam &&
                                       program.prefill_ram_entry == kRamEntryId &&
-                                      program.consume_ram_count == 1 && program.abort_count == 0 &&
-                                      program.discard_ram_count == 0 &&
+                                      program.consume_ram_count == (cache_write ? 1U : 0U) &&
+                                      program.abort_count == 0 && program.discard_ram_count == 0 &&
                                       program.restore_ram_count == 1 && !program.saw_force_cold,
                                   "admission did not restore the RAM checkpoint into the result");
             break;
@@ -1679,6 +1790,132 @@ struct DeferProbe {
     ProbeMemory request_memory;
 };
 
+// A sampler that ranks the close token first after reasoning. Correct exclusion updates must
+// select answer text instead; speculative proposals also include a second close before that update.
+class ReasoningCloseProgram final : public ProbeProgram {
+public:
+    bool speculative                   = false;
+    bool close_in_prefill              = false;
+    bool initial_close_excluded        = false;
+    bool continued_with_close_excluded = false;
+    std::vector<std::uint32_t> committed_prefixes;
+
+    [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t, PreparedPrompt prompt,
+                                                       ProbePlan plan, TransientRegion, PrefillPace,
+                                                       const OutputSession* output) override {
+        excluded_.assign(plan.execution.suppressed_token_ids.begin(),
+                         plan.execution.suppressed_token_ids.begin() +
+                             plan.execution.suppressed_token_count);
+        initial_close_excluded = close_excluded();
+        thinking_              = output->in_reasoning();
+        tokens_[0]             = !thinking_ ? 15 : close_in_prefill ? 248069 : 0;
+        if (close_in_prefill) { emitted_close_ = true; }
+        PrefillStepResult result;
+        result.complete                  = true;
+        result.processed_prompt_tokens   = 1;
+        result.round.tokens              = std::span<const TokenId>(tokens_.data(), 1);
+        result.summary.prompt_tokens     = prompt.summary().prompt_tokens;
+        result.summary.prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+        return result;
+    }
+
+    [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t>,
+                                                     std::span<const RoundBudget>) override {
+        if (thinking_ && !emitted_close_) {
+            if (close_excluded()) { throw std::logic_error("first close was excluded"); }
+            tokens_        = {248069, 248069, 15};
+            count_         = speculative ? 3 : 1;
+            emitted_close_ = true;
+        } else if (thinking_ && !emitted_answer_) {
+            continued_with_close_excluded = close_excluded();
+            tokens_[0]                    = close_excluded() ? 15 : 248069;
+            count_                        = 1;
+            emitted_answer_               = true;
+        } else {
+            continued_with_close_excluded = close_excluded();
+            tokens_[0]                    = 6;
+            count_                        = 1;
+        }
+        return {.tokens     = std::span<const TokenId>(tokens_.data(), count_),
+                .row_counts = std::span<const std::int32_t>(&count_, 1),
+                .row_stride = static_cast<std::uint32_t>(count_)};
+    }
+
+    void set_suppressed_tokens_lane(std::uint32_t, std::span<const TokenId> tokens) override {
+        excluded_.assign(tokens.begin(), tokens.end());
+    }
+
+    void clear_suppressed_tokens_lane(std::uint32_t) override { excluded_.clear(); }
+
+    void resolve_pending_batch(std::span<const std::uint32_t>,
+                               std::span<const std::uint32_t> accepted,
+                               std::span<const std::uint8_t>, std::span<const std::uint8_t>,
+                               std::span<const std::uint8_t>) override {
+        committed_prefixes.push_back(accepted.front());
+    }
+
+private:
+    bool close_excluded() const {
+        return std::find(excluded_.begin(), excluded_.end(), 248069) != excluded_.end();
+    }
+
+    std::vector<TokenId> excluded_;
+    std::array<TokenId, 3> tokens_{};
+    std::int32_t count_  = 1;
+    bool thinking_       = false;
+    bool emitted_close_  = false;
+    bool emitted_answer_ = false;
+};
+
+int run_reasoning_close_sampling(Frontend& frontend) {
+    int failures = 0;
+    for (const bool thinking : {false, true}) {
+        for (const bool speculative : {false, true}) {
+            for (const bool prefill_close : {false, true}) {
+                if (!thinking && prefill_close) { continue; }
+                ReasoningCloseProgram program;
+                program.lifecycle_retries = true;
+                program.script            = CacheCase::AdmitRamHit;
+                program.speculative       = speculative;
+                program.close_in_prefill  = prefill_close;
+                ProbeLoaded loaded{frontend};
+                RecoveryProbe instance{.program = &program, .loaded = &loaded};
+                auto engine                = engine_options();
+                engine.generation_recovery = false;
+                ninfer::runtime::ConcurrentExecutor<RecoveryProbe> executor(instance, engine);
+                auto input                    = thinking_input();
+                input.options.enable_thinking = thinking;
+                auto prompt                   = frontend.prepare(std::move(input));
+                const auto summary            = prompt.summary();
+                ninfer::runtime::ResolvedRequestOptions options;
+                options.execution.allow_prefix_reuse      = false;
+                options.execution.requested_output_tokens = 8;
+                auto submission =
+                    executor.submit(std::move(prompt), summary, 0.0, std::move(options),
+                                    ninfer::OutputDelivery::TerminalOnly);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                const auto result =
+                    submission.wait(nullptr, ninfer::CancellationView([deadline] {
+                                        return std::chrono::steady_clock::now() >= deadline;
+                                    }));
+                const std::size_t expected_closes = thinking ? 1 : 0;
+                failures += check(
+                    result.finish_reason == FinishReason::StopToken && result.content == "answer" &&
+                        std::count(result.generated_token_ids.begin(),
+                                   result.generated_token_ids.end(),
+                                   248069) == static_cast<std::ptrdiff_t>(expected_closes) &&
+                        program.initial_close_excluded == !thinking &&
+                        program.continued_with_close_excluded,
+                    "executor failed to update close exclusion across prefill/decode");
+                failures += check(!program.committed_prefixes.empty() &&
+                                      program.committed_prefixes.front() == 1,
+                                  "executor committed a repeated close from speculative columns");
+            }
+        }
+    }
+    return failures;
+}
+
 int run_admission_defers_for_reclaim(Frontend& frontend) {
     DeferProgram program;
     // Plans sized from each request (service quanta cover the long decode); no resident reuse.
@@ -1795,7 +2032,7 @@ int main() {
             CacheCase::AdmitRamRestoreThenCold,
             CacheCase::AdmitDiskRestoreThenCold,
         };
-        int failures = 0;
+        int failures = run_reasoning_close_sampling(frontend);
         for (const CacheCase script : recovery_cases) {
             failures += run_recovery(frontend, script);
         }
@@ -1823,6 +2060,32 @@ int main() {
                                   .settle_after_decodes = 2});
         for (const CacheCase script : admission_cases) {
             failures += run_admission(frontend, script);
+        }
+        failures += run_admission(frontend, CacheCase::AdmitRamHit, false);
+        for (const auto kind : {ninfer::runtime::CacheRestoreFailureKind::StalePlan,
+                                ninfer::runtime::CacheRestoreFailureKind::DestinationUnavailable}) {
+            for (const bool cache_write : {false, true}) {
+                failures +=
+                    run_admission(frontend, CacheCase::AdmitRamRestoreThenCold, cache_write, kind);
+                failures +=
+                    run_admission(frontend, CacheCase::AdmitDiskRestoreThenCold, cache_write, kind);
+            }
+        }
+        failures += run_recovery(frontend, CacheCase::RecoveryRamHit, {.cache_write = false});
+        failures += run_recovery(frontend, CacheCase::RecoveryDiskHit, {.cache_write = false});
+        failures += run_recovery(frontend, CacheCase::RecoveryRamHit,
+                                 {.cache_write      = false,
+                                  .peer_decoding    = true,
+                                  .cancel_held      = true,
+                                  .peer_round_limit = 2});
+        for (const auto script : {CacheCase::RecoveryRamHit, CacheCase::RecoveryDiskHit}) {
+            for (const bool cache_write : {false, true}) {
+                for (const std::uint32_t stale_failures : {1U, 2U}) {
+                    failures += run_recovery(
+                        frontend, script,
+                        {.cache_write = cache_write, .stale_failures = stale_failures});
+                }
+            }
         }
         failures += run_retry_lifecycle(frontend);
         failures += run_idle_poll_does_not_block_submit(frontend);

@@ -369,6 +369,9 @@ ninfer::bench::ContentionResult run_contention(ninfer::Engine& engine,
 
         const ninfer::RequestOptions prefill_request = benchmark_request(
             {ninfer::bench::TestKind::Prefill, prompt_tokens, 0, "contention"}, false);
+        if (options.profile_measured) {
+            require_cuda(cudaProfilerStart(), "contention cudaProfilerStart");
+        }
         const auto contention_begin_time = std::chrono::steady_clock::now();
         const auto contention_begin      = engine.runtime_stats();
         for (int prompt = 0; prompt < prompts; ++prompt) {
@@ -390,6 +393,9 @@ ninfer::bench::ContentionResult run_contention(ninfer::Engine& engine,
         result.contention = window_delta(contention_begin, engine.runtime_stats(),
                                          contention_begin_time, std::chrono::steady_clock::now());
 
+        if (options.profile_measured) {
+            require_cuda(cudaProfilerStop(), "contention cudaProfilerStop");
+        }
         result.decode_only_after = decode_only_window(engine);
         if (ended_lanes.load() != 0 || engine.runtime_stats().decode_ready_requests != lanes) {
             throw std::runtime_error(
@@ -440,9 +446,10 @@ int main(int argc, char** argv) {
         const std::vector<ninfer::bench::BenchTest> tests =
             options.contention ? std::vector<ninfer::bench::BenchTest>{}
                                : ninfer::bench::expand_tests(options);
-        if (options.profile_measured && (tests.size() != 1 || options.repetitions != 1)) {
+        if (options.profile_measured && !options.contention &&
+            (tests.size() != 1 || options.repetitions != 1)) {
             throw std::invalid_argument(
-                "--profile-measured requires exactly one benchmark test and -r 1");
+                "--profile-measured requires --contention or exactly one benchmark test and -r 1");
         }
         ninfer::bench::validate_prompt_lengths(tests, corpus.size());
         const ninfer::SpeculativeOptions spec_options{options.spec_backend, options.draft_tokens,

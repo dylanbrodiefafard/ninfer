@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/op_tester.h"
@@ -3375,7 +3376,8 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
-int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCase& test_case) {
+int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCase& test_case,
+                   bool replay_graph = false) {
     if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
     const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
     if (batch <= 0 || test_case.valid_columns.size() != static_cast<std::size_t>(batch) ||
@@ -3480,36 +3482,54 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
 
     const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
                                     [&](std::int32_t valid) { return valid != test_case.width; });
-    ops::gqa_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows, kAttentionScale,
-                       cache.view(), envelope, workspace, tout, nullptr);
+    const auto launch = [&](cudaStream_t stream) {
+        ops::gqa_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows, kAttentionScale,
+                           cache.view(), envelope, workspace, tout, stream);
+    };
+    launch(nullptr);
     cuda_synchronize();
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    if (replay_graph) {
+        definition.capture(cudaStreamPerThread, [&] { launch(cudaStreamPerThread); });
+        executable.instantiate(definition);
+    }
 
     const std::string label = std::string("gqa_attention batch ") + geometry.name + " " +
                               cache_name(dtype) + " mapping=" + mapping_name(test_case.mapping) +
                               " B=" + std::to_string(batch) +
                               " W=" + std::to_string(test_case.width);
-    const std::vector<std::uint16_t> output_bits =
-        copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(dtype));
-    failures += verify_invalid_columns_zero(label, output_bits, geometry, test_case.width,
-                                            test_case.valid_columns);
-    failures += cache.verify(label, expected);
-    failures += verify_input(label + " q unchanged", dq, q_bits);
-    failures += verify_input(label + " k unchanged", dk, k_bits);
-    failures += verify_input(label + " v unchanged", dv, v_bits);
-    failures += verify_positions(label + " positions unchanged", dp, positions);
-    if (masked) {
+    int failures            = 0;
+    for (int replay = 0; replay < (replay_graph ? 3 : 1); ++replay) {
+        if (replay != 0) {
+            dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+            cuda_synchronize();
+            executable.launch(cudaStreamPerThread);
+            cuda_synchronize(cudaStreamPerThread);
+        }
+        const std::vector<std::uint16_t> output_bits =
+            copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+        failures += verify_attention(label, bf16_bits_to_double(output_bits), reference,
+                                     attention_criterion(dtype));
+        failures += verify_invalid_columns_zero(label, output_bits, geometry, test_case.width,
+                                                test_case.valid_columns);
+        failures += cache.verify(label, expected);
+        failures += verify_input(label + " q unchanged", dq, q_bits);
+        failures += verify_input(label + " k unchanged", dk, k_bits);
+        failures += verify_input(label + " v unchanged", dv, v_bits);
+        failures += verify_positions(label + " positions unchanged", dp, positions);
+        if (masked) {
+            failures += verify_positions(label + " valid columns unchanged", dvalid,
+                                         test_case.valid_columns);
+        }
         failures +=
-            verify_positions(label + " valid columns unchanged", dvalid, test_case.valid_columns);
-    }
-    failures +=
-        verify_positions(label + " table rows unchanged", dtable_rows, test_case.table_rows);
-    failures += dout.verify_guards((label + " output").c_str());
-    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
-        ++failures;
+            verify_positions(label + " table rows unchanged", dtable_rows, test_case.table_rows);
+        failures += dout.verify_guards((label + " output").c_str());
+        failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+        if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+            std::cerr << label << ": workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -4011,20 +4031,23 @@ int run_tree_column0_matches_decode(const Geometry& geometry, DType dtype, std::
 // causal batch cases omit ancestor_mask. Greedy C=3 isolation can still emit the
 // target argmax from mixed logits; p-less SpecInfer samples the contaminated
 // support. Compact row is not the KV table row: C=2 can occupy tables {1,0}.
-int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype) {
+int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype,
+                                         std::int32_t width = 12, std::int32_t first_prefix = 61,
+                                         std::int32_t second_prefix = 127,
+                                         bool replay_graph          = false) {
     if (outside_sanitizer_scope(geometry, dtype)) { return 0; }
-    constexpr std::int32_t kWidth                   = 12;
-    constexpr std::int32_t kBatch                   = 2;
-    constexpr std::uint32_t kSeed                   = 911u;
-    const std::int32_t prefixes[kBatch]             = {61, 127};
-    const std::int32_t table_rows[kBatch]           = {1, 0};
-    const std::vector<std::int32_t> parents[kBatch] = {star_tree_parent(kWidth),
-                                                       chain_tree_parent(kWidth)};
-    const std::int32_t max_visible                  = prefixes[1] + kWidth;
-    const std::int32_t max_context                  = max_visible + 3;
-    const std::size_t q_column  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
-    const std::size_t kv_column = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
-    const std::size_t columns   = static_cast<std::size_t>(kWidth) * kBatch;
+    const std::int32_t kWidth                            = width;
+    constexpr std::int32_t kBatch                        = 2;
+    constexpr std::uint32_t kSeed                        = 911u;
+    const std::vector<std::int32_t> prefixes             = {first_prefix, second_prefix};
+    const std::vector<std::int32_t> table_rows           = {1, 0};
+    const std::vector<std::vector<std::int32_t>> parents = {star_tree_parent(kWidth),
+                                                            chain_tree_parent(kWidth)};
+    const std::int32_t max_visible = *std::max_element(prefixes.begin(), prefixes.end()) + kWidth;
+    const std::int32_t max_context = max_visible + 3;
+    const std::size_t q_column     = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
+    const std::size_t kv_column    = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
+    const std::size_t columns      = static_cast<std::size_t>(kWidth) * kBatch;
 
     std::vector<float> q = make_bf16_values(q_column * columns, kSeed, -0.25f, 0.25f);
     std::vector<float> k = make_bf16_values(kv_column * columns, kSeed + 1u, -0.25f, 0.25f);
@@ -4066,7 +4089,8 @@ int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype) 
                                q_column, kWidth, row, reference);
     }
 
-    BatchDeviceCache cache(initial, MappingPattern::Identity);
+    BatchDeviceCache cache(initial,
+                           replay_graph ? MappingPattern::Fragmented : MappingPattern::Identity);
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
     const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
     const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
@@ -4083,8 +4107,8 @@ int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype) 
     dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
     dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
     dmask.copy_from_host(ancestor_mask.data(), ancestor_mask.size() * sizeof(std::int32_t));
-    dprefix.copy_from_host(prefixes, sizeof(prefixes));
-    dtable.copy_from_host(table_rows, sizeof(table_rows));
+    dprefix.copy_from_host(prefixes.data(), prefixes.size() * sizeof(std::int32_t));
+    dtable.copy_from_host(table_rows.data(), table_rows.size() * sizeof(std::int32_t));
     std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
     dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
 
@@ -4103,32 +4127,51 @@ int run_tree_verify_batch_isolation_case(const Geometry& geometry, DType dtype) 
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
-    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable, kAttentionScale, cache.view(), envelope,
-                       workspace, tout, nullptr, 1.0f, 1.0f, 8192, nullptr, tmask, tprefix);
+    const auto launch = [&](cudaStream_t stream) {
+        ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable, kAttentionScale, cache.view(),
+                           envelope, workspace, tout, stream, 1.0f, 1.0f, 8192, nullptr, tmask,
+                           tprefix);
+    };
+    launch(nullptr);
     cuda_synchronize();
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable executable;
+    if (replay_graph) {
+        definition.capture(cudaStreamPerThread, [&] { launch(cudaStreamPerThread); });
+        executable.instantiate(definition);
+    }
 
-    const std::string label = std::string("gqa_attention tree-verify B=2 isolation ") +
-                              geometry.name + " " + cache_name(dtype) +
-                              " W=12 prefixes=61,127 tables=1,0 star+chain";
-    const std::vector<std::uint16_t> output_bits =
-        copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(dtype));
-    failures += cache.verify(label, expected);
-    failures += verify_input(label + " q unchanged", dq, q_bits);
-    failures += verify_input(label + " k unchanged", dk, k_bits);
-    failures += verify_input(label + " v unchanged", dv, v_bits);
-    failures += verify_positions(label + " positions unchanged", dp, positions);
-    failures += verify_positions(label + " ancestor mask unchanged", dmask, ancestor_mask);
-    failures += verify_positions(label + " prefix lengths unchanged", dprefix,
-                                 std::vector<std::int32_t>(prefixes, prefixes + kBatch));
-    failures += verify_positions(label + " table rows unchanged", dtable,
-                                 std::vector<std::int32_t>(table_rows, table_rows + kBatch));
-    failures += dout.verify_guards((label + " output").c_str());
-    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
-        ++failures;
+    const std::string label = std::string("gqa_attention tree-verify B=") + std::to_string(kBatch) +
+                              " isolation " + geometry.name + " " + cache_name(dtype) +
+                              " W=" + std::to_string(kWidth) +
+                              " prefixes=" + std::to_string(prefixes[0]) + "," +
+                              std::to_string(prefixes.back()) + " reversed tables star+chain";
+    int failures            = 0;
+    for (int replay = 0; replay < (replay_graph ? 3 : 1); ++replay) {
+        if (replay != 0) {
+            dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+            cuda_synchronize();
+            executable.launch(cudaStreamPerThread);
+            cuda_synchronize(cudaStreamPerThread);
+        }
+        const std::vector<std::uint16_t> output_bits =
+            copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+        failures += verify_attention(label, bf16_bits_to_double(output_bits), reference,
+                                     attention_criterion(dtype));
+        failures += cache.verify(label, expected);
+        failures += verify_input(label + " q unchanged", dq, q_bits);
+        failures += verify_input(label + " k unchanged", dk, k_bits);
+        failures += verify_input(label + " v unchanged", dv, v_bits);
+        failures += verify_positions(label + " positions unchanged", dp, positions);
+        failures += verify_positions(label + " ancestor mask unchanged", dmask, ancestor_mask);
+        failures += verify_positions(label + " prefix lengths unchanged", dprefix, prefixes);
+        failures += verify_positions(label + " table rows unchanged", dtable, table_rows);
+        failures += dout.verify_guards((label + " output").c_str());
+        failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+        if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+            std::cerr << label << ": workspace query/execution high-water mismatch\n";
+            ++failures;
+        }
     }
     return failures;
 }
@@ -4145,6 +4188,10 @@ int run_tree_verify_cases(bool full) {
                 failures += run_tree_verify_case(geometry, dtype, 12, star_tree_parent(12), "star");
             }
             failures += run_tree_verify_batch_isolation_case(geometry, dtype);
+            if (geometry.q_heads == 24 && dtype == DType::U8) {
+                failures +=
+                    run_tree_verify_batch_isolation_case(geometry, dtype, 8, 128, 16256, true);
+            }
             if (dtype == DType::U8 && (full || geometry.q_heads == 24)) {
                 // The real Qwen3.8 DFlash regression reaches this short-context frontier with
                 // W=2 and W=5. Packed tree verification and ordinary T=1 are independently
@@ -4156,6 +4203,16 @@ int run_tree_verify_cases(bool full) {
                 if (full) { failures += run_tree_column0_matches_decode(geometry, dtype, 24, 12); }
             }
         }
+    }
+    return failures;
+}
+
+int run_long_w4_cases() {
+    int failures = 0;
+    for (const AttentionCase test_case :
+         {AttentionCase{4, 8188, 8192, 521u}, AttentionCase{4, 32764, 32768, 522u}}) {
+        failures += run_a1_case(kGeometries[0], DType::U8, test_case, MappingPattern::Fragmented);
+        failures += run_a3_case(kGeometries[0], DType::U8, test_case, MappingPattern::Fragmented);
     }
     return failures;
 }
@@ -4201,10 +4258,16 @@ int run_batch_cases(bool full) {
                        {6, {9000, 12000}, {6, 3}, {1, 0}, MappingPattern::Fragmented, 508u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
-    // Masked B=1 context-split prompts: the merge writes the invalid tail, including a fully
-    // invalid final 128-row block.
+    // Masked B=1 context-split prompts require the merge to zero every invalid output column.
     failures += run_batch_case(kGeometries[0], DType::U8,
                                {128, {4000}, {77}, {0}, MappingPattern::Identity, 509u});
+    // Both non-split schedules zero invalid columns, including complete invalid query tiles.
+    for (const int width : {129, 257}) {
+        const int context = width == 129 ? 63 : 256;
+        failures +=
+            run_batch_case(kGeometries[0], DType::U8,
+                           {width, {context}, {77}, {0}, MappingPattern::Fragmented, 1111u}, true);
+    }
     failures += run_batch_case(kGeometries[1], DType::U8,
                                {300, {1800}, {211}, {0}, MappingPattern::Fragmented, 510u});
     // 27B DFlash k=6/7 verify batches (W=7/8) on the small-T route, with masked short rows.
@@ -4224,6 +4287,40 @@ int run_batch_cases(bool full) {
     failures +=
         run_batch_case(kGeometries[0], DType::BF16,
                        {7, {16, 300, 16}, {7, 7, 2}, {0, 1, 2}, MappingPattern::Identity, 516u});
+    // Ragged 27B verify batches retain the long row while short rows have different valid tails.
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {8,
+                                {128, 128, 128, 128, 128, 16256},
+                                {8, 8, 8, 8, 8, 8},
+                                {0, 1, 2, 3, 4, 5},
+                                MappingPattern::Identity,
+                                517u},
+                               true);
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {8,
+                                {128, 128, 128, 128, 128, 16256},
+                                {0, 1, 4, 7, 8, 8},
+                                {5, 0, 4, 1, 3, 2},
+                                MappingPattern::Fragmented,
+                                518u},
+                               true);
+    // Exact visible-context envelopes exercise capacities below the broad-envelope upper bound.
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {8,
+                                {128, 128, 128, 128, 128, 8199},
+                                {8, 8, 8, 8, 8, 8},
+                                {2, 5, 0, 4, 1, 3},
+                                MappingPattern::Fragmented,
+                                519u},
+                               true);
+    failures += run_batch_case(kGeometries[0], DType::U8,
+                               {8,
+                                {128, 128, 128, 128, 128, 16352},
+                                {8, 8, 8, 8, 8, 8},
+                                {5, 0, 4, 1, 3, 2},
+                                MappingPattern::Fragmented,
+                                520u},
+                               true);
     return failures;
 }
 
@@ -4284,15 +4381,26 @@ int run_geometry(const Geometry& geometry, bool full) {
         if (dtype == DType::U8 && !sage_only) {
             failures +=
                 run_a1_case(geometry, dtype, {128, 64, 256, 210u}, MappingPattern::Identity);
+            if (geometry.q_heads == 24) {
+                failures += run_a1_case(geometry, dtype, {129, 512, 641, 1103u},
+                                        MappingPattern::Fragmented);
+            }
             if (full) {
                 failures +=
                     run_a1_case(geometry, dtype, {129, 64, 256, 211u}, MappingPattern::Identity);
                 failures +=
                     run_a1_case(geometry, dtype, {128, 64, 256, 212u}, MappingPattern::Fragmented);
             }
+            // Both schedules cover fragmented pages and partial rows at the width boundary.
+            for (const int width : {255, 256, 257}) {
+                failures += run_a1_case(geometry, dtype, {width, 64, 512, 230u},
+                                        MappingPattern::Fragmented);
+                failures += run_a1_case(geometry, dtype, {width, 2048 - width, 2048, 231u},
+                                        MappingPattern::Fragmented);
+            }
             // Short appends to long histories. Six-row chunks past W=16 (27B: W=18 at 8K keys),
-            // then the context-split dense prompt (2..8 splits): one partial 128-row block, a
-            // full fragmented block, a partial final block, and a three-block chunk.
+            // then context-split dense prompts (2..8 splits) with full and partial query tiles
+            // and fragmented pages.
             failures +=
                 run_a1_case(geometry, dtype, {7, 4089, 4096, 220u}, MappingPattern::Identity);
             failures +=
@@ -5484,6 +5592,16 @@ int main(int argc, char** argv) {
         std::cout << (rc == 0 ? "PASS" : "FAIL") << " gqa_attention s3-dump\n";
         return rc;
     }
+    if (argc > 1 && std::strcmp(argv[1], "--long-w4-only") == 0) {
+        if (cuda_unavailable()) {
+            std::cerr << "FAIL: no usable CUDA device\n";
+            return 1;
+        }
+        const int failures = run_long_w4_cases();
+        std::cout << (failures == 0 ? "PASS" : "FAIL")
+                  << " gqa_attention native long-window W4 cases\n";
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--batch-only") == 0) {
         if (cuda_unavailable()) {
             std::cerr << "FAIL: no usable CUDA device\n";
@@ -5513,6 +5631,7 @@ int main(int argc, char** argv) {
     int failures = 0;
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry, full); }
+    failures += run_long_w4_cases();
     failures += run_batch_cases(full);
     failures += run_tree_verify_cases(full);
     failures += run_kv_compact_path_cases();

@@ -29,7 +29,7 @@ namespace ninfer::ops {
  * Policy-bearing capacity query. Q4/W8 admit A16Only. NVFP4 admits A16Only through T=20 and
  * AllowA4/AllowA8 for every positive T. AllowA4 covers whichever qualified A16 or A4 route the
  * private resolver selects across the requested interval. NVFP4 AllowA8 selects row-scaled E4M3
- * activation compute at T>=4 and A16 below that; its separately scaled K16 partials preserve the
+ * activation compute at T>=2 and A16 below that; its separately scaled K16 partials preserve the
  * represented weight values.
  */
 [[nodiscard]] std::size_t

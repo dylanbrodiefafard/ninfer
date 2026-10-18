@@ -7,6 +7,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
+#include "core/gdn_history.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
@@ -148,22 +149,24 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
-// A mixed DFlash round runs a prefill owner's chunk and the verify batch as two forwards on
-// separate TextContexts, interleaved layer by layer so each layer's weights stream once for both:
-// the verify forward hands the owner forward a LayerPartner, which the owner invokes after each of
-// its layers to run the verify forward's same layer.
+// A mixed DFlash round runs a prefill owner and verify batch on separate TextContexts.
+// The owner invokes its partner after submitting each layer; the partner submits the matching
+// verify layer and joins both streams before either forward advances to the next layer.
 using LayerPartner      = std::function<void(int layer)>;
 using MixedOwnerForward = std::function<void(const LayerPartner& partner)>;
 
 class TextContext {
 public:
+    // An explicit execution stream borrows startup-owned mixed resources and is used only
+    // with a layer partner; the caller joins it before primary-stream publication or cleanup.
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                cudaStream_t execution_stream              = nullptr);
     ~TextContext() = default;
 
     TextContext(const TextContext&)            = delete;
@@ -198,7 +201,8 @@ public:
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
     void set_linear_state_slot(std::int32_t current_slot);
-    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records,
+                              const GdnHistory* history = nullptr);
     void set_tree_verify(const Tensor* parent_index, const Tensor* gdn_tree_schedule,
                          const Tensor* ancestor_mask, const Tensor* prefix_lengths);
 
@@ -333,6 +337,7 @@ private:
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end,
                  const LayerPartner* partner = nullptr);
     DeviceContext& ctx_;
+    cudaStream_t stream_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
     qwen3_6::PagedKVCacheView kv_;
@@ -362,6 +367,7 @@ private:
     std::int32_t linear_state_current_slot_               = 0;
     GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_               = nullptr;
+    const GdnHistory* gdn_history_                        = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     std::span<const std::uint32_t> prefill_split_frontiers_{};
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;

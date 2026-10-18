@@ -1,10 +1,11 @@
-// ReplaySSM recurrent-Record and all-layer Fold benchmark.
+// Recurrent Record, accepted-history Record, and all-layer Fold benchmark.
 //
 // Each timed GPU body is exactly one public Op call. Row-control construction, buffer
 // initialization, and L2 eviction are outside the timed interval. Fold deliberately uses an
 // ordinary eager launch; host submission time is reported separately from CUDA-event GPU latency.
 
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/gdn_history.h"
 #include "ninfer/ops/gdn_replay.h"
 
 #include "core/gdn_replay_records.h"
@@ -12,9 +13,11 @@
 #include "core/linear_attention_state.h"
 #include "ninfer_bench_common.h"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -53,6 +56,7 @@ enum class CommitSelection : std::uint8_t {
 enum class ComponentSelection : std::uint8_t {
     Fold,
     Recurrent,
+    HistoryRecord,
     All,
 };
 
@@ -80,6 +84,8 @@ struct Options {
     int warmup                   = 10;
     int repeat                   = 50;
     std::size_t flush_bytes      = kDefaultFlush;
+    int retained_count           = -1;
+    bool capture                 = false;
 };
 
 struct Measurement {
@@ -117,8 +123,9 @@ CommitSelection parse_commits(std::string_view value) {
 ComponentSelection parse_component(std::string_view value) {
     if (value == "fold") return ComponentSelection::Fold;
     if (value == "recurrent") return ComponentSelection::Recurrent;
+    if (value == "history-record") return ComponentSelection::HistoryRecord;
     if (value == "all") return ComponentSelection::All;
-    throw std::invalid_argument("--component must be fold, recurrent, or all");
+    throw std::invalid_argument("--component must be fold, recurrent, history-record, or all");
 }
 
 ValidSelection parse_valid(std::string_view value) {
@@ -129,20 +136,24 @@ ValidSelection parse_valid(std::string_view value) {
 }
 
 void print_help(const char* program) {
-    std::printf("Usage: %s [options]\n\n"
-                "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
-                "  --component fold|recurrent|all\n"
-                "                              Measured component (default all).\n"
-                "  --width T                   One physical width in [2,16].\n"
-                "  --batch B                   One active row count in [1,6].\n"
-                "  --commits one|dense|mixed|all\n"
-                "                              Commit policy (default all).\n"
-                "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
-                "  --warmup N                  Warmups per point (default 10).\n"
-                "  --repeat N                  Samples per point (default 50).\n"
-                "  --flush-mib N               Cold-L2 eviction storage (default 256 MiB).\n"
-                "  -h, --help                  Show this text.\n",
-                program);
+    std::printf(
+        "Usage: %s [options]\n\n"
+        "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
+        "  --component fold|recurrent|history-record|all\n"
+        "                              Measured component (all: fold and recurrent; default all).\n"
+        "  --width T                   One physical width in [2,16].\n"
+        "  --batch B                   One active row count in [1,6].\n"
+        "  --commits one|dense|mixed|all\n"
+        "                              Commit policy (default all).\n"
+        "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
+        "  --retained-count N          History record count 0..3 (default all four).\n"
+        "  --capture                   Profile one post-warmup history Record call.\n"
+        "                              History mode fixes 27b, B1, T8, masked chain.\n"
+        "  --warmup N                  Warmups per point (default 10).\n"
+        "  --repeat N                  Samples per point (default 50).\n"
+        "  --flush-mib N               Cold-L2 eviction storage (default 256 MiB).\n"
+        "  -h, --help                  Show this text.\n",
+        program);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -165,6 +176,10 @@ Options parse_options(int argc, char** argv) {
             options.commits = parse_commits(next("commit policy"));
         } else if (argument == "--valid") {
             options.valid = parse_valid(next("valid policy"));
+        } else if (argument == "--retained-count") {
+            options.retained_count = parse_i32(next("retained count"), "retained count", 0, 3);
+        } else if (argument == "--capture") {
+            options.capture = true;
         } else if (argument == "--warmup") {
             options.warmup = parse_i32(next("warmup"), "warmup", 0, INT32_MAX);
         } else if (argument == "--repeat") {
@@ -178,6 +193,19 @@ Options parse_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
         }
+    }
+    if (options.component == ComponentSelection::HistoryRecord) {
+        if (options.profiles == ProfileSelection::Qwen35B ||
+            (options.exact_width != 0 && options.exact_width != 8) ||
+            (options.exact_batch != 0 && options.exact_batch != 1) ||
+            options.valid == ValidSelection::Dense || options.commits != CommitSelection::All) {
+            throw std::invalid_argument("history-record requires 27b, B1, T8 and masked inputs");
+        }
+        if (options.capture && options.retained_count < 0) {
+            throw std::invalid_argument("--capture requires one --retained-count");
+        }
+    } else if (options.retained_count >= 0 || options.capture) {
+        throw std::invalid_argument("--retained-count and --capture require history-record");
     }
     return options;
 }
@@ -534,6 +562,114 @@ Measurement measure_component(Launch&& launch, DeviceBuffer& flush, int warmup, 
     return result;
 }
 
+// Fixed production chain geometry. Seed records and their accepted history are constructed
+// with public Ops before measurement; repeated Record calls leave the checkpoint/count intact.
+void run_history_record(const Options& options, DeviceBuffer& flush) {
+    constexpr int kLayers = 48;
+    constexpr int kHeads  = 48;
+    constexpr int kWidth  = 8;
+    LayoutBuilder state_builder;
+    const auto state_layout =
+        plan_linear_attention_state_pool(state_builder, {.layers         = kLayers,
+                                                         .conv_channels  = 10240,
+                                                         .conv_width     = 3,
+                                                         .value_heads    = kHeads,
+                                                         .value_head_dim = 128,
+                                                         .key_head_dim   = 128,
+                                                         .slot_count     = 1,
+                                                         .conv_dtype     = DType::BF16});
+    DeviceBuffer state_storage(state_builder.finish(256));
+    LinearAttentionStatePool states({state_storage.p, state_storage.bytes}, state_layout);
+    LayoutBuilder record_builder;
+    const auto record_layout = plan_gdn_replay_records(record_builder, {.layers          = kLayers,
+                                                                        .record_capacity = 1,
+                                                                        .width           = kWidth,
+                                                                        .conv_channels   = 10240,
+                                                                        .qk_heads        = 16,
+                                                                        .value_heads     = kHeads,
+                                                                        .key_dim         = 128,
+                                                                        .value_dim       = 128});
+    DeviceBuffer record_storage(record_builder.finish(256));
+    GdnReplayRecords records({record_storage.p, record_storage.bytes}, record_layout);
+    LayoutBuilder history_builder;
+    const auto history_layout = plan_gdn_history(history_builder, {.layers      = kLayers,
+                                                                   .slots       = 1,
+                                                                   .width       = kWidth,
+                                                                   .capacity    = 4,
+                                                                   .qk_heads    = 16,
+                                                                   .value_heads = kHeads,
+                                                                   .key_dim     = 128,
+                                                                   .value_dim   = 128});
+    DeviceBuffer history_storage(history_builder.finish(256));
+    GdnHistory history({history_storage.p, history_storage.bytes}, history_layout);
+    auto query         = bench::make_bf16(128 * 16 * kWidth);
+    auto key           = bench::make_bf16(128 * 16 * kWidth);
+    auto value         = bench::make_bf16(128 * kHeads * kWidth);
+    auto gate          = make_f32(kHeads * kWidth, -0.7F);
+    auto beta_storage  = make_f32(kHeads * kWidth, 0.5F);
+    auto valid_storage = make_i32({kWidth});
+    auto slot_storage  = make_i32({0});
+    DeviceBuffer output(128 * kHeads * kWidth * sizeof(std::uint16_t));
+    const Tensor q(query.p, DType::BF16, {128, 16, kWidth, 1});
+    const Tensor k(key.p, DType::BF16, {128, 16, kWidth, 1});
+    const Tensor v(value.p, DType::BF16, {128, kHeads, kWidth, 1});
+    const Tensor g(gate.p, DType::FP32, {kHeads, kWidth, 1});
+    const Tensor beta(beta_storage.p, DType::FP32, {kHeads, kWidth, 1});
+    const Tensor valid(valid_storage.p, DType::I32, {1});
+    const Tensor slots(slot_storage.p, DType::I32, {1});
+    Tensor out(output.p, DType::BF16, {128, kHeads, kWidth, 1});
+    const auto record = [&](int layer, cudaStream_t stream) {
+        auto raw = records.layer(layer, 1);
+        ops::gated_delta_net_history_record(
+            q, k, v, g, beta, 1.0F / std::sqrt(128.0F), states.recurrent[layer], valid, slots,
+            raw.key, raw.value, raw.gate, out, history.layer(layer, 0, 1), stream);
+    };
+    constexpr std::size_t kStateElements = static_cast<std::size_t>(128) * 128 * kHeads;
+    std::vector<float> checkpoint(kStateElements);
+    for (std::size_t i = 0; i < checkpoint.size(); ++i) {
+        checkpoint[i] = static_cast<float>(static_cast<int>(i % 127) - 63) * 0.00025F;
+    }
+    const int first = options.retained_count < 0 ? 0 : options.retained_count;
+    const int last  = options.retained_count < 0 ? 3 : options.retained_count;
+    for (int count = first; count <= last; ++count) {
+        state_storage.fill(0);
+        for (int layer = 0; layer < kLayers; ++layer) {
+            CUDA_CHECK(cudaMemcpy(states.recurrent[layer].data, checkpoint.data(),
+                                  checkpoint.size() * sizeof(float), cudaMemcpyHostToDevice));
+        }
+        record_storage.fill(0);
+        history_storage.fill(0);
+        ops::gdn_history_reset_all(history, nullptr);
+        if (count > 0) {
+            for (int layer = 0; layer < kLayers; ++layer) { record(layer, nullptr); }
+            const std::array<ops::GdnReplayFoldRow, 1> rows{
+                ops::GdnReplayFoldRow{.linear_state_slot = 0, .commit_columns = count}};
+            ops::gdn_history_commit(records, history, states.all_layers_view(), rows, nullptr);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        std::int32_t retained = -1;
+        CUDA_CHECK(
+            cudaMemcpy(&retained, history.counts.data, sizeof(retained), cudaMemcpyDeviceToHost));
+        if (retained != count) {
+            throw std::runtime_error("history-record setup did not publish the retained count");
+        }
+        const auto launch = [&](cudaStream_t stream) { record(0, stream); };
+        if (options.capture) {
+            for (int i = 0; i < options.warmup; ++i) { launch(nullptr); }
+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
+            CUDA_CHECK(cudaProfilerStart());
+            launch(nullptr);
+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
+            CUDA_CHECK(cudaProfilerStop());
+        } else {
+            const auto result = measure_component(launch, flush, options.warmup, options.repeat);
+            std::printf("component=history-record profile=27b T=8 B=1 valid=8 retained=%d "
+                        "gpu_warm=%8.2f us gpu_cold=%8.2f us host_submit=%7.2f us\n",
+                        count, result.warm.median_us, result.cold.median_us, result.host_median_us);
+        }
+    }
+}
+
 void print_recurrent_result(const Profile& profile, std::int32_t width, std::int32_t batch,
                             ValidSelection valid, const char* form,
                             const Measurement& measurement) {
@@ -582,6 +718,10 @@ void print_result(const Profile& profile, std::int32_t width, std::int32_t batch
 
 int run(const Options& options) {
     DeviceBuffer flush(options.flush_bytes);
+    if (options.component == ComponentSelection::HistoryRecord) {
+        run_history_record(options, flush);
+        return 0;
+    }
     for (const Profile& profile : selected_profiles(options.profiles)) {
         for (const std::int32_t width : selected_widths(profile, options.exact_width)) {
             const bool run_fold      = options.component == ComponentSelection::Fold ||

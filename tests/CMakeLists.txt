@@ -92,6 +92,8 @@ ninfer_add_test(ninfer_media_decode_test
   LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
+ninfer_add_test(ninfer_qwen3_6_panel_copy_test SOURCES targets/qwen3_6/test_panel_copy.cpp)
+set_property(TEST ninfer_qwen3_6_panel_copy_test APPEND PROPERTY LABELS sanitizer)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
@@ -158,15 +160,21 @@ ninfer_add_test(ninfer_qwen3_6_recovery_executor_test
 target_include_directories(ninfer_qwen3_6_recovery_executor_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_qwen3_6_schema_grammar_test
+  SOURCES targets/qwen3_6/test_schema_grammar.cpp
+  LIBRARIES ninfer_token_grammar)
+ninfer_add_test(ninfer_qwen3_6_grammar_tokenizer_test
+  SOURCES targets/qwen3_6/test_grammar_tokenizer.cpp
+  LIBRARIES ninfer_token_grammar)
 ninfer_add_test(ninfer_qwen3_6_tool_grammar_test
   SOURCES targets/qwen3_6/test_tool_grammar.cpp
-  LIBRARIES ninfer_engine ninfer_tool_grammar)
+  LIBRARIES ninfer_engine ninfer_token_grammar)
 target_include_directories(ninfer_qwen3_6_tool_grammar_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_frontend_test
   SOURCES targets/qwen3_6/test_frontend.cpp
   NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_engine ninfer_core ninfer_token_grammar)
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
@@ -217,6 +225,10 @@ target_include_directories(ninfer_qwen3_6_27b_recovery_kv_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 set_tests_properties(ninfer_qwen3_6_27b_recovery_kv_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME ninfer_qwen3_8_27b_fork_state_real_test
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_qwen3_6_27b_recovery_kv_real_test> --fork-state)
+set_tests_properties(ninfer_qwen3_8_27b_fork_state_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS "sanitizer")
 ninfer_add_test(ninfer_qwen3_6_27b_ram_real_test
   SOURCES targets/qwen3_6_27b/test_engine_ram_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)
@@ -259,17 +271,34 @@ add_test(NAME ninfer_qwen3_6_27b_disk_metadata_real_test
   COMMAND ninfer_qwen3_6_27b_disk_real_test --case metadata)
 set_tests_properties(ninfer_qwen3_6_27b_disk_metadata_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 900)
+ninfer_add_test(ninfer_qwen3_8_27b_cache_write_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_cache_write_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_cache_write_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_qwen3_6_27b_context_checkpoint_real_test
   SOURCES targets/qwen3_6_27b/test_engine_context_checkpoint_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)
 target_include_directories(ninfer_qwen3_6_27b_context_checkpoint_real_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 set_tests_properties(ninfer_qwen3_6_27b_context_checkpoint_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_output_constraint_real_test
+  SOURCES targets/qwen3_6_27b/test_output_constraint_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_output_constraint_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash_real.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_dflash_graph_update_real_test
+  SOURCES targets/qwen3_6_27b/test_dflash_graph_update_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_graph_update_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_8_27b_logprobs_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_logprobs_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_logprobs_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash_capacity_real_test
   SOURCES targets/qwen3_6_27b/test_dflash_capacity_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)
@@ -399,6 +428,7 @@ set(ninfer_op_tests
   embedding
   argmax
   nll_from_logits
+  token_logprobs
   gdn_gating
   gdn_gating_proj
   rope
@@ -422,6 +452,7 @@ endforeach()
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
 ninfer_add_op_test(ninfer_gqa_xattn_sort_test
   SOURCES ops/test_gqa_xattn_sort.cu
   LIBRARIES ninfer_ops)
@@ -434,6 +465,16 @@ ninfer_add_op_test(ninfer_swa_test
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_history_test
+  SOURCES ops/test_gdn_history.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_sanitizer_cases(ninfer_gdn_history_test)
+# The all-layer commit/count cadence belongs to memcheck. Racecheck exercises the
+# record's shared-memory chain/tree paths once, keeping instrumentation bounded.
+set_property(TEST ninfer_gdn_history_test_sanitizer PROPERTY LABELS sanitizer)
+add_test(NAME ninfer_gdn_history_record_racecheck
+  COMMAND ${NINFER_TEST_LAUNCHER} $<TARGET_FILE:ninfer_gdn_history_test> --racecheck)
+set_property(TEST ninfer_gdn_history_record_racecheck PROPERTY LABELS sanitizer racecheck)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)
@@ -462,6 +503,7 @@ ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a8_test ops/linear/test_nvfp4_a8.cpp)
+ninfer_add_op_test(ninfer_nvfp4_codec_test SOURCES ops/test_nvfp4_codec.cu LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)
@@ -498,6 +540,7 @@ ninfer_add_fused_linear_test(
 ninfer_add_op_test(ninfer_linear_add_nvfp4_test
   SOURCES ops/linear_add/test_nvfp4.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_sanitizer_cases(ninfer_linear_add_nvfp4_test)
 ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES ops/linear_add/test_fp8.cpp
   LIBRARIES ninfer_ops)
@@ -546,16 +589,17 @@ endforeach()
 # quick under racecheck, which tracks every shared-memory access; the GEMM-heavy linear and
 # projection sweeps take 5 to 50 minutes each under it and stay outside that label.
 ninfer_add_sanitizer_cases(ninfer_sampling_test)
+ninfer_add_sanitizer_cases(ninfer_token_logprobs_test)
 ninfer_add_sanitizer_cases(ninfer_speculative_round_test)
 ninfer_add_sanitizer_cases(ninfer_gqa_attention_test)
 ninfer_add_sanitizer_cases(ninfer_attn_input_proj_test)
-ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
 ninfer_add_sanitizer_cases(ninfer_a8_activation_test)
 ninfer_add_sanitizer_cases(ninfer_normalized_rope_kv_append_test)
 ninfer_add_sanitizer_cases(ninfer_linear_kv_projection_test)
 set_property(TEST ninfer_linear_kv_projection_test_sanitizer PROPERTY LABELS sanitizer)
 set(ninfer_sanitizer_racecheck_tests
   ninfer_kv_cache_test
+  ninfer_kv_ram_cache_test
   ninfer_embedding_test
   ninfer_rmsnorm_test
   ninfer_dual_rmsnorm_test

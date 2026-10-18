@@ -371,6 +371,7 @@ int main(int argc, char** argv) {
         options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
         options.max_concurrency = 1;
         options.prefill_chunk   = prefill_chunk;
+        options.mixed_forward   = 0;
         options.kv_cache        = kv_dtype;
         options.sage_attn       = sage_attn;
         options.keep_frac       = keep_frac.value_or(1.0f);

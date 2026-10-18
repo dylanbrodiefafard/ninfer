@@ -146,7 +146,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 18, "request-log schema is not version 18");
+    failures += check(kRequestLogSchemaVersion == 20, "request-log schema is not version 20");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -232,6 +232,7 @@ int main() {
     request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
     PreparedRequest prepared;
+    prepared.prepare_seconds                   = 12.165;
     prepared.enable_thinking                   = false;
     prepared.preserve_thinking                 = true;
     prepared.preserve_thinking_semantic_change = true;
@@ -243,9 +244,35 @@ int main() {
     prepared.sampling.frequency_penalty        = 0.0F;
     prepared.sampling.seed                     = 7632647173703958409ULL;
 
+    request.cache_write = false;
     const RequestLogContext context =
-        make_request_log_context(7, "openai_chat_completions", request, prepared);
+        make_request_log_context(7, "openai_chat_completions", request, prepared, 13.25);
+    const RequestPreparationLogContext preparing{.id            = 7,
+                                                 .protocol      = "openai_chat_completions",
+                                                 .body_bytes    = 8192,
+                                                 .message_count = 2,
+                                                 .tool_count    = 8,
+                                                 .parse_seconds = 0.03125};
+    const Json preparation =
+        Json::parse(format_request_prepare_json("serve-test", 1999, preparing));
+    failures += check(preparation.at("event") == "request_prepare" &&
+                          preparation.at("request").at("request_id") == 7 &&
+                          preparation.at("request").at("body_bytes") == 8192 &&
+                          preparation.at("request").at("tool_count") == 8 &&
+                          preparation.at("timings_seconds").at("parse") == 0.03125 &&
+                          !preparation.at("request").contains("sampling"),
+                      "preparation event lost unresolved request shape or parse time");
+    failures += check(
+        format_request_prepare(preparing) ==
+            "[req 7] openai_chat_completions preparing msgs=2 tools=8 body_bytes=8192 parse=31ms",
+        "human preparation log mismatch");
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
+    failures +=
+        check(started.at("timings_seconds").at("synchronous_prepare") == 13.25 &&
+                  format_request_start(context).find("prepare_sync=13250ms") != std::string::npos,
+              "submitted request omits completed preparation duration");
+    failures += check(started.at("request").at("cache_write") == false,
+                      "disposable write policy missing from request log");
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
     failures += check(started.at("request").at("requested_output_tokens") == 4096,
@@ -271,6 +298,8 @@ int main() {
         make_request_rejection_log_context(8, "anthropic_messages", request, preparation_error);
     const Json rejected =
         Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
+    failures += check(rejected.at("request").at("cache_write") == false,
+                      "disposable write policy missing from rejection log");
     failures +=
         check(rejected.at("event") == "request_rejected" && rejected.at("phase") == "prepare",
               "preparation rejection event or phase mismatch");
@@ -308,9 +337,10 @@ int main() {
     outcome.metrics.speculative_draft_tokens    = 900;
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
-    outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
-    outcome.metrics.speculative_live_draft_tokens     = 3;
-    outcome.metrics.speculative_rounds_per_draft      = {0, 0, 0, 300};
+    outcome.metrics.speculative_accepted_per_position    = {290, 240, 190};
+    outcome.metrics.speculative_live_draft_tokens        = 3;
+    outcome.metrics.speculative_p_less_draft_temperature = 0.5F;
+    outcome.metrics.speculative_rounds_per_draft         = {0, 0, 0, 300};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -564,6 +594,8 @@ int main() {
               "speculative position counts missing");
     failures += check(done.at("speculative").at("live_draft_tokens") == 3,
                       "speculative live draft tokens missing");
+    failures += check(done.at("speculative").at("p_less_draft_temperature") == 0.5,
+                      "speculative p-less draft temperature missing");
     failures += check(done.at("speculative").at("rounds_per_draft") == Json::array({0, 0, 0, 300}),
                       "speculative rounds_per_draft missing");
 
@@ -637,21 +669,44 @@ int main() {
                   human_ram_throughput.find("save=8ms load=14ms") != std::string::npos &&
                   human_ram_throughput.find("ram_captures=") == std::string::npos,
               "human RAM throughput occupancy mismatch");
-    ram_throughput.kv_disk_capacity_bytes               = 2ULL * 1024ULL * 1024ULL;
-    ram_throughput.kv_disk_used_bytes                   = 1024ULL * 1024ULL;
-    ram_throughput.kv_disk_entry_count                  = 1;
-    ram_throughput.scheduler.kv_disk_restores           = 4;
-    ram_throughput.kv_disk_save_seconds                 = 0.005;
-    ram_throughput.kv_disk_load_seconds                 = 0.009;
-    ram_throughput.kv_disk_h2d_seconds                  = 0.012;
-    ram_throughput.scheduler.gpu_kv_main_capacity_pages = 128;
-    ram_throughput.scheduler.gpu_kv_main_entitled_pages = 40;
-    ram_throughput.scheduler.kv_cache_fallbacks         = 2;
-    const std::string human_disk_throughput             = format_throughput(ram_throughput);
+    ram_throughput.kv_disk_capacity_bytes                  = 2ULL * 1024ULL * 1024ULL;
+    ram_throughput.kv_disk_used_bytes                      = 1024ULL * 1024ULL;
+    ram_throughput.kv_disk_entry_count                     = 1;
+    ram_throughput.scheduler.kv_disk_restores              = 4;
+    ram_throughput.kv_disk_save_seconds                    = 0.005;
+    ram_throughput.kv_disk_load_seconds                    = 0.009;
+    ram_throughput.kv_disk_h2d_seconds                     = 0.012;
+    ram_throughput.scheduler.gpu_kv_main_capacity_pages    = 128;
+    ram_throughput.scheduler.gpu_kv_main_entitled_pages    = 40;
+    ram_throughput.scheduler.kv_cache_fallbacks            = 2;
+    ram_throughput.scheduler.kv_disk_spill_active          = true;
+    ram_throughput.scheduler.kv_disk_compaction_active     = true;
+    ram_throughput.scheduler.kv_disk_restore_active        = true;
+    ram_throughput.scheduler.kv_disk_pending_jobs          = 3;
+    ram_throughput.scheduler.kv_disk_spill_elapsed_seconds = 12.165;
+    ram_throughput.kv_disk_save_seconds                    = 12.165;
+    const std::string human_disk_throughput                = format_throughput(ram_throughput);
+    failures += check(
+        human_disk_throughput.find("spill_completed=12165ms load=9ms work=spill,compact,restore "
+                                   "pending=3 spill_age=12.2s") != std::string::npos,
+        "human disk log hides background work or mislabels completed spill time");
+    const auto disk_json = Json::parse(format_throughput_json("serve-test", 5001, ram_throughput));
+    failures += check(disk_json.at("scheduler").at("kv_disk_spill_active") == true &&
+                          disk_json.at("scheduler").at("kv_disk_compaction_active") == true &&
+                          disk_json.at("scheduler").at("kv_disk_restore_active") == true &&
+                          disk_json.at("scheduler").at("kv_disk_pending_jobs") == 3 &&
+                          disk_json.at("scheduler").at("kv_disk_spill_elapsed_seconds") == 12.165,
+                      "throughput JSON lost active disk work");
+    auto idle_disk      = ram_throughput;
+    idle_disk.scheduler = {};
+    failures +=
+        check(format_throughput(idle_disk).find("work=idle pending=0") != std::string::npos &&
+                  format_throughput(idle_disk).find("spill_age=") == std::string::npos,
+              "idle disk log reports an active spill");
     failures +=
         check(human_disk_throughput.find("kv-disk=1 MiB n=1 restores=4") != std::string::npos,
               "human throughput omits KV disk occupancy");
-    failures += check(human_disk_throughput.find("drops=0 save=") != std::string::npos,
+    failures += check(human_disk_throughput.find("drops=0 spill_completed=") != std::string::npos,
                       "human throughput prints drop causes without drops");
     {
         ThroughputReport dropped                        = ram_throughput;
@@ -660,10 +715,10 @@ int main() {
             ninfer::KvDiskDropReason::SpillNoCapacity)] = 2;
         dropped.scheduler.kv_disk_drop_reasons[static_cast<std::size_t>(
             ninfer::KvDiskDropReason::ReclaimUnsaved)]  = 1;
-        failures +=
-            check(format_throughput(dropped).find(
-                      "drops=3 (spill_no_capacity:2,reclaim_unsaved:1) save=") != std::string::npos,
-                  "human throughput omits KV disk drop causes");
+        failures += check(format_throughput(dropped).find(
+                              "drops=3 (spill_no_capacity:2,reclaim_unsaved:1) spill_completed=") !=
+                              std::string::npos,
+                          "human throughput omits KV disk drop causes");
         const Json dropped_json = Json::parse(format_throughput_json("serve-test", 5002, dropped));
         failures += check(dropped_json.at("scheduler").at("kv_disk_drop_reasons") ==
                               Json{{"spill_no_capacity", 2}, {"reclaim_unsaved", 1}},
@@ -714,6 +769,7 @@ int main() {
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());
+        writer.write_request_prepare(preparing);
         writer.write_request_start(context);
     }
     {
@@ -722,10 +778,15 @@ int main() {
         writer.write_request_error(context, "generation failed");
     }
     std::ifstream input(log_path);
+    std::string preparation_line;
     std::string first_line;
     std::string second_line;
     std::string third_line;
     std::string extra_line;
+    std::getline(input, preparation_line);
+    failures += check(!preparation_line.empty() &&
+                          Json::parse(preparation_line).at("event") == "request_prepare",
+                      "preparation event was not flushed before request start");
     std::getline(input, first_line);
     std::getline(input, second_line);
     std::getline(input, third_line);

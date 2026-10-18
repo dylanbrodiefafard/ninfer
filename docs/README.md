@@ -32,6 +32,10 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Maintainer references
 
+- [Remaining repository experiments](../research/inference-engine-triage/phase7-experiments.md)
+  records all 18 subsequent candidate decisions, five retained implementations,
+  numerical qualification and measured gains; `phase7-ledger.json` tracks completion.
+
 - [RTX 5090 inference research](../research/rtx5090-inference/README.md) preserves the external
   investigation; [experimental applicability](../research/rtx5090-inference/experimental-review.md)
   updates its local assumptions for Qwen3.8-27B NVFP4 on this branch.

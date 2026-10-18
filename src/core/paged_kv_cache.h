@@ -249,6 +249,13 @@ void unpack_paged_kv_allocation_from_host(PagedKVAllocation& allocation, const P
                                           const void* src, std::uint32_t src_page_count,
                                           std::uint32_t dst_extent, cudaStream_t stream);
 
+// Copies leading logical pages between distinct allocations in the same pool without
+// changing their mapping or representation. Both owners remain alive through stream completion.
+// Rejects out-of-range extents, foreign allocations, and overlapping physical pages.
+void copy_paged_kv_allocation(const PagedKVAllocation& source, PagedKVAllocation& destination,
+                              const PagedKVPool& pool, std::uint32_t page_count,
+                              cudaStream_t stream);
+
 [[nodiscard]] std::size_t paged_kv_logical_page_bytes(const PagedKVPool& pool);
 
 void pack_paged_kv_logical_page_to_host(const PagedKVAllocation& allocation,

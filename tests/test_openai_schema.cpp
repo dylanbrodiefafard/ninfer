@@ -15,9 +15,11 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -127,6 +129,42 @@ int test_ninfer_capture_object() {
     failures +=
         check(!parse_chat_completion_request(base, default_limits()).capture_context_checkpoint,
               "omitted ninfer does not pin");
+    for (const Json& vendor : {Json::object(), Json{{"capture_context_checkpoint", false}},
+                               Json{{"cache_write", true}}}) {
+        Json unpinned      = base;
+        unpinned["ninfer"] = vendor;
+        const auto parsed  = parse_chat_completion_request(unpinned, default_limits());
+        failures += check(
+            !to_request_options(parsed, default_server()).execution.capture_context_checkpoint &&
+                parsed.cache_write,
+            "empty or explicit false vendor options preserve ordinary execution");
+    }
+    failures += check(parse_chat_completion_request(base, default_limits()).cache_write,
+                      "omitted cache_write preserves ordinary caching");
+    for (bool stream : {false, true}) {
+        Json disposable      = base;
+        disposable["stream"] = stream;
+        disposable["ninfer"] = Json{{"cache_write", false}};
+        const auto parsed    = parse_chat_completion_request(disposable, default_limits());
+        failures += check(!parsed.cache_write &&
+                              !to_request_options(parsed, default_server()).execution.cache_write,
+                          "disposable option reaches Engine for both response modes");
+        disposable["ninfer"]["capture_context_checkpoint"] = true;
+        try {
+            (void)parse_chat_completion_request(disposable, default_limits());
+            failures += fail("disposable capture conflict accepted");
+        } catch (const ApiException& error) {
+            failures += check(
+                error.error().status == 400 && error.error().code == "cache_write_conflict" &&
+                    error.error().param == "ninfer.capture_context_checkpoint" &&
+                    error.error().message.find("requires cache_write=true") != std::string::npos,
+                "disposable capture conflict diagnostic");
+        }
+        disposable["ninfer"] = Json{{"cache_write", 0}};
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(disposable, default_limits()); }),
+            "non-boolean cache_write rejected");
+    }
     Json pin                       = base;
     pin["ninfer"]                  = Json{{"capture_context_checkpoint", true}};
     const GenerationRequest pinned = parse_chat_completion_request(pin, default_limits());
@@ -397,11 +435,47 @@ int test_reject_unsupported() {
         throws_api([&] { (void)parse_chat_completion_request(function_call, default_limits()); }),
         "deprecated function_call rejected");
 
-    Json rf               = base;
-    rf["response_format"] = Json{{"type", "json_object"}};
+    Json rf                   = base;
+    rf["response_format"]     = Json{{"type", "json_object"}};
+    const auto object_request = parse_chat_completion_request(rf, default_limits());
     failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+        check(object_request.output_constraint && object_request.output_constraint->kind ==
+                                                      ninfer::OutputConstraintKind::JsonObject,
+              "json response_format was not translated");
+
+    Json schema_format               = base;
+    schema_format["response_format"] = Json{
+        {"type", "json_schema"},
+        {"json_schema", {{"name", "result"}, {"schema", {{"type", "object"}}}, {"strict", true}}}};
+    const auto schema_request = parse_chat_completion_request(schema_format, default_limits());
+    failures += check(schema_request.output_constraint &&
+                          schema_request.output_constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonSchema &&
+                          Json::parse(schema_request.output_constraint->source)["type"] == "object",
+                      "JSON schema format was not translated");
+    schema_format["response_format"]["json_schema"]["strict"] = "true";
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(schema_format, default_limits()); }),
+        "invalid strict type accepted");
+    Json grammar_request                  = base;
+    grammar_request["structured_outputs"] = {{"grammar", "root ::= \"yes\""}};
+    const auto parsed_grammar = parse_chat_completion_request(grammar_request, default_limits());
+    failures += check(parsed_grammar.output_constraint && parsed_grammar.output_constraint->kind ==
+                                                              ninfer::OutputConstraintKind::Grammar,
+                      "EBNF grammar was not translated");
+    grammar_request["response_format"] = {{"type", "json_object"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(grammar_request, default_limits()); }),
+        "conflicting output constraints accepted");
+    for (const Json& invalid :
+         {Json("json_object"), Json{{"type", "unknown"}}, Json{{"type", "json_schema"}},
+          Json{{"type", "json_object"}, {"schema", true}}}) {
+        Json request               = base;
+        request["response_format"] = invalid;
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(request, default_limits()); }),
+            "malformed output format accepted");
+    }
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};
@@ -921,6 +995,108 @@ int test_tool_response_serialization() {
     return failures;
 }
 
+// Two content tokens: "Hi" with two alternatives, and the first two bytes of a four-byte UTF-8
+// sequence, which is not valid text on its own.
+std::vector<TokenLogprobEntry> sample_logprobs() {
+    return {
+        TokenLogprobEntry{.bytes   = "Hi",
+                          .logprob = -0.25,
+                          .top     = {TokenLogprobAlternative{.bytes = "Hi", .logprob = -0.25},
+                                      TokenLogprobAlternative{.bytes = "Hey", .logprob = -1.5}}},
+        TokenLogprobEntry{.bytes = "\xF0\x9F", .logprob = -2.0, .top = {}},
+    };
+}
+
+int check_logprob_entries(const Json& content, const std::string& what) {
+    int failures = 0;
+    failures += check(content.is_array() && content.size() == 2, what + ": one entry per token");
+    if (failures != 0) { return failures; }
+    const Json& first = content.at(0);
+    failures += check(first.at("token") == "Hi" && first.at("logprob") == -0.25 &&
+                          first.at("bytes") == Json::array({72, 105}),
+                      what + ": token, logprob, and bytes");
+    failures += check(first.at("top_logprobs").size() == 2 &&
+                          first.at("top_logprobs").at(1).at("token") == "Hey" &&
+                          first.at("top_logprobs").at(1).at("logprob") == -1.5 &&
+                          first.at("top_logprobs").at(1).at("bytes") == Json::array({72, 101, 121}),
+                      what + ": ranked alternatives");
+    const Json& partial = content.at(1);
+    failures += check(partial.at("token") == "\xEF\xBF\xBD" &&
+                          partial.at("bytes") == Json::array({240, 159}) &&
+                          partial.at("top_logprobs").empty(),
+                      what + ": partial UTF-8 token keeps exact bytes and a valid token string");
+    return failures;
+}
+
+int test_logprobs() {
+    int failures          = 0;
+    const Json messages   = Json::array({Json{{"role", "user"}, {"content", "hi"}}});
+    const auto parse_with = [&](const Json& extra) {
+        Json body = {{"model", "m"}, {"messages", messages}};
+        body.update(extra);
+        return parse_chat_completion_request(body, default_limits());
+    };
+    failures +=
+        check(!parse_with(Json::object()).top_logprobs.has_value(), "logprobs are off by default");
+    failures += check(!parse_with(Json{{"logprobs", false}}).top_logprobs.has_value(),
+                      "logprobs=false reports nothing");
+    failures += check(parse_with(Json{{"logprobs", true}}).top_logprobs == 0,
+                      "logprobs=true without top_logprobs reports no alternatives");
+    const GenerationRequest five = parse_with(Json{{"logprobs", true}, {"top_logprobs", 5}});
+    failures += check(five.top_logprobs == 5, "top_logprobs carried");
+    failures += check(to_request_options(five, default_server()).output.top_logprobs == 5U,
+                      "top_logprobs reaches Engine output options");
+    failures +=
+        check(!to_request_options(parse_with(Json::object()), default_server()).output.top_logprobs,
+              "no logprobs requested from the Engine by default");
+    failures += check(parse_with(Json{{"logprobs", true}, {"top_logprobs", 20}}).top_logprobs == 20,
+                      "top_logprobs maximum accepted");
+    failures += check(throws_api([&] { (void)parse_with(Json{{"top_logprobs", 3}}); }),
+                      "top_logprobs requires logprobs");
+    failures +=
+        check(throws_api([&] { (void)parse_with(Json{{"logprobs", true}, {"top_logprobs", 21}}); }),
+              "top_logprobs above 20 rejected");
+    failures +=
+        check(throws_api([&] { (void)parse_with(Json{{"logprobs", true}, {"top_logprobs", -1}}); }),
+              "negative top_logprobs rejected");
+    failures += check(throws_api([&] { (void)parse_with(Json{{"logprobs", "yes"}}); }),
+                      "non-boolean logprobs rejected");
+
+    const std::vector<TokenLogprobEntry> entries = sample_logprobs();
+    const CompletionUsage usage{3, 2};
+    const Json plain =
+        Json::parse(make_chat_completion_response("id", "m", 1, "Hi", "", "stop", usage));
+    failures += check(!plain.at("choices").at(0).contains("logprobs"),
+                      "no logprobs object unless requested");
+    const Json reported = Json::parse(
+        make_chat_completion_response("id", "m", 1, "Hi", "", "stop", usage, nullptr, &entries));
+    const Json& choice = reported.at("choices").at(0);
+    failures += check(choice.at("logprobs").at("refusal").is_null(), "logprobs.refusal is null");
+    failures += check_logprob_entries(choice.at("logprobs").at("content"), "chat response");
+
+    const std::vector<TokenLogprobEntry> none;
+    const Json tool = Json::parse(make_chat_completion_tool_response(
+        "id", "m", 1, "", "", {ToolCall{"call_1", "weather", "{}"}}, usage, nullptr, &none));
+    failures += check(tool.at("choices").at(0).at("logprobs").at("content").empty(),
+                      "tool-call response without content tokens reports an empty list");
+
+    const Json chunk =
+        parse_sse(make_chat_chunk_content_logprobs("id", "m", 1, "Hi", entries, true));
+    failures += check(chunk.at("choices").at(0).at("delta").at("content") == "Hi" &&
+                          chunk.at("choices").at(0).at("finish_reason").is_null() &&
+                          chunk.at("usage").is_null(),
+                      "logprobs chunk keeps the content chunk shape");
+    failures +=
+        check_logprob_entries(chunk.at("choices").at(0).at("logprobs").at("content"), "chat chunk");
+    const Json held = parse_sse(
+        make_chat_chunk_content_logprobs("id", "m", 1, "", std::span(entries).first(1), false));
+    failures +=
+        check(held.at("choices").at(0).at("delta").at("content").get<std::string>().empty() &&
+                  held.at("choices").at(0).at("logprobs").at("content").size() == 1,
+              "a chunk may carry committed tokens before their text is released");
+    return failures;
+}
+
 int test_chunk_serialization() {
     int failures    = 0;
     const Json role = parse_sse(make_chat_chunk_role("id", "m", 1, false));
@@ -1358,6 +1534,7 @@ int main() {
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
+    failures += test_logprobs();
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
     failures += test_owui_youtube_fetch_url_logged_turn();

@@ -141,6 +141,7 @@ Json request_json(const RequestLogContext& context) {
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
+                {"cache_write", context.cache_write},
                 {"message_count", context.message_count},
                 {"requested_output_tokens", context.requested_output_tokens},
                 {"requested_output_tokens_source",
@@ -159,6 +160,7 @@ Json rejected_request_json(const RequestRejectionLogContext& context) {
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
+                {"cache_write", context.cache_write},
                 {"message_count", context.message_count},
                 {"media_item_count", context.media_item_count},
                 {"requested_output_tokens", context.requested_output_tokens},
@@ -194,6 +196,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"fallback_steps", metrics.speculative_fallback_steps},
                 {"accepted_per_position", metrics.speculative_accepted_per_position},
                 {"live_draft_tokens", metrics.speculative_live_draft_tokens},
+                {"p_less_draft_temperature", metrics.speculative_p_less_draft_temperature},
                 {"rounds_per_draft", metrics.speculative_rounds_per_draft}};
 }
 
@@ -293,7 +296,7 @@ format_kv_disk_live(const ninfer::MemorySummary& memory, std::uint64_t restores,
         << " n=" << memory.kv_disk_entry_count << " restores=" << restores
         << " evicts=" << evictions << " drops=" << drops;
     if (drops != 0) { out << " (" << format_kv_disk_drop_reasons(drop_reasons) << ")"; }
-    out << std::fixed << std::setprecision(0) << " save=" << (save_seconds * 1000.0)
+    out << std::fixed << std::setprecision(0) << " spill_completed=" << (save_seconds * 1000.0)
         << "ms load=" << (load_seconds * 1000.0) << "ms";
     if (h2d_seconds) { out << " h2d=" << (*h2d_seconds * 1000.0) << "ms"; }
     return out.str();
@@ -303,12 +306,14 @@ format_kv_disk_live(const ninfer::MemorySummary& memory, std::uint64_t restores,
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
-                                           const PreparedRequest& prepared) {
+                                           const PreparedRequest& prepared,
+                                           double synchronous_prepare_seconds) {
     RequestLogContext context;
     context.id                                 = id;
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
+    context.cache_write                        = request.cache_write;
     context.message_count                      = request.messages.size();
     context.requested_output_tokens            = request.max_tokens;
     context.requested_output_tokens_client_set = request.max_tokens_set;
@@ -319,6 +324,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
+    context.synchronous_prepare_seconds        = synchronous_prepare_seconds;
     return context;
 }
 
@@ -331,6 +337,7 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.protocol                           = std::move(protocol);
     context.model                              = request.model;
     context.stream                             = request.stream;
+    context.cache_write                        = request.cache_write;
     context.message_count                      = request.messages.size();
     context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;
@@ -340,6 +347,15 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.has_tool_history                   = request.has_tool_history();
     context.error                              = std::move(error);
     return context;
+}
+
+std::string format_request_prepare(const RequestPreparationLogContext& context) {
+    std::ostringstream out;
+    out << "[req " << context.id << "] " << context.protocol << " preparing"
+        << " msgs=" << context.message_count << " tools=" << context.tool_count
+        << " body_bytes=" << context.body_bytes << " parse=" << std::fixed << std::setprecision(0)
+        << context.parse_seconds * 1000.0 << "ms";
+    return out.str();
 }
 
 std::string format_request_start(const RequestLogContext& context) {
@@ -354,6 +370,8 @@ std::string format_request_start(const RequestLogContext& context) {
         << " thinking=" << (context.enable_thinking ? "on" : "off")
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
+        << " prepare_sync=" << std::fixed << std::setprecision(0)
+        << context.synchronous_prepare_seconds * 1000.0 << "ms"
         << " sampler=[" << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
     return out.str();
 }
@@ -546,6 +564,23 @@ std::string format_throughput(const ThroughputReport& report) {
             occupancy, report.scheduler.kv_disk_restores, report.scheduler.kv_disk_evictions,
             report.scheduler.kv_disk_drops, report.scheduler.kv_disk_drop_reasons,
             report.kv_disk_save_seconds, report.kv_disk_load_seconds);
+        out << " work=";
+        bool active            = false;
+        const auto append_work = [&](const char* name, bool enabled) {
+            if (!enabled) { return; }
+            if (active) { out << ','; }
+            out << name;
+            active = true;
+        };
+        append_work("spill", report.scheduler.kv_disk_spill_active);
+        append_work("compact", report.scheduler.kv_disk_compaction_active);
+        append_work("restore", report.scheduler.kv_disk_restore_active);
+        if (!active) { out << "idle"; }
+        out << " pending=" << report.scheduler.kv_disk_pending_jobs;
+        if (report.scheduler.kv_disk_spill_active) {
+            out << " spill_age=" << std::fixed << std::setprecision(1)
+                << report.scheduler.kv_disk_spill_elapsed_seconds << 's';
+        }
     }
     if (report.scheduler.gpu_kv_main_capacity_pages != 0 ||
         report.scheduler.gpu_kv_spec_capacity_pages != 0) {
@@ -667,11 +702,25 @@ std::string format_server_start_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+std::string format_request_prepare_json(const std::string& server_instance_id,
+                                        std::uint64_t timestamp_unix_ms,
+                                        const RequestPreparationLogContext& context) {
+    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_prepare");
+    record["request"] = Json{{"request_id", context.id},
+                             {"protocol", context.protocol},
+                             {"body_bytes", context.body_bytes},
+                             {"message_count", context.message_count},
+                             {"tool_count", context.tool_count}};
+    record["timings_seconds"] = Json{{"parse", context.parse_seconds}};
+    return record.dump();
+}
+
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context) {
-    Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_start");
-    record["request"] = request_json(context);
+    Json record               = event_base(server_instance_id, timestamp_unix_ms, "request_start");
+    record["request"]         = request_json(context);
+    record["timings_seconds"] = Json{{"synchronous_prepare", context.synchronous_prepare_seconds}};
     return record.dump();
 }
 
@@ -823,6 +872,11 @@ std::string format_throughput_json(const std::string& server_instance_id,
              {"kv_disk_capacity_bytes", report.kv_disk_capacity_bytes},
              {"kv_disk_used_bytes", report.kv_disk_used_bytes},
              {"kv_disk_entry_count", report.kv_disk_entry_count},
+             {"kv_disk_spill_active", report.scheduler.kv_disk_spill_active},
+             {"kv_disk_compaction_active", report.scheduler.kv_disk_compaction_active},
+             {"kv_disk_restore_active", report.scheduler.kv_disk_restore_active},
+             {"kv_disk_pending_jobs", report.scheduler.kv_disk_pending_jobs},
+             {"kv_disk_spill_elapsed_seconds", report.scheduler.kv_disk_spill_elapsed_seconds},
              {"gpu_kv_main_capacity_pages", report.scheduler.gpu_kv_main_capacity_pages},
              {"gpu_kv_main_entitled_pages", report.scheduler.gpu_kv_main_entitled_pages},
              {"gpu_kv_main_mapped_pages", report.scheduler.gpu_kv_main_mapped_pages},
@@ -905,6 +959,11 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
     append(format_server_start_json(server_instance_id_, unix_time_ms(), options, sampling_defaults,
                                     public_model_id, load, memory,
                                     query_server_log_environment(options.device), artifact_size));
+}
+
+void JsonlRequestLog::write_request_prepare(const RequestPreparationLogContext& context) {
+    if (!enabled()) { return; }
+    append(format_request_prepare_json(server_instance_id_, unix_time_ms(), context));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {

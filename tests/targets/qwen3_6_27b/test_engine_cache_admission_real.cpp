@@ -26,6 +26,7 @@ void exercise(const char* artifact, std::uint32_t concurrency) {
     options.max_context     = (concurrency + 1) * 64;
     options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity((concurrency + 1) * 64);
     options.prefill_chunk   = 128;
+    options.mixed_forward   = 0;
     options.kv_ram_capacity_bytes = 1ULL << 20;
     ninfer::Engine engine(options);
 

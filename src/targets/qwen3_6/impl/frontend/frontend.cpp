@@ -9,7 +9,7 @@
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
-#include "targets/qwen3_6/impl/frontend/tool_grammar.h"
+#include "targets/qwen3_6/impl/frontend/token_grammar.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -516,6 +516,7 @@ struct DecoderState {
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning               = false;
+    bool constrained_content        = false;
     bool strip_content_leading      = false;
     bool terminal                   = false;
     bool require_initial_content    = false;
@@ -525,6 +526,10 @@ struct DecoderState {
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
 };
+
+bool suppress_reasoning_end(const DecoderState& state, bool raw, bool grammar_managed) {
+    return !raw && !state.in_reasoning && !grammar_managed;
+}
 
 void track_structured_content(DecoderState& state, std::string_view text,
                               bool tool_output_enabled) {
@@ -690,7 +695,7 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
-        state.strip_content_leading = true;
+        state.strip_content_leading = !state.constrained_content;
         feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match,
                      tool_output_enabled);
         return;
@@ -754,9 +759,14 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          tool_grammar(tokenizer), processor(processor_options(resources)),
+          token_grammar(tokenizer), processor(processor_options(resources)),
           vision_enabled(vision_enabled_) {
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
+        const auto closing = tokenizer->encode(kThinkClose);
+        if (closing.size() != 1 || tokenizer->decode_token_bytes(closing.front()) != kThinkClose) {
+            throw std::invalid_argument("tokenizer must encode the reasoning close as one token");
+        }
+        reasoning_end_token = closing.front();
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(
@@ -768,10 +778,11 @@ public:
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
-    mutable fi::ToolGrammarCompiler tool_grammar;
+    mutable fi::TokenGrammarCompiler token_grammar;
     fi::ProcessorOptions processor;
     StopPolicy defaults;
-    bool vision_enabled = true;
+    TokenId reasoning_end_token = -1;
+    bool vision_enabled         = true;
 };
 
 class OutputSession::Impl {
@@ -780,7 +791,7 @@ public:
         std::string pending;
         std::vector<ToolCall> calls;
 
-        void filter(PublishedOutput& output, const ToolGrammarData& grammar, bool terminal) {
+        void filter(PublishedOutput& output, const TokenGrammarData& grammar, bool terminal) {
             PublishedOutput visible;
             for (auto& delta : output) {
                 if (delta.channel == OutputChannel::Reasoning) {
@@ -849,18 +860,22 @@ public:
     };
 
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning, bool tool_output_enabled_,
+         bool starts_in_reasoning, bool tool_output_enabled_, TokenId reasoning_end_token_,
          std::span<const TokenId> model_stop_tokens_,
-         std::shared_ptr<const ToolGrammarData> grammar,
+         std::shared_ptr<const TokenGrammarData> grammar,
          std::shared_ptr<const GenerationRecoveryContext> recovery)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           model_stop_tokens(model_stop_tokens_.begin(), model_stop_tokens_.end()),
-          preserve_special(output.raw || output.preserve_special_tokens), raw(output.raw),
-          tool_output_enabled(tool_output_enabled_) {
+          preserve_special(output.raw || output.preserve_special_tokens),
+          preserve_model_stops(output.raw || output.preserve_special_tokens), raw(output.raw),
+          tool_output_enabled(tool_output_enabled_), reasoning_end_token(reasoning_end_token_) {
         state.in_reasoning            = starts_in_reasoning && !output.raw;
         state.require_initial_content = !output.raw && (state.in_reasoning || tool_output_enabled);
         grammar_data                  = std::move(grammar);
-        recovery_context              = std::move(recovery);
+        state.constrained_content     = grammar_data && grammar_data->definitions.empty();
+        if (state.constrained_content) { state.require_initial_content = false; }
+        preserve_special = preserve_special || state.constrained_content;
+        recovery_context = std::move(recovery);
         if (grammar_data) {
             std::vector<TokenId> ignored;
             for (const auto token : model_stop_tokens) {
@@ -869,22 +884,27 @@ public:
                     ignored.push_back(token);
                 }
             }
-            tool_grammar = std::make_unique<fi::ToolGrammarState>(grammar_data, std::move(ignored));
+            token_grammar =
+                std::make_unique<fi::TokenGrammarState>(grammar_data, std::move(ignored));
         }
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::vector<TokenId> model_stop_tokens;
-    bool preserve_special    = false;
-    bool raw                 = false;
-    bool tool_output_enabled = false;
+    bool preserve_special       = false;
+    bool preserve_model_stops   = false;
+    bool raw                    = false;
+    bool tool_output_enabled    = false;
+    TokenId reasoning_end_token = -1;
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;
+    // One entry per token of the pending preview; see preview_token_channels().
+    std::vector<std::optional<OutputChannel>> preview_channels;
     bool preview_ready = false;
-    std::unique_ptr<fi::ToolGrammarState> tool_grammar;
-    std::shared_ptr<const ToolGrammarData> grammar_data;
+    std::unique_ptr<fi::TokenGrammarState> token_grammar;
+    std::shared_ptr<const TokenGrammarData> grammar_data;
     std::shared_ptr<const GenerationRecoveryContext> recovery_context;
     ToolPublication tools;
     ToolPublication preview_tools;
@@ -973,10 +993,12 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         !model_stop_allowed(impl_->state, impl_->raw, impl_->tool_output_enabled);
     bool saw_tool_region = in_tool_region(impl_->state, impl_->tool_output_enabled);
 
+    impl_->preview_channels.clear();
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               bool reject_generated_round = false) {
-        if (impl_->tool_grammar) { impl_->tool_grammar->preview(tokens.first(count)); }
-        if (impl_->grammar_data && !impl_->raw) {
+        impl_->preview_channels.resize(count);
+        if (impl_->token_grammar) { impl_->token_grammar->preview(tokens.first(count)); }
+        if (impl_->grammar_data && !impl_->grammar_data->definitions.empty() && !impl_->raw) {
             impl_->preview_tools = impl_->tools;
             impl_->preview_tools.filter(impl_->preview_output, *impl_->grammar_data,
                                         reason != FinishReason::None);
@@ -995,6 +1017,11 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
                                     std::to_string(token));
         }
 
+        if (suppress_reasoning_end(impl_->preview_state, impl_->raw,
+                                   impl_->grammar_data != nullptr) &&
+            token == impl_->reasoning_end_token) {
+            throw std::logic_error("sampler selected a reasoning close outside reasoning");
+        }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
 
         const bool stop_token =
@@ -1017,10 +1044,26 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         }
 
         StopMatch match;
-        const std::string_view bytes =
-            impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
+        const std::string_view bytes = impl_->tokenizer->decode_token_bytes(
+            token, !impl_->preserve_special || (model_stop && !impl_->preserve_model_stops));
+        const bool was_reasoning      = impl_->preview_state.in_reasoning;
+        const bool was_end_suppressed = suppress_reasoning_end(impl_->preview_state, impl_->raw,
+                                                               impl_->grammar_data != nullptr);
+        const bool was_stripping      = impl_->preview_state.strip_content_leading;
+        const bool was_tool = in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match, impl_->tool_output_enabled);
+        std::optional<OutputChannel> channel;
+        if (stop_token || model_stop || bytes.empty()) {
+            // Publishes no text.
+        } else if (was_reasoning) {
+            // The token that closes reasoning is the marker, not reasoning text.
+            if (impl_->preview_state.in_reasoning) { channel = OutputChannel::Reasoning; }
+        } else if (!was_tool && !in_tool_region(impl_->preview_state, impl_->tool_output_enabled) &&
+                   !(was_stripping && impl_->preview_state.strip_content_leading)) {
+            channel = OutputChannel::Content;
+        }
+        impl_->preview_channels.push_back(channel);
 
         if (match.found) {
             impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
@@ -1038,6 +1081,13 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
             return complete(count, FinishReason::StopToken);
         }
 
+        // Following columns use the round's original exclusions. Commit through a framing
+        // transition, then sample the continuation in its updated eligibility domain.
+        if (was_end_suppressed != suppress_reasoning_end(impl_->preview_state, impl_->raw,
+                                                         impl_->grammar_data != nullptr) &&
+            index + 1 < tokens.size()) {
+            return complete(count, FinishReason::None);
+        }
         saw_tool_region =
             saw_tool_region || in_tool_region(impl_->preview_state, impl_->tool_output_enabled);
         // A round sampled with model stops excluded cannot emit <|im_end|> after
@@ -1070,10 +1120,11 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     }
     impl_->preview_state = impl_->state;
     impl_->preview_output.clear();
+    impl_->preview_channels.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0,
                 impl_->tool_output_enabled);
-    if (impl_->tool_grammar) { impl_->tool_grammar->preview({}); }
-    if (impl_->grammar_data && !impl_->raw) {
+    if (impl_->token_grammar) { impl_->token_grammar->preview({}); }
+    if (impl_->grammar_data && !impl_->grammar_data->definitions.empty() && !impl_->raw) {
         impl_->preview_tools = impl_->tools;
         impl_->preview_tools.filter(impl_->preview_output, *impl_->grammar_data, true);
     }
@@ -1081,11 +1132,19 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
+std::span<const std::optional<OutputChannel>>
+OutputSession::preview_token_channels() const noexcept {
+    if (impl_ == nullptr || !impl_->preview_ready) { return {}; }
+    return impl_->preview_channels;
+}
+
 PublishedOutput OutputSession::commit_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
-    if (impl_->tool_grammar) { impl_->tool_grammar->commit_preview(); }
-    if (impl_->grammar_data && !impl_->raw) { swap(impl_->tools, impl_->preview_tools); }
+    if (impl_->token_grammar) { impl_->token_grammar->commit_preview(); }
+    if (impl_->grammar_data && !impl_->grammar_data->definitions.empty() && !impl_->raw) {
+        swap(impl_->tools, impl_->preview_tools);
+    }
     swap(impl_->state, impl_->preview_state);
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
@@ -1095,7 +1154,7 @@ PublishedOutput OutputSession::commit_preview() noexcept {
 
 void OutputSession::discard_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
-    if (impl_->tool_grammar) { impl_->tool_grammar->discard_preview(); }
+    if (impl_->token_grammar) { impl_->token_grammar->discard_preview(); }
     impl_->preview_state = impl_->state;
     impl_->preview_output.clear();
     impl_->preview_ready = false;
@@ -1114,6 +1173,13 @@ bool OutputSession::model_stop_tokens_allowed() const noexcept {
            model_stop_allowed(impl_->state, impl_->raw, impl_->tool_output_enabled);
 }
 
+std::optional<TokenId> OutputSession::suppressed_reasoning_end_token() const noexcept {
+    if (impl_ && suppress_reasoning_end(impl_->state, impl_->raw, impl_->grammar_data != nullptr)) {
+        return impl_->reasoning_end_token;
+    }
+    return std::nullopt;
+}
+
 bool OutputSession::reasoning_cycle_exclusion_allowed(TokenId token) const {
     if (!in_reasoning() || impl_->raw || token < 0) { return false; }
     if (std::find(impl_->model_stop_tokens.begin(), impl_->model_stop_tokens.end(), token) !=
@@ -1126,8 +1192,8 @@ bool OutputSession::reasoning_cycle_exclusion_allowed(TokenId token) const {
            longest_suffix_prefix(candidate, kThinkClose, true) == 0;
 }
 
-bool OutputSession::has_tool_grammar() const noexcept {
-    return impl_ && impl_->tool_grammar != nullptr;
+bool OutputSession::has_token_grammar() const noexcept {
+    return impl_ && impl_->token_grammar != nullptr;
 }
 
 std::vector<std::string> unconstrained_tool_call_names(std::string_view text,
@@ -1186,11 +1252,11 @@ OutputSession::generation_recovery_context() const noexcept {
 
 bool OutputSession::terminal() const noexcept { return impl_ && impl_->state.terminal; }
 
-void OutputSession::fill_tool_masks(std::span<const TokenId> tokens,
-                                    std::span<const std::int32_t> parents,
-                                    std::span<std::uint32_t> words) const {
-    if (!has_tool_grammar()) { throw std::logic_error("output session has no tool grammar"); }
-    impl_->tool_grammar->fill_masks(tokens, parents, words);
+void OutputSession::fill_token_masks(std::span<const TokenId> tokens,
+                                     std::span<const std::int32_t> parents,
+                                     std::span<std::uint32_t> words) const {
+    if (!has_token_grammar()) { throw std::logic_error("output session has no tool grammar"); }
+    impl_->token_grammar->fill_masks(tokens, parents, words);
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1227,15 +1293,20 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 
 PreparedPrompt Frontend::prepare(PromptInput input) const {
     const auto start               = Clock::now();
-    const PromptOptions options    = input.options;
-    const bool tool_output_enabled = enables_tool_output(input);
+    const PromptOptions& options   = input.options;
+    const bool tool_output_enabled = !options.output_constraint && enables_tool_output(input);
     const auto grammar =
         options.add_generation_prompt
-            ? impl_->tool_grammar.compile(options.tool_jsons, options.enable_thinking)
+            ? impl_->token_grammar.compile(options.tool_jsons, options.enable_thinking,
+                                           options.output_constraint)
             : nullptr;
+    if (options.output_constraint && !options.add_generation_prompt) {
+        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                           "output constraints require a generation prompt");
+    }
     const auto recovery = GenerationRecoveryContext::analyze(input);
     const auto finish   = [&](std::unique_ptr<PreparedPromptData> data) {
-        data->tool_grammar        = grammar;
+        data->token_grammar       = grammar;
         data->generation_recovery = recovery;
         return PreparedPrompt(std::move(data));
     };
@@ -1263,7 +1334,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input) const {
-    const PromptOptions options           = input.options;
+    const PromptOptions& options          = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -1391,9 +1462,10 @@ Frontend::splice_recovery_prompt(std::vector<TokenId> prefix, const PromptInput&
             .frontier = static_cast<std::uint32_t>(data->token_ids.size()),
         };
         data->starts_in_reasoning = true;
-        data->tool_output_enabled = insert_enables_tool_output(source, insert);
-        data->tool_grammar =
-            impl_->tool_grammar.compile(source.options.tool_jsons, source.options.enable_thinking);
+        data->tool_output_enabled =
+            !source.options.output_constraint && insert_enables_tool_output(source, insert);
+        data->token_grammar       = impl_->token_grammar.compile(source.options.tool_jsons, true,
+                                                                 source.options.output_constraint);
         data->generation_recovery = std::move(recovery);
         data->prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
         return PreparedPrompt(std::move(data));
@@ -1410,24 +1482,37 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
-        prompt.data_->tool_output_enabled, impl_->defaults.token_ids, prompt.data_->tool_grammar,
-        prompt.data_->generation_recovery));
+        prompt.data_->tool_output_enabled, impl_->reasoning_end_token, impl_->defaults.token_ids,
+        prompt.data_->token_grammar, prompt.data_->generation_recovery));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
 
+std::string_view Frontend::token_bytes(TokenId token) const {
+    if (!impl_->tokenizer->is_valid_token(token)) {
+        throw std::out_of_range("token is outside the checkpoint vocabulary: " +
+                                std::to_string(token));
+    }
+    return impl_->tokenizer->decode_token_bytes(token);
+}
+
 PreparedPrompt EncodedHistoryPrepare::prepare(const Frontend& frontend, PromptInput input,
                                               frontend_internal::EncodedHistoryCache& cache) {
     const auto start               = Clock::now();
-    const PromptOptions options    = input.options;
-    const bool tool_output_enabled = enables_tool_output(input);
+    const PromptOptions& options   = input.options;
+    const bool tool_output_enabled = !options.output_constraint && enables_tool_output(input);
     const auto grammar =
         options.add_generation_prompt
-            ? frontend.impl_->tool_grammar.compile(options.tool_jsons, options.enable_thinking)
+            ? frontend.impl_->token_grammar.compile(options.tool_jsons, options.enable_thinking,
+                                                    options.output_constraint)
             : nullptr;
+    if (options.output_constraint && !options.add_generation_prompt) {
+        throw RequestError(RequestErrorKind::InvalidOutputConstraint,
+                           "output constraints require a generation prompt");
+    }
     const auto recovery = GenerationRecoveryContext::analyze(input);
     const auto finish   = [&](std::unique_ptr<PreparedPromptData> data) {
-        data->tool_grammar        = grammar;
+        data->token_grammar       = grammar;
         data->generation_recovery = recovery;
         return PreparedPrompt(std::move(data));
     };
@@ -1457,7 +1542,7 @@ PreparedPrompt EncodedHistoryPrepare::prepare(const Frontend& frontend, PromptIn
 
 std::uint32_t EncodedHistoryPrepare::count_tokens(const Frontend& frontend, PromptInput input,
                                                   frontend_internal::EncodedHistoryCache& cache) {
-    const PromptOptions options           = input.options;
+    const PromptOptions& options          = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),

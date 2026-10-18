@@ -14,6 +14,35 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Grid: 160 CTAs of four warps, each owning 32 output rows across up to eight tokens.
+// Three shared stages hold K512 weights and eight activation rows. The upper M16
+// activation half is zero; full-CTA barriers protect shared reuse and ascending K16 MMA
+// order preserves the ordinary A8 result. This route requires N=5120, K=17408, T<=8.
+struct Nvfp4A8Down8Schedule : Nvfp4W4a4MmaSchedule<16, 32, 512, 1, 4, 3, 1> {
+    static constexpr int kActivationRows = 8;
+};
+
+void launch_nvfp4_a8_down8(const Weight& weight, int tokens, Fp8A8Workspace activation,
+                           Tensor& residual, cudaStream_t stream) {
+    using S               = Nvfp4A8Down8Schedule;
+    constexpr auto kernel = nvfp4_w4a8_mma_kernel<Nvfp4Residual17408Geometry, S,
+                                                  Nvfp4AddResidualEpilogue, Nvfp4ContiguousOutput>;
+    constexpr int bytes   = sizeof(Nvfp4W4a8SharedStorage<S>);
+    static const bool configured = [] {
+        CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        return true;
+    }();
+    (void)configured;
+    auto* data = static_cast<__nv_bfloat16*>(residual.data);
+    kernel<<<160, S::kThreads, bytes, stream>>>(
+        activation, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), tokens, 1.0F / weight.weight_scale_divisor,
+        Nvfp4AddResidualEpilogue{data, 5120}, Nvfp4ContiguousOutput{data, 5120},
+        Nvfp4W4a4IdentityRows{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
                  std::int32_t tokens, cudaStream_t stream) {
@@ -46,6 +75,10 @@ void nvfp4_linear_add_w4a8_project(const Weight& weight, std::int32_t tokens,
     auto* data = static_cast<__nv_bfloat16*>(residual.data);
     const Nvfp4AddResidualEpilogue epilogue{data, weight.n};
     const Nvfp4ContiguousOutput out{data, weight.n};
+    if (weight.k == 17408 && tokens <= 8) {
+        launch_nvfp4_a8_down8(weight, tokens, activation, residual, stream);
+        return;
+    }
     if (weight.k == 6144) {
         launch_nvfp4_w4a8_mma<Nvfp4Residual6144Geometry>(weight, tokens, activation, epilogue, out,
                                                          stream);

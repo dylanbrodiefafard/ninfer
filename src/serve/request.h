@@ -158,6 +158,20 @@ struct ChatTurn {
                                    // template)
 };
 
+// One reported token alternative. `bytes` is the token's exact byte string, which may hold a
+// partial UTF-8 sequence.
+struct TokenLogprobAlternative {
+    std::string bytes;
+    double logprob = 0.0;
+};
+
+// One content token's logprob record with its ranked alternatives, most likely first.
+struct TokenLogprobEntry {
+    std::string bytes;
+    double logprob = 0.0;
+    std::vector<TokenLogprobAlternative> top;
+};
+
 // OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
 // parsed for wire compatibility; the current public engine sampler has no bias
 // input, so it does not affect generation.
@@ -235,7 +249,12 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
-    bool capture_context_checkpoint = false;
+    // Set to report every content token's logprob with this many ranked alternatives (0..20).
+    std::optional<int> top_logprobs;
+    std::optional<ninfer::OutputConstraint> output_constraint;
+    std::string output_constraint_param = "response_format";
+    bool cache_write                    = true;
+    bool capture_context_checkpoint     = false;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

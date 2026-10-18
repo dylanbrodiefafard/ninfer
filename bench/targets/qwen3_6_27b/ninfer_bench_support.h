@@ -70,7 +70,8 @@ struct BenchOptions {
     int repetitions = kDefaultRepetitions;
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_context;
-    std::uint32_t prefill_chunk        = kDefaultPrefillChunk;
+    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    // Explicit prefill-first control; product Engine/server defaults enable mixing.
     std::uint32_t mixed_forward        = 0;
     std::uint32_t mixed_forward_rounds = 1;
     KvCacheStorage kv_cache            = KvCacheStorage::Nvfp4;

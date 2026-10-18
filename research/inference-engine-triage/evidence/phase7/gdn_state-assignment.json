@@ -1,0 +1,212 @@
+[
+  {
+    "id": "gdn-long-prefill-affine-partitions",
+    "priority": 5.5,
+    "title": "Parallelize long-prefill GDN partitions with exact state correction",
+    "original_ids": [
+      "repo:hert4/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:hert4/sglang",
+        "repository": "QwenLM/FlashQLA",
+        "head": "da06429d54b0f577de0a638f451ac8f0b395e0ac",
+        "path": "flash_qla/ops/gated_delta_rule/chunk/cp/preprocess.py"
+      },
+      {
+        "original_id": "repo:hert4/sglang",
+        "repository": "QwenLM/FlashQLA",
+        "head": "da06429d54b0f577de0a638f451ac8f0b395e0ac",
+        "path": "flash_qla/ops/gated_delta_rule/chunk/blackwell_sm120/cp_fwd.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu",
+        "range": [
+          9,
+          45
+        ]
+      },
+      {
+        "path": "src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh",
+        "range": [
+          286,
+          355
+        ]
+      }
+    ],
+    "decision": "Current native state-passing CTAs parallelize heads/value strips while looping sequentially over NT chunks. Reached author SM120 source computes independent partition summaries and corrects initial states before its main kernel. It also uses a gate-driven approximation that can discard incoming-state influence; that shortcut is not qualified. This is a conditional long-prefill scheduling question, separate from accepted decode replay overlap.",
+    "next_step": "Classify exact affine partition summaries/correction against current state passing for relevant long-prefill lengths, first including D-by-D summary storage/transfer, correction work, extra launches and actual workload frequency. Keep complete affine correction enabled as the initial numerical reference; compare the full supported prefill phase if operator evidence admits a useful route.",
+    "qualification": "Preserve FP32 persistent state, native ratio3/head mapping, represented GDN formula, variable sequence boundaries and snapshots with an independent FP32/FP64 output/final-state oracle. A gate sum below -10 alone does not bound omitted-state error without incoming-state magnitudes and transition norms. Source chunk32 and state downcasts do not define native semantics. The frozen wrapper mentions unpinned0.1.2; the separately inspected author source is0.1.3, not proven installed there. Scratch capacity, graph lifetime and complete-phase benefit remain unqualified; no speedup has been measured.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "gdn-projection-conv-recurrence",
+    "priority": 5.75,
+    "title": "Assess the convolution-output to recurrence boundary",
+    "original_ids": [
+      "repo:yiijin/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:yiijin/sglang",
+        "repository": "yiijin/sglang",
+        "head": "a754e3df8072aba65e5641eaa11b5f05a1216634",
+        "path": "python/sglang/srt/layers/attention/fla/fused_gdn_fwd_decode_gluon.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_conv_output.cuh",
+        "range": [
+          14,
+          41
+        ]
+      },
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+        "range": [
+          954,
+          997
+        ]
+      }
+    ],
+    "decision": "An actual reached foreign producer combines convolution/SiLU with grouped recurrent GDN. Native already fuses projection and convolution, Q/K normalization inside recurrence, and A/B control transforms with normalization/projection. Only convolution Q/K/V output handoff into recurrence is a separate boundary; this differs from recurrence-to-gated-RMS fusion.",
+    "next_step": "Classify a closed projection/convolution-to-recurrence composition against the existing NVFP4 matrix epilogue at supported widths and batch1\u20136. Include ratio3 state tiles, synchronization and reuse. Reject a route that needs repeated projection or sacrifices the matrix schedule for less handoff traffic.",
+    "qualification": "Evaluate the complete formula from represented projection/convolution/control inputs with an independent oracle. Preserve observable BF16 convolution history, explicit replay casts/records, FP32 persistent recurrence, snapshots, valid prefixes and lane/slot identity. Removed unobservable Q/K/V materialization can use a qualified private fused precision profile; unfused BF16 staging parity is not mandatory. Foreign producer grouping and one-kernel composition supply no native gain or admission proof.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "gdn-fp16-high-low-mma",
+    "priority": 6.25,
+    "title": "Compare exponent-scaled FP16 high/low MMA with native TF32",
+    "original_ids": [
+      "repo:omin-kwon/vllm"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:omin-kwon/vllm",
+        "repository": "omin-kwon/vllm",
+        "head": "9936b310f537dc789085128022ce96fe1b4ed85a",
+        "path": "vllm/third_party/flash_linear_attention/ops/gdn_flush_stream_cuda.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh",
+        "range": [
+          279,
+          304
+        ]
+      }
+    ],
+    "decision": "A reached register-resident window fold uses exponent-scaled FP16 high/low MMA corrections and finishes before optional Phi/anchor latch work. Native already has register-resident FP32 state and TF32 MMA; the distinct question is a separable private arithmetic/instruction schedule, without foreign LS6 rotations or latch state.",
+    "next_step": "Make a cheap classifier comparison of high/low FP16 MMA affine window folding versus current TF32 at native head/value128, ratio3 and actual active widths. Include correction/packing/exponent costs and CTA geometry before any kernel implementation or performance experiment.",
+    "qualification": "Use the same complete independent recurrence oracle from represented BF16 operands and FP32 initial state; check exponent extremes, overflow/subnormals and accumulated state error. Preserve FP32 persistent state, accepted-only transaction and graph/record lifetimes. Foreign W16/full-state CTA, contiguous rings and downstream Phi/Cholesky/anchor work are not native admission. No numerical or speed benefit is proved.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "gdn-accepted-history-checkpoint-amortization",
+    "priority": 7.5,
+    "title": "Amortize persistent GDN checkpoint writes across accepted rounds",
+    "original_ids": [
+      "repo:mxadam99/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:mxadam99/sglang",
+        "repository": "mxadam99/sglang",
+        "head": "8b682cd6119ac5977b4b78a135ec253a875fcf2f",
+        "path": "python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_decode.py"
+      },
+      {
+        "original_id": "repo:mxadam99/sglang",
+        "repository": "mxadam99/sglang",
+        "head": "c4faab56b635e2a20c551cfc558b63a473a62d0a",
+        "path": "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "include/ninfer/ops/gdn_replay.h",
+        "range": [
+          22,
+          43
+        ]
+      },
+      {
+        "path": "src/targets/qwen3_6/impl/runtime/program_impl.h",
+        "range": [
+          1094,
+          1135
+        ]
+      },
+      {
+        "path": "include/ninfer/ops/gated_delta_net.h",
+        "range": [
+          35,
+          45
+        ]
+      }
+    ],
+    "decision": "Native folds every licensed accepted prefix into FP32 state each round. Actual foreign producer retains a request-indexed committed-history ring, reconstructs outputs through triangular WY updates and folds checkpoint only on capacity/track triggers. This reduces full-state write frequency at the cost of history traffic/reconstruction, distinct from long-prefill partitioning, register residency or putting each fold on another stream.",
+    "next_step": "First classify a bounded accepted-history versus state-traffic cost at native ratio3,head128,B1\u20136 and real accepted widths, including reconstruction work, capacity flush and tracking. Only if the bound admits a useful route, design one owner for the logical FP32 state with complete reconstruction on every supported state read and checkpoint.",
+    "qualification": "Preserve native logical FP32 persistent-state semantics, accepted-only transaction, lane/request identity, convolution history, all checkpoint/track paths and stable graph lifetime. Foreign BF16 high/low persistent history, TF32 key products, WY reassociation and four-BF16-MMA fold are unqualified numerical profiles; author bit-identity prose is not evidence. Evaluate complete independent FP32/FP64 recurrence/final-state oracles over multi-round accumulation and exponent extremes before admission. Current selected worker has an actual unexpected-keyword call, so no working-engine or measured gain is claimed. Imported host suffix corpus remains unqualified and is not part of this state question.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  },
+  {
+    "id": "gdn-dependent-launch-edge",
+    "priority": 9.5,
+    "title": "Classify dependent launch on the recurrence-to-gatednorm edge",
+    "original_ids": [
+      "repo:tobymint/sglang"
+    ],
+    "source_anchors": [
+      {
+        "original_id": "repo:tobymint/sglang",
+        "repository": "tobymint/sglang",
+        "head": "1de7cf2a237f637e933574ed832300ed6c953684",
+        "path": "python/sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py"
+      },
+      {
+        "original_id": "repo:tobymint/sglang",
+        "repository": "tobymint/sglang",
+        "head": "1de7cf2a237f637e933574ed832300ed6c953684",
+        "path": "python/sglang/kernels/ops/attention/fla/fused_norm_gate.py"
+      }
+    ],
+    "native_anchors": [
+      {
+        "path": "src/core/pdl.cuh",
+        "range": [
+          17,
+          40
+        ]
+      },
+      {
+        "path": "src/ops/linear_attention/gated_delta_net/recurrent.cu",
+        "range": [
+          152,
+          174
+        ]
+      },
+      {
+        "path": "docs/maintainer/dflash-a8-followups.md",
+        "range": [
+          117,
+          120
+        ]
+      }
+    ],
+    "decision": "Native already owns the dependent-launch facility and a prior A8 weight-prefetch trial regressed and was not kept. Actual foreign recurrent producer waits before global loads then releases dependent launch immediately; its gatednorm waits before all input loads and releases after output stores on the small-width path. The specific recurrence-to-gatednorm edge is untried here, with very little independent setup to hide. This is distinct from cross-stream accepted-state fold overlap and from producer/norm fusion.",
+    "next_step": "Use a cheap classifier to bound genuinely independent consumer work before the required wait, CTA resources and producer/consumer contention. Reject if setup is negligible or contention predicts regression. Only an admitted distinct edge merits native graph/oracle qualification; do not repeat the rejected A8 prefetch trial.",
+    "qualification": "Launch release does not establish output readiness; every consumer path must synchronize before dependent global loads, and every producer CTA must release or exit according to the existing API. Preserve native FP32 persistent state, valid record/snapshot/publication and capture lifetime. Source scheduling and capability names are not hardware, race, numerical or performance qualification. No native PDL facility gap or measured benefit is asserted.",
+    "owner": "state_and_policy",
+    "native_head": "574a8d9167500be2717c0ce5e7d9f2e061a1f32e"
+  }
+]

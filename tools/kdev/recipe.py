@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 
 from . import bound, registry
 
@@ -24,6 +25,7 @@ _NCU_QUESTIONS = (
     "tensor-pipe busy",
     "spills",
     "DRAM bytes vs model_bytes",
+    "source/SASS or phase attribution for the stated overhead hypothesis",
 )
 
 
@@ -48,6 +50,9 @@ def recipe_cmd(card: dict, *, measured_placeholder: bool = False) -> str:
         parts.append("--measured-us <median>")
     elif card.get("measured_us") is not None:
         parts.append(f"--measured-us {card['measured_us']}")
+    for flag in ("bottleneck", "profile_evidence", "hypothesis"):
+        if card.get(flag):
+            parts.append(f"--{flag.replace('_', '-')} {shlex.quote(card[flag])}")
     return " ".join(parts)
 
 
@@ -159,6 +164,9 @@ def _classified(card: dict) -> list[dict]:
                 profiled_ctas=card.get("profiled_ctas"),
                 profiled_dram_gbs=card.get("profiled_dram_gbs"),
                 measured_us=card.get("measured_us"),
+                bottleneck=card.get("bottleneck"),
+                profile_evidence=card.get("profile_evidence"),
+                hypothesis=card.get("hypothesis"),
             )
         )
     return rows
@@ -258,8 +266,11 @@ def render_filled(card: dict) -> str:
         lines.append(f"          {idea['reason']}")
     else:
         lines.append(
-            "4. Idea   unknown  — pass --idea <class>. If it does not attack this bound, stop."
+            "4. Idea   unknown  — pass --idea <class>. Address the bound or a profiler-attributed cost limiting achieved throughput."
         )
+    for field in ("bottleneck", "profile_evidence", "hypothesis"):
+        if card.get(field):
+            lines.append(f"          {field}: {card[field]}")
     if card["sm120"]["legal"]:
         atom = card["mma_atom"]
         lines.append(
@@ -272,6 +283,11 @@ def render_filled(card: dict) -> str:
         lines.append(
             "6. Family Requested precision candidate; preserve represented weights. Baseline atom/roof above does not model candidate arithmetic."
         )
+    elif idea and idea["name"] == "profiled_overhead":
+        lines.append(
+            "6. Family Bounded profiler-supported change in the current legal family. "
+            + idea["reason"]
+        )
     elif idea and idea["name"] == "grid_underfill":
         lines.append(
             "6. Family Evidence-gated output-row partitioning only; preserve K reduction and one weight pass. "
@@ -280,7 +296,7 @@ def render_filled(card: dict) -> str:
     elif card["bound"] == "DRAM":
         lines.append(
             "6. Family DRAM-bound. Do not fork a compute family. "
-            "Attack extra bytes or raise T per weight pass."
+            "Attack extra bytes, raise T per weight pass, or establish a profiled_overhead hypothesis."
         )
     else:
         lines.append(
@@ -381,8 +397,9 @@ Fill this card for a Linear point (host, no GPU):
   python3 -m tools.kdev recipe --list-presets
 
 Layer 0  bound (host). Predicted time = max(t_mem, t_comp[, t_issue]).
-  DRAM (typical decode T≲16; ridge_T≈380 on 27B NVFP4 attn-in): only ideas that cut
-  extra bytes or raise useful work per weight pass (weight_replay, aggregate_T).
+  DRAM (typical decode T≲16; ridge_T≈380 on 27B NVFP4 attn-in): cut extra bytes,
+  raise useful work per weight pass (weight_replay, aggregate_T), or use profiled_overhead
+  with a measured baseline, same-kernel attribution, and a bounded hypothesis.
   tensor-core (typical prefill T=1024): tile / TMA / pipeline / epilogue inside the
   existing SM120 NVFP4 family.
   STOP if verdict=refuse or sm120=ILLEGAL. Do not write CUDA.
@@ -508,6 +525,31 @@ def _self_test() -> int:
     no_idea = bound.analyze(14336, 5120, 1, "nvfp4", measured_us=30.0)
     check("no-idea-fill", status_of(no_idea) == "fill", status_of(no_idea))
 
+    evidence = dict(
+        measured_us=104.448,
+        bottleneck="instruction",
+        profile_evidence="NCU report: codec's instruction share",
+        hypothesis="replace sign assembly; preserve exact bytes",
+    )
+    profiled = bound.analyze(14336, 5120, 8, "nvfp4", idea="profiled_overhead", **evidence)
+    check("profiled-go", status_of(profiled) == "go")
+    parser = argparse.ArgumentParser()
+    bound.add_problem_arguments(parser)
+    reconstructed = shlex.split(recipe_cmd(profiled))[4:]
+    restored = bound.analyze_from_args(parser.parse_args(reconstructed))
+    check("profiled-roundtrip", all(restored[k] == v for k, v in evidence.items()))
+    check(
+        "profiled-readable",
+        all(
+            evidence[k] in render_filled(profiled)
+            for k in ("bottleneck", "profile_evidence", "hypothesis")
+        ),
+    )
+    missing = dict(profiled, hypothesis=None)
+    check(
+        "profiled-missing-evidence",
+        _classified(missing)[bound.IDEAS.index("profiled_overhead")]["verdict"] == "measure",
+    )
     payload = filled_payload(allow)
     check("json-status", payload["status"] == "go")
     check("json-layer2", "--t 1024" in payload["layer2"]["bench"])
@@ -553,6 +595,9 @@ def main(argv=None) -> int:
             args.k is not None,
             args.t is not None,
             args.idea,
+            args.bottleneck,
+            args.profile_evidence,
+            args.hypothesis,
             args.measured_us is not None,
             args.qtype,
             args.mma_json,

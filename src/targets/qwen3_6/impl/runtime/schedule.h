@@ -13,7 +13,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "targets/qwen3_6/impl/runtime/token_masks.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -50,6 +50,7 @@ struct ExecutionCore {
     float keep_frac;
     float xattn_tau;
     std::int32_t xattn_min_len;
+    const GdnHistory* gdn_history;
 };
 
 struct PrefillContext {
@@ -84,7 +85,7 @@ struct MtpBatchContext {
     const qwen3_6::MtpDecodeIngress& host_ingress;
     qwen3_6::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
 };
 
 struct DFlashBatchContext {
@@ -95,9 +96,11 @@ struct DFlashBatchContext {
     const qwen3_6::DFlashDecodeIngress& host_ingress;
     qwen3_6::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
-    qwen3_6::ToolMaskExchange* tool_masks = nullptr;
-    // This chain round scores the p-less proposal calibration grid into host_egress; the Program
-    // reads it back exactly when it sets this.
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
+    // DFlash2 chain rounds score the p-less proposal calibration grid into host_egress. A
+    // captured graph fixes whether the scoring kernel exists, so this is the Program's startup
+    // property (calibrates_p_less_drafts()) at warm-up, capture, and every round alike, never a
+    // per-round choice. Packed-tree rounds do not score, and the Program does not read them.
     bool calibrate_p_less_drafts = false;
 };
 
@@ -147,11 +150,11 @@ struct TargetVerifyFrameView {
     Tensor draft_selector_q;
     // Optional FP32 [G,k,B] chain proposal calibration output; requires the draft selectors.
     Tensor proposal_calibration;
-    bool tree_verify                       = false;
-    const GdnReplayRecords* replay_records = nullptr;
-    const ops::SamplingConfig* sampling    = nullptr;
-    DFlashFeatureSink* feature_sink        = nullptr;
-    qwen3_6::ToolMaskExchange* tool_masks  = nullptr;
+    bool tree_verify                        = false;
+    const GdnReplayRecords* replay_records  = nullptr;
+    const ops::SamplingConfig* sampling     = nullptr;
+    DFlashFeatureSink* feature_sink         = nullptr;
+    qwen3_6::TokenMaskExchange* token_masks = nullptr;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -168,16 +171,40 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,
     std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier, bool finalize_at_end);
 
+// Startup-owned stream and barriers for concurrent forwards of disjoint request slots.
+// Each layer records both completions before either stream waits; the final join includes
+// the owner's normalization, feature positions and optional sampling tail.
+class MixedForwardStreams {
+public:
+    MixedForwardStreams();
+    ~MixedForwardStreams();
+    MixedForwardStreams(const MixedForwardStreams&)            = delete;
+    MixedForwardStreams& operator=(const MixedForwardStreams&) = delete;
+
+    [[nodiscard]] cudaStream_t owner_stream() const noexcept { return owner_stream_; }
+
+    void fork(cudaStream_t verify_stream);
+    void join_layer(cudaStream_t verify_stream);
+    void join_owner(cudaStream_t verify_stream);
+
+private:
+    cudaStream_t owner_stream_ = nullptr;
+    cudaEvent_t owner_done_    = nullptr;
+    cudaEvent_t verify_done_   = nullptr;
+};
+
 // The prefill owner of a mixed DFlash round: one text chunk (no media, no MTP) of the request
 // that `state` describes. The round runs forward() inside its verify forward, then
-// append_context() after accept, since the owner's DFlash context append resets the workspace
-// the verify forward still holds. Lives on the stack of the round that runs it.
+// append_context() on the primary stream after accept and the final owner join. Forward scratch
+// occupies disjoint planned regions; append reclaims the primary workspace after verify.
+// Lives on the stack of the round that runs it.
 class MixedPrefillOwner {
 public:
     MixedPrefillOwner(PrefillContext& state, std::span<const TokenId> ids,
                       std::uint32_t nominal_length,
                       std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier,
-                      bool finalize_at_end);
+                      bool finalize_at_end, MixedForwardStreams& streams,
+                      WorkspaceArena& owner_work);
     MixedPrefillOwner(const MixedPrefillOwner&)            = delete;
     MixedPrefillOwner& operator=(const MixedPrefillOwner&) = delete;
 
@@ -190,6 +217,7 @@ public:
 
 private:
     PrefillContext& state_;
+    MixedForwardStreams& streams_;
     TextContext card_;
     DFlashFeatureSink sink_;
     std::span<const int> prompt_;

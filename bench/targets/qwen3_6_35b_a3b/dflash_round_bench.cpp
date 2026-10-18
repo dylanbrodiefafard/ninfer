@@ -203,6 +203,7 @@ int run(const Options& options) {
     engine.kv_capacity =
         ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
     engine.prefill_chunk             = 128;
+    engine.mixed_forward             = 0;
     engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
     engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
     engine.speculative.draft_tokens  = options.draft_tokens;

@@ -79,10 +79,15 @@ dflash` requires the artifact to contain `dflash/` objects and takes `--draft-to
 selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
 batched-decode check: two Engine lanes, not HTTP.
 
-`--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
-and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
-`cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
-load, graph construction, and warmup do not enter topology counts.
+`--profile-measured` is a benchmark-only profiler boundary. For ordinary tests it requires
+exactly one selected test and `-r 1`, synchronizes after warmup, and brackets the measured
+repetition with `cudaProfilerStart/Stop`. With `--contention` it brackets the owner job window,
+excluding model loading and the decode-only calibration windows. Background decode remains
+live, so a decode round may straddle a capture boundary; use launch-correlated NVTX ranges to
+attribute mixed work. Use an Nsight Systems `cudaProfilerApi` capture range. On the installed
+profiler, stopping collection while background decode remains live can abort the application;
+`--capture-range-end=none` keeps collection active until process exit. In that mode, exclude the
+subsequent calibration and shutdown work when analyzing the owner window.
 
 ## Linear Op benchmark
 
@@ -695,6 +700,14 @@ cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_sele
 ./build/bench/ninfer_argmax_bench
 ./build/bench/ninfer_argmax_bench --shape full --cols 128
 ./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
+```
+
+`ninfer_token_logprobs_bench` times public `token_logprobs` at the same head geometry for the
+ordinary, chain, and widest verify frames, once with every slot active and once with every row
+disabled (the cost of a round in which no request asked for logprobs):
+
+```bash
+./build/bench/ninfer_token_logprobs_bench
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence

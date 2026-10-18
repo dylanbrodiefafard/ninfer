@@ -133,6 +133,7 @@ int run(const Options& options) {
                                                       2ULL * options.draft_tokens);
     engine.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
     engine.prefill_chunk = 128;
+    engine.mixed_forward = 0;
     engine.kv_cache      = ninfer::KvCacheStorage::BFloat16;
     engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;

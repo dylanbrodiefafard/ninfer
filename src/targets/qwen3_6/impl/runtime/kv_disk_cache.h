@@ -456,7 +456,14 @@ public:
         return waiting_reader_drain_.load(std::memory_order_acquire);
     }
 
-    void test_gate_state_h2d(cudaEvent_t gate);
+    // Delays a page or immediate-state completion fence after every restore DMA is submitted.
+    void test_before_restore_completion(bool state, void (*callback)(void*, cudaStream_t),
+                                        void* context) noexcept {
+        before_restore_completion_         = callback;
+        before_restore_completion_context_ = context;
+        hold_state_completion_             = state;
+    }
+
     void test_release_restore_job_barrier();
     void test_arm_restore_state_barrier();
     [[nodiscard]] bool test_restore_state_entered() const;
@@ -1155,25 +1162,28 @@ private:
     std::uint64_t object_id_reservation_limit_  = 1;
     std::array<std::uint32_t, 5> pack_active_segment_{};
     std::array<std::uint64_t, 5> pack_active_tail_{};
-    int lock_fd_                                 = -1;
-    void* restore_window_allocation_             = nullptr;
-    void* restore_window_mem_                    = nullptr;
-    std::size_t restore_window_bytes_            = 0;
-    std::size_t restore_window_stride_           = 0;
-    void* page_staging_                          = nullptr;
-    std::size_t page_staging_bytes_              = 0;
-    std::size_t page_staging_stride_             = 0;
-    cudaStream_t page_scatter_stream_            = nullptr;
-    cudaStream_t scatter_test_gate_stream_       = nullptr;
-    cudaEvent_t scatter_test_gate_               = nullptr;
-    PagedKVScatterPlane* text_scatter_planes_    = nullptr;
-    std::size_t text_scatter_plane_count_        = 0;
-    std::size_t text_scatter_max_plane_bytes_    = 0;
-    std::size_t text_scatter_page_bytes_         = 0;
-    PagedKVScatterPlane* backend_scatter_planes_ = nullptr;
-    std::size_t backend_scatter_plane_count_     = 0;
-    std::size_t backend_scatter_max_plane_bytes_ = 0;
-    std::size_t backend_scatter_page_bytes_      = 0;
+    int lock_fd_                                            = -1;
+    void* restore_window_allocation_                        = nullptr;
+    void* restore_window_mem_                               = nullptr;
+    std::size_t restore_window_bytes_                       = 0;
+    std::size_t restore_window_stride_                      = 0;
+    void* page_staging_                                     = nullptr;
+    std::size_t page_staging_bytes_                         = 0;
+    std::size_t page_staging_stride_                        = 0;
+    cudaStream_t page_scatter_stream_                       = nullptr;
+    void (*before_restore_completion_)(void*, cudaStream_t) = nullptr;
+    void* before_restore_completion_context_                = nullptr;
+    bool hold_state_completion_                             = false;
+    cudaStream_t scatter_test_gate_stream_                  = nullptr;
+    cudaEvent_t scatter_test_gate_                          = nullptr;
+    PagedKVScatterPlane* text_scatter_planes_               = nullptr;
+    std::size_t text_scatter_plane_count_                   = 0;
+    std::size_t text_scatter_max_plane_bytes_               = 0;
+    std::size_t text_scatter_page_bytes_                    = 0;
+    PagedKVScatterPlane* backend_scatter_planes_            = nullptr;
+    std::size_t backend_scatter_plane_count_                = 0;
+    std::size_t backend_scatter_max_plane_bytes_            = 0;
+    std::size_t backend_scatter_page_bytes_                 = 0;
 
     struct ImmediateStateSlices {
         std::span<std::uint8_t> gdn_conv;

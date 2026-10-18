@@ -1,7 +1,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "targets/qwen3_6/impl/runtime/tool_masks.h"
+#include "targets/qwen3_6/impl/runtime/token_masks.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 #include "text/unicode.h"
@@ -162,7 +162,7 @@ void run() {
         input.options.tool_jsons.push_back(tool.dump());
         auto prompt   = frontend.prepare(std::move(input));
         sessions[row] = frontend.make_output_session(prompt, {});
-        require(sessions[row].has_tool_grammar(), "component tool grammar missing");
+        require(sessions[row].has_token_grammar(), "component tool grammar missing");
         (void)sessions[row].preview(prefix, 1024, FinishReason::OutputLimit);
         (void)sessions[row].commit_preview();
     }
@@ -179,7 +179,7 @@ void run() {
     auto updated_ids     = arena.alloc(DType::I32, {width_max, capacity});
     auto updated_parents = arena.alloc(DType::I32, {width_max, capacity});
     auto updated_counts  = arena.alloc(DType::I32, {capacity});
-    family::ToolMaskExchange exchange(masks, sampling, nodes);
+    family::TokenMaskExchange exchange(masks, sampling, nodes, device.stream);
     PinnedHostBuffer result_masks(masks.bytes()), result_sampling(sampling.bytes());
     std::array<const family::OutputSession*, capacity> outputs{};
     std::array<ops::SamplingConfig, capacity> configs{};
@@ -201,11 +201,13 @@ void run() {
                         exchange.enqueue(ids_view, tree ? &parent_view : nullptr, count_view,
                                          device.stream, device.host_stream);
                     CUDA_CHECK(cudaStreamWaitEvent(device.stream, submission.ready, 0));
-                    CUDA_CHECK(cudaMemcpyAsync(result_masks.data(), masks.data, masks.bytes(),
+                    CUDA_CHECK(cudaMemcpyAsync(result_masks.data(), masks.data,
+                                               std::size_t(batch) * width_max * words *
+                                                   sizeof(std::uint32_t),
                                                cudaMemcpyDeviceToHost, device.stream));
                     CUDA_CHECK(cudaMemcpyAsync(result_sampling.data(), sampling.data,
-                                               sampling.bytes(), cudaMemcpyDeviceToHost,
-                                               device.stream));
+                                               std::size_t(batch) * sizeof(ops::SamplingConfig),
+                                               cudaMemcpyDeviceToHost, device.stream));
                 };
                 DecodeGraphDefinition definition;
                 definition.capture(device.stream, body);
@@ -268,7 +270,7 @@ void run() {
                         std::vector<int> row_parents(counts[row]);
                         for (int node = 0; node < counts[row]; ++node)
                             row_parents[node] = tree ? parents[row * width + node] : node - 1;
-                        sessions[row].fill_tool_masks(
+                        sessions[row].fill_token_masks(
                             {ids.data() + std::ptrdiff_t(row) * width, std::size_t(counts[row])},
                             row_parents, {expected.data(), std::size_t(counts[row]) * words});
                         for (int other = 0; other < capacity; ++other) {

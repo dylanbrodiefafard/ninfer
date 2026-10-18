@@ -223,6 +223,11 @@ profile; the artifact identity selects the target. Qwen3.6-27B and Qwen3.8-27B b
 `NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` (BF16-sourced NVFP4 MTP). C=1 greedy MTP must emit 24
 tokens with speculative rounds; overlapping C=2 and C=3 must complete the requested
 lengths with MTP decode (packed MTP verify is not C=1-token-identical). k=3 and k=5.
+`ninfer_qwen3_8_27b_logprobs_real_test` (`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS`) qualifies
+token logprobs through the public Engine on the ordinary, DFlash chain, packed-tree, adaptive,
+eager, and two-row concurrent routes: a greedy token must be rank 0 of its own record, records
+must agree with teacher-forced `Engine::score` on a non-speculative Engine, a row that did not
+ask must report nothing, and a streamed thinking turn's records must spell its published text.
 The RAM-tier test covers capture sites 1–3, INT8 KV, MTP, oversize drop,
 VRAM-wins-equal-reuse, longer-RAM-beats-shorter-VRAM, suffix prefill after RAM restore, RAM disabled, queued matcher,
 `allow_prefix_reuse=false`, rewrite-checkpoint restore, dirty-lane checkpoint restore, cancel-after-consume, consume-then-VRAM,
@@ -448,6 +453,18 @@ NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=/path/to/qwen3_8_27b_nvfp4.ninfer \
   ./scripts/run-unit-tests.sh --real -R '^ninfer_qwen3_6_27b_recovery_kv_real_test$'
 ```
 
+`ninfer_qwen3_6_panel_copy_test` checks exact device bytes for integer panels, BF16 width
+panels, fused QKV row splits, and every GDN replay-record plane. It exercises batches 1–6,
+changed addresses and widths, and graph updates in both directions, checking that graph
+capture/upload preserves destination bytes and that copies preserve padding and source bytes.
+Its replay gate fixture includes the 1536-byte row with a 4608-byte destination pitch at B=3.
+
+`ninfer_qwen3_8_27b_dflash_graph_update_real_test` uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` to construct a graph-enabled Engine with concurrency
+six, adaptive draft length seven, and automatic tree width. Startup validates every captured
+profile; three requests with 124-, 125-, and 127-token prompts exercise the short-context profile
+boundary during generation.
+
 `ninfer_qwen3_8_27b_dflash_capacity_real_test` uses the DFlash artifact named by
 `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` on an otherwise idle RTX 5090. It resolves automatic
 KV capacity at context 260000, concurrency 4, NVFP4 KV, and prefill chunk 4096. It checks that
@@ -562,3 +579,42 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## Constrained-output Engine integration
+
+`ninfer_qwen3_8_27b_output_constraint_real_test` exercises JSON Schema and EBNF alongside an
+unconstrained request at concurrency three with NVFP4 KV, CUDA Graphs, ordinary decode, and each
+available MTP/DFlash backend. It checks parsed schema values, exact EBNF content, EOS completion,
+streaming/result agreement, and speculative verification. The plain request switches from
+no-thinking to thinking on the second pass and checks closing-token count and streamed logprobs
+across the reasoning boundary; the second pass also exercises compiler caching.
+Set `NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` and/or
+`NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` to explicit local artifacts and run:
+
+```bash
+./scripts/run-unit-tests.sh --real -R ninfer_qwen3_8_27b_output_constraint_real_test
+```
+
+The frontend CPU suite independently checks schema acceptance and JSON string/escape syntax,
+including special-token literals, reasoning transitions, ignored EOS, and speculative rollback.
+
+### Disposable-turn cache behavior
+
+`ninfer_qwen3_8_27b_cache_write_real_test` uses
+`NINFER_QWEN3_8_27B_NVFP4_DFLASH_WEIGHTS` and, when provided,
+`NINFER_QWEN3_8_27B_NVFP4_MTP_WEIGHTS` to verify consuming continuation and disposable turns.
+It covers independent VRAM forks, one-lane and shared-page-pressure RAM preservation,
+checkpoint reads without capture, disposable-first eviction, bounded capacity rejection with
+multiple matching sources, promotion, disk reads, cancellation, and shutdown persistence.
+It exercises ordinary execution and each supplied speculative backend with NVFP4 KV.
+
+`ninfer_qwen3_8_27b_fork_state_real_test` checks exact main/backend KV, GDN convolution and FP32
+recurrent state, hidden state, and DFlash cyclic-state copies for current and rewrite frontiers.
+It also checks complete-original preservation of a closed preserve-off chat whose normal
+capture cuts at its rewrite checkpoint. This real-model route is in the sanitizer set; its
+GEMM-heavy inference exceeds racecheck host-memory capacity. The RAM-cache unit test is in
+both sanitizer and racecheck sets and checks the changed copies. The recovery executor tests cover non-consuming restores, stale-plan replanning,
+destination-failure cleanup, and cancelled readers beside decoding peers. The RAM-cache unit
+test verifies physical copies across storage layouts, source isolation, and restore/release
+followed by consuming continuation. Serving schema tests cover the strict flag and conflict
+in both response modes.

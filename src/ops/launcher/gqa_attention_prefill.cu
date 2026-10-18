@@ -41,15 +41,6 @@ void gqa_attention_prompt_attention_launch_for(
         cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
     CUDA_CHECK(attr_i8);
-    static const cudaError_t attr_nvfp4 = cudaFuncSetAttribute(
-        gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, false>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillNvfp4SmemBytes);
-    CUDA_CHECK(attr_nvfp4);
-    static const cudaError_t attr_nvfp4_split = cudaFuncSetAttribute(
-        gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, true>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillNvfp4SmemBytes);
-    CUDA_CHECK(attr_nvfp4_split);
-
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::U8 && cache.sage_pv) {
         if (keep_frac != 1.0f || xattn_tau != 1.0f) {
@@ -93,34 +84,45 @@ void gqa_attention_prompt_attention_launch_for(
     } else if (cache.dtype == DType::U8) {
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        const auto launch_attention = [&]<bool Split>(std::int32_t splits,
-                                                      GqaPrefillNvfp4SplitPartials partials) {
-            const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillNvfp4Br)),
-                                      static_cast<unsigned>(Geometry::QHeads),
-                                      static_cast<unsigned>(splits));
-            gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Split>
-                <<<attention_grid, kGqaPrefillNvfp4Threads, kGqaPrefillNvfp4SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::uint8_t*>(cache_k.data),
-                    static_cast<const std::uint8_t*>(cache_v.data),
-                    static_cast<const std::uint8_t*>(cache_k_scale.data),
-                    static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens, partials);
+        const auto launch_schedule  = [&]<typename Schedule>() {
+            const auto launch_attention = [&]<bool Split>(std::int32_t splits,
+                                                          GqaPrefillNvfp4SplitPartials partials) {
+                static const cudaError_t attr = cudaFuncSetAttribute(
+                    gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Schedule, Split>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSmemBytes);
+                CUDA_CHECK(attr);
+                const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, Schedule::kBr)),
+                                          static_cast<unsigned>(Geometry::QHeads),
+                                          static_cast<unsigned>(splits));
+                gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata, Schedule, Split>
+                    <<<attention_grid, Schedule::kThreads, Schedule::kSmemBytes, stream>>>(
+                        static_cast<const __nv_bfloat16*>(q.data),
+                        static_cast<const std::uint8_t*>(cache_k.data),
+                        static_cast<const std::uint8_t*>(cache_v.data),
+                        static_cast<const std::uint8_t*>(cache_k_scale.data),
+                        static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
+                        static_cast<const std::int32_t*>(positions.data), scale,
+                        static_cast<__nv_bfloat16*>(out.data), tokens, partials);
+            };
+            if (split.splits > 1) {
+                const GqaPrefillNvfp4SplitPartials partials{static_cast<float*>(split.acc.data),
+                                                            static_cast<float*>(split.m.data),
+                                                            static_cast<float*>(split.l.data)};
+                launch_attention.template operator()<true>(split.splits, partials);
+                CUDA_CHECK(cudaGetLastError());
+                gqa_attention_prefill_nvfp4_merge_kernel<Geometry, Metadata>
+                    <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(Geometry::QHeads)),
+                       kGqaPrefillHeadDim, 0, stream>>>(partials, metadata,
+                                                        static_cast<__nv_bfloat16*>(out.data),
+                                                        tokens, split.splits);
+            } else {
+                launch_attention.template operator()<false>(1, {});
+            }
         };
-        if (split.splits > 1) {
-            const GqaPrefillNvfp4SplitPartials partials{static_cast<float*>(split.acc.data),
-                                                        static_cast<float*>(split.m.data),
-                                                        static_cast<float*>(split.l.data)};
-            launch_attention.template operator()<true>(split.splits, partials);
-            CUDA_CHECK(cudaGetLastError());
-            gqa_attention_prefill_nvfp4_merge_kernel<Geometry, Metadata>
-                <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(Geometry::QHeads)),
-                   kGqaPrefillHeadDim, 0, stream>>>(partials, metadata,
-                                                    static_cast<__nv_bfloat16*>(out.data), tokens,
-                                                    split.splits);
+        if (gqa_dense_nvfp4_short_query(tokens)) {
+            launch_schedule.template operator()<GqaDenseNvfp4ShortSchedule>();
         } else {
-            launch_attention.template operator()<false>(1, {});
+            launch_schedule.template operator()<GqaDenseNvfp4WideSchedule>();
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
@@ -249,23 +251,23 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     }
 }
 
-// One 512-thread, 87 KiB CTA per SM on the RTX 5090's 170 SMs.
-constexpr std::int32_t kPromptSplitSms     = 170;
 constexpr std::int32_t kPromptSplitMaximum = 16;
-// A split streams at least this many 64-key tiles, amortizing its Q staging and merge traffic.
-constexpr std::int32_t kPromptSplitMinimumTiles = 8;
 // W * splits bound on the FP32 partial rows (1 KiB per row and q head).
 constexpr std::int32_t kPromptSplitRowBudget = 2 * kGqaPromptSplitMaximumWidth;
 // Per-CTA fixed cost (Q quantization, first tile fill) in key-tile units.
 constexpr std::int32_t kPromptSplitFixedTiles = 1;
 
 std::int32_t prompt_split_ctas(std::int32_t q_heads, std::int32_t width) {
-    return div_up(width, kGqaPrefillNvfp4Br) * q_heads;
+    return div_up(width, gqa_dense_nvfp4_short_query(width) ? GqaDenseNvfp4ShortSchedule::kBr
+                                                            : GqaDenseNvfp4WideSchedule::kBr) *
+           q_heads;
 }
 
-std::int32_t prompt_key_tiles(std::uint32_t visible_keys) {
+std::int32_t prompt_key_tiles(std::int32_t width, std::uint32_t visible_keys) {
     return static_cast<std::int32_t>(
-        div_up(visible_keys, static_cast<std::uint32_t>(kGqaPrefillNvfp4Bc)));
+        div_up(visible_keys, static_cast<std::uint32_t>(gqa_dense_nvfp4_short_query(width)
+                                                            ? GqaDenseNvfp4ShortSchedule::kBc
+                                                            : GqaDenseNvfp4WideSchedule::kBc)));
 }
 
 } // namespace
@@ -273,17 +275,21 @@ std::int32_t prompt_key_tiles(std::uint32_t visible_keys) {
 std::int32_t gqa_attention_prompt_split_capacity(std::int32_t q_heads, std::int32_t width,
                                                  std::uint32_t visible_keys) {
     if (width <= 0) { return 1; }
+    const std::int64_t resident_ctas = gqa_dense_nvfp4_short_query(width)
+                                           ? GqaDenseNvfp4ShortSchedule::kResidentCtas
+                                           : GqaDenseNvfp4WideSchedule::kResidentCtas;
+    const std::int32_t minimum_tiles = gqa_dense_nvfp4_short_query(width)
+                                           ? GqaDenseNvfp4ShortSchedule::kMinimumKeyTiles
+                                           : GqaDenseNvfp4WideSchedule::kMinimumKeyTiles;
     const std::int32_t capacity =
-        std::min({kPromptSplitMaximum, prompt_key_tiles(visible_keys) / kPromptSplitMinimumTiles,
+        std::min({kPromptSplitMaximum, prompt_key_tiles(width, visible_keys) / minimum_tiles,
                   kPromptSplitRowBudget / width});
     // Reserve nothing unless some admitted split count needs fewer waves per key tile than the
     // unsplit grid; otherwise no history length makes splitting pay.
     const std::int64_t ctas  = prompt_split_ctas(q_heads, width);
-    const std::int64_t waves = div_up(ctas, std::int64_t{kPromptSplitSms});
+    const std::int64_t waves = div_up(ctas, resident_ctas);
     for (std::int32_t splits = 2; splits <= capacity; ++splits) {
-        if (div_up(ctas * splits, std::int64_t{kPromptSplitSms}) < waves * splits) {
-            return capacity;
-        }
+        if (div_up(ctas * splits, resident_ctas) < waves * splits) { return capacity; }
     }
     return 1;
 }
@@ -291,10 +297,13 @@ std::int32_t gqa_attention_prompt_split_capacity(std::int32_t q_heads, std::int3
 std::int32_t gqa_attention_prompt_splits(std::int32_t q_heads, std::int32_t width,
                                          std::uint32_t visible_keys) {
     const std::int32_t capacity = gqa_attention_prompt_split_capacity(q_heads, width, visible_keys);
-    const std::int64_t ctas     = prompt_split_ctas(q_heads, width);
-    const std::int64_t tiles    = prompt_key_tiles(visible_keys);
-    const auto cost             = [&](std::int64_t splits) {
-        const std::int64_t waves = div_up(ctas * splits, std::int64_t{kPromptSplitSms});
+    const std::int64_t resident_ctas = gqa_dense_nvfp4_short_query(width)
+                                           ? GqaDenseNvfp4ShortSchedule::kResidentCtas
+                                           : GqaDenseNvfp4WideSchedule::kResidentCtas;
+    const std::int64_t ctas          = prompt_split_ctas(q_heads, width);
+    const std::int64_t tiles         = prompt_key_tiles(width, visible_keys);
+    const auto cost                  = [&](std::int64_t splits) {
+        const std::int64_t waves = div_up(ctas * splits, resident_ctas);
         return waves * (div_up(tiles, splits) + kPromptSplitFixedTiles);
     };
     std::int32_t best = 1;

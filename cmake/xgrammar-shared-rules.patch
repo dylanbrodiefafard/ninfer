@@ -1,0 +1,173 @@
+--- a/grammar_functor.cc
++++ b/grammar_functor.cc
+@@ -540,6 +540,7 @@
+  * Now we only inline rule references that:
+  * 1. at the beginning of a sequence
+  * 2. The rule should be a sequence of choices, cannot be empty, cannot refer to other rules
++ * 3. The rule has at most one reference, preserving shared tokenizer-mask preprocessing.
+  */
+ class RuleInlinerImpl : public GrammarMutator {
+  public:
+@@ -547,6 +548,25 @@
+   using GrammarMutator::GrammarMutator;
+ 
+  private:
++  class ReferenceCounter : public GrammarVisitor<void> {
++   public:
++    explicit ReferenceCounter(std::vector<int>& counts) : counts_(counts) {}
++
++   private:
++    void VisitRuleRef(const GrammarExpr& expr) final {
++      // Only zero, one, and multiple references affect the inlining decision.
++      counts_[expr[0]] = std::min(2, counts_[expr[0]] + 1);
++    }
++    std::vector<int>& counts_;
++  };
++
++  void InitGrammar(const Grammar& grammar) final {
++    GrammarMutator::InitGrammar(grammar);
++    reference_counts_.assign(grammar->NumRules(), 0);
++    ReferenceCounter(reference_counts_).Apply(grammar);
++    can_rule_be_inlined_.clear();
++  }
++
+   int32_t VisitChoices(const GrammarExpr& grammar_expr) final {
+     std::vector<int32_t> new_choice_ids;
+     for (int i : grammar_expr) {
+@@ -597,6 +617,9 @@
+    * The rule should be: a sequence of choices, cannot be empty, cannot refer to other rules
+    */
+   bool CheckIfRuleCanBeInlined(int32_t rule_id) {
++    // Shared terminal rules own one tokenizer-mask table. Copying their bodies
++    // into every caller multiplies vocabulary preprocessing and retained masks.
++    if (reference_counts_[rule_id] > 1) { return false; }
+     auto rule = base_grammar_->GetRule(rule_id);
+     auto grammar_expr = base_grammar_->GetGrammarExpr(rule.body_expr_id);
+     if (grammar_expr.type != GrammarExprType::kChoices) {
+@@ -622,6 +645,7 @@
+   }
+ 
+   std::unordered_map<int32_t, bool> can_rule_be_inlined_;
++  std::vector<int> reference_counts_;
+ };
+ 
+ /*!
+@@ -1565,6 +1589,57 @@
+     const GrammarExpr& expr, const Grammar& grammar
+ ) {
+   XGRAMMAR_DCHECK(expr.type == ExprType::kChoices);
++  // Rule-reference alternatives need no epsilon edges or state simplification.
++  // Share extendable prefixes and a terminal sink, keeping accepting-prefix
++  // edges separate so extending one alternative cannot extend another.
++  bool only_rule_refs = expr.size() != 0;
++  for (int choice_id : expr) {
++    const auto& choice = grammar->GetGrammarExpr(choice_id);
++    if (choice.type == ExprType::kEmptyStr) { continue; }
++    if (choice.type != ExprType::kSequence) { only_rule_refs = false; break; }
++    for (int element_id : choice) {
++      if (grammar->GetGrammarExpr(element_id).type != ExprType::kRuleRef) {
++        only_rule_refs = false;
++        break;
++      }
++    }
++    if (!only_rule_refs) { break; }
++  }
++  if (only_rule_refs) {
++    FSMWithStartEnd result;
++    const int start = result.AddState();
++    int end = -1;
++    result.SetStartState(start);
++    for (int choice_id : expr) {
++      const auto& choice = grammar->GetGrammarExpr(choice_id);
++      if (choice.type == ExprType::kEmptyStr || choice.size() == 0) {
++        result.AddEndState(start);
++        continue;
++      }
++      if (end == -1) {
++        end = result.AddState();
++        result.AddEndState(end);
++      }
++      int state = start;
++      for (int i = 0; i < choice.size(); ++i) {
++        const auto& ref = grammar->GetGrammarExpr(choice[i]);
++        const bool last = i + 1 == choice.size();
++        int next = -1;
++        for (const auto& edge : result.GetFsm().GetEdges(state)) {
++          if (edge.GetRefRuleId() == ref[0] && (edge.target == end) == last) {
++            next = edge.target;
++            break;
++          }
++        }
++        if (next == -1) {
++          next = last ? end : result.AddState();
++          result.GetFsm().AddRuleEdge(state, next, ref[0]);
++        }
++        state = next;
++      }
++    }
++    return result;
++  }
+   std::vector<FSMWithStartEnd> fsm_list;
+   bool nullable = false;
+   for (const auto& choice_id : expr) {
+--- a/grammar_compiler.cc
++++ b/grammar_compiler.cc
+@@ -1088,9 +1088,11 @@
+     auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
+     if (max_threads_ > 1) {
+       std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
+-      compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
++      compiled_grammar_impl->adaptive_token_mask_cache.emplace(
++          state, std::move(cur_adaptive_token_mask_cache));
+     } else {
+-      compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
++      compiled_grammar_impl->adaptive_token_mask_cache.emplace(
++          state, std::move(cur_adaptive_token_mask_cache));
+     }
+   };
+ 
+@@ -1225,8 +1227,8 @@
+         definite_accepted_tokens_since_second_char.Set(j);
+       }
+     }
+-    (*tag_dispatch_rule_id_to_second_slicing_bitset)[i] =
+-        definite_accepted_tokens_since_second_char;
++    tag_dispatch_rule_id_to_second_slicing_bitset->emplace(
++        i, std::move(definite_accepted_tokens_since_second_char));
+   }
+ }
+ 
+--- a/grammar_builder.h
++++ b/grammar_builder.h
+@@ -206,6 +206,8 @@
+  private:
+   // Mutable pointer to the grammar object.
+   std::shared_ptr<Grammar::Impl> grammar_;
++  // Rule references are immutable and share one expression per referenced rule.
++  std::vector<int32_t> rule_ref_expr_ids_;
+   // Map from rule name to rule id.
+   std::unordered_map<std::string, int32_t> rule_name_to_id_;
+   // Cache of next suffix index per name_hint for GetNewRuleName.
+--- a/grammar_builder.cc
++++ b/grammar_builder.cc
+@@ -115,10 +115,16 @@
+ }
+ 
+ int32_t GrammarBuilder::AddRuleRef(int32_t rule_id) {
+-  std::vector<int32_t> data;
+-  data.push_back(rule_id);
+-  return AddGrammarExpr({GrammarExprType::kRuleRef, data.data(), static_cast<int32_t>(data.size())}
+-  );
++  XGRAMMAR_CHECK(rule_id >= 0 && rule_id < NumRules());
++  if (rule_ref_expr_ids_.size() <= static_cast<size_t>(rule_id)) {
++    rule_ref_expr_ids_.resize(NumRules(), -1);
++  }
++  auto& expr_id = rule_ref_expr_ids_[rule_id];
++  if (expr_id == -1) {
++    const int32_t data[] = {rule_id};
++    expr_id = AddGrammarExpr({GrammarExprType::kRuleRef, data, 1});
++  }
++  return expr_id;
+ }
+ 
+ int32_t GrammarBuilder::AddSequence(const std::vector<int32_t>& elements) {

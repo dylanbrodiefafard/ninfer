@@ -21,6 +21,7 @@ ninfer::EngineOptions mtp_engine_options(const char* artifact, std::uint32_t dra
     options.max_context               = 256;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(256);
     options.prefill_chunk             = 128;
+    options.mixed_forward             = 0;
     options.kv_cache                  = ninfer::KvCacheStorage::Nvfp4;
     options.use_cuda_graph            = true;
     options.enable_vision             = false;
@@ -519,9 +520,9 @@ int main() {
             engine.generate(engine.prepare_tokens(prompts[0]), greedy_reuse(8, false));
         if (first.generated_token_ids.size() != 8 ||
             check_adaptive_stats(first, 5, {3, 4, 5}, label) != 0 ||
-            first.speculative.rounds_per_draft.size() < 5 ||
-            first.speculative.rounds_per_draft[4] == 0) {
-            std::cerr << label << " source did not record seeded k=4 rounds\n";
+            first.speculative.rounds_per_draft.size() < 4 ||
+            first.speculative.rounds_per_draft[3] == 0) {
+            std::cerr << label << " source did not record seeded k=3 rounds\n";
             dump_speculative("  spec", first.speculative);
             return 1;
         }
