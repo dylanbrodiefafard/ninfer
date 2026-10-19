@@ -352,6 +352,17 @@ int test_official_tokenizer_merge() {
                           "official tokenizer_config.json token did not merge exactly");
     }
 
+    // Frozen independent official-tokenizer results exercise heap adjacency invalidation,
+    // rank ties and the short/long word boundary, including represented NFC text.
+    const auto merge_cases =
+        nlohmann::json::parse(read_file(NINFER_SOURCE_DIR "/tests/fixtures/tokenizer_merge.json"));
+    for (const auto& item : merge_cases.at("cases")) {
+        const auto expected = item.at("expected").get<std::vector<int>>();
+        failures +=
+            check(tokenizer.encode(item.at("text").get<std::string>()) == expected,
+                  ("official BPE rank regression: " + item.at("name").get<std::string>()).c_str());
+    }
+
     FrontendResources conflicting = resources();
     nlohmann::json config         = nlohmann::json::parse(conflicting.tokenizer_config_json);
     config["added_tokens_decoder"]["248045"]["special"] = false;
