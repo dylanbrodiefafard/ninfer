@@ -226,8 +226,11 @@ std::vector<Sample> score(execution::ProgramImplCore& p, const family::Frontend&
         execution::schedule::TextContext card(p.device, p.model, p.work, {},
                                               p.decoder->linear_attention, p.io, p.prefill_hidden,
                                               p.prefill_chunk, 0, {}, &p.decoder->text_kv);
+        // The production replay commit appends accepted GDN columns to the retained history
+        // and materializes the checkpoint only at capacity, so Verify must read the parent
+        // state through the same history; a plain replay record would read a stale checkpoint.
         card.set_gdn_state_action(execution::schedule::GdnStateAction::RecordForReplay,
-                                  &*p.replay_records);
+                                  &*p.replay_records, p.gdn_history ? &*p.gdn_history : nullptr);
         execution::schedule::DFlashFeatureSink sink{
             .batch_features      = &p.dflash->pending_features,
             .batch_lanes         = &slots,
