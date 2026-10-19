@@ -596,6 +596,7 @@ ninfer_add_sanitizer_cases(ninfer_normalized_rope_kv_append_test)
 ninfer_add_sanitizer_cases(ninfer_linear_kv_projection_test)
 set_property(TEST ninfer_linear_kv_projection_test_sanitizer PROPERTY LABELS sanitizer)
 set(ninfer_sanitizer_racecheck_tests
+  ninfer_layer_norm_test
   ninfer_kv_cache_test
   ninfer_kv_ram_cache_test
   ninfer_embedding_test
