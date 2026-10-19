@@ -12,11 +12,12 @@
 
 namespace {
 
-constexpr std::uint32_t kMark        = 24576;
-constexpr std::uint32_t kSecondMark  = 36864;
-constexpr std::uint32_t kHundredMark = 102400;
-constexpr std::uint32_t k150Mark     = 151552;
-constexpr std::uint32_t kCatchStart  = 8000;
+constexpr std::uint32_t kPrefillChunk = 4096;
+constexpr std::uint32_t kMark         = 24576;
+constexpr std::uint32_t kSecondMark   = 36864;
+constexpr std::uint32_t kHundredMark  = 102400;
+constexpr std::uint32_t k150Mark      = 151552;
+constexpr std::uint32_t kCatchStart   = 8000;
 // Resume 8000, then five 4096 chunks: 12096, 16192, 20288, 24384, 28480.
 // Prompt is one token past that last chunk end so prefill commits 28480.
 constexpr std::uint32_t kCatchFreeze   = 28481;
@@ -82,7 +83,7 @@ engine_options(const char* artifact, std::uint32_t max_concurrency = 1,
     options.max_context               = max_context;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(kv_tokens);
     options.max_concurrency           = max_concurrency;
-    options.prefill_chunk             = 4096;
+    options.prefill_chunk             = kPrefillChunk;
     options.kv_ram_capacity_bytes     = kRamBytes;
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.backend       = spec;
@@ -812,17 +813,23 @@ int exercise_vision(const char* artifact) {
         !complete_capture.prompt.has_media) {
         return fail("vision complete-item capture did not complete");
     }
-    if (const int rc = expect_captured(complete_capture, kMark, "vision complete-item capture");
-        rc != 0) {
-        return rc;
+    // Prefill splits Text at the image's first column so a cold prefill matches a reused
+    // text-only prefix; every later chunk end is offset from a multiple of the chunk size by that
+    // leading text. The freeze is therefore the first committed chunk end at or past the mark.
+    const std::uint32_t complete_f = complete_capture.captured_context_checkpoint_tokens;
+    if (complete_f < kMark || complete_f >= kMark + kPrefillChunk) {
+        std::cerr << "vision complete-item capture froze " << complete_f
+                  << ", expected the first chunk end in [" << kMark << ", " << kMark + kPrefillChunk
+                  << ")\n";
+        return 1;
     }
     std::string probe_text             = capture_text;
     probe_text.back()                  = 'z';
     ninfer::PromptInput complete_probe = vision_user({}, true, image_bytes, probe_text);
     const ninfer::GenerationResult complete_hit =
         engine.generate(engine.prepare(std::move(complete_probe)), greedy(4, true));
-    if (const int rc = expect_restore(complete_hit, ninfer::PrefixReuseSource::VramResident, kMark,
-                                      "vision item complete before 24576");
+    if (const int rc = expect_restore(complete_hit, ninfer::PrefixReuseSource::VramResident,
+                                      complete_f, "vision item complete before 24576");
         rc != 0) {
         return rc;
     }
@@ -834,7 +841,7 @@ int exercise_vision(const char* artifact) {
     ninfer::PromptInput complete_ram_probe = vision_user({}, true, image_bytes, capture_text);
     const ninfer::GenerationResult complete_ram =
         engine.generate(engine.prepare(std::move(complete_ram_probe)), greedy(4, true));
-    if (const int rc = expect_restore(complete_ram, ninfer::PrefixReuseSource::HostRam, kMark,
+    if (const int rc = expect_restore(complete_ram, ninfer::PrefixReuseSource::HostRam, complete_f,
                                       "vision ladder RAM restore");
         rc != 0) {
         return rc;
