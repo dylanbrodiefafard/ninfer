@@ -1248,30 +1248,27 @@ int run_batched_record_qualification(QType qtype, ops::LinearPolicy policy) {
                     ops::detail::allocate_nvfp4_w4a4_workspace(codec_workspace, aggregate, kHidden);
                 ops::detail::launch_nvfp4_w4a4_quantize(x.view({kHidden, aggregate}), parent.view(),
                                                         scratch, nullptr);
-                // The quantizer writes [256 tokens x 16 groups] scale tiles (nvfp4_config.h);
-                // gather them back into the reference's row-major [token, group] order.
-                constexpr std::int32_t kGroups     = kHidden / 16;
-                constexpr std::int32_t kTileGroups = ops::detail::kNvfp4ScaleTileGroups;
-                constexpr std::int32_t kTileTokens = ops::detail::kNvfp4TmaBlockM;
+                // The quantizer writes [256 tokens x 16 groups] scale tiles (nvfp4_config.h) and
+                // leaves the padding token rows beyond the last 16-token fragment unspecified, so
+                // gather only the logical token rows into the reference's row-major
+                // [token, group] order.
+                constexpr std::size_t kGroups     = kHidden / 16;
+                constexpr std::size_t kTileGroups = ops::detail::kNvfp4ScaleTileGroups;
+                constexpr std::size_t kTileTokens = ops::detail::kNvfp4TmaBlockM;
                 std::vector<std::uint8_t> codes(encoded.codes.size()),
-                    tiled_scales(
-                        static_cast<std::size_t>(ops::detail::nvfp4_w4a4_padded_tokens(aggregate)) *
-                        kGroups),
                     scales(encoded.scales.size());
                 CUDA_CHECK(
                     cudaMemcpy(codes.data(), scratch.codes, codes.size(), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(tiled_scales.data(), scratch.scales, tiled_scales.size(),
-                                      cudaMemcpyDeviceToHost));
-                for (std::int32_t token = 0; token < aggregate; ++token) {
-                    for (std::int32_t group = 0; group < kGroups; ++group) {
-                        const std::size_t tile = static_cast<std::size_t>(token / kTileTokens) *
-                                                     (kGroups / kTileGroups) +
-                                                 group / kTileGroups;
-                        scales[static_cast<std::size_t>(token) * kGroups + group] =
-                            tiled_scales[tile * kTileTokens * kTileGroups +
-                                         static_cast<std::size_t>(token % kTileTokens) *
-                                             kTileGroups +
-                                         group % kTileGroups];
+                const auto tokens = static_cast<std::size_t>(aggregate);
+                for (std::size_t token0 = 0; token0 < tokens; token0 += kTileTokens) {
+                    const std::size_t tile_tokens = std::min(kTileTokens, tokens - token0);
+                    for (std::size_t group0 = 0; group0 < kGroups; group0 += kTileGroups) {
+                        const std::size_t tile =
+                            token0 / kTileTokens * (kGroups / kTileGroups) + group0 / kTileGroups;
+                        CUDA_CHECK(cudaMemcpy2D(scales.data() + token0 * kGroups + group0, kGroups,
+                                                scratch.scales + tile * kTileTokens * kTileGroups,
+                                                kTileGroups, kTileGroups, tile_tokens,
+                                                cudaMemcpyDeviceToHost));
                     }
                 }
                 if (codes != encoded.codes || scales != encoded.scales) {
