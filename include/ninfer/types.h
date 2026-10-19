@@ -743,8 +743,8 @@ enum class KvDiskDropReason : std::uint8_t {
     IndexLoad,       // a stored entry was rejected while loading the index
     Persist,         // a manifest write or directory fsync failed
     NoteAlloc,       // bookkeeping for a new RAM entry could not allocate
-    SpillNoRoom,     // the filesystem lacks room for the append plus the compaction reserve
-    SpillNoCapacity, // capacity eviction could not free enough logical bytes
+    SpillNoRoom,     // the filesystem lacks room for a cache write and its metadata
+    SpillNoCapacity, // capacity eviction could not free enough pack-file bytes
     SpillFailed,     // a spill failed while preparing, starting, or writing
     ReclaimUnsaved,  // a non-durable RAM entry was evicted without a disk copy
     OptionalAlloc,   // an optional prefetch or idle spill could not allocate
@@ -819,7 +819,8 @@ struct RuntimeStats {
     // Live disk work is independent of scheduler occupancy. Save time is the full elapsed
     // lifetime of completed spills, not time spent blocking requests in an observer interval.
     bool kv_disk_spill_active            = false;
-    bool kv_disk_compaction_active       = false;
+    bool kv_disk_defrag_active           = false;
+    std::size_t kv_disk_storage_bytes    = 0;
     bool kv_disk_restore_active          = false;
     std::size_t kv_disk_pending_jobs     = 0;
     double kv_disk_spill_elapsed_seconds = 0;

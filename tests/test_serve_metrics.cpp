@@ -97,14 +97,16 @@ int main() {
     ScrapeInputs inputs;
     inputs.stats.kv_ram_used_bytes             = 4096;
     inputs.stats.kv_disk_spill_active          = true;
-    inputs.stats.kv_disk_compaction_active     = true;
+    inputs.stats.kv_disk_defrag_active         = true;
+    inputs.stats.kv_disk_storage_bytes         = 8388608;
     inputs.stats.kv_disk_restore_active        = true;
     inputs.stats.kv_disk_pending_jobs          = 3;
     inputs.stats.kv_disk_spill_elapsed_seconds = 12.165;
     const auto snapshot                        = metrics.snapshot(inputs);
     const std::string text                     = snapshot.prometheus_text();
     failures += check(contains(text, "ninfer_kv_disk_spill_active 1\n") &&
-                          contains(text, "ninfer_kv_disk_compaction_active 1\n") &&
+                          contains(text, "ninfer_kv_disk_defrag_active 1\n") &&
+                          contains(text, "ninfer_kv_disk_storage_bytes 8388608\n") &&
                           contains(text, "ninfer_kv_disk_restore_active 1\n") &&
                           contains(text, "ninfer_kv_disk_pending_jobs 3\n") &&
                           contains(text, "ninfer_kv_disk_spill_elapsed_seconds 12.165\n"),
@@ -255,7 +257,8 @@ int main() {
         failures += check(json.contains(key), "metrics json is missing a required key");
     }
     failures += check(json.at("kv_disk").at("spill_active") == true &&
-                          json.at("kv_disk").at("compaction_active") == true &&
+                          json.at("kv_disk").at("defrag_active") == true &&
+                          json.at("kv_disk").at("storage_bytes") == 8388608 &&
                           json.at("kv_disk").at("restore_active") == true &&
                           json.at("kv_disk").at("pending_jobs") == 3 &&
                           json.at("kv_disk").at("spill_elapsed_seconds") == 12.165,

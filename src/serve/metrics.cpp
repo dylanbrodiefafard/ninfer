@@ -834,8 +834,11 @@ std::string render_text(const MetricsSnapshotData& data) {
             std::uint64_t{stats.kv_disk_entry_count});
     w.gauge("ninfer_kv_disk_spill_active", "Disk spill preparation or session active.",
             std::uint64_t{stats.kv_disk_spill_active});
-    w.gauge("ninfer_kv_disk_compaction_active", "Disk compaction active.",
-            std::uint64_t{stats.kv_disk_compaction_active});
+    w.gauge("ninfer_kv_disk_defrag_active", "Idle disk defragmentation active.",
+            std::uint64_t{stats.kv_disk_defrag_active});
+    w.gauge("ninfer_kv_disk_storage_bytes",
+            "Disk pack storage bytes, including free slots and writes in progress.",
+            std::uint64_t{stats.kv_disk_storage_bytes});
     w.gauge("ninfer_kv_disk_restore_active", "Disk restore target active.",
             std::uint64_t{stats.kv_disk_restore_active});
     w.gauge("ninfer_kv_disk_pending_jobs", "Queued disk cache jobs.",
@@ -1061,7 +1064,8 @@ Json render_json(const MetricsSnapshotData& data) {
           {"load_seconds", stats.kv_disk_load_seconds},
           {"h2d_seconds", stats.kv_disk_h2d_seconds},
           {"spill_active", stats.kv_disk_spill_active},
-          {"compaction_active", stats.kv_disk_compaction_active},
+          {"defrag_active", stats.kv_disk_defrag_active},
+          {"storage_bytes", stats.kv_disk_storage_bytes},
           {"restore_active", stats.kv_disk_restore_active},
           {"pending_jobs", stats.kv_disk_pending_jobs},
           {"spill_elapsed_seconds", stats.kv_disk_spill_elapsed_seconds},

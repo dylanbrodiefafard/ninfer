@@ -148,7 +148,7 @@ std::string serve_usage_text(const char* argv0) {
            "); raise it when a desktop or other process shares the GPU\n"
            "       --kv-ram-capacity sets pinned host KV prefix-cache capacity in MiB (default "
            "off)\n"
-           "       --kv-disk-capacity sets SSD KV prefix-cache unique-object capacity in MiB "
+           "       --kv-disk-capacity sets SSD KV prefix-cache pack-file capacity in MiB "
            "(default off)\n"
            "       --kv-disk-location is required iff --kv-disk-capacity is enabled\n"
            "       --kv-disk-compress applies zstd-1 to new GDN/hidden/cyclic writes (default "

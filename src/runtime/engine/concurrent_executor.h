@@ -360,7 +360,8 @@ private:
         out.kv_disk_used_bytes            = disk.used_bytes;
         out.kv_disk_entry_count           = disk.entry_count;
         out.kv_disk_spill_active          = disk.spill_active;
-        out.kv_disk_compaction_active     = disk.compaction_active;
+        out.kv_disk_defrag_active         = disk.defrag_active;
+        out.kv_disk_storage_bytes         = disk.storage_bytes;
         out.kv_disk_restore_active        = disk.restore_active;
         out.kv_disk_pending_jobs          = disk.pending_jobs;
         out.kv_disk_spill_elapsed_seconds = disk.spill_elapsed_seconds;
@@ -378,7 +379,8 @@ private:
         out.kv_disk_used_bytes            = in.kv_disk_used_bytes;
         out.kv_disk_entry_count           = in.kv_disk_entry_count;
         out.kv_disk_spill_active          = in.kv_disk_spill_active;
-        out.kv_disk_compaction_active     = in.kv_disk_compaction_active;
+        out.kv_disk_defrag_active         = in.kv_disk_defrag_active;
+        out.kv_disk_storage_bytes         = in.kv_disk_storage_bytes;
         out.kv_disk_restore_active        = in.kv_disk_restore_active;
         out.kv_disk_pending_jobs          = in.kv_disk_pending_jobs;
         out.kv_disk_spill_elapsed_seconds = in.kv_disk_spill_elapsed_seconds;
@@ -2967,7 +2969,7 @@ private:
             if (idle && !copy_hold_) {
                 try {
                     copies_ready = instance_.program->kv_copies_ready();
-                    if (copies_ready) { instance_.program->request_idle_spill(); }
+                    if (copies_ready) { instance_.program->set_cache_idle(true); }
                     // NOLINTNEXTLINE(bugprone-empty-catch): opportunistic spill; see above.
                 } catch (...) {}
             }
@@ -3000,6 +3002,7 @@ private:
             }
 
             try {
+                instance_.program->set_cache_idle(false);
                 std::scoped_lock execution_lock(execution_mutex_);
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();

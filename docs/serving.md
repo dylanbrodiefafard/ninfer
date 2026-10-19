@@ -264,7 +264,7 @@ Combining `cache_write: false` with `capture_context_checkpoint: true` returns H
 `cache_write_conflict`, parameter `ninfer.capture_context_checkpoint`, before enqueue or streaming:
 `capture_context_checkpoint=true requires cache_write=true because it creates a retained context checkpoint.`
 Saving an original may increase RAM/disk capture counters and copy time, but the disposable
-request reports zero captured context-checkpoint tokens. Request-log schema 20 records
+request reports zero captured context-checkpoint tokens. Request-log schema 21 records
 `request.cache_write` on generation and preparation-rejection events.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
@@ -842,7 +842,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
-| `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
+| `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..6` | `1` |
@@ -981,7 +981,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v20 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v21 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -1035,7 +1035,7 @@ tokens finally committed by decode rounds, excluding the first token produced by
 `running`, `prefilling`, `decode_ready`, and `waiting` fields are the Engine scheduler snapshot at
 the end of the interval. Fully idle zero intervals are omitted. The JSONL `throughput` event keeps
 the raw token and round deltas as well as derived rates; downstream measurement should prefer those
-raw values. Disk `work` identifies active spill preparation/session, compaction, and restore targets;
+raw values. Disk `work` identifies active spill preparation/session, restore targets, and idle defragmentation;
 `pending` counts queued disk jobs. An active spill session reports `spill_age` in seconds (zero
 while preparation has not installed a session). These are background cache activities, independent
 of scheduler request occupancy. Active disk work keeps the periodic report visible, including its
@@ -1043,7 +1043,7 @@ transition to idle. `spill_completed` is the sum of full lifetimes of spills com
 interval, so it can exceed the interval and does not measure time blocking requests. The JSONL
 `timings_seconds.kv_disk_save` and cumulative metric `ninfer_kv_disk_save_seconds_total` have the
 same completed-spill lifetime semantics. JSONL scheduler fields and both metrics encodings expose
-`spill_active`, `compaction_active`, `restore_active`, `pending_jobs`, and `spill_elapsed_seconds`
+`spill_active`, `defrag_active`, `storage_bytes`, `restore_active`, `pending_jobs`, and `spill_elapsed_seconds`
 (with a `kv_disk_` prefix in JSONL and `ninfer_kv_disk_` in Prometheus).
 
 The preparation line is emitted after JSON/protocol parsing and, for Responses, context assembly;
@@ -1090,10 +1090,20 @@ and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate
 in MiB for completed prefix bundles and does not change GPU pool sizing. One long DFlash chat with five
 context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on
 the live pinned log, but other-lane restore after eviction needs the FIFO.
-`--kv-disk-capacity` is a third-tier SSD budget in unique object bytes. It requires
+`--kv-disk-capacity` is a third-tier SSD pack-file budget in MiB. It requires
 `--kv-ram-capacity > 0` and `--kv-disk-location`. Disk is inclusive of VRAM/RAM hits; equal reuse
 length prefers VRAM, then RAM, then disk. `--kv-disk-compress` is not part of the directory
 fingerprint and affects new GDN/hidden/cyclic writes only.
+The existing `--kv-disk-capacity N` bounds pack-file bytes, including reusable free slots and
+writes in progress. Eviction retires extents durably and reuses their space without copying live
+KV payloads. Fully free segments are truncated. When the Engine has no active or pending
+requests, bounded idle defragmentation can move records from sparse packs into existing holes
+and trim free tails. Copy chunks are at most 1 MiB, paced at least 16 ms apart; request work
+interrupts further copying. Both copies count against the same pack-file limit.
+`ninfer_kv_disk_defrag_active` and throughput `work=defrag` expose this maintenance. Small index, entry, and filesystem metadata
+adds overhead outside the pack-file bound; metadata-only journal checkpoints keep the index
+bounded. The `ninfer_kv_disk_storage_bytes` gauge and throughput `storage=` value report pack
+storage, while `kv-disk=` continues to report live unique-object occupancy.
 Runtime cache capacity or optional capture-allocation failures skip the capture and do not reject
 generation. Optional cache-lookup allocation failure leaves normal cold admission available.
 If a disk cache read or optional RAM/disk restore metadata or CUDA-event allocation fails before
@@ -1101,7 +1111,7 @@ prefill, the Engine drains the partial restore,
 excludes that entry from reuse, and recomputes the prompt from an empty KV image. The same request
 returns through normal capacity admission; its original queue deadline does not expire this
 already-admitted recovery. This cache fallback does not produce `service_unavailable`.
-Disk format v7 fingerprints canonical logical KV pages rather than GPU pool capacity or request
+Disk format v8 fingerprints canonical logical KV pages rather than GPU pool capacity or request
 lane count, so one location can reopen across `--vision` on/off, concurrency, and automatic
 resident-capacity changes when the per-lane state geometry remains compatible. The fingerprint
 binds model/weights identity and a SHA-256 digest of the target-selected tensors and projection
@@ -1114,7 +1124,7 @@ enabled. Artifacts must remain immutable while an Engine is using them. KV dtype
 backend, page/state schema, and attention settings (`--sage`, `--keep-frac`, `--xattn-tau`, and the
 active C++ `xattn_min_len` option) also define compatibility. Token IDs, positions, and media
 identity are checked per entry; sampling defaults and chat rendering are not directory
-compatibility boundaries. Pre-v7 locations fail startup: select a new directory and retain the old
+compatibility boundaries. Pre-v8 locations fail startup: select a new directory and retain the old
 one until its contents are no longer needed.
 On stop, orderly shutdown copies active chats into the host cache, saves cache entries that are not
 yet on SSD, and finishes outstanding disk writes. The progress renderer prints `kv-disk`

@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -196,7 +197,8 @@ struct PackedMapEntry {
 
 // frame_bytes includes the u32 length field and excludes the trailing frame CRC.
 // The canonical Put payload is id/kind/segment/offset/extent/stored/logical/record_crc.
-inline constexpr std::uint8_t kPackMapTypePut           = 1;
+
+
 inline constexpr std::uint32_t kPackMapPutBytes         = 52;
 inline constexpr std::uint32_t kPackMapFrameBytes       = 4 + 4 + kPackMapPutBytes;
 inline constexpr std::uint32_t kPackMapBaseEndianLittle = 1;
@@ -396,10 +398,12 @@ ssize_t pwritev_with_test_limit(int fd, iovec* iov, int count, off_t offset,
     } catch (...) { return false; }
 }
 
-[[nodiscard]] std::vector<std::uint8_t> encode_pack_map_frame(const PackedMapEntry& entry) {
+[[nodiscard]] std::vector<std::uint8_t>
+encode_pack_map_frame(const PackedMapEntry& entry,
+                      DiskMapRecordKind kind = DiskMapRecordKind::Put) {
     OutBuf w;
     w.u32(kPackMapFrameBytes);
-    w.u8(kPackMapTypePut);
+    w.u8(static_cast<std::uint8_t>(kind));
     w.u8(0);
     w.u8(0);
     w.u8(0);
@@ -1230,6 +1234,7 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
         open_directory();
         load_or_write_fingerprint();
         open_pack_store();
+        rebuild_free_extents();
         load_index();
         validate_live_direct_segments();
         io_thread_ = std::thread([this] { io_loop(); });
@@ -1295,10 +1300,6 @@ KVDiskCache::KVDiskCache(DiskOpenConfig config) : config_(std::move(config)) {
 KVDiskCache::~KVDiskCache() noexcept {
     try {
         stop_io_threads();
-        if (compaction_) {
-            discard_compaction_files(*compaction_);
-            compaction_.reset();
-        }
         try {
             // Quarantined entries still waiting for the worker must not reopen as sources.
             for (const std::uint64_t id : pending_invalidations_) {
@@ -1312,7 +1313,7 @@ KVDiskCache::~KVDiskCache() noexcept {
             queue_tombstone_object_unlinks();
             flush_queued_unlinks();
             write_manifest();
-            fsync_store_dirs(pack_generation_);
+            fsync_store_dirs(index_epoch_);
         } catch (...) { note_drop(KvDiskDropReason::Persist); }
         release_lock();
         unregister_location();
@@ -1396,7 +1397,7 @@ void KVDiskCache::open_directory() {
     for (const auto& entry : std::filesystem::directory_iterator(config_.location / "tmp", tec)) {
         std::filesystem::remove_all(entry.path(), tec);
     }
-    fsync_store_dirs(pack_generation_);
+    fsync_store_dirs(index_epoch_);
     const auto parent = config_.location.parent_path();
     if (!parent.empty()) { fsync_dir(parent); }
 }
@@ -1437,7 +1438,7 @@ void KVDiskCache::fsync_path(const std::filesystem::path& path) const {
 KVDiskCache::CommitObjects
 KVDiskCache::snapshot_new_objects_locked(const SpillSession& session) const {
     CommitObjects snapshot;
-    snapshot.generation = pack_generation_;
+    snapshot.generation = index_epoch_;
     snapshot.objects.reserve(session.new_object_ids.size());
     for (const std::uint64_t id : session.new_object_ids) {
         if (id == 0) { continue; }
@@ -1454,8 +1455,7 @@ void KVDiskCache::fsync_new_objects(const CommitObjects& objects) const {
     std::unordered_set<std::string> touched;
     for (const auto& [id, ref] : objects.objects) {
         (void)id;
-        touched.insert(
-            pack_path(*ref.location.generation, ref.kind, ref.location.segment).string());
+        touched.insert(pack_path(*ref.location.store, ref.kind, ref.location.segment).string());
     }
     for (const auto& path : touched) { fsync_path(path); }
     // A map Put is allowed to outlive its entry metadata, but it must never
@@ -1478,7 +1478,8 @@ void KVDiskCache::fsync_dir(const std::filesystem::path& dir) const {
 }
 
 void KVDiskCache::fsync_object_namespaces(std::uint64_t pack_generation) const {
-    const auto generation = config_.location / "packs" / std::to_string(pack_generation);
+    (void)pack_generation;
+    const auto generation = config_.location / "packs" / "1";
     std::error_code ec;
     if (!std::filesystem::exists(generation, ec)) {
         fsync_dir(config_.location / "packs");
@@ -1509,7 +1510,7 @@ void KVDiskCache::persist_eviction(std::unique_lock<std::mutex>& lock) {
         write_manifest(lock);
     } catch (...) { note_drop(KvDiskDropReason::Persist); }
     if (!lock.owns_lock()) { lock.lock(); }
-    const std::uint64_t generation = pack_generation_;
+    const std::uint64_t generation = index_epoch_;
     lock.unlock();
     // Scan before the store fsync: only an entry-directory removal that the fsync below
     // makes durable may release its tombstone. The scan, fsync and tombstone removal all run
@@ -1583,7 +1584,7 @@ void KVDiskCache::load_or_write_fingerprint() {
     check_fingerprint(decode_fingerprint(read_file_bytes(path)), config_.fingerprint);
 }
 
-std::filesystem::path KVDiskCache::pack_path(const PackGeneration& generation, DiskObjectKind kind,
+std::filesystem::path KVDiskCache::pack_path(const PackStore& generation, DiskObjectKind kind,
                                              std::uint32_t segment) const {
     char name[32]{};
     std::snprintf(name, sizeof(name), "%08u.pack", segment);
@@ -1591,10 +1592,8 @@ std::filesystem::path KVDiskCache::pack_path(const PackGeneration& generation, D
 }
 
 std::filesystem::path KVDiskCache::pack_path(DiskObjectKind kind, std::uint32_t segment) const {
-    if (!active_generation_) {
-        throw std::logic_error("KV disk active pack generation is unavailable");
-    }
-    return pack_path(*active_generation_, kind, segment);
+    if (!pack_store_) { throw std::logic_error("KV disk active pack generation is unavailable"); }
+    return pack_path(*pack_store_, kind, segment);
 }
 
 void KVDiskCache::persist_packset(std::uint64_t generation, std::uint64_t reserved_next_id) const {
@@ -1616,11 +1615,11 @@ KVDiskCache::PackDescriptor::~PackDescriptor() {
 }
 
 std::shared_ptr<KVDiskCache::PackDescriptor>
-KVDiskCache::acquire_pack_descriptor(const std::shared_ptr<PackGeneration>& generation,
+KVDiskCache::acquire_pack_descriptor(const std::shared_ptr<PackStore>& generation,
                                      DiskObjectKind kind, std::uint32_t segment,
                                      bool require_direct) const {
-    if (!generation || generation->number == 0) {
-        throw std::logic_error("KV disk pack generation lease is empty");
+    if (!generation || generation->root.empty()) {
+        throw std::logic_error("KV disk pack store is empty");
     }
     const auto path       = pack_path(*generation, kind, segment);
     const std::string key = path.string();
@@ -1720,15 +1719,14 @@ void KVDiskCache::open_pack_store() {
         if (!entries_.empty() || bootstrap_tree_is_nonempty()) {
             throw std::runtime_error("KV disk PACKSET is missing from a non-empty tree");
         }
-        pack_generation_             = 1;
-        next_object_id_              = 1;
-        object_id_reservation_limit_ = (1ULL << 16) + 1;
-        active_generation_           = std::make_shared<PackGeneration>();
-        active_generation_->number   = pack_generation_;
-        active_generation_->root = config_.location / "packs" / std::to_string(pack_generation_);
-        const auto base          = config_.location / "maps" / "objects-1.base";
-        const auto log           = config_.location / "maps" / "objects-1.log";
-        const auto empty_base    = encode_pack_map_base(pack_generation_, next_object_id_, {});
+        index_epoch_                      = 1;
+        next_object_id_                   = 1;
+        object_id_reservation_limit_      = (1ULL << 16) + 1;
+        pack_store_                       = std::make_shared<PackStore>();
+        pack_store_->root                 = config_.location / "packs" / "1";
+        const auto base                   = config_.location / "maps" / "objects-1.base";
+        const auto log                    = config_.location / "maps" / "objects-1.log";
+        const auto empty_base             = encode_pack_map_base(index_epoch_, next_object_id_, {});
         const auto publish_bootstrap_file = [&](const std::filesystem::path& path,
                                                 const std::vector<std::uint8_t>& bytes) {
             const auto tmp = config_.location / "tmp" / ("bootstrap-" + path.filename().string());
@@ -1758,7 +1756,7 @@ void KVDiskCache::open_pack_store() {
             fsync_dir(pack_path(kind, 0).parent_path());
         }
         const auto tmp   = config_.location / "tmp" / "PACKSET";
-        const auto bytes = encode_packset(pack_generation_, object_id_reservation_limit_);
+        const auto bytes = encode_packset(index_epoch_, object_id_reservation_limit_);
         write_file_bytes(tmp, bytes.data(), bytes.size());
         maybe_test_fault(DiskFaultPoint::AfterPacksetTmpWrite);
         fsync_path(tmp);
@@ -1769,17 +1767,16 @@ void KVDiskCache::open_pack_store() {
         maybe_test_fault(DiskFaultPoint::AfterPacksetRootSync);
     } else {
         const auto bytes = read_file_bytes(packset);
-        if (!decode_packset(bytes, pack_generation_, next_object_id_)) {
+        if (!decode_packset(bytes, index_epoch_, next_object_id_)) {
             throw std::runtime_error("KV disk PACKSET is corrupt");
         }
-        active_generation_         = std::make_shared<PackGeneration>();
-        active_generation_->number = pack_generation_;
-        active_generation_->root   = config_.location / "packs" / std::to_string(pack_generation_);
+        pack_store_                  = std::make_shared<PackStore>();
+        pack_store_->root            = config_.location / "packs" / "1";
         object_id_reservation_limit_ = next_object_id_;
     }
     load_pack_map();
     const auto remove_stale_pack_state = [&] {
-        const std::string active = std::to_string(pack_generation_);
+        const std::string active = std::to_string(index_epoch_);
         bool packs_changed       = false;
         bool maps_changed        = false;
         std::error_code cleanup_ec;
@@ -1792,7 +1789,7 @@ void KVDiskCache::open_pack_store() {
                 }
                 continue;
             }
-            if (item.path().filename() == active) { continue; }
+            if (item.path().filename() == "1") { continue; }
             std::uint64_t generation = 0;
             try {
                 const std::string name = item.path().filename().string();
@@ -1855,7 +1852,7 @@ void KVDiskCache::validate_live_direct_segments() const {
         const std::uint64_t key =
             (static_cast<std::uint64_t>(kind_index(ref.kind)) << 32) | ref.location.segment;
         if (direct_segments.insert(key).second) {
-            const auto path = pack_path(*ref.location.generation, ref.kind, ref.location.segment);
+            const auto path = pack_path(*ref.location.store, ref.kind, ref.location.segment);
             ScopedFd descriptor(::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC));
             if (descriptor.value < 0) {
                 throw std::runtime_error("failed to open direct KV disk pack segment");
@@ -1866,9 +1863,9 @@ void KVDiskCache::validate_live_direct_segments() const {
 
 void KVDiskCache::load_pack_map() {
     const auto base =
-        config_.location / "maps" / ("objects-" + std::to_string(pack_generation_) + ".base");
+        config_.location / "maps" / ("objects-" + std::to_string(index_epoch_) + ".base");
     const auto log =
-        config_.location / "maps" / ("objects-" + std::to_string(pack_generation_) + ".log");
+        config_.location / "maps" / ("objects-" + std::to_string(index_epoch_) + ".log");
     std::error_code ec;
     if (!std::filesystem::exists(base, ec) || !std::filesystem::exists(log, ec)) {
         throw std::runtime_error("KV disk object map is missing");
@@ -1906,9 +1903,10 @@ void KVDiskCache::load_pack_map() {
                 " logical=" + std::to_string(entry.logical_bytes));
         }
         ObjectRef ref;
+        ref.location.lease         = std::make_shared<ObjectRef::ReadLease>();
         ref.kind                   = entry.kind;
         ref.bytes                  = entry.extent_bytes;
-        ref.location.generation    = active_generation_;
+        ref.location.store         = pack_store_;
         ref.location.segment       = entry.segment;
         ref.location.offset        = entry.offset;
         ref.location.extent_bytes  = entry.extent_bytes;
@@ -1926,21 +1924,13 @@ void KVDiskCache::load_pack_map() {
             throw std::runtime_error("KV disk object-map id conflict");
         }
         if (!inserted) { return; }
-        ranges[kind_index(entry.kind)][entry.segment].emplace_back(
-            entry.offset, entry.offset + entry.extent_bytes);
+
         bump_next_id(next_object_id_, entry.id);
-        const std::size_t index = kind_index(entry.kind);
-        if (entry.segment > pack_active_segment_[index] ||
-            (entry.segment == pack_active_segment_[index] &&
-             entry.offset + entry.extent_bytes > pack_active_tail_[index])) {
-            pack_active_segment_[index] = entry.segment;
-            pack_active_tail_[index]    = entry.offset + entry.extent_bytes;
-        }
     };
     try {
         InBuf in{base_bytes.data() + 8, base_bytes.data() + base_bytes.size() - 4};
         if (in.u32() != kDiskFormatVersion || in.u32() != kPackMapBaseEndianLittle ||
-            in.u64() != pack_generation_) {
+            in.u64() != index_epoch_) {
             throw std::runtime_error("KV disk object-map base version is invalid");
         }
         bump_next_id(next_object_id_, in.u64());
@@ -1988,7 +1978,10 @@ void KVDiskCache::load_pack_map() {
             }
             try {
                 InBuf in{bytes.data() + off + 4, bytes.data() + off + frame};
-                if (in.u8() != kPackMapTypePut || in.u8() != 0 || in.u8() != 0 || in.u8() != 0) {
+                const auto type = static_cast<DiskMapRecordKind>(in.u8());
+                if ((type != DiskMapRecordKind::Put && type != DiskMapRecordKind::Delete &&
+                     type != DiskMapRecordKind::Move) ||
+                    in.u8() != 0 || in.u8() != 0 || in.u8() != 0) {
                     throw std::runtime_error("KV disk object-map frame type is invalid");
                 }
                 PackedMapEntry entry;
@@ -2001,11 +1994,28 @@ void KVDiskCache::load_pack_map() {
                 entry.stored_bytes  = in.u64();
                 entry.logical_bytes = in.u64();
                 entry.record_crc32c = in.u32();
-                install(entry);
+                bump_next_id(next_object_id_, entry.id);
+                if (type == DiskMapRecordKind::Delete) {
+                    objects_.erase(entry.id);
+                } else {
+                    if (type == DiskMapRecordKind::Move) {
+                        const auto old = objects_.find(entry.id);
+                        if (old == objects_.end() || old->second.kind != entry.kind ||
+                            old->second.bytes != entry.extent_bytes ||
+                            old->second.location.stored_bytes != entry.stored_bytes ||
+                            old->second.location.logical_bytes != entry.logical_bytes ||
+                            old->second.location.record_crc32c != entry.record_crc32c) {
+                            throw std::runtime_error("KV disk Move changes object identity");
+                        }
+                        objects_.erase(old);
+                    }
+                    install(entry);
+                }
             } catch (const std::runtime_error&) { throw; }
             off += static_cast<std::size_t>(frame) + 4;
         }
     }
+    map_log_bytes_.store(off, std::memory_order_relaxed);
     if (off != log_size) {
         const int fd = ::open(log.c_str(), O_RDWR);
         if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(off)) != 0 || ::fsync(fd) != 0) {
@@ -2013,6 +2023,11 @@ void KVDiskCache::load_pack_map() {
             throw std::runtime_error("failed to truncate KV disk object-map tail");
         }
         ::close(fd);
+    }
+    for (const auto& [id, ref] : objects_) {
+        (void)id;
+        ranges[kind_index(ref.kind)][ref.location.segment].emplace_back(
+            ref.location.offset, ref.location.offset + ref.bytes);
     }
     for (auto& by_segment : ranges) {
         for (auto& [segment, extents] : by_segment) {
@@ -2025,765 +2040,180 @@ void KVDiskCache::load_pack_map() {
             }
         }
     }
-
-    // The append frontier is a property of the durable pack namespace, not
-    // merely of the append-only map.  A crash may leave an unpublished Put,
-    // and older writers could also have made that Put durable before the
-    // pathname of a newly rolled segment.  Such an unreachable Put must not
-    // steer later appends to a segment that does not exist.  For an existing
-    // segment retain both its physical tail and every mapped extent so that
-    // partial/unpublished bytes are never overwritten.
-    pack_active_segment_.fill(0);
-    pack_active_tail_.fill(0);
-    for (DiskObjectKind kind :
-         {DiskObjectKind::Main, DiskObjectKind::Backend, DiskObjectKind::State,
-          DiskObjectKind::Ledger, DiskObjectKind::Identity}) {
-        const std::size_t index = kind_index(kind);
-        const auto directory    = active_generation_->root / kind_dir(kind);
-        std::error_code scan_ec;
-        for (const auto& item : std::filesystem::directory_iterator(directory, scan_ec)) {
-            if (scan_ec || !item.is_regular_file(scan_ec)) {
-                if (scan_ec) { throw std::runtime_error("failed to scan KV disk pack namespace"); }
-                continue;
-            }
-            const std::string name = item.path().filename().string();
-            if (name.size() != 13 || name.substr(8) != ".pack" ||
-                !std::all_of(name.begin(), name.begin() + 8,
-                             [](unsigned char c) { return c >= '0' && c <= '9'; })) {
-                continue;
-            }
-            std::uint64_t parsed       = 0;
-            const auto [end, parse_ec] = std::from_chars(name.data(), name.data() + 8, parsed);
-            if (parse_ec != std::errc{} || end != name.data() + 8 ||
-                parsed > std::numeric_limits<std::uint32_t>::max()) {
-                continue;
-            }
-            const std::uint32_t segment    = static_cast<std::uint32_t>(parsed);
-            const std::uint64_t file_bytes = item.file_size(scan_ec);
-            if (scan_ec) { throw std::runtime_error("KV disk pack segment size is invalid"); }
-            // Only mapped extents are semantic.  A sparse/corrupt suffix must
-            // not make startup scale with, or reject, the apparent host file
-            // size.  Mark an oversized segment full so a future append rolls.
-            std::uint64_t tail = kPackSegmentBytes;
-            if (file_bytes < kPackSegmentBytes) {
-                tail = (file_bytes + kDiskPageIoAlignment - 1) &
-                       ~(static_cast<std::uint64_t>(kDiskPageIoAlignment) - 1);
-            }
-            const auto range_it = ranges[index].find(segment);
-            if (range_it != ranges[index].end()) {
-                for (const auto& extent : range_it->second) {
-                    tail = std::max(tail, extent.second);
-                }
-            }
-            if (segment > pack_active_segment_[index] ||
-                (segment == pack_active_segment_[index] && tail > pack_active_tail_[index])) {
-                pack_active_segment_[index] = segment;
-                pack_active_tail_[index]    = tail;
-            }
-        }
-        if (scan_ec) { throw std::runtime_error("failed to scan KV disk pack namespace"); }
-    }
 }
 
-void KVDiskCache::append_pack_map(const CommitObjects& objects) const {
+void KVDiskCache::append_pack_map(const CommitObjects& objects, DiskMapRecordKind kind) const {
+    // Prepare framing before touching the journal. A failed transaction must not
+    // leave a partial frame in front of a later Put, Delete, or Move.
+    std::vector<std::uint8_t> bytes;
+    for (const auto& [id, ref] : objects.objects) {
+        const auto frame = encode_pack_map_frame(
+            PackedMapEntry{id, ref.kind, ref.location.segment, ref.location.offset, ref.bytes,
+                           ref.location.stored_bytes, ref.location.logical_bytes,
+                           ref.location.record_crc32c},
+            kind);
+        bytes.insert(bytes.end(), frame.begin(), frame.end());
+    }
+    std::lock_guard map_lock(map_io_mutex_);
+    if (map_writes_failed_.load(std::memory_order_relaxed)) {
+        throw std::runtime_error("KV disk journal writes are frozen after rollback failure");
+    }
     const auto log =
         config_.location / "maps" / ("objects-" + std::to_string(objects.generation) + ".log");
-    const int fd = ::open(log.c_str(), O_WRONLY | O_APPEND);
-    if (fd < 0) { throw std::runtime_error("failed to open KV disk object-map log"); }
-    auto close_fd = [&] { ::close(fd); };
-    for (const auto& [id, ref] : objects.objects) {
-        const auto frame = encode_pack_map_frame(PackedMapEntry{
-            id, ref.kind, ref.location.segment, ref.location.offset, ref.bytes,
-            ref.location.stored_bytes, ref.location.logical_bytes, ref.location.record_crc32c});
+    ScopedFd fd(::open(log.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC));
+    struct stat status{};
+    if (fd.value < 0 || ::fstat(fd.value, &status) != 0 || status.st_size < 0) {
+        throw std::runtime_error("failed to open KV disk object-map log");
+    }
+    try {
         std::size_t done = 0;
-        while (done < frame.size()) {
-            const ssize_t n = ::write(fd, frame.data() + done, frame.size() - done);
+        while (done < bytes.size()) {
+            const auto n = ::write(fd.value, bytes.data() + done, bytes.size() - done);
             if (n < 0 && errno == EINTR) { continue; }
-            if (n <= 0) {
-                close_fd();
-                throw std::runtime_error("failed to append KV disk object-map");
-            }
+            if (n <= 0) { throw std::runtime_error("failed to append KV disk object-map"); }
             done += static_cast<std::size_t>(n);
         }
-    }
-    try {
-        maybe_test_fault(DiskFaultPoint::AfterMapAppend);
+        maybe_test_fault(kind == DiskMapRecordKind::Move     ? DiskFaultPoint::AfterMoveAppend
+                         : kind == DiskMapRecordKind::Delete ? DiskFaultPoint::AfterDeleteAppend
+                                                             : DiskFaultPoint::AfterMapAppend);
+        if (::fdatasync(fd.value) != 0) {
+            throw std::runtime_error("failed to sync KV disk object-map");
+        }
+        maybe_test_fault(kind == DiskMapRecordKind::Move     ? DiskFaultPoint::AfterMoveSync
+                         : kind == DiskMapRecordKind::Delete ? DiskFaultPoint::AfterDeleteSync
+                                                             : DiskFaultPoint::AfterMapSync);
     } catch (...) {
-        close_fd();
+        const bool restored = attempt_recoverable([&] {
+            maybe_test_fault(DiskFaultPoint::BeforeMapRollback);
+            if (::ftruncate(fd.value, status.st_size) != 0 || ::fdatasync(fd.value) != 0) {
+                throw std::runtime_error("failed to restore KV disk journal boundary");
+            }
+        });
+        if (!restored) {
+            map_writes_failed_.store(true, std::memory_order_relaxed);
+            throw std::runtime_error(
+                "KV disk journal rollback failed; writes are frozen until reopen");
+        }
         throw;
     }
-    if (::fdatasync(fd) != 0) {
-        close_fd();
-        throw std::runtime_error("failed to sync KV disk object-map");
-    }
+    map_log_bytes_.store(static_cast<std::uint64_t>(status.st_size) + bytes.size(),
+                         std::memory_order_relaxed);
+}
+
+bool KVDiskCache::object_map_checkpoint_needed() const {
+    const auto limit = std::max<std::uint64_t>(
+        64ULL << 10, static_cast<std::uint64_t>(objects_.size()) * (kPackMapFrameBytes + 4) * 2);
+    return !stopping_ && !map_writes_failed_.load(std::memory_order_relaxed) && !defrag_active_ &&
+           !spill_ && !payload_io_inflight_ && !emergency_preparing_ && !idle_pinning_ &&
+           !reclaiming_objects_ && !map_checkpoint_publishing_ &&
+           map_checkpoint_failed_generation_ != durable_generation_ &&
+           map_log_bytes_.load(std::memory_order_relaxed) > limit;
+}
+
+void KVDiskCache::checkpoint_object_map(std::unique_lock<std::mutex>& lock) {
+    if (!object_map_checkpoint_needed()) { return; }
+    const auto next = index_epoch_ + 1;
+    std::vector<std::uint8_t> base_bytes;
+    std::filesystem::path maps, base, log;
+    std::uint64_t reserved = 0;
     try {
-        maybe_test_fault(DiskFaultPoint::AfterMapSync);
+        if (index_epoch_ == std::numeric_limits<std::uint64_t>::max()) {
+            throw std::runtime_error("KV disk index epoch space is exhausted");
+        }
+        std::vector<PackedMapEntry> entries;
+        entries.reserve(objects_.size());
+        for (const auto& [id, ref] : objects_) {
+            if (!ref.location.store || ref.location.extent_bytes == 0) { continue; }
+            entries.push_back({id, ref.kind, ref.location.segment, ref.location.offset, ref.bytes,
+                               ref.location.stored_bytes, ref.location.logical_bytes,
+                               ref.location.record_crc32c});
+        }
+        base_bytes = encode_pack_map_base(next, next_object_id_, std::move(entries));
+        maps       = config_.location / "maps";
+        base       = maps / ("objects-" + std::to_string(next) + ".base");
+        log        = maps / ("objects-" + std::to_string(next) + ".log");
+        reserved   = object_id_reservation_limit_;
     } catch (...) {
-        close_fd();
-        throw;
+        map_checkpoint_failed_generation_ = durable_generation_;
+        note_drop(KvDiskDropReason::Persist);
+        return;
     }
-    close_fd();
-}
-
-std::uint64_t KVDiskCache::packed_allocated_bytes() const {
-    std::uint64_t total = 0;
-    if (!active_generation_) { return std::numeric_limits<std::uint64_t>::max(); }
-    std::error_code ec;
-    const auto packs = config_.location / "packs";
-    if (!std::filesystem::exists(packs, ec)) {
-        return ec ? std::numeric_limits<std::uint64_t>::max() : 0;
-    }
-    // A generation being reaped with the mutex released is already unreachable; its files
-    // vanish during the scan.
-    const auto reaping = [&](const std::filesystem::path& root) {
-        return std::any_of(retired_generations_.begin(), retired_generations_.end(),
-                           [&](const auto& retired) {
-                               return retired && retired->reaping && retired->root == root;
-                           });
-    };
-    for (const auto& generation : std::filesystem::directory_iterator(packs, ec)) {
-        if (ec) { return std::numeric_limits<std::uint64_t>::max(); }
-        if (!generation.is_directory(ec) || ec) {
-            if (ec) { return std::numeric_limits<std::uint64_t>::max(); }
-            continue;
-        }
-        if (reaping(generation.path())) { continue; }
-        for (DiskObjectKind kind :
-             {DiskObjectKind::Main, DiskObjectKind::Backend, DiskObjectKind::State,
-              DiskObjectKind::Ledger, DiskObjectKind::Identity}) {
-            const auto directory = generation.path() / kind_dir(kind);
-            if (!std::filesystem::exists(directory, ec)) {
-                if (ec) { return std::numeric_limits<std::uint64_t>::max(); }
-                continue;
-            }
-            for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
-                if (ec) { return std::numeric_limits<std::uint64_t>::max(); }
-                if (!entry.is_regular_file(ec) || ec) {
-                    if (ec) { return std::numeric_limits<std::uint64_t>::max(); }
-                    continue;
-                }
-                const std::uint64_t bytes = entry.file_size(ec);
-                if (ec || std::numeric_limits<std::uint64_t>::max() - total < bytes) {
-                    return std::numeric_limits<std::uint64_t>::max();
-                }
-                total += bytes;
-            }
-        }
-    }
-    return total;
-}
-
-std::uint64_t KVDiskCache::packed_retained_bytes() const {
-    std::uint64_t total = 0;
-    for (const auto& [id, ref] : objects_) {
-        (void)id;
-        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) { continue; }
-        if (std::numeric_limits<std::uint64_t>::max() - total < ref.bytes) {
-            return std::numeric_limits<std::uint64_t>::max();
-        }
-        total += ref.bytes;
-    }
-    return total;
-}
-
-bool KVDiskCache::packs_need_compaction() const {
-    const std::uint64_t allocated = packed_allocated_bytes();
-    const std::uint64_t retained  = packed_retained_bytes();
-    return allocated != 0 && retained < allocated && allocated - retained >= allocated / 4;
-}
-
-// Publication switches object locations to the new generation. Readers copy a
-// location, including its generation lease, under the mutex for every read, and
-// claimed entries keep their objects referenced, so restores may continue across
-// the switch and the source generation is reaped only after those reads drain. Only an object
-// writer (a spill session or its payload I/O) could land bytes the new map omits. A scheduler-side
-// emergency prepare may release the mutex before it installs its session, so it blocks
-// publication too; it waits for an in-flight publication before starting.
-bool KVDiskCache::compaction_publish_blocked_locked() const noexcept {
-    return spill_ || payload_io_inflight_ != 0 || emergency_preparing_;
-}
-
-namespace {
-
-// One worker slice of compaction copy; the cache mutex is released for it.
-constexpr std::uint64_t kCompactionSliceBytes = 64ULL << 20;
-
-} // namespace
-
-void KVDiskCache::CompactionRun::close_outputs() noexcept {
-    for (int& fd : output) {
-        if (fd >= 0) {
-            (void)::close(fd);
-            fd = -1;
-        }
-    }
-}
-
-void KVDiskCache::request_compaction_locked() noexcept {
-    if (compaction_ || compaction_failed_generation_ == durable_generation_) { return; }
-    compaction_requested_ = true;
-    cv_.notify_all();
-}
-
-bool KVDiskCache::compaction_pending_locked() const {
-    if (compaction_ || compaction_requested_) { return true; }
-    return compaction_failed_generation_ != durable_generation_ && retired_generations_.empty() &&
-           packs_need_compaction();
-}
-
-bool KVDiskCache::compaction_runnable_locked() const noexcept {
-    if (stopping_) { return false; }
-    if (!compaction_) { return compaction_requested_; }
-    if (compaction_->next < compaction_->pending.size() || !compaction_->synced) { return true; }
-    return !compaction_publish_blocked_locked();
-}
-
-bool KVDiskCache::begin_compaction_locked() {
-    // A retired generation still leased by a reader is not reclaimable by
-    // another rewrite; compacting again would only copy the live set twice.
-    if (!retired_generations_.empty() || !packs_need_compaction()) { return true; }
-    if (!active_generation_) { return false; }
-    const auto available_bytes = [&]() -> std::optional<std::uint64_t> {
-        if (test_free_bytes_override_) { return test_free_bytes_override_; }
-        struct statvfs fs{};
-        if (::statvfs(config_.location.c_str(), &fs) != 0 || fs.f_frsize == 0 ||
-            fs.f_bavail > std::numeric_limits<std::uint64_t>::max() / fs.f_frsize) {
-            return std::nullopt;
-        }
-        return static_cast<std::uint64_t>(fs.f_bavail) * fs.f_frsize;
-    }();
-    const std::uint64_t retained          = packed_retained_bytes();
-    constexpr std::uint64_t kSegmentSlack = 1ULL << 30;
-    if (!available_bytes || retained > std::numeric_limits<std::uint64_t>::max() - kSegmentSlack ||
-        *available_bytes < retained + kSegmentSlack) {
-        return false;
-    }
-    const std::uint64_t old_generation = pack_generation_;
-    if (old_generation == std::numeric_limits<std::uint64_t>::max()) { return false; }
-    std::uint64_t new_generation = old_generation + 1;
-    std::error_code generation_ec;
-    while (std::filesystem::exists(config_.location / "packs" / std::to_string(new_generation),
-                                   generation_ec)) {
-        if (generation_ec || new_generation == std::numeric_limits<std::uint64_t>::max()) {
-            return false;
-        }
-        ++new_generation;
-    }
-    if (generation_ec) { return false; }
-    auto run            = std::make_unique<CompactionRun>();
-    run->new_generation = new_generation;
-    run->source         = active_generation_;
-    run->root           = config_.location / "packs" / std::to_string(new_generation);
-    run->target         = std::make_shared<PackGeneration>();
-    run->target->number = new_generation;
-    run->target->root   = run->root;
-    run->pending.reserve(objects_.size());
-    for (const auto& [id, ref] : objects_) {
-        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) { continue; }
-        run->pending.push_back({id, ref});
-    }
-    std::sort(run->pending.begin(), run->pending.end(),
-              [](const auto& a, const auto& b) { return a.id < b.id; });
-    run->copied.reserve(run->pending.size());
-    run->moves.reserve(run->pending.size());
-    compaction_ = std::move(run);
-    return true;
-}
-
-KVDiskCache::CompactionRun::Move
-KVDiskCache::copy_compaction_object(CompactionRun& run, const CompactionRun::Source& source) {
-    const auto read_fully = [](int fd, void* data, std::size_t bytes, off_t offset) {
-        auto* out        = static_cast<std::uint8_t*>(data);
-        std::size_t done = 0;
-        while (done < bytes) {
-            const ssize_t n =
-                ::pread(fd, out + done, bytes - done, offset + static_cast<off_t>(done));
-            if (n < 0 && errno == EINTR) { continue; }
-            if (n <= 0) { return false; }
-            done += static_cast<std::size_t>(n);
-        }
-        return true;
-    };
-    const auto write_fully = [](int fd, const void* data, std::size_t bytes, off_t offset) {
-        const auto* in   = static_cast<const std::uint8_t*>(data);
-        std::size_t done = 0;
-        while (done < bytes) {
-            const ssize_t n =
-                ::pwrite(fd, in + done, bytes - done, offset + static_cast<off_t>(done));
-            if (n < 0 && errno == EINTR) { continue; }
-            if (n <= 0) { return false; }
-            done += static_cast<std::size_t>(n);
-        }
-        return true;
-    };
-    maybe_hold_unlocked_io(DiskUnlockedIo::CompactionCopy);
-    if (run.buffer.empty()) { run.buffer.resize(1U << 20); }
-    std::vector<std::uint8_t>& buffer = run.buffer;
-    auto& segment                     = run.segment;
-    auto& tail                        = run.tail;
-    auto& output                      = run.output;
-    const std::uint64_t id            = source.id;
-    const ObjectRef& ref              = source.ref;
-    const std::size_t index           = kind_index(ref.kind);
-    if (!ref.location.generation || ref.location.stored_bytes == 0 ||
-        ref.location.stored_bytes > ref.bytes || ref.location.logical_bytes == 0) {
-        throw std::runtime_error(
-            "invalid KV pack source metadata during compaction id=" + std::to_string(id) +
-            " kind=" + std::to_string(static_cast<unsigned>(ref.kind)) + " extent=" +
-            std::to_string(ref.bytes) + " stored=" + std::to_string(ref.location.stored_bytes) +
-            " logical=" + std::to_string(ref.location.logical_bytes));
-    }
-    if (tail[index] != 0 && tail[index] + ref.bytes > kPackSegmentBytes) {
-        ++segment[index];
-        tail[index] = 0;
-        if (output[index] >= 0) {
-            const int fd  = output[index];
-            output[index] = -1;
-            if (::fdatasync(fd) != 0) {
-                (void)::close(fd);
-                throw std::runtime_error("failed to sync rolled compacted KV pack");
-            }
-            if (::close(fd) != 0) {
-                throw std::runtime_error("failed to close rolled compacted KV pack");
-            }
-        }
-    }
-    const auto out_path = run.root / kind_dir(ref.kind) / ([&] {
-                              char name[32]{};
-                              std::snprintf(name, sizeof(name), "%08u.pack", segment[index]);
-                              return std::string(name);
-                          })();
-    if (output[index] < 0) {
-        std::filesystem::create_directories(out_path.parent_path());
-        // A publication attempt may already have created this segment empty.
-        output[index] = ::open(out_path.c_str(), O_CREAT | O_RDWR, 0644);
-        if (output[index] < 0) { throw std::runtime_error("failed to create compacted KV pack"); }
-    }
-    const auto input =
-        acquire_pack_descriptor(ref.location.generation, ref.kind, ref.location.segment, false);
-    struct stat input_stat{};
-    if (::fstat(input->buffered, &input_stat) != 0 ||
-        static_cast<std::uint64_t>(input_stat.st_size) < ref.location.offset + ref.bytes) {
-        throw std::runtime_error("short KV pack source during compaction");
-    }
-    std::uint8_t header[kDiskStatePayloadOffset]{};
-    const std::size_t header_bytes =
-        ref.kind == DiskObjectKind::State
-            ? kDiskCodecHeaderBytes
-            : (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend
-                   ? kDiskPageHeaderBytes
-                   : 0);
-    if (header_bytes != 0 && !read_fully(input->buffered, header, header_bytes,
-                                         static_cast<off_t>(ref.location.offset))) {
-        throw std::runtime_error("failed to read KV pack source header");
-    }
-    std::uint32_t record_crc  = ~0U;
-    std::uint32_t payload_crc = ~0U;
-    std::uint64_t copied      = 0;
-    while (copied < ref.bytes) {
-        const std::size_t chunk =
-            static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), ref.bytes - copied));
-        if (!read_fully(input->buffered, buffer.data(), chunk,
-                        static_cast<off_t>(ref.location.offset + copied)) ||
-            !write_fully(output[index], buffer.data(), chunk,
-                         static_cast<off_t>(tail[index] + copied))) {
-            throw std::runtime_error("failed to copy KV pack extent");
-        }
-        const std::uint64_t stored_begin = copied;
-        const std::uint64_t stored_end =
-            std::min<std::uint64_t>(copied + chunk, ref.location.stored_bytes);
-        if (stored_begin < stored_end) {
-            const auto stored = std::span<const std::uint8_t>(
-                buffer.data(), static_cast<std::size_t>(stored_end - stored_begin));
-            record_crc = crc32c_update(record_crc, stored);
-            const std::uint64_t payload_begin =
-                ref.kind == DiskObjectKind::State
-                    ? kDiskStatePayloadOffset
-                    : (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend
-                           ? kDiskPageHeaderBytes
-                           : 0);
-            if (stored_begin < ref.location.stored_bytes &&
-                payload_begin < ref.location.stored_bytes) {
-                const std::uint64_t begin = std::max(stored_begin, payload_begin);
-                const std::uint64_t end   = stored_end;
-                if (begin < end) {
-                    payload_crc = crc32c_update(
-                        payload_crc, std::span<const std::uint8_t>(
-                                         buffer.data() + static_cast<std::size_t>(begin - copied),
-                                         static_cast<std::size_t>(end - begin)));
-                }
-            }
-        }
-        copied += chunk;
-    }
-    if (~record_crc != ref.location.record_crc32c) {
-        throw std::runtime_error("KV pack record CRC mismatch during compaction");
-    }
-    if (ref.kind == DiskObjectKind::Main || ref.kind == DiskObjectKind::Backend) {
-        std::uint32_t version  = 0;
-        std::uint32_t expected = 0;
-        std::memcpy(&version, header + 8, sizeof(version));
-        std::memcpy(&expected, header + 12, sizeof(expected));
-        if (std::memcmp(header, kDiskPageMagic, 8) != 0 || version != kDiskFormatVersion ||
-            ref.location.stored_bytes != kDiskPageHeaderBytes + ref.location.logical_bytes ||
-            ref.bytes != aligned_page_file_bytes(ref.location.logical_bytes) ||
-            expected != ~payload_crc) {
-            throw std::runtime_error("invalid KV page record during compaction");
-        }
-    } else if (ref.kind == DiskObjectKind::State) {
-        const auto codec       = static_cast<DiskCodec>(header[0]);
-        const auto state_kind  = static_cast<DiskStateKind>(header[1]);
-        std::uint64_t unc      = 0;
-        std::uint64_t cmp      = 0;
-        std::uint32_t expected = 0;
-        std::memcpy(&unc, header + 4, sizeof(unc));
-        std::memcpy(&cmp, header + 12, sizeof(cmp));
-        std::memcpy(&expected, header + 20, sizeof(expected));
-        if (!valid_state_kind(static_cast<std::uint8_t>(state_kind)) ||
-            !codec_payload_ok(codec, unc, cmp, ref.location.logical_bytes) ||
-            unc != ref.location.logical_bytes ||
-            cmp != ref.location.stored_bytes - kDiskStatePayloadOffset ||
-            expected != ~payload_crc) {
-            throw std::runtime_error("invalid KV state record during compaction");
-        }
-    } else if (ref.location.logical_bytes != ref.location.stored_bytes) {
-        throw std::runtime_error("invalid KV raw record during compaction");
-    }
-    const CompactionRun::Move move{id, ObjectRef::Location{nullptr, segment[index], tail[index],
-                                                           ref.bytes, ref.location.stored_bytes,
-                                                           ref.location.logical_bytes,
-                                                           ref.location.record_crc32c}};
-    tail[index] += ref.bytes;
-    return move;
-}
-
-void KVDiskCache::sync_compaction_outputs(CompactionRun& run) {
-    maybe_test_fault(DiskFaultPoint::CompactionAfterPackCopy);
-    for (int fd : run.output) {
-        if (fd >= 0 && ::fdatasync(fd) != 0) {
-            throw std::runtime_error("failed to sync compacted KV pack");
-        }
-    }
-    maybe_test_fault(DiskFaultPoint::CompactionAfterPackSync);
-}
-
-void KVDiskCache::prepare_compaction_maps(CompactionRun& run,
-                                          const std::vector<std::uint8_t>& base_bytes) {
-    for (DiskObjectKind kind :
-         {DiskObjectKind::Main, DiskObjectKind::Backend, DiskObjectKind::State,
-          DiskObjectKind::Ledger, DiskObjectKind::Identity}) {
-        const std::size_t index = kind_index(kind);
-        const auto path         = pack_path(*run.target, kind, run.segment[index]);
-        if (std::filesystem::exists(path)) { continue; }
-        std::filesystem::create_directories(path.parent_path());
-        const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
-        if (fd < 0) { throw std::runtime_error("failed to create compacted KV pack segment"); }
-        if (::fsync(fd) != 0) {
-            ::close(fd);
-            throw std::runtime_error("failed to sync compacted KV pack segment");
-        }
-        ::close(fd);
-    }
-    const auto maps = config_.location / "maps";
-    const auto base = maps / ("objects-" + std::to_string(run.new_generation) + ".base");
-    const auto log  = maps / ("objects-" + std::to_string(run.new_generation) + ".log");
-    write_file_bytes(base, base_bytes.data(), base_bytes.size());
-    maybe_test_fault(DiskFaultPoint::CompactionAfterBaseWrite);
-    fsync_path(base);
-    maybe_test_fault(DiskFaultPoint::CompactionAfterBaseSync);
-    write_file_bytes(log, nullptr, 0);
-    maybe_test_fault(DiskFaultPoint::CompactionAfterLogWrite);
-    fsync_path(log);
-    maybe_test_fault(DiskFaultPoint::CompactionAfterLogSync);
-    fsync_dir(run.root / "main");
-    fsync_dir(run.root / "backend");
-    fsync_dir(run.root / "state");
-    fsync_dir(run.root / "ledger");
-    fsync_dir(run.root / "identity");
-    fsync_dir(run.root);
-    fsync_dir(config_.location / "packs");
-    fsync_dir(maps);
-}
-
-bool KVDiskCache::compaction_delta_locked(CompactionRun& run) {
-    std::vector<CompactionRun::Source> delta;
-    for (const auto& [id, ref] : objects_) {
-        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) { continue; }
-        if (ref.location.generation != run.source || run.copied.count(id) != 0) { continue; }
-        delta.push_back({id, ref});
-    }
-    if (delta.empty()) { return false; }
-    std::sort(delta.begin(), delta.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
-    run.pending = std::move(delta);
-    run.next    = 0;
-    run.synced  = false;
-    return true;
-}
-
-// Publication waits for no spill session to be allocating in the source generation.
-void KVDiskCache::publish_compaction(std::unique_lock<std::mutex>& lock, CompactionRun& run) {
-    std::vector<PackedMapEntry> base_entries;
-    base_entries.reserve(run.moves.size());
-    for (const CompactionRun::Move& move : run.moves) {
-        const auto it = objects_.find(move.id);
-        if (it == objects_.end() || it->second.location.generation != run.source) { continue; }
-        const ObjectRef& ref = it->second;
-        base_entries.push_back({move.id, ref.kind, move.location.segment, move.location.offset,
-                                ref.bytes, move.location.stored_bytes, move.location.logical_bytes,
-                                move.location.record_crc32c});
-    }
-    const auto base_bytes =
-        encode_pack_map_base(run.new_generation, next_object_id_, std::move(base_entries));
+    map_checkpoint_publishing_ = true;
     lock.unlock();
     try {
-        prepare_compaction_maps(run, base_bytes);
-    } catch (...) {
+        write_file_bytes(base, base_bytes.data(), base_bytes.size());
+        fsync_path(base);
+        maybe_test_fault(DiskFaultPoint::AfterIndexBaseSync);
+        write_file_bytes(log, nullptr, 0);
+        fsync_path(log);
+        maybe_test_fault(DiskFaultPoint::AfterIndexLogSync);
+        fsync_dir(maps);
+        maybe_hold_unlocked_io(DiskUnlockedIo::MapCheckpoint);
+        persist_packset(next, reserved);
         lock.lock();
-        throw;
-    }
-    lock.lock();
-    // A spill may have started while the maps were written; publish after it
-    // commits instead (the maps are rewritten then).
-    if (compaction_publish_blocked_locked() || compaction_delta_locked(run)) { return; }
-    // PACKSET is written, synced and renamed with the mutex released. io_thread_ alone runs
-    // compaction steps and the spill page/commit jobs that allocate object ids, so no other
-    // PACKSET writer runs and the reservation limit is stable. No object writer can start
-    // meanwhile: the worker's own prepares run on this thread and a scheduler emergency
-    // prepare waits for compaction_publishing_ to drop (compaction_step clears it on failure).
-    compaction_publishing_                = true;
-    const std::uint64_t reservation_limit = object_id_reservation_limit_;
-    lock.unlock();
-    try {
-        maybe_hold_unlocked_io(DiskUnlockedIo::CompactionPackset);
-        const auto tmp   = config_.location / "tmp" / "PACKSET";
-        const auto bytes = encode_packset(run.new_generation, reservation_limit);
-        write_file_bytes(tmp, bytes.data(), bytes.size());
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetTmpWrite);
-        fsync_path(tmp);
-        maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetTmpSync);
-        run.close_outputs();
-        std::filesystem::rename(tmp, config_.location / "PACKSET");
-    } catch (...) {
+        index_epoch_ = next;
+        map_log_bytes_.store(0, std::memory_order_relaxed);
+        packset_publication_pending_sync_ = false;
+        lock.unlock();
+        for (const auto& file : std::filesystem::directory_iterator(maps)) {
+            const auto name = file.path().filename().string();
+            if (file.path() != base && file.path() != log && name.starts_with("objects-") &&
+                (name.ends_with(".base") || name.ends_with(".log"))) {
+                std::filesystem::remove(file.path());
+            }
+        }
+        fsync_dir(maps);
         lock.lock();
-        throw;
-    }
-    lock.lock();
-    run.published                     = true;
-    packset_publication_pending_sync_ = true;
-    // Rename success is an uncertain publication until root fsync.  The
-    // visible in-process generation must follow the rename immediately;
-    // the old generation remains leased and retained on a root-fsync
-    // failure because restart may observe either pointer.
-    pack_generation_     = run.new_generation;
-    pack_active_segment_ = run.segment;
-    pack_active_tail_    = run.tail;
-    if (active_generation_) { retired_generations_.push_back(std::move(active_generation_)); }
-    active_generation_ = run.target;
-    for (const CompactionRun::Move& move : run.moves) {
-        const auto it = objects_.find(move.id);
-        if (it == objects_.end() || it->second.location.generation != run.source) { continue; }
-        it->second.location            = move.location;
-        it->second.location.generation = active_generation_;
-    }
-    // Unreferenced map entries are physical garbage, not leases.  Drop
-    // their old-generation pointers after the new map is active so the
-    // retired generation can be reclaimed once real readers have drained.
-    for (auto it = objects_.begin(); it != objects_.end();) {
-        const ObjectRef& ref = it->second;
-        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0) {
-            it = objects_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    maybe_test_fault(DiskFaultPoint::CompactionAfterPacksetRename);
-    // Object writers stay out until the root fsync makes the new generation durable, so no
-    // entry can publish an extent of a generation a restart might not select.
-    lock.unlock();
-    try {
-        fsync_dir(config_.location);
-    } catch (...) {
-        lock.lock();
-        throw;
-    }
-    lock.lock();
-    packset_publication_pending_sync_ = false;
-    compaction_publishing_            = false;
-    idle_cv_.notify_all();
-    maybe_test_fault(DiskFaultPoint::CompactionAfterRootSync);
-    compaction_.reset();
-    reap_retired_generations(lock);
-}
-
-void KVDiskCache::discard_compaction_files(CompactionRun& run) noexcept {
-    run.close_outputs();
-    if (run.published) { return; }
-    std::error_code cleanup_ec;
-    std::filesystem::remove_all(run.root, cleanup_ec);
-    const auto maps = config_.location / "maps";
-    (void)std::filesystem::remove(
-        maps / ("objects-" + std::to_string(run.new_generation) + ".base"), cleanup_ec);
-    (void)std::filesystem::remove(maps / ("objects-" + std::to_string(run.new_generation) + ".log"),
-                                  cleanup_ec);
-}
-
-void KVDiskCache::compaction_step(std::unique_lock<std::mutex>& lock) {
-    try {
-        if (!compaction_) {
-            compaction_requested_ = false;
-            if (!begin_compaction_locked()) { compaction_failed_generation_ = durable_generation_; }
-            if (!compaction_) {
-                idle_cv_.notify_all();
-                cv_.notify_all();
-                return;
-            }
-        }
-        CompactionRun& run = *compaction_;
-        if (run.next < run.pending.size()) {
-            const std::size_t begin = run.next;
-            std::size_t end         = begin;
-            std::uint64_t bytes     = 0;
-            while (end < run.pending.size() && (end == begin || bytes < kCompactionSliceBytes)) {
-                bytes += run.pending[end].ref.bytes;
-                ++end;
-            }
-            std::vector<CompactionRun::Move> moved;
-            moved.reserve(end - begin);
-            lock.unlock();
-            try {
-                if (begin == 0) {
-                    for (DiskObjectKind kind :
-                         {DiskObjectKind::Main, DiskObjectKind::Backend, DiskObjectKind::State,
-                          DiskObjectKind::Ledger, DiskObjectKind::Identity}) {
-                        std::filesystem::create_directories(run.root / kind_dir(kind));
-                    }
-                }
-                for (std::size_t i = begin; i < end; ++i) {
-                    moved.push_back(copy_compaction_object(run, run.pending[i]));
-                }
-            } catch (...) {
-                lock.lock();
-                throw;
-            }
-            lock.lock();
-            for (const CompactionRun::Move& move : moved) {
-                run.copied.insert(move.id);
-                run.moves.push_back(move);
-            }
-            run.next   = end;
-            run.synced = false;
-            return;
-        }
-        if (!run.synced) {
-            lock.unlock();
-            try {
-                sync_compaction_outputs(run);
-            } catch (...) {
-                lock.lock();
-                throw;
-            }
-            lock.lock();
-            run.synced = true;
-            return;
-        }
-        if (compaction_publish_blocked_locked()) { return; }
-        // Objects committed to the source generation since the snapshot are
-        // copied in further slices before publication.
-        if (compaction_delta_locked(run)) { return; }
-        publish_compaction(lock, run);
     } catch (...) {
         if (!lock.owns_lock()) { lock.lock(); }
-        // Stamp before releasing the mutex so a concurrent spill admission does
-        // not immediately request the same failed rewrite again.
-        compaction_failed_generation_ = durable_generation_;
-        compaction_requested_         = false;
-        compaction_publishing_        = false;
-        if (compaction_) {
-            std::unique_ptr<CompactionRun> run = std::move(compaction_);
-            lock.unlock();
-            discard_compaction_files(*run);
-            run.reset();
-            lock.lock();
+        // A failed root fsync may follow a successful PACKSET rename. Select the
+        // visible epoch but prohibit reuse until its root durability is retried.
+        std::uint64_t visible = 0, high_water = 0;
+        const bool selected = attempt_recoverable([&] {
+            if (!decode_packset(read_file_bytes(config_.location / "PACKSET"), visible,
+                                high_water)) {
+                throw std::runtime_error("KV disk index publication is unreadable");
+            }
+        });
+        if (!selected) { packset_publication_pending_sync_ = true; }
+        if (selected && visible == next) {
+            index_epoch_ = next;
+            map_log_bytes_.store(0, std::memory_order_relaxed);
+            packset_publication_pending_sync_ = true;
         }
-        // A successful PACKSET rename followed by a failed root fsync is an
-        // uncertain publication.  The new generation stays active and the old
-        // lease is retained; maintenance reports the failure.
+        map_checkpoint_failed_generation_ = durable_generation_;
+        note_drop(KvDiskDropReason::Persist);
     }
+    map_checkpoint_publishing_ = false;
     idle_cv_.notify_all();
     cv_.notify_all();
 }
 
-void KVDiskCache::reap_retired_generations(std::unique_lock<std::mutex>& lock) {
-    if (packset_publication_pending_sync_) { return; }
-    // Nothing in objects_ names a retired generation, so the last lease is the vector's own:
-    // once a generation is marked reaping no reader can lease it again, and it can be removed
-    // with the mutex released. It stays in retired_generations_ meanwhile, so compaction
-    // keeps treating it as unreclaimed space.
-    std::vector<PackGeneration*> reaping;
-    for (const auto& generation : retired_generations_) {
-        if (generation && !generation->reaping && generation.use_count() == 1) {
-            reaping.push_back(generation.get());
+void KVDiskCache::recover_index_epoch(std::unique_lock<std::mutex>* lock) {
+    if (!packset_publication_pending_sync_) { return; }
+    map_checkpoint_publishing_ = true;
+    if (lock != nullptr) { lock->unlock(); }
+    std::uint64_t epoch = 0, high_water = 0, log_bytes = 0;
+    try {
+        if (!decode_packset(read_file_bytes(config_.location / "PACKSET"), epoch, high_water)) {
+            throw std::runtime_error("KV disk selected index epoch is corrupt");
         }
+        log_bytes = std::filesystem::file_size(config_.location / "maps" /
+                                               ("objects-" + std::to_string(epoch) + ".log"));
+        fsync_dir(config_.location);
+    } catch (...) {
+        if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
+        map_checkpoint_publishing_ = false;
+        idle_cv_.notify_all();
+        throw;
     }
-    if (reaping.empty()) { return; }
-    std::vector<std::uint8_t> reaped(reaping.size(), 0);
-    for (PackGeneration* generation : reaping) { generation->reaping = true; }
-    std::uint64_t sync_failures = 0;
-    lock.unlock();
-    maybe_hold_unlocked_io(DiskUnlockedIo::GenerationReap);
-    for (std::size_t i = 0; i < reaping.size(); ++i) {
-        PackGeneration& generation = *reaping[i];
-        try {
-            std::unordered_map<std::string, std::shared_ptr<PackDescriptor>> descriptors;
-            {
-                std::lock_guard guard(generation.descriptor_mu);
-                descriptors.swap(generation.descriptors);
-            }
-            descriptors.clear();
-            const auto packs = config_.location / "packs";
-            const auto maps  = config_.location / "maps";
-            const auto base  = maps / ("objects-" + std::to_string(generation.number) + ".base");
-            const auto log   = maps / ("objects-" + std::to_string(generation.number) + ".log");
-            std::error_code pack_ec;
-            std::error_code base_ec;
-            std::error_code log_ec;
-            std::filesystem::remove_all(generation.root, pack_ec);
-            std::filesystem::remove(base, base_ec);
-            std::filesystem::remove(log, log_ec);
-            if (pack_ec || base_ec || log_ec) { continue; }
-            try {
-                // Synchronize both namespaces even when a prior attempt already
-                // removed the names but failed before the directory fsyncs.
-                fsync_dir(packs);
-                fsync_dir(maps);
-            } catch (...) {
-                ++sync_failures;
-                continue;
-            }
-            reaped[i] = 1;
-            // An unreaped generation stays retired and is retried at the next reap.
-        } catch (...) { // NOLINT(bugprone-empty-catch): reaped[i] stays 0; see above.
-        }
-    }
-    lock.lock();
-    note_drop(KvDiskDropReason::Persist, sync_failures);
-    for (std::size_t i = 0; i < reaping.size(); ++i) {
-        const auto it =
-            std::find_if(retired_generations_.begin(), retired_generations_.end(),
-                         [&](const auto& generation) { return generation.get() == reaping[i]; });
-        if (it == retired_generations_.end()) { continue; }
-        if (reaped[i] != 0) {
-            retired_generations_.erase(it);
-        } else {
-            (*it)->reaping = false;
-        }
-    }
+    if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
+    index_epoch_                 = epoch;
+    object_id_reservation_limit_ = std::max(object_id_reservation_limit_, high_water);
+    map_log_bytes_.store(log_bytes, std::memory_order_relaxed);
+    packset_publication_pending_sync_ = false;
+    map_checkpoint_publishing_        = false;
     idle_cv_.notify_all();
-}
-
-bool KVDiskCache::generation_reap_in_flight_locked() const noexcept {
-    return std::any_of(retired_generations_.begin(), retired_generations_.end(),
-                       [](const auto& generation) { return generation && generation->reaping; });
 }
 
 KVDiskCache::ManifestImage KVDiskCache::manifest_image_locked() const {
@@ -2953,10 +2383,9 @@ bool KVDiskCache::load_entry(std::uint64_t entry_id) {
                 }
             }
             std::error_code size_ec;
-            const std::uint64_t pack_bytes =
-                std::filesystem::file_size(pack_path(*object->second.location.generation, kind,
-                                                     object->second.location.segment),
-                                           size_ec);
+            const std::uint64_t pack_bytes = std::filesystem::file_size(
+                pack_path(*object->second.location.store, kind, object->second.location.segment),
+                size_ec);
             if (size_ec || object->second.location.offset > pack_bytes ||
                 sz > pack_bytes - object->second.location.offset) {
                 return false;
@@ -3276,26 +2705,34 @@ void KVDiskCache::load_index() {
             }
             queue_tombstone_object_unlinks();
             flush_queued_unlinks();
-            (void)attempt_recoverable([&] { fsync_store_dirs(pack_generation_); });
+            (void)attempt_recoverable([&] { fsync_store_dirs(index_epoch_); });
             reclaim_durable_tombstones();
         } catch (...) { rebuild_manifest(); }
     }
-    bool trimmed = false;
-    // Stops once no entry can be durably tombstoned.
-    while (unique_bytes_ > config_.capacity_bytes && fifo_evict_one()) { trimmed = true; }
+    reclaim_orphan_objects();
     queue_tombstone_object_unlinks();
     flush_queued_unlinks();
+    bool trimmed = false;
+    while (pack_storage_bytes_ > config_.capacity_bytes) {
+        bool evicted = fifo_evict_one();
+        if (!evicted) {
+            EvictionBatch batch;
+            for (std::size_t i = 0; i < skipped_.size(); ++i) {
+                if (begin_skipped_eviction_locked(i, batch)) { break; }
+            }
+            evicted = run_eviction(batch, nullptr);
+        }
+        if (!evicted) {
+            throw std::runtime_error("cannot reduce KV disk pack storage to configured capacity");
+        }
+        trimmed = true;
+        flush_queued_unlinks();
+    }
     if (trimmed) {
-        try {
-            write_manifest();
-        } catch (...) { note_drop(KvDiskDropReason::Persist); }
-        try {
-            fsync_store_dirs(pack_generation_);
-        } catch (...) { note_drop(KvDiskDropReason::Persist); }
+        write_manifest();
+        fsync_store_dirs(index_epoch_);
         reclaim_durable_tombstones();
     }
-    reclaim_orphan_objects();
-    flush_queued_unlinks();
 }
 
 KVDiskCache::IndexEntry& KVDiskCache::require(std::uint64_t entry_id) {
@@ -3612,8 +3049,7 @@ void KVDiskCache::queue_tombstone_object_unlinks() {
                                          it->second.hold_refs != 0)) {
                 continue;
             }
-            // Packed extents become reclaimable garbage after the durable
-            // tombstone; they are reclaimed only by pack-set compaction.
+            unlink_unreferenced(id);
         }
     }
 }
@@ -3623,10 +3059,7 @@ bool KVDiskCache::tombstone_objects_remain(
     std::error_code ec;
     for (const auto& [kind, id] : objects) {
         const auto it = objects_.find(id);
-        if (it != objects_.end() &&
-            (it->second.live_refs != 0 || it->second.skip_refs != 0 || it->second.hold_refs != 0)) {
-            return true;
-        }
+        if (it != objects_.end()) { return true; }
         (void)kind;
     }
     return false;
@@ -3656,6 +3089,7 @@ std::uint32_t KVDiskCache::index_entry_limit() const noexcept {
 }
 
 bool KVDiskCache::flush_queued_unlinks() {
+    reclaim_objects();
     std::vector<std::filesystem::path> paths;
     paths.swap(pending_unlinks_);
     std::size_t failed = 0;
@@ -3673,6 +3107,7 @@ bool KVDiskCache::flush_queued_unlinks() {
 }
 
 bool KVDiskCache::flush_queued_unlinks(std::unique_lock<std::mutex>& lock) {
+    reclaim_objects(&lock);
     std::vector<std::filesystem::path> paths;
     paths.swap(pending_unlinks_);
     if (paths.empty()) { return true; }
@@ -3715,7 +3150,12 @@ void KVDiskCache::unlink_unreferenced(std::uint64_t id) {
     if (it->second.live_refs != 0 || it->second.skip_refs != 0 || it->second.hold_refs != 0) {
         return;
     }
-    objects_.erase(it);
+    if (!it->second.reclaim_pending) {
+        it->second.next_reclaim    = pending_reclaim_head_;
+        it->second.reclaim_pending = true;
+        pending_reclaim_head_      = id;
+        ++pending_reclaim_count_;
+    }
 }
 
 bool KVDiskCache::begin_entry_eviction_locked(std::uint64_t entry_id, EvictionBatch& batch) {
@@ -3984,11 +3424,10 @@ void KVDiskCache::reserve_object_ids_locked(std::uint64_t count,
     const std::uint64_t limit = base + span;
     // Reserve before exposing an id to a write job.  A crash or failed append can therefore
     // create gaps but can never reuse an id whose bytes might have reached a pack extent.
-    // Ids are allocated only by spill page and commit jobs, and compaction publishes only
-    // from compaction steps; io_thread_ alone runs all of them, so no other PACKSET writer
+    // Spill jobs and index checkpoints serialize PACKSET publication, so no other writer
     // or generation switch can run while the mutex is released for the write, fsync, rename
     // and root fsync.
-    const std::uint64_t generation = pack_generation_;
+    const std::uint64_t generation = index_epoch_;
     lock.unlock();
     try {
         persist_packset(generation, limit);
@@ -4030,6 +3469,318 @@ void KVDiskCache::finish_payload_io(std::unique_lock<std::mutex>& lock) {
     }
     idle_cv_.notify_all();
     cv_.notify_all();
+}
+
+void KVDiskCache::insert_free_extent(DiskObjectKind kind, std::uint32_t segment,
+                                     std::uint64_t offset, std::uint64_t bytes) {
+    if (bytes == 0) { return; }
+    auto& index     = free_extents_[kind_index(kind)];
+    const auto next = index.offsets.lower_bound({segment, offset});
+    auto previous   = index.offsets.end();
+    if (next != index.offsets.begin()) {
+        const auto candidate = std::prev(next);
+        if (candidate->first.first == segment &&
+            candidate->first.second + candidate->second->first == offset) {
+            previous = candidate;
+            offset   = candidate->first.second;
+            bytes += candidate->second->first;
+        }
+    }
+    const bool join_next =
+        next != index.offsets.end() && next->first == ExtentKey{segment, offset + bytes};
+    if (join_next) { bytes += next->second->first; }
+    // Prepare both index nodes before changing ownership. Allocation failure
+    // must leave every existing interval available for a subsequent retry.
+    FreeExtentSizes prepared_sizes;
+    const auto prepared_size = prepared_sizes.emplace(bytes, ExtentKey{segment, offset});
+    decltype(index.offsets) prepared_offsets;
+    const auto prepared_offset =
+        prepared_offsets.emplace(ExtentKey{segment, offset}, prepared_size).first;
+    if (previous != index.offsets.end()) {
+        index.sizes.erase(previous->second);
+        index.offsets.erase(previous);
+    }
+    if (join_next) {
+        index.sizes.erase(next->second);
+        index.offsets.erase(next);
+    }
+    const auto size     = index.sizes.insert(prepared_sizes.extract(prepared_size));
+    auto node           = prepared_offsets.extract(prepared_offset);
+    node.mapped()       = size;
+    const auto inserted = index.offsets.insert(std::move(node));
+    if (!inserted.inserted) { throw std::logic_error("KV disk free extents overlap"); }
+}
+
+KVDiskCache::ObjectRef::Location KVDiskCache::reserve_pack_extent(DiskObjectKind kind,
+                                                                  std::uint64_t bytes) {
+    if (bytes == 0 || bytes > kPackSegmentBytes || bytes % kDiskPageIoAlignment != 0) {
+        throw std::logic_error("KV disk extent size is invalid");
+    }
+    ObjectRef::Location location;
+    location.store        = pack_store_;
+    location.lease        = std::make_shared<ObjectRef::ReadLease>();
+    location.extent_bytes = bytes;
+    const auto k          = kind_index(kind);
+    auto& free            = free_extents_[k];
+    const auto fit        = free.sizes.lower_bound(bytes);
+    if (fit != free.sizes.end()) {
+        const auto [segment, offset] = fit->second;
+        const auto remaining         = fit->first - bytes;
+        auto offset_node             = free.offsets.extract(fit->second);
+        auto size_node               = free.sizes.extract(fit);
+        if (remaining != 0) {
+            const ExtentKey suffix{segment, offset + bytes};
+            size_node.key()      = remaining;
+            size_node.mapped()   = suffix;
+            const auto size      = free.sizes.insert(std::move(size_node));
+            offset_node.key()    = suffix;
+            offset_node.mapped() = size;
+            free.offsets.insert(std::move(offset_node));
+        }
+        location.segment = segment;
+        location.offset  = offset;
+        pack_segments_[k].at(segment).occupied_bytes += bytes;
+        return location;
+    }
+    if (bytes > config_.capacity_bytes || pack_storage_bytes_ > config_.capacity_bytes - bytes) {
+        throw std::runtime_error("KV disk pack storage capacity exceeded");
+    }
+    auto segment = pack_active_segment_[k];
+    auto offset  = pack_active_tail_[k];
+    if (pack_segments_[k][segment].trimming || offset > kPackSegmentBytes - bytes) {
+        if (pack_last_segment_[k] == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("KV disk pack segment number overflow");
+        }
+        segment = ++pack_last_segment_[k];
+        offset  = 0;
+        ScopedFd fd(
+            ::open(pack_path(kind, segment).c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644));
+        if (fd.value < 0) { throw std::runtime_error("failed to create KV disk pack segment"); }
+    }
+    if (pack_segments_[k][segment].bytes == 0) {
+        ScopedFd fd(::open(pack_path(kind, segment).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+        if (fd.value < 0) { throw std::runtime_error("failed to open empty KV disk pack segment"); }
+    }
+    auto& state = pack_segments_[k][segment];
+    state.bytes = offset + bytes;
+    state.occupied_bytes += bytes;
+    pack_storage_bytes_ += bytes;
+    pack_active_segment_[k] = segment;
+    pack_active_tail_[k]    = offset + bytes;
+    location.segment        = segment;
+    location.offset         = offset;
+    return location;
+}
+
+void KVDiskCache::release_pack_extent(DiskObjectKind kind, const ObjectRef::Location& location) {
+    if (!location.store || location.extent_bytes == 0) { return; }
+    auto& segment = pack_segments_[kind_index(kind)].at(location.segment);
+    if (segment.occupied_bytes < location.extent_bytes) {
+        throw std::logic_error("KV disk extent ownership underflow");
+    }
+    insert_free_extent(kind, location.segment, location.offset, location.extent_bytes);
+    segment.occupied_bytes -= location.extent_bytes;
+}
+
+void KVDiskCache::rebuild_free_extents() {
+    pack_storage_bytes_ = 0;
+    pack_active_segment_.fill(0);
+    pack_active_tail_.fill(0);
+    pack_last_segment_.fill(0);
+    for (std::size_t k = 0; k < pack_segments_.size(); ++k) {
+        auto& free = free_extents_[k];
+        free.offsets.clear();
+        free.sizes.clear();
+        pack_segments_[k].clear();
+        const auto kind      = static_cast<DiskObjectKind>(k);
+        const auto directory = pack_store_->root / kind_dir(kind);
+        std::filesystem::create_directories(directory);
+        for (const auto& file : std::filesystem::directory_iterator(directory)) {
+            if (!file.is_regular_file()) { continue; }
+            const auto name = file.path().filename().string();
+            if (name.size() != 13 || name.substr(8) != ".pack") { continue; }
+            std::uint32_t segment   = 0;
+            const auto [end, error] = std::from_chars(name.data(), name.data() + 8, segment);
+            if (error != std::errc{} || end != name.data() + 8) { continue; }
+            pack_segments_[k].emplace(segment, PackSegment{file.file_size(), 0});
+            pack_last_segment_[k] = std::max(pack_last_segment_[k], segment);
+        }
+        pack_active_segment_[k] = pack_last_segment_[k];
+        std::map<ExtentKey, std::uint64_t> occupied;
+        for (auto& [id, ref] : objects_) {
+            (void)id;
+            if (ref.kind != kind) { continue; }
+            const auto segment = pack_segments_[k].find(ref.location.segment);
+            if (segment == pack_segments_[k].end() || ref.location.offset > segment->second.bytes ||
+                ref.bytes > segment->second.bytes - ref.location.offset) {
+                // Keep the id so entry validation rejects its missing payload.
+                // It owns no physical extent and cannot credit free storage.
+                ref.location.extent_bytes = 0;
+                continue;
+            }
+            segment->second.occupied_bytes += ref.bytes;
+            occupied.emplace(ExtentKey{ref.location.segment, ref.location.offset}, ref.bytes);
+        }
+        for (auto& [segment, state] : pack_segments_[k]) {
+            std::uint64_t offset = 0;
+            for (auto it = occupied.lower_bound({segment, 0});
+                 it != occupied.end() && it->first.first == segment; ++it) {
+                if (it->first.second > offset) {
+                    insert_free_extent(kind, segment, offset, it->first.second - offset);
+                }
+                offset = it->first.second + it->second;
+            }
+            // An unpublished tail has no map owner. Reclaim it before charging
+            // the real file length; never hide an oversized file behind a cap.
+            if (state.bytes > offset) {
+                ScopedFd fd(::open(pack_path(kind, segment).c_str(), O_WRONLY | O_CLOEXEC));
+                if (fd.value < 0 || ::ftruncate(fd.value, static_cast<off_t>(offset)) != 0 ||
+                    ::fdatasync(fd.value) != 0) {
+                    throw std::runtime_error("failed to truncate unowned KV disk pack tail");
+                }
+                state.bytes = offset;
+            }
+            pack_storage_bytes_ += state.bytes;
+            if (segment == pack_active_segment_[k]) { pack_active_tail_[k] = state.bytes; }
+        }
+    }
+}
+
+void KVDiskCache::trim_pack_tails(std::unique_lock<std::mutex>* lock, PackTrim policy) {
+    const auto epoch = defrag_cancel_epoch_;
+    for (std::size_t k = 0; k < pack_segments_.size(); ++k) {
+        auto& free = free_extents_[k];
+        for (auto& [segment, state] : pack_segments_[k]) {
+            if (policy == PackTrim::FreeTails && maintenance_interrupted(epoch)) { return; }
+            if (state.bytes == 0 || state.trimming ||
+                (policy == PackTrim::EmptyOnly && state.occupied_bytes != 0)) {
+                continue;
+            }
+            auto last = free.offsets.upper_bound({segment, state.bytes});
+            if (last == free.offsets.begin()) { continue; }
+            --last;
+            if (last->first.first != segment ||
+                last->first.second + last->second->first != state.bytes) {
+                continue;
+            }
+            const auto tail  = last->first.second;
+            const auto bytes = last->second->first;
+            auto size_node   = free.sizes.extract(last->second);
+            auto offset_node = free.offsets.extract(last);
+            state.trimming   = true;
+            if (lock != nullptr) { lock->unlock(); }
+            bool truncated = false;
+            bool synced    = false;
+            try {
+                const auto fd = acquire_pack_descriptor(pack_store_, static_cast<DiskObjectKind>(k),
+                                                        segment, false);
+                if (::ftruncate(fd->buffered, static_cast<off_t>(tail)) != 0) {
+                    throw std::runtime_error("failed to truncate KV disk pack tail");
+                }
+                truncated = true;
+                synced    = ::fdatasync(fd->buffered) == 0;
+            } catch (...) {
+                if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
+                state.trimming = false;
+                if (!truncated) {
+                    auto previous = free.offsets.lower_bound({segment, tail});
+                    if (previous != free.offsets.begin()) {
+                        --previous;
+                        if (previous->first.first == segment &&
+                            previous->first.second + previous->second->first == tail) {
+                            size_node.key() += previous->second->first;
+                            size_node.mapped() = previous->first;
+                            offset_node.key()  = previous->first;
+                            free.sizes.erase(previous->second);
+                            free.offsets.erase(previous);
+                        }
+                    }
+                    const auto size      = free.sizes.insert(std::move(size_node));
+                    offset_node.mapped() = size;
+                    free.offsets.insert(std::move(offset_node));
+                    throw;
+                }
+            }
+            if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
+            pack_storage_bytes_ -= bytes;
+            state.bytes = tail;
+            if (segment == pack_active_segment_[k]) { pack_active_tail_[k] = tail; }
+            state.trimming = false;
+            if (!synced) { note_drop(KvDiskDropReason::Persist); }
+        }
+    }
+}
+
+void KVDiskCache::reclaim_objects(std::unique_lock<std::mutex>* lock) {
+    if (reclaiming_objects_ || map_checkpoint_publishing_ ||
+        map_writes_failed_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    recover_index_epoch(lock);
+    CommitObjects retired;
+    retired.generation = index_epoch_;
+    retired.objects.reserve(pending_reclaim_count_);
+    for (auto id = pending_reclaim_head_; id != 0;) {
+        const auto& ref = objects_.at(id);
+        if (ref.live_refs == 0 && ref.skip_refs == 0 && ref.hold_refs == 0 &&
+            (!ref.location.lease || ref.location.lease.use_count() == 1)) {
+            retired.objects.emplace_back(id, ref);
+        }
+        id = ref.next_reclaim;
+    }
+    if (retired.objects.empty()) { return; }
+    for (const auto& [id, ref] : retired.objects) {
+        (void)ref;
+        objects_.at(id).reclaiming = true;
+    }
+    auto* link = &pending_reclaim_head_;
+    while (*link != 0) {
+        auto& ref = objects_.at(*link);
+        if (ref.reclaiming || ref.live_refs != 0 || ref.skip_refs != 0 || ref.hold_refs != 0) {
+            *link               = ref.next_reclaim;
+            ref.next_reclaim    = 0;
+            ref.reclaim_pending = false;
+            --pending_reclaim_count_;
+        } else {
+            link = &ref.next_reclaim;
+        }
+    }
+    reclaiming_objects_ = true;
+    if (lock != nullptr) { lock->unlock(); }
+    try {
+        append_pack_map(retired, DiskMapRecordKind::Delete);
+    } catch (...) {
+        if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
+        reclaiming_objects_ = false;
+        for (const auto& [id, ref] : retired.objects) {
+            (void)ref;
+            objects_.at(id).reclaiming = false;
+            unlink_unreferenced(id);
+        }
+        throw;
+    }
+    if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
+    packset_publication_pending_sync_ = false;
+    try {
+        for (const auto& [id, ref] : retired.objects) {
+            release_pack_extent(ref.kind, ref.location);
+            objects_.erase(id);
+        }
+        trim_pack_tails(lock, PackTrim::EmptyOnly);
+    } catch (...) {
+        for (const auto& [id, ref] : retired.objects) {
+            (void)ref;
+            const auto it = objects_.find(id);
+            if (it != objects_.end()) {
+                it->second.reclaiming = false;
+                unlink_unreferenced(id);
+            }
+        }
+        reclaiming_objects_ = false;
+        throw;
+    }
+    reclaiming_objects_ = false;
+    idle_cv_.notify_all();
 }
 
 void KVDiskCache::write_new_object(DiskObjectKind kind, std::uint64_t id, const void* data,
@@ -4080,32 +3831,14 @@ void KVDiskCache::write_new_object_parts(
     if (total > static_cast<std::uint64_t>(SSIZE_MAX)) {
         throw std::logic_error("KV disk pack record exceeds write size limit");
     }
-    const std::size_t index = kind_index(kind);
-    std::uint32_t segment   = pack_active_segment_[index];
-    std::uint64_t offset    = pack_active_tail_[index];
-    if (offset + bytes < offset) { throw std::runtime_error("KV disk pack offset overflow"); }
-    if (offset != 0 && offset + bytes > kPackSegmentBytes) {
-        segment = ++pack_active_segment_[index];
-        offset  = 0;
-        std::filesystem::create_directories(pack_path(kind, segment).parent_path());
-        const int made = ::open(pack_path(kind, segment).c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
-        if (made < 0) {
-            throw std::runtime_error("failed to create KV disk pack rollover segment");
-        }
-        ::close(made);
-    }
-    if (bytes > kPackSegmentBytes || offset > kPackSegmentBytes - bytes) {
-        throw std::runtime_error("KV disk pack record exceeds segment capacity");
-    }
-    // Reserve the append range before releasing the cache lock.  A partial
-    // write is permanent pack garbage and must never be overwritten by a
-    // later writer in this process.
-    pack_active_segment_[index] = segment;
-    pack_active_tail_[index]    = offset + bytes;
+    const auto location      = reserve_pack_extent(kind, bytes);
+    const auto segment       = location.segment;
+    const auto offset        = location.offset;
+    objects_.at(id).location = location;
     if (lock != nullptr) { lock->unlock(); }
     try {
         maybe_payload_io_stall(DiskUnlockedIo::PayloadWrite);
-        const auto descriptor = acquire_pack_descriptor(active_generation_, kind, segment, false);
+        const auto descriptor = acquire_pack_descriptor(pack_store_, kind, segment, false);
         const int fd          = descriptor->buffered;
         if (fail_object_write_) {
             fail_object_write_ = false;
@@ -4135,13 +3868,13 @@ void KVDiskCache::write_new_object_parts(
         maybe_test_fault(DiskFaultPoint::AfterRecordWrite);
     } catch (...) {
         if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
-        objects_.erase(id);
+        unlink_unreferenced(id);
         throw;
     }
     if (lock != nullptr && !lock->owns_lock()) { lock->lock(); }
     auto it = objects_.find(id);
     if (it != objects_.end()) {
-        it->second.location.generation   = active_generation_;
+        it->second.location.store        = pack_store_;
         it->second.bytes                 = bytes;
         it->second.location.segment      = segment;
         it->second.location.offset       = offset;
@@ -4303,7 +4036,7 @@ bool KVDiskCache::read_object(DiskObjectKind kind, std::uint64_t id, void* dst,
     {
         std::lock_guard lock(mutex_);
         const auto it = objects_.find(id);
-        if (it == objects_.end() || it->second.kind != kind ||
+        if (it == objects_.end() || it->second.reclaiming || it->second.kind != kind ||
             bytes > it->second.location.stored_bytes ||
             it->second.location.stored_bytes > it->second.location.extent_bytes) {
             return false;
@@ -4315,14 +4048,13 @@ bool KVDiskCache::read_object(DiskObjectKind kind, std::uint64_t id, void* dst,
     ScopedFd startup_descriptor;
     int fd = -1;
     if (startup_loading_index_) {
-        const auto path          = pack_path(*location.generation, kind, location.segment);
+        const auto path          = pack_path(*location.store, kind, location.segment);
         startup_descriptor.value = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (startup_descriptor.value < 0) { return false; }
         fd = startup_descriptor.value;
     } else {
         try {
-            descriptor =
-                acquire_pack_descriptor(location.generation, kind, location.segment, false);
+            descriptor = acquire_pack_descriptor(location.store, kind, location.segment, false);
         } catch (...) { return false; }
         fd = descriptor->buffered;
     }
@@ -4358,7 +4090,7 @@ bool KVDiskCache::read_page_payload(DiskObjectKind kind, std::uint64_t id, void*
     {
         std::lock_guard lock(mutex_);
         const auto it = objects_.find(id);
-        if (it == objects_.end() || it->second.kind != kind ||
+        if (it == objects_.end() || it->second.reclaiming || it->second.kind != kind ||
             it->second.location.extent_bytes == 0 ||
             it->second.location.stored_bytes < kDiskPageHeaderBytes ||
             it->second.location.logical_bytes != payload ||
@@ -4371,7 +4103,7 @@ bool KVDiskCache::read_page_payload(DiskObjectKind kind, std::uint64_t id, void*
     maybe_payload_io_stall(DiskUnlockedIo::PayloadRead);
     std::shared_ptr<PackDescriptor> descriptor;
     try {
-        descriptor = acquire_pack_descriptor(location.generation, kind, location.segment, true);
+        descriptor = acquire_pack_descriptor(location.store, kind, location.segment, true);
     } catch (...) { return false; }
     const int fd            = descriptor->direct;
     const std::size_t bytes = static_cast<std::size_t>(location.extent_bytes);
@@ -4416,7 +4148,8 @@ bool KVDiskCache::decode_state_parts(std::uint64_t id, DiskStateKind expected, v
     {
         std::lock_guard lock(mutex_);
         const auto object = objects_.find(id);
-        if (object == objects_.end() || object->second.kind != DiskObjectKind::State) {
+        if (object == objects_.end() || object->second.reclaiming ||
+            object->second.kind != DiskObjectKind::State) {
             return false;
         }
         location = object->second.location;
@@ -4424,8 +4157,8 @@ bool KVDiskCache::decode_state_parts(std::uint64_t id, DiskStateKind expected, v
     maybe_payload_io_stall(DiskUnlockedIo::PayloadRead);
     std::shared_ptr<PackDescriptor> descriptor;
     try {
-        descriptor = acquire_pack_descriptor(location.generation, DiskObjectKind::State,
-                                             location.segment, false);
+        descriptor =
+            acquire_pack_descriptor(location.store, DiskObjectKind::State, location.segment, false);
     } catch (...) { return false; }
     int fd = descriptor->buffered;
     struct stat st{};
@@ -4480,7 +4213,7 @@ bool KVDiskCache::decode_state_parts(std::uint64_t id, DiskStateKind expected, v
         if (direct) {
             maybe_direct_state_read_barrier();
             try {
-                descriptor = acquire_pack_descriptor(location.generation, DiskObjectKind::State,
+                descriptor = acquire_pack_descriptor(location.store, DiskObjectKind::State,
                                                      location.segment, true);
             } catch (...) { return false; }
             fd = descriptor->direct;
@@ -5160,6 +4893,256 @@ bool KVDiskCache::ram_is_durable(std::uint64_t ram_id) const {
     return it != ram_notes_.end() && it->second.durable;
 }
 
+void KVDiskCache::set_cache_idle(bool idle) {
+    std::lock_guard lock(mutex_);
+    if (cache_idle_ != idle) {
+        cache_idle_ = idle;
+        ++defrag_cancel_epoch_;
+        maintenance_due_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        maintenance_done_generation_  = 0;
+        defrag_candidates_generation_ = 0;
+        if (idle) { idle_requested_ = true; }
+    }
+    cv_.notify_all();
+}
+
+bool KVDiskCache::maintenance_interrupted(std::uint64_t epoch) const {
+    return stopping_ || !cache_idle_ || epoch != defrag_cancel_epoch_ || idle_requested_ ||
+           spill_ || emergency_preparing_ || emergency_waiting_ || idle_pinning_ ||
+           map_checkpoint_publishing_ || reclaiming_objects_ || eviction_rounds_in_flight_ != 0 ||
+           !restore_q_.empty() || !prefetch_q_.empty() || !emergency_q_.empty() ||
+           !idle_q_.empty() || restore_or_prefetch_busy_locked() ||
+           map_writes_failed_.load(std::memory_order_relaxed);
+}
+
+bool KVDiskCache::maintenance_ready() const {
+    return !defrag_active_ && !maintenance_interrupted(defrag_cancel_epoch_) &&
+           (maintenance_done_generation_ != durable_generation_ || !retired_extents_.empty() ||
+            pending_reclaim_count_ != 0) &&
+           std::chrono::steady_clock::now() >= maintenance_due_;
+}
+
+void KVDiskCache::reap_relocated_extents() {
+    if (map_writes_failed_.load(std::memory_order_relaxed)) { return; }
+    for (auto it = retired_extents_.begin(); it != retired_extents_.end();) {
+        if (it->location.lease.use_count() != 1) {
+            ++it;
+            continue;
+        }
+        release_pack_extent(it->kind, it->location);
+        it                           = retired_extents_.erase(it);
+        maintenance_done_generation_ = 0;
+    }
+}
+
+void KVDiskCache::defrag_idle_step(std::unique_lock<std::mutex>& lock) {
+    const auto epoch = defrag_cancel_epoch_;
+    maintenance_due_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    std::uint64_t id = 0;
+    std::list<RetiredExtent>::iterator retired = retired_extents_.end();
+    ObjectRef::Location source, target;
+    DiskObjectKind kind = DiskObjectKind::Main;
+    bool held           = false;
+    defrag_active_      = true;
+    try {
+        reclaim_objects(&lock);
+        reap_relocated_extents();
+        trim_pack_tails(&lock, PackTrim::FreeTails);
+        if (maintenance_interrupted(epoch)) {
+            defrag_active_ = false;
+            idle_cv_.notify_all();
+            return;
+        }
+        // Moving strictly toward lower addresses cannot cycle. Source order and
+        // earliest-fit destinations preserve contiguous page runs when a hole fits them. Only
+        // sparse segments justify payload copying; adjacent holes are coalesced without moving
+        // data.
+        if (defrag_candidates_generation_ != durable_generation_) {
+            defrag_candidates_.clear();
+            defrag_candidates_.reserve(objects_.size());
+            for (const auto& [candidate_id, ref] : objects_) {
+                if (ref.location.extent_bytes != 0) {
+                    defrag_candidates_.push_back(
+                        {ref.kind, ref.location.segment, ref.location.offset, candidate_id});
+                }
+            }
+            std::sort(defrag_candidates_.begin(), defrag_candidates_.end(),
+                      [](const auto& a, const auto& b) {
+                          return std::tuple{a.kind, a.segment, a.offset, a.id} >
+                                 std::tuple{b.kind, b.segment, b.offset, b.id};
+                      });
+            defrag_candidates_generation_ = durable_generation_;
+        }
+        std::optional<ExtentKey> destination;
+        while (!defrag_candidates_.empty() && !destination) {
+            const auto candidate_id = defrag_candidates_.back().id;
+            defrag_candidates_.pop_back();
+            const auto found = objects_.find(candidate_id);
+            if (found == objects_.end()) { continue; }
+            const auto& ref = found->second;
+            if (ref.reclaiming || ref.location.extent_bytes == 0 ||
+                (ref.live_refs == 0 && ref.skip_refs == 0) || ref.hold_refs != 0) {
+                continue;
+            }
+            const auto k        = kind_index(ref.kind);
+            const auto& segment = pack_segments_[k].at(ref.location.segment);
+            if (segment.trimming || segment.occupied_bytes > segment.bytes - segment.bytes / 4) {
+                continue;
+            }
+            const ExtentKey from{ref.location.segment, ref.location.offset};
+            const auto& holes = free_extents_[k];
+            for (auto fit = holes.offsets.begin(); fit != holes.offsets.end() && fit->first < from;
+                 ++fit) {
+                if (fit->second->first < ref.bytes) { continue; }
+                id          = candidate_id;
+                source      = ref.location;
+                kind        = ref.kind;
+                destination = fit->first;
+                break;
+            }
+        }
+        if (!destination) {
+            maintenance_done_generation_ = durable_generation_;
+            defrag_active_               = false;
+            idle_cv_.notify_all();
+            return;
+        }
+        // Allocate every owner before removing the target hole from the free index.
+        auto lease = std::make_shared<ObjectRef::ReadLease>();
+        defrag_buffer_.resize(1ULL << 20);
+        auto& buffer = defrag_buffer_;
+        retired_extents_.push_back({kind, source});
+        retired              = std::prev(retired_extents_.end());
+        auto& holes          = free_extents_[kind_index(kind)];
+        const auto size_it   = holes.offsets.at(*destination);
+        auto offset_node     = holes.offsets.extract(*destination);
+        auto size_node       = holes.sizes.extract(size_it);
+        const auto remaining = size_node.key() - source.extent_bytes;
+        if (remaining != 0) {
+            const ExtentKey suffix{destination->first, destination->second + source.extent_bytes};
+            size_node.key()      = remaining;
+            size_node.mapped()   = suffix;
+            const auto inserted  = holes.sizes.insert(std::move(size_node));
+            offset_node.key()    = suffix;
+            offset_node.mapped() = inserted;
+            holes.offsets.insert(std::move(offset_node));
+        }
+        target         = source;
+        target.lease   = std::move(lease);
+        target.segment = destination->first;
+        target.offset  = destination->second;
+        pack_segments_[kind_index(kind)].at(target.segment).occupied_bytes += target.extent_bytes;
+        ++objects_.at(id).hold_refs;
+        held                 = true;
+        const auto input     = acquire_pack_descriptor(source.store, kind, source.segment, false);
+        const auto output    = acquire_pack_descriptor(target.store, kind, target.segment, false);
+        std::uint64_t copied = 0;
+        std::uint32_t crc    = ~0U;
+        while (copied < source.extent_bytes) {
+            if (maintenance_interrupted(epoch)) {
+                throw std::runtime_error("KV disk relocation cancelled");
+            }
+            const auto wake  = std::chrono::steady_clock::now() + std::chrono::milliseconds(16);
+            const auto chunk = static_cast<std::size_t>(
+                std::min<std::uint64_t>(buffer.size(), source.extent_bytes - copied));
+            lock.unlock();
+            maybe_hold_unlocked_io(DiskUnlockedIo::DefragCopy);
+            std::size_t done = 0;
+            while (done < chunk) {
+                const auto n = ::pread(input->buffered, buffer.data() + done, chunk - done,
+                                       static_cast<off_t>(source.offset + copied + done));
+                if (n < 0 && errno == EINTR) { continue; }
+                if (n <= 0) {
+                    throw std::runtime_error("failed to read KV disk relocation source");
+                }
+                done += static_cast<std::size_t>(n);
+            }
+            if (copied < source.stored_bytes) {
+                crc = crc32c_update(
+                    crc, std::span<const std::uint8_t>(
+                             buffer.data(), static_cast<std::size_t>(std::min<std::uint64_t>(
+                                                chunk, source.stored_bytes - copied))));
+            }
+            done = 0;
+            while (done < chunk) {
+                const auto n = ::pwrite(output->buffered, buffer.data() + done, chunk - done,
+                                        static_cast<off_t>(target.offset + copied + done));
+                if (n < 0 && errno == EINTR) { continue; }
+                if (n <= 0) {
+                    throw std::runtime_error("failed to write KV disk relocation target");
+                }
+                done += static_cast<std::size_t>(n);
+            }
+            lock.lock();
+            copied += chunk;
+            cv_.wait_until(lock, wake, [&] { return maintenance_interrupted(epoch); });
+        }
+        if (~crc != source.record_crc32c) {
+            throw std::runtime_error("KV disk relocation source CRC mismatch");
+        }
+        if (maintenance_interrupted(epoch)) {
+            throw std::runtime_error("KV disk relocation cancelled");
+        }
+        CommitObjects moved;
+        moved.generation = index_epoch_;
+        ObjectRef ref    = objects_.at(id);
+        ref.location     = target;
+        moved.objects.emplace_back(id, std::move(ref));
+        lock.unlock();
+        maybe_test_fault(DiskFaultPoint::AfterMoveCopy);
+        if (::fdatasync(output->buffered) != 0) {
+            throw std::runtime_error("failed to sync KV disk relocation target");
+        }
+        maybe_test_fault(DiskFaultPoint::AfterMovePackSync);
+        maybe_hold_unlocked_io(DiskUnlockedIo::DefragPublish);
+        lock.lock();
+        if (maintenance_interrupted(epoch)) {
+            throw std::runtime_error("KV disk relocation cancelled");
+        }
+        lock.unlock();
+        append_pack_map(moved, DiskMapRecordKind::Move);
+        maybe_hold_unlocked_io(DiskUnlockedIo::DefragMapped);
+        lock.lock();
+        // After durable publication, complete the location handoff even if a
+        // request arrived during the sync. No further payload copying is needed.
+        objects_.at(id).location = target;
+        release_hold(id);
+        held                         = false;
+        source                       = {};
+        target                       = {};
+        retired                      = retired_extents_.end();
+        maintenance_done_generation_ = 0;
+    } catch (...) {
+        if (!lock.owns_lock()) { lock.lock(); }
+        if (retired != retired_extents_.end()) {
+            if (target.extent_bytes == 0) {
+                retired_extents_.erase(retired);
+            } else if (map_writes_failed_.load(std::memory_order_relaxed)) {
+                // The source hold and destination reservation survive until
+                // reopen resolves the possibly durable journal location.
+                uncertain_relocation_ = RetiredExtent{kind, target};
+                retired_extents_.erase(retired);
+                held = false;
+            } else {
+                retired->location = target;
+            }
+        }
+        if (held) { release_hold(id); }
+        if (map_writes_failed_.load(std::memory_order_relaxed) || !maintenance_interrupted(epoch)) {
+            note_drop(KvDiskDropReason::Persist);
+        }
+        maintenance_done_generation_ = durable_generation_;
+    }
+    source = {};
+    target = {};
+    try {
+        reap_relocated_extents();
+    } catch (const std::bad_alloc&) { note_drop(KvDiskDropReason::OptionalAlloc); }
+    defrag_active_ = false;
+    idle_cv_.notify_all();
+    cv_.notify_all();
+}
+
 void KVDiskCache::request_idle_spill() {
     std::lock_guard lock(mutex_);
     idle_requested_ = true;
@@ -5174,6 +5157,8 @@ void KVDiskCache::cancel_worker_prepare_locked(std::uint64_t ram_id, bool includ
 }
 
 void KVDiskCache::cancel_idle_locked(std::unique_lock<std::mutex>& lock) {
+    cache_idle_ = false;
+    ++defrag_cancel_epoch_;
     ++idle_cancel_epoch_;
     idle_requested_ = false;
     idle_q_.clear();
@@ -5492,7 +5477,7 @@ void KVDiskCache::drop_spill(SpillSession& session) noexcept {
     if (!session.meta_installed) {
         for (std::size_t i = 0; i < session.new_object_ids.size(); ++i) {
             const std::uint64_t id = session.new_object_ids[i];
-            objects_.erase(id);
+            unlink_unreferenced(id);
         }
         for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
         branch_shared_ids_.clear();
@@ -5796,95 +5781,88 @@ void KVDiskCache::spill_page_batch(SpillSession& session, std::span<const Job> j
     }
     reserve_object_ids_locked(records.size(), lock);
 
-    const std::size_t index = kind_index(main ? DiskObjectKind::Main : DiskObjectKind::Backend);
-    std::uint32_t segment   = pack_active_segment_[index];
-    std::uint64_t offset    = pack_active_tail_[index];
-    if (offset != 0 && total_extent > kPackSegmentBytes - offset) {
-        if (segment == std::numeric_limits<std::uint32_t>::max()) {
-            throw std::runtime_error("KV disk pack segment number overflow");
-        }
-        segment = ++pack_active_segment_[index];
-        offset  = 0;
-        std::filesystem::create_directories(
-            pack_path(main ? DiskObjectKind::Main : DiskObjectKind::Backend, segment)
-                .parent_path());
-        const int made = ::open(
-            pack_path(main ? DiskObjectKind::Main : DiskObjectKind::Backend, segment).c_str(),
-            O_RDWR | O_CREAT | O_EXCL, 0644);
-        if (made < 0) { throw std::runtime_error("failed to create KV disk page batch segment"); }
-        if (::close(made) != 0) {
-            throw std::runtime_error("failed to close KV page batch segment");
-        }
-    }
+    const auto kind = main ? DiskObjectKind::Main : DiskObjectKind::Backend;
+    std::vector<ObjectRef::Location> locations;
+    locations.reserve(records.size());
     try {
         for (PageRecord& record : records) {
-            record.id = allocate_object(main ? DiskObjectKind::Main : DiskObjectKind::Backend,
-                                        record.extent);
+            record.id                  = allocate_object(kind, record.extent);
+            auto location              = reserve_pack_extent(kind, record.extent);
+            auto& ref                  = objects_.at(record.id);
+            ref.location               = location;
+            ref.location.stored_bytes  = record.stored;
+            ref.location.logical_bytes = record.logical;
+            ref.location.record_crc32c = record.record_crc;
+            locations.push_back(std::move(location));
         }
     } catch (...) {
-        for (const PageRecord& record : records) {
-            if (record.id != 0) { objects_.erase(record.id); }
+        for (const auto& record : records) {
+            if (record.id != 0) { unlink_unreferenced(record.id); }
         }
         throw;
     }
-    // Reserve the complete range before dropping the cache lock.  Failed or
-    // cancelled batches therefore leave unreachable bytes, never a reusable
-    // range that a later append could overwrite.
-    pack_active_segment_[index] = segment;
-    pack_active_tail_[index]    = offset + total_extent;
     if (!lock.owns_lock()) { lock.lock(); }
     lock.unlock();
     try {
         maybe_payload_io_stall(DiskUnlockedIo::PayloadWrite);
-        const auto descriptor = acquire_pack_descriptor(
-            active_generation_, main ? DiskObjectKind::Main : DiskObjectKind::Backend, segment,
-            false);
-        std::vector<iovec> iov;
-        iov.reserve(total_iov);
-        for (const PageRecord& record : records) {
-            for (const auto& [data, bytes] : record.parts) {
-                iov.push_back({const_cast<void*>(data), static_cast<std::size_t>(bytes)});
+        for (std::size_t begin = 0; begin < records.size();) {
+            std::size_t end = begin + 1;
+            while (end < records.size() && locations[end].segment == locations[begin].segment &&
+                   locations[end].offset == locations[end - 1].offset + records[end - 1].extent) {
+                ++end;
             }
-        }
-        std::size_t first  = 0;
-        std::uint64_t done = 0;
-        while (done < total_extent) {
-            const ssize_t n = pwritev_with_test_limit(
-                descriptor->buffered, iov.data() + first, static_cast<int>(iov.size() - first),
-                static_cast<off_t>(offset + done), take_test_partial_pwritev_bytes());
-            if (n < 0 && errno == EINTR) { continue; }
-            if (n <= 0) { throw std::runtime_error("KV disk page batch pwrite failed"); }
-            done += static_cast<std::uint64_t>(n);
-            ssize_t left = n;
-            while (left > 0 && first < iov.size()) {
-                auto& current = iov[first];
-                if (static_cast<std::size_t>(left) < current.iov_len) {
-                    current.iov_base = static_cast<char*>(current.iov_base) + left;
-                    current.iov_len -= static_cast<std::size_t>(left);
-                    break;
+            const auto descriptor =
+                acquire_pack_descriptor(pack_store_, kind, locations[begin].segment, false);
+            std::vector<iovec> iov;
+            iov.reserve(total_iov);
+            std::uint64_t run_bytes = 0;
+            for (auto i = begin; i < end; ++i) {
+                run_bytes += records[i].extent;
+                for (const auto& [data, bytes] : records[i].parts) {
+                    iov.push_back({const_cast<void*>(data), static_cast<std::size_t>(bytes)});
                 }
-                left -= static_cast<ssize_t>(current.iov_len);
-                ++first;
             }
+            std::size_t first  = 0;
+            std::uint64_t done = 0;
+            while (done < run_bytes) {
+                const ssize_t n = pwritev_with_test_limit(
+                    descriptor->buffered, iov.data() + first, static_cast<int>(iov.size() - first),
+                    static_cast<off_t>(locations[begin].offset + done),
+                    take_test_partial_pwritev_bytes());
+                if (n < 0 && errno == EINTR) { continue; }
+                if (n <= 0) { throw std::runtime_error("KV disk page batch pwrite failed"); }
+                done += static_cast<std::uint64_t>(n);
+                ssize_t left = n;
+                while (left > 0 && first < iov.size()) {
+                    auto& current = iov[first];
+                    if (static_cast<std::size_t>(left) < current.iov_len) {
+                        current.iov_base = static_cast<char*>(current.iov_base) + left;
+                        current.iov_len -= static_cast<std::size_t>(left);
+                        break;
+                    }
+                    left -= static_cast<ssize_t>(current.iov_len);
+                    ++first;
+                }
+            }
+            begin = end;
         }
         maybe_test_fault(DiskFaultPoint::AfterRecordWrite);
     } catch (...) {
         if (!lock.owns_lock()) { lock.lock(); }
-        for (const PageRecord& record : records) { objects_.erase(record.id); }
+        for (const PageRecord& record : records) { unlink_unreferenced(record.id); }
         throw;
     }
     if (!lock.owns_lock()) { lock.lock(); }
-    const DiskObjectKind kind = main ? DiskObjectKind::Main : DiskObjectKind::Backend;
-    auto& ids                 = main ? session.draft.main_page_ids : session.draft.backend_page_ids;
+    auto& ids = main ? session.draft.main_page_ids : session.draft.backend_page_ids;
     for (std::size_t i = 0; i < records.size(); ++i) {
         PageRecord& record = records[i];
         auto object        = objects_.find(record.id);
         if (object == objects_.end()) {
             throw std::runtime_error("KV disk page batch object vanished");
         }
-        object->second.location.generation    = active_generation_;
-        object->second.location.segment       = segment;
-        object->second.location.offset        = offset + static_cast<std::uint64_t>(i) * extent;
+        object->second.location.store         = pack_store_;
+        object->second.location.segment       = locations[i].segment;
+        object->second.location.offset        = locations[i].offset;
         object->second.location.extent_bytes  = record.extent;
         object->second.location.stored_bytes  = record.stored;
         object->second.location.logical_bytes = record.logical;
@@ -6020,21 +5998,9 @@ void KVDiskCache::reclaim_orphan_objects() {
     for (const auto& [id, ref] : objects_) {
         if (ref.live_refs != 0 || ref.skip_refs != 0 || ref.hold_refs != 0) { add_id(id); }
     }
-    static constexpr DiskObjectKind kKinds[] = {DiskObjectKind::Main, DiskObjectKind::Backend,
-                                                DiskObjectKind::State, DiskObjectKind::Ledger,
-                                                DiskObjectKind::Identity};
-    for (DiskObjectKind kind : kKinds) {
-        for (const auto& entry : std::filesystem::directory_iterator(
-                 config_.location / "objects" / kind_dir(kind), ec)) {
-            if (!entry.is_regular_file()) { continue; }
-            std::uint64_t id = 0;
-            try {
-                id = static_cast<std::uint64_t>(std::stoull(entry.path().filename().string()));
-            } catch (...) { continue; }
-            if (id == 0 || referenced.count(id) != 0) { continue; }
-            queue_unlink(entry.path());
-            objects_.erase(id);
-        }
+    for (const auto& [id, ref] : objects_) {
+        (void)ref;
+        if (referenced.count(id) == 0) { unlink_unreferenced(id); }
     }
 }
 
@@ -6104,6 +6070,18 @@ void KVDiskCache::enqueue_spill_jobs(SpillSession& session) {
 
 bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
                                 std::unique_lock<std::mutex>& lock) {
+    ++defrag_cancel_epoch_;
+    cv_.notify_all();
+    if (map_writes_failed_.load(std::memory_order_relaxed)) {
+        note_drop(KvDiskDropReason::Persist);
+        return false;
+    }
+    try {
+        recover_index_epoch(&lock);
+    } catch (...) {
+        note_drop(KvDiskDropReason::Persist);
+        return false;
+    }
     if (config_.ram == nullptr) { return false; }
     if (!emergency && restore_cancels_idle_locked()) { return false; }
     auto note_it = ram_notes_.find(ram_id);
@@ -6129,12 +6107,6 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
         note_it = ram_notes_.find(ram_id);
         if (note_it == ram_notes_.end() || note_it->second.durable) { return false; }
     }
-    // Never make an emergency eviction fail merely because a queued restore
-    // still owns a generation descriptor.  Maintenance is retried at the next
-    // quiescent admission point; the hard logical capacity check below remains
-    // authoritative for the new spill.
-    // Compaction is scheduled only from explicit quiescent maintenance.  A
-    // spill admission must stay independent of stale worker queue bookkeeping.
     SpillSession session;
     bool refresh_mtp_tail_identical = false;
     bool acquired_disk_pin          = false;
@@ -6426,8 +6398,8 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             static_cast<std::uint64_t>(session.host.ledger.size()) * sizeof(TokenId));
         const std::uint64_t identity_bytes =
             aligned_raw_bytes(static_cast<std::uint64_t>(session.host.identity.packed_bytes()));
-        // Physical append bytes are immutable until a generation rewrite.  Keep
-        // this full extent total separate from logical overwrite credit below.
+        // The old image stays owned until replacement publication, so admission
+        // reserves every new extent without crediting the old image.
         const auto spill_extent = [&](std::uint64_t state_bytes) -> std::uint64_t {
             if (page_bytes > std::numeric_limits<std::uint64_t>::max() - ledger_bytes ||
                 page_bytes + ledger_bytes >
@@ -6438,16 +6410,6 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             }
             return page_bytes + ledger_bytes + identity_bytes + state_bytes;
         };
-        // Garbage is physical until a generation rewrite completes.  The disk
-        // worker compacts in unlocked slices and publishes at a quiescent point;
-        // admission never copies the pack store itself.  An idle spill waits for
-        // that rewrite, while an emergency spill appends past the threshold because
-        // the physical-room check below still reserves the compaction copy.
-        // A generation retired while a read held its lease is reclaimed at the next
-        // admission; until then it occupies disk and blocks another rewrite.
-        if (!retired_generations_.empty()) { reap_retired_generations(lock); }
-        // Generation reaping, capacity eviction and unlink flushes release the mutex, so the note
-        // is looked up again rather than through `note_it`.
         const auto refuse = [&](std::optional<KvDiskDropReason> failure) {
             if (session.ticket != 0) { unpin_disk(session.ticket); }
             for (std::uint64_t id : branch_shared_ids_) { drop_ref(id); }
@@ -6463,36 +6425,25 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             flush_queued_unlinks(lock);
             return false;
         };
-        // Logical eviction cannot release append-pack blocks.  Refuse admission
-        // before any record write if the filesystem cannot hold this append plus
-        // the worst-case copy-on-write compaction generation and one segment of
-        // rollover slack.
-        constexpr std::uint64_t kPackSlack = 1ULL << 30;
-        const auto physical_room           = [&](std::uint64_t append_bytes) {
-            const std::uint64_t reserve_base =
-                packs_need_compaction() ? packed_retained_bytes() : 0;
-            const auto available_bytes = [&]() -> std::optional<std::uint64_t> {
-                if (test_free_bytes_override_) { return test_free_bytes_override_; }
+        // Reuse needs no second payload generation. Filesystem free space still
+        // covers this write and a small metadata allowance, independently of the
+        // configured bound on pack-file growth.
+        constexpr std::uint64_t kMetadataSlack = 1ULL << 20;
+        const auto physical_room               = [&](std::uint64_t append_bytes) {
+            std::optional<std::uint64_t> available;
+            if (test_free_bytes_override_) {
+                available = test_free_bytes_override_;
+            } else {
                 struct statvfs fs{};
-                if (::statvfs(config_.location.c_str(), &fs) != 0 || fs.f_frsize == 0 ||
-                    fs.f_bavail > std::numeric_limits<std::uint64_t>::max() / fs.f_frsize) {
-                    return std::nullopt;
+                if (::statvfs(config_.location.c_str(), &fs) == 0 && fs.f_frsize != 0 &&
+                    fs.f_bavail <= std::numeric_limits<std::uint64_t>::max() / fs.f_frsize) {
+                    available = static_cast<std::uint64_t>(fs.f_bavail) * fs.f_frsize;
                 }
-                return static_cast<std::uint64_t>(fs.f_bavail) * fs.f_frsize;
-            }();
-            return available_bytes &&
-                   reserve_base <= std::numeric_limits<std::uint64_t>::max() - append_bytes &&
-                   reserve_base + append_bytes <=
-                       std::numeric_limits<std::uint64_t>::max() - kPackSlack &&
-                   *available_bytes >= reserve_base + append_bytes + kPackSlack;
+            }
+            return available &&
+                   append_bytes <= std::numeric_limits<std::uint64_t>::max() - kMetadataSlack &&
+                   *available >= append_bytes + kMetadataSlack;
         };
-        // Refuse what the encode cannot change before paying for it: a pending generation
-        // rewrite holds idle spills, and an append that cannot fit even with every state blob
-        // compressed away cannot fit after encoding. Raw blobs need no encode, so their size
-        // is exact here.
-        const bool compaction_pending = compaction_pending_locked();
-        if (compaction_pending) { request_compaction_locked(); }
-        if (compaction_pending && !emergency) { return refuse(std::nullopt); }
         std::uint64_t state_floor = 0;
         if (!compress) {
             for (const StateSource& source : state_sources) {
@@ -6530,7 +6481,7 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             throw;
         }
         if (!lock.owns_lock()) { lock.lock(); }
-        // Re-validate what the unlocked windows (generation reap, encode) may have changed: a
+        // Re-validate what the unlocked encoding window may have changed: a
         // cancellation, a claim of the entry an Extend/Refresh rewrites (its claim saw no
         // installed spill to cancel), or a quarantine or eviction of the source this spill shares
         // or replaces. None marks the note failed; a later attempt re-plans against the current
@@ -6554,49 +6505,8 @@ bool KVDiskCache::prepare_spill(std::uint64_t ram_id, bool emergency,
             state_bytes += aligned_state_file_bytes(blob.payload_bytes());
         }
         const std::uint64_t append_bytes = spill_extent(state_bytes);
-        std::uint64_t credit             = 0;
-        if (session.action == SpillSession::Action::Refresh ||
-            session.action == SpillSession::Action::Extend) {
-            const DiskMeta& replaced = require(session.child_id).meta;
-            auto unique_bytes        = [&](std::uint64_t id) -> std::uint64_t {
-                if (id == 0) { return 0; }
-                const auto it = objects_.find(id);
-                if (it == objects_.end() || it->second.live_refs != 1) { return 0; }
-                return it->second.bytes;
-            };
-            credit += unique_bytes(replaced.ledger_id);
-            credit += unique_bytes(replaced.identity_id);
-            credit += unique_bytes(replaced.current_gdn_id);
-            credit += unique_bytes(replaced.current_hidden_id);
-            credit += unique_bytes(replaced.current_cyclic_id);
-            credit += unique_bytes(replaced.rewrite_gdn_id);
-            credit += unique_bytes(replaced.rewrite_hidden_id);
-            credit += unique_bytes(replaced.rewrite_cyclic_id);
-            credit += unique_bytes(replaced.rollback.gdn_id);
-            credit += unique_bytes(replaced.rollback.hidden_id);
-            credit += unique_bytes(replaced.rollback.dflash_id);
-            for (const auto& slot : replaced.ladders) {
-                credit += unique_bytes(slot.gdn_id);
-                credit += unique_bytes(slot.hidden_id);
-                credit += unique_bytes(slot.dflash_id);
-            }
-            std::unordered_set<std::uint64_t> draft_pages;
-            for (std::uint64_t id : session.draft.main_page_ids) {
-                if (id != 0) { draft_pages.insert(id); }
-            }
-            for (std::uint64_t id : session.draft.backend_page_ids) {
-                if (id != 0) { draft_pages.insert(id); }
-            }
-            for (std::uint64_t id : replaced.main_page_ids) {
-                if (draft_pages.count(id) == 0) { credit += unique_bytes(id); }
-            }
-            for (std::uint64_t id : replaced.backend_page_ids) {
-                if (draft_pages.count(id) == 0) { credit += unique_bytes(id); }
-            }
-        }
-        const std::uint64_t logical_needed = append_bytes > credit ? append_bytes - credit : 0;
         if (!physical_room(append_bytes)) { return refuse(KvDiskDropReason::SpillNoRoom); }
-        if (!make_capacity(logical_needed, lock)) {
+        if (!make_capacity(append_bytes, lock)) {
             return refuse(KvDiskDropReason::SpillNoCapacity);
         }
 
@@ -6793,7 +6703,7 @@ void KVDiskCache::commit_spill(SpillSession& session, std::unique_lock<std::mute
         // Unlink the cancelled generation before the directory sync persists its removal.
         flush_queued_unlinks(lock);
         if (!had_entry) {
-            const std::uint64_t generation = pack_generation_;
+            const std::uint64_t generation = index_epoch_;
             if (lock.owns_lock()) { lock.unlock(); }
             bool sync_failed = false;
             try {
@@ -7227,7 +7137,7 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         return true;
     }
     // prepare_spill may release the mutex (unlink flush, capacity eviction,
-    // compaction) before it installs spill_; the worker's idle prepare must not
+    // index recovery) before it installs spill_; the worker's idle prepare must not
     // be in that span either, so neither installation overwrites the other. An idle
     // prepare of another entry would be discarded by this emergency prepare: stop it, and
     // keep the worker from starting another one while this caller waits.
@@ -7236,10 +7146,10 @@ bool KVDiskCache::emergency_spill_ram(std::uint64_t ram_id) {
         cancel_worker_prepare_locked(0, false);
         // Another entry's emergency session (a worker reclaim spill) finishes
         // first; prepare_spill cannot replace it.
-        // A compaction publication in flight finishes its generation switch first.
+        // An index checkpoint in flight finishes publication first.
         return stopping_ || ((payload_io_inflight_ == 0 || !spill_ || spill_->ram_id == ram_id) &&
                              !(spill_ && spill_->emergency && spill_->ram_id != ram_id) &&
-                             !idle_pinning_ && !compaction_publishing_);
+                             !idle_pinning_ && !map_checkpoint_publishing_);
     });
     emergency_waiting_ = false;
     cv_.notify_all();
@@ -7325,33 +7235,25 @@ void KVDiskCache::flush_not_durable_ram(
 void KVDiskCache::wait_idle_and_fsync() {
     std::unique_lock lock(mutex_);
     idle_requested_ = false;
+    cache_idle_     = false;
+    ++defrag_cancel_epoch_;
+    cv_.notify_all();
     idle_cv_.wait(lock, [&] {
         return !spill_ && restore_q_.empty() && emergency_q_.empty() && idle_q_.empty() &&
                prefetch_q_.empty() && !idle_pinning_ && window_inflight_ == 0 &&
-               payload_io_inflight_ == 0 && restore_state_inflight_ == 0 && reader_claims_.empty();
+               payload_io_inflight_ == 0 && restore_state_inflight_ == 0 &&
+               reader_claims_.empty() && !map_checkpoint_publishing_ && !reclaiming_objects_ &&
+               !defrag_active_ && eviction_rounds_in_flight_ == 0;
     });
-    // Explicit maintenance retries a rewrite that failed earlier.
-    if (!compaction_ && retired_generations_.empty() && packs_need_compaction()) {
-        compaction_requested_ = true;
-    }
-    if (compaction_ || compaction_requested_) {
-        cv_.notify_all();
-        idle_cv_.wait(lock, [&] { return stopping_ || (!compaction_ && !compaction_requested_); });
-    }
-    reap_retired_generations(lock);
-    // A reap another thread runs unlocked is part of the idle state this call waits for.
-    idle_cv_.wait(lock, [&] { return !generation_reap_in_flight_locked(); });
+    reclaim_objects(&lock);
+    reap_relocated_extents();
+    checkpoint_object_map(lock);
     try {
         write_manifest(lock);
         lock.unlock();
-        if (packset_publication_pending_sync_) {
-            maybe_test_fault(DiskFaultPoint::CompactionRecoveryBeforeRootSync);
-        }
         fsync_dir(config_.location);
         lock.lock();
         packset_publication_pending_sync_ = false;
-        reap_retired_generations(lock);
-        idle_cv_.wait(lock, [&] { return !generation_reap_in_flight_locked(); });
         lock.unlock();
     } catch (...) {
         if (!lock.owns_lock()) { lock.lock(); }
@@ -8475,19 +8377,20 @@ std::optional<KvDiskSnapshot> KVDiskCache::try_snapshot() const noexcept {
 
 KvDiskSnapshot KVDiskCache::snapshot_locked() const noexcept {
     return KvDiskSnapshot{
-        .capacity_bytes    = config_.capacity_bytes,
-        .used_bytes        = static_cast<std::size_t>(unique_bytes_),
-        .entry_count       = entries_.size(),
-        .captures          = captures_,
-        .restores          = restores_,
-        .evictions         = evictions_,
-        .drops             = drops_,
-        .drop_reasons      = drop_reasons_,
-        .save_seconds      = save_seconds_,
-        .load_seconds      = load_seconds_,
-        .spill_active      = spill_.has_value() || idle_pinning_ || emergency_preparing_,
-        .compaction_active = compaction_ != nullptr || compaction_publishing_,
-        .restore_active    = restore_target_.has_value(),
+        .capacity_bytes = config_.capacity_bytes,
+        .used_bytes     = static_cast<std::size_t>(unique_bytes_),
+        .entry_count    = entries_.size(),
+        .captures       = captures_,
+        .restores       = restores_,
+        .evictions      = evictions_,
+        .drops          = drops_,
+        .drop_reasons   = drop_reasons_,
+        .save_seconds   = save_seconds_,
+        .load_seconds   = load_seconds_,
+        .spill_active   = spill_.has_value() || idle_pinning_ || emergency_preparing_,
+        .defrag_active  = defrag_active_,
+        .storage_bytes  = static_cast<std::size_t>(pack_storage_bytes_),
+        .restore_active = restore_target_.has_value(),
         .pending_jobs =
             restore_q_.size() + emergency_q_.size() + idle_q_.size() + prefetch_q_.size(),
         .spill_elapsed_seconds = spill_ ? std::chrono::duration<double>(
@@ -8795,6 +8698,11 @@ void KVDiskCache::load_restore_state_locked(std::unique_lock<std::mutex>& lock) 
 }
 
 void KVDiskCache::process_job(const Job& job) {
+    if (map_writes_failed_.load(std::memory_order_relaxed) &&
+        (job.kind == JobKind::EmergencySpillPage || job.kind == JobKind::IdleSpillPage ||
+         job.kind == JobKind::EmergencyCommit || job.kind == JobKind::IdleCommit)) {
+        throw std::runtime_error("KV disk spill writes are frozen after journal rollback failure");
+    }
     if (job.kind == JobKind::PrefetchWindow || job.kind == JobKind::RestoreRead) {
         struct ReaderClaimGuard {
             KVDiskCache& cache;
@@ -9177,7 +9085,7 @@ void KVDiskCache::io_loop() {
         Job job;
         {
             std::unique_lock lock(mutex_);
-            cv_.wait(lock, [&] {
+            const auto work_ready = [&] {
                 if (stopping_) {
                     if (emergency_q_.empty() && idle_q_.empty() &&
                         (restore_io_threads_ > 1 || (restore_q_.empty() && prefetch_q_.empty()))) {
@@ -9196,16 +9104,23 @@ void KVDiskCache::io_loop() {
                     reclaim_target_live_locked()) {
                     return true;
                 }
-                if (compaction_runnable_locked()) { return true; }
-                if ((!idle_q_.empty() ||
-                     (idle_requested_ && !emergency_preparing_ && !emergency_waiting_ &&
-                      !compaction_ && !compaction_requested_)) &&
+                if (object_map_checkpoint_needed()) { return true; }
+                if ((!idle_q_.empty() || (idle_requested_ && !emergency_preparing_ &&
+                                          !emergency_waiting_ && !map_checkpoint_publishing_)) &&
                     !restore_or_prefetch_busy_locked()) {
                     return true;
                 }
-                return restore_active_ && restore_target_ && !restore_state_loaded_ &&
-                       !restore_failed_ && restore_state_inflight_ == 0;
-            });
+                return maintenance_ready() ||
+                       (restore_active_ && restore_target_ && !restore_state_loaded_ &&
+                        !restore_failed_ && restore_state_inflight_ == 0);
+            };
+            if (cache_idle_ && !maintenance_interrupted(defrag_cancel_epoch_) &&
+                (maintenance_done_generation_ != durable_generation_ || !retired_extents_.empty() ||
+                 pending_reclaim_count_ != 0)) {
+                cv_.wait_until(lock, maintenance_due_, work_ready);
+            } else {
+                cv_.wait(lock, work_ready);
+            }
             if (stopping_) {
                 if (restore_io_threads_ > 1) {
                     if (emergency_q_.empty() && idle_q_.empty()) { return; }
@@ -9239,11 +9154,11 @@ void KVDiskCache::io_loop() {
                        reclaim_target_live_locked()) {
                 start_worker_spill(lock, reclaim_ram_, true);
                 continue;
-            } else if (compaction_runnable_locked()) {
-                compaction_step(lock);
+            } else if (object_map_checkpoint_needed()) {
+                checkpoint_object_map(lock);
                 continue;
             } else if (!stopping_ && idle_requested_ && !emergency_preparing_ &&
-                       !emergency_waiting_ && !compaction_ && !compaction_requested_ && !spill_ &&
+                       !emergency_waiting_ && !map_checkpoint_publishing_ && !spill_ &&
                        !idle_cancel_all_ && !restore_or_prefetch_busy_locked() &&
                        config_.ram != nullptr) {
                 std::uint64_t ram_id = 0;
@@ -9277,6 +9192,9 @@ void KVDiskCache::io_loop() {
                     continue;
                 }
                 start_worker_spill(lock, ram_id, false);
+                continue;
+            } else if (maintenance_ready()) {
+                defrag_idle_step(lock);
                 continue;
             } else {
                 continue;
@@ -9317,7 +9235,7 @@ void KVDiskCache::test_break_object(std::uint64_t object_id, DiskObjectKind kind
     std::lock_guard lock(mutex_);
     const auto it = objects_.find(object_id);
     if (it == objects_.end() || it->second.kind != kind) { return; }
-    const auto path = pack_path(*it->second.location.generation, kind, it->second.location.segment);
+    const auto path   = pack_path(*it->second.location.store, kind, it->second.location.segment);
     const auto offset = it->second.location.offset;
     std::uint8_t zero[8]{};
     const int fd = ::open(path.c_str(), O_WRONLY);
@@ -9501,7 +9419,19 @@ void KVDiskCache::test_set_pack_position(DiskObjectKind kind, std::uint32_t segm
         window_inflight_ != 0 || restore_state_inflight_ != 0) {
         throw std::logic_error("cannot move test KV pack position during I/O");
     }
-    const std::size_t index     = kind_index(kind);
+    const std::size_t index = kind_index(kind);
+    auto& state             = pack_segments_[index][segment];
+    if (state.occupied_bytes != 0 || tail < state.bytes ||
+        tail - state.bytes > config_.capacity_bytes - pack_storage_bytes_) {
+        throw std::logic_error("test KV pack position exceeds physical capacity");
+    }
+    ScopedFd fd(::open(pack_path(kind, segment).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644));
+    if (fd.value < 0 || ::ftruncate(fd.value, static_cast<off_t>(tail)) != 0) {
+        throw std::runtime_error("failed to extend test KV pack segment");
+    }
+    pack_storage_bytes_ += tail - state.bytes;
+    state.bytes                 = tail;
+    pack_last_segment_[index]   = std::max(pack_last_segment_[index], segment);
     pack_active_segment_[index] = segment;
     pack_active_tail_[index]    = tail;
 }
@@ -9537,11 +9467,6 @@ void KVDiskCache::maybe_test_fault(DiskFaultPoint point) const {
             std::memory_order_release);
         throw std::runtime_error("injected KV disk durability phase failure");
     }
-}
-
-std::shared_ptr<void> KVDiskCache::test_hold_active_generation() const {
-    std::lock_guard lock(mutex_);
-    return active_generation_;
 }
 
 void KVDiskCache::test_arm_restore_job_barrier() {

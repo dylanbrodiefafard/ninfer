@@ -412,8 +412,8 @@ void Program<Variant>::shutdown_kv_tiers(LoadProgress progress) {
 }
 
 template <>
-void Program<Variant>::request_idle_spill() {
-    impl_->request_idle_spill();
+void Program<Variant>::set_cache_idle(bool idle) {
+    impl_->set_cache_idle(idle);
 }
 
 template <>

@@ -121,7 +121,8 @@ bool report_has_activity(const ThroughputReport& report, const ninfer::RuntimeSt
            report.kv_ram_used_bytes != previous.kv_ram_used_bytes ||
            report.kv_ram_entry_count != previous.kv_ram_entry_count ||
            report.scheduler.kv_disk_spill_active || previous.kv_disk_spill_active ||
-           report.scheduler.kv_disk_compaction_active || previous.kv_disk_compaction_active ||
+           report.scheduler.kv_disk_defrag_active || previous.kv_disk_defrag_active ||
+           report.scheduler.kv_disk_storage_bytes != previous.kv_disk_storage_bytes ||
            report.scheduler.kv_disk_restore_active || previous.kv_disk_restore_active ||
            report.scheduler.kv_disk_pending_jobs != 0 || previous.kv_disk_pending_jobs != 0 ||
            report.scheduler.kv_disk_captures != previous.kv_disk_captures ||

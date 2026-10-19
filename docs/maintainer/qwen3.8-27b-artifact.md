@@ -128,7 +128,7 @@ perplexity optimality or elimination of reasoning loops.
 ### Mixed FP8/NVFP4 storage profile
 
 Different numerical tensor inventories under the same artifact identity must not exchange retained
-state. KV disk format v7 binds retained-state tensor descriptors and selected encoded contents with
+state. KV disk format v8 binds retained-state tensor descriptors and selected encoded contents with
 SHA-256; use a fresh
 cache directory when switching to a composed mixed or selective variant. Copies of identical
 tensors remain compatible. Old cache directories are not deleted.

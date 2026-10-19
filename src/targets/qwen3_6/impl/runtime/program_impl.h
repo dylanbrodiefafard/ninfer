@@ -3127,8 +3127,8 @@ void ProgramImplCore::shutdown_kv_tiers(LoadProgress progress) {
     }
 }
 
-void ProgramImplCore::request_idle_spill() {
-    if (kv_disk_cache_) { kv_disk_cache_->request_idle_spill(); }
+void ProgramImplCore::set_cache_idle(bool idle) {
+    if (kv_disk_cache_) { kv_disk_cache_->set_cache_idle(idle); }
 }
 
 std::optional<qwen3_6::detail::KvDiskSnapshot>

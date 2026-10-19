@@ -896,58 +896,6 @@ int main() {
         std::cerr << "kv_disk_perf state readers=" << state_readers
                   << " mean=" << timed_mbps(state_bytes * kReps, state_sum) << " MB/s\n";
         state_disk.release(match->entry_id);
-
-        if (const char* compact_perf = std::getenv("NINFER_KV_DISK_PERF_COMPACTION");
-            compact_perf != nullptr && std::string_view(compact_perf) == "1") {
-            for (ninfer::TokenId token : {8, 9}) {
-                auto extra_prompt   = text_prompt({token, token, token, token});
-                auto extra_retained = extra_prompt;
-                extra_retained.token_ids.push_back(0);
-                extra_retained.token_types.assign(extra_retained.token_ids.size(), 0);
-                extra_retained.positions.resize(3 * extra_retained.token_ids.size());
-                for (int axis = 0; axis < 3; ++axis) {
-                    for (std::size_t i = 0; i < extra_retained.token_ids.size(); ++i) {
-                        extra_retained.positions[static_cast<std::size_t>(axis) *
-                                                     extra_retained.token_ids.size() +
-                                                 i] = static_cast<std::int32_t>(i);
-                    }
-                }
-                q36::detail::ResidentPrefixIdentity extra_identity;
-                extra_identity.assign(extra_retained);
-                auto extra_capture     = state_capture;
-                extra_capture.ledger   = extra_retained.token_ids;
-                extra_capture.identity = &extra_identity;
-                extra_capture.hash_f =
-                    q36::detail::prefix_hash_at(extra_retained.token_ids, extra_identity, 4);
-                const auto extra_ram_id = capture_or_evict(state_ram, extra_capture);
-                if (!extra_ram_id) {
-                    source.release();
-                    fs::remove_all(root);
-                    return fail("disk_perf compaction RAM capture failed");
-                }
-                ctx.synchronize_all();
-                state_ram.wait_pending_copies();
-                state_disk.note_ram_resident(*extra_ram_id, 0);
-                if (!state_disk.emergency_spill_ram(*extra_ram_id)) {
-                    source.release();
-                    fs::remove_all(root);
-                    return fail("disk_perf compaction spill failed");
-                }
-            }
-            if (!state_disk.test_fifo_evict_one()) {
-                source.release();
-                fs::remove_all(root);
-                return fail("disk_perf compaction eviction failed");
-            }
-            const std::size_t retained_bytes = state_disk.snapshot().used_bytes;
-            const auto begin                 = std::chrono::steady_clock::now();
-            state_disk.wait_idle_and_fsync();
-            const double elapsed =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-            std::cerr << "kv_disk_perf compaction retained=" << retained_bytes << " "
-                      << timed_mbps(retained_bytes, elapsed) << " MB/s (" << elapsed * 1e3
-                      << " ms)\n";
-        }
     }
 
     source.release();

@@ -22,6 +22,8 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <map>
+#include <list>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -199,26 +201,25 @@ enum class DiskFaultPoint : std::uint8_t {
     AfterPacksetTmpSync,
     AfterPacksetRename,
     AfterPacksetRootSync,
-    CompactionAfterPackCopy,
-    CompactionAfterPackSync,
-    CompactionAfterBaseWrite,
-    CompactionAfterBaseSync,
-    CompactionAfterLogWrite,
-    CompactionAfterLogSync,
-    CompactionAfterPacksetTmpWrite,
-    CompactionAfterPacksetTmpSync,
-    CompactionAfterPacksetRename,
-    CompactionRecoveryBeforeRootSync,
-    CompactionAfterRootSync,
+    AfterDeleteAppend,
+    AfterDeleteSync,
+    AfterMoveCopy,
+    AfterMovePackSync,
+    AfterMoveAppend,
+    AfterMoveSync,
+    BeforeMapRollback,
+    AfterIndexBaseSync,
+    AfterIndexLogSync,
 };
 
 // Unlocked disk-I/O windows a test can hold open to show the index mutex stays free there.
 enum class DiskUnlockedIo : std::uint8_t {
     PageBatchCrc,       // spill page-batch header/CRC build
     EvictionTombstones, // capacity/quarantine eviction tombstone write and directory fsync
-    GenerationReap,     // retired pack-generation removal and directory fsyncs
-    CompactionPackset,  // compaction PACKSET write, fsync and rename
-    CompactionCopy,     // compaction copy of one live object into the new generation
+    DefragCopy,         // one bounded relocation read/write chunk
+    DefragMapped,       // durable Move before runtime location publication
+    DefragPublish,      // copied payload durable, before its location journal update
+    MapCheckpoint,      // metadata-only index checkpoint publication
     PayloadWrite,       // spill object/page-batch pwrite
     PayloadRead,        // object, page and state pread
     StoreDirFsync,      // object-namespace and store directory fsyncs
@@ -288,6 +289,8 @@ public:
     [[nodiscard]] bool ram_is_durable(std::uint64_t ram_id) const;
 
     void request_idle_spill();
+    // Engine idleness, independent of opportunistic write-behind during decoding.
+    void set_cache_idle(bool idle);
     void cancel_idle_spill();
     // The caller rolls this RAM entry back: its idle or reclaim spill is cancelled without
     // waiting (a worker still encoding or writing it stops at its next cancellation point)
@@ -444,7 +447,11 @@ public:
     void test_arm_partial_pwritev(std::size_t max_bytes);
     void test_arm_fault(DiskFaultPoint point);
     void test_arm_fault_sequence(DiskFaultPoint first, DiskFaultPoint second);
-    [[nodiscard]] std::shared_ptr<void> test_hold_active_generation() const;
+
+    bool test_read_object(DiskObjectKind kind, std::uint64_t id, void* data, std::size_t bytes) {
+        return read_object(kind, id, data, bytes);
+    }
+
     bool test_gc_skipped_one();
     bool test_fifo_evict_one();
     void test_arm_restore_job_barrier();
@@ -718,18 +725,20 @@ private:
         ~PackDescriptor();
     };
 
-    struct PackGeneration {
-        std::uint64_t number = 0;
+    struct PackStore {
         std::filesystem::path root;
         mutable std::mutex descriptor_mu;
         mutable std::unordered_map<std::string, std::shared_ptr<PackDescriptor>> descriptors;
-        // Retired generation being removed with the index mutex released; guarded by mutex_.
-        bool reaping = false;
     };
 
     struct ObjectRef {
+        // Every unlocked payload reader copies this lease with its location. An extent
+        // cannot be reused while one of those copies still exists.
+        struct ReadLease {};
+
         struct Location {
-            std::shared_ptr<PackGeneration> generation;
+            std::shared_ptr<PackStore> store;
+            std::shared_ptr<ReadLease> lease;
             std::uint32_t segment       = 0;
             std::uint64_t offset        = 0;
             std::uint64_t extent_bytes  = 0;
@@ -738,42 +747,52 @@ private:
             std::uint32_t record_crc32c = 0;
         } location;
 
-        DiskObjectKind kind     = DiskObjectKind::Main;
-        std::uint64_t bytes     = 0;
-        std::uint32_t live_refs = 0;
-        std::uint32_t skip_refs = 0;
-        std::uint32_t hold_refs = 0;
+        DiskObjectKind kind        = DiskObjectKind::Main;
+        std::uint64_t bytes        = 0;
+        std::uint32_t live_refs    = 0;
+        std::uint32_t skip_refs    = 0;
+        std::uint32_t hold_refs    = 0;
+        std::uint64_t next_reclaim = 0;
+        bool reclaim_pending       = false;
+        bool reclaiming            = false;
     };
 
-    // Worker-owned copy-on-write generation rewrite, advanced in unlocked slices.
-    struct CompactionRun {
-        struct Source {
-            std::uint64_t id = 0;
-            ObjectRef ref;
-        };
+    using ExtentKey       = std::pair<std::uint32_t, std::uint64_t>;
+    using FreeExtentSizes = std::multimap<std::uint64_t, ExtentKey>;
 
-        struct Move {
-            std::uint64_t id = 0;
-            ObjectRef::Location location;
-        };
-
-        std::uint64_t new_generation = 0;
-        std::shared_ptr<PackGeneration> source;
-        std::shared_ptr<PackGeneration> target;
-        std::filesystem::path root;
-        std::array<std::uint32_t, 5> segment{};
-        std::array<std::uint64_t, 5> tail{};
-        std::array<int, 5> output{-1, -1, -1, -1, -1};
-        std::vector<Source> pending;
-        std::size_t next = 0;
-        std::unordered_set<std::uint64_t> copied;
-        std::vector<Move> moves;
-        std::vector<std::uint8_t> buffer;
-        bool synced    = false;
-        bool published = false;
-
-        void close_outputs() noexcept;
+    struct FreeExtentIndex {
+        FreeExtentSizes sizes;
+        std::map<ExtentKey, FreeExtentSizes::iterator> offsets;
     };
+
+    struct PackSegment {
+        std::uint64_t bytes          = 0;
+        std::uint64_t occupied_bytes = 0;
+        bool trimming                = false;
+    };
+
+    [[nodiscard]] ObjectRef::Location reserve_pack_extent(DiskObjectKind kind, std::uint64_t bytes);
+    void release_pack_extent(DiskObjectKind kind, const ObjectRef::Location& location);
+    void insert_free_extent(DiskObjectKind kind, std::uint32_t segment, std::uint64_t offset,
+                            std::uint64_t bytes);
+    void rebuild_free_extents();
+    enum class PackTrim { EmptyOnly, FreeTails };
+    void trim_pack_tails(std::unique_lock<std::mutex>* lock, PackTrim policy);
+
+    struct RetiredExtent {
+        DiskObjectKind kind;
+        ObjectRef::Location location;
+    };
+
+    void reap_relocated_extents();
+    void defrag_idle_step(std::unique_lock<std::mutex>& lock);
+    [[nodiscard]] bool maintenance_ready() const;
+    [[nodiscard]] bool maintenance_interrupted(std::uint64_t epoch) const;
+
+    void reclaim_objects(std::unique_lock<std::mutex>* lock = nullptr);
+    void checkpoint_object_map(std::unique_lock<std::mutex>& lock);
+    void recover_index_epoch(std::unique_lock<std::mutex>* lock);
+    [[nodiscard]] bool object_map_checkpoint_needed() const;
 
     // New objects of a spill commit, copied under the mutex for its unlocked fsync and
     // object-map append; the scheduler may drop other objects_ entries meanwhile.
@@ -834,7 +853,6 @@ private:
     [[nodiscard]] std::optional<Job> take_job(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] std::optional<Job> take_restore_job(std::unique_lock<std::mutex>& lock);
     [[nodiscard]] KvDiskSnapshot snapshot_locked() const noexcept;
-    [[nodiscard]] bool compaction_publish_blocked_locked() const noexcept;
     [[nodiscard]] bool prefetch_readable_locked() const noexcept;
     [[nodiscard]] bool restore_readers_busy_locked() const noexcept;
     [[nodiscard]] bool restore_or_prefetch_busy_locked() const noexcept;
@@ -912,22 +930,8 @@ private:
     void persist_packset(std::uint64_t generation, std::uint64_t reserved_next_id) const;
     void load_pack_map();
     void validate_live_direct_segments() const;
-    void append_pack_map(const CommitObjects& objects) const;
-    void request_compaction_locked() noexcept;
-    [[nodiscard]] bool compaction_pending_locked() const;
-    [[nodiscard]] bool compaction_runnable_locked() const noexcept;
-    [[nodiscard]] bool begin_compaction_locked();
-    CompactionRun::Move copy_compaction_object(CompactionRun& run,
-                                               const CompactionRun::Source& source);
-    void sync_compaction_outputs(CompactionRun& run);
-    void prepare_compaction_maps(CompactionRun& run, const std::vector<std::uint8_t>& base_bytes);
-    [[nodiscard]] bool compaction_delta_locked(CompactionRun& run);
-    void publish_compaction(std::unique_lock<std::mutex>& lock, CompactionRun& run);
-    void discard_compaction_files(CompactionRun& run) noexcept;
-    void compaction_step(std::unique_lock<std::mutex>& lock);
-    [[nodiscard]] std::uint64_t packed_allocated_bytes() const;
-    [[nodiscard]] std::uint64_t packed_retained_bytes() const;
-    [[nodiscard]] bool packs_need_compaction() const;
+    void append_pack_map(const CommitObjects& objects,
+                         DiskMapRecordKind kind = DiskMapRecordKind::Put) const;
     void load_index();
     void rebuild_manifest();
     bool load_entry(std::uint64_t entry_id);
@@ -972,16 +976,12 @@ private:
     bool flush_queued_unlinks();
     bool flush_queued_unlinks(std::unique_lock<std::mutex>& lock);
 
-    [[nodiscard]] std::filesystem::path pack_path(const PackGeneration& generation,
-                                                  DiskObjectKind kind, std::uint32_t segment) const;
+    [[nodiscard]] std::filesystem::path pack_path(const PackStore& generation, DiskObjectKind kind,
+                                                  std::uint32_t segment) const;
     [[nodiscard]] std::filesystem::path pack_path(DiskObjectKind kind, std::uint32_t segment) const;
     [[nodiscard]] std::shared_ptr<PackDescriptor>
-    acquire_pack_descriptor(const std::shared_ptr<PackGeneration>& generation, DiskObjectKind kind,
+    acquire_pack_descriptor(const std::shared_ptr<PackStore>& generation, DiskObjectKind kind,
                             std::uint32_t segment, bool require_direct) const;
-    // Removes retired generations no reader leases; the removal and directory fsyncs run with
-    // the mutex released.
-    void reap_retired_generations(std::unique_lock<std::mutex>& lock);
-    [[nodiscard]] bool generation_reap_in_flight_locked() const noexcept;
     [[nodiscard]] std::filesystem::path entry_dir(std::uint64_t id) const;
     // Extends the durable object-id reservation so `count` further ids can be allocated; a
     // PACKSET rewrite runs with the mutex released.
@@ -1146,22 +1146,44 @@ private:
 
     DiskOpenConfig config_;
     static constexpr std::uint64_t kPackSegmentBytes = 1ULL << 30;
-    std::uint64_t pack_generation_                   = 1;
-    std::shared_ptr<PackGeneration> active_generation_;
-    std::vector<std::shared_ptr<PackGeneration>> retired_generations_;
-    bool packset_publication_pending_sync_ = false;
-    // The worker writes and renames a compaction PACKSET with the mutex released; no object
-    // writer may start until the in-memory generation switch completes.
-    bool compaction_publishing_ = false;
-    // Eviction rounds whose tombstones are being written with the mutex released.
-    std::uint32_t eviction_rounds_in_flight_ = 0;
-    std::unique_ptr<CompactionRun> compaction_;
-    bool compaction_requested_ = false;
-    // A failed rewrite is not retried until the durable generation changes.
-    std::uint64_t compaction_failed_generation_ = 0;
-    std::uint64_t object_id_reservation_limit_  = 1;
+    std::uint64_t index_epoch_                       = 1;
+    std::shared_ptr<PackStore> pack_store_;
+    bool packset_publication_pending_sync_          = false;
+    bool map_checkpoint_publishing_                 = false;
+    std::uint64_t map_checkpoint_failed_generation_ = 0;
+    mutable std::mutex map_io_mutex_;
+    // A failed journal rollback freezes writes until reopen; both possible locations stay owned.
+    mutable std::atomic<bool> map_writes_failed_{false};
+    std::optional<RetiredExtent> uncertain_relocation_;
+    std::list<RetiredExtent> retired_extents_;
+    bool cache_idle_                            = false;
+    bool defrag_active_                         = false;
+    std::uint64_t defrag_cancel_epoch_          = 0;
+    std::uint64_t maintenance_done_generation_  = 0;
+    std::uint64_t defrag_candidates_generation_ = 0;
+
+    struct DefragCandidate {
+        DiskObjectKind kind;
+        std::uint32_t segment;
+        std::uint64_t offset;
+        std::uint64_t id;
+    };
+
+    std::vector<DefragCandidate> defrag_candidates_;
+    UninitializedBytes defrag_buffer_;
+    std::chrono::steady_clock::time_point maintenance_due_{};
+    mutable std::atomic<std::uint64_t> map_log_bytes_{0};
+    std::uint32_t eviction_rounds_in_flight_   = 0;
+    std::uint64_t object_id_reservation_limit_ = 1;
     std::array<std::uint32_t, 5> pack_active_segment_{};
     std::array<std::uint64_t, 5> pack_active_tail_{};
+    std::array<FreeExtentIndex, 5> free_extents_;
+    std::array<std::map<std::uint32_t, PackSegment>, 5> pack_segments_;
+    std::array<std::uint32_t, 5> pack_last_segment_{};
+    std::uint64_t pack_storage_bytes_                       = 0;
+    std::uint64_t pending_reclaim_head_                     = 0;
+    std::size_t pending_reclaim_count_                      = 0;
+    bool reclaiming_objects_                                = false;
     int lock_fd_                                            = -1;
     void* restore_window_allocation_                        = nullptr;
     void* restore_window_mem_                               = nullptr;

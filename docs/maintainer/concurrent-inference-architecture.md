@@ -1022,18 +1022,27 @@ retained VRAM, flushes not-durable RAM, and fsyncs before aborting occupied lane
 `kv-disk save cache entries`, and `kv-disk finish disk writes` during shutdown.
 
 One restore coordinator and the startup-fixed reader pool own disk restore. A claimed request pins
-its immutable entry and pack generation while readers fill the bounded pinned/page-device window.
+its immutable entry while per-extent reader leases protect locations as readers fill the bounded pinned/page-device window.
 The coordinator may overlap validated page H2D/scatter with later SSD reads and may load independent
 state objects in parallel, but it publishes no partially restored lane. Admit-complete waits for
 the restore state owners and copy-stream event immediately before `start_prefill_lane`; cancellation
 drains those owners and releases the claim without consuming the durable entry.
 
-Disk work has three scheduling classes. Restore reads yield only to an emergency spill needed to
+Disk request work has three scheduling classes. Restore reads yield only to an emergency spill needed to
 make the selected admission feasible. Emergency spill excludes all restore payload I/O. Idle spill
 uses separate staging and may duplex with restore, but every page job rechecks its spill epoch and
 RAM residency before capture so eviction/cancellation cannot publish a stale bundle. Commit and
 fsync preserve pack-namespace → map → entry → manifest order. Shutdown promotes unfinished idle
 work as needed, waits for all payload jobs, publishes durable metadata, then synchronizes the store.
+
+The Executor separately grants disk maintenance permission only when pending ingress, all request
+lanes (including disposable requests), and copy holds are empty and tier copies are ready. It
+revokes permission before admitting or executing request work. RAM write-behind does not grant
+this permission. Idle defragmentation yields to every request I/O class, uses throttled copy
+chunks into existing holes, and preserves old locations for readers across durable Move journal
+publication. Shutdown cancels maintenance and waits for its location handoff or cancellation
+before reporting the disk tier synchronized. The exact budgets and recovery order are defined in
+`paged-kv-cache.md`.
 
 ---
 

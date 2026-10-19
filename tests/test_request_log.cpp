@@ -146,7 +146,7 @@ int main() {
                       "server record artifact type mismatch");
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
-    failures += check(kRequestLogSchemaVersion == 20, "request-log schema is not version 20");
+    failures += check(kRequestLogSchemaVersion == 21, "request-log schema is not version 21");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
@@ -680,19 +680,22 @@ int main() {
     ram_throughput.scheduler.gpu_kv_main_entitled_pages    = 40;
     ram_throughput.scheduler.kv_cache_fallbacks            = 2;
     ram_throughput.scheduler.kv_disk_spill_active          = true;
-    ram_throughput.scheduler.kv_disk_compaction_active     = true;
+    ram_throughput.scheduler.kv_disk_defrag_active         = true;
+    ram_throughput.scheduler.kv_disk_storage_bytes         = 8388608;
     ram_throughput.scheduler.kv_disk_restore_active        = true;
     ram_throughput.scheduler.kv_disk_pending_jobs          = 3;
     ram_throughput.scheduler.kv_disk_spill_elapsed_seconds = 12.165;
     ram_throughput.kv_disk_save_seconds                    = 12.165;
     const std::string human_disk_throughput                = format_throughput(ram_throughput);
-    failures += check(
-        human_disk_throughput.find("spill_completed=12165ms load=9ms work=spill,compact,restore "
-                                   "pending=3 spill_age=12.2s") != std::string::npos,
-        "human disk log hides background work or mislabels completed spill time");
+    failures +=
+        check(human_disk_throughput.find(
+                  "spill_completed=12165ms load=9ms storage=8.0MiB work=spill,defrag,restore "
+                  "pending=3 spill_age=12.2s") != std::string::npos,
+              "human disk log hides background work or mislabels completed spill time");
     const auto disk_json = Json::parse(format_throughput_json("serve-test", 5001, ram_throughput));
     failures += check(disk_json.at("scheduler").at("kv_disk_spill_active") == true &&
-                          disk_json.at("scheduler").at("kv_disk_compaction_active") == true &&
+                          disk_json.at("scheduler").at("kv_disk_defrag_active") == true &&
+                          disk_json.at("scheduler").at("kv_disk_storage_bytes") == 8388608 &&
                           disk_json.at("scheduler").at("kv_disk_restore_active") == true &&
                           disk_json.at("scheduler").at("kv_disk_pending_jobs") == 3 &&
                           disk_json.at("scheduler").at("kv_disk_spill_elapsed_seconds") == 12.165,

@@ -26,7 +26,8 @@ struct KvDiskSnapshot {
     double save_seconds          = 0;
     double load_seconds          = 0;
     bool spill_active            = false;
-    bool compaction_active       = false;
+    bool defrag_active           = false;
+    std::size_t storage_bytes    = 0;
     bool restore_active          = false;
     std::size_t pending_jobs     = 0;
     double spill_elapsed_seconds = 0;

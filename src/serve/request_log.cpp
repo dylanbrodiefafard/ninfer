@@ -564,7 +564,9 @@ std::string format_throughput(const ThroughputReport& report) {
             occupancy, report.scheduler.kv_disk_restores, report.scheduler.kv_disk_evictions,
             report.scheduler.kv_disk_drops, report.scheduler.kv_disk_drop_reasons,
             report.kv_disk_save_seconds, report.kv_disk_load_seconds);
-        out << " work=";
+        out << " storage=" << std::fixed << std::setprecision(1)
+            << static_cast<double>(report.scheduler.kv_disk_storage_bytes) / (1024.0 * 1024.0)
+            << "MiB work=";
         bool active            = false;
         const auto append_work = [&](const char* name, bool enabled) {
             if (!enabled) { return; }
@@ -573,7 +575,7 @@ std::string format_throughput(const ThroughputReport& report) {
             active = true;
         };
         append_work("spill", report.scheduler.kv_disk_spill_active);
-        append_work("compact", report.scheduler.kv_disk_compaction_active);
+        append_work("defrag", report.scheduler.kv_disk_defrag_active);
         append_work("restore", report.scheduler.kv_disk_restore_active);
         if (!active) { out << "idle"; }
         out << " pending=" << report.scheduler.kv_disk_pending_jobs;
@@ -873,7 +875,8 @@ std::string format_throughput_json(const std::string& server_instance_id,
              {"kv_disk_used_bytes", report.kv_disk_used_bytes},
              {"kv_disk_entry_count", report.kv_disk_entry_count},
              {"kv_disk_spill_active", report.scheduler.kv_disk_spill_active},
-             {"kv_disk_compaction_active", report.scheduler.kv_disk_compaction_active},
+             {"kv_disk_defrag_active", report.scheduler.kv_disk_defrag_active},
+             {"kv_disk_storage_bytes", report.scheduler.kv_disk_storage_bytes},
              {"kv_disk_restore_active", report.scheduler.kv_disk_restore_active},
              {"kv_disk_pending_jobs", report.scheduler.kv_disk_pending_jobs},
              {"kv_disk_spill_elapsed_seconds", report.scheduler.kv_disk_spill_elapsed_seconds},

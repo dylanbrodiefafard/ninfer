@@ -189,8 +189,7 @@ packed_object_location(const fs::path& root, q36::detail::DiskObjectKind kind, s
                           : kind == q36::detail::DiskObjectKind::State   ? "state"
                           : kind == q36::detail::DiskObjectKind::Ledger  ? "ledger"
                                                                          : "identity";
-        return PackedObjectLocation{root / "packs" / std::to_string(generation) / dir / name,
-                                    offset, extent, stored};
+        return PackedObjectLocation{root / "packs" / "1" / dir / name, offset, extent, stored};
     };
     std::optional<PackedObjectLocation> found;
     std::ifstream base(root / "maps" / ("objects-" + std::to_string(generation) + ".base"),
@@ -222,8 +221,8 @@ packed_object_location(const fs::path& root, q36::detail::DiskObjectKind kind, s
         in.read(reinterpret_cast<char*>(frame_payload.data()), frame_payload.size());
         in.read(reinterpret_cast<char*>(&crc), sizeof(crc));
         if (!in) { return found; }
-        if (frame_payload[0] != 1 || frame_payload[1] != 0 || frame_payload[2] != 0 ||
-            frame_payload[3] != 0) {
+        if ((frame_payload[0] != 1 && frame_payload[0] != 2 && frame_payload[0] != 3) ||
+            frame_payload[1] != 0 || frame_payload[2] != 0 || frame_payload[3] != 0) {
             return std::nullopt;
         }
         std::array<std::uint8_t, 52> payload{};
@@ -231,7 +230,11 @@ packed_object_location(const fs::path& root, q36::detail::DiskObjectKind kind, s
         std::uint64_t seen = 0;
         std::memcpy(&seen, payload.data(), sizeof(seen));
         if (seen != id || payload[8] != static_cast<std::uint8_t>(kind)) { continue; }
-        found = location_from_payload(payload);
+        if (frame_payload[0] == 2) {
+            found.reset();
+        } else {
+            found = location_from_payload(payload);
+        }
     }
 }
 
@@ -2160,7 +2163,7 @@ int test_pack_map_recovery_boundaries(ninfer::DeviceContext& ctx, ninfer::PagedK
         const auto log = active_map_path(dir.path, ".log");
         auto bytes     = read_bytes(log);
         if (bytes.size() < 64) { return fail("log-type fixture has no complete frame"); }
-        bytes[4]                = 2;
+        bytes[4]                = 255;
         const std::uint32_t crc = test_crc32c(bytes.data(), 60);
         std::memcpy(bytes.data() + 60, &crc, sizeof(crc));
         write_bytes(log, bytes);
@@ -2247,6 +2250,709 @@ int test_pack_page_batch_variants(ninfer::DeviceContext& ctx, ninfer::PagedKVPoo
         alloc.release();
     }
     return 0;
+}
+
+int expect_mapped_pages_equal(ninfer::PagedKVPool& pool, const ninfer::PagedKVAllocation& src,
+                              const ninfer::PagedKVAllocation& dst, std::uint32_t pages,
+                              ninfer::DeviceContext& ctx, const char* label);
+
+std::uint64_t pack_file_bytes(const fs::path& root) {
+    std::uint64_t bytes = 0;
+    for (const auto& file : fs::recursive_directory_iterator(root / "packs")) {
+        if (file.is_regular_file()) { bytes += file.file_size(); }
+    }
+    return bytes;
+}
+
+int test_idle_defrag_large_state(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    TmpDir dir("idle-defrag-state");
+    constexpr std::size_t hidden_bytes = 5ULL << 20;
+    q36::detail::KVRamCache ram(64ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, source, 39);
+    ninfer::DeviceBuffer hidden_data(hidden_bytes);
+    ninfer::Tensor hidden(hidden_data.p, ninfer::DType::U8,
+                          {static_cast<std::int64_t>(hidden_bytes)});
+    auto cfg         = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                                   32ULL << 20, 4096);
+    cfg.hidden_bytes = hidden_bytes;
+    const auto kept  = text_prompt(std::vector<ninfer::TokenId>(64, 143));
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        for (int round = 0; round < 3; ++round) {
+            hidden_data.fill(static_cast<std::uint8_t>(71 + round));
+            auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 141 + round));
+            prompt.token_ids.push_back(0);
+            q36::detail::ResidentPrefixIdentity identity;
+            auto capture        = make_source(prompt, identity, source, pool, ctx.copy_stream, 64);
+            capture.tail_hidden = &hidden;
+            const auto id       = capture_or_evict(ram, capture);
+            if (!id) {
+                source.release();
+                return fail("large defrag RAM capture failed");
+            }
+            ctx.synchronize_all();
+            ram.wait_pending_copies();
+            disk.note_ram_resident(*id, 0);
+            if (!disk.emergency_spill_ram(*id)) {
+                source.release();
+                return fail("large defrag spill failed");
+            }
+            if (!ram.evict_one_unpinned(*id)) {
+                source.release();
+                return fail("large defrag RAM retirement failed");
+            }
+            disk.forget_ram_resident(*id);
+        }
+        disk.wait_idle_and_fsync();
+        const auto match = disk.plan_match(kept, q36::detail::prefix_hash_chain(kept));
+        if (!match) {
+            source.release();
+            return fail("large defrag entry missing");
+        }
+        const auto id = disk.test_load_meta(match->entry_id).current_hidden_id;
+        const auto before =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::State, id);
+        if (!before || before->offset == 0) {
+            source.release();
+            return fail("large defrag location missing");
+        }
+        if (!disk.test_fifo_evict_one() || !disk.test_fifo_evict_one()) {
+            source.release();
+            return fail("large defrag eviction failed");
+        }
+        const auto storage = pack_file_bytes(dir.path);
+        {
+            UnlockedIoHold first_move(disk, q36::detail::DiskUnlockedIo::DefragMapped);
+            disk.set_cache_idle(true);
+            if (!first_move.entered()) {
+                first_move.release();
+                source.release();
+                return fail("large defrag first page did not move");
+            }
+            UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::DefragCopy);
+            first_move.release();
+            if (!hold.entered()) {
+                hold.release();
+                source.release();
+                return fail("large defrag copy did not start");
+            }
+            disk.set_cache_idle(false);
+            hold.release();
+            disk.wait_idle_and_fsync();
+        }
+        const auto cancelled =
+            packed_object_location(dir.path, q36::detail::DiskObjectKind::State, id);
+        if (!cancelled || cancelled->offset != before->offset) {
+            source.release();
+            return fail("partial large relocation published");
+        }
+        disk.set_cache_idle(true);
+        if (!wait_pred(
+                [&] {
+                    const auto now =
+                        packed_object_location(dir.path, q36::detail::DiskObjectKind::State, id);
+                    return now && now->offset < before->offset &&
+                           fs::file_size(now->path) < before->offset + before->extent;
+                },
+                std::chrono::seconds(5))) {
+            disk.wait_idle_and_fsync();
+            source.release();
+            return fail("large state defrag did not finish");
+        }
+        disk.wait_idle_and_fsync();
+        if (pack_file_bytes(dir.path) > storage ||
+            disk.snapshot().storage_bytes != pack_file_bytes(dir.path)) {
+            source.release();
+            return fail("large state defrag grew storage");
+        }
+    }
+    q36::detail::KVDiskCache reopened(cfg);
+    const auto match = reopened.plan_match(kept, q36::detail::prefix_hash_chain(kept));
+    if (!match || !reopened.claim(match->entry_id)) {
+        source.release();
+        return fail("large defrag reopen failed");
+    }
+    auto destination = pool.reserve(2);
+    destination.materialize_pages(1, ctx.stream);
+    ninfer::DeviceBuffer result(hidden_bytes);
+    ninfer::Tensor result_tensor(result.p, ninfer::DType::U8,
+                                 {static_cast<std::int64_t>(hidden_bytes)});
+    q36::detail::DiskRestoreTarget target;
+    target.text           = &destination;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.tail_hidden    = &result_tensor;
+    target.stream         = ctx.copy_stream;
+    reopened.restore_device(match->entry_id, target);
+    int failures = wait_restore_bounded(reopened, ctx, "large defrag restore stalled");
+    if (failures == 0) {
+        std::vector<std::uint8_t> actual(hidden_bytes);
+        CUDA_CHECK(cudaMemcpy(actual.data(), result.p, actual.size(), cudaMemcpyDeviceToHost));
+        if (!std::all_of(actual.begin(), actual.end(), [](auto value) { return value == 73; })) {
+            failures += fail("defrag changed a multi-chunk state payload");
+        }
+        failures +=
+            expect_mapped_pages_equal(pool, source, destination, 1, ctx, "large state defrag KV");
+    }
+    reopened.release(match->entry_id);
+    destination.release();
+    source.release();
+    return failures;
+}
+
+int test_idle_defrag(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault  = q36::detail::DiskFaultPoint;
+    using Window = q36::detail::DiskUnlockedIo;
+    // Success, four durability failures, interrupted copy/publication, a held reader,
+    // and crash snapshots on either side of durable location publication.
+    for (int scenario = 0; scenario < 11; ++scenario) {
+        TmpDir dir("idle-defrag");
+        q36::detail::KVRamCache ram(32ULL << 20);
+        auto source = pool.reserve(2);
+        source.materialize_pages(2, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               256ULL << 10, 4096);
+        std::uint64_t page = 0;
+        std::vector<std::uint8_t> expected;
+        const std::vector<ninfer::TokenId> kept(128, 103);
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            for (int round = 0; round < 3; ++round) {
+                fill_logical_pages(pool, source, static_cast<std::uint8_t>(51 + round));
+                const auto ram_id = capture_tokens(ram, pool, source, ctx,
+                                                   std::vector<ninfer::TokenId>(128, 101 + round));
+                disk.note_ram_resident(ram_id, 0);
+                if (!disk.emergency_spill_ram(ram_id)) {
+                    source.release();
+                    return fail("defrag fixture spill failed");
+                }
+                if (!ram.evict_one_unpinned(ram_id)) {
+                    source.release();
+                    return fail("defrag fixture RAM retirement failed");
+                }
+                disk.forget_ram_resident(ram_id);
+            }
+            disk.wait_idle_and_fsync();
+            const auto prompt = text_prompt(kept);
+            const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match) {
+                source.release();
+                return fail("defrag fixture missing");
+            }
+            page = disk.test_main_page_ids(match->entry_id).at(0);
+            const auto before =
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+            if (!before || before->offset == 0) {
+                source.release();
+                return fail("defrag fixture has no movable page");
+            }
+            expected.resize(before->stored);
+            if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::Main, page,
+                                    expected.data(), expected.size())) {
+                source.release();
+                return fail("defrag oracle read failed");
+            }
+            if (!disk.test_fifo_evict_one() || !disk.test_fifo_evict_one()) {
+                source.release();
+                return fail("defrag fixture eviction failed");
+            }
+            const auto storage_before = pack_file_bytes(dir.path);
+            // Write-behind permission alone must not trigger relocation during active decoding.
+            disk.request_idle_spill();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            const auto active_location =
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+            if (!active_location || active_location->offset != before->offset) {
+                source.release();
+                return fail("write-behind triggered defrag without Engine idle permission");
+            }
+            if (scenario >= 1 && scenario <= 4) {
+                constexpr std::array faults{Fault::AfterMoveCopy, Fault::AfterMovePackSync,
+                                            Fault::AfterMoveAppend, Fault::AfterMoveSync};
+                const auto drops = disk.snapshot().drops;
+                disk.test_arm_fault(faults[static_cast<std::size_t>(scenario - 1)]);
+                disk.set_cache_idle(true);
+                if (!wait_pred([&] { return disk.snapshot().drops > drops; },
+                               std::chrono::seconds(5))) {
+                    source.release();
+                    return fail("defrag durability fault did not execute");
+                }
+                disk.wait_idle_and_fsync();
+                const auto failed =
+                    packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+                if (!failed || failed->offset != before->offset) {
+                    source.release();
+                    return fail("failed relocation changed the durable location");
+                }
+            } else if (scenario == 5 || scenario == 6) {
+                UnlockedIoHold hold(disk,
+                                    scenario == 5 ? Window::DefragCopy : Window::DefragPublish);
+                disk.set_cache_idle(true);
+                if (!hold.entered()) {
+                    hold.release();
+                    source.release();
+                    return fail("defrag interruption window was not reached");
+                }
+                disk.set_cache_idle(false);
+                hold.release();
+                disk.wait_idle_and_fsync();
+                const auto cancelled =
+                    packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+                if (!cancelled || cancelled->offset != before->offset) {
+                    source.release();
+                    return fail("interrupted relocation published its destination");
+                }
+            } else if (scenario == 7) {
+                UnlockedIoHold hold(disk, Window::PayloadRead);
+                std::vector<std::uint8_t> actual(expected.size());
+                std::atomic<bool> read_ok{false};
+                std::jthread reader([&] {
+                    read_ok.store(disk.test_read_object(q36::detail::DiskObjectKind::Main, page,
+                                                        actual.data(), actual.size()));
+                });
+                if (!hold.entered()) {
+                    hold.release();
+                    reader.join();
+                    source.release();
+                    return fail("defrag held reader did not enter");
+                }
+                disk.set_cache_idle(true);
+                const bool moved = wait_pred(
+                    [&] {
+                        const auto now = packed_object_location(
+                            dir.path, q36::detail::DiskObjectKind::Main, page);
+                        return now && now->offset < before->offset;
+                    },
+                    std::chrono::seconds(5));
+                const bool preserved =
+                    fs::file_size(before->path) >= before->offset + before->extent;
+                hold.release();
+                reader.join();
+                if (!moved || !preserved || !read_ok.load() || actual != expected) {
+                    source.release();
+                    return fail("defrag overwrote or truncated a reader's old location");
+                }
+            } else if (scenario == 8 || scenario == 9) {
+                UnlockedIoHold hold(disk,
+                                    scenario == 8 ? Window::DefragPublish : Window::DefragMapped);
+                disk.set_cache_idle(true);
+                if (!hold.entered()) {
+                    hold.release();
+                    source.release();
+                    return fail("defrag crash window was not reached");
+                }
+                TmpDir crash("defrag-crash");
+                fs::copy(dir.path, crash.path,
+                         fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+                // Repeated idle permission must preserve the in-flight relocation.
+                disk.set_cache_idle(true);
+                hold.release();
+                auto recovered_cfg     = cfg;
+                recovered_cfg.location = crash.path;
+                q36::detail::KVDiskCache recovered(recovered_cfg);
+                std::vector<std::uint8_t> actual(expected.size());
+                const auto location =
+                    packed_object_location(crash.path, q36::detail::DiskObjectKind::Main, page);
+                const bool was_moved = location && location->offset < before->offset;
+                if (!location || was_moved != (scenario == 9) ||
+                    !recovered.test_read_object(q36::detail::DiskObjectKind::Main, page,
+                                                actual.data(), actual.size()) ||
+                    actual != expected) {
+                    source.release();
+                    return fail("defrag crash recovery selected invalid payload or location");
+                }
+            }
+            if (scenario == 10) {
+                const auto drops = disk.snapshot().drops;
+                disk.test_arm_fault_sequence(Fault::AfterMoveAppend, Fault::BeforeMapRollback);
+                disk.set_cache_idle(true);
+                if (!wait_pred([&] { return disk.snapshot().drops > drops; },
+                               std::chrono::seconds(5))) {
+                    source.release();
+                    return fail("defrag rollback failure did not execute");
+                }
+                disk.wait_idle_and_fsync();
+                const auto frozen_storage = pack_file_bytes(dir.path);
+                const auto unsaved =
+                    capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 199));
+                disk.note_ram_resident(unsaved, 0);
+                std::vector<std::uint8_t> actual(expected.size());
+                if (disk.emergency_spill_ram(unsaved) ||
+                    pack_file_bytes(dir.path) != frozen_storage ||
+                    fs::file_size(before->path) < before->offset + before->extent ||
+                    !disk.test_read_object(q36::detail::DiskObjectKind::Main, page, actual.data(),
+                                           actual.size()) ||
+                    actual != expected) {
+                    source.release();
+                    return fail("ambiguous relocation reused space or corrupted its source");
+                }
+            } else {
+                disk.set_cache_idle(true);
+                if (!wait_pred(
+                        [&] {
+                            const auto now = packed_object_location(
+                                dir.path, q36::detail::DiskObjectKind::Main, page);
+                            return now && now->offset < before->offset &&
+                                   fs::file_size(now->path) < before->offset + before->extent;
+                        },
+                        std::chrono::seconds(5))) {
+                    disk.wait_idle_and_fsync();
+                    const auto now =
+                        packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+                    std::cerr << "defrag scenario=" << scenario << " before=" << before->offset
+                              << " after=" << (now ? now->offset : UINT64_MAX)
+                              << " file_bytes=" << fs::file_size(before->path)
+                              << " drops=" << disk.snapshot().drops << '\n';
+                    source.release();
+                    return fail("idle defrag did not reuse a hole and trim the sparse tail");
+                }
+                disk.wait_idle_and_fsync();
+                const auto pages = disk.test_main_page_ids(match->entry_id);
+                const auto first = packed_object_location(
+                    dir.path, q36::detail::DiskObjectKind::Main, pages.at(0));
+                const auto second = packed_object_location(
+                    dir.path, q36::detail::DiskObjectKind::Main, pages.at(1));
+                if (!first || !second || first->path != second->path ||
+                    second->offset != first->offset + first->extent) {
+                    source.release();
+                    return fail("defrag split a contiguous page run despite an adequate hole");
+                }
+            }
+            if (pack_file_bytes(dir.path) > storage_before ||
+                disk.snapshot().storage_bytes != pack_file_bytes(dir.path)) {
+                source.release();
+                return fail("idle defrag grew pack storage or lost its accounting");
+            }
+        }
+        q36::detail::KVDiskCache reopened(cfg);
+        const auto prompt = text_prompt(kept);
+        const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+        if (!match || !reopened.claim(match->entry_id)) {
+            source.release();
+            return fail("defrag lost its retained entry on reopen");
+        }
+        auto destination = pool.reserve(2);
+        destination.materialize_pages(2, ctx.stream);
+        q36::detail::DiskRestoreTarget target;
+        target.text           = &destination;
+        target.text_pool      = &pool;
+        target.text_dst_pages = 2;
+        target.stream         = ctx.copy_stream;
+        reopened.restore_device(match->entry_id, target);
+        int result = wait_restore_bounded(reopened, ctx, "defrag restored payload stalled");
+        if (result == 0) {
+            result = expect_mapped_pages_equal(pool, source, destination, 2, ctx,
+                                               "defrag exact restored payload");
+        }
+        reopened.release(match->entry_id);
+        destination.release();
+        source.release();
+        if (result != 0) { return result; }
+    }
+    return test_idle_defrag_large_state(ctx, pool);
+}
+
+int test_bounded_storage_churn(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool,
+                               q36::detail::DiskFaultPoint fault) {
+    TmpDir dir("bounded-storage");
+    q36::detail::KVRamCache ram(32ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           128ULL << 10, 4096);
+    std::vector<ninfer::TokenId> latest;
+    {
+        q36::detail::KVDiskCache disk(cfg);
+        disk.test_arm_fault(fault);
+        for (int round = 0; round < 320; ++round) {
+            fill_logical_pages(pool, source, static_cast<std::uint8_t>(round));
+            latest.assign(64, 2000 + round);
+            const auto ram_id = capture_tokens(ram, pool, source, ctx, latest);
+            disk.note_ram_resident(ram_id, 0);
+            if (!disk.emergency_spill_ram(ram_id)) {
+                source.release();
+                return fail("bounded storage churn could not reuse evicted space");
+            }
+            disk.wait_idle_and_fsync();
+            const auto physical = pack_file_bytes(dir.path);
+            if (physical > cfg.capacity_bytes || disk.snapshot().storage_bytes != physical) {
+                source.release();
+                return fail("pack growth exceeded physical capacity or escaped accounting");
+            }
+            std::uint64_t metadata = 0;
+            for (const auto& file : fs::recursive_directory_iterator(dir.path)) {
+                if (file.is_regular_file() && file.path().extension() != ".pack") {
+                    metadata += file.file_size();
+                }
+            }
+            if (metadata > (256ULL << 10)) {
+                source.release();
+                return fail("metadata grew without a bounded index checkpoint");
+            }
+        }
+        if (fault != q36::detail::DiskFaultPoint::None && disk.snapshot().drops == 0) {
+            source.release();
+            return fail("index checkpoint fault did not execute during storage churn");
+        }
+    }
+    q36::detail::KVDiskCache reopened(cfg);
+    const auto prompt = text_prompt(latest);
+    const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match || !reopened.claim(match->entry_id)) {
+        source.release();
+        return fail("bounded storage lost its newest entry after restart");
+    }
+    auto destination = pool.reserve(2);
+    destination.materialize_pages(1, ctx.stream);
+    q36::detail::DiskRestoreTarget target;
+    target.text           = &destination;
+    target.text_pool      = &pool;
+    target.text_dst_pages = 1;
+    target.stream         = ctx.copy_stream;
+    reopened.restore_device(match->entry_id, target);
+    int result = wait_restore_bounded(reopened, ctx, "bounded storage restore stalled");
+    if (result == 0) {
+        result = expect_mapped_pages_equal(pool, source, destination, 1, ctx,
+                                           "bounded storage reused payload");
+    }
+    reopened.release(match->entry_id);
+    destination.release();
+    source.release();
+    return result;
+}
+
+int test_retirement_waits_for_payload_reader(ninfer::DeviceContext& ctx,
+                                             ninfer::PagedKVPool& pool) {
+    TmpDir dir("retired-reader");
+    q36::detail::KVRamCache ram(32ULL << 20);
+    auto source = pool.reserve(2);
+    source.materialize_pages(1, ctx.stream);
+    fill_logical_pages(pool, source, 31);
+    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                           32ULL << 20, 4096);
+    q36::detail::KVDiskCache disk(cfg);
+    const std::vector<ninfer::TokenId> first(64, 71);
+    const auto ram_id = capture_tokens(ram, pool, source, ctx, first);
+    disk.note_ram_resident(ram_id, 0);
+    if (!disk.emergency_spill_ram(ram_id)) {
+        source.release();
+        return fail("reader lease spill failed");
+    }
+    const auto prompt = text_prompt(first);
+    const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+    if (!match) {
+        source.release();
+        return fail("reader lease fixture is missing");
+    }
+    const auto page     = disk.test_main_page_ids(match->entry_id).front();
+    const auto location = packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page);
+    if (!location) {
+        source.release();
+        return fail("reader lease page is missing");
+    }
+    std::vector<std::uint8_t> expected(location->stored), actual(location->stored);
+    if (!packed_read_prefix(dir.path, q36::detail::DiskObjectKind::Main, page, expected.data(),
+                            expected.size())) {
+        source.release();
+        return fail("reader lease oracle read failed");
+    }
+    UnlockedIoHold hold(disk, q36::detail::DiskUnlockedIo::PayloadRead);
+    std::atomic<bool> read_ok{false};
+    std::jthread reader([&] {
+        read_ok.store(disk.test_read_object(q36::detail::DiskObjectKind::Main, page, actual.data(),
+                                            actual.size()));
+    });
+    if (!hold.entered()) {
+        hold.release();
+        reader.join();
+        source.release();
+        return fail("reader lease did not reach the unlocked read");
+    }
+    hold.arm();
+    const bool evicted = disk.test_fifo_evict_one();
+    fill_logical_pages(pool, source, 97);
+    const auto next_ram =
+        capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 83));
+    disk.note_ram_resident(next_ram, 0);
+    const bool spilled  = disk.emergency_spill_ram(next_ram);
+    const bool returned = hold.disarm();
+    hold.release();
+    reader.join();
+    disk.wait_idle_and_fsync();
+    source.release();
+    if (!evicted || !spilled || !returned || !read_ok.load() || expected != actual) {
+        return fail("retirement blocked on or overwrote an in-flight payload reader");
+    }
+    if (packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page)) {
+        return fail("retired extent was not released after its reader drained");
+    }
+    return 0;
+}
+
+int test_backing_file_recovery(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    for (int damage = 0; damage < 3; ++damage) {
+        TmpDir dir("backing-recovery");
+        q36::detail::KVRamCache ram(32ULL << 20);
+        auto source = pool.reserve(2);
+        source.materialize_pages(1, ctx.stream);
+        fill_logical_pages(pool, source, 47);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               128ULL << 10, 4096);
+        const std::vector<ninfer::TokenId> original(64, 51);
+        fs::path path;
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            const auto id = capture_tokens(ram, pool, source, ctx, original);
+            disk.note_ram_resident(id, 0);
+            if (!disk.emergency_spill_ram(id)) {
+                source.release();
+                return fail("backing recovery fixture spill failed");
+            }
+            disk.wait_idle_and_fsync();
+            const auto prompt = text_prompt(original);
+            const auto match  = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match) {
+                source.release();
+                return fail("backing recovery fixture missing");
+            }
+            const auto pages = disk.test_main_page_ids(match->entry_id);
+            const auto location =
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, pages.at(0));
+            if (!location) {
+                source.release();
+                return fail("backing recovery location missing");
+            }
+            path = location->path;
+        }
+        if (damage == 0) {
+            fs::remove(path);
+        } else if (damage == 1) {
+            fs::resize_file(path, 1);
+        } else {
+            fs::resize_file(path, 2ULL << 30);
+        }
+        q36::detail::KVDiskCache disk(cfg);
+        const auto prompt = text_prompt(original);
+        const bool retained =
+            disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt)).has_value();
+        if (retained != (damage == 2) ||
+            disk.snapshot().storage_bytes != pack_file_bytes(dir.path) ||
+            pack_file_bytes(dir.path) > cfg.capacity_bytes) {
+            source.release();
+            return fail("backing recovery retained invalid data or miscounted storage");
+        }
+        for (int round = 0; round < 12; ++round) {
+            const auto id = capture_tokens(ram, pool, source, ctx,
+                                           std::vector<ninfer::TokenId>(64, 60 + round));
+            disk.note_ram_resident(id, 0);
+            if (!disk.emergency_spill_ram(id)) {
+                source.release();
+                return fail("backing recovery prevented reuse");
+            }
+            disk.wait_idle_and_fsync();
+            if (pack_file_bytes(dir.path) > cfg.capacity_bytes ||
+                disk.snapshot().storage_bytes != pack_file_bytes(dir.path)) {
+                source.release();
+                return fail("backing recovery permitted uncharged growth");
+            }
+        }
+        source.release();
+    }
+    return 0;
+}
+
+int test_retirement_durability_failure(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault = q36::detail::DiskFaultPoint;
+    for (const auto fault : {Fault::AfterDeleteAppend, Fault::AfterDeleteSync}) {
+        TmpDir dir("retire-failure");
+        q36::detail::KVRamCache ram(32ULL << 20);
+        auto source = pool.reserve(2);
+        source.materialize_pages(1, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               128ULL << 10, 4096);
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            for (int round = 0; round < 2; ++round) {
+                fill_logical_pages(pool, source, static_cast<std::uint8_t>(30 + round));
+                const auto id = capture_tokens(ram, pool, source, ctx,
+                                               std::vector<ninfer::TokenId>(64, 90 + round));
+                disk.note_ram_resident(id, 0);
+                if (!disk.emergency_spill_ram(id)) {
+                    source.release();
+                    return fail("retirement fault fixture failed");
+                }
+            }
+            disk.wait_idle_and_fsync();
+            disk.test_arm_fault(fault);
+            bool failed = false;
+            try {
+                (void)disk.test_fifo_evict_one();
+            } catch (const std::runtime_error&) { failed = true; }
+            if (!failed) {
+                source.release();
+                return fail("retirement durability fault was not exercised");
+            }
+            fill_logical_pages(pool, source, 32);
+            const auto id =
+                capture_tokens(ram, pool, source, ctx, std::vector<ninfer::TokenId>(64, 92));
+            disk.note_ram_resident(id, 0);
+            if (!disk.emergency_spill_ram(id)) {
+                source.release();
+                return fail("retirement fault prevented retry");
+            }
+            disk.wait_idle_and_fsync();
+            if (pack_file_bytes(dir.path) > cfg.capacity_bytes ||
+                pack_file_bytes(dir.path) != disk.snapshot().storage_bytes) {
+                source.release();
+                return fail("retirement failure lost physical accounting");
+            }
+        }
+        q36::detail::KVDiskCache reopened(cfg);
+        for (int round = 1; round < 3; ++round) {
+            const auto prompt = text_prompt(std::vector<ninfer::TokenId>(64, 90 + round));
+            const auto match  = reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
+            if (!match || !reopened.claim(match->entry_id)) {
+                source.release();
+                return fail("retirement fault lost a retained entry");
+            }
+            fill_logical_pages(pool, source, static_cast<std::uint8_t>(30 + round));
+            auto destination = pool.reserve(2);
+            destination.materialize_pages(1, ctx.stream);
+            q36::detail::DiskRestoreTarget target;
+            target.text           = &destination;
+            target.text_pool      = &pool;
+            target.text_dst_pages = 1;
+            target.stream         = ctx.copy_stream;
+            reopened.restore_device(match->entry_id, target);
+            int result = wait_restore_bounded(reopened, ctx, "retirement fault restore stalled");
+            if (result == 0) {
+                result = expect_mapped_pages_equal(pool, source, destination, 1, ctx,
+                                                   "retirement failure retained payload");
+            }
+            reopened.release(match->entry_id);
+            destination.release();
+            if (result != 0) {
+                source.release();
+                return result;
+            }
+        }
+        source.release();
+    }
+    return 0;
+}
+
+int test_bounded_storage(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+    using Fault  = q36::detail::DiskFaultPoint;
+    int failures = test_retirement_waits_for_payload_reader(ctx, pool);
+    failures += test_backing_file_recovery(ctx, pool);
+    failures += test_retirement_durability_failure(ctx, pool);
+    for (const auto fault : {Fault::None, Fault::AfterIndexBaseSync, Fault::AfterIndexLogSync,
+                             Fault::AfterPacksetRename, Fault::AfterPacksetRootSync}) {
+        failures += test_bounded_storage_churn(ctx, pool, fault);
+    }
+    return failures;
 }
 
 int test_disk_match_filters_unready_heads(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -2677,7 +3383,7 @@ int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx, ninfer::P
         alloc.materialize_pages(1, ctx.stream);
         fill_logical_pages(pool, alloc, partial ? 41 : 57);
         auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                               64ULL << 20, 4096);
+                               2ULL << 30, 4096);
         const std::vector<ninfer::TokenId> tokens(64, partial ? 41 : 57);
         {
             q36::detail::KVDiskCache disk(cfg);
@@ -2725,97 +3431,6 @@ int test_pack_rollover_and_partial_pwritev(ninfer::DeviceContext& ctx, ninfer::P
     }
     return exercise("pack-roll-next", kSegmentBytes - extent + q36::detail::kDiskPageIoAlignment, 1,
                     0, false);
-}
-
-int test_compaction_reclaims_retired_pack_generation(ninfer::DeviceContext& ctx,
-                                                     ninfer::PagedKVPool& pool) {
-    TmpDir dir("pack-compaction");
-    q36::detail::KVRamCache ram(64ULL << 20);
-    auto alloc = pool.reserve(4);
-    alloc.materialize_pages(3, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    const std::vector<ninfer::TokenId> tokens_a(64, 31);
-    const std::vector<ninfer::TokenId> tokens_b(128, 47);
-    std::uint64_t entry_b = 0;
-    {
-        q36::detail::KVDiskCache disk(cfg);
-        const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
-        disk.note_ram_resident(ram_a, 0);
-        if (!disk.emergency_spill_ram(ram_a)) {
-            alloc.release();
-            return fail("pack-compaction spill A failed");
-        }
-        const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
-        disk.note_ram_resident(ram_b, 0);
-        if (!disk.emergency_spill_ram(ram_b)) {
-            alloc.release();
-            return fail("pack-compaction spill B failed");
-        }
-        const auto match_b = disk.plan_match(text_prompt(tokens_b),
-                                             q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!match_b) {
-            alloc.release();
-            return fail("pack-compaction could not find B before eviction");
-        }
-        entry_b = match_b->entry_id;
-        if (!disk.test_fifo_evict_one()) {
-            alloc.release();
-            return fail("pack-compaction could not evict A");
-        }
-    }
-    const auto old_packset = read_bytes(dir.path / "PACKSET");
-    if (old_packset.size() != 32) {
-        alloc.release();
-        return fail("pack-compaction PACKSET is missing before reopen");
-    }
-    std::uint64_t old_generation = 0;
-    std::memcpy(&old_generation, old_packset.data() + 12, sizeof(old_generation));
-    const auto old_base =
-        dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".base");
-    const auto old_log = dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".log");
-    {
-        q36::detail::KVDiskCache reopened(cfg);
-        auto old_generation_lease = reopened.test_hold_active_generation();
-        const auto match_b        = reopened.plan_match(
-            text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!match_b || match_b->entry_id != entry_b) {
-            alloc.release();
-            return fail("pack-compaction lost the retained entry on reopen");
-        }
-        // Reopen leaves the evicted map entry as a zero-ref map record.  The
-        // idle maintenance path must compact it away and release the retired
-        // generation without losing B.
-        reopened.wait_idle_and_fsync();
-        const auto new_packset = read_bytes(dir.path / "PACKSET");
-        if (new_packset.size() != 32) {
-            alloc.release();
-            return fail("pack-compaction PACKSET is missing after compaction");
-        }
-        std::uint64_t new_generation = 0;
-        std::memcpy(&new_generation, new_packset.data() + 12, sizeof(new_generation));
-        if (new_generation <= old_generation ||
-            !fs::exists(dir.path / "packs" / std::to_string(old_generation)) ||
-            !fs::exists(old_base) || !fs::exists(old_log)) {
-            alloc.release();
-            return fail("pack-compaction ignored a held retired-generation pack/map lease");
-        }
-        const auto retained = reopened.plan_match(
-            text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!retained || retained->entry_id != entry_b) {
-            alloc.release();
-            return fail("pack-compaction lost the retained entry after rewrite");
-        }
-        old_generation_lease.reset();
-        reopened.wait_idle_and_fsync();
-        if (fs::exists(dir.path / "packs" / std::to_string(old_generation)) ||
-            fs::exists(old_base) || fs::exists(old_log)) {
-            alloc.release();
-            return fail("pack-compaction did not reap released generation pack/maps");
-        }
-    }
-    alloc.release();
-    return 0;
 }
 
 int test_spill_durability_phase_matrix(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
@@ -2885,92 +3500,6 @@ int test_packset_bootstrap_phase_matrix(ninfer::PagedKVPool& pool) {
             std::cerr << "PACKSET bootstrap recovery threw: " << e.what() << '\n';
             return fail("PACKSET bootstrap phase was not restart recoverable");
         }
-    }
-    return 0;
-}
-
-int test_compaction_publication_phase_matrix(ninfer::DeviceContext& ctx,
-                                             ninfer::PagedKVPool& pool) {
-    using Fault             = q36::detail::DiskFaultPoint;
-    const std::array points = {
-        Fault::CompactionAfterPackCopy,        Fault::CompactionAfterPackSync,
-        Fault::CompactionAfterBaseWrite,       Fault::CompactionAfterBaseSync,
-        Fault::CompactionAfterLogWrite,        Fault::CompactionAfterLogSync,
-        Fault::CompactionAfterPacksetTmpWrite, Fault::CompactionAfterPacksetTmpSync,
-        Fault::CompactionAfterPacksetRename,   Fault::CompactionAfterRootSync,
-    };
-    int ordinal = 0;
-    for (Fault point : points) {
-        TmpDir dir((std::string("compact-phase-") + std::to_string(ordinal)).c_str());
-        q36::detail::KVRamCache ram(48ULL << 20);
-        auto alloc = pool.reserve(3);
-        alloc.materialize_pages(2, ctx.stream);
-        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                               64ULL << 20, 4096);
-        const std::vector<ninfer::TokenId> dropped(64, 121 + ordinal);
-        const std::vector<ninfer::TokenId> retained(128, 141 + ordinal);
-        {
-            q36::detail::KVDiskCache disk(cfg);
-            for (const auto* tokens : {&dropped, &retained}) {
-                const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
-                disk.note_ram_resident(ram_id, 0);
-                if (!disk.emergency_spill_ram(ram_id)) {
-                    alloc.release();
-                    return fail("compaction phase fixture spill failed");
-                }
-            }
-            if (!disk.test_fifo_evict_one()) {
-                alloc.release();
-                return fail("compaction phase fixture eviction failed");
-            }
-        }
-        {
-            q36::detail::KVDiskCache disk(cfg);
-            const auto packset = read_bytes(dir.path / "PACKSET");
-            if (packset.size() != 32) {
-                alloc.release();
-                return fail("compaction phase PACKSET fixture is invalid");
-            }
-            std::uint64_t old_generation = 0;
-            std::memcpy(&old_generation, packset.data() + 12, sizeof(old_generation));
-            const auto old_base =
-                dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".base");
-            const auto old_log =
-                dir.path / "maps" / ("objects-" + std::to_string(old_generation) + ".log");
-            if (point == Fault::CompactionAfterPacksetRename) {
-                disk.test_arm_fault_sequence(point, Fault::CompactionRecoveryBeforeRootSync);
-            } else {
-                disk.test_arm_fault(point);
-            }
-            disk.wait_idle_and_fsync();
-            if (point == Fault::CompactionAfterPacksetRename) {
-                const auto old_root = dir.path / "packs" / std::to_string(old_generation);
-                if (!fs::exists(old_root) || !fs::exists(old_base) || !fs::exists(old_log)) {
-                    alloc.release();
-                    return fail("uncertain PACKSET publication reaped old generation pack/maps");
-                }
-                disk.wait_idle_and_fsync();
-                if (fs::exists(old_root) || fs::exists(old_base) || fs::exists(old_log)) {
-                    alloc.release();
-                    return fail("durable PACKSET retry did not reap old generation pack/maps");
-                }
-            }
-        }
-        try {
-            q36::detail::KVDiskCache reopened(cfg);
-            const auto prompt = text_prompt(retained);
-            if (!reopened.plan_match(prompt, q36::detail::prefix_hash_chain(prompt))) {
-                alloc.release();
-                return fail("compaction phase lost the retained restart generation");
-            }
-            reopened.wait_idle_and_fsync();
-        } catch (const std::exception& e) {
-            std::cerr << "compaction phase " << ordinal << " reopen threw: " << e.what() << '\n';
-            alloc.release();
-            return fail("compaction phase left an unreadable published generation");
-        }
-        ++ordinal;
-        alloc.release();
     }
     return 0;
 }
@@ -3051,8 +3580,8 @@ int test_physical_preflight_rejects_before_pack_write(ninfer::DeviceContext& ctx
     return 0;
 }
 
-int test_low_free_subthreshold_garbage_rejects_without_write(ninfer::DeviceContext& ctx,
-                                                             ninfer::PagedKVPool& pool) {
+int test_low_free_recycled_extent_rejects_without_write(ninfer::DeviceContext& ctx,
+                                                        ninfer::PagedKVPool& pool) {
     TmpDir dir("pack-low-free-garbage");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(2);
@@ -3090,7 +3619,7 @@ int test_low_free_subthreshold_garbage_rejects_without_write(ninfer::DeviceConte
     }
     if (!disk.test_fifo_evict_one()) {
         alloc.release();
-        return fail("low-free fixture could not create sub-threshold garbage");
+        return fail("low-free fixture could not create reusable extents");
     }
     const auto before_packs   = file_size_snapshot(dir.path / "packs");
     const auto before_maps    = file_size_snapshot(dir.path / "maps");
@@ -3098,11 +3627,11 @@ int test_low_free_subthreshold_garbage_rejects_without_write(ninfer::DeviceConte
     const std::vector<ninfer::TokenId> rejected(64, 99);
     const auto rejected_ram = capture_tokens(ram, pool, alloc, ctx, rejected);
     disk.note_ram_resident(rejected_ram, 0);
-    constexpr std::uint64_t kSegmentSlack = 1ULL << 30;
-    disk.test_set_free_bytes_override(append_bytes + kSegmentSlack - 1);
+    constexpr std::uint64_t kMetadataSlack = 1ULL << 20;
+    disk.test_set_free_bytes_override(append_bytes + kMetadataSlack - 1);
     if (disk.emergency_spill_ram(rejected_ram)) {
         alloc.release();
-        return fail("low-free sub-threshold-garbage spill was admitted");
+        return fail("low-free recycled-extent spill was admitted");
     }
     if (file_size_snapshot(dir.path / "packs") != before_packs ||
         file_size_snapshot(dir.path / "maps") != before_maps ||
@@ -3125,7 +3654,7 @@ int test_low_free_subthreshold_garbage_rejects_without_write(ninfer::DeviceConte
     const std::vector<ninfer::TokenId> accepted(64, 100);
     const auto accepted_ram = capture_tokens(ram, pool, alloc, ctx, accepted);
     disk.note_ram_resident(accepted_ram, 0);
-    disk.test_set_free_bytes_override(append_bytes + kSegmentSlack);
+    disk.test_set_free_bytes_override(append_bytes + kMetadataSlack);
     if (!disk.emergency_spill_ram(accepted_ram)) {
         alloc.release();
         return fail("low-free exact append-plus-slack boundary was rejected");
@@ -6445,7 +6974,7 @@ int test_gc_skipped_shared_pages(ninfer::DeviceContext& ctx, ninfer::PagedKVPool
         skipped.wait_idle_and_fsync();
         if (!packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, shared_page)) {
             alloc.release();
-            return fail("compaction dropped a shared object retained only by a skipped tree");
+            return fail("retirement dropped a shared object retained only by a skipped tree");
         }
     }
     cfg.max_context = 4096;
@@ -7950,96 +8479,6 @@ int test_capacity_eviction_tombstone_failure(ninfer::DeviceContext& ctx, ninfer:
         planned_entry(reopened, evicted) != 0 || planned_entry(reopened, fallback) != 0 ||
         planned_entry(reopened, incoming) == 0) {
         failures += fail("failed eviction round exposed the wrong restart generation");
-    }
-    alloc.release();
-    return failures;
-}
-
-// Compaction writes and renames PACKSET, and reaps the retired generation (remove_all and
-// directory fsyncs), with the index mutex released. Admission completes while either
-// window is held, and the old generation is gone once the reap finishes.
-int test_compaction_publish_and_reap_run_without_index_mutex(ninfer::DeviceContext& ctx,
-                                                             ninfer::PagedKVPool& pool) {
-    TmpDir dir("compaction-unlocked");
-    q36::detail::KVRamCache ram(48ULL << 20);
-    auto alloc = pool.reserve(3);
-    alloc.materialize_pages(2, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    const std::vector<ninfer::TokenId> dropped(64, 101);
-    const std::vector<ninfer::TokenId> retained(128, 102);
-    {
-        q36::detail::KVDiskCache disk(cfg);
-        for (const auto* tokens : {&dropped, &retained}) {
-            const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
-            disk.note_ram_resident(ram_id, 0);
-            if (!disk.emergency_spill_ram(ram_id)) {
-                alloc.release();
-                return fail("compaction-unlocked fixture spill failed");
-            }
-        }
-        if (!disk.test_fifo_evict_one()) {
-            alloc.release();
-            return fail("compaction-unlocked fixture eviction failed");
-        }
-    }
-    int failures = 0;
-    q36::detail::KVDiskCache disk(cfg);
-    const auto packset           = read_bytes(dir.path / "PACKSET");
-    std::uint64_t old_generation = 0;
-    if (packset.size() == 32) { std::memcpy(&old_generation, packset.data() + 12, 8); }
-    const auto old_root                = dir.path / "packs" / std::to_string(old_generation);
-    const std::uint64_t retained_entry = planned_entry(disk, retained);
-    if (old_generation == 0 || !fs::exists(old_root) || retained_entry == 0) {
-        alloc.release();
-        return fail("compaction-unlocked fixture is invalid");
-    }
-    UnlockedIoHold publish(disk, q36::detail::DiskUnlockedIo::CompactionPackset);
-    UnlockedIoHold reap(disk, q36::detail::DiskUnlockedIo::GenerationReap);
-    std::jthread maintenance([&] { disk.wait_idle_and_fsync(); });
-    if (!publish.entered()) {
-        publish.release();
-        reap.release();
-        alloc.release();
-        return fail("compaction-unlocked compaction never reached PACKSET publication");
-    }
-    publish.arm();
-    if (!disk_admission_round(disk, retained, retained_entry) || !publish.disarm()) {
-        failures += fail("admission waited for compaction PACKSET publication");
-    }
-    // An emergency spill must not install an object writer while the generation switch is
-    // in flight; it starts once publication completes.
-    const std::vector<ninfer::TokenId> urgent(64, 103);
-    const auto urgent_ram = capture_tokens(ram, pool, alloc, ctx, urgent);
-    disk.note_ram_resident(urgent_ram, 0);
-    std::atomic<bool> urgent_done{false};
-    std::atomic<bool> urgent_ok{false};
-    std::jthread urgent_spill([&] {
-        urgent_ok.store(disk.emergency_spill_ram(urgent_ram));
-        urgent_done.store(true);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    if (urgent_done.load() || disk.ram_is_durable(urgent_ram)) {
-        failures += fail("emergency spill ran during compaction PACKSET publication");
-    }
-    publish.release();
-    if (!reap.entered()) {
-        reap.release();
-        alloc.release();
-        return fail("compaction-unlocked publication never reaped the retired generation");
-    }
-    reap.arm();
-    if (!disk_admission_round(disk, retained, retained_entry) || !reap.disarm()) {
-        failures += fail("admission waited for the retired-generation reap");
-    }
-    reap.release();
-    maintenance.join();
-    urgent_spill.join();
-    if (!urgent_ok.load()) { failures += fail("emergency spill failed after publication"); }
-    // wait_idle_and_fsync returns only after every in-flight reap has finished.
-    if (fs::exists(old_root)) { failures += fail("retired pack generation was not reaped"); }
-    if (!disk_admission_round(disk, retained, retained_entry)) {
-        failures += fail("retained entry was lost across the unlocked compaction");
     }
     alloc.release();
     return failures;
@@ -10511,7 +10950,8 @@ int test_invalid_checkpoint_kind_is_skipped(ninfer::DeviceContext& ctx, ninfer::
     return 0;
 }
 
-int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
+int test_refresh_shares_pages_with_replacement_headroom(ninfer::DeviceContext& ctx,
+                                                        ninfer::PagedKVPool& pool) {
     TmpDir dir("refresh-sib");
     q36::detail::KVRamCache ram(64ULL << 20);
     auto alloc = pool.reserve(4);
@@ -10546,7 +10986,8 @@ int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::Page
         used = disk.snapshot().used_bytes;
         disk.wait_idle_and_fsync();
     }
-    cfg.capacity_bytes = used;
+    // Keep room for the replacement ledger/identity while both old entries remain owned.
+    cfg.capacity_bytes = used + used / 2;
     q36::detail::KVDiskCache disk(cfg);
     const auto ram_a2 = capture_tokens(ram, pool, alloc, ctx, tokens_a);
     ram.set_disk_entry_id(ram_a2, entry_a);
@@ -10559,11 +11000,11 @@ int test_refresh_does_not_evict_sibling(ninfer::DeviceContext& ctx, ninfer::Page
                                        q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
     if (!hit_b) {
         alloc.release();
-        return fail("refresh charged retained pages and evicted sibling B");
+        return fail("refresh with replacement headroom evicted sibling B");
     }
-    if (disk.snapshot().used_bytes > cfg.capacity_bytes) {
+    if (disk.snapshot().storage_bytes > cfg.capacity_bytes) {
         alloc.release();
-        return fail("refresh unique_bytes exceeded capacity");
+        return fail("refresh pack storage exceeded capacity");
     }
     alloc.release();
     return 0;
@@ -11061,57 +11502,7 @@ int test_spill_pin_waits_only_its_entry(ninfer::DeviceContext& ctx, ninfer::Page
 
 // Compaction copies the whole live pack store. Lookups and admission on the
 // scheduler thread must not wait for that copy.
-int test_plan_match_during_compaction(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
-    TmpDir dir("compaction-lock");
-    q36::detail::KVRamCache ram(64ULL << 20);
-    auto alloc = pool.reserve(4);
-    alloc.materialize_pages(3, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    const std::vector<ninfer::TokenId> tokens_a(64, 25);
-    const std::vector<ninfer::TokenId> tokens_b(128, 26);
-    {
-        q36::detail::KVDiskCache disk(cfg);
-        for (const auto* tokens : {&tokens_a, &tokens_b}) {
-            const auto ram_id = capture_tokens(ram, pool, alloc, ctx, *tokens);
-            disk.note_ram_resident(ram_id, 0);
-            if (!disk.emergency_spill_ram(ram_id)) {
-                alloc.release();
-                return fail("compaction-lock fixture spill failed");
-            }
-        }
-        if (!disk.test_fifo_evict_one()) {
-            alloc.release();
-            return fail("compaction-lock fixture eviction failed");
-        }
-    }
-    const auto before = read_bytes(dir.path / "PACKSET");
-    q36::detail::KVDiskCache disk(cfg);
-    UnlockedIoHold copy(disk, q36::detail::DiskUnlockedIo::CompactionCopy);
-    std::thread maintenance([&] { disk.wait_idle_and_fsync(); });
-    if (!copy.entered()) {
-        copy.release();
-        maintenance.join();
-        alloc.release();
-        return fail("compaction-lock maintenance never started copying");
-    }
-    copy.arm();
-    const auto prompt          = text_prompt(tokens_b);
-    const auto match           = disk.plan_match(prompt, q36::detail::prefix_hash_chain(prompt));
-    const bool prompt_returned = copy.disarm();
-    copy.release();
-    maintenance.join();
-    const auto after = read_bytes(dir.path / "PACKSET");
-    alloc.release();
-    int failures = 0;
-    if (!prompt_returned) { failures += fail("plan_match waited for the compaction copy"); }
-    if (!match) { failures += fail("compaction-lock lost the retained entry"); }
-    if (before.size() != 32 || after.size() != 32 ||
-        std::memcmp(before.data() + 12, after.data() + 12, sizeof(std::uint64_t)) == 0) {
-        failures += fail("compaction-lock maintenance did not publish a new generation");
-    }
-    return failures;
-}
+
 
 // Reclaiming RAM for a capture while other lanes decode must not wait on a
 // disk write: a disk-durable entry is evicted first, and without one the
@@ -11571,78 +11962,83 @@ int test_fifo_evict_rewrites_manifest(ninfer::DeviceContext& ctx, ninfer::PagedK
 
 int test_smaller_capacity_open_persists_eviction(ninfer::DeviceContext& ctx,
                                                  ninfer::PagedKVPool& pool) {
-    TmpDir dir("small-cap");
-    q36::detail::KVRamCache ram(64ULL << 20);
-    auto alloc = pool.reserve(4);
-    alloc.materialize_pages(3, ctx.stream);
-    auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
-                           64ULL << 20, 4096);
-    std::vector<ninfer::TokenId> tokens_a(192, 1);
-    std::vector<ninfer::TokenId> tokens_b(192, 2);
-    std::uint64_t id_a = 0;
-    std::uint64_t id_b = 0;
-    {
-        q36::detail::KVDiskCache disk(cfg);
-        const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
-        disk.note_ram_resident(ram_a, 0);
-        if (!disk.emergency_spill_ram(ram_a)) {
-            alloc.release();
-            return fail("small-cap spill A failed");
+    for (bool short_context : {false, true}) {
+        TmpDir dir("small-cap");
+        q36::detail::KVRamCache ram(64ULL << 20);
+        auto alloc = pool.reserve(4);
+        alloc.materialize_pages(3, ctx.stream);
+        auto cfg = disk_config(dir.path, ram, pool, nullptr, ninfer::SpeculativeBackend::None,
+                               64ULL << 20, 4096);
+        std::vector<ninfer::TokenId> tokens_a(192, 1);
+        std::vector<ninfer::TokenId> tokens_b(192, 2);
+        std::uint64_t id_a = 0;
+        std::uint64_t id_b = 0;
+        {
+            q36::detail::KVDiskCache disk(cfg);
+            const auto ram_a = capture_tokens(ram, pool, alloc, ctx, tokens_a);
+            disk.note_ram_resident(ram_a, 0);
+            if (!disk.emergency_spill_ram(ram_a)) {
+                alloc.release();
+                return fail("small-cap spill A failed");
+            }
+            const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
+            disk.note_ram_resident(ram_b, 0);
+            if (!disk.emergency_spill_ram(ram_b)) {
+                alloc.release();
+                return fail("small-cap spill B failed");
+            }
+            const auto match_a = disk.plan_match(
+                text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+            const auto match_b = disk.plan_match(
+                text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+            if (!match_a || !match_b) {
+                alloc.release();
+                return fail("small-cap match failed");
+            }
+            id_a = match_a->entry_id;
+            id_b = match_b->entry_id;
+            disk.wait_idle_and_fsync();
         }
-        const auto ram_b = capture_tokens(ram, pool, alloc, ctx, tokens_b);
-        disk.note_ram_resident(ram_b, 0);
-        if (!disk.emergency_spill_ram(ram_b)) {
-            alloc.release();
-            return fail("small-cap spill B failed");
+        auto used = 0ULL;
+        {
+            q36::detail::KVDiskCache measure(cfg);
+            used = measure.snapshot().used_bytes;
         }
-        const auto match_a = disk.plan_match(text_prompt(tokens_a),
-                                             q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
-        const auto match_b = disk.plan_match(text_prompt(tokens_b),
-                                             q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-        if (!match_a || !match_b) {
+        if (used == 0) {
             alloc.release();
-            return fail("small-cap match failed");
+            return fail("small-cap could not measure used bytes");
         }
-        id_a = match_a->entry_id;
-        id_b = match_b->entry_id;
-        disk.wait_idle_and_fsync();
-    }
-    auto used = 0ULL;
-    {
-        q36::detail::KVDiskCache measure(cfg);
-        used = measure.snapshot().used_bytes;
-    }
-    if (used == 0) {
+        cfg.capacity_bytes = used > 1 ? used - 1 : 1;
+        cfg.max_context    = short_context ? 16 : 4096;
+        {
+            q36::detail::KVDiskCache small(cfg);
+            const auto ids      = read_manifest_ids(dir.path / "MANIFEST");
+            const bool a_listed = std::find(ids.begin(), ids.end(), id_a) != ids.end();
+            const bool b_listed = std::find(ids.begin(), ids.end(), id_b) != ids.end();
+            if (a_listed && b_listed) {
+                alloc.release();
+                return fail("smaller-capacity open did not persist FIFO eviction to MANIFEST");
+            }
+            if (small.snapshot().storage_bytes > cfg.capacity_bytes ||
+                pack_file_bytes(dir.path) != small.snapshot().storage_bytes) {
+                alloc.release();
+                return fail("smaller-capacity open exceeded physical pack capacity");
+            }
+        }
+        cfg.capacity_bytes = 64ULL << 20;
+        cfg.max_context    = 4096;
+        q36::detail::KVDiskCache reopened(cfg);
+        const auto hit_a = reopened.plan_match(
+            text_prompt(tokens_a), q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
+        const auto hit_b = reopened.plan_match(
+            text_prompt(tokens_b), q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
+        const int hits = (hit_a ? 1 : 0) + (hit_b ? 1 : 0);
+        if (hits > 1) {
+            alloc.release();
+            return fail("smaller-capacity eviction did not remain after reopen at full capacity");
+        }
         alloc.release();
-        return fail("small-cap could not measure used bytes");
     }
-    cfg.capacity_bytes = used > 1 ? used - 1 : 1;
-    {
-        q36::detail::KVDiskCache small(cfg);
-        const auto ids      = read_manifest_ids(dir.path / "MANIFEST");
-        const bool a_listed = std::find(ids.begin(), ids.end(), id_a) != ids.end();
-        const bool b_listed = std::find(ids.begin(), ids.end(), id_b) != ids.end();
-        if (a_listed && b_listed) {
-            alloc.release();
-            return fail("smaller-capacity open did not persist FIFO eviction to MANIFEST");
-        }
-        if (small.snapshot().used_bytes > cfg.capacity_bytes) {
-            alloc.release();
-            return fail("smaller-capacity open exceeded unique-byte capacity");
-        }
-    }
-    cfg.capacity_bytes = 64ULL << 20;
-    q36::detail::KVDiskCache reopened(cfg);
-    const auto hit_a = reopened.plan_match(text_prompt(tokens_a),
-                                           q36::detail::prefix_hash_chain(text_prompt(tokens_a)));
-    const auto hit_b = reopened.plan_match(text_prompt(tokens_b),
-                                           q36::detail::prefix_hash_chain(text_prompt(tokens_b)));
-    const int hits   = (hit_a ? 1 : 0) + (hit_b ? 1 : 0);
-    if (hits != 1) {
-        alloc.release();
-        return fail("smaller-capacity eviction did not remain after reopen at full capacity");
-    }
-    alloc.release();
     return 0;
 }
 
@@ -13484,8 +13880,7 @@ int test_skipped_corrupt_ids_do_not_poison_valid_entry(ninfer::DeviceContext& ct
     return 0;
 }
 
-int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx,
-                                              ninfer::PagedKVPool& pool) {
+int test_eviction_reclaims_pack_extent(ninfer::DeviceContext& ctx, ninfer::PagedKVPool& pool) {
     TmpDir dir("unlink-obj");
     q36::detail::KVRamCache ram(32ULL << 20);
     auto alloc = pool.reserve(2);
@@ -13522,9 +13917,9 @@ int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx,
         }
         const auto location =
             packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page_id);
-        if (!location || !fs::exists(location->path)) {
+        if (location) {
             alloc.release();
-            return fail("packed eviction deleted a retained pack extent");
+            return fail("packed eviction retained a retired object mapping");
         }
     }
     if (fs::exists(dir.path / "tombstones" / std::to_string(entry_id))) {
@@ -13533,9 +13928,9 @@ int test_failed_object_unlink_keeps_tombstone(ninfer::DeviceContext& ctx,
     }
     const auto location =
         packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, page_id);
-    if (!location || !fs::exists(location->path)) {
+    if (location) {
         alloc.release();
-        return fail("packed eviction reclaimed its extent before compaction");
+        return fail("packed eviction retained a dead extent mapping");
     }
     alloc.release();
     return 0;
@@ -13684,8 +14079,7 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
     cfg.hidden_bytes = hidden_bytes;
     const std::vector<ninfer::TokenId> tokens_a(64, 73);
     const std::vector<ninfer::TokenId> tokens_b(64, 89);
-    std::uint64_t entry_b        = 0;
-    std::uint64_t old_generation = 0;
+    std::uint64_t entry_b = 0;
     {
         q36::detail::KVDiskCache disk(cfg);
         const auto ram_a = capture_tokens_hidden(ram, pool, alloc, ctx, tokens_a, hidden);
@@ -13709,28 +14103,7 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
         entry_b = match_b->entry_id;
         if (!disk.test_fifo_evict_one()) {
             alloc.release();
-            return fail("big-state could not evict A before compaction");
-        }
-    }
-    {
-        const auto packset = read_bytes(dir.path / "PACKSET");
-        if (packset.size() != 32) {
-            alloc.release();
-            return fail("big-state PACKSET is missing before compaction");
-        }
-        std::memcpy(&old_generation, packset.data() + 12, sizeof(old_generation));
-        q36::detail::KVDiskCache compacting(cfg);
-        compacting.wait_idle_and_fsync();
-        const auto compacted         = read_bytes(dir.path / "PACKSET");
-        std::uint64_t new_generation = 0;
-        if (compacted.size() != 32) {
-            alloc.release();
-            return fail("big-state PACKSET is missing after compaction");
-        }
-        std::memcpy(&new_generation, compacted.data() + 12, sizeof(new_generation));
-        if (new_generation <= old_generation) {
-            alloc.release();
-            return fail("big-state retained object prevented compaction");
+            return fail("big-state could not evict A");
         }
     }
     q36::detail::KVDiskCache reopened(cfg);
@@ -13738,7 +14111,7 @@ int test_fingerprint_state_over_64mib_is_accepted(ninfer::DeviceContext& ctx,
     const auto match_b  = reopened.plan_match(prompt_b, q36::detail::prefix_hash_chain(prompt_b));
     if (!match_b || match_b->entry_id != entry_b) {
         alloc.release();
-        return fail("big-state compaction/reopen lost B");
+        return fail("big-state reopen lost B");
     }
     ninfer::DeviceBuffer hidden_out_storage(hidden_bytes);
     hidden_out_storage.fill(0);
@@ -14346,9 +14719,10 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
         }
         for (std::uint64_t id : pages_b) {
             if (id != 0 &&
-                !packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
+                packed_object_location(dir.path, q36::detail::DiskObjectKind::Main, id)) {
                 alloc.release();
-                return fail("fifo eviction left uncertainty-protected predecessor objects");
+                return fail("durable eviction retained predecessor extents after releasing "
+                            "uncertainty holds");
             }
         }
     }
@@ -14399,10 +14773,6 @@ int test_uncertainty_holds_reclaim_on_evict_and_reopen(ninfer::DeviceContext& ct
         alloc.release();
         return fail("reopen after uncertain rollback kept the unpublished new generation");
     }
-    // A durable location append can precede a failed meta publication. In the packed format,
-    // that extent is intentionally retained as unreachable pack garbage until
-    // generation compaction; the observable requirement is that it is not
-    // resurrected as a matching entry.
     alloc.release();
     return 0;
 }
@@ -18104,6 +18474,20 @@ int main(int argc, char** argv) {
     ninfer::PagedKVPool paged_pool({paged_arena.base(), paged_arena.capacity()}, paged_plan.layout);
 
     if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "idle-defrag") {
+        return test_idle_defrag(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "storage-recovery") {
+        return test_smaller_capacity_open_persists_eviction(ctx, paged_pool) +
+               test_backing_file_recovery(ctx, paged_pool) +
+               test_retirement_durability_failure(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
+        std::string_view(argv[2]) == "bounded-storage") {
+        return test_bounded_storage(ctx, paged_pool);
+    }
+    if (argc == 3 && std::string_view(argv[1]) == "--case" &&
         std::string_view(argv[2]) == "spill-allocation") {
         return test_spill_batch_allocation_and_promotion(ctx);
     }
@@ -18116,7 +18500,6 @@ int main(int argc, char** argv) {
         std::string_view(argv[2]) == "stalls") {
         return test_idle_cancel_during_capacity_eviction(ctx, paged_pool) +
                test_spill_pin_waits_only_its_entry(ctx, paged_pool) +
-               test_plan_match_during_compaction(ctx, paged_pool) +
                test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool) +
                test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool) +
                test_ram_reclaim_skips_attempt_captures(ctx, paged_pool) +
@@ -18183,12 +18566,10 @@ int main(int argc, char** argv) {
     failures += test_disk_match_filters_unready_heads(ctx, paged_pool);
     failures += test_disk_claim_rejects_refreshed_generation(ctx, paged_pool);
     failures += test_pack_rollover_and_partial_pwritev(ctx, paged_pool);
-    failures += test_compaction_reclaims_retired_pack_generation(ctx, paged_pool);
     failures += test_spill_durability_phase_matrix(ctx, paged_pool);
-    failures += test_compaction_publication_phase_matrix(ctx, paged_pool);
     failures += test_tombstone_durability_phase_matrix(ctx, paged_pool);
     failures += test_physical_preflight_rejects_before_pack_write(ctx, paged_pool);
-    failures += test_low_free_subthreshold_garbage_rejects_without_write(ctx, paged_pool);
+    failures += test_low_free_recycled_extent_rejects_without_write(ctx, paged_pool);
     failures += test_restore_pread_fail(ctx, paged_pool);
     failures += test_failed_restore_invalidation_preserves_shared_entries(ctx);
     failures += test_prefetch_queue_allocation_failure(ctx);
@@ -18248,7 +18629,6 @@ int main(int argc, char** argv) {
     failures += test_claim_during_encode_aborts_idle_extend(ctx, paged_pool);
     failures += test_spill_crc_runs_without_index_mutex(ctx, paged_pool);
     failures += test_capacity_eviction_tombstone_runs_without_index_mutex(ctx, paged_pool);
-    failures += test_compaction_publish_and_reap_run_without_index_mutex(ctx, paged_pool);
     failures += test_capacity_eviction_tombstone_failure(ctx, paged_pool, false);
     failures += test_capacity_eviction_tombstone_failure(ctx, paged_pool, true);
     failures += test_invalidate_during_spill_defers_eviction(ctx, paged_pool);
@@ -18278,7 +18658,7 @@ int main(int argc, char** argv) {
     failures += test_claim_rejects_checkpoint_only_refresh(ctx, paged_pool);
     failures += test_claim_rejects_replaced_head_at_same_frontier(ctx, paged_pool);
     failures += test_invalid_checkpoint_kind_is_skipped(ctx, paged_pool);
-    failures += test_refresh_does_not_evict_sibling(ctx, paged_pool);
+    failures += test_refresh_shares_pages_with_replacement_headroom(ctx, paged_pool);
     failures += test_raw_state_unequal_codec_bytes_is_skipped(ctx, paged_pool);
     failures += test_gdn_checkpoint_without_hidden_is_not_selected(ctx, paged_pool);
     failures += test_load_host_misses_evicted_entry(ctx, paged_pool);
@@ -18286,7 +18666,6 @@ int main(int argc, char** argv) {
     failures += test_plan_match_does_not_wait_on_manifest(ctx, paged_pool);
     failures += test_idle_cancel_during_capacity_eviction(ctx, paged_pool);
     failures += test_spill_pin_waits_only_its_entry(ctx, paged_pool);
-    failures += test_plan_match_during_compaction(ctx, paged_pool);
     failures += test_ram_reclaim_never_blocks_on_disk(ctx, paged_pool);
     failures += test_ram_reclaim_waits_for_inflight_spill(ctx, paged_pool);
     failures += test_ram_reclaim_skips_attempt_captures(ctx, paged_pool);
@@ -18323,7 +18702,9 @@ int main(int argc, char** argv) {
     failures += test_kind_conflict_is_skipped(ctx, paged_pool);
     failures += test_short_text_kv_valid_is_skipped(ctx, paged_pool);
     failures += test_skipped_corrupt_ids_do_not_poison_valid_entry(ctx, paged_pool);
-    failures += test_failed_object_unlink_keeps_tombstone(ctx, paged_pool);
+    failures += test_bounded_storage(ctx, paged_pool);
+    failures += test_idle_defrag(ctx, paged_pool);
+    failures += test_eviction_reclaims_pack_extent(ctx, paged_pool);
     failures += test_ledger_frontier_must_be_execution_plus_one(ctx, paged_pool);
     failures += test_mtp_frontier_beyond_valid_backend_is_not_reused(ctx);
     failures += test_fingerprint_state_over_64mib_is_accepted(ctx, paged_pool);

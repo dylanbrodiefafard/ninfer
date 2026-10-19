@@ -2500,14 +2500,14 @@ fell from 65.6 to 59.1 ms (-9.9%). Reusing the existing restore threads through 
 state-task queue instead regressed paired state restores by 3.4% and 7.1% (13.54→13.08 and
 14.73→13.69 GB/s); that candidate was rejected and the transient four-worker state path remains.
 
-Compaction of 312,246,272 retained bytes measured 2.57–2.65 GB/s against a 2.9–3.27 GB/s direct
-write control. Increasing its transfer buffer from 1 MiB to 8 MiB regressed from 2.65 to 2.48 GB/s,
-so the production buffer remains 1 MiB and no extra pipeline is retained. The final physical
+The retired payload-compaction path (removed in disk format v8) measured 312,246,272 retained
+bytes at 2.57–2.65 GB/s against a 2.9–3.27 GB/s direct write control. Increasing its transfer buffer from 1 MiB to 8 MiB regressed from 2.65 to 2.48 GB/s,
+so that path retained a 1 MiB buffer without an extra pipeline. The final physical
 batch-four rerun measured 3.944 GB/s host-visible commit and 2.448 GB/s post-pool-sync payload,
 with every mirror-normalized sample within the 3% accounting bound. The accepted state and startup
 changes did not alter page-record transfer layout; disk format v5 later changed only the startup
 fingerprint from physical tensor geometry to the canonical logical-page schema. Contiguous page
-reads, compaction, H2D/scatter, and durable writes remain at or close to the relevant measured
+reads, H2D/scatter, and durable writes measured at or close to the relevant measured
 hardware/filesystem ceilings.
 
 The serving measurements characterize the two measured Qwen3.6 model IDs independently on one

@@ -156,7 +156,7 @@ The RTX 5090 tree investigation is in
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
-| `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
+| `--kv-disk-capacity off\|N` | SSD KV prefix-cache pack-file capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `4096` |
@@ -313,12 +313,19 @@ image copies it back on the device, otherwise it costs one H2D before the suffix
 `--kv-ram-capacity N` is a separate pinned-host budget in MiB for completed prefix bundles. It is
 not a token capacity, does not enlarge the GPU pool, and defaults to `off`. `N` must be a positive
 decimal integer; `0` is rejected. Construction fails if the host pin cannot be allocated.
-`--kv-disk-capacity N` is a third-tier SSD budget in MiB of unique object bytes. It requires
+`--kv-disk-capacity N` is a third-tier SSD pack-file budget in MiB. It requires
 `--kv-ram-capacity > 0` and `--kv-disk-location PATH`. Location without capacity is an error.
+The bound covers allocated pack extents, reusable free slots, and writes in progress. Evicted
+extents are reused in place; fully free segments are truncated. During Engine idle periods,
+bounded defragmentation moves records from sparse packs into existing free extents and trims
+free tails. Copies use at most 1 MiB per chunk, paced at least 16 ms apart, and stop when work
+arrives. Both old and new extents stay within the same pack-file budget. Small index, entry, and filesystem metadata adds overhead outside
+the pack-file bound. Metadata-only journal checkpoints keep the index bounded. A capture that
+cannot fit without overwriting a retained or in-flight image is skipped; generation continues.
 `--kv-disk-compress zstd` compresses new GDN/hidden/cyclic blobs only; KV pages are never
 application-compressed. Disk is inclusive: a VRAM or RAM hit does not delete the committed SSD
 generation. Equal reuse prefers VRAM, then RAM, then disk.
-Disk format v7 fingerprints canonical logical KV pages rather than GPU pool capacity or request
+Disk format v8 fingerprints canonical logical KV pages rather than GPU pool capacity or request
 lane count, so one location can reopen across `--vision` on/off, concurrency, and automatic
 resident-capacity changes when the per-lane state geometry remains compatible. The fingerprint
 binds model/weights identity and a SHA-256 digest of the target-selected tensors and projection
@@ -331,7 +338,7 @@ enabled. Artifacts must remain immutable while an Engine is using them. KV dtype
 backend, page/state schema, and attention settings (`--sage`, `--keep-frac`, `--xattn-tau`, and the
 active C++ `xattn_min_len` option) also define compatibility. Token IDs, positions, and media
 identity are checked per entry; sampling defaults and chat rendering are not directory
-compatibility boundaries. Pre-v7 locations fail startup: select a new directory and retain the old
+compatibility boundaries. Pre-v8 locations fail startup: select a new directory and retain the old
 one until its contents are no longer needed.
 Orderly Engine shutdown copies active chats into the host cache, saves cache entries that are not
 yet on SSD, and finishes outstanding disk writes. When disk is enabled, the same stderr progress

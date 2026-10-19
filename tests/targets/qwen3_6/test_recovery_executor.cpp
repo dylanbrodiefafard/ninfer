@@ -273,8 +273,9 @@ struct DiskSnapshot {
     double save_seconds          = 0;
     double load_seconds          = 0;
     std::uint64_t sequence       = 0;
+    bool defrag_active           = false;
     bool spill_active            = false;
-    bool compaction_active       = false;
+    std::uint64_t storage_bytes  = 0;
     bool restore_active          = false;
     std::size_t pending_jobs     = 0;
     double spill_elapsed_seconds = 0;
@@ -308,6 +309,11 @@ struct DiskCopySeconds {
 class ProbeProgram {
 public:
     ProbeProgram() { trace.reserve(32); }
+
+    std::atomic<bool> report_copies_ready{false};
+    std::atomic<bool> cache_idle_permission{false};
+    std::atomic<bool> execution_while_idle{false};
+    std::atomic<std::uint32_t> idle_true_count{0};
 
     // DeferProgram overrides the admission, capture, and decode members marked virtual.
     virtual ~ProbeProgram() = default;
@@ -364,7 +370,7 @@ public:
     // The cold prefill after a failed recovery restore cannot be planned (request-local).
     bool cold_plan_fails = false;
     std::vector<std::vector<TokenId>> prefilled_prompts;
-    // While held, simulates the disk tier holding its mutex (for example during compaction).
+    // While held, simulates the disk tier holding its mutex (for example during index maintenance).
     std::atomic<bool> copies_ready_held{false};
     mutable std::atomic<bool> copies_ready_entered{false};
 
@@ -639,10 +645,13 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
-        return false;
+        return report_copies_ready.load();
     }
 
-    void request_idle_spill() {}
+    void set_cache_idle(bool idle) {
+        if (idle) { idle_true_count.fetch_add(1); }
+        cache_idle_permission.store(idle);
+    }
 
     void shutdown_kv_tiers(const ninfer::LoadProgress& = {}) {}
 
@@ -1730,6 +1739,7 @@ public:
     [[nodiscard]] PrefillStepResult start_prefill_lane(std::uint32_t lane, PreparedPrompt prompt,
                                                        ProbePlan, TransientRegion,
                                                        const OutputSession*) override {
+        if (cache_idle_permission.load()) { execution_while_idle.store(true); }
         prefills.fetch_add(1);
         if (lane < retained_.size()) { retained_[lane].store(false); }
         prefill_token_ = lane == 0 ? kDecodeToken : kCallerStop;
@@ -1744,6 +1754,7 @@ public:
 
     [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
                                                      std::span<const RoundBudget>) override {
+        if (cache_idle_permission.load()) { execution_while_idle.store(true); }
         decode_calls.fetch_add(1);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2009,6 +2020,74 @@ int run_admission_defers_for_reclaim(Frontend& frontend) {
     return failures;
 }
 
+int run_cache_maintenance_idle(Frontend& frontend) {
+    int failures = 0;
+    for (bool decoder_writes_cache : {false, true}) {
+        DeferProgram program;
+        program.lifecycle_retries = true;
+        program.script            = CacheCase::AdmitRamHit;
+        program.report_copies_ready.store(true);
+        ProbeLoaded loaded{frontend};
+        DeferProbe instance;
+        instance.program           = &program;
+        instance.loaded            = &loaded;
+        auto engine                = engine_options();
+        engine.max_concurrency     = 3;
+        engine.max_context         = 32768;
+        engine.generation_recovery = false;
+        ninfer::runtime::ConcurrentExecutor<DeferProbe> executor(instance, engine);
+        const auto wait_until = [](auto&& predicate) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!predicate()) {
+                if (std::chrono::steady_clock::now() >= deadline) { return false; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return true;
+        };
+        if (!wait_until([&] { return program.cache_idle_permission.load(); })) {
+            return failures +
+                   check(false, "maintenance: empty Engine did not enable idle maintenance");
+        }
+        const auto idle_count = program.idle_true_count.load();
+        auto submit           = [&](std::uint32_t outputs, bool cache_write) {
+            auto prepared      = frontend.prepare(thinking_input());
+            const auto summary = prepared.summary();
+            ninfer::runtime::ResolvedRequestOptions options;
+            options.execution.sampling.p_less         = true;
+            options.execution.allow_prefix_reuse      = false;
+            options.execution.cache_write             = cache_write;
+            options.execution.requested_output_tokens = outputs;
+            options.stop.token_ids                    = {kCallerStop};
+            return executor.submit(std::move(prepared), summary, 0.0, std::move(options),
+                                   ninfer::OutputDelivery::TerminalOnly);
+        };
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        ninfer::CancellationView cancel(
+            [deadline] { return std::chrono::steady_clock::now() >= deadline; });
+        auto decoder = submit(30000, decoder_writes_cache);
+        if (!wait_until([&] { return program.decode_calls.load() >= 2; })) {
+            return failures + check(false, "maintenance: decoder did not start");
+        }
+        failures += check(!program.cache_idle_permission.load(),
+                          "maintenance: decode retained idle permission");
+        auto short_request      = submit(8, !decoder_writes_cache);
+        const auto short_result = short_request.wait(nullptr, cancel);
+        failures +=
+            check(short_result.finish_reason == FinishReason::StopToken &&
+                      !program.cache_idle_permission.load() &&
+                      program.idle_true_count.load() == idle_count,
+                  "maintenance: one completed request enabled maintenance beside an active peer");
+        program.release_decoder.store(true);
+        const auto decoder_result = decoder.wait(nullptr, cancel);
+        failures += check(
+            decoder_result.finish_reason == FinishReason::StopToken &&
+                wait_until([&] { return program.cache_idle_permission.load(); }) &&
+                program.idle_true_count.load() > idle_count && !program.execution_while_idle.load(),
+            "maintenance: idle handoff failed for ordinary/disposable request activity");
+    }
+    return failures;
+}
+
 int main() {
     try {
         Frontend frontend                = FrontendTestAccess::create_component(resources(), false);
@@ -2081,6 +2160,7 @@ int main() {
         failures += run_retry_lifecycle(frontend);
         failures += run_idle_poll_does_not_block_submit(frontend);
         failures += run_admission_defers_for_reclaim(frontend);
+        failures += run_cache_maintenance_idle(frontend);
         std::cout << "recovery executor failures=" << failures << '\n';
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

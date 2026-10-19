@@ -956,19 +956,30 @@ other lanes keep decoding. The admission retries once that spill commits, so dec
 for a disk write and an entry is dropped unsaved only when the disk cannot store it. The
 admission's own earlier captures, which a deferral rolls back, are never that spill or drop
 target; when only they remain, the capture is dropped and the admission proceeds. Equal reuse prefers VRAM, then RAM, then disk. A disk hit claims an
-immutable entry and its pack-generation lease, restores directly into the selected VRAM lane,
-and never parks the restored bundle in the RAM FIFO. Consuming the claim releases its generation
-lease but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
+immutable entry, and each unlocked payload read acquires a per-extent lease. The hit restores
+directly into the selected VRAM lane and never parks the restored bundle in the RAM FIFO.
+Consuming the claim releases request ownership but does not delete the durable entry; a later VRAM or RAM hit likewise leaves the disk copy
 available. C=1 does not submit restore reads until the selected retained victim has been captured
 and its GPU pages released.
 
-Disk format v7 stores objects in 1 GiB, per-kind pack segments under an atomically selected
-generation. `PACKSET` names the generation and reserves monotonically increasing object-ID ranges.
-The immutable base map and append-only, CRC-framed log resolve stable object IDs to aligned
-extents. Page and state records carry header/payload CRC32C; ledger and identity records retain
-their exact codecs. Page records are individually 4 KiB padded even when a spill submits four
-contiguous records with one `pwritev`. Capacity bills unique retained extents and includes all
-physically allocated active, stale, and rolled pack files when deciding whether a write can start.
+Disk format v8 stores objects in reusable, 4 KiB-aligned extents in per-kind pack files of at
+most 1 GiB under `packs/1`. `PACKSET` selects an object-index epoch and reserves monotonically
+increasing object IDs; its epoch does not identify a second payload copy. The immutable base
+map and CRC-framed Put/Delete/Move journal resolve stable object IDs to extents. Record codecs and
+CRC32C checks remain unchanged. Adjacent page writes use one `pwritev`; reused nonadjacent slots
+are submitted as separate contiguous runs.
+
+The existing `--kv-disk-capacity` MiB value bounds the sum of pack-file lengths, including
+interior free extents and writes reserved before I/O starts. Extents are allocated from a
+coalescing best-fit index before growing a pack. A completely free segment is truncated with
+its slot unavailable to writers until truncation finishes. Index, entry, and filesystem metadata
+is additional overhead. Metadata-only journal checkpoints bound the index: after the log exceeds
+the greater of 64 KiB or twice the current object population's frame bytes, a quiescent worker
+writes a new base and empty log, syncs their namespace, and atomically publishes the index epoch.
+Old index files can then be removed without moving any payload. Captures that cannot fit a
+free extent or bounded pack growth are optional misses, not inference failures. Reopening with
+a smaller budget evicts ordinary and skipped entries until pack lengths fit; fragmentation may
+require evicting extra entries to release a whole segment.
 
 The publication order is segment bytes and segment namespace, object-map log, entry metadata,
 then manifest. Each preceding stage is synchronized before the next one becomes durable. A crash
@@ -993,15 +1004,13 @@ previous generation and releasing its pins. Spill page batches have a fixed maxi
 jobs, and idle-to-emergency promotion transfers its queue without allocation.
 Spill preparation transfers the caller's RAM pin only after all jobs are queued, so a failed
 queue allocation leaves exactly one caller-owned pin to release. The state-blob encode runs
-with the index mutex released for both codecs, after the refusals it cannot change (pending
-compaction for an idle spill, a physical-room floor): it compresses (zstd) and seals each
+with the index mutex released for both codecs, after the filesystem-space refusal it cannot change: it compresses (zstd) and seals each
 record's codec header and record CRC32C, so the commit only reserves an object ID and extent
 under the mutex; a cancelled worker prepare stops between 8 MiB compression chunks. A page
 batch likewise builds its record headers and CRCs unlocked from the I/O-pinned RAM image, then
 relocks to reserve IDs and the contiguous append range. An object-ID reservation that must
 extend `PACKSET` writes it unlocked; only the installed spill session allocates IDs, and it
-blocks compaction publication. Retired generations reaped during preparation are removed
-unlocked as well. After relocking, preparation re-validates cancellation, a claim of the
+blocks index checkpoint publication. After relocking, preparation re-validates cancellation, a claim of the
 entry an Extend or Refresh would rewrite, and quarantine or eviction of its source, and abandons
 without marking the RAM entry failed so a retry re-plans. A commit's unlocked object sync and map append
 use object records copied under the mutex. MANIFEST images are sequenced under the index mutex
@@ -1020,7 +1029,7 @@ size, logical plane schema, speculative backend, and persistent GDN/DFlash state
 strict compatibility boundaries. Vision media identity remains in each entry's exact identity
 record, so changed image or video content cannot reuse a stored prefix.
 
-The v7 fingerprint binds model/weights identity and a SHA-256 digest of target-selected tensor
+The v8 fingerprint binds model/weights identity and a SHA-256 digest of target-selected tensor
 names, shapes, numeric formats, storage layouts, encoded byte ranges, and their contents. The
 artifact reader maps logical row selections to registered code/scale/divisor ranges and hashes
 in canonical name/range order; dependency selection belongs to each target package. For 27B:
@@ -1053,7 +1062,7 @@ the disk image stores one lane and restore selects a destination lane. Sampling 
 token count, transport settings, RAM/disk budgets, compression choice, GPU resident capacity, and
 request concurrency do not invalidate a directory unless they also change the recorded per-lane
 geometry. Model/weights identity identifies the target's fixed mathematical contract; code changes
-that invalidate persistent state must advance the snapshot version. Pre-v7 stores are rejected
+that invalidate persistent state must advance the snapshot version. Pre-v8 stores are rejected
 rather than silently adopted or automatically deleted.
 
 Exact-frontier reuse also requires a valid target tail-hidden image. In particular, speculative
@@ -1071,27 +1080,41 @@ frontier. A same-frontier refresh preserves the full backend only when that toke
 and the valid extent are unchanged; otherwise it rewrites the affected tail, including any
 new page required when an exact-hit bridge extends validity after cancelled prefill.
 
-Compaction copies live extents into a new generation, publishes its complete base map, and then
-atomically replaces `PACKSET`. Old pack roots and their maps are removed only after publication is
-durable and all reader leases have drained. Spill admission only requests compaction; the disk
-worker runs it between its queued jobs, copying a snapshot of live extents in 64 MiB slices with
-the cache mutex released, then copying objects committed to the source generation meanwhile.
-Lookups, claims, and statistics therefore never wait for the copy. Publication switches object
-locations to the new generation and waits only for no spill session, payload I/O, or scheduler
-emergency preparation; restores and reader claims continue across it on their generation
-leases. The new `PACKSET` is written, synced and renamed with the mutex released, the
-in-memory generation switch follows under the mutex, and the root fsync again runs unlocked.
-A publishing flag keeps object writers out from the `PACKSET` write until that root fsync: the
-worker's own prepares run on the publishing thread, and an emergency prepare waits for the
-flag. A retired generation no reader leases is marked reaping under the mutex and stays listed
-as retired, while its descriptors are closed, its pack root and maps removed, and the `packs`
-and `maps` directories fsynced with the mutex released; a failed reap is retried later. Pack
-space accounting skips a generation being reaped, and explicit maintenance
-(`wait_idle_and_fsync`) returns only after every in-flight reap finishes. While compaction is pending an idle spill defers without marking its entry failed,
-and an emergency spill appends past the garbage threshold inside the copy-on-write reserve. A
-spill's room check counts the pending compaction copy but not later appends, so a compaction that
-no longer fits falls back to low-space eviction; a failed compaction is not retried until the
-durable generation changes. Eviction uses durable tombstones so an uncertain
+Whole-store payload generations are not rewritten. Retirement requires a durable entry tombstone, zero live,
+skipped, and uncertainty references, and drainage of the per-extent leases that unlocked
+payload readers acquire with their copied locations. A CRC-framed Delete becomes durable
+before its extent enters the free index. Replacement data is then written and synchronized,
+its Put is synchronized, and only then may entry metadata publish it. Crash recovery replays
+Put/Delete/Move frames before validating final extents for overlap, reconstructs free space from
+those extents and actual segment lengths, and preserves the durable object-ID high-water mark.
+An interrupted metadata checkpoint retains both index epochs until `PACKSET` publication is
+durable; no reuse or new spill publication can rely on an uncertain epoch. No payload generation
+is copied or retained for index checkpointing.
+
+The Engine explicitly sets cache idleness only when every lane, pending ingress, and copy hold
+is empty; a RAM capture's write-behind permission does not enable defragmentation. Admission
+clears idleness before request execution, including disposable requests. After 250 ms idle,
+maintenance drains reader-delayed retirement and truncates free tails. A single candidate pass
+visits each kind in increasing address order, selecting source packs with at least 25% free bytes and
+the earliest adequate earlier hole of the same kind, preserving contiguous page order when
+the available hole can hold the run. The destination never grows a pack. Copies use a
+1 MiB buffer and at least 16 ms per chunk (at most 62.5 MiB/s copied payload), with cancellation
+checks between chunks and before sync/publication. Restore, prefetch, and spill work take
+priority. Existing holes are coalesced without payload copying; fragmented space without an
+adequate hole is deferred, and maintenance never evicts an entry to fund relocation.
+
+A relocation holds its source object and verifies its stored-record CRC while copying. It syncs
+the destination, durably appends a Move for the same object ID, then publishes the location.
+Move preserves kind, extent/encoded/logical sizes, and CRC. Old locations retire independently
+of IDs and remain occupied until their individual read leases drain; a later Move or Delete
+cannot release an older reader's extent. Cancellation before publication releases the temporary
+destination. Once Move is durable, the location handoff finishes even if a request arrives.
+A failed journal append truncates and syncs its original boundary before later appends. If that
+rollback also fails, journal/checkpoint/spill writes freeze and both possible locations stay
+reserved until reopening resolves the journal. Startup needs only the final selected locations
+because readers do not survive a restart.
+
+Eviction uses durable tombstones so an uncertain
 metadata publication cannot make a referenced object reusable. Capacity and quarantine
 eviction are two-phase: victims are selected under the mutex (capacity eviction projects the
 unique bytes released by FIFO victims so one round covers the shortfall) and made unavailable
@@ -1106,8 +1129,8 @@ follows the unlocked scan finding its entry directory gone, and only when no ent
 tree, or object reference still needs it. Before capacity eviction, admission
 checks that the incoming incremental bytes plus unique extents protected by claims or I/O pins
 (including a spill's parent) fit the budget. Known capacity shortfalls are rejected without
-evicting unrelated residents. Shared protected extents are counted once, and refresh/extend
-replacement credit remains included in the incremental-byte calculation.
+evicting unrelated residents. Shared protected extents are counted once. Refresh and extension reserve replacement bytes
+without crediting the old image, which remains owned until publication.
 
 Restore owns `2 * restore_io_threads` pinned page slots and equally sized device staging slots.
 Readers issue aligned direct reads into the pinned slots, validate each packed record, enqueue one
@@ -1119,7 +1142,7 @@ four readers and independent objects share the startup-fixed reader budget. Comp
 bounded decoded owners. Contiguous CRC32C checks use the serial SSE4.2 dependency chain below
 512 KiB and three interleaved hardware chains for larger payloads; incremental checks remain
 serial.
-The page window, state owners, destination page mappings, and generation lease remain alive until
+The page window, state owners, destination page mappings, and object read lease remain alive until
 the copy-stream completion event has been consumed. The spill side uses separate pinned scratch,
 so an idle spill may overlap restore reads; emergency spill remains exclusive with restore I/O.
 Restore readiness requires the completed join of page scatter and independent state H2D, not
