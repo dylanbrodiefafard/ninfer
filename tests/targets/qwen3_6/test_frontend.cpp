@@ -1640,6 +1640,25 @@ int test_preview_token_channels(const Frontend& frontend) {
                       "stop-string tokens lost their content attribution");
     (void)stopped.commit_preview();
 
+    // Raw output publishes model-stop text, so the token is a content token whether it continues
+    // generation (model defaults excluded) or ends it as a stop token.
+    ninfer::StopPolicy no_model_stops;
+    no_model_stops.include_model_defaults = false;
+    for (const ninfer::StopPolicy& raw_stop : {no_model_stops, ninfer::StopPolicy{}}) {
+        auto raw =
+            frontend.make_output_session(frontend.prepare_tokens({0}), raw_stop, {.raw = true});
+        const auto raw_decision = raw.preview(std::array<ninfer::TokenId, 2>{15, 6}, 4,
+                                              ninfer::FinishReason::OutputLimit);
+        const bool stops        = raw_stop.include_model_defaults;
+        failures += check(
+            raw_decision.accepted_tokens == 2 &&
+                raw_decision.finish_reason ==
+                    (stops ? ninfer::FinishReason::StopToken : ninfer::FinishReason::None) &&
+                channels_of(raw) == std::vector<Channel>{content, content} &&
+                channel_text(raw.commit_preview(), ninfer::OutputChannel::Content) == "answer<eos>",
+            "raw model-stop text lost its content attribution");
+    }
+
     // With tool output enabled, tool-call markup publishes to neither channel.
     ninfer::ChatMessage assistant_call;
     assistant_call.role = ninfer::ChatRole::Assistant;

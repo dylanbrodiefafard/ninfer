@@ -523,7 +523,8 @@ struct OutputDelta {
     // produced the delta. Records are token-aligned rather than text-aligned: text held back for a
     // stop-string or UTF-8 boundary arrives in a later delta, so text may be empty here, and a
     // token trimmed by a stop string still has its record. Tokens that publish to no channel
-    // (reasoning markers, tool-call markup, stop tokens) have no record.
+    // (reasoning markers, tool-call markup, stop tokens whose text is not published) have no
+    // record; raw output publishes stop-token text, so those tokens have content records.
     std::vector<TokenLogprob> logprobs;
 };
 

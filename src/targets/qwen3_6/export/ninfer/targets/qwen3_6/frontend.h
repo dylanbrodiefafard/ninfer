@@ -99,7 +99,8 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     // The channel each token accepted by the pending preview publishes its text to, in token
     // order; nullopt for a token that publishes to neither channel (a reasoning marker, tool-call
-    // markup when tool output is enabled, a stop token, or whitespace stripped after reasoning).
+    // markup when tool output is enabled, a stop token whose text is not published, a special
+    // token decoded without its text, or whitespace stripped after reasoning).
     // The attribution is per token: text a token contributed may still be held back or later
     // trimmed by a stop string. Valid from preview() until commit_preview() or discard_preview().
     [[nodiscard]] std::span<const std::optional<OutputChannel>>

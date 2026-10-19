@@ -1054,8 +1054,11 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
         feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
                          &match, impl_->tool_output_enabled);
         std::optional<OutputChannel> channel;
-        if (stop_token || model_stop || bytes.empty()) {
-            // Publishes no text.
+        if (bytes.empty() || (stop_token && !impl_->policy.publish_stop_token)) {
+            // Publishes no text: a special token decoded without its text, or a stop token whose
+            // text is rolled back below. A model-stop or stop token whose text is published
+            // (raw output, preserved special tokens, publish_stop_token) is attributed like any
+            // other token.
         } else if (was_reasoning) {
             // The token that closes reasoning is the marker, not reasoning text.
             if (impl_->preview_state.in_reasoning) { channel = OutputChannel::Reasoning; }
