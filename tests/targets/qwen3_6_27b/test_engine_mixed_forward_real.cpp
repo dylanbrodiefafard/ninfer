@@ -343,7 +343,10 @@ void exercise_compact_isolation(const char* artifact) {
 }
 
 // Both owners reuse separate resident prefixes. The large owner's ladder/rollback state must
-// survive suspension; different logprob settings expose shared output-record bindings.
+// survive suspension; different logprob settings expose shared output-record bindings. Draft K
+// stays fixed: adaptive draft picks K from measured wall-clock round times, and greedy output is
+// not identical across K, so the primes and the decoder stream compared across two Engines would
+// otherwise depend on timing.
 void exercise_cached_prefill_interruption(const char* artifact) {
     ninfer::EngineOptions options;
     options.artifact_path                      = artifact;
@@ -354,7 +357,6 @@ void exercise_cached_prefill_interruption(const char* artifact) {
     options.enable_vision                      = false;
     options.speculative.backend                = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens           = 5;
-    options.speculative.adaptive_draft         = true;
     options.speculative.proposal_head          = ninfer::ProposalHead::Optimized;
     auto large_options                         = greedy(1);
     large_options.execution.allow_prefix_reuse = true;
