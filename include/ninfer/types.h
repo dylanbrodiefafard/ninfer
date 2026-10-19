@@ -149,7 +149,7 @@ struct EngineOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t pending_timeout_ms   = 300000;
     std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
@@ -255,8 +255,8 @@ struct ModelSamplingDefaults {
     }
 };
 
-// Public request-side overrides. std::nullopt means "use the registered model/mode default";
-// explicit zero remains a real override (including temperature=0 for exact argmax).
+// Public request-side overrides. Omitted temperature uses 1.5 with p-less or the registered
+// model/mode preset otherwise. Explicit zero remains an override, including exact argmax.
 struct SamplingOverrides {
     std::optional<float> temperature;
     std::optional<std::int32_t> top_k;

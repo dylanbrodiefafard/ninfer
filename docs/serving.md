@@ -11,9 +11,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --port 8080 \
   --max-context 16384 \
   --kv-capacity 32768 \
-  --max-concurrency 2 \
-  --spec dflash --draft-tokens 3 \
-  --lm-head-draft
+  --max-concurrency 2
 ```
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
@@ -24,7 +22,10 @@ Vision is disabled by default: its weights, Vision scratch phase, and frozen req
 buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
 server must accept image or video input. Speculative residency is likewise frozen by
-`--spec dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
+`--spec none|dflash` and `--draft-tokens`. Omitting `--spec` inspects the artifact directory:
+a supported Qwen3.8 NVFP4 file containing DFlash2 selects seven draft tokens, adaptive drafting
+and the optimized proposal head; a base file stays non-speculative. `--spec none` disables
+speculation explicitly. MTP execution is disabled.
 `--lm-head-draft` additionally loads the optimized proposal head. Qwen3.8-27B DFlash2 is available
 when `dflash/` is present and can be combined with `--vision`; the text-only companion consumes
 Vision-composed target hidden features. A fixed draft window verifies the chain `W=k+1` for `k`
@@ -230,8 +231,8 @@ frontier `E` on an exact-hit / decode-only request into the one-slot turn-rollba
 (the same slot automatic occupy-append already writes). A later `true` at a new `E` replaces
 that pin; ladder heads stay. If a ladder or rollback head already sits at this `E`, the
 request succeeds with `captured_tokens = 0` and does not fill the rollback slot. A brand-new
-chat (`E == 0`) is the same quiet no-op. `true` on a server started without `--spec dflash`
-or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
+chat (`E == 0`) is the same quiet no-op. `true` on a server with speculation disabled
+(`--spec none`, or a base artifact without DFlash2) or with `--no-prefix-reuse` returns HTTP 400 `context_checkpoint_unavailable` before the
 request is enqueued. Anthropic Messages does not accept this object.
 `POST /v1/responses/input_tokens` allows `ninfer` only when omitted or JSON `null`.
 
@@ -839,14 +840,14 @@ curl http://127.0.0.1:8080/v1/models \
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-location PATH` | directory for the SSD page store; required iff `--kv-disk-capacity` is enabled | unset |
 | `--kv-disk-compress off\|zstd` | zstd-1 on new GDN/hidden/cyclic writes; KV pages stay uncompressed | `off` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..6` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
-| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
+| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `300000` |
 | `--prefill-chunk N` | text-prefill chunk | `4096` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
@@ -858,17 +859,17 @@ curl http://127.0.0.1:8080/v1/models \
 | `--sage` | Sage3 recipe on NVFP4 KV: V is stored with one scale per (dim, 16-key block), and prompt prefill runs PV as FP4 P × FP4 V (with SmoothQ); decode and verify keep BF16 P·V on the same cache. Requires `--kv-dtype nvfp4`; excludes `--keep-frac` / `--xattn-tau` | off |
 | `--keep-frac F` | Sparge prompt-prefill tile skipping on NVFP4 KV: per 128-query tile, keep the top fraction `F` `(0,1]` of 64-key tiles by mean-Q·mean-K score, plus forced leading-sink and local-window tiles. `1` is dense; decode, verify and ≤6-token chunks stay dense | `1` |
 | `--xattn-tau F` | XAttention prompt-prefill block skipping on NVFP4 KV: keep the 128-key blocks covering attention mass `F` `(0,1]` once more than 8,192 keys are visible. `1` is dense; exclusive with `--keep-frac` below `1`; decode and verify stay dense | `1` |
-| `--spec dflash` | speculative backend | off |
-| `--draft-tokens N` | DFlash2 `1..7` | unset |
-| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | off |
+| `--spec none\|dflash` | explicit backend override; MTP execution is disabled | DFlash2 if present, otherwise off |
+| `--draft-tokens N` | DFlash2 `1..7` | `7` with automatic DFlash2; otherwise unset |
+| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | on with automatic DFlash2; otherwise off |
 | `--dflash-verify-width N` | pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([calibration](performance.md#dflash2-p-less-proposal-calibration-2026-10-03)) | calibrated |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--lm-head-draft` | optimized proposal head | on with automatic DFlash2; otherwise off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
+| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks. Custom lists require explicit `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark. | default ladder |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--system-prepend TEXT` | prepend TEXT to the leading system/developer instruction on every request; inserts a system turn if none exists | off |
@@ -883,14 +884,16 @@ curl http://127.0.0.1:8080/v1/models \
 | `--greedy` | force exact argmax for all requests | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
 
-Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
+With p-less disabled, Engine selects sampling defaults from the loaded model and the request's
+resolved thinking mode.
 Qwen3.6-27B uses `1.0/0.95/20/0/0` for temperature/top-p/top-k/min-p/presence penalty in thinking
 mode and `0.7/0.80/20/0/1.5` in non-thinking mode. Qwen3.8-27B uses temperature `2.0` and presence
 penalty `0` in both modes (`2.0/0.95/20/0/0` thinking, `2.0/0.80/20/0/0` non-thinking).
 Qwen3.6-35B-A3B uses `1.0/0.95/20/0/1.5` in thinking mode and `0.7/0.80/20/0/1.5` in
 non-thinking mode. Frequency penalty is `0` for all registered presets. Process flags override
 registered values, request fields override process flags, and `--greedy` finally forces
-temperature `0`. P-less is enabled by default; it keeps temperature and seed and ignores top-p,
+temperature `0`. P-less is enabled by default with temperature `1.5` unless explicitly overridden;
+it keeps temperature and seed and ignores top-p,
 top-k, min-p, and presence/frequency penalties from both process flags and request bodies. Startup
 logs a one-time warning. Ignored request fields must still satisfy their normal input ranges before
 sampler resolution.
@@ -1080,8 +1083,9 @@ requests and retained prefixes. Both are represented with 64-token pages interna
 sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` requests an explicit
 capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
 after weights are loaded, leaving `--kv-capacity-headroom` MiB free (default 64; raise it when a
-desktop or another process shares the GPU). When omitted it follows
-`--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
+desktop or another process shares the GPU). Automatic sizing is the default when the option is
+omitted. The 64 MiB default margin targets a dedicated headless GPU; desktop-display and
+concurrent-load configurations have not been qualified. The shared pool is fixed at startup
 and is not divided evenly among request lanes. `--kv-ram-capacity` is a separate pinned-host budget
 in MiB for completed prefix bundles and does not change GPU pool sizing. One long DFlash chat with five
 context-checkpoint heads is about 6 GiB in that FIFO; `off` still keeps same-lane GDN rollback on

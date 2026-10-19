@@ -1,0 +1,377 @@
+{
+  "measured_on": "2026-10-18",
+  "revision": "edaad03a737aa1a9e8288c47af3f07ada50ae905",
+  "hardware": {
+    "gpu_name": "NVIDIA GeForce RTX 5090",
+    "cuda_runtime_version": "13.1",
+    "cuda_driver_version": "13.0",
+    "device_id": 0,
+    "cuda_compiler": "13.1.115",
+    "nvidia_driver": "580.178.04",
+    "power_limit_w": 600
+  },
+  "artifact": {
+    "identity": "qwen3.8-27b/nvfp4",
+    "filename": "qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer",
+    "size_bytes": 19589713920,
+    "variant": "DFlash2 NVFP4 matrices, BF16 selector codebooks"
+  },
+  "settings": {
+    "build": "Release",
+    "cuda_graphs": true,
+    "kv_dtype": "nvfp4",
+    "vision": false,
+    "ram_prefix_cache": false,
+    "disk_prefix_cache": false,
+    "speculative_backend": "dflash",
+    "adaptive_draft": true,
+    "max_draft_tokens": 7,
+    "optimized_draft_head": true,
+    "warmup": 1,
+    "repetitions": 3
+  },
+  "generation_settings": {
+    "concurrency": [
+      1,
+      6
+    ],
+    "max_context": 65536,
+    "kv_capacity": "auto",
+    "resolved_shared_kv_capacity": {
+      "1": 65536,
+      "6": 393216
+    },
+    "p_less_sampling": true,
+    "temperature": 1.5,
+    "output_tokens_per_request": 512,
+    "seed_base": 7632647173703958409,
+    "seed_repetition_increment": 100,
+    "seed_lane_increment": 1,
+    "prompt_cache_seeded": true,
+    "natural_stops": true,
+    "prefill_chunk": 2048
+  },
+  "prefill_settings": {
+    "concurrency": 1,
+    "max_context": 262144,
+    "kv_capacity": 262144,
+    "kv_capacity_mode": "explicit",
+    "corpus": "bench/fixtures/bench_corpus.ids repeated four times",
+    "corpus_tokens": 262144,
+    "greedy": true,
+    "prefix_reuse": false,
+    "output_tokens_per_request": 1,
+    "prefill_chunk": 4096
+  },
+  "inputs": {
+    "source": "AMD experimental README workload matrix, 2026-10-17 stock archive",
+    "source_revision": "0b78d7b1",
+    "manifest": "tools/bench/fixtures/readme_workloads.json",
+    "runner": "tools/bench/run_readme_workloads.py",
+    "match": "All C1/C6 input messages and thinking flags, and every prefill token ID, match the archived AMD inputs exactly."
+  },
+  "metrics": {
+    "generation": "committed decode tokens / complete full-batch decode-only periodic wall interval seconds; includes host scheduling and reasoning; excludes startup, prefill and intervals after any lane finishes",
+    "prefill": "prompt tokens / GenerationTimings.prefill_seconds; excludes model load, request preparation and HTTP transport",
+    "aggregation": "C6 is aggregate throughput; divide by six for the average per active request",
+    "statistics": "arithmetic mean and sample standard deviation of three measured rates after one warmup"
+  },
+  "gpu_lock": "/tmp/ninfer-gpu-queue.lock",
+  "quality_scored": false,
+  "validation": {
+    "generation_cells": 10,
+    "prefill_cells": 5,
+    "generation_waves_including_warmup": 40,
+    "all_generation_requests_reached_output_limit": true,
+    "all_generation_waves_have_full_batch_intervals": true,
+    "prompt_counts_match_amd": true,
+    "report_statistics_recomputed": true,
+    "gpu_samples": 200,
+    "foreign_gpu_process_samples": 0,
+    "generation_gpu_samples": 30,
+    "prefill_gpu_samples": 170
+  },
+  "generation": [
+    {
+      "workload": "English story",
+      "concurrency": 1,
+      "mean_tok_s": 185.8075886301539,
+      "stdev_tok_s": 1.5173309133846764,
+      "prompt_tokens": [
+        146
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.2520277295682422
+    },
+    {
+      "workload": "Python package",
+      "concurrency": 1,
+      "mean_tok_s": 311.5620073725328,
+      "stdev_tok_s": 39.75964828389309,
+      "prompt_tokens": [
+        171
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.5122541683738547
+    },
+    {
+      "workload": "Math reasoning",
+      "concurrency": 1,
+      "mean_tok_s": 286.5821473118557,
+      "stdev_tok_s": 24.91954661244661,
+      "prompt_tokens": [
+        346
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.458403348832386
+    },
+    {
+      "workload": "Document summary 8K",
+      "concurrency": 1,
+      "mean_tok_s": 227.72300709793168,
+      "stdev_tok_s": 19.026779553574656,
+      "prompt_tokens": [
+        8192
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.3592168261210909
+    },
+    {
+      "workload": "Document summary 32K",
+      "concurrency": 1,
+      "mean_tok_s": 226.42294525411776,
+      "stdev_tok_s": 13.582058814564624,
+      "prompt_tokens": [
+        32779
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.37680253935751634
+    },
+    {
+      "workload": "English story",
+      "concurrency": 6,
+      "mean_tok_s": 783.321805997968,
+      "stdev_tok_s": 17.323669255945365,
+      "prompt_tokens": [
+        146
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.3599450333908747
+    },
+    {
+      "workload": "Python package",
+      "concurrency": 6,
+      "mean_tok_s": 1057.4445117972753,
+      "stdev_tok_s": 45.91415023149,
+      "prompt_tokens": [
+        171
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.5878791685440325
+    },
+    {
+      "workload": "Math reasoning",
+      "concurrency": 6,
+      "mean_tok_s": 999.590444803426,
+      "stdev_tok_s": 32.969332034981576,
+      "prompt_tokens": [
+        346
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.5369566733115517
+    },
+    {
+      "workload": "Document summary 8K",
+      "concurrency": 6,
+      "mean_tok_s": 790.2353025982605,
+      "stdev_tok_s": 5.0482803908237885,
+      "prompt_tokens": [
+        8192
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.4072476951451324
+    },
+    {
+      "workload": "Document summary 32K",
+      "concurrency": 6,
+      "mean_tok_s": 738.7214520016931,
+      "stdev_tok_s": 14.182818539036793,
+      "prompt_tokens": [
+        32779
+      ],
+      "completion_tokens": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
+      "acceptance": 0.42867963265960757
+    }
+  ],
+  "prefill": [
+    {
+      "prompt_tokens": 8192,
+      "mean_tok_s": 15384.51393058831,
+      "stdev_tok_s": 10.018753783653708,
+      "repetition_tok_s": [
+        15383.35667543008,
+        15395.06105844337,
+        15375.124057891479
+      ]
+    },
+    {
+      "prompt_tokens": 32768,
+      "mean_tok_s": 12294.438160952064,
+      "stdev_tok_s": 10.727880163208294,
+      "repetition_tok_s": [
+        12306.489383484775,
+        12290.89517720438,
+        12285.929922167037
+      ]
+    },
+    {
+      "prompt_tokens": 65536,
+      "mean_tok_s": 9651.524884192313,
+      "stdev_tok_s": 18.55425418585932,
+      "repetition_tok_s": [
+        9670.416048614505,
+        9650.831631869525,
+        9633.32697209291
+      ]
+    },
+    {
+      "prompt_tokens": 131072,
+      "mean_tok_s": 6746.8334969159,
+      "stdev_tok_s": 5.928196296562046,
+      "repetition_tok_s": [
+        6753.6703279518615,
+        6743.709729272252,
+        6743.120433523584
+      ]
+    },
+    {
+      "prompt_tokens": 245760,
+      "mean_tok_s": 4433.470951248746,
+      "stdev_tok_s": 0.7777232578120177,
+      "repetition_tok_s": [
+        4433.717150150611,
+        4434.09577762387,
+        4432.599925971757
+      ]
+    }
+  ],
+  "raw_reports": {
+    "generation": "profiles/bench/readme-refresh-20261018/workloads/",
+    "prefill": "profiles/bench/readme-prefill4096-20261018/isolated/"
+  }
+}

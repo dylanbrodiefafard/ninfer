@@ -73,10 +73,12 @@ or will be changed, proportionately and without performative apology or praise.
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance,
 compiled for `sm_120a` and tuned on an NVIDIA GeForce RTX 5090. The only supported identity is
-`qwen3.8-27b/nvfp4`; its default artifact, when available, is the DFlash2 (NVFP4
-matrices, BF16 selector codebook) variant over the base Ostfralla NVFP4 shell. MTP execution is
-disabled; stored MTP tensors remain artifact-validation inputs only. The workload is one GPU,
-one resident model instance, and a startup-fixed one to six active requests. The
+`qwen3.8-27b/nvfp4`; its recommended artifact is the DFlash2 variant (NVFP4 matrices, BF16
+selector codebook) over the base Ostfralla NVFP4 shell. CLI/server default to automatic KV capacity
+and enable adaptive DFlash2 K7 with the optimized proposal head when that companion is present;
+base artifacts run without speculation. MTP execution is disabled; stored MTP tensors remain
+artifact-validation inputs only. NVFP4 KV is the recommended cache format. The workload is one
+GPU, one resident model instance, and a startup-fixed one to six active requests. The
 Engine forms one compact decode batch per round boundary with bounded FIFO ingress and no
 preemption. Large-scale or preemptive continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current

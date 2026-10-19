@@ -74,6 +74,19 @@ int main() {
               "CLI help omits --no-p-less-sampling");
 
     const ninfer::cli::Options defaults = parse({"ninfer", "model.ninfer", "--prompt", "hi"});
+    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          defaults.kv_capacity.automatic_headroom_bytes ==
+                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                      "CLI did not default to automatic KV capacity");
+    const auto headroom =
+        parse({"ninfer", "model.ninfer", "--prompt", "hi", "--kv-capacity-headroom", "512"});
+    failures += check(headroom.kv_capacity.automatic_headroom_bytes == 512ULL * 1024ULL * 1024ULL,
+                      "CLI headroom override did not apply to default automatic sizing");
+    const auto disabled = parse({"ninfer", "model.ninfer", "--prompt", "hi", "--spec", "none"});
+    failures +=
+        check(disabled.speculative.backend == ninfer::SpeculativeBackend::None &&
+                  disabled.speculative_selection == ninfer::product::SpeculativeSelection::Explicit,
+              "CLI --spec none did not disable artifact-default speculation");
     failures += check(defaults.prefill_chunk == 4096, "CLI prefill chunk default is not 4096");
     failures += check(defaults.sampling.p_less, "CLI did not enable p-less by default");
     const ninfer::cli::Options production = parse(

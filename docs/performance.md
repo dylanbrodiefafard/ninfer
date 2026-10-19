@@ -21,6 +21,115 @@ Tested Git revisions:
 - Qwen3.8-27B NVFP4 EvalScope accuracy (INT8 and NVFP4 KV):
   `c0f4ec2cfe234b3e3988f79f0399d077de8178b6`.
 
+## README workload measurements (2026-10-18)
+
+Fresh measurements on one NVIDIA GeForce RTX 5090, driver 580.178.04, CUDA 13.1 runtime and
+13.1.115 compiler, `sm_120a`, Release build at `edaad03a`. The selected artifact is
+`qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`
+(19,589,713,920 bytes): Qwen3.8-27B NVFP4 with DFlash2 NVFP4 matrices and BF16 selector codebooks.
+Both phases use NVFP4 KV, CUDA Graphs, adaptive DFlash up to seven draft tokens and the
+optimized proposal head. Prefill uses 4,096-token chunks; the cached-prompt generation runs
+used 2,048-token chunks. Vision and RAM/SSD prefix tiers are off. The GPU power
+cap remains 600 W; no clock or power settings were changed by the campaign.
+
+The benchmark repeats the AMD fork's README workload matrix. The C1/C6 messages and thinking
+flags are frozen from its 2026-10-17 stock archive at `0b78d7b1`; all five workloads on every
+lane compare exactly with that archive. The prefill token IDs also match exactly. Source text
+changes in either checkout therefore do not change these inputs. The request and timing method
+is adapted from the AMD runner, with NVFP4 KV selected explicitly for this engine. The prefill
+ladder was rerun with the default 4,096-token chunk for RTX 5090 throughput; the generation
+measurements retain their original settings and results.
+
+### Prompt processing
+
+The committed 65,536-token curated corpus is repeated four times without re-tokenizing. C1 uses
+`--max-ctx 262144`, one discarded warmup and three measured repetitions at each prompt length.
+This benchmark fixes its shared KV pool explicitly to 262,144 tokens; unlike the AMD benchmark,
+it has no `--kv-capacity` argument. The AMD ladder's automatic C1 pool also resolved to 262,144.
+The request produces one greedy output token with raw output, model stops disabled and prefix
+reuse disabled.
+
+Report prompt tokens divided by `GenerationTimings.prefill_seconds` for each repetition. Values
+are mean ± sample standard deviation of those three rates, excluding model load, request
+preparation and HTTP transport. They are prefill service rates rather than whole-request wall
+rates or prorated trailing-window estimates.
+
+| Prompt tokens | Prefill service tokens/s |
+|---:|---:|
+| 8,192 | 15,384.5 ± 10.02 |
+| 32,768 | 12,294.4 ± 10.73 |
+| 65,536 | 9,651.5 ± 18.55 |
+| 131,072 | 6,746.8 ± 5.93 |
+| 245,760 | 4,433.5 ± 0.78 |
+
+### Generation workloads
+
+The server uses `--max-context 65536 --kv-capacity auto`, C1 or C6, p-less temperature 1.5,
+and 512 output tokens per request. Lane-specific system prefixes keep each request's cached
+state distinct. Story, code and document summaries disable thinking; math enables it. Each cell
+has one discarded warmup wave and three measured waves, with seed
+`7632647173703958409 + 100 * repetition + lane` (warmup is repetition zero).
+
+Each wave follows untimed one-token requests that seed the prompt cache. Only complete 100-ms
+periodic throughput intervals with zero computed prefill, exactly C active decode lanes and C
+rows in every decode round count. Committed decode tokens divided by those intervals' actual
+wall time includes host scheduling between rounds. There is no fallback to prefill-inclusive
+makespan or per-request service-time rates. C6 is aggregate throughput; divide by six for the
+average per active request in the selected intervals.
+
+| Workload | Prompt tokens | C1 tokens/s | C6 aggregate tokens/s |
+|---|---:|---:|---:|
+| English story | 146 | 185.8 ± 1.5 | 783.3 ± 17.3 |
+| Python package | 171 | 311.6 ± 39.8 | 1057.4 ± 45.9 |
+| Math reasoning | 346 | 286.6 ± 24.9 | 999.6 ± 33.0 |
+| Document summary 8K | 8,192 | 227.7 ± 19.0 | 790.2 ± 5.0 |
+| Document summary 32K | 32,779 | 226.4 ± 13.6 | 738.7 ± 14.2 |
+
+Values are mean ± sample standard deviation. All 40 waves, including warmups, have valid
+full-batch intervals, reusable cached prefixes and exactly 512 generated tokens per request.
+All ten generation cells and five prefill cells completed. Report means and sample standard
+deviations were recomputed from the saved repetitions. The campaign holds the host NVIDIA GPU
+lock for each measurement phase, including the server's full lifetime. The 30 generation and
+170 replacement-prefill GPU process/power samples show only the selected benchmark/server
+process and a 600 W cap.
+
+These are generation-throughput measurements, including reasoning. The fixed 512-token budget
+truncates long-form story and code requests; output quality and task completion were not scored.
+Sampling and acceptance vary between runs. The two GPUs use their own supported weights, cache
+formats and kernels, so matching workloads does not establish numerical identity or equal answer
+quality. Existing EvalScope scores below use a separate base artifact and evaluation profile.
+
+Reproduction commands and frozen-input details are in
+[`tools/bench/README.md`](../tools/bench/README.md#readme-workload-measurements).
+The public summary is
+[`bench/results/readme-benchmarks-20261018.json`](../bench/results/readme-benchmarks-20261018.json).
+Raw inputs, outputs, per-request counters, intervals, startup metadata, prefill repetitions and
+GPU samples remain local under `profiles/bench/readme-refresh-20261018/` for generation and
+`profiles/bench/readme-prefill4096-20261018/isolated/` for the replacement prefill ladder. The earlier
+2,048-token prefill report remains in the first directory.
+
+## CLI/server startup defaults and twelve-session smoke (2026-10-18)
+
+On the same RTX 5090 / CUDA 13.1 DFlash2 NVFP4 artifact, the CLI and server select automatic KV
+capacity and adaptive DFlash2 K7 with the optimized proposal head when backend flags are omitted.
+Nonempty raw greedy CLI output with thinking disabled and a 32-token limit matches explicit
+`--kv-capacity auto --spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft` output.
+`--spec none` also completes generation. The artifact-directory fixture checks a base artifact
+staying non-speculative and explicit None/DFlash overrides taking precedence.
+
+A real HTTP smoke starts six active lanes, a 4,096-token per-request context, automatic KV sizing
+and an 8 GiB RAM tier, with no speculative flags. It seeds twelve distinct story prefixes of
+146–147 tokens and submits all twelve 128-token greedy completions together. Every request
+completes with a full cached prompt and zero computed prefill tokens; three restore from GPU
+state and nine from RAM. Observed RAM load service times range from 16.84 to 18.58 ms. This is a
+short-history integration check, not a throughput A/B or a long-context overhead guarantee.
+At most six requests are active; the other sessions wait in FIFO order. RAM restores require
+state storage and transfer, so their overhead is workload-dependent.
+
+The checks hold `/tmp/ninfer-gpu-queue.lock` throughout GPU execution. Focused startup, CLI/server
+option and OpenAI/Responses/Anthropic schema tests pass. Commands, stderr, responses and request
+records are local under `profiles/bench/startup-defaults-20261018/`.
+
 ## NVFP4 decode scheduling and GDN prefetch (2026-10-16)
 
 RTX 5090, CUDA 13.1.115 compiler, `sm_120a` (host Engine runtime reports CUDA 13.3), artifact
@@ -2209,6 +2318,45 @@ are `/build/apps/ninfer-serve-scaling-a4-projections` and
 
 ## DFlash2 automatic KV capacity
 
+### Startup concurrency (2026-10-18)
+
+One RTX 5090, driver 580.178.04, CUDA 13.1, Release build, `sm_120a`, and the recommended
+`qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`
+artifact (19,589,713,920 bytes). Each server started with:
+
+```bash
+build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --max-context 262144 --max-concurrency C \
+  --kv-capacity auto --kv-capacity-headroom 64 --prefill-chunk 4096 --kv-dtype nvfp4 \
+  --spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft
+```
+
+CUDA Graphs and prefix reuse were on; Vision and RAM/SSD caches were off. Each row records the
+resolved shared token pool after startup and warmup; all six servers became healthy. Free device
+memory after weights was 15,653,994,496 bytes at every C. These are startup capacity measurements,
+not six simultaneous full-length requests: each request is limited to 262,144 tokens, and retained
+histories share the same pool. The upper bound is C times the page-rounded per-request limit.
+
+| Startup concurrency (C) | Shared KV capacity (tokens, total) |
+|---:|---:|
+| 1 | 262,144 |
+| 2 | 524,288 |
+| 3 | 732,096 |
+| 4 | 714,432 |
+| 5 | 697,408 |
+| 6 | 680,384 |
+
+C1 and C2 reach that upper bound. C3–C6 use the available VRAM after reserving request state,
+DFlash2 state, workspace, graph allowances and 64 MiB headroom. Increasing C therefore reduces the
+shared pool after the upper bound stops being the limiting factor. The GPU lock was held across
+all six startups; 28 GPU process samples contained only the selected server or an idle GPU.
+
+[Machine-readable results](../bench/results/readme-kv-capacity-20261018.json) preserve capacities
+and memory reservations. Full startup records, commands and GPU samples remain local under
+`profiles/bench/readme-capacity-20261018/`.
+
+### Earlier graph-budget qualification
+
 Qualified on RTX 5090, driver 580.173.02, CUDA 13.1, `sm_120a`, using
 `qwen3.8-nvfp4-flash2-nvfp4-bf16codebook-from-bf16/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer`.
 The server workload used `--max-context 260000 --kv-capacity auto --max-concurrency 4
@@ -2217,13 +2365,13 @@ The server workload used `--max-context 260000 --kv-capacity auto --max-concurre
 
 This qualification reserved 12 MiB per DFlash2 `(K, B, topology)` graph executable, or 144 MiB
 for the three-width adaptive set used then, instead of inheriting the
-autoregressive DFlash allowance of 1152 MiB. The current five-width set reserves 144 MiB
+autoregressive DFlash allowance of 1152 MiB. A later five-width set reserved 144 MiB
 at C=4 (`min(12n, 24+6n)` MiB for `n` executables); the capacity numbers below describe the
 earlier set.
 With the same reported 13.26 GiB free after weights, server startup resolved 558656 tokens,
 up from the reported 501312-token configuration: the 1008 MiB reduction buys exactly 896
 64-token pages (57344 tokens). Measured graph usage was 54 MiB and free memory after startup
-was 1.05 GiB. The 1 GiB sizing headroom and address-stable workspace/KV allocations are unchanged.
+was 1.05 GiB. The 1 GiB sizing headroom and address-stable workspace/KV allocations were unchanged in that comparison.
 A separate cold single-request startup with fixed `K=5` used 4 MiB of its 12 MiB graph allowance
 and completed generation, covering the smallest executable-count budget.
 

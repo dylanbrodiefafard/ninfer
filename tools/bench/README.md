@@ -3,6 +3,72 @@
 Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
 under [`tools/parity`](../parity).
 
+## README workload measurements
+
+`run_readme_workloads.py` measures the same five generation workloads as the AMD fork's
+README: English story, Python package, math reasoning, and document summaries near 8K and
+32K prompt tokens. `fixtures/readme_workloads.json` freezes the messages and thinking flags
+from its 2026-10-17 stock archive (revision `0b78d7b1`). The two document strings are stored
+as complete CLI message arrays under `examples/cli/messages/readme_document_*.json`. Freezing
+the messages keeps the benchmark inputs stable as either repository's documentation changes. No tokenizer or Python packages beyond the standard
+library are needed to replay them.
+
+Run in the `ninfer-builder` GPU environment with Python 3.11, holding the host NVIDIA GPU lock
+throughout the runner and server lifetimes:
+
+```bash
+flock --exclusive /tmp/ninfer-gpu-queue.lock \
+  python3.11 tools/bench/run_readme_workloads.py \
+    --artifact /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+    --concurrency 1 6 --tokens 512 --warmup 1 --repetitions 3 \
+    --output profiles/bench/readme-workloads
+```
+
+The runner selects NVFP4 KV, CUDA Graphs, adaptive DFlash up to seven drafts, the optimized
+proposal head, chunk 2048, automatic KV capacity and p-less temperature 1.5. Vision and RAM/SSD
+prefix tiers stay off. Each synchronized wave follows untimed per-lane prompt-cache seeding.
+Only complete 100-ms periodic intervals with no prefill and all C lanes decoding count;
+the rate is committed decode tokens divided by those intervals' wall time, including host
+scheduling. There is no fallback to per-request rates or prefill-inclusive makespan. C6 is
+aggregate throughput. Natural stops remain enabled; actual completion lengths are recorded.
+
+Reports preserve inputs, responses, per-request counters, startup settings and timing intervals.
+Each cell reports the mean and sample standard deviation of three measured waves after one
+warmup. The output directory must not exist. `--workload "Python package"` selects one workload;
+`--serve`, `--port` and `--concurrency` select the server and batch settings.
+
+For the C1 prefill ladder, use the CLI/server default 4,096-token chunk while retaining the
+same prompt lengths and corpus. Repeat the committed 65,536-token corpus four times without
+re-tokenizing it, then run:
+
+```bash
+python3.11 - <<'PYCODE'
+from pathlib import Path
+ids = Path("bench/fixtures/bench_corpus.ids").read_text().split()
+assert len(ids) == 65536
+output = Path("profiles/bench/readme-prefill.ids")
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(" ".join(ids * 4) + "\n")
+PYCODE
+
+flock --exclusive /tmp/ninfer-gpu-queue.lock \
+  build/bench/ninfer_bench \
+    --weights /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+    --corpus profiles/bench/readme-prefill.ids \
+    -p 8192,32768,65536,131072,245760 \
+    --max-ctx 262144 --prefill-chunk 4096 --kv-dtype nvfp4 \
+    --spec dflash --draft-tokens 7 --adaptive-draft --lm-head-draft \
+    --warmup 1 -r 3 -o json --output-file profiles/bench/readme-prefill.json
+```
+
+The native benchmark fixes the C1 KV pool to 262,144 tokens through `--max-ctx`; it has no
+`--kv-capacity` option. This matches the AMD ladder's resolved C1 pool size.
+
+Report each repetition's prompt tokens divided by its `timings.prefill_seconds`, then compute
+the mean and sample standard deviation. This is prefill service throughput, excluding model
+load, request preparation and HTTP transport. Whole-request wall time and trailing-window
+prefill estimates are different metrics.
+
 ## Corpus baker
 
 `ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a

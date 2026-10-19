@@ -122,7 +122,7 @@ std::string usage_text(const char* argv0) {
            "       [--kv-disk-compress off|zstd] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F]\n"
-           "       [--spec dflash --draft-tokens N]\n"
+           "       [--spec none|dflash --draft-tokens N]\n"
            "       [--adaptive-draft] [--dflash-verify-width N] [--lm-head-draft]\n"
            "       [--dflash-p-less-draft-temperature T]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -139,7 +139,10 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--kv-capacity auto sizes the KV pool from all free GPU memory except\n"
+           "Omitting --spec enables adaptive DFlash K7 with the optimized head when the artifact\n"
+           "contains the Qwen3.8 NVFP4 DFlash2 companion; otherwise speculation stays off.\n"
+           "--spec none disables speculation. MTP execution is disabled.\n"
+           "--kv-capacity defaults to auto and sizes the KV pool from all free GPU memory except\n"
            "--kv-capacity-headroom MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); raise it when other processes, such as a desktop, share the GPU.\n"
@@ -152,7 +155,7 @@ std::string usage_text(const char* argv0) {
            "replaces the default marks and requires --spec dflash.\n"
            "--capture-context-checkpoint pins the current resume frontier on an exact-hit "
            "(no-op on a fresh one-shot run).\n"
-           "P-less sampling is enabled by default and uses temperature (default 2.0) and seed "
+           "P-less sampling is enabled by default and uses temperature (default 1.5) and seed "
            "only; top-p, top-k, min-p, and penalties are ignored.\n"
            "--no-p-less-sampling opts into the registered production sampler.\n";
 }
@@ -164,8 +167,7 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
-    options.artifact_path     = argv[1];
-    bool kv_capacity_explicit = false;
+    options.artifact_path = argv[1];
     std::optional<std::uint64_t> kv_capacity_headroom_mib;
 
     for (int i = 2; i < argc; ++i) {
@@ -190,8 +192,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
         } else if (arg == "--kv-capacity") {
-            options.kv_capacity  = parse_kv_capacity(value(arg));
-            kv_capacity_explicit = true;
+            options.kv_capacity = parse_kv_capacity(value(arg));
         } else if (arg == "--kv-capacity-headroom") {
             kv_capacity_headroom_mib = parse_u64(value(arg), "kv-capacity-headroom");
         } else if (arg == "--kv-ram-capacity") {
@@ -215,7 +216,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--xattn-tau") {
             options.xattn_tau = parse_unit_interval_flag(value(arg), "--xattn-tau");
         } else if (arg == "--spec") {
-            options.speculative.backend = product::parse_speculative_backend(value(arg));
+            options.speculative_selection = product::SpeculativeSelection::Explicit;
+            options.speculative.backend   = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--adaptive-draft") {
@@ -287,9 +289,6 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
-    }
     if (kv_capacity_headroom_mib) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-capacity-headroom requires --kv-capacity auto");

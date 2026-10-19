@@ -34,7 +34,9 @@ template's default. An artifact whose template does not expose effort rejects th
 
 GPU residency is frozen when the Engine starts:
 
-- no `--spec` omits speculative weights and state and the optimized proposal head;
+- omitting `--spec` selects adaptive DFlash2 K7 and the optimized proposal head when the
+  supported Qwen3.8 NVFP4 artifact contains `dflash/`; a base artifact stays non-speculative;
+- `--spec none` omits speculative weights and state and the optimized proposal head;
 - `--spec dflash` loads the DFlash companion
   (35B-A3B DFlash v1, or Qwen3.8-27B DFlash2 when `dflash/` is present);
 - a speculative backend with the full proposal head omits the optimized proposal head;
@@ -45,7 +47,7 @@ GPU residency is frozen when the Engine starts:
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an
 Engine without `--vision` rejects media and cannot enable Vision later. Qwen3.8-27B DFlash2 can be
 combined with Vision when both are selected at startup; 35B-A3B DFlash v1 remains text-only. The
-default speculative and Vision settings produce the smallest resident profile.
+`--spec none` and default Vision settings produce the smallest resident profile.
 
 ## Structured messages
 
@@ -111,8 +113,10 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. The supported backend is Qwen3.8-27B NVFP4
-DFlash2, with chain draft windows from one to seven. MTP execution is disabled in the Engine,
+CLI startup inspects the artifact directory and enables adaptive DFlash2 with up to seven draft
+tokens and the optimized proposal head when its companion is present. Otherwise speculation stays
+off. `--spec none` explicitly disables it; explicit `--spec dflash` settings override the defaults.
+The supported backend is Qwen3.8-27B NVFP4 DFlash2, with chain draft windows from one to seven. MTP execution is disabled in the Engine,
 CLI, and server. Stored MTP tensors do not enable execution or affect the cache fingerprint.
 The companion is text-only internally, but a `--vision` Engine supplies it target hidden
 features after Vision embedding composition and uses target MRoPE positions for verification.
@@ -149,7 +153,7 @@ The RTX 5090 tree investigation is in
 | Option | Meaning | Default |
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or automatic sizing from remaining GPU memory | `auto` |
 | `--kv-capacity-headroom MiB` | device memory `--kv-capacity auto` leaves free; requires `auto` | `64` |
 | `--kv-ram-capacity off\|N` | pinned host KV prefix-cache capacity in MiB; `off` disables the tier | `off` |
 | `--kv-disk-capacity off\|N` | SSD KV prefix-cache unique-object capacity in MiB; `off` disables the tier | `off` |
@@ -162,21 +166,21 @@ The RTX 5090 tree investigation is in
 | `--sage` | Sage3 recipe on NVFP4 KV: V is stored with one scale per (dim, 16-key block), and prompt prefill runs PV as FP4 P × FP4 V (with SmoothQ); decode and verify keep BF16 P·V on the same cache. Requires `--kv-dtype nvfp4`; excludes `--keep-frac` / `--xattn-tau` | off |
 | `--keep-frac F` | Sparge prompt-prefill tile skipping on NVFP4 KV: per 128-query tile, keep the top fraction `F` `(0,1]` of 64-key tiles by mean-Q·mean-K score, plus forced leading-sink and local-window tiles. `1` is dense; decode, verify and ≤6-token chunks stay dense | `1` |
 | `--xattn-tau F` | XAttention prompt-prefill block skipping on NVFP4 KV: keep the 128-key blocks covering attention mass `F` `(0,1]` once more than 8,192 keys are visible. `1` is dense; exclusive with `--keep-frac` below `1`; decode and verify stay dense | `1` |
-| `--spec dflash` | speculative backend | off |
-| `--draft-tokens N` | DFlash2 `1..7` | unset |
-| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | off |
+| `--spec none\|dflash` | explicit backend override; MTP execution is disabled | DFlash2 if present, otherwise off |
+| `--draft-tokens N` | DFlash2 `1..7` | `7` with automatic DFlash2; otherwise unset |
+| `--adaptive-draft` | pick the live draft arm by `E[Y]/T(arm,C,L)` (nested hop acceptance; DFlash learns engine-global hop hazards from one exploration round in 32, and tree depth hazards from every tree round; forgetting least-squares T; each captured arm measured once per batch size; 1 ms switch cost). DFlash with `--draft-tokens N` (N=5..7) captures chains `{3..N}`, `--draft-tokens 4` stays `{4}`; Qwen3.8 DFlash2 adds the `W=12` tree arm for batches of up to four | on with automatic DFlash2; otherwise off |
 | `--dflash-verify-width N` | pin the draft window's DFlash verify width (`W=k+1` chain, wider: packed tree, at most 16) for every batch size and disable the adaptive tree arm; chain-only targets require `W=k+1` | auto |
 | `--dflash-p-less-draft-temperature T` | Pins the DFlash2 draft temperature `0..2` for p-less requests: drafts are drawn from the 16-candidate path-select softmax at `T` and verified against that proposal, so output stays exactly the p-less target distribution. `0` drafts greedily. Unset, the engine calibrates it online per p-less `--temperature` and draft length: every chain round scores eight candidate temperatures against the verified target distribution and the next round uses the best ([calibration](performance.md#dflash2-p-less-proposal-calibration-2026-10-03)) | calibrated |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--lm-head-draft` | optimized proposal head | on with automatic DFlash2; otherwise off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks (24576, 36864, 53248, 77824, 102400, 151552). Custom lists require `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. | default ladder |
+| `--context-checkpoints off\|a,b,c` | disable the automatic prefill ladder, or replace the default marks (24576, 36864, 53248, 77824, 102400, 151552). Custom lists require explicit `--spec dflash`. Marks at or above `--max-context` stay unused. Advertised freeze `F` is the committed chunk end at or past the mark, not the raw named size. | default ladder |
 | `--capture-context-checkpoint` | pin the current resume frontier `E` on an exact-hit / decode-only request (the same one-slot turn-rollback head automatic occupy-append already writes). A fresh one-shot run has `E == 0`, so this is a no-op unless a retained lane already exists in the process. | off |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
-| `--temperature F` | sampling temperature override | registered model/mode default |
+| `--temperature F` | sampling temperature override | `1.5` with p-less; otherwise registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
 | `--top-k N` | top-k-threshold override | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
@@ -184,8 +188,8 @@ The RTX 5090 tree investigation is in
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
 
-When a sampling flag is omitted, Engine selects the official general-task preset registered for
-the loaded model and the rendered prompt mode. The current presets are:
+With p-less disabled, omitted sampling flags use the official general-task preset registered for
+the loaded model and rendered prompt mode. The current presets are:
 
 | Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
 |---|---|---:|---:|---:|---:|---:|
@@ -199,7 +203,7 @@ the loaded model and the rendered prompt mode. The current presets are:
 Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
 is task-specific and is therefore an explicit override rather than an inferred Engine default.
 
-P-less is the default process/request truncation mode, with temperature `2.0` for Qwen3.8. It keeps
+P-less is the default process/request truncation mode, with temperature `1.5` unless overridden. It keeps
 temperature and seed, ignores top-p, top-k, min-p, and presence/frequency penalties, and writes a
 one-time warning on stderr. Ignored parameters must still satisfy their normal input ranges.
 `--no-p-less-sampling` opts into the registered production sampler. Combined with `--greedy`,
@@ -269,8 +273,8 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 The registered model IDs have a native context limit of 262,144 tokens. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Default KV storage is NVFP4. Use `--kv-dtype bf16` for uncompressed KV; `--kv-dtype int8`
-remains a capacity alternative. The prepared prompt must fit
+NVFP4 KV is the default and recommended storage. BF16 and INT8 remain available for explicit
+numerical comparisons and diagnostics. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
@@ -279,9 +283,9 @@ layout. This includes the selected speculative backend, fixed sequence state, wo
 request transient, and CUDA Graph allowance, while leaving `--kv-capacity-headroom` MiB (default 64)
 unallocated. The Engine allocates all device memory at startup, so the default only covers
 driver-side growth such as lazy per-kernel local memory; raise it when a desktop or another process
-uses the same GPU. A startup failure in automatic mode names this option. It does not probe allocations or resize the pool at request time. The single-request
-CLI normally leaves the option omitted so it follows
-`--max-context`; the distinction matters primarily to a concurrent Engine or server.
+uses the same GPU. A startup failure in automatic mode names this option. It does not probe allocations or resize the pool at request time. Omitting `--kv-capacity` selects automatic sizing in both CLI and server. The 64 MiB default
+headroom is intended for a dedicated headless GPU. Desktop display and concurrent GPU loads have
+not been qualified; increase the headroom for their peak memory use.
 The startup log's `slack` includes the automatic `headroom`; they are not separate deductions.
 `graphs` reports measured GPU usage / planned allowance; the measurement is a device-wide free-memory
 delta, so other processes on the GPU can move it, and it does not fail startup. Ordinary and DFlash2 budget

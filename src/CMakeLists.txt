@@ -328,6 +328,9 @@ if(NINFER_BUILD_PROMPT_INPUT)
 endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(ninfer_product_startup STATIC product/startup_options.cpp)
+  ninfer_internal_includes(ninfer_product_startup)
+  target_link_libraries(ninfer_product_startup PRIVATE ninfer_artifact)
   add_library(ninfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
   ninfer_internal_includes(ninfer_product_load_progress)

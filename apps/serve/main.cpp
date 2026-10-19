@@ -41,12 +41,14 @@ std::string format_bytes(std::size_t bytes) {
 
 int main(int argc, char** argv) {
     try {
-        const ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
+        ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
         if (options.help_requested) {
             std::cout << ninfer::serve::serve_usage_text(argv[0]);
             return 0;
         }
 
+        options.speculative = ninfer::product::resolve_speculative_startup(
+            options.artifact_path, options.speculative_selection, options.speculative);
         using Clock = std::chrono::steady_clock;
         ninfer::serve::HttpServer server(options);
         if (!server.bind()) {

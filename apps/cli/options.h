@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "product/startup_options.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -22,7 +23,7 @@ struct Options {
 
     std::uint32_t max_new              = 128;
     std::uint32_t max_context          = 2048;
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::automatic();
     std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
     std::filesystem::path kv_disk_location;
@@ -35,6 +36,8 @@ struct Options {
     float keep_frac         = 1.0f;
     float xattn_tau         = 1.0f;
     SpeculativeOptions speculative;
+    product::SpeculativeSelection speculative_selection =
+        product::SpeculativeSelection::ArtifactDefault;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
 

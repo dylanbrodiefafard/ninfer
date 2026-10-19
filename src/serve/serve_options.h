@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "product/startup_options.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,10 +30,10 @@ struct ServeOptions {
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context          = 8192;
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::automatic();
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t pending_timeout_ms   = 300000;
     std::uint32_t prefill_chunk        = 4096;
     std::size_t kv_ram_capacity_bytes  = 0;
     std::size_t kv_disk_capacity_bytes = 0;
@@ -48,6 +49,8 @@ struct ServeOptions {
     float keep_frac                        = 1.0f;
     float xattn_tau                        = 1.0f;
     SpeculativeOptions speculative;
+    product::SpeculativeSelection speculative_selection =
+        product::SpeculativeSelection::ArtifactDefault;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;

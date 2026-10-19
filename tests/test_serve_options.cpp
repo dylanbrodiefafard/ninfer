@@ -37,6 +37,9 @@ int main() {
 
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.pending_timeout_ms == 300000 &&
+                          ninfer::EngineOptions{}.pending_timeout_ms == 300000,
+                      "server and Engine admission timeouts must default to five minutes");
     failures += check(defaults.prefill_chunk == 4096, "serving prefill chunk default is not 4096");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
@@ -47,11 +50,12 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
-    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
-                      "default KV capacity does not follow max context");
+    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          defaults.kv_capacity.automatic_headroom_bytes ==
+                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                      "default KV capacity is not automatic");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
-                      "speculative decoding is not disabled by default");
+                      "artifact-default speculation was resolved before artifact inspection");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
                       "Responses store defaults mismatch");
@@ -315,9 +319,19 @@ int main() {
 
     const ServeOptions inherited =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
-    failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          inherited.kv_capacity.explicit_tokens == 16384,
-                      "omitted --kv-capacity did not follow --max-context");
+    failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Automatic,
+                      "changing --max-context disabled automatic KV sizing");
+
+    const auto disabled = parse({"ninfer-serve", "model.ninfer", "--spec", "none"});
+    failures +=
+        check(disabled.speculative.backend == ninfer::SpeculativeBackend::None &&
+                  disabled.speculative_selection == ninfer::product::SpeculativeSelection::Explicit,
+              "--spec none did not disable artifact-default speculation");
+    const auto default_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512"});
+    failures +=
+        check(default_headroom.kv_capacity.automatic_headroom_bytes == 512ULL * 1024ULL * 1024ULL,
+              "headroom override did not apply to default automatic sizing");
 
     const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
     failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
@@ -333,9 +347,11 @@ int main() {
               "--kv-capacity-headroom did not set automatic headroom in MiB");
     bool headroom_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--kv-capacity-headroom", "512",
+                     "--kv-capacity", "8192"});
     } catch (const std::invalid_argument&) { headroom_rejected = true; }
-    failures += check(headroom_rejected, "--kv-capacity-headroom without auto was accepted");
+    failures +=
+        check(headroom_rejected, "--kv-capacity-headroom with explicit capacity was accepted");
 
     const ServeOptions ram_off = parse({"ninfer-serve", "model.ninfer"});
     failures +=

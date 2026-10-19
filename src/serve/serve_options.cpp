@@ -115,7 +115,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|nvfp4] [--sage] [--keep-frac F] [--xattn-tau F] "
-           "[--spec dflash --draft-tokens N] "
+           "[--spec none|dflash --draft-tokens N] "
            "[--adaptive-draft] "
            "[--dflash-verify-width N] [--dflash-p-less-draft-temperature T] "
            "[--default-max-tokens N] "
@@ -135,9 +135,13 @@ std::string serve_usage_text(const char* argv0) {
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
+           "       --pending-timeout-ms defaults to 300000 for preparation and admission\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --kv-capacity auto sizes KV from all free GPU memory except "
+           "       omitted --spec enables adaptive DFlash K7 with its optimized head when the\n"
+           "       Qwen3.8 NVFP4 artifact contains DFlash2; otherwise speculation stays off\n"
+           "       --spec none disables speculation; MTP execution is disabled\n"
+           "       --kv-capacity defaults to auto and sizes KV from all free GPU memory except "
            "--kv-capacity-headroom "
            "MiB (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
@@ -159,7 +163,7 @@ std::string serve_usage_text(const char* argv0) {
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
-           "       p-less sampling is enabled by default and uses temperature (default 2.0) and "
+           "       p-less sampling is enabled by default and uses temperature (default 1.5) and "
            "seed only; top-p, top-k, min-p, and penalties from flags and requests are ignored.\n"
            "       --no-p-less-sampling opts into the registered production sampler.\n";
 }
@@ -178,7 +182,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
-    bool kv_capacity_explicit        = false;
     std::optional<std::uint64_t> kv_capacity_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
@@ -207,8 +210,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
         } else if (arg == "--kv-capacity") {
-            options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
-            kv_capacity_explicit = true;
+            options.kv_capacity = parse_kv_capacity(require_value("--kv-capacity"));
         } else if (arg == "--kv-capacity-headroom") {
             kv_capacity_headroom_mib =
                 parse_u64(require_value("--kv-capacity-headroom"), "kv-capacity-headroom");
@@ -278,6 +280,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.xattn_tau =
                 parse_unit_interval_flag(require_value("--xattn-tau"), "--xattn-tau");
         } else if (arg == "--spec") {
+            options.speculative_selection = product::SpeculativeSelection::Explicit;
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
         } else if (arg == "--draft-tokens") {
@@ -346,9 +349,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
-    }
-    if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     if (kv_capacity_headroom_mib) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {

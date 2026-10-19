@@ -378,6 +378,9 @@ ninfer_add_test(ninfer_cli_options_test
   SOURCES test_cli_options.cpp
           ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps)
+ninfer_add_test(ninfer_product_startup_test
+  SOURCES test_product_startup.cpp
+  LIBRARIES ninfer_product_startup)
 ninfer_add_test(ninfer_serve_system_prepend_real_test
   SOURCES test_serve_system_prepend_real.cpp
   LIBRARIES ninfer_serve ninfer_engine)
