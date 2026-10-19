@@ -179,6 +179,7 @@ int verify_profile_mismatch_rejection() {
     options.max_context    = 128;
     options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk  = 128;
+    options.mixed_forward  = 0;
     options.use_cuda_graph = false;
     auto planner = Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt);
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;

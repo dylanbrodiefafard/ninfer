@@ -99,7 +99,6 @@ add_library(ninfer_ops STATIC
   ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
-  ops/launcher/rmsnorm_a4.cu
   ops/launcher/residual_rmsnorm.cu
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
@@ -108,7 +107,6 @@ add_library(ninfer_ops STATIC
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu
   ops/launcher/sigmoid_gate_mul.cu
-  ops/launcher/sigmoid_a4.cu
   ops/launcher/silu_and_mul.cu
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
@@ -283,7 +281,6 @@ add_library(ninfer_ops STATIC
   ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
-  ops/wrapper/rmsnorm_a4.cpp
   ops/wrapper/residual_rmsnorm.cpp
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp

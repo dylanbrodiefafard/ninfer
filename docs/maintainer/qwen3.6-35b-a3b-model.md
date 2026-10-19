@@ -294,8 +294,8 @@ Only concatenated Q/K/V passes through a depthwise causal width-4 convolution fo
 Z, A, and B do not pass through the convolution. The convolved Q and K are L2-normalized per head
 with epsilon `1e-6`; GDN consumes no position ids and applies no RoPE. The production GDN Op always
 receives raw BF16 q/k. Its recurrent implementation retains normalized values in FP32 registers;
-when it selects the chunked implementation, it privately materializes normalized BF16 q/k for the
-chunked body and recurrent tail.
+when it selects the chunked implementation (T >= 60, the last chunk possibly partial), it privately
+materializes normalized FP16 q/k for it.
 
 The decay and update controls `g` and `beta` are observable FP32 values. Their logical formula for
 every V head is:

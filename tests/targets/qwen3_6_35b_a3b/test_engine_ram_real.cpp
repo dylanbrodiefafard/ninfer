@@ -40,6 +40,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.max_concurrency       = 1;
     options.prefill_chunk         = 1024;
+    options.mixed_forward         = 0;
     options.kv_ram_capacity_bytes = kRamHitBytes;
     options.kv_cache              = ninfer::KvCacheStorage::Int8Group64;
     options.enable_vision         = false;

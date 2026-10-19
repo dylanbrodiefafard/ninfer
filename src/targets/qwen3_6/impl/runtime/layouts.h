@@ -63,8 +63,10 @@ struct WorkspacePlan {
     std::size_t mtp_round      = 0;
     std::size_t dflash_context = 0;
     std::size_t dflash_round   = 0;
-    std::size_t vision_encode  = 0;
-    std::size_t capacity       = 0;
+    // A DFlash round whose verify forward also runs a prefill owner's mixed-forward chunk.
+    std::size_t dflash_mixed  = 0;
+    std::size_t vision_encode = 0;
+    std::size_t capacity      = 0;
 };
 
 struct SequencePlanningInputs {
@@ -72,6 +74,7 @@ struct SequencePlanningInputs {
     std::uint32_t capacity            = 0;
     std::uint32_t max_concurrency     = 1;
     std::uint32_t prefill_chunk       = 0;
+    std::uint32_t mixed_forward       = 0;
     std::uint32_t draft_window        = 0;
     std::uint32_t dflash_verify_width = 0;
     bool adaptive_draft               = false;
@@ -109,6 +112,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t main_page_groups = 0;
     std::uint32_t max_concurrency  = 1;
     std::uint32_t prefill_chunk    = 0;
+    std::uint32_t mixed_forward    = 0;
     std::uint32_t draft_window     = 0;
     // Widest captured DFlash verify width (storage, ReplaySSM records, pending features).
     std::uint32_t dflash_verify_width = 0;

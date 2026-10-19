@@ -419,6 +419,7 @@ int main(int argc, char** argv) {
         engine_options.kv_disk_compress         = cli.kv_disk_compress;
         engine_options.context_checkpoint_marks = cli.context_checkpoint_marks;
         engine_options.prefill_chunk            = cli.prefill_chunk;
+        engine_options.mixed_forward            = 0;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.sage_attn                = cli.sage_attn;
         engine_options.keep_frac                = cli.keep_frac;

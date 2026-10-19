@@ -31,6 +31,7 @@ ninfer::EngineOptions base_engine_options(const char* artifact) {
     options.max_context   = 512;
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(512);
     options.prefill_chunk = 128;
+    options.mixed_forward = 0;
     options.kv_cache      = ninfer::KvCacheStorage::Nvfp4;
     if (std::getenv("NINFER_DFLASH_TEST_BF16_KV") != nullptr) {
         options.kv_cache = ninfer::KvCacheStorage::BFloat16;
@@ -119,6 +120,7 @@ ninfer::EngineOptions chat_dflash_options(const char* artifact) {
     options.max_context   = 2048;
     options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(2048);
     options.prefill_chunk = 512;
+    options.mixed_forward = 0;
     return options;
 }
 

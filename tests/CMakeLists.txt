@@ -262,6 +262,11 @@ ninfer_add_test(ninfer_qwen3_6_27b_dflash_cache_cancel_real_test
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_dflash_cache_cancel_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 900)
+ninfer_add_test(ninfer_qwen3_8_27b_mixed_forward_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_mixed_forward_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_mixed_forward_real_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 900)
 ninfer_add_test(ninfer_qwen3_6_27b_disk_real_test
   SOURCES targets/qwen3_6_27b/test_engine_disk_real.cpp
   LIBRARIES ninfer_engine CUDA::cudart)
@@ -410,6 +415,7 @@ target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DI
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
+  a4_activation
   a8_activation
   add_bias
   gelu
@@ -449,9 +455,6 @@ endforeach()
 # is one checkpoint/device.
 ninfer_add_op_test(ninfer_gqa_attention_test
   SOURCES ops/test_gqa_attention.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_a4_activation_test
-  SOURCES ops/test_a4_activation.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_sanitizer_cases(ninfer_a4_activation_test)
 ninfer_add_op_test(ninfer_gqa_xattn_sort_test

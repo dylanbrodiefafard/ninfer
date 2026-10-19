@@ -42,6 +42,7 @@ int exercise(const char* artifact, ninfer::SpeculativeBackend backend) {
     options.max_context               = 1024;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(3072);
     options.prefill_chunk             = 128;
+    options.mixed_forward             = 0;
     options.max_concurrency           = 3;
     options.kv_cache                  = ninfer::KvCacheStorage::Nvfp4;
     options.speculative.backend       = backend;

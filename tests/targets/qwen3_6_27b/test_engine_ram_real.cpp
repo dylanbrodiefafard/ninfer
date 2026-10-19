@@ -94,6 +94,7 @@ ninfer::EngineOptions ordinary_options(const char* artifact, std::uint32_t max_c
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
     options.max_concurrency       = max_concurrency;
     options.prefill_chunk         = prefill_chunk;
+    options.mixed_forward         = 0;
     options.kv_ram_capacity_bytes = ram_bytes;
     options.kv_cache              = ninfer::KvCacheStorage::Int8Group64;
     options.enable_vision         = false;

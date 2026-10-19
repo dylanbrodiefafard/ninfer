@@ -3,10 +3,8 @@
 // See docs/op-development.md §2.
 #include "ninfer/ops/sigmoid_mul.h"
 
-#include "ops/common/a8_activation_check.h"
 #include "ops/common/a4_activation_check.h"
-#include "ops/launcher/sigmoid_a4.h"
-#include <array>
+#include "ops/common/a8_activation_check.h"
 #include "ops/launcher/sigmoid_gate_mul.h"
 
 #include <cstdint>
@@ -73,36 +71,23 @@ void sigmoid_mul_a8(const Tensor& gate, const Tensor& x, A8Activation& activatio
     detail::sigmoid_gate_mul_a8_launch(gate, x, activation, stream);
 }
 
-void sigmoid_mul_a4(const Tensor& gate, const Tensor& x, Tensor* normalized,
-                    A4Activation& activation, cudaStream_t stream) {
-    detail::validate_a4_activation(activation);
-    const auto matrix = [&](const Tensor& t) {
-        return t.dtype == DType::BF16 && t.ne[0] == 6144 && t.ne[1] == activation.tokens &&
-               t.ne[2] == 1 && t.ne[3] == 1 && t.is_contiguous() && t.data != nullptr &&
+void sigmoid_mul_a4(const Tensor& gate, const Tensor& x, A4Activation& activation,
+                    cudaStream_t stream) {
+    constexpr std::int32_t kRows = 6144;
+    const std::int32_t tokens    = x.ne[1];
+    const auto valid             = [&](const Tensor& t) {
+        return t.dtype == DType::BF16 && t.ne[0] == kRows && t.ne[1] == tokens && t.ne[2] == 1 &&
+               t.ne[3] == 1 && t.is_contiguous() && t.data != nullptr &&
                (reinterpret_cast<std::uintptr_t>(t.data) % 16) == 0;
     };
-    if (activation.rows != 6144 || !matrix(gate) || !matrix(x) ||
-        (normalized != nullptr && !matrix(*normalized))) {
-        throw std::invalid_argument("sigmoid_mul_a4: requires BF16 and A4 [6144,T]");
+    if (tokens <= 0 || !valid(gate) || !valid(x)) {
+        throw std::invalid_argument(
+            "sigmoid_mul_a4: gate/x must be aligned contiguous BF16 [6144,T] with T>0");
     }
-    detail::require_disjoint(gate.data, gate.bytes(), x.data, x.bytes());
-    const std::array<DeviceSpan, 3> outputs{
-        activation.codes,
-        activation.scales,
-        normalized != nullptr ? DeviceSpan{normalized->data, normalized->bytes()} : DeviceSpan{},
-    };
-    for (std::size_t i = 0; i < outputs.size(); ++i) {
-        if (outputs[i].data == nullptr) { continue; }
-        detail::require_disjoint(x.data, x.bytes(), outputs[i].data, outputs[i].bytes);
-        detail::require_disjoint(gate.data, gate.bytes(), outputs[i].data, outputs[i].bytes);
-        for (std::size_t j = i + 1; j < outputs.size(); ++j) {
-            if (outputs[j].data != nullptr) {
-                detail::require_disjoint(outputs[i].data, outputs[i].bytes, outputs[j].data,
-                                         outputs[j].bytes);
-            }
-        }
+    if (detail::validate_a4_activation(activation, kRows, "sigmoid_mul_a4") != tokens) {
+        throw std::invalid_argument("sigmoid_mul_a4: activation must be [6144,T]");
     }
-    detail::sigmoid_mul_a4_launch(gate, x, normalized, activation, stream);
+    detail::sigmoid_gate_mul_a4_launch(gate, x, activation, stream);
 }
 
 } // namespace ninfer::ops

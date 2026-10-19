@@ -30,19 +30,24 @@ struct workspace_layout {
     std::size_t total_bytes = 0;
 };
 
+// Every region spans whole chunks: a partial last chunk's padding rows hold the zero W/U/v_new
+// rows and the flat g_cumsum values the stages write for them.
 inline workspace_layout compute_workspace_layout(std::int32_t value_heads, std::int32_t tokens,
                                                  DType private_dtype = DType::BF16) {
-    const std::int32_t chunks = tokens / kChunkSize;
+    const std::int32_t chunks        = (tokens + kChunkSize - 1) / kChunkSize;
+    const std::int32_t padded_tokens = chunks * kChunkSize;
     LayoutBuilder builder;
     workspace_layout w{};
     w.g_cumsum =
-        builder.add_tensor(DType::FP32, {value_heads, tokens}, kWorkspaceAlign, "g_cumsum");
-    w.W = builder.add_tensor(private_dtype, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "W");
-    w.U = builder.add_tensor(private_dtype, {kStateDim, value_heads, tokens}, kWorkspaceAlign, "U");
-    w.v_new   = builder.add_tensor(private_dtype, {kStateDim, value_heads, tokens}, kWorkspaceAlign,
-                                   "v_new");
-    w.h_chunk = builder.add_tensor(private_dtype, {kStateDim, kStateDim, value_heads, chunks},
-                                   kWorkspaceAlign, "h_chunk");
+        builder.add_tensor(DType::FP32, {value_heads, padded_tokens}, kWorkspaceAlign, "g_cumsum");
+    w.W           = builder.add_tensor(private_dtype, {kStateDim, value_heads, padded_tokens},
+                                       kWorkspaceAlign, "W");
+    w.U           = builder.add_tensor(private_dtype, {kStateDim, value_heads, padded_tokens},
+                                       kWorkspaceAlign, "U");
+    w.v_new       = builder.add_tensor(private_dtype, {kStateDim, value_heads, padded_tokens},
+                                       kWorkspaceAlign, "v_new");
+    w.h_chunk     = builder.add_tensor(private_dtype, {kStateDim, kStateDim, value_heads, chunks},
+                                       kWorkspaceAlign, "h_chunk");
     w.total_bytes = builder.finish(kWorkspaceAlign, "Gated DeltaNet chunk workspace");
     return w;
 }
@@ -116,17 +121,6 @@ struct stage_validator {
     cudaError_t check_shape() const {
         if (T <= 0 || !are_head_counts_valid(H_qk, H_v)) {
             std::fprintf(stderr, "%s: invalid shape (H_qk=%d H_v=%d T=%d)\n", name, H_qk, H_v, T);
-            return cudaErrorInvalidValue;
-        }
-        return cudaSuccess;
-    }
-
-    cudaError_t check_full_chunks() const {
-        if ((T % kChunkSize) != 0) {
-            std::fprintf(stderr,
-                         "%s: Gated DeltaNet chunked path requires T to be a multiple of %d; "
-                         "route tail tokens through AR instead (T=%lld)\n",
-                         name, kChunkSize, static_cast<long long>(T));
             return cudaErrorInvalidValue;
         }
         return cudaSuccess;

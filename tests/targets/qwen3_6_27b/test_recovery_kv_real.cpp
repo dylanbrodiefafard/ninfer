@@ -204,11 +204,12 @@ std::vector<ninfer::TokenId> decode_rounds(execution::ProgramImplCore& program, 
 PrefillRun finish_prefill(execution::ProgramImplCore& program, family::PreparedPromptData prompt,
                           execution::RequestPlan plan) {
     PrefillRun run;
-    auto step     = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {});
+    auto step     = program.start_prefill_lane(0, std::move(prompt), std::move(plan), {},
+                                               ninfer::runtime::PrefillPace::Exclusive);
     run.summary   = step.summary;
     run.processed = step.processed_prompt_tokens;
     while (!step.complete) {
-        step = program.advance_prefill_lane(0);
+        step = program.advance_prefill_lane(0, ninfer::runtime::PrefillPace::Exclusive);
         run.processed += step.processed_prompt_tokens;
     }
     require(!step.round.tokens.empty(), "prefill completed without a sampled token");
@@ -361,6 +362,7 @@ void exercise(const char* artifact, ninfer::SpeculativeBackend backend, bool for
     options.max_concurrency       = 2;
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk         = 1024;
+    options.mixed_forward         = 0;
     options.kv_cache              = ninfer::KvCacheStorage::Nvfp4;
     options.kv_ram_capacity_bytes = kRamBytes;
     options.enable_vision         = false;

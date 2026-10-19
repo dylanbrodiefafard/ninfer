@@ -856,6 +856,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `300000` |
 | `--prefill-chunk N` | text-prefill chunk | `4096` |
+| `--mixed-forward N` | prefill step width while other requests decode: the prefilling request advances at most `N` tokens per step and yields `--mixed-forward-rounds` decode rounds between steps; a multiple of `256`, at most `--prefill-chunk` and `4096`; `0` prefills the whole prompt first | `4096` |
+| `--mixed-forward-rounds N` | decode rounds between shared prefill steps | `12` |
+| `--mixed-forward-min-tokens N` | remaining uncached suffix threshold for shared pacing; smaller suffixes finish prefill-first; `0` applies the fixed cadence to every suffix and disables short-prefill interruption | `4096` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
@@ -890,6 +893,78 @@ curl http://127.0.0.1:8080/v1/models \
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
 | `--no-p-less-sampling` | opt out of p-less and use top-p/top-k/min-p/penalties | p-less on |
+
+Mixed prefill defaults to `--mixed-forward 4096 --mixed-forward-rounds 12
+--mixed-forward-min-tokens 4096`. Remaining uncached suffixes below 4,096 tokens finish
+prefill-first. At or above 4,096, the owner advances by up to 4,096 tokens per twelve decode
+rounds while other requests are ready. The decision uses the selected lane's actual reuse
+frontier and is reevaluated after every chunk, including checkpoint splits. With no ready
+decoders, prefill runs uninterrupted.
+
+With DFlash, eligible shared steps run alongside target verification; initial admission
+prefill remains separate. Other backends yield separate decode rounds between shared steps.
+The cadence is not a fixed fraction of GPU time or accepted tokens. These are startup
+options, not per-request API fields. Concurrency and speculation remain independent options.
+
+At a completed chunk boundary, an eligible queued text suffix below the threshold may run
+before a large owner continues, provided a spare lane and all required resources already fit.
+Both requests retain independent lane/KV/GDN state. This path does not evict retained state,
+restore a host prefix, offload an active request, or borrow a vision/transient lease. Resident
+reuse on the spare lane is eligible; disposable cached-source forks use ordinary admission.
+Only one short prefill may interrupt before the large owner advances another nonzero chunk.
+Only an eligible FIFO queue head can take this shortcut, subject to existing decode-debt
+limits; later short requests cannot bypass an earlier waiting request. Without a usable spare lane, the current owner continues.
+
+The historical fixed W4096/rounds1 configuration scored **1.0148** on RTX 5090 with three decode lanes plus one
+8,192-token prefill owner, NVFP4 KV, adaptive DFlash k=5, and the optimized proposal head.
+The full lane/width score, accepted decode throughput, TTFT, and round-spacing tables are in
+`docs/performance.md`, “Qualified mixed-execution frontier on the merged runtime (2026-10-15)”.
+This is a measured combined-efficiency score for that workload, not a guaranteed speedup or
+preservation of standalone decode speed. A matched confirmation after the October 18
+experimental integration scores **1.0166** for the same configuration; its evidence is
+recorded alongside the historical tables.
+These fixed-cadence scores do not describe the remaining-work default, which finishes small
+checkpoint tails exclusively. Its functional latency comparison is in `docs/performance.md`,
+“Remaining-work policy and spare-lane interruption (2026-10-19)”.
+
+To change the prefill/decode ratio:
+
+- Keep `--mixed-forward 4096 --mixed-forward-rounds 12 --mixed-forward-min-tokens 4096`
+  for size-dependent scheduling.
+- Use `--mixed-forward-min-tokens 0` to apply an explicit fixed cadence at every suffix size;
+  `--mixed-forward 4096 --mixed-forward-rounds 1 --mixed-forward-min-tokens 0` reproduces
+  the historical throughput-oriented configuration.
+- Use `--mixed-forward 2048 --mixed-forward-rounds 1 --mixed-forward-min-tokens 0`
+  for more frequent decode progress than the historical W4096/rounds1 configuration,
+  or width `1024` for shorter gaps at a larger prefill cost; consult the measured tables.
+- Set `--mixed-forward-rounds` to `2` or `3` for intermediate decode progress with faster
+  prefill completion than rounds12. Cached-chat rounds2/rounds3 measurements and their prefill-rate, TTFT and
+  decode-gap tradeoffs are in `docs/performance.md`,
+  “Rounds2/rounds3 effective-prefill comparison (2026-10-18)”. Higher decode-progress
+  settings `6` and `9`, including matched decode-only fractions and prefill costs, are in
+  “Rounds6/rounds9 decode-share comparison (2026-10-18)” in the same reference. The
+  rounds `12` follow-up at one/three/five decode lanes is in
+  “Rounds12 decode-share comparison (2026-10-18)”.
+  These measurements qualify fixed cadences at the recorded sizes; they do not establish
+  an optimal switching threshold. Set `--mixed-forward-min-tokens 0` when reproducing those
+  fixed-cadence tables, including their small checkpoint tails.
+- Use `--mixed-forward 0` to finish the owner's prefill before resuming decode.
+
+A positive mixed width must be a multiple of 256 and no larger than either
+`--prefill-chunk` or 4096. When lowering `--prefill-chunk` below 4096, also set a compatible
+`--mixed-forward` width, or `0` for prefill-first execution. A 128-token prefill chunk requires
+`--mixed-forward 0`.
+
+For the measured three-decode-lane setup:
+
+```bash
+./build/apps/ninfer-serve /path/to/qwen3_8_27b_nvfp4_dflash_nvfp4.ninfer \
+  --max-concurrency 4 --max-context 16384 --kv-capacity auto --kv-dtype nvfp4 \
+  --spec dflash --draft-tokens 5 --adaptive-draft --lm-head-draft \
+  --prefill-chunk 4096 --mixed-forward 4096 --mixed-forward-rounds 12 \
+  --mixed-forward-min-tokens 4096
+```
+
 
 With p-less disabled, Engine selects sampling defaults from the loaded model and the request's
 resolved thinking mode.

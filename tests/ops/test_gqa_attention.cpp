@@ -4258,13 +4258,16 @@ int run_batch_cases(bool full) {
                        {6, {9000, 12000}, {6, 3}, {1, 0}, MappingPattern::Fragmented, 508u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
-    // Masked B=1 context-split prompts: the merge writes the invalid tail, including a fully
-    // invalid final 128-row block.
+    // Masked B=1 context-split prompts require the merge to zero every invalid output column.
     failures += run_batch_case(kGeometries[0], DType::U8,
                                {128, {4000}, {77}, {0}, MappingPattern::Identity, 509u});
-    // A non-split prompt CTA must also zero the invalid part of its own tile.
-    failures += run_batch_case(kGeometries[0], DType::U8,
-                               {129, {63}, {77}, {0}, MappingPattern::Fragmented, 1111u});
+    // Both non-split schedules zero invalid columns, including complete invalid query tiles.
+    for (const int width : {129, 257}) {
+        const int context = width == 129 ? 63 : 256;
+        failures +=
+            run_batch_case(kGeometries[0], DType::U8,
+                           {width, {context}, {77}, {0}, MappingPattern::Fragmented, 1111u}, true);
+    }
     failures += run_batch_case(kGeometries[1], DType::U8,
                                {300, {1800}, {211}, {0}, MappingPattern::Fragmented, 510u});
     // 27B DFlash k=6/7 verify batches (W=7/8) on the small-T route, with masked short rows.
@@ -4388,9 +4391,16 @@ int run_geometry(const Geometry& geometry, bool full) {
                 failures +=
                     run_a1_case(geometry, dtype, {128, 64, 256, 212u}, MappingPattern::Fragmented);
             }
+            // Both schedules cover fragmented pages and partial rows at the width boundary.
+            for (const int width : {255, 256, 257}) {
+                failures += run_a1_case(geometry, dtype, {width, 64, 512, 230u},
+                                        MappingPattern::Fragmented);
+                failures += run_a1_case(geometry, dtype, {width, 2048 - width, 2048, 231u},
+                                        MappingPattern::Fragmented);
+            }
             // Short appends to long histories. Six-row chunks past W=16 (27B: W=18 at 8K keys),
-            // then the context-split dense prompt (2..8 splits): one partial 128-row block, a
-            // full fragmented block, a partial final block, and a three-block chunk.
+            // then context-split dense prompts (2..8 splits) with full and partial query tiles
+            // and fragmented pages.
             failures +=
                 run_a1_case(geometry, dtype, {7, 4089, 4096, 220u}, MappingPattern::Identity);
             failures +=

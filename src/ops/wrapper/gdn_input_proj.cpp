@@ -1,6 +1,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "core/layout.h"
+#include "ops/common/a4_activation_check.h"
 #include "ops/common/a8_activation_check.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
@@ -856,6 +857,39 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     cudaStream_t stream) {
     dispatch_single_parent(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only, nullptr,
                            stream);
+}
+
+void gdn_input_proj(const A4Activation& x, const Weight& query_key_value_z_weight, Tensor& qkv,
+                    Tensor& z, cudaStream_t stream) {
+    constexpr std::int32_t kHidden  = 5120;
+    constexpr std::int32_t kQkvRows = 10240;
+    constexpr std::int32_t kZRows   = 6144;
+    const Weight& weight            = query_key_value_z_weight;
+    const std::int32_t cols         = detail::validate_a4_activation(x, kHidden, "gdn_input_proj");
+    if (cols < kA4GdnInputMinTokens) {
+        throw std::invalid_argument("gdn_input_proj: A4 activation must be [5120,T] with T >= 3");
+    }
+    if (weight.qtype != QType::NVFP4) {
+        throw std::invalid_argument("gdn_input_proj: an A4 activation requires an NVFP4 weight");
+    }
+    detail::validate_nvfp4_weight(weight, "nvfp4 gdn_input_proj");
+    if (weight.n != kQkvRows + kZRows || weight.k != kHidden) {
+        throw std::invalid_argument("nvfp4 gdn_input_proj: unsupported weight shape");
+    }
+    if (x.input_scale_divisor != weight.input_scale_divisor) {
+        throw std::invalid_argument(
+            "gdn_input_proj: A4 activation input scale divisor differs from the weight's");
+    }
+    require_matrix(qkv, kQkvRows, cols, "qkv");
+    require_matrix(z, kZRows, cols, "z");
+    if (overlaps(qkv, z) || overlaps(x.codes, qkv) || overlaps(x.codes, z) ||
+        overlaps(x.scales, qkv) || overlaps(x.scales, z)) {
+        throw std::invalid_argument("gdn_input_proj: the activation, qkv, and z must not overlap");
+    }
+    detail::nvfp4_gdn_input_w4a4_project(
+        weight, cols,
+        {static_cast<std::uint8_t*>(x.codes.data), static_cast<std::uint8_t*>(x.scales.data)}, qkv,
+        z, stream);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(

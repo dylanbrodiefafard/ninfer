@@ -2,7 +2,6 @@
 #include "ninfer/ops/grouped_dynamic_conv.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/residual_add.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/sanitizer_scope.h"

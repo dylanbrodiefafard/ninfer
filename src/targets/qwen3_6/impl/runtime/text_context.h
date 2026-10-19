@@ -149,15 +149,24 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+// A mixed DFlash round runs a prefill owner and verify batch on separate TextContexts.
+// The owner invokes its partner after submitting each layer; the partner submits the matching
+// verify layer and joins both streams before either forward advances to the next layer.
+using LayerPartner      = std::function<void(int layer)>;
+using MixedOwnerForward = std::function<void(const LayerPartner& partner)>;
+
 class TextContext {
 public:
+    // An explicit execution stream borrows startup-owned mixed resources and is used only
+    // with a layer partner; the caller joins it before primary-stream publication or cleanup.
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                cudaStream_t execution_stream              = nullptr);
     ~TextContext() = default;
 
     TextContext(const TextContext&)            = delete;
@@ -215,6 +224,12 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // The text chunk as a mixed-round owner: `partner` runs after each layer. The chunk leaves the
+    // workspace unreset, does not synchronize, and does not consume the sink; the round calls
+    // sink.consume_prefill_chunk(processed_tokens) once the partner forward is resolved.
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
+                  bool finalize_at_end, DFlashFeatureSink& sink, const LayerPartner& partner);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -249,7 +264,8 @@ public:
                              const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                              ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
                              Tensor& target_tokens, DFlashFeatureSink& sink,
-                             bool reset_workspace = true, cudaEvent_t sampling_ready = nullptr);
+                             bool reset_workspace = true, cudaEvent_t sampling_ready = nullptr,
+                             const MixedOwnerForward* owner = nullptr);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
@@ -274,16 +290,19 @@ private:
     void attn_mix(const FullLayerW& weights, Tensor& x, int full_index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+    template <class Tap>
+    void run_layer(int layer, Tensor& x, Phase phase, Tap& tap);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
-    void run_layers(Tensor& x, Phase phase, Tap& tap);
+    void run_layers(Tensor& x, Phase phase, Tap& tap, const LayerPartner* partner = nullptr);
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap,
-                                  bool reset_workspace, cudaEvent_t sampling_ready);
+                                  bool reset_workspace, cudaEvent_t sampling_ready,
+                                  const MixedOwnerForward* owner);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
@@ -315,8 +334,10 @@ private:
     template <class Tap>
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
-                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+                 const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end,
+                 const LayerPartner* partner = nullptr);
     DeviceContext& ctx_;
+    cudaStream_t stream_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
     qwen3_6::PagedKVCacheView kv_;

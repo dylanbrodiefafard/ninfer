@@ -113,6 +113,7 @@ void exercise(const char* artifact, std::uint32_t concurrency, bool disk_enabled
     options.max_context           = 256;
     options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(concurrency * 256);
     options.prefill_chunk         = 128;
+    options.mixed_forward         = 0;
     options.kv_ram_capacity_bytes = kRamBytes;
     options.enable_vision         = false;
     options.speculative.backend   = backend;

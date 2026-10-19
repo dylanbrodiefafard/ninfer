@@ -79,10 +79,15 @@ the k-dependent default, or use explicit `--dflash-verify-width`). MTP execution
 `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is enabled by default. `--concurrency 2` is the
 batched-decode check: two Engine lanes, not HTTP.
 
-`--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
-and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
-`cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
-load, graph construction, and warmup do not enter topology counts.
+`--profile-measured` is a benchmark-only profiler boundary. For ordinary tests it requires
+exactly one selected test and `-r 1`, synchronizes after warmup, and brackets the measured
+repetition with `cudaProfilerStart/Stop`. With `--contention` it brackets the owner job window,
+excluding model loading and the decode-only calibration windows. Background decode remains
+live, so a decode round may straddle a capture boundary; use launch-correlated NVTX ranges to
+attribute mixed work. Use an Nsight Systems `cudaProfilerApi` capture range. On the installed
+profiler, stopping collection while background decode remains live can abort the application;
+`--capture-range-end=none` keeps collection active until process exit. In that mode, exclude the
+subsequent calibration and shutdown work when analyzing the owner window.
 
 ## Linear Op benchmark
 
@@ -264,9 +269,9 @@ Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and opti
 prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
 interval.
 
-`--running` measures the public running-state entry across recurrent-only, complete 64-token
-chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the snapshot entry over the
-production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+`--running` measures the public running-state entry across its recurrent route (T < 60) and
+its chunked route, whose last 64-token chunk may be partial. `--snapshot` measures the snapshot
+entry over the production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
 `--chunked-only` measures the complete pre-normalized BF16 pipeline through the public Op. Adding
 `--breakdown` reports isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings. These
 three intrinsic algorithm stages are the benchmark's sole private-launcher exception; the complete

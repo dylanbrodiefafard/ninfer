@@ -79,8 +79,11 @@ and enable adaptive DFlash2 K7 with the optimized proposal head when that compan
 base artifacts run without speculation. MTP execution is disabled; stored MTP tensors remain
 artifact-validation inputs only. NVFP4 KV is the recommended cache format. The workload is one
 GPU, one resident model instance, and a startup-fixed one to six active requests. The
-Engine forms one compact decode batch per round boundary with bounded FIFO ingress and no
-preemption. Large-scale or preemptive continuous batching, priority/QoS scheduling, additional
+Engine forms one compact decode batch per round boundary with bounded FIFO ingress. A short
+text prefill may interrupt a large prefill at a completed chunk boundary only on a genuinely
+available spare lane with its own feasible resources; the suspended owner retains its lane
+and state and must advance another chunk before another interruption. General preemptive
+continuous batching, priority/QoS scheduling, additional
 checkpoint targets, and retargeting to another execution platform are outside the current
 product. Per-request `cache_write: false` supports disposable turns that fork coherent cached
 state into independent allocations, preserve the original through initialization, suppress reuse

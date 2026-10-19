@@ -1,6 +1,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include "ops/common/a4_activation_check.h"
 #include "ops/common/a8_activation_check.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
@@ -147,12 +148,16 @@ void require_h_activation(const A8Activation* h_activation, const Tensor& h, con
 
 void norm_gating_27(const Tensor& x, const Tensor& norm_weight, float eps, const Weight& a_weight,
                     const Weight& b_weight, const Tensor& A_log, const Tensor& dt_bias,
-                    WorkspaceArena& ws, Tensor& h, A8Activation* h_activation, Tensor& g,
-                    Tensor& beta, cudaStream_t stream) {
+                    WorkspaceArena& ws, Tensor& h, detail::Bf16GdnHiddenActivation h_activation,
+                    Tensor& g, Tensor& beta, cudaStream_t stream) {
     constexpr const char* op = "gdn_norm_gating_proj";
     validate_norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, h, g, beta,
                             op);
-    require_h_activation(h_activation, h, op);
+    require_h_activation(h_activation.a8, h, op);
+    if (h_activation.a4 != nullptr &&
+        detail::validate_a4_activation(*h_activation.a4, 5120, op) != h.ne[1]) {
+        throw std::invalid_argument(std::string(op) + ": h A4 activation must be [5120,T]");
+    }
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, h_activation, a_weight, b_weight,
                                           A_log, dt_bias, ws, g, beta, stream);
 }
@@ -192,8 +197,8 @@ void norm_gating_27_packed(const Tensor& x, const Tensor& norm_weight, float eps
         }
         norm_gating_27(x.slice(1, offset, sequence_width), norm_weight, eps, a_weight, b_weight,
                        A_log, dt_bias, ws, h_panel,
-                       h_activation != nullptr ? &activation_panel : nullptr, g_panel, beta_panel,
-                       stream);
+                       {h_activation != nullptr ? &activation_panel : nullptr, nullptr}, g_panel,
+                       beta_panel, stream);
     }
 }
 
@@ -203,7 +208,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h, Tensor& g,
                           Tensor& beta, cudaStream_t stream) {
-    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h, nullptr, g, beta,
+    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h, {}, g, beta,
                    stream);
 }
 
@@ -212,8 +217,17 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
                           A8Activation& h_activation, Tensor& g, Tensor& beta,
                           cudaStream_t stream) {
-    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h, &h_activation, g,
-                   beta, stream);
+    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h,
+                   {&h_activation, nullptr}, g, beta, stream);
+}
+
+void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
+                          const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                          const Tensor& dt_bias, WorkspaceArena& ws, Tensor& h,
+                          A4Activation& h_activation, Tensor& g, Tensor& beta,
+                          cudaStream_t stream) {
+    norm_gating_27(x, norm_weight, eps, a_weight, b_weight, A_log, dt_bias, ws, h,
+                   {nullptr, &h_activation}, g, beta, stream);
 }
 
 void gdn_norm_gating_proj_packed_sequences(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -255,8 +269,8 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, 32);
     const Weight b_weight = bf16_row_view(ab_weight, 32, 32);
-    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, nullptr, a_weight, b_weight,
-                                          A_log, dt_bias, ws, g, beta, stream);
+    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, {}, a_weight, b_weight, A_log,
+                                          dt_bias, ws, g, beta, stream);
 }
 
 } // namespace ninfer::ops

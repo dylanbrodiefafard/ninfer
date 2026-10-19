@@ -41,6 +41,23 @@ void rmsnorm_a8(const Tensor& x, const Tensor& weight, float eps, Tensor* normal
                 A8Activation& activation, cudaStream_t stream);
 
 /**
+ * Unit-offset RMSNorm over D=5120 that publishes its output as an NVFP4 activation
+ * (ninfer/ops/a4_activation.h) for a weight with activation.input_scale_divisor: the activation
+ * encodes BF16(ideal) column by column, where `ideal` is rmsnorm's with unit_offset = true, so it
+ * is bit-identical to rmsnorm followed by the W4A4 projections' quantizer. When `normalized` is
+ * non-null the same BF16 values are also written there, bit-identical to
+ * rmsnorm(x, weight, eps, true, *normalized).
+ *
+ * x is contiguous 16-byte aligned BF16 [5120,T] with T >= 1 (no further dimensions), weight
+ * contiguous BF16 [5120], `normalized` (optional) has x's shape and is 16-byte aligned, and
+ * `activation` is an A4 activation of [5120,T]. No input overlaps an output. The codes/scales are
+ * checked exactly against the A4 codec of rmsnorm's BF16 output. Invalid arguments throw
+ * std::invalid_argument. No workspace.
+ */
+void rmsnorm_a4(const Tensor& x, const Tensor& weight, float eps, Tensor* normalized,
+                A4Activation& activation, cudaStream_t stream);
+
+/**
  * Applies two independent offset RMS normalizations. For panel p in {0,1}, row r, and d:
  *
  *   inv_p[r] = 1 / sqrt(sum_j x_p[j,r]^2 / 5120 + eps)
@@ -62,17 +79,5 @@ void rmsnorm_a8(const Tensor& x, const Tensor& weight, float eps, Tensor* normal
 void dual_offset_rmsnorm(const Tensor& x0, const Tensor& weight0, const Tensor& x1,
                          const Tensor& weight1, float eps, Tensor& out0, Tensor& out1,
                          cudaStream_t stream);
-
-/**
- * Unit-offset RMSNorm publishing the A4 codec of its explicitly BF16-rounded logical output.
- * The route admits contiguous BF16 x[5120,T], weight[5120], eps positive finite,
- * and tiled activation[5120,T]. Optional normalized publishes the same BF16 values.
- * Inputs and all outputs must be disjoint; x/normalized are 16-byte aligned, weight 4-byte.
- * No allocation, workspace or persistent state. Invalid arguments throw before submission.
- * The independent primary oracle evaluates FP64 RMS, rounds to BF16, independently encodes
- * G16, then decodes that value; private normalization association may differ at cast ties.
- */
-void rmsnorm_a4(const Tensor& x, const Tensor& weight, float eps, Tensor* normalized,
-                A4Activation& activation, cudaStream_t stream);
 
 } // namespace ninfer::ops

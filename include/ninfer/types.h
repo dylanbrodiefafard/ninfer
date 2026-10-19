@@ -151,8 +151,17 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 300000;
     std::uint32_t prefill_chunk        = 4096;
-    std::size_t kv_ram_capacity_bytes  = 0;
-    std::size_t kv_disk_capacity_bytes = 0;
+    // Shared prefill step width: a multiple of 256, at most min(prefill_chunk, 4096).
+    // Zero runs prefill-first. Otherwise remaining suffixes below mixed_forward_min_tokens
+    // run exclusively; larger suffixes advance after mixed_forward_rounds decode rounds.
+    // The threshold is evaluated after each chunk from the selected lane's actual frontier.
+    // Zero threshold applies the configured cadence to every suffix and disables short-job
+    // interruption. Eligible short text requests may interrupt a large owner on a spare lane.
+    std::uint32_t mixed_forward            = 4096;
+    std::uint32_t mixed_forward_rounds     = 12;
+    std::uint32_t mixed_forward_min_tokens = 4096;
+    std::size_t kv_ram_capacity_bytes      = 0;
+    std::size_t kv_disk_capacity_bytes     = 0;
     std::filesystem::path kv_disk_location;
     KvDiskCompress kv_disk_compress = KvDiskCompress::Off;
     // Filled from the loaded artifact at Engine construction for the KV-disk fingerprint.
@@ -791,8 +800,10 @@ struct RuntimeStats {
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
-    std::uint64_t decode_rounds         = 0;
-    std::uint64_t decode_row_rounds     = 0;
+    std::uint64_t decode_rounds     = 0;
+    std::uint64_t decode_row_rounds = 0;
+    // Decode rounds that also evaluate a prefill owner in the target forward.
+    std::uint64_t mixed_decode_rounds   = 0;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;

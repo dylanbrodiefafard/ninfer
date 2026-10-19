@@ -239,10 +239,11 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
                          qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
-                         const qwen3_6::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv), state_(state), io_(io),
-      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
+                         const qwen3_6::PagedKVCache* batch_mtp_kv, cudaStream_t execution_stream)
+    : ctx_(ctx), stream_(execution_stream != nullptr ? execution_stream : ctx.stream),
+      weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), batch_text_kv_(batch_text_kv),
+      batch_mtp_kv_(batch_mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
+      prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -347,7 +348,7 @@ const MtpW& TextContext::mtp_weights() const {
 
 void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
                                    const Tensor* input_embeddings, Tensor& x, Tensor& ah) {
-    cudaStream_t s     = ctx_.stream;
+    cudaStream_t s     = stream_;
     const int T        = ids.ne[0] * ids.ne[1];
     Tensor flat_ids    = ids.view({T});
     Tensor flat_hidden = hidden.view({kCfg.hidden, T});
@@ -387,7 +388,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden) {
-    cudaStream_t s = ctx_.stream;
+    cudaStream_t s = stream_;
     const int T    = x.ne[1];
 
     const auto projection = workspace_recipe::mtp_attention_projection<TextConfig>(work_, T);
@@ -492,7 +493,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
     }
 
-    cudaStream_t s     = ctx_.stream;
+    cudaStream_t s     = stream_;
     auto scratch_scope = work_.scope();
     Tensor x_last;
     Tensor ah_last;
@@ -580,14 +581,14 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_tensor_window(logits, DType::BF16, kCfg.vocab, T, "proposal logits");
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
-        ops::linear(hidden, *proposal_head_, proposal_logits, ctx_.stream);
-        ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
+        ops::linear(hidden, *proposal_head_, proposal_logits, stream_);
+        ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, stream_);
         ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
-                                      ctx_.stream);
+                                      stream_);
     } else {
         Tensor output_logits = matrix_window(logits, T);
-        ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
-        ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
+        ops::linear(hidden, *lm_head_, output_logits, stream_);
+        ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, stream_);
     }
 }
 
@@ -619,7 +620,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     const Tensor* rope_positions = explicit_rope_positions;
     if (rope_positions == nullptr) {
         generated_rope_positions = work_.alloc(DType::I32, {T});
-        ops::offset_i32_positions(positions, io_.rope_delta, generated_rope_positions, ctx_.stream);
+        ops::offset_i32_positions(positions, io_.rope_delta, generated_rope_positions, stream_);
         rope_positions = &generated_rope_positions;
     } else if (rope_positions->dtype != DType::I32 || rope_positions->ne[0] != T ||
                (rope_positions->ne[1] != 1 && rope_positions->ne[1] != 3) ||
@@ -650,7 +651,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
 
     auto position_scope  = work_.scope();
     Tensor rope_position = work_.alloc(DType::I32, {1});
-    ops::offset_i32_positions(position, io_.rope_delta, rope_position, ctx_.stream);
+    ops::offset_i32_positions(position, io_.rope_delta, rope_position, stream_);
     mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden,
                      nullptr);
     auto logits_scope = work_.scope();
@@ -675,7 +676,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, batch}, "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, batch}, "ordinary decode logits");
 
-    cudaStream_t stream = ctx_.stream;
+    cudaStream_t stream = stream_;
     work_.reset();
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
@@ -697,13 +698,11 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 }
 
 template <class Tap>
-void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
-                                           const Tensor& rope_positions,
-                                           const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                           const Tensor& linear_state_slots,
-                                           ops::GqaExecutionEnvelope envelope, Tensor& hidden,
-                                           Tensor& logits, Tensor& target_tokens, Tap& tap,
-                                           bool reset_workspace, cudaEvent_t sampling_ready) {
+void TextContext::target_verify_batch_impl(
+    const Tensor& ids, const Tensor& cache_positions, const Tensor& rope_positions,
+    const Tensor& valid_columns, const Tensor& kv_table_rows, const Tensor& linear_state_slots,
+    ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits, Tensor& target_tokens,
+    Tap& tap, bool reset_workspace, cudaEvent_t sampling_ready, const MixedOwnerForward* owner) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
@@ -738,7 +737,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                              "target verify batch prefix lengths");
     }
 
-    cudaStream_t stream = ctx_.stream;
+    cudaStream_t stream = stream_;
     if (reset_workspace) { work_.reset(); }
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
@@ -754,7 +753,14 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
-        run_layers(x, Phase::Verify, tap);
+        if (owner != nullptr) {
+            const LayerPartner partner = [&](int layer) {
+                run_layer(layer, x, Phase::Verify, tap);
+            };
+            (*owner)(partner);
+        } else {
+            run_layers(x, Phase::Verify, tap);
+        }
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
             tap.capture_positions(cache_positions, stream);
         }
@@ -783,7 +789,7 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, tap,
-                             reset_workspace, sampling_ready);
+                             reset_workspace, sampling_ready, nullptr);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
@@ -792,10 +798,10 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                       Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink, bool reset_workspace,
-                                      cudaEvent_t sampling_ready) {
+                                      cudaEvent_t sampling_ready, const MixedOwnerForward* owner) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                              linear_state_slots, envelope, hidden, logits, target_tokens, sink,
-                             reset_workspace, sampling_ready);
+                             reset_workspace, sampling_ready, owner);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
@@ -838,7 +844,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 }
 
 void TextContext::attn_mix(const FullLayerW& weights, Tensor& x, int full_index, Phase phase) {
-    cudaStream_t s = ctx_.stream;
+    cudaStream_t s = stream_;
     const int T    = x.ne[1];
     if (active_gqa_envelope_ == nullptr) {
         throw std::logic_error("Text GQA execution envelope is not set");
@@ -905,7 +911,7 @@ void TextContext::attn_mix(const FullLayerW& weights, Tensor& x, int full_index,
 }
 
 void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Phase phase) {
-    cudaStream_t s = ctx_.stream;
+    cudaStream_t s = stream_;
     const int T    = x.ne[1];
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
@@ -920,9 +926,19 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
         hidden_activation     = workspace_recipe::gdn_input_activation<TextConfig>(work_, T);
         hidden_activation_ptr = &hidden_activation;
     }
-    Variant::gdn_norm_control_projection(
-        x, *weights.input_norm, kCfg.rms_eps, *weights.projection, h, hidden_activation_ptr, g,
-        beta, phase, work_, s, packed_route_tokens(active_sequence_batch_, active_sequence_width_));
+    // Prefill lets the norm leaf publish the input projection's NVFP4 activation when the Variant
+    // projects this layer from one.
+    const std::int32_t route_tokens =
+        packed_route_tokens(active_sequence_batch_, active_sequence_width_);
+    ops::A4Activation hidden_a4;
+    ops::A4Activation* hidden_a4_ptr = nullptr;
+    if (Variant::allocate_gdn_input_a4(*weights.projection, phase, T, route_tokens, work_,
+                                       hidden_a4)) {
+        hidden_a4_ptr = &hidden_a4;
+    }
+    Variant::gdn_norm_control_projection(x, *weights.input_norm, kCfg.rms_eps, *weights.projection,
+                                         h, hidden_activation_ptr, hidden_a4_ptr, g, beta, phase,
+                                         work_, s, route_tokens);
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -1031,7 +1047,7 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
 
     const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
     Tensor qkv      = conv.projected;
-    Variant::gdn_input_projection(h, *weights.projection, qkv, z, phase, work_, s);
+    Variant::gdn_input_projection(h, hidden_a4_ptr, *weights.projection, qkv, z, phase, work_, s);
     Tensor conv_state =
         state_.conv_slot(static_cast<std::uint32_t>(gdn_index), linear_state_current_slot_);
     ops::causal_conv1d_silu_split(qkv, *weights.conv1d, conv_state, qc, kc, vc, s);
@@ -1054,7 +1070,7 @@ void TextContext::gdn_mix(const GdnLayerW& weights, Tensor& x, int gdn_index, Ph
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase) {
-    cudaStream_t s = ctx_.stream;
+    cudaStream_t s = stream_;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     Variant::post_mixer(*post_norm, kCfg.rms_eps, h, *weights.payload, x, phase, work_, s,
@@ -1062,52 +1078,57 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor&
 }
 
 template <class Tap>
-void TextContext::run_layers(Tensor& x, Phase phase, Tap& tap) {
+void TextContext::run_layer(int layer, Tensor& x, Phase phase, Tap& tap) {
     const bool prefill = phase == Phase::Prefill;
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
-        if (ModelConfig::is_full(layer)) {
-            const int fidx         = ModelConfig::full_idx(layer);
-            const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
-            nvtx::ScopedRange layer_range(
-                prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
+    if (ModelConfig::is_full(layer)) {
+        const int fidx         = ModelConfig::full_idx(layer);
+        const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
+        nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerFull
+                                              : nvtx::Name::VerifyLayerFull,
+                                      nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
+        {
+            nvtx::ScopedRange mixer_range(
+                prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                 nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
-            {
-                nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
-                    nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
-                auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, phase);
-            }
-            {
-                nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
-                    nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto mlp_scope = work_.scope();
-                mlp_tail(full.post_attn_norm, full.mlp, x, phase);
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
-            }
-        } else {
-            const int gidx       = ModelConfig::gdn_idx(layer);
-            const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
-            nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
-                                                  : nvtx::Name::VerifyLayerGdn,
-                                          nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
-            {
-                nvtx::ScopedRange mixer_range(
-                    prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
-                    static_cast<std::uint64_t>(layer));
-                auto mixer_scope = work_.scope();
-                gdn_mix(gdn, x, gidx, phase);
-            }
-            {
-                nvtx::ScopedRange post_mixer_range(
-                    prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
-                    nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
-                auto mlp_scope = work_.scope();
-                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, phase);
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
-            }
+            auto mixer_scope = work_.scope();
+            attn_mix(full, x, fidx, phase);
         }
+        {
+            nvtx::ScopedRange post_mixer_range(
+                prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
+            auto mlp_scope = work_.scope();
+            mlp_tail(full.post_attn_norm, full.mlp, x, phase);
+            if constexpr (Tap::enabled) { tap.capture_layer(layer, x, stream_); }
+        }
+    } else {
+        const int gidx       = ModelConfig::gdn_idx(layer);
+        const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
+        nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
+                                              : nvtx::Name::VerifyLayerGdn,
+                                      nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
+        {
+            nvtx::ScopedRange mixer_range(prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn,
+                                          nvtx::Category::Gdn, static_cast<std::uint64_t>(layer));
+            auto mixer_scope = work_.scope();
+            gdn_mix(gdn, x, gidx, phase);
+        }
+        {
+            nvtx::ScopedRange post_mixer_range(
+                prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
+                nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
+            auto mlp_scope = work_.scope();
+            mlp_tail(gdn.post_attn_norm, gdn.mlp, x, phase);
+            if constexpr (Tap::enabled) { tap.capture_layer(layer, x, stream_); }
+        }
+    }
+}
+
+template <class Tap>
+void TextContext::run_layers(Tensor& x, Phase phase, Tap& tap, const LayerPartner* partner) {
+    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        run_layer(layer, x, phase, tap);
+        if (partner != nullptr) { (*partner)(layer); }
     }
 }
 
@@ -1117,14 +1138,15 @@ void TextContext::run_layers(Tensor& x, Phase phase) {
 }
 
 template <class Tap>
-PrefillChunkResult
-TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
-                          const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
+PrefillChunkResult TextContext::prefill_impl(std::span<const int> ids,
+                                             const TextPrefill* text_prefill,
+                                             const MultimodalPrefill* multimodal, Tap& tap,
+                                             bool finalize_at_end, const LayerPartner* partner) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
     }
-    cudaStream_t s           = ctx_.stream;
+    cudaStream_t s           = stream_;
     const int T              = static_cast<int>(ids.size());
     const int chunk          = static_cast<int>(prefill_chunk_);
     const std::uint32_t base = text_kv_base_;
@@ -1178,7 +1200,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         len = static_cast<int>(qwen3_6::detail::cap_prefill_at_frontiers(
             base + static_cast<std::uint32_t>(t0), static_cast<std::uint32_t>(len),
             prefill_split_frontiers_));
-        work_.reset();
+        // A mixed-round owner has a separate workspace region. Its partner joins each layer,
+        // and the caller retains the owner roots until the final tail has joined.
+        if (partner == nullptr) { work_.reset(); }
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
@@ -1250,7 +1274,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
+            run_layers(x, Phase::Prefill, tap, partner);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
@@ -1384,8 +1408,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         }
 
         if constexpr (requires { tap.consume_prefill_chunk(len); }) {
-            work_.reset();
-            tap.consume_prefill_chunk(len);
+            if (partner == nullptr) {
+                work_.reset();
+                tap.consume_prefill_chunk(len);
+            }
         }
 
         t0 += len;
@@ -1394,8 +1420,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_rewrite_checkpoint_frontier_ = -1;
 
-    ctx_.synchronize();
-    work_.reset();
+    if (partner == nullptr) {
+        ctx_.synchronize();
+        work_.reset();
+    }
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T};
 }
@@ -1422,6 +1450,24 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              DFlashFeatureSink& sink,
+                                              const LayerPartner& partner) {
+    if (begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - begin) {
+        throw std::invalid_argument("text prefill chunk is outside the prompt");
+    }
+    // The MTP prompt preparation synchronizes on the generated token and owns MTP state that a
+    // mixed round does not stage.
+    if (mtp_enabled()) {
+        throw std::logic_error("a mixed-round prefill owner cannot prepare an MTP prompt");
+    }
+    const TextPrefill text_prefill{full_ids, begin};
+    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
+                        finalize_at_end, &partner);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,

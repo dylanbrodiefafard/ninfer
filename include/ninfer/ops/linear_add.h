@@ -85,11 +85,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
 void linear_add(const A8Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream);
 
 /**
- * Adds an NVFP4 [5120,K] projection of caller-owned tiled A4[K,T] to BF16 residual.
- * K is 6144 or 17408 and T>512, matching the native tiled consumer.
- * The independent oracle decodes signed codes, exact stored scales and divisors, then sums
- * the FP64 projection with represented residual. Operands must be disjoint; residual is
- * aligned contiguous BF16[5120,T]. No quantization, repacking, allocation or workspace.
+ * LinearAdd of an already quantized activation: the NVFP4 AllowA4 route above with its NVFP4
+ * quantization supplied by the producer (ninfer/ops/a4_activation.h), whose input scale divisor
+ * equals w's. For the same BF16 activation the residual update is bit-identical to
+ * linear_add(x, w, residual, AllowA4, ...). w is NVFP4 [5120,6144] (T >= kA4Residual6144MinTokens)
+ * or [5120,17408] (T >= kA4Residual17408MinTokens); residual is contiguous, 16-byte aligned BF16
+ * [5120,T] and does not overlap x. The oracle is LinearAdd's evaluated on the represented
+ * activation. Invalid arguments throw std::invalid_argument. No workspace.
  */
 void linear_add(const A4Activation& x, const Weight& w, Tensor& residual, cudaStream_t stream);
 

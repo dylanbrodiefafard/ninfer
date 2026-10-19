@@ -173,18 +173,45 @@ runtime::AdmissionResources Program<Variant>::admission_capacity() const noexcep
 }
 
 template <>
-runtime::PrefillStepResult Program<Variant>::start_prefill_lane(std::uint32_t lane,
-                                                                PreparedPrompt&& prompt,
-                                                                RequestPlan<Variant>&& plan,
-                                                                runtime::TransientRegion transient,
-                                                                const OutputSession* output) {
+runtime::PrefillStepResult Program<Variant>::start_prefill_lane(
+    std::uint32_t lane, PreparedPrompt&& prompt, RequestPlan<Variant>&& plan,
+    runtime::TransientRegion transient, runtime::PrefillPace pace, const OutputSession* output) {
     return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                     std::move(plan), transient, output);
+                                     std::move(plan), transient, pace, output);
 }
 
 template <>
-runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane) {
-    return impl_->advance_prefill_lane(lane);
+runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane,
+                                                                  runtime::PrefillPace pace) {
+    return impl_->advance_prefill_lane(lane, pace);
+}
+
+template <>
+std::uint32_t Program<Variant>::prefill_remaining_tokens(std::uint32_t lane) const {
+    return impl_->prefill_remaining_tokens(lane);
+}
+
+template <>
+bool Program<Variant>::prefill_suspendable(std::uint32_t lane) const {
+    return impl_->prefill_suspendable(lane);
+}
+
+template <>
+void Program<Variant>::resume_prefill_lane(std::uint32_t lane) {
+    impl_->resume_prefill_lane(lane);
+}
+
+template <>
+bool Program<Variant>::prefill_mixable(std::uint32_t lane) const {
+    return impl_->prefill_mixable(lane);
+}
+
+template <>
+runtime::MixedGeneratedRound
+Program<Variant>::decode_batch_with_prefill(std::span<const std::uint32_t> lanes,
+                                            std::span<const runtime::RoundBudget> budgets,
+                                            std::uint32_t owner_lane) {
+    return impl_->decode_batch_with_prefill(lanes, budgets, owner_lane);
 }
 
 template <>

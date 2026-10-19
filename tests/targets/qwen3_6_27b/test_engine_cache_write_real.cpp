@@ -72,6 +72,7 @@ ninfer::EngineOptions fork_config(const char* artifact, std::uint32_t lanes,
         config.context_checkpoint_marks = std::vector<std::uint32_t>{64};
     }
     config.prefill_chunk = 128;
+    config.mixed_forward = 0;
     return config;
 }
 

@@ -220,14 +220,17 @@ void LinearAttentionStatePool::copy_slot_2d(std::int32_t src, std::int32_t dst,
 
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool zero_slot");
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor state = conv_slot(layer, slot);
-        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
-    }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor state = recurrent_slot(layer, slot);
-        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
-    }
+    // The layers of each component sit at a constant stride, so one 2D memset per component
+    // clears the slot in every layer (rows = layers, row pitch = layer stride).
+    const LinearAttentionStateAllLayersView view = all_layers_view();
+    const auto zero_component = [&](const Tensor& slot_layer0, std::int64_t layer_stride_bytes) {
+        const std::size_t bytes = slot_layer0.bytes();
+        const std::size_t pitch =
+            layer_count() == 1 ? bytes : static_cast<std::size_t>(layer_stride_bytes);
+        CUDA_CHECK(cudaMemset2DAsync(slot_layer0.data, pitch, 0, bytes, layer_count(), stream));
+    };
+    zero_component(conv_slot(0, slot), view.conv_layer_stride_bytes);
+    zero_component(recurrent_slot(0, slot), view.recurrent_layer_stride_bytes);
 }
 
 std::size_t LinearAttentionStatePool::conv_slot_bytes() const noexcept {

@@ -64,6 +64,15 @@ int test_cli_contract() {
     const qb::BenchOptions default_options =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
     failures += expect_u32(default_options.prefill_chunk, 4096, "default prefill chunk");
+    failures += expect_u32(default_options.mixed_forward_rounds, 12, "default mixed cadence");
+    failures +=
+        expect_u32(default_options.mixed_forward_min_tokens, 4096, "default mixed threshold");
+    const auto fixed_cadence =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--mixed-forward", "4096",
+                        "--mixed-forward-rounds", "3", "--mixed-forward-min-tokens", "0"});
+    failures += expect(fixed_cadence.mixed_forward_rounds == 3 &&
+                           fixed_cadence.mixed_forward_min_tokens == 0,
+                       "explicit fixed cadence override");
     const qb::BenchOptions parsed = parse_for_test({
         "ninfer_bench",
         "--weights",

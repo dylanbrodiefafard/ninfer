@@ -32,8 +32,9 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 
 ### 1.2 Non-goals
 
-- request preemption、swap、pause/resume，或把 **active** request 的 KV 迁出 GPU；
-- 多请求 batched prefill 或 prefill/decode mixed forward；
+- General request preemption, swapping or active KV offload. The sole exception is the
+  bounded spare-lane short-prefill interruption in §7.3; it keeps all active state resident.
+- 多请求 batched prefill；
 - 多 GPU 或 distributed inference；
 - priority、tenant QoS 或 deadline-aware GPU scheduling；
 - 面向数十至数百请求的通用 continuous batching；
@@ -85,14 +86,24 @@ metadata 和一份 shared executor workspace；否则该 `max_concurrency` 无�
 
 ### 2.4 Admission guarantees completion capacity
 
-NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最大生成长度和必要的临时增长都能
-获得完整资源承诺后才可 admission。已经 admitted 的 request 不会因为后来请求到达而被截断或逐出。
+Admission requires capacity for the complete prompt, declared output bound and transient growth.
+A spare-lane prefill interruption changes execution order without releasing the suspended
+request's reservations. Later arrivals never truncate or evict an active request.
 
-### 2.5 One prefill owner
+### 2.5 Executing and suspended prefill owners
 
-同一时刻最多有一个 admitted request 拥有 prefill/finalization path。Suffix prefill 以 bounded chunk 为
-单位连续运行到 finalization；只在整个 owner 完成、取消或失败后选择下一次 admission 或 decode。
-其他等待请求仍留在 host queue，不占 slot 或 model state。
+At most one request executes prefill/finalization at a time. One additional text owner may
+be suspended at a completed chunk boundary while a short request prefills on a spare lane.
+Both retain their stable lane, KV/GDN/checkpoint allocations and request-local cursor; a
+suspended owner is not decode-ready. No transient-bearing or media owner is suspended.
+The suspended owner resumes before ordinary admission or recovery and must complete another
+nonzero chunk before another short interruption. The spare-lane path performs no eviction,
+active-state offload or host restore; otherwise ordinary admission waits for the owner.
+
+The default remaining-work policy uses prefill-first below 4096 uncached tokens and
+W4096/rounds12 at or above 4096. Remaining work is `prompt_tokens - cursor`, not total
+conversation length or the best pre-admission reuse estimate. Section 7.3 defines cadence,
+explicit tuning and the protected spare-lane admission exception.
 
 ### 2.6 Single GPU execution owner
 
@@ -466,9 +477,10 @@ frame 和权重是 engine-fixed resources；owning result capacity 已在 ingres
 1. 存在可用 control lane；
 2. request 对固定 model、frontend 和 selected execution backend 合法；
 3. active-priority retained eviction 后，每个 entitlement dimension 都能承诺 request 的完整生命周期需求；
-4. 当前没有其他 prefill owner，也没有未完成的 copy-hold admission；admission 会立即建立该
-   request 的 suffix-prefill 或 exact-hit finalization ownership，或先进入 copy-hold 直到
-   相关 RAM copies 允许 `start_prefill_lane`。
+4. Ordinary admission requires no other prefill owner or unfinished copy-hold. The only
+   exception is the FIFO-head spare-lane short-prefill path in §7.3, which preserves the
+   existing owner's lane and resources. Admission establishes suffix-prefill or exact-hit
+   finalization ownership, or parks a copy-hold until RAM copies permit `start_prefill_lane`.
 
 Selected backend 的差异只体现在 target 给出的 typed entitlement；Scheduler 不为 ordinary、MTP 或 DFlash
 建立不同 queue policy。即使 startup sizing 保证 backend 不会早于 Main pool 成为正常 backpressure，
@@ -502,6 +514,8 @@ oldest head is exclusively feasible but blocked by active lane/entitlement
 head waiting，不建立 protection epoch，也不扫描 later candidates；prefill owner 清除后的下一个有
 admission budget 的 boundary 先重试该 head。Protection 只在没有 prefill owner、head 确实需要现有 active request 释放
 lane 或 entitlement 时建立，因此 frozen donor set 非空。
+An eligible short FIFO head may instead take the spare-lane exception in §7.3; it still
+cannot bypass an earlier live head or establish a backfill protection epoch while interrupting.
 
 同一时刻只保护一个最老 head。Protection 绑定稳定的 request generation identity，不绑定可回收的 lane、
 slot index 或 compact batch row。它只是一份 Scheduler shadow state，不为 waiting request 预占真实 pages、
@@ -627,13 +641,16 @@ qualification 会自然保守，仍可使用可证明的 persistent-safe backfil
 
 ### 5.6 Admission burst and progress rules
 
-只有满足以下条件的 boundary 才能尝试 admission：
+Ordinary admission requires:
 
 ```text
 no prefill owner
 and no copy-hold admission
 and (no decode-ready request or decode-admission budget > 0)
 ```
+
+Section 7.3 permits one short FIFO head to use a resource-feasible spare lane while a large
+text owner is suspended. That bind spends the same budget and never evicts retained state.
 
 copy-hold 与 prefill owner 一样独占 admission/prefill opportunity：它不是 GPU unit，但在 D2H/H2D
 完成并调用 `start_prefill_lane` 之前不得再 admission 第二个 request。held lane 不是 decode-ready，
@@ -669,7 +686,8 @@ cancelled、expired 或 permanent-invalid entries 可以继续检查同一 snaps
 已经释放，或当前非-temporal shadow resources 已足以容纳 `H`，但 `H` 仍被 temporal borrower 或现有
 prefill owner 阻塞，protection 立即进入 `PROTECTED_DRAIN`。Drain 不抢占 borrower；它禁止 later/backfill
 admission，但 protected head 仍在每个 eligible boundary 优先重试。Persistent-safe borrower 尚在 prefill 时也可能
-短暂阻止 head admission，但 one-prefill-owner work 有限且此期间不能再接纳其他请求。
+短暂阻止 head admission。Its work is finite; the only nested admission is the bounded short-head
+spare-lane exception, which must allow another nonzero owner chunk before repeating.
 
 Frontier member completion/cancellation 只在其 state 于 boundary 真正释放后计为 release。该 boundary 若有
 admission budget 就立即 head-first retry；否则更新 maturity。只要 decode membership 仍存活，就在下一次
@@ -1057,14 +1075,18 @@ PrefillChunk(request)
 DecodeRound(all decode-ready requests)
 ```
 
-完整 request 不是 scheduling unit。所有 **compute** GPU work 在 `device.stream` 上串行执行。
+完整 request 不是 scheduling unit。Ordinary decode and exclusive prefill execute on
+`device.stream`. Eligible DFlash mixed rounds also use one startup-owned nonblocking owner
+stream; matching-layer event joins preserve the single round boundary (§8.8).
 Host-RAM D2H/H2D 在 `copy_stream` 上，不是 scheduling unit，不得进入 CUDA Graph，也不得与当前
 compute unit 的 pages 别名。
 
-Model Runtime 拥有一份地址稳定的 shared workspace，由串行的 GPU units 复用，不按 request
-复制。Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
-final prefill、cancellation 或 failure 后释放。copy-hold 与 prefill owner 一样独占 admission
-opportunity，直到该 lane 的 copies 允许 `start_prefill_lane`。
+Model Runtime 拥有一份地址稳定的 shared workspace，不按 request 复制。Serial units reuse
+the allocation; a mixed round uses disjoint bounded owner and verify views within that same
+startup allocation (§8.8). Prefill owner 可在 Vision/Text phases 及多个 chunks 之间持有一份 request-transient lease；
+final prefill、cancellation 或 failure 后释放。A copy-hold blocks further admission until its copies
+permit `start_prefill_lane`. A transient-bearing owner cannot use the interruption exception;
+a suspended text owner retains no transient lease.
 
 ### 7.2 Boundary processing
 
@@ -1098,6 +1120,24 @@ boundary 最多发布一个新 admitted request。
 
 ### 7.3 Decode/prefill policy
 
+The Engine and server default to `mixed_forward = 4096`, `mixed_forward_rounds = 12`,
+and `mixed_forward_min_tokens = 4096`. Suffixes below the threshold run exclusively,
+including checkpoint tails; zero threshold applies fixed cadence to every suffix and
+disables short-prefill interruption.
+Concurrency and speculative backend selection remain independent. A smaller explicit
+`prefill_chunk` requires a compatible mixed width or `mixed_forward = 0`; single-request
+CLI and perplexity execution explicitly select prefill-first. Benchmark defaults remain
+prefill-first for control measurements. User tuning is documented in `docs/serving.md`.
+
+
+The spare-lane exception checks the FIFO head's exact selected resident plans before
+suspension. It never bypasses a live queued head, creates a protection epoch or borrows
+backfill credit. Every successful short bind consumes the same frozen decode-admission budget
+as ordinary admission. Cancelling a suspended owner releases only its state; cancelling the
+short owner resumes the large one at the next legal boundary. Statistics count both staged
+owners as prefilling requests. The single request-transient lease remains exclusive to the
+executing owner.
+
 调度策略为：
 
 ```text
@@ -1111,8 +1151,22 @@ else if an admitted copy-hold exists:
         run one DecodeRound containing them
     else:
         complete it and start its prefill
+else if a suspended prefill exists and no current owner/copy-hold exists:
+    restore its shared KV-row, RoPE, logprob and sampling-mask bindings; resume its cursor
 else if a prefill owner exists:
-    run the next PrefillChunk
+    if its last chunk completed, interruption allowance exists, remaining >= threshold,
+       and decode-admission debt allows another bind:
+        consider only the live FIFO head from one bounded queue snapshot
+        require a spare lane, no transient lease, direct resident feasibility and no eviction
+        respect protected-head persistent safety; suspend the large owner and admit the short one
+    if mixed_forward > 0 and remaining >= mixed_forward_min_tokens and requests are DECODE_READY:
+        if the target can mix the owner's next chunk into DFlash verification:
+            run mixed_forward_rounds - 1 ordinary DecodeRounds, then one DecodeRound
+            containing the owner's next Shared-pace chunk
+        else:
+            run mixed_forward_rounds ordinary DecodeRounds, then the next Shared-pace chunk
+    else:
+        run the next Exclusive-pace PrefillChunk (at most prefill_chunk)
 else if a generation-recovery retry is queued:
     start it (a host restore parks it as a copy-hold)
 else if a pending request is admissible and decode-admission budget permits:
@@ -1123,7 +1177,8 @@ else:
     remain idle
 ```
 
-因此 startup 有三个 cold requests 时：
+With prefill-first pacing (`mixed_forward = 0`, or every remaining suffix below the threshold),
+three cold startup requests follow:
 
 ```text
 Prefill[A, all chunks] -> Prefill[B, all chunks] -> Prefill[C, all chunks]
@@ -1134,6 +1189,9 @@ Prefill[A, all chunks] -> Prefill[B, all chunks] -> Prefill[C, all chunks]
 C；B/C 都 decode-ready 后才运行 `DecodeRound[A,B,C]`。若 B 在 prefill token terminal，其 bind 仍消费
 budget，持续 ingress 不能跳过 mandatory donor decode。
 
+Request plan 以 Shared-pace step 宽度投影 prefill service work：`mixed_forward` 不超过 4096
+（irregular-split extent），因此任何 Shared/Exclusive 交替都不会比投影多走一步。
+
 Prefill chunk profile 限制一次不可取消 GPU unit 的时间；完整 admission burst 的 wall time 可以包含最多
 `C-1` 个完整 request prefills。其具体 token/media extent 是经过 target 和 hardware qualification 的配置，
 不属于 scheduler semantic。Vision 和其他 prefill GPU phases 必须本身构成 bounded unit，或已被计入该
@@ -1141,8 +1199,9 @@ chunk 的 latency bound；不存在 scheduler 之外的 unbounded prefill work�
 
 ### 7.4 Joining and leaving decode
 
-- request 在 final prefill/finalization 完成后加入 active decode set；exact retained hit 只省略 suffix work，
-  不绕过现有 prefill owner；
+- request 在 final prefill/finalization 完成后加入 active decode set。Exact retained hits skip
+  suffix work; a short FIFO head may use the spare-lane exception, subject to the same resources
+  and interruption allowance as other short prefills;
 - newly ready request 首次出现在下一个 boundary 构建的 batch；
 - protected-head policy 只影响 admission；backfill 一旦 decode-ready，不得为了保护 waiting head 而从
   maximal batch 中排除；
@@ -1419,9 +1478,24 @@ boundary 重新 compact；没有任何 row identity 从当前 frame 继承到下
 `B=1` 使用完全相同的 membership、frame、whole-model schedule 和 commit transaction，不保留独立的
 request-local ordinary decode path。
 
-Prefill 仍是单 sequence unit。它独占自己的 `SequenceState`，但复用 Model Runtime 和 shared workspace；
-它不占有一个长期 `DecodeBatchFrame` row。Final prefill 建立完整 decode cursor 后，该 request 只在下一
-boundary 通过正常 batch assembly 加入 ordinary decode。
+Prefill has one sequence owner. An eligible DFlash mixed round evaluates that owner alongside
+the decode rows while preserving separate state and activation storage. The Model Runtime owns
+one nonblocking owner stream and two completion events for its lifetime. A primary-stream event
+orders owner work after ingress. Each matching layer records both streams' completion events
+before either cross-stream wait, so the two branches can overlap within a layer and both finish
+before the next layer. The primary stream joins the owner tail before verify-head evaluation,
+acceptance, state publication, or owner-context append. Failure cleanup drains outstanding owner
+work before either branch's state or scratch can be released.
+
+The owner and verify branches borrow disjoint bounded views of the same startup-planned workspace
+allocation. Round scopes restore both cursors after stream completion, including failure cleanup;
+the views retain their observed peaks. Public workspace accounting reports the greatest observed
+allocation extent across the ordinary, verify, and offset owner views, and peak reset resets all
+three views. No mixed round allocates a second workspace or changes graph addresses.
+
+Exclusive prefill remains a single-sequence unit. The owner exclusively owns its `SequenceState`
+and does not hold a persistent `DecodeBatchFrame` row. After final prefill establishes its complete
+decode cursor, the request joins ordinary decode through batch assembly at the next boundary.
 
 ---
 
@@ -1680,6 +1754,9 @@ shared round 中某一行可以安全继续。
 ## 12. End-to-end examples
 
 ### 12.1 Prefill burst joins an existing decode
+
+This example uses prefill-first pacing. Shared large owners instead yield the decode cadence
+in §7.3, and an eligible short FIFO head may use its spare-lane interruption.
 
 ```text
 time ───────────────────────────────────────────────────────────►

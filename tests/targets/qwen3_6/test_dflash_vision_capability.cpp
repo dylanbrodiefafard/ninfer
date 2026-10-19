@@ -19,6 +19,7 @@ ninfer::EngineOptions dflash_vision_options(std::string model_id, std::string we
     options.max_context              = 128;
     options.kv_capacity              = ninfer::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk            = 128;
+    options.mixed_forward            = 0;
     options.max_concurrency          = 1;
     options.speculative.backend      = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens = 4;

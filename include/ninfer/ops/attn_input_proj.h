@@ -99,6 +99,17 @@ void attn_input_proj(const A8Activation& x, const Weight& query_key_gate_value_w
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
+ * The NVFP4 AllowA4 single-parent projection of an already quantized activation
+ * (ninfer/ops/a4_activation.h) of [5120,T], T >= kA4AttnInputMinTokens (the widths at which
+ * AllowA4 selects W4A4), whose input scale divisor equals the weight's. For the same BF16
+ * activation the four outputs are bit-identical to the policy overload's with AllowA4. The weight
+ * is NVFP4 [14336,5120]; q/gate/k/v are as above. The oracle is the overload's, evaluated on the
+ * represented activation. Invalid arguments throw std::invalid_argument. No workspace.
+ */
+void attn_input_proj(const A4Activation& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
+
+/**
  * Qwen3.6 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
  * and stored row order [query 4096, key 1024, value 1024]. `x` is contiguous BF16 [2048,T],
  * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes
@@ -108,15 +119,5 @@ void attn_input_proj(const A8Activation& x, const Weight& query_key_gate_value_w
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
-
-/**
- * Single-parent NVFP4 [14336,5120] projection of caller-owned tiled A4[5120,T].
- * T must be 256 or greater than 384, matching the native tiled consumer.
- * Output shapes and row ordering match the BF16 overload. The oracle independently decodes
- * signed activation/weight codes with their exact stored scales and divisors, accumulating
- * each projection in FP64. No quantization, repacking, allocation or workspace occurs here.
- */
-void attn_input_proj(const A4Activation& x, const Weight& weight, Tensor& q, Tensor& gate,
-                     Tensor& k, Tensor& v, cudaStream_t stream);
 
 } // namespace ninfer::ops

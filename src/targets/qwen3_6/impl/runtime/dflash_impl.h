@@ -519,7 +519,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 Tensor residual_batch =
                                     residual.view({Config::hidden, width, batch_size});
                                 const auto& next_weight =
-                                    dflash.layers.at(static_cast<std::size_t>(layer) + 1);
+                                    dflash.layers.at(static_cast<std::size_t>(layer) + 1U);
                                 ops::grouped_dynamic_conv_finish_residual_rmsnorm(
                                     mlp_in, weight.mlp_conv.base_kernel, finish_dynamic,
                                     residual_batch, next_weight.input_norm, Config::rms_epsilon,
@@ -1053,9 +1053,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               std::uint32_t verify_width, DFlashEnvelopes envelopes,
                               ops::GqaExecutionEnvelope target_envelope,
-                              bool exact_sequence_envelopes) {
+                              bool exact_sequence_envelopes, MixedPrefillOwner* owner) {
     return [&state, batch_size, k, verify_width, envelopes, target_envelope,
-            exact_sequence_envelopes] {
+            exact_sequence_envelopes, owner] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts || verify_width < 2) {
             throw std::logic_error("DFlash decode batch state is incomplete");
@@ -1240,8 +1240,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }
         }
         target_verify_accept(state.execution, state.continuation_hidden_store, card, verify_frame,
-                             target_envelope, !compact);
-        // A tree round's token i was drawn at node fold_path[i]; a chain round's at column i.
+                             target_envelope, !compact,
+                             owner != nullptr ? &owner->forward() : nullptr);
+        // A tree round scores the selected path; a chain round scores its sequential columns.
         qwen3_6::record_round_logprobs(frame.logprobs, target_logits, licensed_tokens,
                                        &licensed_counts, use_tree ? &fold_path : nullptr,
                                        TextConfig::token_domain, state.execution.device.stream);
@@ -1256,6 +1257,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        if (owner != nullptr) { owner->append_context(); }
     };
 }
 
@@ -1286,19 +1288,22 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  ops::GqaExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
     auto body = dflash_decode_batch_body(state, batch_size, k, verify_width, envelopes,
-                                         target_envelope, false);
+                                         target_envelope, false, nullptr);
     capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          std::uint32_t verify_width, DFlashEnvelopes envelopes,
                          ops::GqaExecutionEnvelope target_envelope, bool exact_sequence_envelopes,
-                         DecodeGraphExecutable* executable) {
+                         DecodeGraphExecutable* executable, MixedPrefillOwner* owner) {
     if (exact_sequence_envelopes && executable != nullptr) {
         throw std::logic_error("DFlash graph replay requires its captured execution envelopes");
     }
+    if (owner != nullptr && (executable != nullptr || !exact_sequence_envelopes)) {
+        throw std::logic_error("a mixed DFlash round runs eagerly with exact envelopes");
+    }
     auto body = dflash_decode_batch_body(state, batch_size, k, verify_width, envelopes,
-                                         target_envelope, exact_sequence_envelopes);
+                                         target_envelope, exact_sequence_envelopes, owner);
     run_prepared(state, executable, body);
 }
 

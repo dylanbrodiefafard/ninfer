@@ -165,18 +165,24 @@ struct K16View {
     }
 };
 
+// K is the caller's input, whose last chunk may hold fewer than BT tokens: rows at or past
+// valid_rows are zero-filled without reading global memory. A zero K row adds nothing to the
+// state update.
 template <int THREADS, class T>
 __device__ __forceinline__ void issue_load_k_16(K16View<T> view, const T* gmem_base_row0,
-                                                int64_t gmem_row_stride, int tid) {
+                                                int64_t gmem_row_stride, int valid_rows, int tid) {
     constexpr int ELEMS_PER_COPY = 8;
     constexpr int COPIES_PER_ROW = kStateDim / ELEMS_PER_COPY;
     constexpr int COPIES         = BT * COPIES_PER_ROW;
 #pragma unroll
     for (int copy = tid; copy < COPIES; copy += THREADS) {
-        const int row = copy / COPIES_PER_ROW;
-        const int col = (copy - row * COPIES_PER_ROW) * ELEMS_PER_COPY;
-        cp_async<16>(view.logical_ptr(row, col),
-                     gmem_base_row0 + static_cast<int64_t>(row) * gmem_row_stride + col);
+        const int row    = copy / COPIES_PER_ROW;
+        const int col    = (copy - row * COPIES_PER_ROW) * ELEMS_PER_COPY;
+        const bool valid = row < valid_rows;
+        cp_async_zfill<16>(view.logical_ptr(row, col),
+                           gmem_base_row0 +
+                               static_cast<int64_t>(valid ? row : 0) * gmem_row_stride + col,
+                           valid ? 16 : 0);
     }
 }
 
@@ -201,7 +207,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                               const void* __restrict__ k_raw, const float* __restrict__ g_cumsum,
                               const float* state_in, void* __restrict__ v_new_raw,
                               void* __restrict__ h_chunk_raw, float* state_out, head_map qk_map,
-                              int chunks) {
+                              int tokens, int chunks) {
     using D                         = kernel_dims<NStrip>;
     using KType                     = std::conditional_t<K_F16, __half, __nv_bfloat16>;
     const auto* const k_in          = static_cast<const KType*>(k_raw);
@@ -305,9 +311,9 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         }
     }
 
-    // Chunk 0 is staged before the loop. Later W/K async groups and converted
-    // U are issued together at the preceding chunk's Phase-E boundary. All
-    // global bases advance additively across the sequential chunk loop.
+    // Chunk 0 is staged before the loop. Later W groups overlap MM2; K groups
+    // and converted U are issued after MM2 completes. Global bases advance
+    // additively across the sequential chunk loop.
     const int64_t W_stride        = H_v * kStateDim;
     const int64_t k_stride        = static_cast<int64_t>(qk_map.H_qk) * kStateDim;
     const int64_t W_chunk_stride  = (int64_t)BT * W_stride;
@@ -330,7 +336,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     {
         issue_load_w_16<THREADS_K>(W_view, W_in + W_block_base, W_stride, tid);
         cp_commit();
-        issue_load_k_16<THREADS_K>(k_view, k_in + k_block_base, k_stride, tid);
+        issue_load_k_16<THREADS_K>(k_view, k_in + k_block_base, k_stride, min(BT, tokens), tid);
         cp_commit();
         if constexpr (K_F16) {
             issue_load_f16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
@@ -525,6 +531,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         cp_wait<0>();
         __syncthreads();
 
+        // MM1 has finished reading W. The next W group overlaps MM2, which reads only
+        // K and v_decay; the next K and aliased U region remain behind MM2's barrier.
+        if (chunk + 1 < chunks) {
+            issue_load_w_16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
+            cp_commit();
+        }
+
         // === Phase E: matmul2 over the full chunk of k ===
 #pragma unroll
         for (int kt = 0; kt < K_TILES_MM2; ++kt) {
@@ -557,14 +570,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
             }
         }
 
-        __syncthreads(); // gates MM2 before the next chunk overwrites W/K/U
+        __syncthreads(); // Gates MM2 before the next chunk overwrites K and U.
 
-        // The next chunk repeats the W-then-K async group order used by the
-        // prologue. Its Phase A drains W only; Phase E drains K.
+        // Preserve the prologue's W-then-K async group order: Phase A drains W
+        // and Phase E drains K. U aliases the v_decay region consumed by MM2.
         if (chunk + 1 < chunks) {
-            issue_load_w_16<THREADS_K>(W_view, W_in + W_base_next, W_stride, tid);
-            cp_commit();
-            issue_load_k_16<THREADS_K>(k_view, k_in + k_base_next, k_stride, tid);
+            issue_load_k_16<THREADS_K>(k_view, k_in + k_base_next, k_stride,
+                                       min(BT, tokens - (chunk + 1) * BT), tid);
             cp_commit();
             if constexpr (K_F16) {
                 issue_load_f16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(

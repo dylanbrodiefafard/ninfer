@@ -50,6 +50,7 @@ void exercise(const char* artifact, int tier, unsigned publications) {
     options.max_context               = 256;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(256);
     options.prefill_chunk             = 128;
+    options.mixed_forward             = 0;
     options.kv_ram_capacity_bytes     = 2ULL << 30;
     options.enable_vision             = false;
     options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
@@ -151,6 +152,7 @@ void exercise_c2_admission(const char* artifact) {
     options.max_context               = 256;
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(512);
     options.prefill_chunk             = 128;
+    options.mixed_forward             = 0;
     options.kv_ram_capacity_bytes     = 2ULL << 30;
     options.kv_disk_capacity_bytes    = 4ULL << 30;
     options.kv_disk_location          = directory.path;
@@ -341,6 +343,7 @@ void exercise_short_terminal_restore(const char* artifact) {
         options.max_context               = 256;
         options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(256);
         options.prefill_chunk             = 128;
+        options.mixed_forward             = 0;
         options.kv_ram_capacity_bytes     = 2ULL << 30;
         options.enable_vision             = false;
         options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;

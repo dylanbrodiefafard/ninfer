@@ -20,6 +20,7 @@ int main() {
         options.kv_capacity                = ninfer::KvCapacityPolicy::explicit_capacity(1536);
         options.kv_cache                   = ninfer::KvCacheStorage::Nvfp4;
         options.prefill_chunk              = 128;
+        options.mixed_forward              = 0;
         options.use_cuda_graph             = true;
         options.enable_vision              = false;
         options.speculative.backend        = ninfer::SpeculativeBackend::DFlash;
